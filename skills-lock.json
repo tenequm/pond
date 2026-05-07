@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-dev": {
+      "source": "tenequm/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-dev/SKILL.md",
+      "computedHash": "f7b6ae73e4c5142fa609790e2a69603d775255a3c799aa8ce86e7cebea30aa03"
+    }
+  }
+}
