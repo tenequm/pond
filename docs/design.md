@@ -50,7 +50,7 @@ Own Rust serde structs/enums in the shape of the `effect/unstable/ai` Prompt + R
 
 Part union (each variant is a column-materialized row in the `parts` dataset):
 - Text, Reasoning, File, ToolCall, ToolResult, ToolApproval{Request, Response}
-- Plus streaming Start/Delta/End variants where applicable
+- Streaming Start/Delta/End variants are not part of v1 storage; live-write capture deferred to section 15.
 
 Harness extensions (not in upstream):
 - CompactionPart (auto / overflow / tail_start_id)
