@@ -393,27 +393,7 @@ Each entry: what it is, why deferred, activation condition. None require schema 
 
 ## 5. Open Questions
 
-Workspace for unresolved items. When a question is decided, its answer moves into the relevant section above and the question is struck through here with a one-line note pointing to where the decision landed.
-
-### ~~OQ1. Resources application: canonical type and storage shape~~
-
-Resolved 2026-05-08. Resources deferred to v2 (see section 4). Goal: ship sessions-only v1 with the smallest possible codebase. Adding a second Lance-backed application later is mechanical given Lance's table-level isolation.
-
-### OQ2. `schema_version` on `sessions` contradicts invariant 10
-
-**Where**: 2.3 invariant 10 vs 3.2.
-
-**Issue**: 2.3 #10 forbids per-row `schema_version` columns; 3.2 lists `schema_version` as a column on `sessions`. One must change.
-
-**Lean**: drop the column. Use a dataset-level metadata key (Lance manifest) to record schema version. Matches the invariant.
-
-### OQ3. `workspace_id` vs `workspace_path` - which one is canonical?
-
-**Where**: 2.3 invariant 6 vs 3.2.
-
-**Issue**: invariant 6 names `workspace_id` as an opaque string the SourceAdapter decodes once. 3.2 lists only `workspace_path`. The Claude Code adapter has a path, not a separate ID.
-
-**Lean**: drop `workspace_id` from invariant 6. Keep `workspace_path` on sessions. If a future adapter has a non-path identifier, introduce `workspace_id` then.
+Workspace for unresolved items. When a question is decided, its answer moves into the relevant section above and the question is removed entirely from this list. Goal: an empty section 5. Git history preserves the trail of resolved questions.
 
 ### OQ4. S3 native conditional writes claim - verify against current `lance-io`
 
@@ -422,14 +402,6 @@ Resolved 2026-05-08. Resources deferred to v2 (see section 4). Goal: ship sessio
 **Issue**: 2.4 asserts "no external coordinator on plain S3 (native conditional writes since mid-2025)." Archived U1 (from earlier in 2026) said S3 commits still required `s3+ddb://`. Need to verify Lance's current S3 commit implementation actually uses `If-None-Match` before locking the claim.
 
 **Lean**: read `lance-io` source. If confirmed, claim stands. If not, qualify 2.4 with "AWS hosted requires `s3+ddb://` or single-writer-per-namespace lease."
-
-### OQ5. v1 Part variant set - lock the shipped list
-
-**Where**: 3.1.
-
-**Issue**: 3.1 enumerates many variants including harness extensions (`Compaction`, `Retry`, `Snapshot`/`Patch`, `StepStart`/`StepFinish`, `Subtask`, `Agent`). Not clear which ship in v1 vs which are placeholder for future adapters.
-
-**Lean**: ship only what the Claude Code adapter emits today: `Text`, `Reasoning`, `ToolCall`, `ToolResult`, `ToolApproval`, `File` (image inputs), `Compaction`. Defer `Subtask`, `Agent`, `Snapshot`/`Patch`, `StepStart`/`StepFinish`, `Retry`. Adding a variant later is additive.
 
 ### OQ6. Embeddings chunking strategy
 
