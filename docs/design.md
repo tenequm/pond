@@ -224,7 +224,7 @@ Notes:
 - Per-role content allowlists are enforced at the type level: a `ToolResultPart` inside a `UserMessage` is a category error.
 - **Append-only log.** Messages within a session form a linear, append-only log per invariant 1 and the Anthropic Managed Agents session-as-event-log framing. Ordering within a session is `ORDER BY (timestamp, id)` with `id` as tiebreak. The SourceAdapter walks source data in source order and appends in that order.
 - **No `parent_message_id` field.** Branching exists only at the Session level (3.1.3). In an append-only linear log, position in the log IS the next-after relationship - no per-message parent pointers are needed.
-- **No turn-level metadata fields** (model, provider, finish_reason, tokens, response_id, error). Effect places these on Response-side metadata Parts (`FinishPart`, `ResponseMetadataPart`, `ErrorPart`); pond projects them at ingest into Lance columns on the message row. Canonical Message stays Effect-shaped.
+- **No turn-level metadata fields** (model, provider, finish_reason, tokens, response_id, error). Effect places these on Response-side Parts (`FinishPart`, `ResponseMetadataPart`, `ErrorPart`) that pond does not store. Sources record this metadata on their assistant turns; SourceAdapters route it to `options.<provider>.*` matching Effect's own declaration-merging pattern for `AssistantMessageOptions` (e.g. Anthropic-shape usage to `options.anthropic.usage.*`, OpenAI to `options.openai.*`). Cross-source normalization is a search/replay-layer concern (section 4), not a storage-shape concern. Canonical Message stays Effect-shaped.
 
 #### 3.1.5 Part
 
@@ -323,8 +323,8 @@ Behaviors that some references model as first-class Parts or message-level field
 | Streaming start/delta/end variants (Effect Response-side) | Not persisted (assembled state only) |
 | Source/citation Parts (Effect's DocumentSourcePart, UrlSourcePart) | Deferred; not v1 |
 | Tool definitions / available-tools list | `options.source.tools` per Session if the source provides it |
-| Per-message error string / error tagged union (opencode AssistantError) | Lance column on the message row, projected at ingest from Effect's `ErrorPart` |
-| Finish reason, token usage, model, provider, response_id | Lance columns on the message row, projected at ingest from Effect's `FinishPart` and `ResponseMetadataPart` |
+| Per-message error (Effect's `ErrorPart`, opencode `AssistantError`) | `options.<provider>.error` per the source's wire format |
+| Finish reason, token usage, model, provider, response_id (Effect's `FinishPart` and `ResponseMetadataPart`) | `options.<provider>.*` per the source's wire format (e.g. `options.anthropic.usage.input_tokens`, `options.openai.finish_reason`) |
 | Tool approvals as side-table (opencode pattern) | Pond keeps as Parts (Effect's pattern), inside canonical |
 | Per-Part timestamps (opencode's `text?:{start,end?}` on TextPart) | `options.source.time.*` on the Part |
 | Synthetic orphan-tool-result sentinels (pi-mono inserts these at replay time) | Not in canonical storage; replay layer (deferred, section 4) generates them on demand |
@@ -367,7 +367,7 @@ One row per Message (any role).
 | timestamp | timestamp_micros | clustering pos=2; source-recorded |
 | role | Utf8 | "system" / "user" / "assistant" / "tool"; BTREE |
 | content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
-| options | Utf8 | JSON-serialized ProviderOptions; carries projected response metadata under `options.response.*` (model, provider, finish_reason, tokens, response_id, error) and source/harness facts under `options.source.*` |
+| options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*` |
 
 Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
 
