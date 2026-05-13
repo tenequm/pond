@@ -1,6 +1,6 @@
 # Pond - Design v2
 
-> Status: in progress, built section by section. Section 5 (Open Questions) is the workspace for unresolved items. As each question is decided, the answer moves up into the relevant section and the question is struck through in section 5. Goal: an empty section 5.
+> Status: sections 1-4 are the source of truth. Section 5 (Open Questions) is empty; all v1 design decisions are locked into the relevant sections above. Git history preserves the trail of resolved questions (OQ1-OQ10).
 
 ---
 
@@ -50,7 +50,7 @@ Items deferred for later (resources, replay, live-write, additional sources, hos
 | HTTP server | axum (tokio-native, JSON-first, SSE built in). |
 | MCP server | rmcp (official Anthropic Rust SDK), wrapping the same handlers as HTTP. |
 | Wire format | JSON. Single evolving schema with top-level `protocol_version` field. Additive-only changes; formal `v2` only on breaking changes. |
-| Default embedding model | Qwen3-Embedding-0.6B via fastembed-rs (candle backend, 1024-dim with Matryoshka 32-1024, 32K context, Apache 2.0). Pond's embedding registry supports multi-model coexistence. |
+| Default embedding model | Qwen3-Embedding-0.6B via fastembed-rs (candle backend, 1024-dim with Matryoshka 32-1024, 32K context, Apache 2.0). Pond's embedding registry is config-driven (TOML `[[embeddings.models]]`, validated against fastembed-rs's known set); built-in default ships in the binary. Multi-model coexistence in one table while dims match. |
 | Output | single static binary via `cargo build --release`. |
 | Code organization | Single Cargo crate. Strict module discipline separates substrate from consumer (sessions) code internally. Workspace split deferred until a second consumer (resources, archives) ships real code. |
 
@@ -59,7 +59,7 @@ No SQL anywhere. No additional database. No `lancedb` crate dependency. Personal
 ### 2.1.1 Personal pond defaults
 
 - **Bind**: `--host 127.0.0.1 --port 9797`. Env overrides: `POND_HOST`, `POND_PORT`. `--port 0` selects an OS-assigned free port. `--host 0.0.0.0` is accepted but logs a security notice at startup (personal pond is single-user; LAN exposure is opt-in).
-- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example.
+- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (3.2.4 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace chunk tuning), `[cleanup]` (3.2.0 background task and retention).
 - **Data**: `$XDG_DATA_HOME/pond/` (Linux and macOS; XDG-strict). Override via `--data-dir <path>` or `POND_DATA_DIR`.
 - **Logs**: stdout for normal program output (search results, status), stderr for structured tracing diagnostics.
 - **Platform scope**: Linux and macOS for v1. Windows not in scope.
@@ -103,7 +103,8 @@ No in-process write queue. Concurrent HTTP requests dispatch to handlers in para
 
 - **Hybrid by default.** Every search runs vector kNN plus BM25 FTS, merged with RRF (`k=60`, no weighting), unless the request specifies otherwise.
 - **Wire-level override.** Optional `search_mode` enum field on search requests: `hybrid` (default), `vector`, `fts`. Optional `rrf_k` integer field overrides the default `k`.
-- **Both indexes always present.** FTS index on text columns and vector index on embedding columns are created at table creation. The schema does not branch on whether an embedding model is configured. Turning a model on or off does not require a schema migration.
+- **Both indexes always present.** FTS index on `messages.search_text` (3.2.2) and vector index on `embeddings.vector` (3.2.4) are created at table creation. Both retrievers operate at message granularity over the same input string; the schema does not branch on whether an embedding model is configured. Turning a model on or off does not require a schema migration.
+- **Search corpus is fixed by concatenation policy.** What gets indexed is determined by 3.3.1 (TextPart, ToolCallPart name+string-leaf params, FilePart name/media/url; reasoning, tool results, approvals, system messages excluded). Excluded Parts remain canonically stored and retrievable via `pond_get` (3.6).
 
 ---
 
@@ -162,6 +163,13 @@ model Session {
   // Provenance: the source harness brand. One source per session.
   // Common values: "claude-code", "opencode", "pi-mono", "anthropic-managed-agents",
   // "openclaw", "nanoclaw", "kilocode", ... (open string)
+  //
+  // Validation: trimmed at ingest; rejected if empty after trim or if it contains
+  // Unicode control characters (Cc, Cf). No casing rule, no length cap, no
+  // kebab-case enforcement. Preserved verbatim; filter equality is case-sensitive.
+  // Adapter selection is a separate concern (CLI flag --from <name>, code-level
+  // registry); the source_agent string is set by the adapter at canonical
+  // projection time and stored as-is.
   source_agent: string;
 
   // Source's session-creation time. NOT pond's ingest time
@@ -356,8 +364,10 @@ Applied to all four tables on create (via `lance::dataset::WriteParams`):
 - `data_storage_version`: latest stable (2.2+). Per 2.1.
 - `enable_v2_manifest_paths`: true (Lance default). Constant-time latest-manifest lookups.
 - `enable_stable_row_ids`: true. Required so `_rowid` joins (parts to embeddings) survive compaction.
-- `auto_cleanup`: `older_than: 30 days` for personal pond, `older_than: 90 days` for hosted. The longer-than-Lance-default window establishes pond as a viable recovery surface for scenarios where re-ingesting from source data isn't possible (sources deleted, API sessions expired, PKs corrupted such that `merge_insert` can't overwrite). Storage cost is negligible for append-only workloads (old manifests reference an immutable subset of fragments; nothing duplicated). Per the lance-format/lance maintainer guidance, `interval` (how often cleanup actually runs) follows Lance defaults.
+- `auto_cleanup`: `older_than: 30 days` for personal pond (URI scheme: local filesystem), `older_than: 90 days` for hosted (URI scheme: `s3://`, `gs://`, `az://`). The longer-than-Lance-default window establishes pond as a viable recovery surface for scenarios where re-ingesting from source data isn't possible (sources deleted, API sessions expired, PKs corrupted such that `merge_insert` can't overwrite). Storage cost is negligible for append-only workloads (old manifests reference an immutable subset of fragments; nothing duplicated). Cleanup only removes old Lance manifest versions and any fragments referenced only by them; it does NOT delete logical rows. Stored sessions/messages/parts/embeddings accumulate indefinitely until an operator runs an explicit delete operation (not in v1 wire surface). The retention window IS the recovery window for `pond restore`.
 - Unenforced primary keys declared at the schema level via `Field.unenforced_primary_key_position`. `merge_insert` defaults to using them, satisfying invariant 2 with no per-call boilerplate.
+
+Cleanup execution: a background tokio task spawned by `pond serve` invokes `Dataset::cleanup_old_versions(older_than)` on each table on a configurable interval (default 6h). Logged at info level (versions removed, bytes reclaimed, duration). Failures logged at warn and retried at the next interval; cleanup failures do not crash `pond serve`. A `pond cleanup` CLI verb runs the same logic one-shot (for cron-style ops or systems without long-running `pond serve`); supports `--older-than <duration>` override for ad-hoc reclaim. Both paths are safe against concurrent reads and writes (Lance OCC). Multiple pond processes running cleanup against the same dataset converge harmlessly. Configuration lives under `[cleanup]` in `config.toml` (`enabled`, `interval`, `retention`); CLI verb runs regardless of `enabled`.
 
 #### 3.2.1 sessions
 
@@ -384,7 +394,8 @@ One row per Message (any role).
 | timestamp | timestamp_micros | clustering pos=2; source-recorded |
 | role | Utf8 | "system" / "user" / "assistant" / "tool"; BTREE |
 | content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
-| options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*` |
+| search_text | Utf8? | indexed retrieval surface; populated at ingest by pond core via the concatenation policy in 3.3.1. Non-null for user and assistant roles when at least one indexable Part exists; null for system and tool roles. FTS-indexed and consumed by the embedding worker (same string feeds both retrievers). |
+| options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*`. Stored as JSON string (not Lance Struct) for additive-only evolution: any new provider key requires zero schema change. Empty options serialize as `"{}"` (no NULLs). Hot keys may be promoted to dedicated typed sibling columns additively (e.g. `messages.input_tokens Int64?` populated forward at ingest); the JSON column stays intact, promotion is reversible. |
 
 Composite PK `(session_id, id)` lets pond preserve source-supplied IDs verbatim (per 3.1.1) without requiring them to be globally unique across sources or sessions. Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
 
@@ -402,36 +413,80 @@ One row per Part. Non-system message content lives here.
 | variant_data | Utf8 | JSON-serialized variant-specific fields (TextPart.text, ReasoningPart.text, ToolCallPart.{call_id, name, params, provider_executed}, ToolResultPart.{call_id, name, is_failure, result}, ToolApprovalRequestPart.{approval_id, tool_call_id}, ToolApprovalResponsePart.{approval_id, approved, reason}, FilePart.{media_type, file_name}) |
 | data | Struct&lt;data: LargeBinary?, uri: Utf8?&gt; with `ARROW:extension:name = lance.blob.v2` | FilePart.data only; null on other Part types. Lance Blob v2 natively carries the inline-bytes-OR-uri union from 3.1.5. Blobs above `blob_pack_file_size_threshold` (Lance default 1 GiB) auto-routed to dedicated `.blob` pack files within the dataset. |
 
-Search-layer derived columns (BM25 FTS targets) and FilePart content-hashing are owned by 3.3 and section 4, not by canonical storage.
+No search-layer columns live on `parts` - retrieval is message-level and `search_text` lives on `messages` (3.2.2). FilePart content-hashing is deferred (section 4).
 
 #### 3.2.4 embeddings
 
-One row per (Part, embedding model, chunk).
+One row per (Message, embedding model, chunk). Granularity is the Message, not the Part: retrieval returns messages (per 3.3) and vector + FTS agree on row identity for RRF.
 
 | Column | Type | Notes |
 |---|---|---|
-| part_id | Utf8 | PK pos=1 |
-| model_id | Utf8 | PK pos=2; free-form string. Adapter may include a revision suffix (e.g. `BAAI/bge-small-en-v1.5@<hf-sha>`, `Qwen/Qwen3-Embedding-0.6B@abc123`) when strict cache invalidation across upstream weight updates is required. Without a suffix, re-embeds with the same `model_id` and `text` overwrite prior rows. Pond does not parse this field. |
+| message_id | Utf8 | PK pos=1 |
+| model_id | Utf8 | PK pos=2; free-form string. Adapter may include a revision suffix (e.g. `Qwen/Qwen3-Embedding-0.6B@abc123`) when strict cache invalidation across upstream weight updates is required. Without a suffix, re-embeds with the same `model_id` and `text` overwrite prior rows. Pond does not parse this field. |
 | chunk_index | Int32 | PK pos=3 |
 | vector | FixedSizeList&lt;Float32, N&gt; | dim N is per-model |
 
-Vector index (IVF_PQ default per Lance auto-index) on `vector`. Multi-model coexistence: multi-row-per-part within one table while dims match; a second embeddings table per model is the activation path when a model with a different dim ships.
+Input text for embedding is `messages.search_text` (3.2.2), produced by the concatenation policy in 3.3.1. Messages with NULL `search_text` (system and tool rows) produce no embedding rows.
 
-Chunking: token-aware, applied at embed-worker time. The chunker uses the model's own tokenizer (the HuggingFace `tokenizers` crate; already transitive via fastembed-rs) so chunk budgets match what the embedding model actually sees. Chunks are deterministic: same `(model_id, text)` always produces the same chunks, keeping the PK stable across retries. Chunk size and overlap are per-model parameters declared in pond's embedding registry; for Qwen3-Embedding-0.6B (the v1 default), values are 1024 tokens per chunk with 128 tokens overlap. Chunk size is calibrated for retrieval-quality plateau (~1K-2K tokens), not model-context capacity (Qwen3's 32K window is far larger than retrieval needs - longer chunks dilute the embedding signal). Output dim is the Matryoshka-full 1024 by default.
+Vector index: IVF_PQ on `vector`. Distance: cosine (Qwen3 vectors are L2-normalized by the model; matches its training objective). Defaults for the 1024-dim Qwen3-Embedding-0.6B case: `num_partitions = max(32, min(4096, round(sqrt(num_rows))))` (recomputed at each index build); `num_sub_vectors = 64` (16-float PQ codebooks); `num_bits = 8` (Lance default, 256 centroids per codebook). Activation threshold: 10,000 rows in the embeddings table - below that, queries use a flat exact scan (Lance handles this transparently when no index exists). When a future model with a different `dim` lands, the chosen `num_sub_vectors` for that model lives in the registry entry; no universal formula is committed in code.
 
-v1 scope: only `TextPart.text` and `ReasoningPart.text` are embedded. Other Part types (FilePart, ToolCallPart, ToolResultPart, approvals) are not vector-indexed in v1; BM25/FTS coverage is a 3.3 concern.
+Index rebuilds: auto-triggered by Lance when fragments added since last build exceed the auto-index threshold; manual via `pond optimize` is not exposed in v1 (auto-trigger only).
+
+Multi-model coexistence: multi-row-per-message within one table while dims match; a second embeddings table per model is the activation path when a model with a different dim ships.
+
+Chunking: token-aware, applied at embed-worker time. The chunker uses the model's own tokenizer (the HuggingFace `tokenizers` crate; already transitive via fastembed-rs) so chunk budgets match what the embedding model actually sees. Chunks are deterministic: same `(model_id, search_text)` always produces the same chunks, keeping the PK stable across retries. Chunk size and overlap are per-model parameters declared in pond's embedding registry; for Qwen3-Embedding-0.6B (the v1 default), values are 1024 tokens per chunk with 128 tokens overlap (overridable per-namespace per 2.1.1). Chunk size is calibrated for retrieval-quality plateau (~1K-2K tokens), not model-context capacity (Qwen3's 32K window is far larger than retrieval needs - longer chunks dilute the embedding signal). Output dim is the Matryoshka-full 1024 by default.
+
+Embedding model registry: configuration-driven (TOML in `config.toml` under `[[embeddings.models]]`). Built-in defaults shipped in the binary so a pond instance with no user config still works. User config adds or overrides entries. Each entry: `{ id, fastembed_code, dim, chunk_size_tokens, chunk_overlap_tokens, num_sub_vectors, distance, normalize, default }`. Validated at startup against fastembed-rs's known set; pond fails to start with a clear error on unknown `fastembed_code`, dim mismatch, unsupported distance, or zero `default = true` entries. Adding a fastembed-supported model is config-only (no release); adding a non-fastembed model or remote provider (deferred per section 4) still requires code. Per-namespace tunable overrides via `[embeddings.overrides.<namespace>.<model_id>]` are limited to `chunk_size_tokens`, `chunk_overlap_tokens`, `num_sub_vectors`; the immutable fields (`dim`, `distance`, `normalize`, `fastembed_code`) cannot be overridden because they would invalidate stored vectors.
 
 ### 3.3 Search surface
 
-Hybrid (vector + BM25 + RRF) by default. Filters mirror the kb tool surface: `project`, `conversation_id`, `from_date` / `to_date`, `role`, `min_score`, `boost_recent`, `group_by_conversation`, `include_tool_results`, `include_thinking`, `limit`.
+Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index keyed on message_id per 3.2.4; FTS index on `messages.search_text` per 3.2.2). Filters: `project`, `session_id`, `from_date` / `to_date`, `role`, `source_agent`, `min_score`, `boost_recent`, `group_by_conversation`, `limit`. The kb-inherited `include_tool_results` / `include_thinking` toggles are NOT search filters; they live on `pond_get` (3.6) and govern which Part types are returned at retrieval time. The search corpus is fixed by the concatenation policy in 3.3.1 - what isn't in `search_text` cannot be found via search.
 
-`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim. The filter accepts `project: <value>` plus `project_match: "exact" | "contains"` (default `exact`). Exact equality pushes down to a BTREE prefilter on the scan; contains falls back to expression-engine substring match. Case-insensitive search is the caller's responsibility (fold case before submitting); pond does not normalize at storage or filter time.
+`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim. The filter accepts `project: <value>` plus `project_match: "exact" | "contains"` (default `exact`). Exact equality pushes down to a BTREE prefilter on the scan; contains falls back to expression-engine substring match. Case-insensitive search is the caller's responsibility (fold case before submitting); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id`.
+
+`role` accepts a single value (`"user"` | `"assistant"` | `"system"` | `"tool"`). System and tool values are accepted on the wire but always return empty (those rows have NULL `search_text` and no embeddings per 3.2.2 / 3.2.4).
 
 `boost_recent` is a boolean on the search request (default `true`). When set, an additive exponential-decay boost is applied to each result's base score: `boost = 0.2 * exp(-age_seconds / 604800)` where `age_seconds` is `now - message.timestamp` and `604800` is 7 days in seconds. The boost caps at `+0.2` (at `age = 0`) and decays to near-zero past a few weeks. Formula inherited verbatim from kb (`claude-kb/src/claude_kb/search.py:_apply_recency_boost`) for behavioral parity; constants are not empirically tuned by pond and should be revisited when retrieval-quality measurement is available.
 
-`group_by_conversation` is a boolean on the search request (default `false`). When `true`, results collapse to one summary object per `session_id`, with fields: `session_id`, `project`, `first_timestamp` and `last_timestamp` (min/max across matching messages), `message_count` (total messages in the session, via a separate count query against the `messages` table - NOT the count of matches), `preview` (text extracted from the first matching Part with text content), and `best_score` (`max(score)` across matches in the session). Summaries are sorted by `best_score` descending then limited. Behavior inherited from kb's `_group_by_conversation` for parity.
+`group_by_conversation` is a boolean on the search request (default `false`). When `true`, results collapse to one summary object per `session_id`, with fields: `session_id`, `project`, `source_agent`, `first_timestamp` and `last_timestamp` (min/max across matching messages), `message_count` (total messages in the session, via a separate count query against the `messages` table - NOT the count of matches), `preview` (truncated `search_text` from the best-scoring matched message), and `best_score` (`max(score)` across matches in the session). Summaries are sorted by `best_score` descending then limited.
 
-Retrieval modes: single message, single message with N thread-context messages above and below, full conversation, conversation up to a message.
+Filter pushdown: scalar predicates (`project`, `session_id`, `source_agent`, `role`, `from_date`, `to_date`) prefilter via BTREE indexes before vector kNN ranking (Lance default; produces correct top-k without postfilter underrun). `min_score` is applied postfilter after RRF and recency boost (not a Lance-pushable predicate).
+
+Retrieval modes (handled by `pond_get` per 3.6, not search): single message, single message with N thread-context messages above and below, full conversation, conversation up to a message.
+
+#### 3.3.1 Indexed content and concatenation policy
+
+`messages.search_text` is populated at ingest by a single pond-core function applied uniformly to every canonical Message. The function is the only knob; per-source customization is rejected to keep search corpus shape predictable across all adapters.
+
+Per-role concatenation:
+
+| Role | search_text content |
+|---|---|
+| system | NULL (not indexed; retrievable via `pond_get`) |
+| user | TextPart.text values, plus `FilePart.file_name`, `FilePart.media_type`, and the URL string when `FilePart.data` is the `url` variant. All concatenated with newline separators in `ordinal` order. |
+| assistant | Above plus `ToolCallPart.name` and the recursive string-valued leaves of `ToolCallPart.params` (numbers, booleans, nulls, and object/array keys are skipped; only string values are emitted, space-separated). |
+| tool | NULL (not indexed; retrievable via `pond_get`) |
+
+What's deliberately NOT indexed:
+
+- `ReasoningPart.text` - thinking traces. Stored canonically, retrievable via `pond_get` with `include_thinking: true`. Excluded from search to keep BM25 corpus tight and to align with the "search the conversation, not the plumbing" intent.
+- `ToolResultPart.*` - tool output, often megabytes of structured data or scraped content. Stored canonically, retrievable via `pond_get` with `include_tool_results: true`.
+- `ToolApprovalRequestPart`, `ToolApprovalResponsePart` - operational plumbing, never search-relevant.
+- `FilePart.data` payload (decoded base64 / bytes) - indexing file contents is a deferred feature (section 4).
+- SystemMessage content - boilerplate harness prompts dominate BM25 IDF and cluster vector embeddings; indexing them adds bytes without retrieval value.
+
+`ToolCallPart.params` string-leaf extraction: a recursive walk of the JsonValue. For every leaf node whose JSON type is `string`, the value is emitted into the concatenation. Object keys, array indices, and non-string leaves are skipped. This avoids polluting BM25 with JSON structural tokens (`{`, `}`, `"`, field names) while preserving the rare-token search precision BM25 is best at (file paths, CLI commands, URLs, API names). Nested objects flatten to space-separated strings.
+
+The embedding worker reads `messages.search_text` directly (no second concatenation path). Vector input and FTS input are byte-identical.
+
+Ingest flow (search_text population). Per 3.4, the SourceAdapter emits `IngestEvent`s one at a time via the `decode` stream in the order specified there. Pond core's ingest handler buffers the current Message event and its subsequent Part events until a boundary signal arrives - either the next non-Part event (Session or Message) or the end of the decode stream. At the boundary, pond core:
+
+1. Computes `search_text` for the buffered Message from its Parts using the per-role concatenation policy above.
+2. Writes the Message row and the buffered Part rows in one ingest pass (per-event `merge_insert` per 3.4, with search_text set on the Message write).
+
+This keeps the concatenation policy in pond core (3.3.1 single-knob requirement) without introducing a background indexer or a two-pass update to the messages table. Memory footprint per ingest stream is bounded by a single message's Parts (typically 1-15 per the source-sample survey in `docs/references/session-samples/`).
+
+Concat policy changes require re-ingest (run the SourceAdapter again); re-ingest is idempotent per invariant 2 - matching PKs with matching content are no-ops, matching PKs with new content (e.g. a new policy producing a different `search_text`) overwrite via merge_insert. Embedding rebuilds follow naturally because chunk content changes.
 
 ### 3.4 Ingest surface
 
@@ -476,6 +531,13 @@ pub trait SourceAdapter: Send + Sync {
 
 Async + streaming both methods. Stream-based design gives pull-driven backpressure for free (pond core controls flow), bounds memory for huge JSONL files, and maps cleanly to all 8 source shapes pond plans to absorb (see `docs/references/session-samples/`). Adapter implementations use tokio I/O primitives (`tokio::fs`, `tokio::io::BufReader::lines` for JSONL, the `serde` / `serde_json` stack for parsing).
 
+**Event ordering contract** (load-bearing for 3.3.1's search_text-population flow). The `decode` stream MUST emit events in this order for a single session:
+
+1. The `Session` event first (exactly one per session).
+2. For each Message in canonical source order: the `Message` event, followed by all of its `Part` events in `ordinal` order, before the next `Message` event.
+
+In other words: Parts always immediately follow their parent Message, and the transition from a Part event to any non-Part event (Session or Message) signals end-of-Parts for the preceding Message. Pond core relies on this boundary to compute `messages.search_text` per 3.3.1 without buffering across Message boundaries. Adapters that produce events in any other order are non-conformant.
+
 Each adapter is responsible for populating `Session.project` from its source's native attribution mechanism. v1 ships the claude-code adapter, which populates from `cwd`. The same source-native-attribution convention applies to adapters on the roadmap (section 4): codex, pi, openclaw, nanoclaw also from `cwd`; opencode from `projectID`; claude-app from the primary folder in `userSelectedFolders[]`; claude-managed-agents leaves it null (no source notion) or uses an attached `memory_store_id` when present. Adapter discretion is the only mechanism; no user-facing override flag.
 
 Per-event append granularity, not batched. Pond core consumes the `decode` stream and writes one Lance row per `IngestEvent` via `merge_insert` keyed on the canonical PKs (`Session.id`, `(session_id, Message.id)`, `(message_id, Part.id)`). Re-ingest is idempotent (invariant 2): re-reading an already-ingested session is a no-op for matched rows. This pattern is validated against `lance-format/cocoindex-lancedb-demo` (uses the same `merge_insert`-on-stable-PK approach for incremental ingest). Discover-time efficiency optimizations (per-source mtime+size checkpoint table, modeled on `lancedb/lancedb-claw`'s engine state-row pattern) are deferred until scan cost becomes measurable. End-of-session import is the v1 default; live-write is deferred (section 4) and activates additively by adding a `follow(SessionRef) -> impl Stream<Item = Result<IngestEvent>>` method (or a separate `LiveSourceAdapter` trait) - same Stream shape, infinite stream.
@@ -486,22 +548,249 @@ Pi-mono's cross-provider fixture data ported as committed test assets (JSON file
 
 ### 3.6 Wire operations
 
-Working set (to be finalized):
+Operations:
 
 - `pond_search` - `POST /v1/search`
 - `pond_get` - `POST /v1/get`
-- `pond_ingest` - `POST /v1/ingest` (single event or batched events)
-- `pond_session_events` - `GET /v1/sessions/{id}/events?since=<id>` (SSE stream)
+- `pond_ingest` - `POST /v1/ingest` (always-batched events)
+- `pond_session_events` - `GET /v1/sessions/{id}/events?since=<id>` (SSE stream; HTTP-only, no MCP equivalent in v1)
 - `schema://pond` - resource (search fields and filter documentation)
 - `stats://pond` - resource (dataset counts, embedding model, storage stats)
 
-CLI verbs (out-of-band): `pond ingest --from claude-code`, `pond status`, `pond embed-worker`, `pond serve`.
+Every request body carries `protocol_version: 1` (per 2.2) and an optional `namespace` (defaults to `"local"`). Every response body (success or error) carries `request_id` (server-generated UUIDv7) for log correlation.
+
+CLI verbs (out-of-band): `pond ingest --from <adapter>`, `pond status`, `pond embed-worker`, `pond serve`, `pond cleanup`.
 
 Admin CLI verbs (for recovery / inspection, not user-facing search):
 
 - `pond versions list` - enumerate Lance manifest version history (version_id, commit timestamp, fragment summary).
 - `pond checkout <version>` - open a read-only handle pinned to that version for inspection (read-only; does not replace current state).
-- `pond restore <version> --force` - dangerous: rolls the dataset back to a prior version. Requires `--force`. Used for recovery from corrupted ingest, bad adapter shipments, or PK-mangled writes that can't be fixed by re-ingest. Bounded by the 2.3 invariant 4 retention window (30 days personal / 90 days hosted).
+- `pond restore <version> --force` - dangerous: rolls the dataset back to a prior version. Requires `--force`. Used for recovery from corrupted ingest, bad adapter shipments, or PK-mangled writes that can't be fixed by re-ingest. Bounded by the 3.2.0 `auto_cleanup` retention window (30 days personal / 90 days hosted).
+
+#### 3.6.1 Error envelope
+
+Same envelope for HTTP and MCP. Success and error are mutually exclusive at the body level.
+
+Error body:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "filters.project_match must be one of: exact, contains",
+    "details": { "field": "filters.project_match", "value": "wildcard" }
+  },
+  "request_id": "req_01HXY..."
+}
+```
+
+Codes (closed enum for v1):
+
+| Code | When | HTTP | Retryable |
+|---|---|---|---|
+| `validation_failed` | Bad request shape, missing required field, type mismatch, enum out of range, batch over 8MB | 400 | No |
+| `version_unsupported` | `protocol_version` value pond doesn't understand | 400 | No |
+| `not_found` | `pond_get` for a session/message/part that doesn't exist | 404 | No |
+| `namespace_unknown` | Hosted: integrator's gateway routed an unprovisioned namespace string | 403 | No |
+| `storage_unavailable` | Lance/object-store error after retry-with-jitter exhausted | 503 | Yes |
+| `conflict` | OCC retries exhausted on a write | 409 | Yes |
+| `internal` | Bug / unhandled exception | 500 | Maybe (once) |
+
+Retryability is conveyed by the code; no separate `retryable` field. Per-code `details` shapes:
+
+- `validation_failed`: `{ "field": "<JSON Pointer or dotted path>", "value"?: <offending>, "expected"?: "<short desc>" }`
+- `version_unsupported`: `{ "received": <int>, "supported": [<int>, ...] }`
+- `not_found`: `{ "kind": "session" | "message" | "part", "pk": <scalar | tuple> }`
+- `namespace_unknown`: `{ "namespace": "<string>" }`
+- `storage_unavailable`: `{ "retry_after_ms"?: <int>, "underlying"?: "<one-line cause>" }`
+- `conflict`: `{ "attempts": <int> }`
+- `internal`: `{}` (empty; `request_id` carries everything actionable)
+
+Per-row errors in `pond_ingest` reuse the inner shape (just the `error` object). MCP surfaces the same domain error in JSON-RPC's `error.data`; rmcp sets the JSON-RPC `code` (-32000 family). The `message` field stays short (one line); long context goes to server logs.
+
+#### 3.6.2 pond_search
+
+Request `POST /v1/search`:
+
+```json
+{
+  "protocol_version": 1,
+  "namespace": "local",
+  "query": "rust lifetime error",
+  "search_mode": "hybrid",
+  "rrf_k": 60,
+  "filters": {
+    "project": null,
+    "project_match": "exact",
+    "session_id": null,
+    "source_agent": null,
+    "from_date": null,
+    "to_date": null,
+    "role": null,
+    "min_score": 0.0
+  },
+  "boost_recent": true,
+  "group_by_conversation": false,
+  "limit": 10
+}
+```
+
+- `query`: required, non-empty after trim.
+- `search_mode`: `"hybrid"` (default) | `"vector"` | `"fts"`. Per 2.5.
+- `rrf_k`: default 60. Consulted only when `search_mode = hybrid`.
+- `filters.project_match`: `"exact"` (default) | `"contains"`.
+- `filters.role`: `"user"` | `"assistant"` | `"system"` | `"tool"`. System/tool always return empty (NULL search_text).
+- `filters.min_score`: default `0.0` (no threshold).
+- `boost_recent`: default `true`; formula in 3.3.
+- `group_by_conversation`: default `false`.
+- `limit`: default 10, server-enforced cap 200.
+
+Response (default):
+
+```json
+{
+  "hits": [
+    {
+      "session_id": "01HXY...",
+      "message_id": "msg_01ABC...",
+      "role": "assistant",
+      "timestamp": "2026-04-15T10:23:45.123Z",
+      "project": "/Users/me/Projects/pond",
+      "source_agent": "claude-code",
+      "preview": "Let me check the lifetime bound on `T: 'a` in the trait...",
+      "score": 0.83,
+      "base_score": 0.71,
+      "recency_boost": 0.12,
+      "matched_via": ["vector", "fts"]
+    }
+  ],
+  "total": 17,
+  "request_id": "req_01HXY..."
+}
+```
+
+- `preview`: first 500 chars of `messages.search_text`, truncated at code-point boundary, `"..."` appended if truncated. v1 does not generate matched-token-highlighted snippets (Lance FTS does not surface token offsets); upgrade is deferred.
+- `score`: final ranking score. `hybrid` = RRF + recency_boost; `vector` = normalized cosine + recency; `fts` = normalized BM25 + recency.
+- `base_score`: score before recency boost. Always reported.
+- `recency_boost`: additive bump; `0` when `boost_recent: false`.
+- `matched_via`: which retriever(s) ranked this row in their top-K. Useful for debugging hybrid.
+- `total`: count of returned hits (= `hits.length`); not the global match count.
+
+Response (`group_by_conversation: true`): the `hits` field is replaced by `groups` per 3.3 shape.
+
+#### 3.6.3 pond_get
+
+Request `POST /v1/get` (one of `session_id` or `message_id` required):
+
+```json
+{
+  "protocol_version": 1,
+  "namespace": "local",
+  "session_id": "01HXY...",
+  "message_id": null,
+  "context_depth": 0,
+  "include_thinking": false,
+  "include_tool_results": false
+}
+```
+
+- `session_id` alone: return the whole session (Session + all Messages + all Parts).
+- `message_id` alone: return one Message (with its Parts), `context_depth` messages before, `context_depth` messages after (within the same session).
+- `include_thinking`: default `false`. When `false`, `ReasoningPart` entries are stripped from returned Messages.
+- `include_tool_results`: default `false`. When `false`, `ToolResultPart` entries are stripped. ToolMessages whose only Parts are ToolResultPart become empty and are omitted from the response.
+- `ToolApprovalRequestPart` and `ToolApprovalResponsePart` are always stripped from default responses (no toggle).
+
+Response shape carries the canonical Session/Message/Part types verbatim plus `request_id`. Specific shape omitted from this section (mirrors 3.1).
+
+#### 3.6.4 pond_ingest
+
+Request `POST /v1/ingest`:
+
+```json
+{
+  "protocol_version": 1,
+  "namespace": "local",
+  "events": [
+    { "kind": "session", "data": { /* Session per 3.1.3 */ } },
+    { "kind": "message", "data": { /* Message per 3.1.4 */ } },
+    { "kind": "part",    "data": { /* Part per 3.1.5 */ } }
+  ]
+}
+```
+
+- Always-batched (single-event is a length-1 array). `events` required and non-empty.
+- Envelope `kind` discriminator (`"session"` | `"message"` | `"part"`) avoids collision with canonical types' internal discriminators (`Message.role`, `Part.type`).
+- Events processed in array order. Pond does not reorder.
+- Batch caps: 1000 events OR 8MB body size, whichever first. Over: `validation_failed`.
+- No batch atomicity. Each event is its own `merge_insert`. Partial success is normal and explicit via per-row `status`.
+- Transport-level errors (bad JSON, version_unsupported, namespace_unknown, empty batch) fail the whole request via 3.6.1 envelope.
+
+Response:
+
+```json
+{
+  "accepted": 2,
+  "rejected": 1,
+  "results": [
+    { "index": 0, "kind": "session", "pk": "01HXY...",                            "status": "inserted" },
+    { "index": 1, "kind": "message", "pk": ["01HXY...", "msg_01ABC..."],          "status": "matched"  },
+    { "index": 2, "kind": "part",    "pk": ["msg_01ABC...", "part_01XYZ..."],     "status": "error",
+      "error": { "code": "validation_failed", "message": "ToolCallPart.call_id missing", "details": { "field": "call_id" } } }
+  ],
+  "request_id": "req_01HXY..."
+}
+```
+
+- `status`: `"inserted"` (new row), `"matched"` (PK existed, `merge_insert` no-op per invariant 2), `"error"` (per-row failure).
+- `pk` shape mirrors canonical PKs: scalar for session, tuple for message/part. Echoed so retries reconcile.
+- `accepted` = inserted + matched; `rejected` = error.
+
+#### 3.6.5 pond_session_events (SSE)
+
+`GET /v1/sessions/{session_id}/events?since=<event_id>&include_thinking=false&include_tool_results=false&namespace=local`
+
+v1 scope: catch-up reads only. The server scans messages + parts strictly after `since`, emits them in `(timestamp, message_id)` order, then closes. Live-tail activates with live-write (section 4) on the same endpoint without a wire change.
+
+Query params:
+- `since`: optional. Falls back to the `Last-Event-ID` HTTP header (EventSource auto-reconnect). Explicit `since` wins if both set.
+- `include_thinking` / `include_tool_results`: same defaults and semantics as `pond_get`.
+- `namespace`: default `"local"`.
+
+Three event types:
+
+```
+event: session
+id: session:01HXY...
+data: {"id":"01HXY...","source_agent":"claude-code","project":"...","created_at":"...","options":{...}}
+
+event: message
+id: msg_01ABC...
+data: {"message":{"id":"...","role":"assistant","timestamp":"...","options":{...}},"parts":[{...},{...}]}
+
+event: end
+id: end:01HXY...
+data: {"reason":"caught_up"}
+```
+
+Plus SSE keepalive: `: keepalive` comment lines every 15 seconds during long scans.
+
+- `session` event: emitted first only when no `since` provided.
+- `message` event: bundles message + its parts (filtered by include_thinking / include_tool_results), one per message in canonical order.
+- `end` event: emitted after the last message; server closes the connection.
+
+Event ids: `session:<session_id>` for the header, `<message_id>` verbatim for messages, `end:<session_id>` for the terminator. Prefixes prevent collision in the message_id space.
+
+Resume: client reconnects with `since=<last id received>`.
+- `since` matches a message id: scan resumes from `(timestamp, message_id) > (since.ts, since.id)`.
+- `since = session:<id>`: server emits messages from start (header already seen).
+- `since = end:<id>`: server emits `end` immediately and closes (idempotent re-fetch).
+- `since` unknown: `400 validation_failed`; client falls back to no `since` for a full re-read.
+
+Sequencing source: direct scan of `messages` and `parts` tables; no separate event log. Lossless replay; any pond instance can serve any session's stream.
+
+Server-side idle timeout: 30 minutes. Client disconnect cancels the scan. No "session deleted" event in v1 (sessions are append-only; deletes are not in the v1 wire surface).
+
+MCP equivalent: not exposed in v1. Future deferred.
 
 ---
 
@@ -524,33 +813,11 @@ Each entry: what it is, why deferred, activation condition. None require schema 
 - **Per-namespace bucket separation.** Operational upgrade for KMS isolation when prefix-only is insufficient. Activation: hosted-tier KMS isolation requirement.
 - **Remote embedding providers.** OpenAI, Voyage, Cohere, custom. Activation: model demand beyond local fastembed-rs default.
 - **Nested namespaces.** Hard isolation between sub-spaces within a tenant (e.g. separate Lance dataset per project). Activation: opt-in user/tenant request. v1 uses single namespace per tenant with project as a column.
-- **Wire-API-surfaced time-travel / friendly historical queries.** Lance natively versions every commit and supports `Dataset::checkout(version)`, `list_versions`, tags. v1 surfaces these via the admin CLI verbs in 3.6 (`pond versions list`, `pond checkout`, `pond restore`) and the 30/90-day retention window in 2.3 invariant 4 - sufficient for operational recovery. Activation: friendlier UX needs (`--as-of "yesterday at 3pm"` time-string queries, audit endpoints returning historical search results, automated rollback workflows). When activated, adds `version: int?` to read-side wire requests and a `pond_versions` operation; no schema changes since Lance owns the mechanism.
+- **Wire-API-surfaced time-travel / friendly historical queries.** Lance natively versions every commit and supports `Dataset::checkout(version)`, `list_versions`, tags. v1 surfaces these via the admin CLI verbs in 3.6 (`pond versions list`, `pond checkout`, `pond restore`) and the 30/90-day retention window in 3.2.0 `auto_cleanup` - sufficient for operational recovery. Activation: friendlier UX needs (`--as-of "yesterday at 3pm"` time-string queries, audit endpoints returning historical search results, automated rollback workflows). When activated, adds `version: int?` to read-side wire requests and a `pond_versions` operation; no schema changes since Lance owns the mechanism.
 
 ---
 
 ## 5. Open Questions
 
-Workspace for unresolved items in section 3. When a question is decided, its answer moves into the relevant section above and the question is removed entirely from this list. Goal: an empty section 5. Git history preserves the trail of resolved questions.
-
-### Blockers for first implementer
-
-- **OQ1. FTS target columns.** 2.5 says "FTS index on text columns... created at table creation"; 3.2.3 punts to 3.3; 3.3 never names them. Candidates: (a) FTS on `parts.variant_data` directly (cheap; indexes JSON-as-text), (b) derived `parts.search_text` column written at ingest from the variant fields that carry user-visible text (clean; adds a column to 3.2.3), (c) FTS on `messages.content` for system rows plus (b) for non-system rows. Decision shapes 3.2.3.
-- **OQ2. Search wire shape.** Request and response JSON for `POST /v1/search`. Field set, defaults (`min_score`, `limit`), response item shape (per-message vs per-Part vs grouped per 3.3 `group_by_conversation`), score field naming, how recency-boosted scores are reported alongside the base score.
-- **OQ3. Ingest wire shape.** `POST /v1/ingest` payload: single `IngestEvent` JSON vs `{events: IngestEvent[]}` batch. Response shape (per-event ack, aggregate count, error-per-row). Idempotency surface: does the response echo back the resolved PKs so retries can be reconciled.
-- **OQ4. Error envelope.** Shared error response shape across all `POST /v1/*` operations: `code`, `message`, `details?`. Enumerated `code` values (validation, not_found, version_unsupported, storage_unavailable, ...). Same envelope for MCP tool errors.
-
-### Schema fillers
-
-- **OQ5. Vector index params.** IVF_PQ params for `embeddings.vector` (num_partitions, num_sub_vectors) for the 1024-dim Qwen3-Embedding-0.6B default, plus the auto-index activation threshold (row count below which a flat scan beats indexed kNN).
-- **OQ6. Embedding model registry.** Where per-model facts (`dim`, chunk_size, chunk_overlap, tokenizer ref, normalize flag) live: hardcoded Rust table in pond core, config-file driven via 2.1.1, or a `models` Lance table. Activation path for registering a new model.
-- **OQ7. `options` storage shape.** JSON-string `Utf8` (current 3.2 assumption) vs Lance native `Struct`. Trade-off captured explicitly so it isn't a silent default: forward-compat for arbitrary `options` shape evolution vs queryable Struct columns and smaller storage. v1 pick to be locked in 3.2.
-
-### Wire surface fillers
-
-- **OQ8. SSE event shape.** `GET /v1/sessions/{id}/events?since=<id>` from 3.6: event types emitted, event id format and ordering, retry/resume semantics on disconnect, what triggers stream termination, sequencing strategy (poll the messages/parts tables vs a dedicated events log).
-
-### Operational
-
-- **OQ9. `auto_cleanup` execution.** When does cleanup actually run? Background task spawned by `pond serve`, dedicated `pond cleanup` CLI verb invoked via cron, or opportunistic on-write. Affects 3.2.0 and 2.3 invariant 4.
-- **OQ10. `source_agent` validation.** Open-string field with examples in 3.1.3 - is there any validation (reject empty, require kebab-case, case-fold for filter), or fully pass-through.
+Empty. Sections 1-4 are the source of truth; git history preserves the trail of resolved questions (OQ1-OQ10).
 
