@@ -331,12 +331,75 @@ Behaviors that some references model as first-class Parts or message-level field
 
 ### 3.2 Datasets
 
-Working shape (to be specified):
+Pond stores the canonical types in 3.1 as four Lance datasets. Each dataset is a direct serialization of the corresponding canonical object - no projections, no promotions, no schema design beyond what 3.1 already defines. Open-ended fields (`options`, Part variant payloads) live as JSON; canonical scalars live as typed Lance columns; FilePart binary data uses Lance Blob v2.
 
-- `sessions` - container, source provenance, project, workspace_path, agent_id, source_agent, source_version, schema_version.
-- `messages` - per-turn, role, model, provider (OTel `gen_ai.provider.name` registry), input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost, finish_reason, parent_message_id.
-- `parts` - per content block, Part union materialized, `search_text` column, blob columns for FilePart payloads, content_hash.
-- `embeddings` - backfilled vectors keyed `(part_id, model_id, model_version, chunk_index)`. Multi-model coexistence supported.
+#### 3.2.0 Lance write parameters
+
+Applied to all four tables on create (via `lance::dataset::WriteParams`):
+
+- `data_storage_version`: latest stable (2.2+). Per 2.1.
+- `enable_v2_manifest_paths`: true (Lance default). Constant-time latest-manifest lookups.
+- `enable_stable_row_ids`: true. Required so `_rowid` joins (parts to embeddings) survive compaction.
+- `auto_cleanup`: Lance default with `older_than >= 1 week` per the lance-format/lance maintainer guidance on production write amplification.
+- Unenforced primary keys declared at the schema level via `Field.unenforced_primary_key_position`. `merge_insert` defaults to using them, satisfying invariant 2 with no per-call boilerplate.
+
+#### 3.2.1 sessions
+
+One row per Session.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | Utf8 | PK pos=1 |
+| parent_session_id | Utf8? | session fork pointer |
+| parent_message_id | Utf8? | cut-point in parent session |
+| source_agent | Utf8 | BTREE |
+| created_at | timestamp_micros | source-recorded |
+| options | Utf8 | JSON-serialized ProviderOptions |
+
+#### 3.2.2 messages
+
+One row per Message (any role).
+
+| Column | Type | Notes |
+|---|---|---|
+| id | Utf8 | PK pos=1 |
+| session_id | Utf8 | clustering pos=1; BTREE |
+| timestamp | timestamp_micros | clustering pos=2; source-recorded |
+| role | Utf8 | "system" / "user" / "assistant" / "tool"; BTREE |
+| content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
+| options | Utf8 | JSON-serialized ProviderOptions; carries projected response metadata under `options.response.*` (model, provider, finish_reason, tokens, response_id, error) and source/harness facts under `options.source.*` |
+
+Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
+
+#### 3.2.3 parts
+
+One row per Part. Non-system message content lives here.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | Utf8 | PK pos=1 |
+| message_id | Utf8 | clustering pos=1; BTREE |
+| ordinal | Int32 | position within `message.content[]`; preserves the array order canonical to 3.1.4 |
+| type | Utf8 | Part discriminator (`text` / `reasoning` / `file` / `tool_call` / `tool_result` / `tool_approval_request` / `tool_approval_response`); BTREE |
+| options | Utf8 | JSON-serialized ProviderOptions |
+| variant_data | Utf8 | JSON-serialized variant-specific fields (TextPart.text, ReasoningPart.text, ToolCallPart.{call_id, name, params, provider_executed}, ToolResultPart.{call_id, name, is_failure, result}, ToolApprovalRequestPart.{approval_id, tool_call_id}, ToolApprovalResponsePart.{approval_id, approved, reason}, FilePart.{media_type, file_name}) |
+| data | Struct&lt;data: LargeBinary?, uri: Utf8?&gt; with `ARROW:extension:name = lance.blob.v2` | FilePart.data only; null on other Part types. Lance Blob v2 natively carries the inline-bytes-OR-uri union from 3.1.5. Blobs above `blob_pack_file_size_threshold` (Lance default 1 GiB) auto-routed to dedicated `.blob` pack files within the dataset. |
+
+Search-layer derived columns (BM25 FTS targets) and FilePart content-hashing are owned by 3.3 and section 4, not by canonical storage.
+
+#### 3.2.4 embeddings
+
+One row per (Part, embedding model, version, chunk).
+
+| Column | Type | Notes |
+|---|---|---|
+| part_id | Utf8 | PK pos=1 |
+| model_id | Utf8 | PK pos=2 |
+| model_version | Utf8 | PK pos=3 |
+| chunk_index | Int32 | PK pos=4 |
+| vector | FixedSizeList&lt;Float32, N&gt; | dim N is per-model |
+
+Vector index (IVF_PQ default per Lance auto-index) on `vector`. Multi-model coexistence: multi-row-per-part within one table while dims match; a second embeddings table per model is the activation path when a model with a different dim ships. Chunking rule remains open (5.OQ6).
 
 ### 3.3 Search surface
 
