@@ -59,7 +59,7 @@ No SQL anywhere. No additional database. No `lancedb` crate dependency. Personal
 ### 2.1.1 Personal pond defaults
 
 - **Bind**: `--host 127.0.0.1 --port 9797`. Env overrides: `POND_HOST`, `POND_PORT`. `--port 0` selects an OS-assigned free port. `--host 0.0.0.0` is accepted but logs a security notice at startup (personal pond is single-user; LAN exposure is opt-in).
-- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (3.2.4 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace chunk tuning), `[cleanup]` (3.2.0 background task and retention).
+- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (3.2.4 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace chunk tuning), `[maintenance]` (3.2.0 background cleanup + index optimization).
 - **Data**: `$XDG_DATA_HOME/pond/` (Linux and macOS; XDG-strict). Override via `--data-dir <path>` or `POND_DATA_DIR`.
 - **Logs**: stdout for normal program output (search results, status), stderr for structured tracing diagnostics.
 - **Platform scope**: Linux and macOS for v1. Windows not in scope.
@@ -367,7 +367,12 @@ Applied to all four tables on create (via `lance::dataset::WriteParams`):
 - `auto_cleanup`: `older_than: 30 days` for personal pond (URI scheme: local filesystem), `older_than: 90 days` for hosted (URI scheme: `s3://`, `gs://`, `az://`). The longer-than-Lance-default window establishes pond as a viable recovery surface for scenarios where re-ingesting from source data isn't possible (sources deleted, API sessions expired, PKs corrupted such that `merge_insert` can't overwrite). Storage cost is negligible for append-only workloads (old manifests reference an immutable subset of fragments; nothing duplicated). Cleanup only removes old Lance manifest versions and any fragments referenced only by them; it does NOT delete logical rows. Stored sessions/messages/parts/embeddings accumulate indefinitely until an operator runs an explicit delete operation (not in v1 wire surface). The retention window IS the recovery window for `pond restore`.
 - Unenforced primary keys declared at the schema level via `Field.unenforced_primary_key_position`. `merge_insert` defaults to using them, satisfying invariant 2 with no per-call boilerplate.
 
-Cleanup execution: a background tokio task spawned by `pond serve` invokes `Dataset::cleanup_old_versions(older_than)` on each table on a configurable interval (default 6h). Logged at info level (versions removed, bytes reclaimed, duration). Failures logged at warn and retried at the next interval; cleanup failures do not crash `pond serve`. A `pond cleanup` CLI verb runs the same logic one-shot (for cron-style ops or systems without long-running `pond serve`); supports `--older-than <duration>` override for ad-hoc reclaim. Both paths are safe against concurrent reads and writes (Lance OCC). Multiple pond processes running cleanup against the same dataset converge harmlessly. Configuration lives under `[cleanup]` in `config.toml` (`enabled`, `interval`, `retention`); CLI verb runs regardless of `enabled`.
+Maintenance execution: a background tokio task spawned by `pond serve` runs two operations per interval on each table:
+
+1. `Dataset::cleanup_old_versions(older_than)` to remove old manifest versions and unreferenced fragments per the `auto_cleanup` window above. Default `delete_unverified: false` (in-flight write files newer than the verification threshold are skipped, preventing a cleanup-vs-write race; see `rust/lance/src/dataset/cleanup.rs:357-363`).
+2. `Dataset::optimize_indices(append)` to extend each scalar / FTS / vector index `fragment_bitmap` to fragments appended since the last build. Without this, freshly-ingested data has degraded filter pushdown until the next interval (Lance falls back to full-scan-with-predicate on uncovered fragments per `rust/lance/src/io/exec/filtered_read.rs:712-747`).
+
+Interval default: 6h. Both operations logged at info level (versions removed, bytes reclaimed, fragments newly indexed, duration). Failures logged at warn and retried at the next interval; maintenance failures do not crash `pond serve`. A `pond maintenance` CLI verb runs the same logic one-shot (for cron-style ops or systems without long-running `pond serve`); supports `--older-than <duration>` override for ad-hoc reclaim and `--skip-cleanup` / `--skip-optimize` flags to run either half. Both paths are safe against concurrent reads and writes (Lance OCC; Append-vs-Append commutes per `rust/lance/src/io/commit/conflict_resolver.rs:873-899`). Multiple pond processes running maintenance against the same dataset converge harmlessly. Configuration lives under `[maintenance]` in `config.toml` (`enabled`, `interval`, `retention`); CLI verb runs regardless of `enabled`.
 
 #### 3.2.1 sessions
 
@@ -378,7 +383,7 @@ One row per Session.
 | id | Utf8 | PK pos=1 |
 | parent_session_id | Utf8? | session fork pointer |
 | parent_message_id | Utf8? | cut-point in parent session |
-| source_agent | Utf8 | BTREE |
+| source_agent | Utf8 | NOT NULL; Bitmap (low cardinality per 3.4 canonical-strings table) |
 | created_at | timestamp_micros | source-recorded |
 | project | Utf8? | user attribution per 3.1.3; BTREE (case-sensitive equality and prefix filter pushable) |
 | options | Utf8 | JSON-serialized ProviderOptions |
@@ -391,13 +396,17 @@ One row per Message (any role).
 |---|---|---|
 | session_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
 | id | Utf8 | PK pos=2; unique within session (source IDs may be locally-scoped per 3.1.1) |
-| timestamp | timestamp_micros | clustering pos=2; source-recorded |
-| role | Utf8 | "system" / "user" / "assistant" / "tool"; BTREE |
+| timestamp | timestamp_micros | clustering pos=2; source-recorded; BTREE |
+| role | Utf8 | "system" / "user" / "assistant" / "tool"; Bitmap (4-value low-cardinality column; BTREE would prune nothing because every page's [min,max] covers every value) |
+| source_agent | Utf8 | NOT NULL; denormalized from `sessions.source_agent` at ingest by pond core; Bitmap (typically 5-20 distinct values across the corpus). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
+| project | Utf8? | denormalized from `sessions.project` at ingest by pond core; BTREE (moderate cardinality, supports exact and prefix predicates). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
 | content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
 | search_text | Utf8? | indexed retrieval surface; populated at ingest by pond core via the concatenation policy in 3.3.1. Non-null for user and assistant roles when at least one indexable Part exists; null for system and tool roles. FTS-indexed and consumed by the embedding worker (same string feeds both retrievers). |
 | options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*`. Stored as JSON string (not Lance Struct) for additive-only evolution: any new provider key requires zero schema change. Empty options serialize as `"{}"` (no NULLs). Hot keys may be promoted to dedicated typed sibling columns additively (e.g. `messages.input_tokens Int64?` populated forward at ingest); the JSON column stays intact, promotion is reversible. |
 
 Composite PK `(session_id, id)` lets pond preserve source-supplied IDs verbatim (per 3.1.1) without requiring them to be globally unique across sources or sessions. Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
+
+Denormalized columns (`source_agent`, `project`) are immutable post-write: invariant 1 (append-only) plus pond core writers stamping them once at ingest from the Session event buffered per the 3.4 ordering contract. They are not user-writable via the wire surface (see 3.6.4). If a `sessions` row's `project` ever needs correcting, the recovery path is re-ingest, not in-place column update - matching the universal pattern observed across production Lance/LanceDB applications.
 
 #### 3.2.3 parts
 
@@ -408,7 +417,7 @@ One row per Part. Non-system message content lives here.
 | message_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
 | id | Utf8 | PK pos=2; unique within message (Part IDs in source data, where present, are array-local; otherwise SourceAdapter-generated UUIDv7 per 3.1.1) |
 | ordinal | Int32 | position within `message.content[]`; preserves the array order canonical to 3.1.4 |
-| type | Utf8 | Part discriminator (`text` / `reasoning` / `file` / `tool_call` / `tool_result` / `tool_approval_request` / `tool_approval_response`); BTREE |
+| type | Utf8 | Part discriminator (`text` / `reasoning` / `file` / `tool_call` / `tool_result` / `tool_approval_request` / `tool_approval_response`); Bitmap (7-value low-cardinality column) |
 | options | Utf8 | JSON-serialized ProviderOptions |
 | variant_data | Utf8 | JSON-serialized variant-specific fields (TextPart.text, ReasoningPart.text, ToolCallPart.{call_id, name, params, provider_executed}, ToolResultPart.{call_id, name, is_failure, result}, ToolApprovalRequestPart.{approval_id, tool_call_id}, ToolApprovalResponsePart.{approval_id, approved, reason}, FilePart.{media_type, file_name}) |
 | data | Struct&lt;data: LargeBinary?, uri: Utf8?&gt; with `ARROW:extension:name = lance.blob.v2` | FilePart.data only; null on other Part types. Lance Blob v2 natively carries the inline-bytes-OR-uri union from 3.1.5. Blobs above `blob_pack_file_size_threshold` (Lance default 1 GiB) auto-routed to dedicated `.blob` pack files within the dataset. |
@@ -421,10 +430,17 @@ One row per (Message, embedding model, chunk). Granularity is the Message, not t
 
 | Column | Type | Notes |
 |---|---|---|
-| message_id | Utf8 | PK pos=1 |
+| message_id | Utf8 | PK pos=1; BTREE (enables `message_id IN (...)` prefilter for cross-table joins when needed) |
 | model_id | Utf8 | PK pos=2; free-form string. Adapter may include a revision suffix (e.g. `Qwen/Qwen3-Embedding-0.6B@abc123`) when strict cache invalidation across upstream weight updates is required. Without a suffix, re-embeds with the same `model_id` and `text` overwrite prior rows. Pond does not parse this field. |
 | chunk_index | Int32 | PK pos=3 |
 | vector | FixedSizeList&lt;Float32, N&gt; | dim N is per-model |
+| session_id | Utf8 | NOT NULL; denormalized from `messages.session_id` at ingest by pond core; BTREE (high cardinality, supports `session_id = X` prefilter on vector kNN) |
+| source_agent | Utf8 | NOT NULL; denormalized from `messages.source_agent` at ingest by pond core; Bitmap (low cardinality) |
+| project | Utf8? | denormalized from `messages.project` at ingest by pond core; BTREE |
+| role | Utf8 | NOT NULL; denormalized from `messages.role` at ingest by pond core; Bitmap (4-value column; only `user` and `assistant` rows actually exist in this table since system/tool produce no embeddings per 3.3.1, but the column is declared for filter-pushdown completeness) |
+| timestamp | timestamp_micros | denormalized from `messages.timestamp` at ingest by pond core; BTREE (supports `from_date`/`to_date` prefilter on vector kNN) |
+
+Denormalized columns are immutable post-write (same rule as 3.2.2). They exist to enable single-stage filter pushdown for vector kNN without cross-table joins (Lance has no relational join planner with the crate stack pond uses; see 3.3). Dictionary encoding for low-cardinality denorm columns (`source_agent`, `role`) is auto-detected by Lance v2.2+ at fragment-write time (`rust/lance-encoding/src/encodings/logical/primitive.rs:4869-4934`); small ingest batches under the 100-row threshold under-encode until compaction merges fragments (handled by the maintenance task per 3.2.0).
 
 Input text for embedding is `messages.search_text` (3.2.2), produced by the concatenation policy in 3.3.1. Messages with NULL `search_text` (system and tool rows) produce no embedding rows.
 
@@ -442,7 +458,13 @@ Embedding model registry: configuration-driven (TOML in `config.toml` under `[[e
 
 Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index keyed on message_id per 3.2.4; FTS index on `messages.search_text` per 3.2.2). Filters: `project`, `session_id`, `from_date` / `to_date`, `role`, `source_agent`, `min_score`, `boost_recent`, `group_by_conversation`, `limit`. The kb-inherited `include_tool_results` / `include_thinking` toggles are NOT search filters; they live on `pond_get` (3.6) and govern which Part types are returned at retrieval time. The search corpus is fixed by the concatenation policy in 3.3.1 - what isn't in `search_text` cannot be found via search.
 
-`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim. The filter accepts `project: <value>` plus `project_match: "exact" | "contains"` (default `exact`). Exact equality pushes down to a BTREE prefilter on the scan; contains falls back to expression-engine substring match. Case-insensitive search is the caller's responsibility (fold case before submitting); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id`.
+`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim, denormalized onto `messages` and `embeddings` for filter pushdown (3.2.2 / 3.2.4). The filter accepts `project: <value>` plus `project_match: "exact" | "contains" | "is_null"` (default `exact`).
+
+- `exact`: pushes down to the BTREE prefilter on the queried table's `project` column.
+- `contains`: falls back to expression-engine substring match (no index pushdown).
+- `is_null`: emits `project IS NULL` (Lance BTREE supports this natively per `rust/lance-index/src/scalar/btree.rs:1537, 824-830`); the `project` value field is ignored when `is_null` is set. Required for filtering source harnesses that have no project notion (claude-managed-agents per 3.4).
+
+Case-insensitive search is the caller's responsibility (fold case before submitting); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id` (without `is_null`; both are NOT NULL).
 
 `role` accepts a single value (`"user"` | `"assistant"` | `"system"` | `"tool"`). System and tool values are accepted on the wire but always return empty (those rows have NULL `search_text` and no embeddings per 3.2.2 / 3.2.4).
 
@@ -450,7 +472,7 @@ Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index ke
 
 `group_by_conversation` is a boolean on the search request (default `false`). When `true`, results collapse to one summary object per `session_id`, with fields: `session_id`, `project`, `source_agent`, `first_timestamp` and `last_timestamp` (min/max across matching messages), `message_count` (total messages in the session, via a separate count query against the `messages` table - NOT the count of matches), `preview` (truncated `search_text` from the best-scoring matched message), and `best_score` (`max(score)` across matches in the session). Summaries are sorted by `best_score` descending then limited.
 
-Filter pushdown: scalar predicates (`project`, `session_id`, `source_agent`, `role`, `from_date`, `to_date`) prefilter via BTREE indexes before vector kNN ranking (Lance default; produces correct top-k without postfilter underrun). `min_score` is applied postfilter after RRF and recency boost (not a Lance-pushable predicate).
+Filter pushdown: every search filter column is colocated on the queried table via the denormalization in 3.2.2 (messages: `project`, `source_agent`, `role`, `session_id`, `timestamp`) and 3.2.4 (embeddings: same set). The FTS query on `messages.search_text` and the vector kNN on `embeddings.vector` each push their predicates into the table-level scalar indexes (BTREE for `project`/`session_id`/`timestamp`, Bitmap for `source_agent`/`role`) before retriever ranking - produces correct top-k without postfilter underrun and without cross-table joins. RRF merges on `message_id` (vector results dedupe to one row per message, keeping the best-scoring chunk). `min_score` is applied postfilter after RRF and recency boost (not a Lance-pushable predicate). Implementation note: the doc's filter-pushdown claim is load-bearing; an integration test on real data must confirm Lance is prefiltering (via `explain_plan` per LanceDB hybrid-search docs `docs/search/hybrid-search.mdx#L300-L339`) and not silently postfiltering - multiple production Lance/LanceDB apps fall back to client-side filtering, suggesting the path is not always trustworthy by default.
 
 Retrieval modes (handled by `pond_get` per 3.6, not search): single message, single message with N thread-context messages above and below, full conversation, conversation up to a message.
 
@@ -538,7 +560,35 @@ Async + streaming both methods. Stream-based design gives pull-driven backpressu
 
 In other words: Parts always immediately follow their parent Message, and the transition from a Part event to any non-Part event (Session or Message) signals end-of-Parts for the preceding Message. Pond core relies on this boundary to compute `messages.search_text` per 3.3.1 without buffering across Message boundaries. Adapters that produce events in any other order are non-conformant.
 
-Each adapter is responsible for populating `Session.project` from its source's native attribution mechanism. v1 ships the claude-code adapter, which populates from `cwd`. The same source-native-attribution convention applies to adapters on the roadmap (section 4): codex, pi, openclaw, nanoclaw also from `cwd`; opencode from `projectID`; claude-app from the primary folder in `userSelectedFolders[]`; claude-managed-agents leaves it null (no source notion) or uses an attached `memory_store_id` when present. Adapter discretion is the only mechanism; no user-facing override flag.
+**Ordering enforcement.** Pond core's ingest path validates the contract per-stream: (a) the first event must be `Session`; (b) every `Part` event must carry a `message_id` matching the most recent `Message` event since the last boundary; (c) a `Message` event must reference an already-seen `Session.id` (in the current stream or in the dataset). Violations surface as `validation_failed` (3.6.1) and abort the stream - silent partial ingest is invariant 5 (no silent drops). The check is O(1) per event; the buffered Session and current-Message handles are the only state.
+
+**Canonical `source_agent` strings.** The adapter is responsible for stamping `Session.source_agent` at canonical-projection time per 3.1.3 (trimmed, non-empty, no control chars). To keep cross-source filters predictable, pond reserves the following canonical strings for v1 + roadmap adapters; each adapter MUST emit one of these values:
+
+| Adapter | `source_agent` value(s) |
+|---|---|
+| Claude Code (v1) | `claude-code` |
+| Codex CLI - interactive | `codex-cli` |
+| Codex CLI - exec/sandbox | `codex-exec` |
+| OpenCode | `opencode` |
+| OpenClaw | `openclaw` |
+| nanoClaw | `nanoclaw` |
+| pi-mono | `pi` |
+| Claude desktop (local-agent-mode) | `claude-app` |
+| Anthropic Managed Agents | `anthropic-managed-agents` |
+
+Where one source surface ships multiple operationally distinct runtimes (codex's `codex_cli_rs` vs `codex_exec`), the adapter splits them into distinct `source_agent` strings rather than collapsing - real codex samples show these have very different `cwd` patterns (real project paths vs `/tmp/workspace`) and bucketing them together corrupts the `project` filter surface. Additional source surfaces ship adapter-defined strings; the table here is amendment-only.
+
+**Per-adapter `Session.project` derivation rules.** Each adapter populates `Session.project` from its source's native attribution mechanism. Concrete rules (motivated by stress-testing real source samples in `docs/references/session-samples/`):
+
+- **claude-code, codex-cli, codex-exec, pi, nanoclaw**: session-level `cwd` field. For codex, the session-level `cwd` from `session_meta` is canonical; per-turn `turn_context.cwd` drift goes to `options.source.codex.turn_cwd[]` (preserved verbatim, not promoted to `project`). For nanoclaw, container `cwd` (e.g. `/workspace/agent`) is acceptable as `project` since it identifies the agent's working root.
+- **opencode**: per-session `directory` field (the user-meaningful working dir), NOT the source's `projectID` hash. The `projectID` value is stashed under `options.source.opencode_project_id` for cross-reference; three real samples (`opencode/storage/session/0c929829.../ses_*.json`) collapse three different repos under one hashed `projectID`, so it's unusable as a filter. Per-message `path.cwd` drift goes to `options.source.opencode.message_cwd[]`.
+- **openclaw**: session header `cwd` field, with a denylist: when `cwd` matches `$HOME`, `/`, `/tmp`, `/var/tmp`, `/private/tmp` (resolved at ingest), the adapter emits `project = null` with an info-level log. The raw value goes to `options.source.openclaw.cwd_raw`. Rationale: a real sample (`openclaw/agents/main/sessions/a5ecbacb-...jsonl.reset.2026-04-03T16-08-18.440Z`) has `cwd=/Users/user`, which is not a meaningful project filter.
+- **claude-app**: `userSelectedFolders[0]` from the metadata sidecar (the "primary folder"). The full array goes to `options.source.claude_app.user_selected_folders[]`. A single audit.jsonl file can contain rows for multiple inner `session_id` values (real sample `local_4f2429ff-.../audit.jsonl` has three); the adapter splits per-inner-session_id and projects each as a separate pond Session, applying the sidecar's `cwd`/`userSelectedFolders`/`systemPrompt` only to the Session whose id matches the sidecar's `cliSessionId`. Other inner sessions get `project = null` plus an `options.source.claude_app.split_origin` marker.
+- **anthropic-managed-agents**: `project = null`. No source attribution mechanism exists; `memory_store_id` (when attached) goes to `options.source.anthropic.memory_store_id` (not `project`, since `memory_store_id` doesn't identify a project).
+
+**openclaw `.reset.<ts>` rotation handling (E6c).** OpenClaw rotates active session files to `<id>.jsonl.reset.<iso8601>` and starts fresh files reusing the same inner `Session.id`. When `discover` enumerates rotated files alongside the live file, the adapter emits events from both into the same `Session.id`; per-event `merge_insert` on canonical PKs deduplicates message and part rows by content. Each event from a rotated file carries `options.source.openclaw.rotation_origin = "<basename of source file>"` so consumers can partition by rotation epoch later (the v1 search and get surface ignores this tag; a future rotation-aware view can read it without re-ingest). The resulting Session's message log is the union of rotation epochs, ordered by `(timestamp, message_id)` per the canonical Message ordering rule (3.1.4).
+
+**`parent_session_id` is a soft foreign key.** Pond core does not validate that a forked session's `parent_session_id` references an existing session row at ingest. Forks against missing parents (real case: nanoclaw subagent files referencing parent sessions absent from disk) are stored as-is; consumers traversing fork lineage handle dangling pointers. This avoids ordering constraints between independent adapter runs and matches the append-only invariant (the parent might land in a later ingest pass).
 
 Per-event append granularity, not batched. Pond core consumes the `decode` stream and writes one Lance row per `IngestEvent` via `merge_insert` keyed on the canonical PKs (`Session.id`, `(session_id, Message.id)`, `(message_id, Part.id)`). Re-ingest is idempotent (invariant 2): re-reading an already-ingested session is a no-op for matched rows. This pattern is validated against `lance-format/cocoindex-lancedb-demo` (uses the same `merge_insert`-on-stable-PK approach for incremental ingest). Discover-time efficiency optimizations (per-source mtime+size checkpoint table, modeled on `lancedb/lancedb-claw`'s engine state-row pattern) are deferred until scan cost becomes measurable. End-of-session import is the v1 default; live-write is deferred (section 4) and activates additively by adding a `follow(SessionRef) -> impl Stream<Item = Result<IngestEvent>>` method (or a separate `LiveSourceAdapter` trait) - same Stream shape, infinite stream.
 
@@ -559,7 +609,7 @@ Operations:
 
 Every request body carries `protocol_version: 1` (per 2.2) and an optional `namespace` (defaults to `"local"`). Every response body (success or error) carries `request_id` (server-generated UUIDv7) for log correlation.
 
-CLI verbs (out-of-band): `pond ingest --from <adapter>`, `pond status`, `pond embed-worker`, `pond serve`, `pond cleanup`.
+CLI verbs (out-of-band): `pond ingest --from <adapter>`, `pond status`, `pond embed-worker`, `pond serve`, `pond maintenance` (runs cleanup_old_versions + optimize_indices one-shot per 3.2.0).
 
 Admin CLI verbs (for recovery / inspection, not user-facing search):
 
@@ -638,7 +688,7 @@ Request `POST /v1/search`:
 - `query`: required, non-empty after trim.
 - `search_mode`: `"hybrid"` (default) | `"vector"` | `"fts"`. Per 2.5.
 - `rrf_k`: default 60. Consulted only when `search_mode = hybrid`.
-- `filters.project_match`: `"exact"` (default) | `"contains"`.
+- `filters.project_match`: `"exact"` (default) | `"contains"` | `"is_null"`. `is_null` ignores the `project` value field and emits `project IS NULL` (required for filtering anthropic-managed-agents per 3.3 / 3.4).
 - `filters.role`: `"user"` | `"assistant"` | `"system"` | `"tool"`. System/tool always return empty (NULL search_text).
 - `filters.min_score`: default `0.0` (no threshold).
 - `boost_recent`: default `true`; formula in 3.3.
@@ -724,6 +774,8 @@ Request `POST /v1/ingest`:
 - Batch caps: 1000 events OR 8MB body size, whichever first. Over: `validation_failed`.
 - No batch atomicity. Each event is its own `merge_insert`. Partial success is normal and explicit via per-row `status`.
 - Transport-level errors (bad JSON, version_unsupported, namespace_unknown, empty batch) fail the whole request via 3.6.1 envelope.
+- **Event ordering enforced** (3.4): first event in any new-session stream must be `Session`; every `Part` event's `message_id` must match the most recent `Message` in the same batch; every `Message`'s `session_id` must reference a `Session` already seen (this batch or the dataset). Violations surface as per-row `validation_failed`; subsequent events in the same stream still attempt processing (each event is independent).
+- **Immutable session-level fields.** `Session.source_agent` and `Session.project` are immutable post-first-write. A `kind: "session"` event whose `data.id` matches an existing session row and whose `source_agent` or `project` differs from the stored row returns per-row `validation_failed` with `details: { field: "source_agent" | "project", reason: "immutable" }`. Other Session fields (`options`, `parent_session_id`, `parent_message_id`, `created_at`) re-write idempotently via `merge_insert` (matching content = no-op; non-matching content overwrites). Rationale: the denormalized copies on `messages` and `embeddings` (3.2.2 / 3.2.4) are stamped once at ingest from the Session event; mutating the canonical source post-hoc would silently desynchronize them. Recovery from a wrong `source_agent`/`project`: delete the affected session rows and re-ingest (delete is not in the v1 wire surface; admin operation only).
 
 Response:
 
