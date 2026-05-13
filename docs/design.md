@@ -379,14 +379,14 @@ One row per Message (any role).
 
 | Column | Type | Notes |
 |---|---|---|
-| id | Utf8 | PK pos=1 |
-| session_id | Utf8 | clustering pos=1; BTREE |
+| session_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
+| id | Utf8 | PK pos=2; unique within session (source IDs may be locally-scoped per 3.1.1) |
 | timestamp | timestamp_micros | clustering pos=2; source-recorded |
 | role | Utf8 | "system" / "user" / "assistant" / "tool"; BTREE |
 | content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
 | options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*` |
 
-Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
+Composite PK `(session_id, id)` lets pond preserve source-supplied IDs verbatim (per 3.1.1) without requiring them to be globally unique across sources or sessions. Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
 
 #### 3.2.3 parts
 
@@ -394,8 +394,8 @@ One row per Part. Non-system message content lives here.
 
 | Column | Type | Notes |
 |---|---|---|
-| id | Utf8 | PK pos=1 |
-| message_id | Utf8 | clustering pos=1; BTREE |
+| message_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
+| id | Utf8 | PK pos=2; unique within message (Part IDs in source data, where present, are array-local; otherwise SourceAdapter-generated UUIDv7 per 3.1.1) |
 | ordinal | Int32 | position within `message.content[]`; preserves the array order canonical to 3.1.4 |
 | type | Utf8 | Part discriminator (`text` / `reasoning` / `file` / `tool_call` / `tool_result` / `tool_approval_request` / `tool_approval_response`); BTREE |
 | options | Utf8 | JSON-serialized ProviderOptions |
@@ -476,7 +476,7 @@ pub trait SourceAdapter: Send + Sync {
 
 Async + streaming both methods. Stream-based design gives pull-driven backpressure for free (pond core controls flow), bounds memory for huge JSONL files, and maps cleanly to all 8 source shapes pond plans to absorb (see `docs/references/session-samples/`). Adapter implementations use tokio I/O primitives (`tokio::fs`, `tokio::io::BufReader::lines` for JSONL, the `serde` / `serde_json` stack for parsing).
 
-Each adapter is responsible for populating `Session.project` from its source's native attribution mechanism. Convention per source: claude-code, codex, pi, openclaw, nanoclaw populate from `cwd`; opencode populates from `projectID`; claude-app from the primary folder in `userSelectedFolders[]`; claude-managed-agents leaves it null (no source notion) or uses an attached `memory_store_id` when present. Adapter discretion is the only mechanism in v1; no user-facing override flag.
+Each adapter is responsible for populating `Session.project` from its source's native attribution mechanism. v1 ships the claude-code adapter, which populates from `cwd`. The same source-native-attribution convention applies to adapters on the roadmap (section 4): codex, pi, openclaw, nanoclaw also from `cwd`; opencode from `projectID`; claude-app from the primary folder in `userSelectedFolders[]`; claude-managed-agents leaves it null (no source notion) or uses an attached `memory_store_id` when present. Adapter discretion is the only mechanism; no user-facing override flag.
 
 Per-event append granularity, not batched. Pond core consumes the `decode` stream and writes one Lance row per `IngestEvent` via `merge_insert` keyed on the canonical PKs (`Session.id`, `(session_id, Message.id)`, `(message_id, Part.id)`). Re-ingest is idempotent (invariant 2): re-reading an already-ingested session is a no-op for matched rows. This pattern is validated against `lance-format/cocoindex-lancedb-demo` (uses the same `merge_insert`-on-stable-PK approach for incremental ingest). Discover-time efficiency optimizations (per-source mtime+size checkpoint table, modeled on `lancedb/lancedb-claw`'s engine state-row pattern) are deferred until scan cost becomes measurable. End-of-session import is the v1 default; live-write is deferred (section 4) and activates additively by adding a `follow(SessionRef) -> impl Stream<Item = Result<IngestEvent>>` method (or a separate `LiveSourceAdapter` trait) - same Stream shape, infinite stream.
 
@@ -530,5 +530,27 @@ Each entry: what it is, why deferred, activation condition. None require schema 
 
 ## 5. Open Questions
 
-Workspace for unresolved items. When a question is decided, its answer moves into the relevant section above and the question is removed entirely from this list. Goal: an empty section 5. Git history preserves the trail of resolved questions.
+Workspace for unresolved items in section 3. When a question is decided, its answer moves into the relevant section above and the question is removed entirely from this list. Goal: an empty section 5. Git history preserves the trail of resolved questions.
+
+### Blockers for first implementer
+
+- **OQ1. FTS target columns.** 2.5 says "FTS index on text columns... created at table creation"; 3.2.3 punts to 3.3; 3.3 never names them. Candidates: (a) FTS on `parts.variant_data` directly (cheap; indexes JSON-as-text), (b) derived `parts.search_text` column written at ingest from the variant fields that carry user-visible text (clean; adds a column to 3.2.3), (c) FTS on `messages.content` for system rows plus (b) for non-system rows. Decision shapes 3.2.3.
+- **OQ2. Search wire shape.** Request and response JSON for `POST /v1/search`. Field set, defaults (`min_score`, `limit`), response item shape (per-message vs per-Part vs grouped per 3.3 `group_by_conversation`), score field naming, how recency-boosted scores are reported alongside the base score.
+- **OQ3. Ingest wire shape.** `POST /v1/ingest` payload: single `IngestEvent` JSON vs `{events: IngestEvent[]}` batch. Response shape (per-event ack, aggregate count, error-per-row). Idempotency surface: does the response echo back the resolved PKs so retries can be reconciled.
+- **OQ4. Error envelope.** Shared error response shape across all `POST /v1/*` operations: `code`, `message`, `details?`. Enumerated `code` values (validation, not_found, version_unsupported, storage_unavailable, ...). Same envelope for MCP tool errors.
+
+### Schema fillers
+
+- **OQ5. Vector index params.** IVF_PQ params for `embeddings.vector` (num_partitions, num_sub_vectors) for the 1024-dim Qwen3-Embedding-0.6B default, plus the auto-index activation threshold (row count below which a flat scan beats indexed kNN).
+- **OQ6. Embedding model registry.** Where per-model facts (`dim`, chunk_size, chunk_overlap, tokenizer ref, normalize flag) live: hardcoded Rust table in pond core, config-file driven via 2.1.1, or a `models` Lance table. Activation path for registering a new model.
+- **OQ7. `options` storage shape.** JSON-string `Utf8` (current 3.2 assumption) vs Lance native `Struct`. Trade-off captured explicitly so it isn't a silent default: forward-compat for arbitrary `options` shape evolution vs queryable Struct columns and smaller storage. v1 pick to be locked in 3.2.
+
+### Wire surface fillers
+
+- **OQ8. SSE event shape.** `GET /v1/sessions/{id}/events?since=<id>` from 3.6: event types emitted, event id format and ordering, retry/resume semantics on disconnect, what triggers stream termination, sequencing strategy (poll the messages/parts tables vs a dedicated events log).
+
+### Operational
+
+- **OQ9. `auto_cleanup` execution.** When does cleanup actually run? Background task spawned by `pond serve`, dedicated `pond cleanup` CLI verb invoked via cron, or opportunistic on-write. Affects 3.2.0 and 2.3 invariant 4.
+- **OQ10. `source_agent` validation.** Open-string field with examples in 3.1.3 - is there any validation (reject empty, require kebab-case, case-fold for filter), or fully pass-through.
 
