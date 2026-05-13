@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bfa34d1b001F8VAfVLNEB4m3e",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa33a44002CZkouvJb2yhMBS",
+  "type": "tool",
+  "callID": "call_3332ae043ab747d5bd556cbd",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "cd packages/frontend && GOOGLE_GENERATIVE_AI_API_KEY=dummy DATABASE_URL=dummy APIFY_API_KEY=dummy npx knip",
+      "description": "Run knip with dummy environment variables"
+    },
+    "output": "<snipped: ~283 lines of output>",
+    "title": "cd packages/frontend && GOOGLE_GENERATIVE_AI_API_KEY=dummy DATABASE_URL=dummy APIFY_API_KEY=dummy npx knip",
+    "metadata": {
+      "output": "<snipped: ~283 lines of output>",
+      "exit": 1,
+      "description": "Run knip with dummy environment variables"
+    },
+    "time": {
+      "start": 1759856774429,
+      "end": 1759856775816
+    }
+  }
+}

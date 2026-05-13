@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd88cb79001zDHEKXU82EEgzS",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88bcf60021kwKGO7TURm7lG",
+  "type": "tool",
+  "callID": "toolu_01W5G9LKPjBF96uQa9cWfPHj",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/messages.ts"
+    },
+    "output": "<snipped: ~134 lines of output>",
+    "title": "packages/frontend/lib/db/schema/messages.ts",
+    "metadata": {
+      "preview": "import type { UITools } from 'ai'\nimport type { InferInsertModel, InferSelectModel } from 'drizzle-orm'\nimport { index, integer, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core'\nimport { createInsertSchema, createSelectSchema } from 'drizzle-zod'\nimport { z } from 'zod'\nimport { generateId } from '@/lib/utils'\nimport { chats } from './chats'\n\nexport const messages = pgTable(\n  'frontend_messages',\n  {\n    id: text('id')\n      .primaryKey()\n      .$defaultFn(() => generateId()),\n    chatId: text('chat_id')\n      .notNull()\n      .references(() => chats.id, { onDelete: 'cascade' }),\n    role: text('role').notNull(), // 'user', 'assistant', 'system'\n    metadata: jsonb('metadata'), // Message-level metadata (model, tokens, timestamps, etc.)\n    createdAt: timestamp('created_at').notNull().defaultNow(),"
+    },
+    "time": {
+      "start": 1759821483143,
+      "end": 1759821483144
+    }
+  }
+}

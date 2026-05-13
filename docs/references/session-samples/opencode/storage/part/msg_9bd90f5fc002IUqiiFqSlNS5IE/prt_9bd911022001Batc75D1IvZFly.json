@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd911022001Batc75D1IvZFly",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd90f5fc002IUqiiFqSlNS5IE",
+  "type": "tool",
+  "callID": "toolu_01AmVwAHJieViyxLSeHs6Lwi",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/.mcp.json"
+    },
+    "output": "<file>\n00001| {\n00002|   \"mcpServers\": {\n00003|     \"gitmcp\": {\n00004|       \"command\": \"npx\",\n00005|       \"args\": [\"-y\", \"mcp-remote\", \"https://companytwo.example.com/docs\"]\n00006|     },\n00007|     \"apify\": {\n00008|       \"type\": \"http\",\n00009|       \"url\": \"https://companythree.example.com\"\n00010|     },\n00011|     \"playwright\": {\n00012|       \"command\": \"npx\",\n00013|       \"args\": [\"-y\", \"@playwright/mcp@latest\"]\n00014|     },\n00015|     \"rag-browser\": {\n00016|       \"command\": \"npx\",\n00017|       \"args\": [\"@apify/mcp-server-rag-web-browser\"],\n00018|       \"env\": {\n00019|         \"APIFY_TOKEN\": \"${APIFY_API_TOKEN_MCP}\",\n<snipped: ~123 lines of tool output>\n00143|         \"ide-assistant\",\n00144|         \"--project\",\n00145|         \"/Users/user/Projects/myproject\"\n00146|       ],\n00147|       \"env\": {}\n00148|     }\n00149|   }\n00150| }\n00151| \n</file>",
+    "title": ".mcp.json",
+    "metadata": {
+      "preview": "{\n  \"mcpServers\": {\n    \"gitmcp\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"mcp-remote\", \"https://companytwo.example.com/docs\"]\n    },\n    \"apify\": {\n      \"type\": \"http\",\n      \"url\": \"https://companythree.example.com\"\n    },\n    \"playwright\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@playwright/mcp@latest\"]\n    },\n    \"rag-browser\": {\n      \"command\": \"npx\",\n      \"args\": [\"@apify/mcp-server-rag-web-browser\"],\n      \"env\": {\n        \"APIFY_TOKEN\": \"${APIFY_API_TOKEN_MCP}\",\n        \"APIFY_META_ORIGIN\": \"STANDBY\""
+    },
+    "time": {
+      "start": 1759822024785,
+      "end": 1759822024786
+    }
+  }
+}

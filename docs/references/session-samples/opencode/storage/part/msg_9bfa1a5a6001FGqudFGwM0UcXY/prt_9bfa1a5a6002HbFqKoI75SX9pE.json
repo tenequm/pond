@@ -1,0 +1,12 @@
+{
+  "id": "prt_9bfa1a5a6002HbFqKoI75SX9pE",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa1a5a6001FGqudFGwM0UcXY",
+  "type": "text",
+  "text": "using knip from the root of the repo please identify if there are 100% safe to remove completely unused dependencies in my pacakges/frontend/pacakges.json config",
+  "synthetic": false,
+  "time": {
+    "start": 0,
+    "end": 0
+  }
+}

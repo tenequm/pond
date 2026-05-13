@@ -1,0 +1,11 @@
+{
+  "id": "prt_9bd9b6741001ZWT37LbO3LDklw",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9b5a70002G6vlqr5J7Doxrm",
+  "type": "text",
+  "text": "I took them from the documentation examples at https://opencode.ai/docs/permissions/. The docs showed:\n\n- `\"terraform *\": \"deny\"` as an example of disabling Terraform commands\n- Pattern examples for `git push`, `npm run build`, `ls`, `pwd`\n\nI added `kubectl delete` and install commands (`npm install`, `pnpm install`) based on common patterns, but those were **my assumptions**, not from your project or the docs.\n\nShould I remove the commands that aren't relevant to your project (terraform, kubectl) and only keep patterns for commands you actually use in myproject?",
+  "time": {
+    "start": 1759822705341,
+    "end": 1759822705341
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "msg_9bd9bba0b002BPrCWA3tPdsb0Y",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "role": "assistant",
+  "time": {
+    "created": 1759822723595,
+    "completed": 1759822727088
+  },
+  "system": [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "<redacted: ~2.3k-char system prompt with project-specific context>"
+  ],
+  "modelID": "claude-sonnet-4-5-20250929",
+  "providerID": "anthropic",
+  "mode": "plan",
+  "path": {
+    "cwd": "/Users/user/Projects/myproject",
+    "root": "/Users/user/Projects/myproject"
+  },
+  "cost": 0,
+  "tokens": {
+    "input": 2,
+    "output": 123,
+    "reasoning": 0,
+    "cache": {
+      "read": 28963,
+      "write": 324
+    }
+  }
+}

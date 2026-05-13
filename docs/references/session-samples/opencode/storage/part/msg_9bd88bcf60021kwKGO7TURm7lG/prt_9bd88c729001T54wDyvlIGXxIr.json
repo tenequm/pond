@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd88c729001T54wDyvlIGXxIr",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88bcf60021kwKGO7TURm7lG",
+  "type": "tool",
+  "callID": "toolu_015EPgcguGRGjKq6z39ugdEA",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/chats.ts"
+    },
+    "output": "<snipped: ~57 lines of output>",
+    "title": "packages/frontend/lib/db/schema/chats.ts",
+    "metadata": {
+      "preview": "import type { InferSelectModel } from 'drizzle-orm'\nimport { index, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core'\nimport { generateId } from '@/lib/utils'\n\n// AI SDK v5 optimized chat schema - frontend-specific, no server dependencies\nexport const chats = pgTable(\n  'frontend_chats',\n  {\n    id: text('id')\n      .primaryKey()\n      .$defaultFn(() => generateId()),\n    title: text('title'),\n    userId: text('user_id').notNull(), // From auth provider\n    agentId: text('agent_id').notNull(),\n    createdAt: timestamp('created_at').notNull().defaultNow(),\n    updatedAt: timestamp('updated_at')\n      .notNull()\n      .defaultNow()\n      .$onUpdate(() => new Date()),\n    metadata: jsonb('metadata'), // Store brand voice and context data"
+    },
+    "time": {
+      "start": 1759821482872,
+      "end": 1759821482874
+    }
+  }
+}

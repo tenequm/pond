@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd88931d0015HlCUy3GFe851g",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88788f002fuNPpHzwLglL3Y",
+  "type": "tool",
+  "callID": "toolu_01C686RQyK2CrML2er3X6w1M",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/package.json"
+    },
+    "output": "<snipped: ~76 lines of output>",
+    "title": "package.json",
+    "metadata": {
+      "preview": "{\n  \"name\": \"myproject_b\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"workspaces\": [\n    \"packages/*\"\n  ],\n  \"scripts\": {\n    \"build\": \"turbo build\",\n    \"dev\": \"turbo dev\",\n    \"lint\": \"biome lint .\",\n    \"lint:fix\": \"biome lint --write .\",\n    \"type-check\": \"turbo type-check\",\n    \"check\": \"turbo type-check && biome check\",\n    \"clean\": \"turbo clean && rm -rf node_modules .turbo\",\n    \"format\": \"biome format --write .\",\n    \"format:check\": \"biome format .\",\n    \"knip\": \"knip\",\n    \"reset-ide\": \"chmod +x scripts/reset-ide.sh && ./scripts/reset-ide.sh\"\n  },"
+    },
+    "time": {
+      "start": 1759821469048,
+      "end": 1759821469049
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "prt_9bd9107df001Ru5ZwQIKYh4wqZ",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd90f5fc002IUqiiFqSlNS5IE",
+  "type": "tool",
+  "callID": "toolu_01MLcbZ4geT8q8ubCCepvjat",
+  "tool": "webfetch",
+  "state": {
+    "status": "completed",
+    "input": {
+      "url": "https://opencode.ai/docs/config/",
+      "format": "markdown"
+    },
+    "output": "Config | opencode     [Skip to content](#_top)\n\n  [![](/docs/_astro/logo-dark.DOStV66V.svg) ![](/docs/_astro/logo-light.B0yzR0O5.svg) opencode](/)\n\n[Home](/)[Docs](/docs/)\n\n[](https://github.com/sst/opencode)[](https://opencode.ai/discord)\n\nSearch CtrlK\n\nCancel\n\n-   [Intro](/docs/)\n-   [Config](/docs/config/)\n-   [Providers](/docs/providers/)\n-   [Enterprise](/docs/enterprise/)\n-   [Troubleshooting](/docs/troubleshooting/)\n-   Usage\n    \n    -   [TUI](/docs/tui/)\n<snipped: ~383 lines of tool output>\n\n-   Keeping sensitive data like API keys in separate files.\n-   Including large instruction files without cluttering your config.\n-   Sharing common configuration snippets across multiple config files.\n\n[Edit this page](https://github.com/sst/opencode/edit/dev/packages/web/src/content/docs/config.mdx) [Find a bug? Open an issue](https://github.com/sst/opencode/issues/new) [Join our Discord community](https://opencode.ai/discord)\n\n© [CompanyOne](https://companyone.example.com)\n\nLast updated — Oct 6, 2025",
+    "title": "https://opencode.ai/docs/config/ (text/html)",
+    "metadata": {},
+    "time": {
+      "start": 1759822023856,
+      "end": 1759822024221
+    }
+  }
+}

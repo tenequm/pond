@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bd891cf5001wr97h5hsZJlGfy",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd890e5a0027LKycwZW5s94Nc",
+  "type": "tool",
+  "callID": "toolu_01RE6DHFgrv4YNGfLradPpEj",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "rg \"export const.*pgTable\" /Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/*.ts 2>/dev/null",
+      "description": "Count frontend tables"
+    },
+    "output": "/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/chats.ts:export const chats = pgTable(\n/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/messages.ts:export const messages = pgTable(\n/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/messages.ts:export const parts = pgTable(\n",
+    "title": "rg \"export const.*pgTable\" /Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/*.ts 2>/dev/null",
+    "metadata": {
+      "output": "/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/chats.ts:export const chats = pgTable(\n/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/messages.ts:export const messages = pgTable(\n/Users/user/Projects/myproject-b/packages/frontend/lib/db/schema/messages.ts:export const parts = pgTable(\n",
+      "exit": 0,
+      "description": "Count frontend tables"
+    },
+    "time": {
+      "start": 1759821504867,
+      "end": 1759821505879
+    }
+  }
+}

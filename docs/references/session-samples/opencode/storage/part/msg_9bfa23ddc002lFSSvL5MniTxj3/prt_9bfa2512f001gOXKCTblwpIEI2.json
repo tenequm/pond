@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bfa2512f001gOXKCTblwpIEI2",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa23ddc002lFSSvL5MniTxj3",
+  "type": "tool",
+  "callID": "call_9594d0e49c34409bb1903b6d",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "cd packages/frontend && npx knip --include src --exclude node_modules,.next,.turbo,dist",
+      "description": "Run knip directly in frontend directory"
+    },
+    "output": "ERROR: Invalid issue type: src\n\nRun `knip --help` or visit https://companyfour.example.com for help\n",
+    "title": "cd packages/frontend && npx knip --include src --exclude node_modules,.next,.turbo,dist",
+    "metadata": {
+      "output": "ERROR: Invalid issue type: src\n\nRun `knip --help` or visit https://companyfour.example.com for help\n",
+      "exit": 2,
+      "description": "Run knip directly in frontend directory"
+    },
+    "time": {
+      "start": 1759856709937,
+      "end": 1759856743965
+    }
+  }
+}

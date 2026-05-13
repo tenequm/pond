@@ -1,0 +1,11 @@
+{
+  "id": "prt_9bda5cca7001I2uzTCo07A5rdM",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bda5bdbd0026iGnUXJ6W3ttdH",
+  "type": "text",
+  "text": "I can see you've added thinking configuration on lines 8-21:\n\n```jsonc\n\"provider\": {\n  \"anthropic\": {\n    \"models\": {\n      \"claude-sonnet-4-5-20250929\": {\n        \"options\": {\n          \"thinking\": {\n            \"type\": \"enabled\",\n            \"budgetTokens\": 16000\n          }\n        }\n      }\n    }\n  }\n}\n```\n\n**To answer your question:** You likely need to **restart** the OpenCode session for configuration changes to take effect. Configuration files are typically loaded at startup, not dynamically reloaded.\n\nTry restarting OpenCode and then asking me a question that would benefit from extended thinking (like complex problem-solving or multi-step reasoning) to see if the thinking output appears.",
+  "time": {
+    "start": 1759823386474,
+    "end": 1759823386474
+  }
+}

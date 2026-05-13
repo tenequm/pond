@@ -1,0 +1,19 @@
+{
+  "id": "prt_9bd88edde002Drd1Nh2rtik7bJ",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88dc45002yecJnJrQbhrLXo",
+  "type": "tool",
+  "callID": "toolu_01TxLHrrfAtXFgdRq3tGm7Vj",
+  "tool": "read",
+  "state": {
+    "status": "error",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/packages/frontend/tailwind.config.ts"
+    },
+    "error": "Error: File not found: /Users/user/Projects/myproject-b/packages/frontend/tailwind.config.ts\n\nDid you mean one of these?\n/Users/user/Projects/myproject-b/packages/frontend/config",
+    "time": {
+      "start": 1759821492217,
+      "end": 1759821492217
+    }
+  }
+}

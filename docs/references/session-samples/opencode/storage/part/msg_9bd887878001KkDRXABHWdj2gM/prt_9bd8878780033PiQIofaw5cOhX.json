@@ -1,0 +1,18 @@
+{
+  "id": "prt_9bd8878780033PiQIofaw5cOhX",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd887878001KkDRXABHWdj2gM",
+  "type": "file",
+  "mime": "text/plain",
+  "filename": "CLAUDE.md",
+  "url": "file:///Users/user/Projects/myproject-b/CLAUDE.md",
+  "source": {
+    "text": {
+      "value": "@CLAUDE.md",
+      "start": 7,
+      "end": 17
+    },
+    "type": "file",
+    "path": "/Users/user/Projects/myproject-b/CLAUDE.md"
+  }
+}

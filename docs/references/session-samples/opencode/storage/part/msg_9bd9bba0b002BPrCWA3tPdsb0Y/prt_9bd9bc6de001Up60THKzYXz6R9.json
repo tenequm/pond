@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd9bc6de001Up60THKzYXz6R9",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9bba0b002BPrCWA3tPdsb0Y",
+  "type": "tool",
+  "callID": "toolu_017oHYfFs5o9GNbCnxsG47kA",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/.claude/settings.local.json"
+    },
+    "output": "<file>\n00001| {\n00002|   \"$schema\": \"https://companysix.example.com/claude-code-settings.json\",\n00003|   \"permissions\": {\n00004|     \"allow\": [\n00005|       \"mcp__Context7__resolve-library-id\",\n00006|       \"mcp__llms-txt-mcp__docs_query\",\n00007|       \"Bash(mkdir:*)\",\n00008|       \"Bash(curl:*)\",\n00009|       \"Bash(pnpm run check:*)\",\n00010|       \"Bash(pnpm -F frontend check)\",\n00011|       \"WebSearch\",\n00012|       \"Bash(psql:*)\",\n00013|       \"Bash(grep:*)\",\n00014|       \"Bash(pnpm type-check:*)\",\n00015|       \"Bash(pnpm generate:types:*)\",\n00016|       \"Bash(npx tsx:*)\",\n00017|       \"Bash(pnpm -F server check)\",\n00018|       \"Bash(find:*)\",\n00019|       \"Bash(pnpm add:*)\",\n<snipped: ~286 lines of tool output>\n00306|       \"/Users/user/Projects/shadcn-ui\",\n00307|       \"/Users/user/Projects/ai-chatbot\",\n00308|       \"/Users/user/Projects/example-repo\",\n00309|       \"/Users/user/Projects/mastra\"\n00310|     ]\n00311|   },\n00312|   \"hooks\": {},\n00313|   \"outputStyle\": \"thorough-learning-first\"\n00314| }\n</file>",
+    "title": ".claude/settings.local.json",
+    "metadata": {
+      "preview": "{\n  \"$schema\": \"https://companysix.example.com/claude-code-settings.json\",\n  \"permissions\": {\n    \"allow\": [\n      \"mcp__Context7__resolve-library-id\",\n      \"mcp__llms-txt-mcp__docs_query\",\n      \"Bash(mkdir:*)\",\n      \"Bash(curl:*)\",\n      \"Bash(pnpm run check:*)\",\n      \"Bash(pnpm -F frontend check)\",\n      \"WebSearch\",\n      \"Bash(psql:*)\",\n      \"Bash(grep:*)\",\n      \"Bash(pnpm type-check:*)\",\n      \"Bash(pnpm generate:types:*)\",\n      \"Bash(npx tsx:*)\",\n      \"Bash(pnpm -F server check)\",\n      \"Bash(find:*)\",\n      \"Bash(pnpm add:*)\",\n      \"mcp__Context7__get-library-docs\","
+    },
+    "time": {
+      "start": 1759822727035,
+      "end": 1759822727035
+    }
+  }
+}

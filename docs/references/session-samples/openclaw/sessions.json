@@ -1,0 +1,86 @@
+{
+  "agent:main:main": {
+    "sessionId": "bddd19c3-0ce6-44b9-918b-b7ecf2eecd9e",
+    "updatedAt": 1778659575439,
+    "systemSent": true,
+    "abortedLastRun": false,
+    "authProfileOverride": "anthropic:default",
+    "authProfileOverrideSource": "auto",
+    "authProfileOverrideCompactionCount": 0,
+    "chatType": "direct",
+    "deliveryContext": {
+      "to": "heartbeat"
+    },
+    "lastTo": "heartbeat",
+    "origin": {
+      "label": "heartbeat",
+      "provider": "heartbeat",
+      "from": "heartbeat",
+      "to": "heartbeat"
+    },
+    "sessionFile": "agents/main/sessions/8c70b10c-6c21-4873-84bb-de7482904df5.jsonl.reset.2026-03-28T04-14-24.192Z",
+    "sessionFileNote": "Live main:main session (bddd19c3) was too large (>500K); pointing at a representative heartbeat-driven reset snapshot instead.",
+    "compactionCount": 0,
+    "skillsSnapshot": {
+      "prompt": "<snipped: ~1 line of text with embedded <available_skills> XML listing ~50 skills with name/description/location>",
+      "skills": [
+        {
+          "name": "clawhub",
+          "requiredEnv": []
+        },
+        {
+          "name": "gh-issues",
+          "primaryEnv": "GH_TOKEN",
+          "requiredEnv": []
+        },
+        {
+          "name": "openai-whisper-api",
+          "primaryEnv": "OPENAI_API_KEY",
+          "requiredEnv": ["OPENAI_API_KEY"]
+        }
+      ]
+    }
+  },
+  "agent:main:telegram:direct:00000000": {
+    "sessionId": "a5ecbacb-a30b-4233-a738-e7c4debdb83b",
+    "updatedAt": 1775163724860,
+    "systemSent": true,
+    "abortedLastRun": false,
+    "authProfileOverride": "anthropic:default",
+    "authProfileOverrideSource": "auto",
+    "chatType": "direct",
+    "deliveryContext": {
+      "to": "telegram:00000000"
+    },
+    "lastTo": "telegram:00000000",
+    "origin": {
+      "label": "someone (00000000)",
+      "provider": "telegram",
+      "from": "00000000",
+      "to": "telegram:00000000"
+    },
+    "sessionFile": "agents/main/sessions/a5ecbacb-a30b-4233-a738-e7c4debdb83b.jsonl.reset.2026-04-03T16-08-18.440Z",
+    "compactionCount": 0
+  },
+  "agent:main:subagent:0e8d1680-13cb-4f8b-92d4-4547525ca230": {
+    "sessionId": "e7a8ca73-9423-4c60-a6f2-957cd2e965d6",
+    "updatedAt": 1774517345592,
+    "systemSent": true,
+    "abortedLastRun": false,
+    "authProfileOverride": "anthropic:default",
+    "authProfileOverrideSource": "auto",
+    "chatType": "direct",
+    "deliveryContext": {
+      "to": "subagent:0e8d1680-13cb-4f8b-92d4-4547525ca230"
+    },
+    "lastTo": "subagent:0e8d1680-13cb-4f8b-92d4-4547525ca230",
+    "origin": {
+      "label": "subagent",
+      "provider": "subagent",
+      "from": "subagent:0e8d1680-13cb-4f8b-92d4-4547525ca230",
+      "to": "subagent:0e8d1680-13cb-4f8b-92d4-4547525ca230"
+    },
+    "sessionFile": "agents/main/sessions/e7a8ca73-9423-4c60-a6f2-957cd2e965d6.jsonl",
+    "compactionCount": 0
+  }
+}

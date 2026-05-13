@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bfa2e97c001Y7uEgxb1AHESmT",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa2d639002TZTspuiESo6vw5",
+  "type": "tool",
+  "callID": "call_7a83bcb3cde04ba793e8edd4",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-a/knip.json"
+    },
+    "output": "<file>\n00001| {\n00002|   \"$schema\": \"https://companyfive.example.com/knip@5/schema.json\",\n00003|   \"ignore\": [\"packages/backend/drizzle.config.ts\"],\n00004|   \"ignoreDependencies\": [\"@ai-sdk/anthropic\", \"import-in-the-middle\", \"require-in-the-middle\", \"tailwindcss\"],\n00005|   \"ignoreExportsUsedInFile\": true\n00006| }\n00007| \n</file>",
+    "title": "knip.json",
+    "metadata": {
+      "preview": "{\n  \"$schema\": \"https://companyfive.example.com/knip@5/schema.json\",\n  \"ignore\": [\"packages/backend/drizzle.config.ts\"],\n  \"ignoreDependencies\": [\"@ai-sdk/anthropic\", \"import-in-the-middle\", \"require-in-the-middle\", \"tailwindcss\"],\n  \"ignoreExportsUsedInFile\": true\n}\n"
+    },
+    "time": {
+      "start": 1759856748925,
+      "end": 1759856748926
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd9bc5c9001cLD5OnbsWzrNrr",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9bba0b002BPrCWA3tPdsb0Y",
+  "type": "tool",
+  "callID": "toolu_015C3YaCUsozSPgFbqtZ1F12",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/.claude/settings.json"
+    },
+    "output": "<file>\n00001| {\n00002|   \"$schema\": \"https://companysix.example.com/claude-code-settings.json\",\n00003|   \"permissions\": {\n00004|     \"allow\": [],\n00005|     \"deny\": []\n00006|   },\n00007|   \"enableAllProjectMcpServers\": false,\n00008|   \"enabledMcpjsonServers\": [\"Context7\", \"gitmcp\"],\n00009|   \"disabledMcpjsonServers\": [\n00010|     \"llms-txt-mcp\",\n00011|     \"firecrawl\",\n00012|     \"time\",\n00013|     \"tavily-mcp\",\n00014|     \"rag-browser\",\n00015|     \"apify\",\n00016|     \"posthog\",\n00017|     \"chroma\",\n00018|     \"chrome-mcp\",\n00019|     \"playwright\",\n00020|     \"postgres-backend-remote\",\n00021|     \"x3k-mcp\",\n00022|     \"repomix\",\n00023|     \"postgres-backend\",\n00024|     \"octocode\",\n00025|     \"github\",\n00026|     \"exa\",\n00027|     \"fetch\",\n00028|     \"serena\"\n00029|   ],\n00030|   \"hooks\": {}\n00031| }\n00032| \n</file>",
+    "title": ".claude/settings.json",
+    "metadata": {
+      "preview": "{\n  \"$schema\": \"https://companysix.example.com/claude-code-settings.json\",\n  \"permissions\": {\n    \"allow\": [],\n    \"deny\": []\n  },\n  \"enableAllProjectMcpServers\": false,\n  \"enabledMcpjsonServers\": [\"Context7\", \"gitmcp\"],\n  \"disabledMcpjsonServers\": [\n    \"llms-txt-mcp\",\n    \"firecrawl\",\n    \"time\",\n    \"tavily-mcp\",\n    \"rag-browser\",\n    \"apify\",\n    \"posthog\",\n    \"chroma\",\n    \"chrome-mcp\",\n    \"playwright\",\n    \"postgres-backend-remote\","
+    },
+    "time": {
+      "start": 1759822726878,
+      "end": 1759822726879
+    }
+  }
+}

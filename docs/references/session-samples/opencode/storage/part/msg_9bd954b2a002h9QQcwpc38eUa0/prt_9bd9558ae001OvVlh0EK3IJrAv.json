@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bd9558ae001OvVlh0EK3IJrAv",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd954b2a002h9QQcwpc38eUa0",
+  "type": "tool",
+  "callID": "toolu_015TaKLi4Z7rc5egqupoTvA1",
+  "tool": "write",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/opencode.jsonc",
+      "content": "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \n  // Model Configuration\n  \"model\": \"anthropic/claude-sonnet-4-20250514\",\n  \"small_model\": \"anthropic/claude-3-5-haiku-20241022\",\n  \n  // Auto-update enabled\n  \"autoupdate\": true,\n  \n  // Instructions from existing files\n  \"instructions\": [\n    \"CLAUDE.md\",\n    \".cursor/rules/*.mdc\",\n    \"docs/claude-guidelines/*.md\"\n  ],\n  \n  // MCP Servers (migrated from .mcp.json with active ones only)\n  \"mcp\": {\n    \"Context7\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@upstash/context7-mcp\"]\n    },\n    \"gitmcp\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"mcp-remote\", \"https://companytwo.example.com/docs\"]\n    }\n  },\n  \n  // Permissions - ask before destructive operations\n  \"permission\": {\n    \"edit\": \"ask\",\n    \"bash\": {\n      \"default\": \"ask\",\n      // Allow read-only operations without asking\n      \"allow\": [\n        \"pnpm -w check\",\n        \"pnpm --filter * check\",\n        \"curl -s http://localhost:*\",\n        \"psql -h localhost * -c 'SELECT *'\",\n        \"git status\",\n        \"git diff\",\n        \"git log\"\n      ]\n    }\n  },\n  \n  // Commands for common operations\n  \"command\": {\n    \"check\": {\n      \"template\": \"Run type-check and linting for all packages. Fix any errors found.\",\n      \"description\": \"Type-check and lint all packages\"\n    },\n    \"db-migrate\": {\n      \"template\": \"Generate and run database migrations for $ARGUMENTS (backend or frontend). Make sure to review the migration files.\",\n      \"description\": \"Generate and run DB migrations\"\n    },\n    \"test-api\": {\n      \"template\": \"Test the API endpoint $ARGUMENTS using curl with the dev bypass token.\",\n      \"description\": \"Test an API endpoint\"\n    }\n  },\n  \n  // Sharing - manual only (security for private repo)\n  \"share\": \"disabled\",\n  \n  // Formatters configuration\n  \"formatter\": {\n    \"biome\": {\n      \"command\": [\"pnpm\", \"biome\", \"format\", \"--write\", \"$FILE\"],\n      \"extensions\": [\".js\", \".ts\", \".jsx\", \".tsx\", \".json\", \".jsonc\"]\n    }\n  }\n}\n"
+    },
+    "output": "",
+    "title": "opencode.jsonc",
+    "metadata": {
+      "diagnostics": {},
+      "filepath": "/Users/user/Projects/myproject/opencode.jsonc",
+      "exists": false
+    },
+    "time": {
+      "start": 1759822310563,
+      "end": 1759822310630
+    }
+  }
+}

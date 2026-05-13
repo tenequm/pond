@@ -1,0 +1,12 @@
+{
+  "id": "prt_9bd90f5a1002Ajzb7JCUB6Gha6",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd90f5a1001otIM6SpOpdYOBr",
+  "type": "text",
+  "text": "based on this doc https://opencode.ai/docs/config/ can you suggest the initial config of or opencode.jsonc to put into our root of the repo based on the configs we have now?",
+  "synthetic": false,
+  "time": {
+    "start": 0,
+    "end": 0
+  }
+}

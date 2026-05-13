@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd889578001Uz2sOBbcio9X9W",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88788f002fuNPpHzwLglL3Y",
+  "type": "tool",
+  "callID": "toolu_01XjQBWt3mpbG4DFyzfKoqTk",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/packages/frontend/package.json"
+    },
+    "output": "<snipped: ~178 lines of output>",
+    "title": "packages/frontend/package.json",
+    "metadata": {
+      "preview": "{\n  \"name\": \"@myproject-b/frontend\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"dev\": \"exec next dev --turbopack 2>&1 | tee -i logs/frontend-dev.log\",\n    \"build\": \"next build\",\n    \"start\": \"next start\",\n    \"lint\": \"biome lint .\",\n    \"lint:fix\": \"biome lint --write .\",\n    \"type-check\": \"tsgo --noEmit\",\n    \"type-check-old\": \"tsc --noEmit\",\n    \"check\": \"pnpm type-check && biome check\",\n    \"clean\": \"rm -rf .next .turbo dist node_modules/.cache\",\n    \"db:generate\": \"drizzle-kit generate\",\n    \"db:migrate\": \"drizzle-kit migrate\",\n    \"db:push\": \"drizzle-kit push\",\n    \"db:studio\": \"drizzle-kit studio\",\n    \"generate:types\": \"openapi-typescript http://localhost:4111/doc -o ./lib/api-types.d.ts\",\n    \"format\": \"biome format --write .\","
+    },
+    "time": {
+      "start": 1759821469559,
+      "end": 1759821469560
+    }
+  }
+}

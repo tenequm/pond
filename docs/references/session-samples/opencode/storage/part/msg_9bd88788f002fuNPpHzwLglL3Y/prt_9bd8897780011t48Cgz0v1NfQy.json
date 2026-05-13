@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd8897780011t48Cgz0v1NfQy",
+  "sessionID": "ses_64277f81dffeBJVvPRohiQpxk6",
+  "messageID": "msg_9bd88788f002fuNPpHzwLglL3Y",
+  "type": "tool",
+  "callID": "toolu_014rtYZ3egBcU5DwPbC1x9hU",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject-b/packages/backend/package.json"
+    },
+    "output": "<snipped: ~121 lines of output>",
+    "title": "packages/backend/package.json",
+    "metadata": {
+      "preview": "{\n  \"name\": \"@myproject-b/backend\",\n  \"version\": \"1.0.0\",\n  \"main\": \"src/index.ts\",\n  \"type\": \"module\",\n  \"types\": \"src/index.ts\",\n  \"exports\": {\n    \".\": \"./src/index.ts\",\n    \"./db/schema\": {\n      \"types\": \"./src/db/schema/index.ts\",\n      \"import\": \"./src/db/schema/index.ts\",\n      \"default\": \"./src/db/schema/index.ts\"\n    },\n    \"./db/schema/*\": {\n      \"types\": \"./src/db/schema/*.ts\",\n      \"import\": \"./src/db/schema/*.ts\",\n      \"default\": \"./src/db/schema/*.ts\"\n    }\n  },\n  \"scripts\": {"
+    },
+    "time": {
+      "start": 1759821469803,
+      "end": 1759821469804
+    }
+  }
+}

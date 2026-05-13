@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bd9abb9f001W350Ngzv4oyRAw",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9aadf700201CXPbVN1jiWFZ",
+  "type": "tool",
+  "callID": "toolu_01LfxSnEUCcxiyh2ozXEiCpM",
+  "tool": "edit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/opencode.jsonc",
+      "oldString": "  // Permissions - ask before destructive operations\n  \"permission\": {\n    \"edit\": \"ask\",\n    \"bash\": {\n      \"default\": \"ask\",\n      // Allow read-only operations without asking\n      \"allow\": [\n        \"pnpm -w check\",\n        \"pnpm --filter * check\",\n        \"curl -s http://localhost:*\",\n        \"psql -h localhost * -c 'SELECT *'\",\n        \"git status\",\n        \"git diff\",\n        \"git log\"\n      ]\n    }\n  },",
+      "newString": "  // Permissions - ask before destructive operations\n  \"permission\": {\n    \"edit\": \"ask\",\n    \"bash\": {\n      // Allow read-only operations\n      \"git status\": \"allow\",\n      \"git diff\": \"allow\",\n      \"git diff *\": \"allow\",\n      \"git log\": \"allow\",\n      \"git log *\": \"allow\",\n      \"pnpm -w check\": \"allow\",\n      \"pnpm --filter * check\": \"allow\",\n      \"pnpm -F * check\": \"allow\",\n      \"curl -s *\": \"allow\",\n      \"ls\": \"allow\",\n      \"ls *\": \"allow\",\n      \"pwd\": \"allow\",\n      \"cat *\": \"allow\",\n      \n      // Ask for approval on destructive operations\n      \"git push\": \"ask\",\n      \"git push *\": \"ask\",\n      \"git commit\": \"ask\",\n      \"git commit *\": \"ask\",\n      \"rm *\": \"ask\",\n      \"npm install\": \"ask\",\n      \"npm install *\": \"ask\",\n      \"pnpm install\": \"ask\",\n      \"pnpm install *\": \"ask\",\n      \n      // Deny dangerous operations\n      \"terraform *\": \"deny\",\n      \"kubectl delete *\": \"deny\",\n      \n      // Allow everything else\n      \"*\": \"allow\"\n    }\n  },"
+    },
+    "output": "",
+    "title": "opencode.jsonc",
+    "metadata": {
+      "diagnostics": {},
+      "diff": "Index: /Users/user/Projects/myproject/opencode.jsonc\n===================================================================\n--- /Users/user/Projects/myproject/opencode.jsonc\n+++ /Users/user/Projects/myproject/opencode.jsonc\n@@ -26,19 +26,40 @@\n // Permissions - ask before destructive operations\n \"permission\": {\n   \"edit\": \"ask\",\n   \"bash\": {\n-    \"default\": \"ask\",\n-    // Allow read-only operations without asking\n-    \"allow\": [\n-      \"pnpm -w check\",\n-      \"pnpm --filter * check\",\n-      \"curl -s http://localhost:*\",\n-      \"psql -h localhost * -c 'SELECT *'\",\n-      \"git status\",\n-      \"git diff\",\n-      \"git log\"\n-    ]\n+    // Allow read-only operations\n+    \"git status\": \"allow\",\n+    \"git diff\": \"allow\",\n+    \"git diff *\": \"allow\",\n+    \"git log\": \"allow\",\n+    \"git log *\": \"allow\",\n+    \"pnpm -w check\": \"allow\",\n+    \"pnpm --filter * check\": \"allow\",\n+    \"pnpm -F * check\": \"allow\",\n+    \"curl -s *\": \"allow\",\n+    \"ls\": \"allow\",\n+    \"ls *\": \"allow\",\n+    \"pwd\": \"allow\",\n+    \"cat *\": \"allow\",\n+\n+    // Ask for approval on destructive operations\n+    \"git push\": \"ask\",\n+    \"git push *\": \"ask\",\n+    \"git commit\": \"ask\",\n+    \"git commit *\": \"ask\",\n+    \"rm *\": \"ask\",\n+    \"npm install\": \"ask\",\n+    \"npm install *\": \"ask\",\n+    \"pnpm install\": \"ask\",\n+    \"pnpm install *\": \"ask\",\n+\n+    // Deny dangerous operations\n+    \"terraform *\": \"deny\",\n+    \"kubectl delete *\": \"deny\",\n+\n+    // Allow everything else\n+    \"*\": \"allow\"\n   }\n },\n \n // Commands for common operations\n"
+    },
+    "time": {
+      "start": 1759822663401,
+      "end": 1759822663470
+    }
+  }
+}

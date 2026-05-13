@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bfa1e946001xRxRX3jSEC7hDO",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa1ca0d002F9sSHnRamKegDx",
+  "type": "tool",
+  "callID": "call_72de560eb8cb47cd8c56a150",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "pnpm knip --config packages/frontend/knip.json",
+      "description": "Run knip analysis on frontend dependencies"
+    },
+    "output": "\n> myproject_a@ knip /Users/user/Projects/myproject-a\n> knip --config packages/frontend/knip.json\n\nERROR: Unable to find packages/frontend/knip.json or package.json#knip\n\nRun `knip --help` or visit https://companyfour.example.com for help\n ELIFECYCLE  Command failed with exit code 2.\n",
+    "title": "pnpm knip --config packages/frontend/knip.json",
+    "metadata": {
+      "output": "\n> myproject_a@ knip /Users/user/Projects/myproject-a\n> knip --config packages/frontend/knip.json\n\nERROR: Unable to find packages/frontend/knip.json or package.json#knip\n\nRun `knip --help` or visit https://companyfour.example.com for help\n ELIFECYCLE  Command failed with exit code 2.\n",
+      "exit": 2,
+      "description": "Run knip analysis on frontend dependencies"
+    },
+    "time": {
+      "start": 1759856683869,
+      "end": 1759856687439
+    }
+  }
+}

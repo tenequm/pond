@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bfa3364b001Dh3w3psagzaRCn",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa2e9b30026HlGv3WNT8u5Fq",
+  "type": "tool",
+  "callID": "call_be60d455bccf4fc78749888d",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "cd packages/frontend && npx knip",
+      "description": "Run knip in frontend directory with default config"
+    },
+    "output": "❌ Invalid environment variables: [\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'GOOGLE_GENERATIVE_AI_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'DATABASE_URL' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'APIFY_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  }\n]\nERROR: Error loading /Users/user/Projects/myproject-a/packages/frontend/drizzle.config.ts\nReason: Invalid environment variables\n",
+    "title": "cd packages/frontend && npx knip",
+    "metadata": {
+      "output": "❌ Invalid environment variables: [\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'GOOGLE_GENERATIVE_AI_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'DATABASE_URL' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'APIFY_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  }\n]\nERROR: Error loading /Users/user/Projects/myproject-a/packages/frontend/drizzle.config.ts\nReason: Invalid environment variables\n",
+      "exit": 2,
+      "description": "Run knip in frontend directory with default config"
+    },
+    "time": {
+      "start": 1759856768590,
+      "end": 1759856769571
+    }
+  }
+}

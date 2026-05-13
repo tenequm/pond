@@ -1,0 +1,23 @@
+{
+  "id": "prt_9bd9aad38001pjCZWNk6Kx4LIa",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9a9e6b002QrxFIgaV5OiGgN",
+  "type": "tool",
+  "callID": "toolu_015KAKEpvE5chswk1NQDtSKm",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/Users/user/Projects/myproject/opencode.jsonc"
+    },
+    "output": "<file>\n00001| {\n00002|   \"$schema\": \"https://opencode.ai/config.json\",\n00003| \n00004|   // Model Configuration\n00005|   \"model\": \"anthropic/claude-sonnet-4-5-20250929\",\n00006|   \"small_model\": \"anthropic/claude-sonnet-4-5-20250929\",\n00007| \n00008|   // Auto-update enabled\n00009|   \"autoupdate\": true,\n00010| \n00011|   // Instructions from existing files\n00012|   \"instructions\": [\"CLAUDE.md\"],\n00013| \n00014|   // MCP Servers (migrated from .mcp.json with active ones only)\n00015|   \"mcp\": {\n00016|     \"Context7\": {\n00017|       \"type\": \"local\",\n00018|       \"command\": [\"npx\", \"-y\", \"@upstash/context7-mcp\"]\n00019|     },\n00020|     \"gitmcp\": {\n00021|       \"type\": \"local\",\n00022|       \"command\": [\"npx\", \"-y\", \"mcp-remote\", \"https://companytwo.example.com/docs\"]\n00023|     }\n00024|   },\n00025| \n00026|   // Permissions - ask before destructive operations\n00027|   \"permission\": {\n00028|     \"edit\": \"ask\",\n00029|     \"bash\": {\n00030|       \"default\": \"ask\",\n00031|       // Allow read-only operations without asking\n00032|       \"allow\": [\n00033|         \"pnpm -w check\",\n00034|         \"pnpm --filter * check\",\n00035|         \"curl -s http://localhost:*\",\n00036|         \"psql -h localhost * -c 'SELECT *'\",\n00037|         \"git status\",\n00038|         \"git diff\",\n00039|         \"git log\"\n00040|       ]\n00041|     }\n00042|   },\n00043| \n00044|   // Commands for common operations\n00045|   \"command\": {\n00046|     \"check\": {\n00047|       \"template\": \"Run type-check and linting for all packages. Fix any errors found.\",\n00048|       \"description\": \"Type-check and lint all packages\"\n00049|     },\n00050|     \"db-migrate\": {\n00051|       \"template\": \"Generate and run database migrations for $ARGUMENTS (backend or frontend). Make sure to review the migration files.\",\n00052|       \"description\": \"Generate and run DB migrations\"\n00053|     },\n00054|     \"test-api\": {\n00055|       \"template\": \"Test the API endpoint $ARGUMENTS using curl with the dev bypass token.\",\n00056|       \"description\": \"Test an API endpoint\"\n00057|     }\n00058|   },\n00059| \n00060|   // Sharing - manual only (security for private repo)\n00061|   \"share\": \"disabled\",\n00062| \n00063|   // Formatters configuration\n00064|   \"formatter\": {\n00065|     \"biome\": {\n00066|       \"command\": [\"pnpm\", \"biome\", \"format\", \"--write\", \"$FILE\"],\n00067|       \"extensions\": [\".js\", \".ts\", \".jsx\", \".tsx\", \".json\", \".jsonc\"]\n00068|     }\n00069|   }\n00070| }\n00071| \n</file>",
+    "title": "opencode.jsonc",
+    "metadata": {
+      "preview": "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n\n  // Model Configuration\n  \"model\": \"anthropic/claude-sonnet-4-5-20250929\",\n  \"small_model\": \"anthropic/claude-sonnet-4-5-20250929\",\n\n  // Auto-update enabled\n  \"autoupdate\": true,\n\n  // Instructions from existing files\n  \"instructions\": [\"CLAUDE.md\"],\n\n  // MCP Servers (migrated from .mcp.json with active ones only)\n  \"mcp\": {\n    \"Context7\": {\n      \"type\": \"local\",\n      \"command\": [\"npx\", \"-y\", \"@upstash/context7-mcp\"]\n    },\n    \"gitmcp\": {"
+    },
+    "time": {
+      "start": 1759822654904,
+      "end": 1759822654905
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "prt_9bfa239a9001Afdtl4cn3eClJx",
+  "sessionID": "ses_6405e5a5cffeIG2QHRuTmm4mA7",
+  "messageID": "msg_9bfa2203b0021Pfv7Vk1qSheGF",
+  "type": "tool",
+  "callID": "call_32a48962c98a44f1a64b6cd6",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "pnpm knip --workspace packages/frontend",
+      "description": "Run knip analysis on frontend workspace"
+    },
+    "output": "\n> myproject_a@ knip /Users/user/Projects/myproject-a\n> knip --workspace packages/frontend\n\n❌ Invalid environment variables: [\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'GOOGLE_GENERATIVE_AI_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'DATABASE_URL' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'APIFY_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  }\n]\nERROR: Error loading /Users/user/Projects/myproject-a/packages/frontend/drizzle.config.ts\nReason: Invalid environment variables\n ELIFECYCLE  Command failed with exit code 2.\n",
+    "title": "pnpm knip --workspace packages/frontend",
+    "metadata": {
+      "output": "\n> myproject_a@ knip /Users/user/Projects/myproject-a\n> knip --workspace packages/frontend\n\n❌ Invalid environment variables: [\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'GOOGLE_GENERATIVE_AI_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'DATABASE_URL' ],\n    message: 'Invalid input: expected string, received undefined'\n  },\n  {\n    expected: 'string',\n    code: 'invalid_type',\n    path: [ 'APIFY_API_KEY' ],\n    message: 'Invalid input: expected string, received undefined'\n  }\n]\nERROR: Error loading /Users/user/Projects/myproject-a/packages/frontend/drizzle.config.ts\nReason: Invalid environment variables\n ELIFECYCLE  Command failed with exit code 2.\n",
+      "exit": 2,
+      "description": "Run knip analysis on frontend workspace"
+    },
+    "time": {
+      "start": 1759856703914,
+      "end": 1759856704957
+    }
+  }
+}

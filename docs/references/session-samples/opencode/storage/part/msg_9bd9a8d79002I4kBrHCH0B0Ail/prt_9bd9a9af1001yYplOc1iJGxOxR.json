@@ -1,0 +1,22 @@
+{
+  "id": "prt_9bd9a9af1001yYplOc1iJGxOxR",
+  "sessionID": "ses_6426f0a61ffeBavfbUkZwd1k1R",
+  "messageID": "msg_9bd9a8d79002I4kBrHCH0B0Ail",
+  "type": "tool",
+  "callID": "toolu_01ADnqEdGoTqELFyR9jfUJPN",
+  "tool": "webfetch",
+  "state": {
+    "status": "completed",
+    "input": {
+      "url": "https://opencode.ai/docs/permissions/",
+      "format": "markdown"
+    },
+    "output": "Permissions | opencode     [Skip to content](#_top)\n\n  [![](/docs/_astro/logo-dark.DOStV66V.svg) ![](/docs/_astro/logo-light.B0yzR0O5.svg) opencode](/)\n\n[Home](/)[Docs](/docs/)\n\n[](https://github.com/sst/opencode)[](https://opencode.ai/discord)\n\nSearch CtrlK\n\nCancel\n\n-   [Intro](/docs/)\n-   [Config](/docs/config/)\n-   [Providers](/docs/providers/)\n-   [Enterprise](/docs/enterprise/)\n-   [Troubleshooting](/docs/troubleshooting/)\n-   Usage\n    \n    -   [TUI](/docs/tui/)\n<snipped: ~142 lines of tool output>\n    ```\n    \n    This configuration allows all commands by default (`\"*\": \"allow\"`) but requires approval for `git push` commands.\n    \n\n[Edit this page](https://github.com/sst/opencode/edit/dev/packages/web/src/content/docs/permissions.mdx) [Find a bug? Open an issue](https://github.com/sst/opencode/issues/new) [Join our Discord community](https://opencode.ai/discord)\n\n© [CompanyOne](https://companyone.example.com)\n\nLast updated — Oct 6, 2025",
+    "title": "https://opencode.ai/docs/permissions/ (text/html)",
+    "metadata": {},
+    "time": {
+      "start": 1759822650540,
+      "end": 1759822650935
+    }
+  }
+}
