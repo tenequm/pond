@@ -1,0 +1,9 @@
+id,name,category,price,in_stock
+1,Alpha Widget,tools,12.50,true
+2,Beta Gadget,tools,8.75,false
+3,Gamma Sprocket,parts,3.20,true
+4,Delta Component,parts,15.00,true
+5,Epsilon Module,electronics,42.99,false
+6,Zeta Connector,electronics,6.40,true
+7,Eta Bracket,parts,2.10,true
+8,Theta Panel,electronics,29.99,false

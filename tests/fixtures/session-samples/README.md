@@ -63,9 +63,21 @@ sample tree.
   line, mirroring the Anthropic Messages API content-block shape. An
   `_audit_hmac` field appears on records (cryptographically invalid against
   the anonymized content but the field is retained for schema fidelity).
-- Samples: 3 sessions (opus-4-6, opus-4-5 older format, sonnet-4-6 with an
-  `api_retry` 529-overload storm). Same workspace UUID for all because only
-  one workspace existed on the source machine.
+  Newer Claude Desktop versions also write, under `local_<session-uuid>/`:
+  `uploads/` (files the user attached - populated), `.audit-key` (binary
+  HMAC key; replaced with a zero-filled dummy of identical length in the
+  sample), and a nested `.claude/` Claude Code environment (`.claude.json`,
+  `projects/<encoded-path>/<uuid>.jsonl`, `backups/`). A `spaces.json` index
+  sits beside the session files (the workspace / "space" concept). The
+  `outputs/` sidecar dir exists but stays empty - the agent writes
+  deliverables to the user's selected workspace folder, not into `outputs/`
+  (it is only the agent's cwd anchor).
+- Samples: 4 sessions. Three (opus-4-6, opus-4-5 older format, sonnet-4-6
+  with an `api_retry` 529-overload storm) predate the `.claude/` /
+  `.audit-key` / `spaces.json` structure. `local_5c09adfc` is a deliberately
+  benign staged session (a generic CSV analysis) added to capture a
+  populated `uploads/` sidecar and the newer structure. Same workspace UUID
+  for all because only one workspace existed on the source machine.
 - The web chat history at
   `~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/`
   is described in `claude-app/schema-notes.md` but not captured (binary
@@ -288,13 +300,6 @@ be applied to refreshed samples.
 Tracked shortfalls where a future SourceAdapter would have untested surface.
 Update as gaps are closed.
 
-- **claude-app - no populated `uploads/` / `outputs/` sidecars.** The
-  cross-platform table lists these sidecars, but on the source machine they
-  are empty across all 10 available sessions (as are `shim-perm/`); only
-  `shim-lib/shim.sh` carries content, and that is generic Cowork boilerplate
-  identical across installs. No real sample exercises populated upload /
-  output sidecar discovery; this gap cannot be closed without a session that
-  actually produced those files.
 - **claude-managed-agents - single session.** All 9 event types are present
   (enough to design the adapter) but there is no second session for an
   idempotency / round-trip pair and no error or version-skew case. Source is
@@ -308,6 +313,10 @@ Closed gaps (kept here briefly for history):
 - **nanoclaw single top-level session** - closed by adding
   `agentgroup-synthetic-001/` (2 synthetic structural-replay sessions; see
   the nanoclaw per-platform note).
+- **claude-app populated `uploads/` sidecar** - closed by adding the
+  `local_5c09adfc` staged session. Also established definitively that
+  `outputs/` is not a deliverable sink (the agent writes to the user's
+  workspace folder); it stays empty by design, so it is not a gap.
 
 ## How to refresh
 
