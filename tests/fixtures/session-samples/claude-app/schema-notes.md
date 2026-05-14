@@ -1,6 +1,8 @@
 # Claude Desktop (macOS) - local session storage notes
 
-Captured: 2026-05-13. Source machine had Claude Desktop installed at
+Captured: 2026-05-13 (a fourth session, `local_5c09adfc`, was staged and
+captured 2026-05-14 from a newer Claude Desktop version - see below).
+Source machine had Claude Desktop installed at
 `~/Library/Application Support/Claude/`.
 
 ## Two distinct conversation stores
@@ -36,16 +38,24 @@ This is the rich, easily-parseable store. Two parallel directory trees:
   claude-code-sessions/<account-uuid>/<workspace-uuid>/
     local_<session-uuid>.json          # lightweight session metadata
   local-agent-mode-sessions/<account-uuid>/<workspace-uuid>/
+    spaces.json                        # workspace / "space" index (newer)
     local_<session-uuid>.json          # richer session metadata
     local_<session-uuid>/
       audit.jsonl                      # full transcript (one record per line)
-      .claude/                         # per-session claude-code state
-      outputs/
-      uploads/
+      .audit-key                       # binary HMAC key for audit.jsonl (newer)
+      .claude/                         # per-session claude-code state:
+                                       #   .claude.json, projects/<enc>/<uuid>.jsonl,
+                                       #   backups/, .last-cleanup
+      uploads/                         # files the user attached (populated)
+      outputs/                         # agent cwd anchor - stays empty
 ```
 
 The `local-agent-mode-sessions` tree is keyed by a stable account UUID
 and workspace UUID, then by a per-conversation `local_<uuid>` directory.
+The `spaces.json` index, `.audit-key`, and the nested `.claude/`
+Claude Code environment are present on newer Claude Desktop versions and
+were not in the 2026-05-13 capture; `local_5c09adfc` (2026-05-14) has
+them.
 
 ## Sample layout in this repo
 
@@ -57,13 +67,17 @@ claude-app/
   local-agent-mode-sessions/
     <account-uuid>/
       <workspace-uuid>/
+        spaces.json                            # workspace index (5c09adfc only)
         local_<session-uuid>.json              # session metadata
         local_<session-uuid>/
           audit.jsonl                          # transcript
+          .audit-key                           # binary HMAC key (5c09adfc only)
+          .claude/                             # nested CC env  (5c09adfc only)
+          uploads/                             # attached files (5c09adfc only)
 ```
 
 Account UUID and workspace UUID directory names are opaque IDs and
-kept as-is. Three sessions are bundled, all from the same workspace
+kept as-is. Four sessions are bundled, all from the same workspace
 (only one workspace was present on the source machine):
 
 - `local_40d67183-...` - opus-4-6, Cowork sandbox, 73 audit lines.
@@ -80,10 +94,19 @@ kept as-is. Three sessions are bundled, all from the same workspace
   `system.subtype: api_retry` records with `error_status: 529`,
   and a final terminal `API Error: 529` assistant text. Useful for
   exercising retry / overload handling paths.
+- `local_5c09adfc-...` - a deliberately benign staged session (generic
+  CSV analysis, no personal content by construction), captured
+  2026-05-14 from a newer Claude Desktop version. The only session
+  with a populated `uploads/` sidecar, plus the newer `.audit-key`,
+  nested `.claude/` Claude Code environment, and sibling `spaces.json`.
+  The `.audit-key` binary is replaced with a zero-filled dummy of
+  identical length.
 
 Together they cover: two schema variants (with / without
-`_audit_hmac`), three model strings, presence of file-upload markup,
-presence of api retries, and the Cowork permission-prompt flow.
+`_audit_hmac`), four model strings, presence of file-upload markup,
+presence of api retries, the Cowork permission-prompt flow, a
+populated `uploads/` sidecar, and the newer `.audit-key` / `.claude/`
+/ `spaces.json` structure.
 
 ## `local_<uuid>.json` (session metadata) - top-level fields
 
@@ -157,8 +180,16 @@ Variants observed:
 - The init record is effectively a snapshot of the agent's full
   capability surface at session start (tools, MCP servers, skills,
   plugins, agents) - useful for replay / reproducibility.
-- Attachments / uploads live out-of-band under
-  `local_<uuid>/uploads/` and `outputs/`, not inline in the JSONL.
+- User-attached files live out-of-band under `local_<uuid>/uploads/`,
+  not inline in the JSONL. The sibling `outputs/` dir exists but is not
+  a deliverable sink - the agent writes deliverables to the user's
+  selected workspace folder; `outputs/` is only the agent's cwd anchor
+  and stays empty.
+- Newer Claude Desktop versions add, under `local_<uuid>/`: `.audit-key`
+  (binary HMAC key for `audit.jsonl`) and a nested `.claude/` Claude
+  Code environment (`.claude.json`, `projects/<encoded-path>/<uuid>.jsonl`,
+  `backups/`, `.last-cleanup`). A `spaces.json` index sits beside the
+  session files.
 - `accountName` and `emailAddress` are stored in plaintext in the
   session metadata.
 - The claude.ai web history (IndexedDB) and the Cowork session history
