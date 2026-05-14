@@ -88,10 +88,9 @@ These are constraints every pond write and read must satisfy. Code review rules.
 4. **No cached table handles forever.** Pond is a long-lived server. The `lance` crates expose no `read_consistency_interval` option (that is a `lancedb`-wrapper concept, absent from the `lance` Rust API), so pond owns the staleness window itself: each cached `Dataset` handle records its last-refresh time, and pond calls `Dataset::checkout_latest()` (a cheap manifest read) to pick up external writers before serving a read whenever the handle is older than the configured interval. The interval is keyed off the connection URI scheme: local filesystem = `0` (always refresh; manifest reads are microseconds), object store (`s3://`, `s3+ddb://`, `gs://`, `az://`) = `5s` (caps manifest fetch overhead; acceptable lag for human-driven queries). Configurable override. Table handles may be reused between requests but must not be opened at startup and held without refresh.
 5. **No silent drops.** Malformed input surfaces with line offset and error context. Ingest fails closed by default.
 6. **Opaque IDs, not paths.** `namespace_id`, `workspace_id`, `project`, `agent_id` are opaque strings. The Claude Code SourceAdapter decodes path-encoded session directories once at ingest and stores the decoded values; readers never re-parse.
-7. **ASCII-only docs.** All Markdown files in this repo use ASCII characters only. Per `CLAUDE.md`.
-8. **No SQL.** Lance scalar predicates and search APIs are the only query mechanism.
-9. **Encryption is operational.** Bucket SSE plus filesystem encryption. No application-level crypto, no `is_encrypted` columns, no KeyProvider.
-10. **Schema versioning at the dataset level.** Lance manifest version plus dataset-level metadata key. No per-row `schema_version` columns.
+7. **No SQL.** Lance scalar predicates and search APIs are the only query mechanism.
+8. **Encryption is operational.** Bucket SSE plus filesystem encryption. No application-level crypto, no `is_encrypted` columns, no KeyProvider.
+9. **Schema versioning at the dataset level.** Lance manifest version plus dataset-level metadata key. No per-row `schema_version` columns.
 
 ### 2.4 Concurrency model
 
