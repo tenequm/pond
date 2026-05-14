@@ -225,8 +225,10 @@ buffer, `merge_insert` on canonical PKs, Blob v2.
   the pond-owned staleness window (`checkout_latest()` refresh policy - invariant 4).
 - `mod ingest` - `IngestEvent` enum, the event-ordering contract validator (3.4),
   the per-role `search_text` concatenation policy (3.3.1), the buffer-to-boundary
-  ingest flow that writes a Message row + its Part rows in one pass. Per-event
-  `merge_insert`. `source_agent` / `project` denormalization onto `messages`. The
+  ingest flow that accumulates a whole session substream and writes at most three
+  Lance batches per session: one `sessions` merge-insert, one `messages` merge-insert,
+  and one `parts` merge-insert. Per-event/per-row Lance commits are explicitly not
+  allowed. `source_agent` / `project` denormalization onto `messages`. The
   validator's abort unit is the offending session's event substream - a violation
   drops the rest of that session's events and continues with other sessions. This is
   one validator with one rule, shared verbatim by the CLI streaming adapter and the
@@ -286,6 +288,18 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   overlap), deterministic chunking, writes `embeddings` rows with denormalized filter
   columns (3.2.4). `pond embed-worker` CLI verb. Reads `messages.search_text` directly
   - no second concat path.
+  **Batching is load-bearing**: the worker batches chunks across messages and calls
+  `Qwen3TextEmbedding::embed(&[...])` with a non-singleton slice whenever more than
+  one chunk is pending; it never does one message/chunk -> one model call. The local
+  fastembed reference is `~/pjv/anush008/fastembed-rs/src/models/qwen3.rs`
+  (`Qwen3TextEmbedding::embed` builds one tokenizer/model batch from `texts: &[S]`).
+  Note: that same file also carries the Qwen3-VL (vision) variant with its own
+  `embed` / `embed_internal` - pond uses the text-only `Qwen3TextEmbedding::embed`,
+  not the VL impl.
+  On Metal this is especially important: per-call GPU dispatch overhead dominates
+  batch-size-1 inference. The embedding row write path follows the same rule as Stage
+  1 Lance ingest: write RecordBatches of embedding rows, never one `merge_insert` /
+  commit per chunk.
 - `mod search` - the `pond_search` handler: vector kNN + BM25 FTS retrievers, each
   with `Scanner::prefilter(true)` (load-bearing - design.md 3.3 implementation note),
   RRF merge on `message_id` (k=60), recency boost (3.3 formula), `min_score`
@@ -319,6 +333,10 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
 - `group_by_conversation` collapses to one summary per session with correct
   `best_score` / `message_count`.
 - Determinism: same `(model_id, search_text)` produces identical chunks across runs.
+- Embedding batching guard: a fake/instrumented embedder records call sizes while the
+  worker processes multiple messages/chunks; the test fails if it observes a sequence
+  of batch-size-1 calls when more than one chunk was available. A companion write test
+  asserts embedding rows are submitted to Lance in batches, not committed per chunk.
 
 **CI test tiers** (the embedding tests cannot all run in a vanilla CI runner - Qwen3
 weights are a ~600MB HuggingFace download):
@@ -338,6 +356,10 @@ weights are a ~600MB HuggingFace download):
 - Hybrid / vector / fts modes all return ranked results over the fixture corpus.
 - All filters verified.
 - `pond embed-worker` populates `embeddings` for an ingested corpus.
+- The embedding worker demonstrably batches both model inference and Lance writes:
+  multiple pending chunks produce batched `Qwen3TextEmbedding::embed(&[...])` calls and
+  batched embedding-row writes. Per-message/per-chunk model calls or per-chunk Lance
+  commits are not acceptable Stage 2 implementations.
 - On macOS the embedding worker runs on the Metal device - asserted (the selected
   device is `Metal`, not the `Cpu` fallback) and logged. On Linux it runs on CPU.
 - Vector-index activation is verified against a synthetic 10k+ row `embeddings`
