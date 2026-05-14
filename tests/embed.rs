@@ -7,7 +7,7 @@ use std::{str::FromStr, sync::Mutex};
 
 use pond::{
     adapter::ClaudeCodeAdapter,
-    config::{Config, EmbeddingModel, EmbeddingsConfig},
+    config::{Config, DEFAULT_CONFIG_TOML, EmbeddingModel, EmbeddingsConfig, resolve_data_dir},
     embed::{Chunker, EmbedBackend, EmbedWorker, qwen3_query_instruction},
     ingest::ingest_adapter,
     substrate::PondStore,
@@ -215,6 +215,56 @@ fn config_load_merges_namespace_overrides() {
 fn config_load_missing_file_falls_back_to_builtin() {
     let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
     assert_eq!(config.embeddings.models.len(), 1);
+}
+
+#[test]
+fn default_config_toml_loads_to_the_builtin_registry() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
+    // The shipped template is all comments, so it must load and validate as the
+    // built-in registry - a malformed template fails right here.
+    let config = Config::load(&path).unwrap();
+    config.embeddings.validate().unwrap();
+    assert_eq!(
+        config.embeddings.default_model("local").unwrap().id,
+        "Qwen/Qwen3-Embedding-0.6B",
+    );
+}
+
+#[test]
+fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
+    use std::path::PathBuf;
+
+    // An explicit `--data-dir` / `POND_DATA_DIR` wins over everything.
+    assert_eq!(
+        resolve_data_dir(
+            Some(PathBuf::from("/explicit")),
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/home")),
+        ),
+        PathBuf::from("/explicit"),
+    );
+    // An absolute XDG_DATA_HOME is used next.
+    assert_eq!(
+        resolve_data_dir(
+            None,
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/home"))
+        ),
+        PathBuf::from("/xdg/pond"),
+    );
+    // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
+    assert_eq!(
+        resolve_data_dir(
+            None,
+            Some(PathBuf::from("relative")),
+            Some(PathBuf::from("/home")),
+        ),
+        PathBuf::from("/home/.local/share/pond"),
+    );
+    // No XDG and no HOME - stays usable rather than panicking.
+    assert_eq!(resolve_data_dir(None, None, None), PathBuf::from(".pond"));
 }
 
 #[tokio::test]

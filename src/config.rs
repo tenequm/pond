@@ -5,10 +5,40 @@
 //! defaults are shipped in the binary so a pond instance with no `config.toml`
 //! still works; user config adds or overrides entries by `id`.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// Default `config.toml` body written by `pond setup`. Every line is commented:
+/// pond ships built-in defaults, so the file is purely a discoverable template.
+pub const DEFAULT_CONFIG_TOML: &str = "\
+# pond configuration.
+#
+# pond ships built-in defaults, so every setting here is optional - delete this
+# file and pond still works. Uncomment and edit to override.
+
+# Register or tune an embedding model. pond validates each entry against its
+# known-model set (loader code, dimension, distance metric).
+#
+# [[embeddings.models]]
+# id = \"Qwen/Qwen3-Embedding-0.6B\"
+# fastembed_code = \"Qwen/Qwen3-Embedding-0.6B\"
+# dim = 1024
+# chunk_size_tokens = 1024
+# chunk_overlap_tokens = 128
+# num_sub_vectors = 64
+# distance = \"cosine\"
+# normalize = true
+# default = true
+#
+# Per-namespace chunking / IVF overrides (immutable fields cannot be overridden):
+# [embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]
+# chunk_size_tokens = 512
+";
 
 /// Top-level `config.toml` shape. Only `[embeddings]` is wired in v1.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -76,6 +106,8 @@ struct KnownModel {
     code: &'static str,
     dim: u32,
     distance: Distance,
+    /// Approximate first-download size, surfaced by `pond setup`.
+    download_mb: u32,
 }
 
 /// v1 ships a single loader path: the Qwen3 candle backend via
@@ -85,7 +117,38 @@ const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
     code: "Qwen/Qwen3-Embedding-0.6B",
     dim: 1024,
     distance: Distance::Cosine,
+    download_mb: 1190,
 }];
+
+/// Approximate first-download size in MB for a known model's loader code.
+pub fn known_model_download_mb(fastembed_code: &str) -> Option<u32> {
+    KNOWN_MODELS
+        .iter()
+        .find(|known| known.code == fastembed_code)
+        .map(|known| known.download_mb)
+}
+
+/// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
+/// wins; otherwise `$XDG_DATA_HOME/pond`, falling back to
+/// `$HOME/.local/share/pond`. `xdg_data_home` is honored only if absolute, per
+/// the XDG base-directory spec.
+pub fn resolve_data_dir(
+    explicit: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
+        return xdg.join("pond");
+    }
+    if let Some(home) = home {
+        return home.join(".local").join("share").join("pond");
+    }
+    // No HOME and no usable XDG var - stay usable rather than panic.
+    PathBuf::from(".pond")
+}
 
 fn default_distance() -> Distance {
     Distance::Cosine

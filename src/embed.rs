@@ -126,6 +126,11 @@ impl Qwen3Embedder {
             dim: model.dim as usize,
         })
     }
+
+    /// The device the weights were loaded onto (`"metal"`, `"cuda"`, or `"cpu"`).
+    pub fn device(&self) -> &'static str {
+        device_label(self.inner.device())
+    }
 }
 
 impl EmbedBackend for Qwen3Embedder {
@@ -153,6 +158,16 @@ pub fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
         .get("tokenizer.json")
         .map_err(|error| anyhow!("failed to fetch tokenizer.json for {repo_id}: {error}"))?;
     Tokenizer::from_file(&path).map_err(|error| anyhow!("failed to load tokenizer: {error}"))
+}
+
+/// Whether `repo_id`'s weights and tokenizer are already in the local
+/// HuggingFace cache. Lets `pond setup` report "present" vs "downloading"
+/// without triggering a fetch.
+pub fn model_is_cached(repo_id: &str) -> bool {
+    let repo = hf_hub::Cache::from_env().model(repo_id.to_owned());
+    ["config.json", "tokenizer.json", "model.safetensors"]
+        .iter()
+        .all(|file| repo.get(file).is_some())
 }
 
 #[cfg(target_os = "macos")]
