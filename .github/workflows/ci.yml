@@ -9,7 +9,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  HF_HOME: ${{ github.workspace }}/.cache/huggingface
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
 
@@ -35,11 +34,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-on-failure: true
-
-      - uses: actions/cache@v5.0.5
-        with:
-          path: .cache/huggingface
-          key: qwen3-embedding-0.6b-${{ runner.os }}
 
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings

@@ -12,11 +12,13 @@ axum = "0.8.9"
 candle-core = "0.10.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-table = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
@@ -32,13 +34,19 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23", features = ["v7"] }
 
+# `ort` is a non-optional dependency of fastembed 5.13.4; `ort-load-dynamic`
+# keeps it from static-linking ONNX Runtime (or downloading the binary). pond's
+# Qwen3 path is pure candle and never dlopens onnxruntime, so this is free.
 [target.'cfg(target_os = "macos")'.dependencies]
-fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "metal"] }
+fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "ort-load-dynamic", "metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls"] }
+fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "ort-load-dynamic"] }
 
 [dev-dependencies]
+# Also a regular dependency; declared here so integration tests can name
+# `MetricType` when asserting the distance-metric mapping.
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 reqwest = "0.13"
 tempfile = "3.25"
 

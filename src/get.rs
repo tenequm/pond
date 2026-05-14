@@ -3,7 +3,10 @@ use serde_json::json;
 use crate::{
     substrate::PondStore,
     types::{PartKind, StoredMessage, StoredSession},
-    wire::{ErrorCode, GetEnvelope, GetRequest, GetResponse, GetResult, error, validate_protocol},
+    wire::{
+        ErrorCode, GetEnvelope, GetRequest, GetResponse, GetResult, error, storage_error,
+        validate_protocol,
+    },
 };
 
 pub async fn pond_get(store: &PondStore, request: GetRequest) -> GetEnvelope {
@@ -132,12 +135,4 @@ fn filter_messages(
     messages.retain(|message| {
         message.message.role() != crate::types::Role::Tool || !message.parts.is_empty()
     });
-}
-
-fn storage_error(error_value: anyhow::Error) -> crate::wire::ErrorEnvelope {
-    error(
-        ErrorCode::StorageUnavailable,
-        "storage operation failed",
-        json!({"underlying": error_value.to_string()}),
-    )
 }

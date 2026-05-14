@@ -5,7 +5,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::deps::arrow_array::{
-    Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
+    Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+    StringArray, TimestampMicrosecondArray,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance_file::version::LanceFileVersion;
@@ -18,6 +19,10 @@ pub const SESSIONS: &str = "sessions.lance";
 pub const MESSAGES: &str = "messages.lance";
 pub const PARTS: &str = "parts.lance";
 pub const EMBEDDINGS: &str = "embeddings.lance";
+
+/// Fixed embedding vector dimension (Qwen3-Embedding-0.6B, design.md 3.2.4).
+/// A future model with a different dim activates a second `embeddings` table.
+pub const EMBEDDING_DIM: usize = 1024;
 
 pub fn write_params() -> WriteParams {
     WriteParams {
@@ -83,11 +88,7 @@ pub fn embedding_schema() -> Arc<Schema> {
         primary_field("message_id", DataType::Utf8, false),
         primary_field("model_id", DataType::Utf8, false),
         primary_field("chunk_index", DataType::Int32, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 1024),
-            false,
-        ),
+        Field::new("vector", embedding_vector_type(), false),
         Field::new("session_id", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
         Field::new("project", DataType::Utf8, true),
@@ -128,6 +129,97 @@ pub struct MessageBatchRow<'a> {
     pub source_agent: &'a str,
     pub project: Option<&'a str>,
     pub search_text: Option<&'a str>,
+}
+
+/// One row of the `embeddings` dataset: a (Message, model, chunk) vector with
+/// the filter columns denormalized from `messages` (design.md 3.2.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingRow {
+    pub message_id: String,
+    pub model_id: String,
+    pub chunk_index: i32,
+    pub vector: Vec<f32>,
+    pub session_id: String,
+    pub source_agent: String,
+    pub project: Option<String>,
+    pub role: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+fn embedding_vector_type() -> DataType {
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        EMBEDDING_DIM as i32,
+    )
+}
+
+pub fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
+    let schema = embedding_schema();
+    let mut flat = Vec::with_capacity(rows.len() * EMBEDDING_DIM);
+    for row in rows {
+        if row.vector.len() != EMBEDDING_DIM {
+            anyhow::bail!(
+                "embedding for message {} has dim {}, expected {EMBEDDING_DIM}",
+                row.message_id,
+                row.vector.len(),
+            );
+        }
+        flat.extend_from_slice(&row.vector);
+    }
+    let vectors = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        EMBEDDING_DIM as i32,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .context("failed to build embedding vector column")?;
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.message_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.model_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                rows.iter().map(|row| row.chunk_index).collect::<Vec<_>>(),
+            )),
+            Arc::new(vectors),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.source_agent.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.project.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.role.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                TimestampMicrosecondArray::from(
+                    rows.iter()
+                        .map(|row| micros(row.timestamp))
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .context("failed to build embeddings batch")
 }
 
 pub fn session_batch(session: &Session) -> Result<RecordBatch> {
@@ -366,6 +458,23 @@ pub fn message_from_batch(batch: &RecordBatch, row: usize) -> Result<Message> {
     }
 }
 
+/// Decode one `messages` row (projected by `PondStore::pending_messages_stream`)
+/// into a `PendingMessage` for the embed worker.
+pub fn pending_message_from_batch(
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<crate::substrate::PendingMessage> {
+    Ok(crate::substrate::PendingMessage {
+        message_id: string(batch, "id", row)?.context("message id is null")?,
+        session_id: string(batch, "session_id", row)?.context("session_id is null")?,
+        source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
+        project: string(batch, "project", row)?,
+        role: string(batch, "role", row)?.context("role is null")?,
+        timestamp: datetime(batch, "timestamp", row)?,
+        search_text: string(batch, "search_text", row)?.context("search_text is null")?,
+    })
+}
+
 pub fn part_from_batch(batch: &RecordBatch, row: usize) -> Result<Part> {
     let type_name = string(batch, "type", row)?.context("part type is null")?;
     let variant_data = string(batch, "variant_data", row)?.context("variant_data is null")?;
@@ -402,7 +511,17 @@ fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<i32> {
     Ok(array.value(row))
 }
 
-fn datetime(batch: &RecordBatch, name: &str, row: usize) -> Result<DateTime<Utc>> {
+pub fn float32(batch: &RecordBatch, name: &str, row: usize) -> Result<f32> {
+    let array = batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .with_context(|| format!("column {name} is not Float32"))?;
+    Ok(array.value(row))
+}
+
+pub fn datetime(batch: &RecordBatch, name: &str, row: usize) -> Result<DateTime<Utc>> {
     let array = batch
         .column_by_name(name)
         .with_context(|| format!("missing column {name}"))?

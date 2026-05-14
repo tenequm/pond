@@ -67,7 +67,7 @@ The MCP surface a Claude session sees must match `kb` behavior:
   `docs/references/`). v1 tests consume only `claude-code/`; the rest are design
   reference until their adapters ship. The committed `claude-code/` set is expanded
   beyond the original 3 sessions with deep-redacted real sessions from the `blackbox`
-  project (5-10 added, spanning old + modern CLI-format eras) for Tier-1 relevance /
+  project (5-10 added, spanning old + modern CLI-format eras) for relevance /
   filter test diversity. Volume for the vector-index activation test is synthetic, not
   fixture-sourced (see Stage 2 "Done when").
 - **CI**: GitHub Actions on push/PR - `cargo fmt --check`, `cargo clippy --locked --
@@ -172,11 +172,8 @@ the git-pinned `v7.0.0-beta.8` tag (the 7.x beta line is not published to crates
 - `.github/workflows/ci.yml` - `cargo fmt --check`, `cargo clippy --locked --
   -D warnings`, `cargo test --locked`. Runs on both `ubuntu-latest` and
   `macos-latest` so the target-split `fastembed` feature sets (Linux CPU candle vs
-  macOS Metal candle) both build. Includes an `actions/cache` step keyed on the Qwen3
-  model id with `HF_HOME` pointed at the cache dir: the first Tier-2 run is a cache
-  miss and downloads the weights (~600MB) over the network, then populates the cache;
-  every run after restores from cache with no download (see Stage 2 test split).
-  Tier-1 jobs need no model and no cache.
+  macOS Metal candle) both build. No HuggingFace model-cache step: no test downloads
+  the Qwen3 weights (see Stage 2 - tests are one fast suite, no real model).
 - `tests/lance_smoke.rs` - exercises the four load-bearing Lance APIs against the
   git-pinned `v7.0.0-beta.8` lance crates: (1) unenforced-PK `merge_insert`
   find-or-create, (2) `WhenNotMatched::DoNothing` insert-only mode, (3) Blob v2
@@ -317,8 +314,11 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   via `Scanner::explain_plan` that the scalar predicate appears as a
   `ScalarIndexQuery` / `ScalarIndexExec` node, NOT a top-level `FilterExec`. This is
   the load-bearing test design.md 3.3 demands.
-- Hybrid relevance: known query against the fixture corpus returns the expected
-  message in the top hits; `matched_via` reports the contributing retrievers.
+- Search modes: with the instrumented `FakeBackend`, `hybrid` / `vector` / `fts`
+  each execute and produce ordered results, and `matched_via` reports the
+  contributing retrievers. RRF fusion has its own pure-function test. Relevance
+  *quality* - does the right message rank high for a real query - is a human
+  judgement, not an automated test; it lives in the Stage 4 cutover parity checklist.
 - Filter correctness: `project`, `role`, `from_date`/`to_date`, `session_id`,
   `source_agent` each narrow results as expected over the fixture corpus.
 - `project_match: is_null`: a Claude-Code-only corpus has no null-project rows (Claude
@@ -338,18 +338,26 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   of batch-size-1 calls when more than one chunk was available. A companion write test
   asserts embedding rows are submitted to Lance in batches, not committed per chunk.
 
-**CI test tiers** (the embedding tests cannot all run in a vanilla CI runner - Qwen3
-weights are a ~600MB HuggingFace download):
-- **Tier 1 - always-run, no model.** Chunker determinism, registry validation, RRF
-  merge math, recency-boost formula, filter-predicate construction, the `explain_plan`
-  prefilter assertion (uses a tiny vector written directly, no model needed), and the
-  10k-row IVF_PQ index-activation test (synthetic `embeddings` rows written directly,
-  no model needed). These run in the standard `cargo test` CI job.
-- **Tier 2 - real-model, cached job.** The actual Qwen3 embedding round-trip and
-  end-to-end hybrid relevance over the fixture corpus. Gated to a dedicated CI job
-  that restores the `actions/cache` model cache from Stage 0; locally these run
-  whenever the model is cached. Marked so they are skippable (`#[ignore]` + an
-  explicit job, or a cfg/env gate) - never blocking a contributor without the weights.
+**Tests are one suite - fast, always-run, no model.** There is no tiered split and
+nothing is `#[ignore]`d. Every test runs on every `cargo test` and in the single CI
+job; the whole suite finishes in seconds. The Qwen3 weights are never downloaded in a
+test: the chunker runs against a toy tokenizer, the embedding worker against the
+instrumented `FakeBackend`, and the prefilter / vector-index tests against synthetic
+`embeddings` rows written directly.
+
+Why this is sufficient (and why a real-model test is not added): the Qwen3 model is a
+pinned, deterministic dependency - it does not regress, and verifying its embedding
+*quality* is the model vendor's responsibility, not pond's test suite's. Pond's job is
+(a) correct API plumbing, which fastembed's types enforce at compile time, and (b)
+correct use of the model's documented semantic knobs - the query-side instruction
+prefix and the distance metric. (b) is extracted into pure functions and unit-tested
+with plain assertions, no weights required. A test gated behind `#[ignore]` with no CI
+job behind it verifies nothing while looking like coverage - that is the anti-pattern
+this avoids. Empirical "do the results feel right" judgement belongs to a human at the
+Stage 4 cutover, not to a weak automated assertion.
+
+Synthetic-data row counts are calibrated to the minimum that makes each assertion hold,
+with a comment justifying the number - never a guessed volume.
 
 **Done when**:
 - The `explain_plan` prefilter test passes - pushdown confirmed on real data.
@@ -362,15 +370,14 @@ weights are a ~600MB HuggingFace download):
   commits are not acceptable Stage 2 implementations.
 - On macOS the embedding worker runs on the Metal device - asserted (the selected
   device is `Metal`, not the `Cpu` fallback) and logged. On Linux it runs on CPU.
-- Vector-index activation is verified against a synthetic 10k+ row `embeddings`
-  dataset: the test writes 10k+ rows directly into the `embeddings` dataset with random
-  f32 vectors of the production dimension (real IVF_PQ config, synthetic data - no
-  model, no ingest, no JSONL multiplier), confirms the IVF_PQ index builds past the
-  10k-row threshold, and runs a query whose vector is one of the planted rows to
-  confirm via `explain_plan` that the index is used (not the flat-scan fallback).
-  Because no Qwen3 weights are needed this is a Tier-1 test, separate from the
-  real-model relevance tests, which run on the real `claude-code` fixtures and stay
-  below the threshold.
+- Vector-index activation is verified with synthetic `embeddings` rows written
+  directly (no model, no ingest) and a *test-supplied low activation threshold*. The
+  activation logic is `row_count >= threshold` and is volume-agnostic, so the test
+  exercises the identical activation + IVF_PQ build path without production data
+  volume. The synthetic row count is the calibrated minimum IVF_PQ needs to train at
+  the clamped partition floor - not a round number - with a comment stating why. The
+  test confirms the index does not build below the threshold, does build at/above it,
+  and that a planted-vector query is served by the index.
 - clippy + fmt + CI green.
 
 **design.md coverage**: 2.5 search defaults, 3.2.4 embeddings, 3.3 search surface,

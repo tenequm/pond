@@ -7,6 +7,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use pond::{
     adapter::{Adapter, ClaudeCodeAdapter},
+    config::Config,
+    embed::{EmbedWorker, Qwen3Embedder, load_tokenizer},
     substrate::PondStore,
 };
 use tracing_subscriber::{EnvFilter, fmt};
@@ -33,6 +35,18 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         source_dir: Option<PathBuf>,
+    },
+    /// Embed ingested messages and build the search indexes.
+    EmbedWorker {
+        #[arg(long, env = "POND_DATA_DIR", default_value = ".pond")]
+        data_dir: PathBuf,
+        #[arg(long, env = "POND_CONFIG", default_value = "config.toml")]
+        config: PathBuf,
+        /// Registry model id to embed with; defaults to the registry default.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
     },
 }
 
@@ -66,12 +80,36 @@ async fn main() -> anyhow::Result<()> {
                 )),
             };
             let summary = adapter.ingest(&store).await?;
+            store.ensure_indices().await?;
             output(&format!(
                 "accepted={} inserted={} matched={} errors={}",
                 summary.accepted(),
                 summary.inserted,
                 summary.matched,
                 summary.errors
+            ))?;
+        }
+        Command::EmbedWorker {
+            data_dir,
+            config,
+            model,
+            namespace,
+        } => {
+            let config = Config::load(&config)?;
+            let model = match model {
+                Some(id) => config.embeddings.model(&id, &namespace)?,
+                None => config.embeddings.default_model(&namespace)?,
+            };
+            let store = PondStore::open(data_dir).await?;
+            let embedder = Qwen3Embedder::load(&model)?;
+            let tokenizer = load_tokenizer(&model.fastembed_code)?;
+            let summary = EmbedWorker::new(&store, &embedder, &tokenizer, &model)?
+                .run()
+                .await?;
+            store.ensure_embedding_indices(&model).await?;
+            output(&format!(
+                "model={} messages={} chunks={} batches={}",
+                model.id, summary.messages, summary.chunks, summary.batches
             ))?;
         }
     }

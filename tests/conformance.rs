@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use pond::{
-    adapter::{ClaudeCodeAdapter, SourceAdapter},
+    adapter::ClaudeCodeAdapter,
     get::pond_get,
     ingest::{IngestEvent, IngestValidator, ingest_adapter},
     substrate::PondStore,
@@ -10,7 +10,6 @@ use pond::{
     wire::{GetEnvelope, GetRequest},
 };
 use tempfile::TempDir;
-use tokio_stream::StreamExt;
 
 #[tokio::test]
 async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
@@ -21,7 +20,9 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
     let summary = ingest_adapter(&store, &adapter).await?;
     assert_eq!(summary.errors, 0);
 
-    let session_ids = fixture_session_ids().await?;
+    // Read the ingested session ids back from the store rather than re-parsing
+    // the fixture files that ingest already decoded.
+    let session_ids = store.session_ids().await?;
     assert!(!session_ids.is_empty());
 
     for session_id in &session_ids {
@@ -201,30 +202,6 @@ async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
     assert_eq!(stored_part, &part);
 
     Ok(())
-}
-
-async fn fixture_session_ids() -> anyhow::Result<Vec<String>> {
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
-    let discovered = adapter.discover();
-    tokio::pin!(discovered);
-    let mut ids = Vec::new();
-    while let Some(path) = discovered.next().await {
-        let path = path?;
-        let first = tokio::fs::read_to_string(path).await?;
-        let line = first
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .expect("fixture should not be empty");
-        let value: serde_json::Value = serde_json::from_str(line)?;
-        ids.push(
-            value
-                .get("sessionId")
-                .and_then(serde_json::Value::as_str)
-                .expect("fixture should have sessionId")
-                .to_owned(),
-        );
-    }
-    Ok(ids)
 }
 
 fn synthetic_session(id: &str) -> Session {
