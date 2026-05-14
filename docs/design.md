@@ -50,7 +50,7 @@ Items deferred for later (resources, replay, live-write, additional sources, hos
 | HTTP server | axum (tokio-native, JSON-first, SSE built in). |
 | MCP server | rmcp (official Anthropic Rust SDK), wrapping the same handlers as HTTP. |
 | Wire format | JSON. Single evolving schema with top-level `protocol_version` field. Additive-only changes; formal `v2` only on breaking changes. |
-| Default embedding model | Qwen3-Embedding-0.6B via fastembed-rs (candle backend, behind fastembed-rs's opt-in `qwen3` Cargo feature; fixed 1024-dim output, 32K context, Apache 2.0). Qwen3 is NOT in fastembed-rs's standard `EmbeddingModel` enum - it is reached via the separate `Qwen3TextEmbedding::from_hf` API, distinct from the ort-backed enum models. Pond's embedding registry is config-driven (TOML `[[embeddings.models]]`, validated against pond's own known-model set, not fastembed-rs's enum); built-in default ships in the binary. Multi-model coexistence in one table while dims match. |
+| Default embedding model | Qwen3-Embedding-0.6B via fastembed-rs (candle backend, behind fastembed-rs's opt-in `qwen3` Cargo feature; fixed 1024-dim output, 32K context, Apache 2.0). The candle backend runs on the Metal GPU on macOS (target-gated `metal` feature, day-one) and on CPU on Linux; pond constructs the `candle-core` `Device` and passes it into `Qwen3TextEmbedding::from_hf`. Qwen3 is NOT in fastembed-rs's standard `EmbeddingModel` enum - it is reached via the separate `Qwen3TextEmbedding::from_hf` API, distinct from the ort-backed enum models. Pond's embedding registry is config-driven (TOML `[[embeddings.models]]`, validated against pond's own known-model set, not fastembed-rs's enum); built-in default ships in the binary. Multi-model coexistence in one table while dims match. |
 | Output | single static binary via `cargo build --release`. |
 | Code organization | Single Cargo crate. Strict module discipline separates substrate from consumer (sessions) code internally. Workspace split deferred until a second consumer (resources, archives) ships real code. |
 
@@ -61,7 +61,9 @@ No SQL anywhere. No additional database. No `lancedb` crate dependency. Personal
 - **Bind**: `--host 127.0.0.1 --port 9797`. Env overrides: `POND_HOST`, `POND_PORT`. `--port 0` selects an OS-assigned free port. `--host 0.0.0.0` is accepted but logs a security notice at startup (personal pond is single-user; LAN exposure is opt-in).
 - **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (3.2.4 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace chunk tuning), `[maintenance]` (3.2.0 background cleanup + index optimization).
 - **Data**: `$XDG_DATA_HOME/pond/` (Linux and macOS; XDG-strict). Override via `--data-dir <path>` or `POND_DATA_DIR`.
-- **Logs**: for `pond serve` and the CLI verbs, stdout carries normal program output (search results, status) and stderr carries structured tracing diagnostics. For `pond mcp` (the stdio MCP server), stdout is reserved exclusively for JSON-RPC frames - all logging, tracing, and diagnostics go to stderr. `pond serve` has no such restriction because its MCP channel is the `/mcp` HTTP route, not stdout.
+- **Logs and output - two channels, each with one owner**:
+  - *Diagnostics channel*: all structured logging (spans, debug/info/warn/error) goes through `tracing`. The `tracing-subscriber` is initialized exactly once at process start (env-filter via `RUST_LOG` / `POND_LOG`) and always writes to **stderr**. No module configures logging itself.
+  - *Results channel*: the actual output of a verb (search results, status) is not logging - it is written by a single `output` helper. For `pond serve` and the CLI verbs it goes to **stdout** (human-readable, or JSON where the verb is machine-facing). For `pond mcp` (the stdio MCP server) stdout is reserved exclusively for JSON-RPC frames, so the `output` helper emits the result as a JSON-RPC frame instead. `pond serve` has no stdout restriction because its MCP channel is the `/mcp` HTTP route, not stdout.
 - **Platform scope**: Linux and macOS for v1. Windows not in scope.
 
 ### 2.2 Wire interface
@@ -552,6 +554,8 @@ pub trait SourceAdapter: Send + Sync {
 ```
 
 Async + streaming both methods. Stream-based design gives pull-driven backpressure for free (pond core controls flow), bounds memory for huge JSONL files, and maps cleanly to all 8 source shapes pond plans to absorb (see `tests/fixtures/session-samples/`). Adapter implementations use tokio I/O primitives (`tokio::fs`, `tokio::io::BufReader::lines` for JSONL, the `serde` / `serde_json` stack for parsing).
+
+**Dispatch.** Because `discover` and `decode` return `impl Stream` in trait-method position (return-position `impl Trait` in trait), `SourceAdapter` is NOT dyn-compatible - `Box<dyn SourceAdapter>` does not compile. This is intentional and costs nothing: v1 ships a single adapter, and multi-adapter dispatch is via an `enum Adapter { ClaudeCode(..), .. }` (the `--from <name>` CLI flag and the code-level registry select the variant). Pond never needs `dyn SourceAdapter`.
 
 **Event ordering contract** (load-bearing for 3.3.1's search_text-population flow). The `decode` stream MUST emit events in this order for a single session:
 
