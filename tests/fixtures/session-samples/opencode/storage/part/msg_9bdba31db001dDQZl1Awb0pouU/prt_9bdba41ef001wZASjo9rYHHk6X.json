@@ -1,0 +1,17 @@
+{
+  "id": "prt_9bdba41ef001wZASjo9rYHHk6X",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdba31db001dDQZl1Awb0pouU",
+  "type": "tool",
+  "callID": "toolu_01EUEazDsZaYu7bV7PvYVKzv",
+  "tool": "Context7_resolve_library_id",
+  "state": {
+    "status": "error",
+    "input": {},
+    "error": "Tool execution aborted",
+    "time": {
+      "start": 1759824725196,
+      "end": 1759824725196
+    }
+  }
+}

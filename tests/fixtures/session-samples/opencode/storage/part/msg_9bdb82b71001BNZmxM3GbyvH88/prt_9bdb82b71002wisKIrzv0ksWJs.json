@@ -1,0 +1,12 @@
+{
+  "id": "prt_9bdb82b71002wisKIrzv0ksWJs",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdb82b71001BNZmxM3GbyvH88",
+  "type": "text",
+  "text": "please add to @opencode.jsonc all the missing mcp servers from .mcp.json\nand configure them as \"enabled\": false as a default",
+  "synthetic": false,
+  "time": {
+    "start": 0,
+    "end": 0
+  }
+}

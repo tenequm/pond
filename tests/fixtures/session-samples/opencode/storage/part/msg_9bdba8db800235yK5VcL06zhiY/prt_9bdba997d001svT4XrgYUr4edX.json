@@ -1,0 +1,10 @@
+{
+  "id": "prt_9bdba997d001svT4XrgYUr4edX",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdba8db800235yK5VcL06zhiY",
+  "type": "reasoning",
+  "text": "The user is asking me to check the Context7 MCP documentation first to use the proper format for MCP server configuration in opencode.jsonc. They also mention I'm in READ-ONLY mode,",
+  "time": {
+    "start": 1759824746877
+  }
+}

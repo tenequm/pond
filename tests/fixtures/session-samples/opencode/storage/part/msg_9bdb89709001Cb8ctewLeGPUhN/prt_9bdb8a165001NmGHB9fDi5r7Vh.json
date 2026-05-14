@@ -1,0 +1,16 @@
+{
+  "id": "prt_9bdb8a165001NmGHB9fDi5r7Vh",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdb89709001Cb8ctewLeGPUhN",
+  "type": "reasoning",
+  "text": "The user is asking why I'm getting an API error with the message \"Internal server error\". They haven't provided much context, but let me think about what could cause this:\n\n1. This could be related to an API call they're making\n2. Could be from the backend API (Hono server on port 4111)\n3. Could be from a frontend API route\n4. Could be from an external service\n\nWithout more context, I should ask the user for:\n- What endpoint or action were they trying when this occurred?\n- Where did they see this error (browser, logs, curl)?\n- Are there any logs showing more details?\n\nLet me provide a structured way to help them debug this.",
+  "metadata": {
+    "anthropic": {
+      "signature": "EqEGCkYICBgCKkAs1SxawMgYd0nOB/0XKsKeQDuZAl4YqwQR3ovD1kprUPA3AnT7X6M4ARWZQgGD7zWGlkjMAtNBtM9NQIWyBxgAEgytOdM+DecwGMhyb/4aDDUFNdsT9yILAiYCFCIw50PT4tU8UN9JkrepjArnErVV0O6gayUREFdYlFFZUdbyLUIpGtW/wyN7jvgeckhfKogFkPdaw8RjDvaDNtZtbKDk9GB6hav3FsXEKvyARZOhPvDqHJ3/Bwg3gYs4N82VhnW4bOsU7s0obqa1IvuUVzmQOLbeskg8H91cheiCjXC2qo7yA4hKPLsc5IJv/8EkcbhUOTmf2HNxQ3Mxseuwrz7v6FUiO6g/896NxU8bkeu8nIiOeCMQ4IUIkb9FTdsjJG/ebOSKXvX+4h+GwhjRA93Z3X7JMXDK5bi/cGy+L0NtZCI2NLJ5rFNyMz9dqWy8hQT9LLXmamOeKnD2UmCxGeTF9OqK7FVlPh5DRSj8uvub5rN5cHkWk+S3V98z10GglrRyswTEo8IG/yuvbBlGLyubi8acCmFQpw9tbmJF5QBqmdd9EOM9uAm7kAUhBbkgCHfsYx49Sq6wIH95uYSHxCcm23siDTx0edIkTHqB3d2Fd61hLofNJz1ywRtlccL3tkqKqIjO+DqabbWbRXg+QfwgHQSwJ3SBFNT+8s4DzEZXFBwEzqGbcnO8krjBe9atlSwgM1cZzLUCnRs+f2VN+sK1lX468zBR0lvczJw0l00Z99JDWU+1l6K2rp9lkTUmbxZs3lWfdRXmf0Pqa9UA1avXqe+KebYDqCGepLzMyWKTy5NxJ47/Poa0rU0blu7Z6/CTgJ8DM/zMy7F/KVyT7VT/xqrQkhhmK48/86x5sdy8jrIb/FcGNRydjDzcX7zgsFbkTCwOa8mmSkLB/Bcvg814SLVEShw7+7UgA7WIeWP//lKNxh9WptH77T1HqiTWBIakMLEBuA8+lx2XeuDPwU7plnbNzvrVMj5qjODKm2yDdHkZow1fVWihSia1zGKdfn7PkBOhNY1BJr7Rf/15I9amEPnvDhGpb+0vGAE="
+    }
+  },
+  "time": {
+    "start": 1759824617829,
+    "end": 1759824622191
+  }
+}

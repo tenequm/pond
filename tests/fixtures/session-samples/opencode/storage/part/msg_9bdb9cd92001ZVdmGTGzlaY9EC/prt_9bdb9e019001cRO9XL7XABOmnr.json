@@ -1,0 +1,11 @@
+{
+  "id": "prt_9bdb9e019001cRO9XL7XABOmnr",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdb9cd92001ZVdmGTGzlaY9EC",
+  "type": "text",
+  "text": "Done! Added all 18 missing MCP servers to `opencode.jsonc` with `\"enabled\": false` as default.",
+  "time": {
+    "start": 1759824699528,
+    "end": 1759824699528
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "prt_9bdb836ed001Jle0AtC7qyYDWD",
+  "sessionID": "ses_64247d48fffeqpnbetOp1fY31b",
+  "messageID": "msg_9bdb82bed0014A9qfyyM01ILo7",
+  "type": "reasoning",
+  "text": "I need to read both files to compare them and see which MCP servers are missing from opencode.jsonc that are present in .mcp.json.\n\nLet me first read both files.",
+  "metadata": {
+    "anthropic": {
+      "signature": "EssCCkYICBgCKkDqs6F7/PgtVWc3sqh1X6pS92AVzCgzPhR3Y+dyv81Dbemg/pHbLXRXvgI3IMlds20ZjOC0NXv9zRNx7rX7DY3lEgzIDhn1b/fOvbDLBIoaDCRzaCZ4wc1fyga5cCIwXuyCCFPTQ6Gg2rMOwfHpnH8BcZ21jH0pY877HgwtCuuSEtDcww1YdxmQk73hX17YKrIB7zMsX5rlCtAu/WhTBQvhOe+zzZDUE+mbVXkODz12WZAfq5znfD80ySPxUg8paEZ9+qrsCSY7r1d1dqteywoZMnOo9Km1uw++A8vR+6fcCN0cl8R29nnqmdWqMrJeUnDjV9ntRzXPCIl0BDE/qPHmw56iYwlIYyPBvn2ErIIkOIa3QZ2BxeOzdIUm2WW+iqM4/QK3u4rgPg8KY16kLhor4NwSrAxg9eKycviDEP3ZVeKzhxgB"
+    }
+  },
+  "time": {
+    "start": 1759824590573,
+    "end": 1759824592393
+  }
+}
