@@ -364,8 +364,8 @@ impl PondStore {
         ))
     }
 
-    /// Merge-insert embedding rows keyed on `(message_id, model_id, chunk_index)`.
-    /// Re-running with deterministic chunks is a no-op for matched rows.
+    /// Merge-insert embedding rows keyed on `(message_id, model_id)`.
+    /// Re-running over already-embedded messages is a no-op for matched rows.
     pub async fn upsert_embeddings(&self, rows: &[EmbeddingRow]) -> Result<Vec<UpsertStatus>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -464,8 +464,8 @@ impl PondStore {
     }
 
     /// Vector kNN retriever over `embeddings.vector`. Returns
-    /// `(message_id, distance)` pairs, lower distance better. Multiple chunks of
-    /// one message may appear; the caller dedupes to the best chunk.
+    /// `(message_id, distance)` pairs, lower distance better. Each message has
+    /// exactly one vector, so the returned `message_id`s are distinct.
     pub async fn vector_search(
         &self,
         query: &[f32],

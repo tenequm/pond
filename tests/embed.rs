@@ -1,60 +1,23 @@
-//! Stage 2 tests for the embedding registry, chunker, worker, and query
-//! instruction. No test requires the Qwen3 weights - the chunker runs against a
-//! toy tokenizer and the worker against an instrumented fake backend.
+//! Stage 2 tests for the embedding registry, worker, and query instruction. No
+//! test requires the Qwen3 weights - the worker runs against an instrumented
+//! fake backend.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::{str::FromStr, sync::Mutex};
+use std::sync::Mutex;
 
 use pond::{
     adapter::ClaudeCodeAdapter,
     config::{Config, DEFAULT_CONFIG_TOML, EmbeddingModel, EmbeddingsConfig, resolve_data_dir},
-    embed::{Chunker, EmbedBackend, EmbedWorker, qwen3_query_instruction},
+    embed::{EmbedBackend, EmbedWorker, qwen3_query_instruction},
     ingest::ingest_adapter,
     substrate::PondStore,
 };
 use tempfile::TempDir;
-use tokenizers::Tokenizer;
 
 /// A single fixture project subdir - enough sessions to fill more than one
 /// embedding batch without ingesting the whole fixture corpus.
 const FIXTURES: &str =
     "tests/fixtures/session-samples/claude-code/projects/-Users-user-Projects-myproject-d";
-
-/// A deterministic WordLevel + whitespace tokenizer over a fixed toy vocab,
-/// built from an inline spec - enough to exercise the chunker without
-/// downloading a real model.
-fn toy_tokenizer() -> Tokenizer {
-    let words = "the quick brown fox jumps over the lazy dog and then runs away fast today";
-    let mut vocab = serde_json::Map::new();
-    vocab.insert("[UNK]".to_owned(), serde_json::json!(0));
-    for word in words.split_whitespace() {
-        let next = vocab.len();
-        vocab
-            .entry(word.to_owned())
-            .or_insert_with(|| serde_json::json!(next));
-    }
-    let spec = serde_json::json!({
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": [],
-        "normalizer": null,
-        "pre_tokenizer": { "type": "Whitespace" },
-        "post_processor": null,
-        "decoder": null,
-        "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]" },
-    });
-    Tokenizer::from_str(&spec.to_string()).expect("toy tokenizer spec is valid")
-}
-
-/// A registry model with a tiny chunk budget so the chunker actually splits.
-fn small_chunk_model() -> EmbeddingModel {
-    EmbeddingModel {
-        chunk_size_tokens: 5,
-        chunk_overlap_tokens: 2,
-        ..EmbeddingModel::qwen3_default()
-    }
-}
 
 /// Records the batch size of every `embed` call so tests can assert batching.
 struct FakeBackend {
@@ -87,29 +50,6 @@ impl EmbedBackend for FakeBackend {
 }
 
 #[test]
-fn chunker_is_deterministic_and_overlaps() {
-    let tokenizer = toy_tokenizer();
-    let chunker = Chunker::new(&small_chunk_model());
-    let text = "the quick brown fox jumps over the lazy dog and then runs";
-
-    let first = chunker.chunk(&tokenizer, text).unwrap();
-    let second = chunker.chunk(&tokenizer, text).unwrap();
-    assert_eq!(first, second, "chunking must be deterministic");
-    assert!(first.len() > 1, "text past the chunk budget must split");
-}
-
-#[test]
-fn chunker_keeps_short_text_whole() {
-    let tokenizer = toy_tokenizer();
-    let chunker = Chunker::new(&small_chunk_model());
-    let text = "the quick brown";
-    assert_eq!(
-        chunker.chunk(&tokenizer, text).unwrap(),
-        vec![text.to_owned()]
-    );
-}
-
-#[test]
 fn qwen3_query_instruction_wraps_the_query_in_the_model_card_prefix() {
     let prompt = qwen3_query_instruction("how does retry backoff work");
     // Model-card format: `Instruct: {task}\nQuery: {query}` - the query sits on
@@ -131,10 +71,10 @@ fn builtin_registry_validates() {
 }
 
 #[test]
-fn registry_rejects_unknown_loader_code() {
+fn registry_rejects_unknown_model() {
     let config = EmbeddingsConfig {
         models: vec![EmbeddingModel {
-            fastembed_code: "bogus/model".to_owned(),
+            id: "bogus/model".to_owned(),
             ..EmbeddingModel::qwen3_default()
         }],
         ..EmbeddingsConfig::default()
@@ -187,7 +127,7 @@ fn config_load_merges_namespace_overrides() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]\nchunk_size_tokens = 512\n",
+        "[embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]\nmax_embed_tokens = 2048\n",
     )
     .unwrap();
 
@@ -197,8 +137,8 @@ fn config_load_merges_namespace_overrides() {
             .embeddings
             .default_model("local")
             .unwrap()
-            .chunk_size_tokens,
-        512,
+            .max_embed_tokens,
+        2048,
     );
     // The override is scoped to its namespace; others keep the built-in value.
     assert_eq!(
@@ -206,8 +146,8 @@ fn config_load_merges_namespace_overrides() {
             .embeddings
             .default_model("other")
             .unwrap()
-            .chunk_size_tokens,
-        1024,
+            .max_embed_tokens,
+        4096,
     );
 }
 
@@ -275,10 +215,9 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
     ingest_adapter(&store, &adapter).await?;
 
     let model = Config::builtin().embeddings.default_model("local")?;
-    let tokenizer = toy_tokenizer();
     let backend = FakeBackend::new(model.dim as usize);
 
-    let summary = EmbedWorker::new(&store, &backend, &tokenizer, &model)?
+    let summary = EmbedWorker::new(&store, &backend, &model)?
         .with_batch_size(4)
         .run()
         .await?;
@@ -287,7 +226,6 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
         summary.messages > 0,
         "fixtures should yield pending messages"
     );
-    assert!(summary.chunks >= summary.messages);
 
     let calls = backend.call_sizes();
     assert_eq!(
@@ -297,8 +235,8 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
     );
     assert_eq!(
         calls.iter().sum::<usize>(),
-        summary.chunks,
-        "every chunk is embedded exactly once",
+        summary.messages,
+        "every message is embedded exactly once",
     );
     // Batching is load-bearing: no singleton call while a full batch was
     // available - every non-final batch is full.
@@ -308,14 +246,13 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
         }
     }
 
-    // Re-run is a no-op: deterministic chunks produce stable PKs.
+    // Re-run is a no-op: the `(message_id, model_id)` PK is already populated.
     let backend = FakeBackend::new(model.dim as usize);
-    let again = EmbedWorker::new(&store, &backend, &tokenizer, &model)?
+    let again = EmbedWorker::new(&store, &backend, &model)?
         .with_batch_size(4)
         .run()
         .await?;
     assert_eq!(again.messages, 0);
-    assert_eq!(again.chunks, 0);
     assert!(backend.call_sizes().is_empty());
 
     Ok(())

@@ -173,7 +173,6 @@ fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
             EmbeddingRow {
                 message_id: format!("msg-{i}"),
                 model_id: model_id.to_owned(),
-                chunk_index: 0,
                 vector,
                 session_id: format!("session-{}", i % 8),
                 source_agent: "claude-code".to_owned(),

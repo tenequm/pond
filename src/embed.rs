@@ -1,15 +1,13 @@
-//! The embedding worker: token-aware chunking, the Qwen3 candle backend, and
-//! the batch-oriented worker that populates the `embeddings` dataset.
+//! The embedding stage of `pond ingest`: the Qwen3 candle backend and the
+//! batch-oriented worker that populates the `embeddings` dataset. One message
+//! produces one vector - there is no chunking.
 //!
-//! Batching is load-bearing (plan.md Stage 2): the worker accumulates chunks
-//! across messages and calls the model once per batch, never once per chunk.
-//! The same rule applies to the Lance write path - embedding rows are written
-//! in batches, never one `merge_insert` per chunk.
-
-use std::sync::Arc;
+//! Batching is load-bearing (plan.md Stage 2): the worker accumulates messages
+//! and calls the model once per batch, never once per message. The same rule
+//! applies to the Lance write path - embedding rows are written in batches,
+//! never one `merge_insert` per message.
 
 use anyhow::{Result, anyhow};
-use tokenizers::Tokenizer;
 use tokio_stream::StreamExt;
 
 use crate::{
@@ -18,56 +16,8 @@ use crate::{
     substrate::{PendingMessage, PondStore},
 };
 
-/// Default number of chunks accumulated before a model-inference + write batch.
+/// Default number of messages accumulated before a model-inference + write batch.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
-
-/// Token-aware deterministic chunker. Same `(tokenizer, text)` always produces
-/// the same chunks, which keeps the `embeddings` PK stable across retries
-/// (design.md 3.2.4).
-#[derive(Debug, Clone, Copy)]
-pub struct Chunker {
-    chunk_size: usize,
-    overlap: usize,
-}
-
-impl Chunker {
-    /// Build a chunker for a registry model. `chunk_overlap_tokens` is required
-    /// to be `< chunk_size_tokens` (enforced by config validation).
-    pub fn new(model: &EmbeddingModel) -> Self {
-        Self {
-            chunk_size: model.chunk_size_tokens,
-            overlap: model.chunk_overlap_tokens,
-        }
-    }
-
-    /// Split `text` into overlapping token windows, each decoded back to a
-    /// string. Text within a single chunk budget round-trips as-is.
-    pub fn chunk(&self, tokenizer: &Tokenizer, text: &str) -> Result<Vec<String>> {
-        let encoding = tokenizer
-            .encode(text, false)
-            .map_err(|error| anyhow!("tokenizer encode failed: {error}"))?;
-        let ids = encoding.get_ids();
-        if ids.len() <= self.chunk_size {
-            return Ok(vec![text.to_owned()]);
-        }
-
-        let step = self.chunk_size - self.overlap;
-        let mut chunks = Vec::new();
-        let mut start = 0;
-        while start < ids.len() {
-            let end = (start + self.chunk_size).min(ids.len());
-            let decoded = tokenizer
-                .decode(&ids[start..end], true)
-                .map_err(|error| anyhow!("tokenizer decode failed: {error}"))?;
-            chunks.push(decoded);
-            if end == ids.len() {
-                break;
-            }
-            start += step;
-        }
-        Ok(chunks)
-    }
-}
 
 /// The retrieval task description baked into the Qwen3 query instruction.
 const QUERY_INSTRUCTION_TASK: &str =
@@ -108,16 +58,20 @@ impl Qwen3Embedder {
         // The Qwen3-Embedding weights ship as bf16; loading them as bf16 (rather
         // than upconverting to f32) halves resident memory at no quality cost
         // and keeps the full f32 exponent range, so no overflow risk.
+        //
+        // `max_embed_tokens` is the tokenizer `max_length`: input past it is
+        // truncated before inference, which is exactly the per-message cap - one
+        // message, one vector, bounded embed cost (plan.md Stage 2).
         let inner = fastembed::Qwen3TextEmbedding::from_hf(
-            &model.fastembed_code,
+            model.load_repo(),
             &device,
             candle_core::DType::BF16,
-            model.chunk_size_tokens,
+            model.max_embed_tokens,
         )
         .map_err(|error| {
             anyhow!(
                 "failed to load embedding model {}: {error}",
-                model.fastembed_code
+                model.load_repo()
             )
         })?;
         tracing::info!(model = %model.id, device = label, "loaded embedding model");
@@ -143,21 +97,6 @@ impl EmbedBackend for Qwen3Embedder {
     fn dim(&self) -> usize {
         self.dim
     }
-}
-
-/// Load the model's own tokenizer for the chunker. After [`Qwen3Embedder::load`]
-/// has run, `tokenizer.json` is already in the HuggingFace cache so this is a
-/// cache hit; standalone it downloads just that one small file.
-pub fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
-    let api = hf_hub::api::sync::ApiBuilder::new()
-        .with_progress(false)
-        .build()
-        .map_err(|error| anyhow!("failed to initialize HuggingFace API: {error}"))?;
-    let path = api
-        .model(repo_id.to_owned())
-        .get("tokenizer.json")
-        .map_err(|error| anyhow!("failed to fetch tokenizer.json for {repo_id}: {error}"))?;
-    Tokenizer::from_file(&path).map_err(|error| anyhow!("failed to load tokenizer: {error}"))
 }
 
 /// Whether `repo_id`'s weights and tokenizer are already in the local
@@ -197,23 +136,19 @@ fn device_label(device: &candle_core::Device) -> &'static str {
 /// Outcome of an [`EmbedWorker::run`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedSummary {
-    /// Messages that had pending (un-embedded) `search_text`.
+    /// Messages that had pending (un-embedded) `search_text`; one vector each.
     pub messages: usize,
-    /// Chunks produced and embedded across those messages.
-    pub chunks: usize,
     /// Model-inference + write batches issued.
     pub batches: usize,
 }
 
 /// Populates the `embeddings` dataset for one registry model. Reads
-/// `messages.search_text` directly (no second concatenation path), chunks it,
-/// batches chunks across messages through the backend, and writes embedding
-/// rows in batches.
+/// `messages.search_text` directly (no second concatenation path), batches
+/// messages through the backend one vector each, and writes embedding rows in
+/// batches.
 pub struct EmbedWorker<'a, B: EmbedBackend> {
     store: &'a PondStore,
     backend: &'a B,
-    tokenizer: &'a Tokenizer,
-    chunker: Chunker,
     model_id: String,
     batch_size: usize,
 }
@@ -221,12 +156,7 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
 impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
     /// Build a worker for `model`. The backend's [`dim`](EmbedBackend::dim) must
     /// match the model's declared `dim`.
-    pub fn new(
-        store: &'a PondStore,
-        backend: &'a B,
-        tokenizer: &'a Tokenizer,
-        model: &EmbeddingModel,
-    ) -> Result<Self> {
+    pub fn new(store: &'a PondStore, backend: &'a B, model: &EmbeddingModel) -> Result<Self> {
         if backend.dim() != model.dim as usize {
             return Err(anyhow!(
                 "backend dim {} does not match model {} dim {}",
@@ -238,22 +168,20 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         Ok(Self {
             store,
             backend,
-            tokenizer,
-            chunker: Chunker::new(model),
             model_id: model.id.clone(),
             batch_size: DEFAULT_BATCH_SIZE,
         })
     }
 
-    /// Override the chunk batch size (default [`DEFAULT_BATCH_SIZE`]).
+    /// Override the message batch size (default [`DEFAULT_BATCH_SIZE`]).
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
     }
 
-    /// Embed every message with `search_text` that does not yet have embedding
-    /// rows for this model. Idempotent: deterministic chunks produce stable PKs,
-    /// so a re-run over an already-embedded corpus is a no-op.
+    /// Embed every message with `search_text` that does not yet have an
+    /// embedding row for this model. Idempotent: the PK is `(message_id,
+    /// model_id)`, so a re-run over an already-embedded corpus is a no-op.
     ///
     /// Messages are pulled from a streaming scan, so peak memory is one stream
     /// page plus the staged batch - not the whole corpus.
@@ -261,30 +189,28 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         let embedded = self.store.embedded_message_ids(&self.model_id).await?;
         let mut summary = EmbedSummary::default();
 
-        // Accumulate chunks across messages *and* across stream pages so the
-        // model and the write path always see full batches; `staged` is flushed
-        // only when it reaches `batch_size`, never at a page boundary.
-        let mut staged: Vec<StagedChunk> = Vec::with_capacity(self.batch_size);
+        // Accumulate messages *and* across stream pages so the model and the
+        // write path always see full batches; `staged` is flushed only when it
+        // reaches `batch_size`, never at a page boundary.
+        let mut staged: Vec<StagedMessage> = Vec::with_capacity(self.batch_size);
         let mut stream = self.store.pending_messages_stream().await?;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
-                let pending = datasets::pending_message_from_batch(&batch, row)?;
+                let mut pending = datasets::pending_message_from_batch(&batch, row)?;
                 if embedded.contains(&pending.message_id) {
                     continue;
                 }
                 summary.messages += 1;
-                let chunks = self.chunker.chunk(self.tokenizer, &pending.search_text)?;
-                let pending = Arc::new(pending);
-                for (chunk_index, text) in chunks.into_iter().enumerate() {
-                    staged.push(StagedChunk {
-                        message: Arc::clone(&pending),
-                        chunk_index: i32::try_from(chunk_index).unwrap_or(i32::MAX),
-                        text,
-                    });
-                    if staged.len() >= self.batch_size {
-                        self.flush(&mut staged, &mut summary).await?;
-                    }
+                // Move `search_text` out of the message: it is handed to the
+                // backend, and the embedding row never carries it.
+                let text = std::mem::take(&mut pending.search_text);
+                staged.push(StagedMessage {
+                    message: pending,
+                    text,
+                });
+                if staged.len() >= self.batch_size {
+                    self.flush(&mut staged, &mut summary).await?;
                 }
             }
         }
@@ -293,61 +219,61 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         tracing::info!(
             model = %self.model_id,
             messages = summary.messages,
-            chunks = summary.chunks,
             batches = summary.batches,
             "embed worker finished",
         );
         Ok(summary)
     }
 
-    /// Embed the staged chunks in one model call and write the resulting rows in
-    /// one Lance batch. Empties `staged`.
-    async fn flush(&self, staged: &mut Vec<StagedChunk>, summary: &mut EmbedSummary) -> Result<()> {
+    /// Embed the staged messages in one model call and write the resulting rows
+    /// in one Lance batch. Empties `staged`.
+    async fn flush(
+        &self,
+        staged: &mut Vec<StagedMessage>,
+        summary: &mut EmbedSummary,
+    ) -> Result<()> {
         if staged.is_empty() {
             return Ok(());
         }
-        // Move the staged chunks out so their text can be handed to the backend
-        // without cloning; `staged` is left empty for the next batch.
-        let chunks = std::mem::take(staged);
-        let mut texts = Vec::with_capacity(chunks.len());
-        let mut metas = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            texts.push(chunk.text);
-            metas.push((chunk.message, chunk.chunk_index));
+        // Move the staged messages out so their text can be handed to the
+        // backend without cloning; `staged` is left empty for the next batch.
+        let messages = std::mem::take(staged);
+        let mut texts = Vec::with_capacity(messages.len());
+        let mut metas = Vec::with_capacity(messages.len());
+        for staged in messages {
+            texts.push(staged.text);
+            metas.push(staged.message);
         }
         let vectors = self.backend.embed(&texts)?;
         if vectors.len() != metas.len() {
             return Err(anyhow!(
-                "backend returned {} vectors for {} chunks",
+                "backend returned {} vectors for {} messages",
                 vectors.len(),
                 metas.len()
             ));
         }
 
         let mut rows = Vec::with_capacity(metas.len());
-        for ((message, chunk_index), vector) in metas.into_iter().zip(vectors) {
+        for (message, vector) in metas.into_iter().zip(vectors) {
             rows.push(EmbeddingRow {
-                message_id: message.message_id.clone(),
+                message_id: message.message_id,
                 model_id: self.model_id.clone(),
-                chunk_index,
                 vector,
-                session_id: message.session_id.clone(),
-                source_agent: message.source_agent.clone(),
-                project: message.project.clone(),
-                role: message.role.clone(),
+                session_id: message.session_id,
+                source_agent: message.source_agent,
+                project: message.project,
+                role: message.role,
                 timestamp: message.timestamp,
             });
         }
 
         self.store.upsert_embeddings(&rows).await?;
-        summary.chunks += rows.len();
         summary.batches += 1;
         Ok(())
     }
 }
 
-struct StagedChunk {
-    message: Arc<PendingMessage>,
-    chunk_index: i32,
+struct StagedMessage {
+    message: PendingMessage,
     text: String,
 }

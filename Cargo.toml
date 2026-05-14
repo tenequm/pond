@@ -28,7 +28,6 @@ serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1.18"
-tokenizers = "0.22"
 toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -47,7 +46,6 @@ fastembed = { version = "5.13.4", default-features = false, features = ["qwen3",
 # Also a regular dependency; declared here so integration tests can name
 # `MetricType` when asserting the distance-metric mapping.
 lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-reqwest = "0.13"
 tempfile = "3.25"
 
 [profile.release]

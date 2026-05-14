@@ -92,7 +92,7 @@ async fn run_search(
                 .vector_search(&vector, pool.saturating_mul(2), &filter)
                 .await
                 .map_err(storage_error)?;
-            normalize_vector(dedup_vector(hits))
+            normalize_vector(hits)
         }
         SearchMode::Hybrid => {
             let vector = embed_query(embedder, &query)?;
@@ -111,11 +111,10 @@ async fn run_search(
                     .map_err(storage_error)
             };
             let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
-            let vector_hits = dedup_vector(vector_raw);
             let lists = [
                 RankedList {
                     retriever: "vector",
-                    ids: vector_hits.into_iter().map(|(id, _)| id).collect(),
+                    ids: vector_raw.into_iter().map(|(id, _)| id).collect(),
                 },
                 RankedList {
                     retriever: "fts",
@@ -304,15 +303,6 @@ impl ScoredHit {
             matched_via: self.matched_via,
         }
     }
-}
-
-/// Keep the best-scoring (lowest-distance) chunk per message, preserving the
-/// distance-ascending order vector search returns.
-fn dedup_vector(hits: Vec<(String, f32)>) -> Vec<(String, f32)> {
-    let mut seen = std::collections::HashSet::new();
-    hits.into_iter()
-        .filter(|(id, _)| seen.insert(id.clone()))
-        .collect()
 }
 
 /// Cosine distance (Lance metric) to a `[0, 1]` similarity base score.

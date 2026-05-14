@@ -27,7 +27,7 @@ Pond replaces `kb` when all of the following hold:
 3. Hybrid search (vector + BM25 + RRF) returns relevant results over that corpus with
    working `project` / `session_id` / `from_date` / `to_date` / `role` / `source_agent`
    / `min_score` / `boost_recent` / `group_by_conversation` filters.
-4. The HTTP+JSON transport serves the same handlers (`POST /v1/<op>` + SSE).
+4. The HTTP+JSON transport serves the same handlers (`POST /v1/<op>`).
 5. Conversations that exist in `kb` but no longer have source `.jsonl` on disk are
    back-filled from kb's Qdrant store (gap-fill only, never overwriting local data).
 6. CI is green: `cargo fmt --check`, `cargo clippy --locked -- -D warnings`,
@@ -49,11 +49,12 @@ The MCP surface a Claude session sees must match `kb` behavior:
 ## Locked decisions (resolved during planning)
 
 - **Build order**: risk-first - storage spine, then search, then transports. Each is a stage.
-- **Module layout**: 5 source files. `src/main.rs`, `src/lib.rs` (core as inline `mod`s,
-  splitting to files only when a module gets long), `src/substrate.rs` (Lance store +
-  staleness window + retry + maintenance), `src/embed.rs` (embedding worker),
-  `src/transport.rs` (`mod http` + `mod mcp`). Plus `tests/`. The Qdrant migration is a
-  throwaway `examples/migrate_qdrant.rs`, `git rm`'d after its one run.
+- **Module layout**: one file per module under `src/` - `main.rs`, `lib.rs`, and the
+  modules `types`, `datasets`, `substrate`, `ingest`, `adapter`, `get`, `wire`,
+  `search`, `embed`, `config`, `transport`. (The early "5 files, inline `mod`s" sketch
+  was dropped in Stage 1 - each module was substantial enough to warrant its own file
+  from the start.) Plus `tests/`. The Qdrant migration is a throwaway
+  `examples/migrate_qdrant.rs`, `git rm`'d after its one run.
 - **Lance crates**: git dependencies pinned to tag `v7.0.0-beta.8` (`lance`,
   `lance-table`, `lance-io`, `lance-encoding`, `lance-index`, `lance-namespace`,
   `lance-namespace-impls`). The 7.x beta line is not published to crates.io (latest
@@ -85,8 +86,8 @@ The MCP surface a Claude session sees must match `kb` behavior:
   `debug!` / `info!` / `warn!` / `error!`) go through `tracing` everywhere; the
   `tracing-subscriber` is initialized exactly once in `main.rs` (env-filter via
   `RUST_LOG` / `POND_LOG`, always writes to stderr) - no per-module setup. Program
-  output - the actual result of a verb (search hits, `pond status`, `pond versions
-  list`) - is NOT logging and never goes through `tracing`; it is written by a single
+  output - the actual result of a verb (search hits, `pond status`) - is NOT logging
+  and never goes through `tracing`; it is written by a single
   `output` helper that is the sole `print_stdout` site and the one place that branches
   CLI human-readable vs MCP JSON-RPC frame. No ad-hoc `println!` anywhere else. This
   is what keeps the stdout-vs-stderr discipline (design.md 2.1.1) honest: results on
@@ -138,8 +139,6 @@ the git-pinned `v7.0.0-beta.8` tag (the 7.x beta line is not published to crates
   | `rmcp` | `1.7` | `features = ["transport-io", "transport-streamable-http-server"]` - stdio for `pond mcp`, streamable-HTTP for the `pond serve` `/mcp` route (`server` + `macros` arrive via default features). Pin `"1.7"`. |
   | `fastembed` | `5.13.4` | `default-features = false` - the defaults pull onnxruntime binary downloads + the image-model stack, none of which pond's Qwen3/candle path uses. Feature set is target-split for Metal - see "Target-specific dependencies" below. |
   | `candle-core` | `0.10.2` | direct dep: pond constructs `Device` / `DType` to pass into `Qwen3TextEmbedding::from_hf` (fastembed does not re-export them). Version MUST match fastembed 5.13.4's transitive `candle-core` for type identity. |
-  | `tokenizers` | `0.22` | MUST match fastembed 5.13.4's transitive `tokenizers` (0.22.2): pond builds its own `Tokenizer` and passes it into `Qwen3TextEmbedding::new`, so the type identity must match. Latest is 0.23.1 but pond deliberately does not use it. |
-  | `reqwest` | `0.13` | dev-dependency only, for `examples/migrate_qdrant.rs` |
 
   **Target-specific dependencies (macOS Metal acceleration, day-one).** `fastembed`'s
   `metal` feature enables `candle-core/metal`, which pulls Apple-only crates
@@ -249,7 +248,7 @@ buffer, `merge_insert` on canonical PKs, Blob v2.
   the stage is dogfoodable from the CLI.
 
 **Tests** (`tests/conformance.rs`):
-- Round-trip: ingest each of the 3 `claude-code` fixtures, read back via `pond_get`,
+- Round-trip: ingest each of the `claude-code` fixtures, read back via `pond_get`,
   assert structural equivalence with a re-parse of the source (design.md 3.5).
 - Idempotency double-run: ingest the same fixture twice; second run reports all
   `matched`, zero `inserted`; dataset row counts unchanged.
@@ -258,7 +257,7 @@ buffer, `merge_insert` on canonical PKs, Blob v2.
 - Blob v2: a FilePart payload round-trips through the `parts.data` column.
 
 **Done when**:
-- All `tests/conformance.rs` cases pass on the 3 real fixtures.
+- All `tests/conformance.rs` cases pass on the real `claude-code` fixtures.
 - `pond ingest --from claude-code --data-dir <tmp>` against a copy of
   `~/.claude/projects/` completes without `no silent drops` violations.
 - `pond_get` returns a full session and a message-with-context correctly.
@@ -278,17 +277,31 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
 **Build** (`lib.rs` inline modules + `embed.rs`):
 - `embed.rs` - the embedding worker: fastembed-rs `Qwen3TextEmbedding::from_hf` (the
   `qwen3` / candle path), constructed with a pond-built `candle_core::Device` and
-  `DType::F32`. Device selection is a `#[cfg(target_os = "macos")]` split:
+  `DType::BF16` (Qwen3 ships bf16 weights; loading as bf16 rather than upconverting to
+  f32 halves resident memory at no quality cost). Device selection is a
+  `#[cfg(target_os = "macos")]` split:
   `Device::new_metal(0).unwrap_or(Device::Cpu)` on macOS (Metal GPU, day-one),
-  `Device::Cpu` elsewhere; the selected device is logged at startup. pond-owned
-  `tokenizers::Tokenizer` for the token-aware chunker (1024-token chunks, 128
-  overlap), deterministic chunking, writes `embeddings` rows with denormalized filter
-  columns (3.2.4). The worker is the embedding stage of `pond ingest` - there is no
-  separate verb; a message is either fully in (parsed, stored, embedded, searchable)
-  or not in at all. Reads `messages.search_text` directly - no second concat path.
-  **Batching is load-bearing**: the worker batches chunks across messages and calls
+  `Device::Cpu` elsewhere; the selected device is logged at startup.
+  **One embedding vector per message - no chunking.** Measured against the real
+  `~/.claude/projects/` corpus (689,702 messages): `search_text` is 20 tokens at the
+  median and ~98% of messages are under 1024 tokens. Chunking would multiply
+  `embeddings` rows for the ~2% of messages that exceed a chunk size, only to have
+  search dedup them straight back to one hit per message - work done purely to be
+  undone. So the worker embeds each message's `search_text` whole, capped to a
+  4096-token prefix: `max_embed_tokens` is passed as the `Qwen3TextEmbedding::from_hf`
+  tokenizer `max_length`, so fastembed truncates input past it before inference - pond
+  owns no tokenizer of its own. The cap is a model-cost bound on the ~1% of
+  messages past p99 (and on the rare multi-100k-token outlier), not a quality knob -
+  the full uncapped `search_text` still goes to the BM25/FTS index, and the full
+  message is always retrievable via `pond_get`. Truncation is deterministic: the same
+  `search_text` always yields the same capped input. The worker writes `embeddings`
+  rows with denormalized filter columns (3.2.4). It is the embedding stage of
+  `pond ingest` - there is no separate verb; a message is either fully in (parsed,
+  stored, embedded, searchable) or not in at all. Reads `messages.search_text`
+  directly - no second concat path.
+  **Batching is load-bearing**: the worker batches messages and calls
   `Qwen3TextEmbedding::embed(&[...])` with a non-singleton slice whenever more than
-  one chunk is pending; it never does one message/chunk -> one model call. The local
+  one message is pending; it never does one message -> one model call. The local
   fastembed reference is `~/pjv/anush008/fastembed-rs/src/models/qwen3.rs`
   (`Qwen3TextEmbedding::embed` builds one tokenizer/model batch from `texts: &[S]`).
   Note: that same file also carries the Qwen3-VL (vision) variant with its own
@@ -297,7 +310,7 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   On Metal this is especially important: per-call GPU dispatch overhead dominates
   batch-size-1 inference. The embedding row write path follows the same rule as Stage
   1 Lance ingest: write RecordBatches of embedding rows, never one `merge_insert` /
-  commit per chunk.
+  commit per message.
 - `mod search` - the `pond_search` handler: vector kNN + BM25 FTS retrievers, each
   with `Scanner::prefilter(true)` (load-bearing - design.md 3.3 implementation note),
   RRF merge on `message_id` (k=60), recency boost (3.3 formula), `min_score`
@@ -333,16 +346,18 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   files cannot be ingested until those adapters ship - out of v1 scope.)
 - `group_by_conversation` collapses to one summary per session with correct
   `best_score` / `message_count`.
-- Determinism: same `(model_id, search_text)` produces identical chunks across runs.
+- Determinism: token-capping is deterministic - the same `search_text` truncates to
+  the same 4096-token prefix every run, so an unchanged message always re-embeds to a
+  stable vector and re-ingest is a no-op.
 - Embedding batching guard: a fake/instrumented embedder records call sizes while the
-  worker processes multiple messages/chunks; the test fails if it observes a sequence
-  of batch-size-1 calls when more than one chunk was available. A companion write test
-  asserts embedding rows are submitted to Lance in batches, not committed per chunk.
+  worker processes multiple messages; the test fails if it observes a sequence of
+  batch-size-1 calls when more than one message was available. A companion write test
+  asserts embedding rows are submitted to Lance in batches, not committed per message.
 
 **Tests are one suite - fast, always-run, no model.** There is no tiered split and
 nothing is `#[ignore]`d. Every test runs on every `cargo test` and in the single CI
 job; the whole suite finishes in seconds. The Qwen3 weights are never downloaded in a
-test: the chunker runs against a toy tokenizer, the embedding worker against the
+test: the token-cap logic runs against a toy tokenizer, the embedding worker against the
 instrumented `FakeBackend`, and the prefilter / vector-index tests against synthetic
 `embeddings` rows written directly.
 
@@ -366,10 +381,14 @@ with a comment justifying the number - never a guessed volume.
 - All filters verified.
 - `pond ingest` populates `embeddings` in the same pass that stores messages - not a
   separate step.
+- One embedding row per message per model - no chunking. `search_text` is embedded
+  whole, truncated to a 4096-token prefix only for the ~1% of messages that exceed it.
+  The `embeddings` table has exactly one row per embedded message per model (the
+  `chunk_index` PK component from the original schema is therefore gone).
 - The embedding worker demonstrably batches both model inference and Lance writes:
-  multiple pending chunks produce batched `Qwen3TextEmbedding::embed(&[...])` calls and
-  batched embedding-row writes. Per-message/per-chunk model calls or per-chunk Lance
-  commits are not acceptable Stage 2 implementations.
+  multiple pending messages produce batched `Qwen3TextEmbedding::embed(&[...])` calls
+  and batched embedding-row writes. One model call per message, or one Lance commit
+  per message, is not an acceptable Stage 2 implementation.
 - On macOS the embedding worker runs on the Metal device - asserted (the selected
   device is `Metal`, not the `Cpu` fallback) and logged. On Linux it runs on CPU.
 - Vector-index activation is verified with synthetic `embeddings` rows written
@@ -394,10 +413,9 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 
 **Build** (`transport.rs` + `main.rs` + `substrate.rs`):
 - `transport.rs::http` - axum server: `POST /v1/search`, `/v1/get`, `/v1/ingest` as
-  thin adapters over the wire handlers; `GET /v1/sessions/{id}/events` SSE (catch-up
-  reads per 3.6.5, `axum::response::sse` with 15s keepalive); the `/mcp` route
-  carrying rmcp's streamable-HTTP MCP transport. Binds `127.0.0.1:9797`, env
-  overrides, `--port 0` support, `0.0.0.0` security notice (2.1.1).
+  thin adapters over the wire handlers; the `/mcp` route carrying rmcp's
+  streamable-HTTP MCP transport. Binds `127.0.0.1:9797`, env overrides, `--port 0`
+  support, `0.0.0.0` security notice (2.1.1).
 - `transport.rs::mcp` - the rmcp MCP layer, transport-agnostic: exposes `pond_search`
   / `pond_get` / `pond_ingest` tools and `schema://pond` / `stats://pond` resources as
   thin adapters over the same wire handlers, mounted both on the `/mcp` HTTP route
@@ -408,24 +426,21 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
   normally (stdout = output, stderr = tracing). `pond mcp` runs a stdio MCP server
   only and routes ALL logging - tracing, diagnostics, everything - to stderr; stdout
   is reserved exclusively for JSON-RPC frames (design.md 2.1.1).
-- `mod config` (in `lib.rs`) - full `config.toml` schema + load/validate,
-  `pond config --print-schema` (2.1.1).
+- `config.rs` (scaffolded in Stage 2 with the embedding registry) - extend to the
+  full `config.toml` schema + load/validate, `pond config --print-schema` (2.1.1).
 - `substrate.rs` - the maintenance task: `cleanup_old_versions` + `optimize_indices`
   background tokio task spawned by `pond serve`, `[maintenance]` config block, and the
   `pond maintenance` one-shot verb (3.2.0).
-- `main.rs` - remaining CLI verbs: `pond serve` (HTTP + `/mcp`), `pond mcp` (stdio MCP
-  only), and admin verbs `pond versions list`, `pond checkout <version>`,
-  `pond restore <version> --force` (3.6, mapping to Lance `versions()` /
-  `checkout_version()` / `restore()`). `pond serve` and `pond mcp` load the embedding
-  model at startup - it is required to embed search queries - so a missing or broken
-  model fails loudly at boot, not on the first search.
+- `main.rs` - remaining CLI verbs: `pond serve` (HTTP + `/mcp`) and `pond mcp` (stdio
+  MCP only). Both load the embedding model at startup - it is required to embed search
+  queries - so a missing or broken model fails loudly at boot, not on the first
+  search. (Time-travel admin verbs - `pond versions list` / `checkout` / `restore` -
+  are deferred to design.md section 4; v1 recovery is re-ingest.)
 
 **Tests**:
 - HTTP integration: each `POST /v1/<op>` round-trips against a real ingested dataset;
   error envelope shapes (3.6.1) verified for `validation_failed`, `not_found`,
   `version_unsupported`.
-- SSE: `GET /v1/sessions/{id}/events` streams `session` / `message` / `end` events in
-  canonical order; `since` resume works.
 - MCP integration: drive the rmcp stdio server, call `pond_search` and `pond_get`,
   assert the responses match the kb parity contract (including placeholder rendering).
 - Maintenance: the task runs `cleanup_old_versions` + `optimize_indices` without
@@ -434,11 +449,11 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 **Done when**:
 - `pond serve` runs; HTTP and MCP both answer over the same handlers.
 - The MCP `pond_search` / `pond_get` behavior matches the kb parity contract.
-- Maintenance task verified; admin verbs work against a real dataset.
+- Maintenance task verified.
 - clippy + fmt + CI green.
 
 **design.md coverage**: 2.1.1 personal defaults, 2.2 wire interface, 3.2.0 maintenance,
-3.6 wire operations (HTTP + MCP + CLI + admin verbs), 3.6.5 SSE.
+3.6 wire operations (HTTP + MCP + CLI).
 
 ---
 
@@ -497,6 +512,7 @@ replacing `kb` in the MCP config.
 `.jsonl` is gone from disk - the only data Stage 4 cannot recover.
 
 **Build** (throwaway):
+- Add `reqwest` as a dev-dependency (the Qdrant HTTP client) - removed with the script.
 - `examples/migrate_qdrant.rs` - a one-off script:
   1. Enumerate `session_id`s already present in pond's `sessions` dataset.
   2. Read kb's Qdrant store; for each session NOT already in pond, project its records
@@ -524,9 +540,10 @@ surface.
 
 Per `design.md` section 4, all of these stay deferred and are NOT in any stage above:
 additional source adapters (Codex, OpenCode, etc.), cross-provider replay,
-live-write tools, the resources application, wire-fidelity capture, hosted-tier facade
-extensions, graph traversal, AuditSink, EventBus, SecretsRedactor, remote embedding
-providers, nested namespaces, wire-surfaced time-travel, FilePart content-hash dedup.
+live-write tools, session-event SSE streaming, the resources application,
+wire-fidelity capture, hosted-tier facade extensions, graph traversal, AuditSink,
+EventBus, SecretsRedactor, remote embedding providers, nested namespaces, time-travel
+(admin verbs and the wire API), FilePart content-hash dedup.
 
 The hosted deployment (object-store URL, opaque namespaces) is *designed for* by the
 code written in Stages 1-3 - namespace is a wire field and a storage-path prefix from

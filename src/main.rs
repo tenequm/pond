@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pond::{
     adapter::{Adapter, ClaudeCodeAdapter},
     config::{Config, DEFAULT_CONFIG_TOML, known_model_download_mb},
-    embed::{EmbedBackend, EmbedWorker, Qwen3Embedder, load_tokenizer, model_is_cached},
+    embed::{EmbedBackend, EmbedWorker, Qwen3Embedder, model_is_cached},
     substrate::PondStore,
 };
 use tracing_subscriber::{EnvFilter, fmt};
@@ -100,13 +100,13 @@ async fn main() -> anyhow::Result<()> {
                 None => config.embeddings.default_model(&namespace)?,
             };
 
-            if model_is_cached(&model.fastembed_code) {
+            if model_is_cached(model.load_repo()) {
                 output(&format!(
                     "model:    {} (present, skipping download)",
                     model.id
                 ))?;
             } else {
-                let size = known_model_download_mb(&model.fastembed_code)
+                let size = known_model_download_mb(model.load_repo())
                     .map_or_else(|| "unknown size".to_owned(), |mb| format!("~{mb} MB"));
                 output(&format!(
                     "model:    {} (not cached - downloading {size} to the HuggingFace cache)",
@@ -170,20 +170,16 @@ async fn main() -> anyhow::Result<()> {
             // Embedding is part of ingest: a message is either fully in the
             // system - parsed, stored, indexed, searchable - or not in at all.
             let embedder = Qwen3Embedder::load(&model)?;
-            let tokenizer = load_tokenizer(&model.fastembed_code)?;
-            let embed = EmbedWorker::new(&store, &embedder, &tokenizer, &model)?
-                .run()
-                .await?;
+            let embed = EmbedWorker::new(&store, &embedder, &model)?.run().await?;
             store.ensure_embedding_indices(&model).await?;
 
             output(&format!(
-                "accepted={} inserted={} matched={} errors={} embedded={} chunks={}",
+                "accepted={} inserted={} matched={} errors={} embedded={}",
                 ingest.accepted(),
                 ingest.inserted,
                 ingest.matched,
                 ingest.errors,
                 embed.messages,
-                embed.chunks,
             ))?;
         }
     }

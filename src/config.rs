@@ -22,22 +22,20 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # file and pond still works. Uncomment and edit to override.
 
 # Register or tune an embedding model. pond validates each entry against its
-# known-model set (loader code, dimension, distance metric).
+# known-model set (model id, dimension, distance metric).
 #
 # [[embeddings.models]]
 # id = \"Qwen/Qwen3-Embedding-0.6B\"
-# fastembed_code = \"Qwen/Qwen3-Embedding-0.6B\"
 # dim = 1024
-# chunk_size_tokens = 1024
-# chunk_overlap_tokens = 128
+# max_embed_tokens = 4096
 # num_sub_vectors = 64
 # distance = \"cosine\"
 # normalize = true
 # default = true
 #
-# Per-namespace chunking / IVF overrides (immutable fields cannot be overridden):
+# Per-namespace tunable overrides (immutable fields cannot be overridden):
 # [embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]
-# chunk_size_tokens = 512
+# max_embed_tokens = 2048
 ";
 
 /// Top-level `config.toml` shape. Only `[embeddings]` is wired in v1.
@@ -64,14 +62,18 @@ pub struct EmbeddingsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingModel {
-    /// Registry id, also the `model_id` PK component on the `embeddings` table.
+    /// Registry id and the `model_id` PK component on the `embeddings` table.
+    /// Doubles as the HuggingFace repo passed to the loader - see `load_repo`,
+    /// which strips any `@revision` suffix used for cache invalidation.
     pub id: String,
-    /// Loader code: the HuggingFace repo id passed to `Qwen3TextEmbedding::from_hf`.
-    pub fastembed_code: String,
     /// Output vector dimension. Must match the known model's actual dim.
     pub dim: u32,
-    pub chunk_size_tokens: usize,
-    pub chunk_overlap_tokens: usize,
+    /// Token cap on the text embedded per message. One message produces one
+    /// vector; the model's own ceiling is far higher, but a longer input still
+    /// collapses into a single vector, so this caps embed cost for the rare
+    /// giant message. Enforced as the tokenizer `max_length` at model load -
+    /// the full `search_text` still goes to the BM25 index uncapped.
+    pub max_embed_tokens: usize,
     /// IVF_PQ `num_sub_vectors` for this model's vector index.
     pub num_sub_vectors: usize,
     #[serde(default = "default_distance")]
@@ -83,13 +85,12 @@ pub struct EmbeddingModel {
 }
 
 /// Per-namespace tunable overrides. Immutable fields (`dim`, `distance`,
-/// `normalize`, `fastembed_code`) cannot be overridden - they would invalidate
-/// stored vectors (design.md 3.2.4).
+/// `normalize`) cannot be overridden - they would invalidate stored vectors
+/// (design.md 3.2.4).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingOverride {
-    pub chunk_size_tokens: Option<usize>,
-    pub chunk_overlap_tokens: Option<usize>,
+    pub max_embed_tokens: Option<usize>,
     pub num_sub_vectors: Option<usize>,
 }
 
@@ -101,7 +102,7 @@ pub enum Distance {
     Dot,
 }
 
-/// A model pond knows how to load: the validation set for `fastembed_code`.
+/// A model pond knows how to load: the validation set for a model's load repo.
 struct KnownModel {
     code: &'static str,
     dim: u32,
@@ -120,11 +121,11 @@ const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
     download_mb: 1190,
 }];
 
-/// Approximate first-download size in MB for a known model's loader code.
-pub fn known_model_download_mb(fastembed_code: &str) -> Option<u32> {
+/// Approximate first-download size in MB for a known model's load repo.
+pub fn known_model_download_mb(repo: &str) -> Option<u32> {
     KNOWN_MODELS
         .iter()
-        .find(|known| known.code == fastembed_code)
+        .find(|known| known.code == repo)
         .map(|known| known.download_mb)
 }
 
@@ -163,15 +164,21 @@ impl EmbeddingModel {
     pub fn qwen3_default() -> Self {
         Self {
             id: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
-            fastembed_code: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
             dim: 1024,
-            chunk_size_tokens: 1024,
-            chunk_overlap_tokens: 128,
+            max_embed_tokens: 4096,
             num_sub_vectors: 64,
             distance: Distance::Cosine,
             normalize: true,
             default: true,
         }
+    }
+
+    /// The HuggingFace repo id to load: `id` with any `@revision` suffix stripped.
+    /// `id` itself stays the logical identity (registry key + `model_id` PK).
+    pub fn load_repo(&self) -> &str {
+        self.id
+            .split_once('@')
+            .map_or(self.id.as_str(), |(repo, _)| repo)
     }
 }
 
@@ -213,7 +220,7 @@ impl EmbeddingsConfig {
     }
 
     /// Validate the resolved registry against pond's known-model set: unknown
-    /// loader code, dim mismatch, unsupported distance, or not exactly one
+    /// load repo, dim mismatch, unsupported distance, or not exactly one
     /// `default = true` entry all fail startup with a clear error (design.md 3.2.4).
     pub fn validate(&self) -> Result<()> {
         if self.models.is_empty() {
@@ -222,12 +229,12 @@ impl EmbeddingsConfig {
         for model in &self.models {
             let known = KNOWN_MODELS
                 .iter()
-                .find(|known| known.code == model.fastembed_code)
+                .find(|known| known.code == model.load_repo())
                 .with_context(|| {
                     format!(
-                        "embedding model {:?} uses unknown loader code {:?}; known codes: {}",
+                        "embedding model {:?} uses unknown load repo {:?}; known repos: {}",
                         model.id,
-                        model.fastembed_code,
+                        model.load_repo(),
                         KNOWN_MODELS
                             .iter()
                             .map(|known| known.code)
@@ -253,12 +260,10 @@ impl EmbeddingsConfig {
                     known.distance,
                 );
             }
-            if model.chunk_overlap_tokens >= model.chunk_size_tokens {
+            if model.max_embed_tokens == 0 {
                 bail!(
-                    "embedding model {:?} chunk_overlap_tokens ({}) must be < chunk_size_tokens ({})",
+                    "embedding model {:?} max_embed_tokens must be greater than 0",
                     model.id,
-                    model.chunk_overlap_tokens,
-                    model.chunk_size_tokens,
                 );
             }
         }
@@ -300,11 +305,8 @@ impl EmbeddingsConfig {
             .get(namespace)
             .and_then(|models| models.get(&model.id))
         {
-            if let Some(value) = over.chunk_size_tokens {
-                model.chunk_size_tokens = value;
-            }
-            if let Some(value) = over.chunk_overlap_tokens {
-                model.chunk_overlap_tokens = value;
+            if let Some(value) = over.max_embed_tokens {
+                model.max_embed_tokens = value;
             }
             if let Some(value) = over.num_sub_vectors {
                 model.num_sub_vectors = value;

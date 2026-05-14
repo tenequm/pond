@@ -87,7 +87,6 @@ pub fn embedding_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         primary_field("message_id", DataType::Utf8, false),
         primary_field("model_id", DataType::Utf8, false),
-        primary_field("chunk_index", DataType::Int32, false),
         Field::new("vector", embedding_vector_type(), false),
         Field::new("session_id", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
@@ -131,13 +130,13 @@ pub struct MessageBatchRow<'a> {
     pub search_text: Option<&'a str>,
 }
 
-/// One row of the `embeddings` dataset: a (Message, model, chunk) vector with
-/// the filter columns denormalized from `messages` (design.md 3.2.4).
+/// One row of the `embeddings` dataset: a (message, model) vector with the
+/// filter columns denormalized from `messages` (design.md 3.2.4). One message
+/// produces exactly one vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingRow {
     pub message_id: String,
     pub model_id: String,
-    pub chunk_index: i32,
     pub vector: Vec<f32>,
     pub session_id: String,
     pub source_agent: String,
@@ -186,9 +185,6 @@ pub fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
                 rows.iter()
                     .map(|row| row.model_id.as_str())
                     .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int32Array::from(
-                rows.iter().map(|row| row.chunk_index).collect::<Vec<_>>(),
             )),
             Arc::new(vectors),
             Arc::new(StringArray::from(
