@@ -14,6 +14,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::embed::DEFAULT_BATCH_TOKEN_SQ_BUDGET;
+
 /// Default `config.toml` body written by `pond setup`. Every line is commented:
 /// pond ships built-in defaults, so the file is purely a discoverable template.
 pub const DEFAULT_CONFIG_TOML: &str = "\
@@ -28,7 +30,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [[embeddings.models]]
 # id = \"Qwen/Qwen3-Embedding-0.6B\"
 # dim = 1024
-# max_embed_tokens = 4096
+# max_embed_tokens = 1024
 # num_sub_vectors = 64
 # distance = \"cosine\"
 # normalize = true
@@ -233,7 +235,11 @@ impl EmbeddingModel {
         Self {
             id: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
             dim: 1024,
-            max_embed_tokens: 4096,
+            // ~98% of the measured corpus is under 1024 tokens (plan.md Stage
+            // 2); the tail is truncated for the vector but kept whole in
+            // BM25/FTS and `pond_get`. 1024 also keeps the per-message embed
+            // cost tiny - see `DEFAULT_BATCH_TOKEN_SQ_BUDGET`.
+            max_embed_tokens: 1024,
             num_sub_vectors: 64,
             distance: Distance::Cosine,
             normalize: true,
@@ -329,11 +335,18 @@ impl EmbeddingsConfig {
                     known.distance,
                 );
             }
-            if model.max_embed_tokens == 0 {
-                bail!(
-                    "embedding model {:?} max_embed_tokens must be greater than 0",
-                    model.id,
-                );
+            check_max_embed_tokens(model.max_embed_tokens, &model.id)?;
+        }
+        // Namespace overrides can raise `max_embed_tokens` after the base
+        // registry is validated, so they must clear the same ceiling.
+        for (namespace, models) in &self.overrides {
+            for (model_id, over) in models {
+                if let Some(value) = over.max_embed_tokens {
+                    check_max_embed_tokens(
+                        value,
+                        &format!("{model_id} (override for namespace {namespace:?})"),
+                    )?;
+                }
             }
         }
         match self.models.iter().filter(|model| model.default).count() {
@@ -387,4 +400,25 @@ impl EmbeddingsConfig {
 
 fn builtin_models() -> Vec<EmbeddingModel> {
     vec![EmbeddingModel::qwen3_default()]
+}
+
+/// Validate one `max_embed_tokens` value. Beyond a non-zero check, it must be
+/// small enough that a single message's attention cost (`max_embed_tokens^2`)
+/// fits one embedding batch's budget: cost-aware batching keeps a long message
+/// out of an oversized batch, but it cannot split a single message, so a
+/// message that does not fit a batch on its own would risk an out-of-memory
+/// inference pass. `label` identifies the offending registry entry or override.
+fn check_max_embed_tokens(value: usize, label: &str) -> Result<()> {
+    if value == 0 {
+        bail!("embedding model {label:?} max_embed_tokens must be greater than 0");
+    }
+    let cost = value.saturating_mul(value);
+    if cost > DEFAULT_BATCH_TOKEN_SQ_BUDGET {
+        bail!(
+            "embedding model {label:?} max_embed_tokens {value} is too large: a single \
+             message would cost {cost} token^2, over the {DEFAULT_BATCH_TOKEN_SQ_BUDGET} \
+             per-batch budget - a message must fit one embedding batch on its own"
+        );
+    }
+    Ok(())
 }

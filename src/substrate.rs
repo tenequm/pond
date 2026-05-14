@@ -379,8 +379,9 @@ impl PondStore {
         ))
     }
 
-    /// Merge-insert embedding rows keyed on `(message_id, model_id)`.
-    /// Re-running over already-embedded messages is a no-op for matched rows.
+    /// Merge-insert embedding rows keyed on `(message_id, model_id,
+    /// max_embed_tokens)`. Re-running over already-embedded messages is a no-op
+    /// for matched rows.
     pub async fn upsert_embeddings(&self, rows: &[EmbeddingRow]) -> Result<Vec<UpsertStatus>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -400,15 +401,25 @@ impl PondStore {
         .await
     }
 
-    /// The set of `message_id`s that already have `embeddings` rows for
-    /// `model_id`. IDs only - the large `search_text` payload is never
-    /// materialized here, so peak memory is the id-set, not the corpus. The
-    /// embed worker anti-joins this against [`pending_messages_stream`].
-    pub async fn embedded_message_ids(&self, model_id: &str) -> Result<HashSet<String>> {
+    /// The set of `message_id`s that already have `embeddings` rows for this
+    /// `(model_id, max_embed_tokens)` identity. IDs only - the large
+    /// `search_text` payload is never materialized here, so peak memory is the
+    /// id-set, not the corpus. The embed worker anti-joins this against
+    /// [`pending_messages_stream`]. `max_embed_tokens` is part of the match: a
+    /// vector embedded under a different cap is a different vector, so it must
+    /// not suppress a re-embed under the current cap.
+    pub async fn embedded_message_ids(
+        &self,
+        model_id: &str,
+        max_embed_tokens: i32,
+    ) -> Result<HashSet<String>> {
         let mut cached = self.datasets.embeddings.lock().await;
         let dataset = cached.latest().await?;
         let mut scanner = dataset.scan();
-        scanner.filter(&format!("model_id = {}", sql_string(model_id)))?;
+        scanner.filter(&format!(
+            "model_id = {} AND max_embed_tokens = {max_embed_tokens}",
+            sql_string(model_id),
+        ))?;
         scanner.project(&["message_id"])?;
         let mut stream = scanner.try_into_stream().await?;
         let mut set = HashSet::new();
@@ -479,21 +490,24 @@ impl PondStore {
     }
 
     /// Vector kNN retriever over `embeddings.vector`. Returns
-    /// `(message_id, distance)` pairs, lower distance better. Each message has
-    /// exactly one vector, so the returned `message_id`s are distinct.
+    /// `(message_id, distance)` pairs, lower distance better. The scan is scoped
+    /// to one `(model_id, max_embed_tokens)` embedding identity - the table can
+    /// hold multiple rows per message (per model, per cap), but a search only
+    /// ranks vectors from the model that produced the query, so each returned
+    /// `message_id` is distinct.
     pub async fn vector_search(
         &self,
         query: &[f32],
         limit: usize,
         filter: &str,
+        model_id: &str,
+        max_embed_tokens: i32,
     ) -> Result<Vec<(String, f32)>> {
         let mut cached = self.datasets.embeddings.lock().await;
         let dataset = cached.latest().await?;
         let mut scanner = dataset.scan();
         scanner.prefilter(true);
-        if !filter.is_empty() {
-            scanner.filter(filter)?;
-        }
+        scanner.filter(&embedding_identity_filter(model_id, max_embed_tokens, filter))?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         scanner.project(&["message_id"])?;
@@ -515,14 +529,14 @@ impl PondStore {
         query: &[f32],
         limit: usize,
         filter: &str,
+        model_id: &str,
+        max_embed_tokens: i32,
     ) -> Result<String> {
         let mut cached = self.datasets.embeddings.lock().await;
         let dataset = cached.latest().await?;
         let mut scanner = dataset.scan();
         scanner.prefilter(true);
-        if !filter.is_empty() {
-            scanner.filter(filter)?;
-        }
+        scanner.filter(&embedding_identity_filter(model_id, max_embed_tokens, filter))?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         scanner
@@ -961,15 +975,43 @@ async fn open_or_create(
 ) -> Result<Dataset> {
     let uri = path.to_string_lossy().into_owned();
     if path.exists() {
-        Dataset::open(&uri)
+        let dataset = Dataset::open(&uri)
             .await
-            .with_context(|| format!("failed to open dataset {uri}"))
+            .with_context(|| format!("failed to open dataset {uri}"))?;
+        ensure_schema_matches(&dataset, &schema, &uri)?;
+        Ok(dataset)
     } else {
         let reader = datasets::empty_reader(schema)?;
         Dataset::write(reader, &uri, Some(datasets::write_params()))
             .await
             .with_context(|| format!("failed to create dataset {uri}"))
     }
+}
+
+/// Reject an existing dataset whose on-disk column set no longer matches the
+/// schema this pond build expects (e.g. a store written before a schema
+/// change). pond does not migrate datasets in place, so fail here with the
+/// clear remedy - delete the data dir and re-`pond ingest` - rather than
+/// letting a later scan or merge-insert die on a raw column-not-found error.
+fn ensure_schema_matches(
+    dataset: &Dataset,
+    expected: &lance::deps::arrow_schema::Schema,
+    uri: &str,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
+    let actual_names: BTreeSet<&str> =
+        actual.fields().iter().map(|f| f.name().as_str()).collect();
+    let expected_names: BTreeSet<&str> =
+        expected.fields().iter().map(|f| f.name().as_str()).collect();
+    if actual_names != expected_names {
+        anyhow::bail!(
+            "dataset {uri} has columns {actual_names:?} but this pond build expects \
+             {expected_names:?} - the on-disk store predates a schema change; delete the \
+             data directory and re-run `pond ingest`",
+        );
+    }
+    Ok(())
 }
 
 /// Scalar indexes on `messages` (design.md 3.2.2): BTREE for high-cardinality
@@ -1076,6 +1118,23 @@ pub fn sql_like_contains(value: &str) -> String {
         .replace('_', "\\_")
         .replace('\'', "''");
     format!("'%{escaped}%'")
+}
+
+/// The `embeddings`-table scan predicate scoped to one embedding identity.
+/// Vector search must only ever rank rows for the model + cap that produced the
+/// query vector - the table can hold other `(model_id, max_embed_tokens)` rows
+/// for the same message. `extra` is the caller's user-filter predicate, ANDed
+/// on when non-empty.
+fn embedding_identity_filter(model_id: &str, max_embed_tokens: i32, extra: &str) -> String {
+    let identity = format!(
+        "model_id = {} AND max_embed_tokens = {max_embed_tokens}",
+        sql_string(model_id),
+    );
+    if extra.is_empty() {
+        identity
+    } else {
+        format!("{identity} AND {extra}")
+    }
 }
 
 fn sql_in(column: &str, values: &[String]) -> String {

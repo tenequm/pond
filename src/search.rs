@@ -89,7 +89,13 @@ async fn run_search(
         SearchMode::Vector => {
             let vector = embed_query(embedder, &query)?;
             let hits = store
-                .vector_search(&vector, pool.saturating_mul(2), &filter)
+                .vector_search(
+                    &vector,
+                    pool.saturating_mul(2),
+                    &filter,
+                    embedder.model_id(),
+                    embedder.max_embed_tokens(),
+                )
                 .await
                 .map_err(storage_error)?;
             normalize_vector(hits)
@@ -106,7 +112,13 @@ async fn run_search(
             };
             let vector_fut = async {
                 store
-                    .vector_search(&vector, pool.saturating_mul(2), &filter)
+                    .vector_search(
+                        &vector,
+                        pool.saturating_mul(2),
+                        &filter,
+                        embedder.model_id(),
+                        embedder.max_embed_tokens(),
+                    )
                     .await
                     .map_err(storage_error)
             };

@@ -43,6 +43,14 @@ impl EmbedBackend for FakeBackend {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn model_id(&self) -> &str {
+        "Qwen/Qwen3-Embedding-0.6B"
+    }
+
+    fn max_embed_tokens(&self) -> i32 {
+        1024
+    }
 }
 
 fn fake_vector(text: &str, dim: usize) -> Vec<f32> {

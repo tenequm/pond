@@ -20,3 +20,4 @@ Thumbs.db
 tmp/
 .claude/*local.json
 .agents/
+/benches/corpus/

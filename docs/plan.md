@@ -291,29 +291,45 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   `embeddings` rows for the ~2% of messages that exceed a chunk size, only to have
   search dedup them straight back to one hit per message - work done purely to be
   undone. So the worker embeds each message's `search_text` whole, capped to a
-  4096-token prefix: `max_embed_tokens` is passed as the `Qwen3TextEmbedding::from_hf`
+  1024-token prefix: `max_embed_tokens` is passed as the `Qwen3TextEmbedding::from_hf`
   tokenizer `max_length`, so fastembed truncates input past it before inference - pond
-  owns no tokenizer of its own. The cap is a model-cost bound on the ~1% of
-  messages past p99 (and on the rare multi-100k-token outlier), not a quality knob -
-  the full uncapped `search_text` still goes to the BM25/FTS index, and the full
-  message is always retrievable via `pond_get`. Truncation is deterministic: the same
-  `search_text` always yields the same capped input. The worker writes `embeddings`
-  rows with denormalized filter columns (3.2.4). It is the embedding stage of
-  `pond ingest` - there is no separate verb; a message is either fully in (parsed,
-  stored, embedded, searchable) or not in at all. Reads `messages.search_text`
-  directly - no second concat path.
-  **Batching is load-bearing**: the worker batches messages and calls
-  `Qwen3TextEmbedding::embed(&[...])` with a non-singleton slice whenever more than
-  one message is pending; it never does one message -> one model call. The local
-  fastembed reference is `~/pjv/anush008/fastembed-rs/src/models/qwen3.rs`
-  (`Qwen3TextEmbedding::embed` builds one tokenizer/model batch from `texts: &[S]`).
-  Note: that same file also carries the Qwen3-VL (vision) variant with its own
-  `embed` / `embed_internal` - pond uses the text-only `Qwen3TextEmbedding::embed`,
-  not the VL impl.
-  On Metal this is especially important: per-call GPU dispatch overhead dominates
-  batch-size-1 inference. The embedding row write path follows the same rule as Stage
-  1 Lance ingest: write RecordBatches of embedding rows, never one `merge_insert` /
-  commit per message.
+  owns no tokenizer of its own. 1024 is the plan's measured ~98%-coverage breakpoint;
+  the cap is a model-cost bound on the ~2% of messages past it (and on the rare
+  multi-100k-token outlier), not a quality knob - the full uncapped `search_text`
+  still goes to the BM25/FTS index, and the full message is always retrievable via
+  `pond_get`. Truncation is deterministic: the same `search_text` always yields the
+  same capped input. The worker writes `embeddings` rows with denormalized filter
+  columns (3.2.4). It is the embedding stage of `pond ingest` - there is no separate
+  verb; a message is either fully in (parsed, stored, embedded, searchable) or not in
+  at all. Reads `messages.search_text` directly - no second concat path.
+  **Batching is load-bearing - and must be cost-aware, not count-only.** The worker
+  batches messages and calls `Qwen3TextEmbedding::embed(&[...])` with a non-singleton
+  slice whenever more than one message is pending; it never does one message -> one
+  model call. The local fastembed reference is
+  `~/pjv/anush008/fastembed-rs/src/models/qwen3.rs` (`Qwen3TextEmbedding::embed` builds
+  one tokenizer/model batch from `texts: &[S]`). Note: that same file also carries the
+  Qwen3-VL (vision) variant with its own `embed` / `embed_internal` - pond uses the
+  text-only `Qwen3TextEmbedding::embed`, not the VL impl.
+  A fixed-*count* batch is both a memory trap and a throughput trap, because
+  fastembed's tokenizer pads every batch to its longest member and fastembed's Qwen3
+  attention materializes the full `[batch, heads, seq, seq]` scores tensor. So one
+  long message in a count-sized batch (a) drags the short ones up to its length and
+  allocates tens of GB, and (b) makes the short ones each pay the long one's compute -
+  measured at ~86% wasted padding on a realistic corpus. The worker therefore does two
+  things. First, **length-bucketing**: pending messages are buffered into a window and
+  sorted by estimated token length before batching, so each batch holds
+  similar-length messages and pads to barely above their own length. This is the
+  `sentence-transformers` `SentenceTransformer.encode` technique; pond windows the
+  sort (it streams - peak memory is a window, not the corpus) and skips the un-sort
+  (embeddings are keyed by `(message_id, model_id)`, so order is irrelevant). Second,
+  a **cost budget** on `count * max_seq_len^2` (the attention tensor's dominant term),
+  with `count` only a secondary ceiling: even a length-homogeneous batch of long
+  messages is capped so the tensor stays bounded. The 1024 token cap keeps even a lone
+  max-length message cheap (`1024^2`), and `config` validation rejects any
+  `max_embed_tokens` whose single-message cost overflows the budget - cost-aware
+  batching cannot split one message. The embedding row write path follows the same
+  rule as Stage 1 Lance ingest: write RecordBatches of embedding rows, never one
+  `merge_insert` / commit per message.
 - `mod search` - the `pond_search` handler: vector kNN + BM25 FTS retrievers, each
   with `Scanner::prefilter(true)` (load-bearing - design.md 3.3 implementation note),
   RRF merge on `message_id` (k=60), recency boost (3.3 formula), `min_score`
@@ -354,10 +370,13 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   populated. Token-capping is enforced inside fastembed via the `from_hf` `max_length`
   parameter and is deterministic by construction, so pond owns no truncation logic of
   its own to test.
-- Embedding batching guard: a fake/instrumented embedder records call sizes while the
-  worker processes multiple messages; the test fails if it observes a sequence of
-  batch-size-1 calls when more than one message was available. A companion write test
-  asserts embedding rows are submitted to Lance in batches, not committed per message.
+- Embedding batching guard: a fake/instrumented embedder records each call's
+  `(count, max_byte_len)` while the worker processes multiple messages; one test fails
+  on a sequence of batch-size-1 calls when more than one short message was available,
+  a second test fails if a long message is ever co-batched (the cost budget must put
+  it in its own batch). A companion write test asserts embedding rows are submitted to
+  Lance in batches, not committed per message. Config validation rejects a
+  `max_embed_tokens` whose single-message cost overflows the batch budget.
 
 **Tests are one suite - fast, always-run, no model.** There is no tiered split and
 nothing is `#[ignore]`d. Every test runs on every `cargo test` and in the single CI
@@ -387,13 +406,16 @@ with a comment justifying the number - never a guessed volume.
 - `pond ingest` populates `embeddings` in the same pass that stores messages - not a
   separate step.
 - One embedding row per message per model - no chunking. `search_text` is embedded
-  whole, truncated to a 4096-token prefix only for the ~1% of messages that exceed it.
+  whole, truncated to a 1024-token prefix only for the ~2% of messages that exceed it.
   The `embeddings` table has exactly one row per embedded message per model (the
   `chunk_index` PK component from the original schema is therefore gone).
 - The embedding worker demonstrably batches both model inference and Lance writes:
   multiple pending messages produce batched `Qwen3TextEmbedding::embed(&[...])` calls
   and batched embedding-row writes. One model call per message, or one Lance commit
-  per message, is not an acceptable Stage 2 implementation.
+  per message, is not an acceptable Stage 2 implementation. Batching is by a cost
+  budget on `count * max_seq_len^2`, not count alone - a fixed-count batch padded to
+  a long message's length allocates a `[count, heads, seq, seq]` attention tensor of
+  tens of GB and wedges the process.
 - On macOS the embedding worker runs on the Metal device - asserted (the selected
   device is `Metal`, not the `Cpu` fallback) and logged. A default non-macOS build
   runs on CPU; a `--features cuda` build selects an NVIDIA GPU when present.

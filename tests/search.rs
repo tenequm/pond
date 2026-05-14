@@ -181,6 +181,7 @@ fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
             EmbeddingRow {
                 message_id: format!("msg-{i}"),
                 model_id: model_id.to_owned(),
+                max_embed_tokens: 1024,
                 vector,
                 session_id: format!("session-{}", i % 8),
                 source_agent: "claude-code".to_owned(),
@@ -210,7 +211,13 @@ async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow
 
     let query = vec![0.01_f32; EMBEDDING_DIM];
     let plan = store
-        .explain_vector_plan(&query, 10, "session_id = 'session-3'")
+        .explain_vector_plan(
+            &query,
+            10,
+            "session_id = 'session-3'",
+            &model.id,
+            model.max_embed_tokens as i32,
+        )
         .await?;
 
     // The load-bearing assertion (design.md 3.3): the predicate is served by a
@@ -268,11 +275,81 @@ async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
     );
 
     // A query whose vector is a planted row returns that row.
-    let hits = store.vector_search(&planted.vector, 10, "").await?;
+    let hits = store
+        .vector_search(
+            &planted.vector,
+            10,
+            "",
+            &model.id,
+            model.max_embed_tokens as i32,
+        )
+        .await?;
     assert!(
         hits.iter().any(|(id, _)| id == &planted.message_id),
         "planted vector should be retrievable via the index",
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<()> {
+    // Regression guard: `max_embed_tokens` is part of the embeddings PK, so one
+    // message can have several rows (one per cap). Vector search must scan only
+    // the identity that produced the query vector - never mix caps, never return
+    // a message_id twice (RRF would double-count it).
+    let temp = TempDir::new()?;
+    let store = PondStore::open(temp.path()).await?;
+    let model = Config::builtin().embeddings.default_model("local")?;
+
+    // Same message, two caps, deliberately opposite vectors so the result
+    // distance tells us which row the scan actually ranked.
+    let near = vec![0.1_f32; EMBEDDING_DIM];
+    let far = vec![-0.1_f32; EMBEDDING_DIM];
+    let base = synthetic_rows(1, &model.id).pop().expect("one synthetic row");
+    let row_1024 = EmbeddingRow {
+        max_embed_tokens: 1024,
+        vector: near.clone(),
+        ..base.clone()
+    };
+    let row_4096 = EmbeddingRow {
+        max_embed_tokens: 4096,
+        vector: far,
+        ..base.clone()
+    };
+    // Distinct PKs (same message_id, different cap), so both rows persist.
+    store.upsert_embeddings(&[row_1024, row_4096]).await?;
+
+    // Scoped to cap 1024: the message appears exactly once - not once per cap -
+    // ranked against the cap-1024 (near) vector, so distance ~0.
+    let hits_1024 = store
+        .vector_search(&near, 10, "", &model.id, 1024)
+        .await?;
+    assert_eq!(
+        hits_1024.len(),
+        1,
+        "the message must appear exactly once, not once per cap: {hits_1024:?}",
+    );
+    assert_eq!(hits_1024[0].0, base.message_id);
+    assert!(
+        hits_1024[0].1 < 0.01,
+        "cap-1024 scan must rank the cap-1024 vector, got distance {}",
+        hits_1024[0].1,
+    );
+
+    // Scoped to cap 4096: same single message, but ranked against the opposite
+    // (far) vector - so the same query is now distant. Proves the scan switched
+    // rows on the cap, rather than just deduplicating.
+    let hits_4096 = store
+        .vector_search(&near, 10, "", &model.id, 4096)
+        .await?;
+    assert_eq!(hits_4096.len(), 1);
+    assert_eq!(hits_4096[0].0, base.message_id);
+    assert!(
+        hits_4096[0].1 > 1.0,
+        "cap-4096 scan must rank the cap-4096 vector, got distance {}",
+        hits_4096[0].1,
+    );
+
     Ok(())
 }
 
@@ -305,6 +382,16 @@ impl EmbedBackend for FakeBackend {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    // The fake stands in for the builtin model: `searchable_corpus` embeds the
+    // fixtures with it, so vector search must scope to this identity to see them.
+    fn model_id(&self) -> &str {
+        "Qwen/Qwen3-Embedding-0.6B"
+    }
+
+    fn max_embed_tokens(&self) -> i32 {
+        1024
     }
 }
 

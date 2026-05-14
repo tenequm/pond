@@ -55,6 +55,13 @@ tempfile = "3.25"
 # with no socket bind and no HTTP client dependency.
 tower = { version = "0.5", features = ["util"] }
 
+# `benches/embed_bench.rs` is a parameterized stress-test harness, not a
+# `cargo bench` micro-benchmark - `harness = false` makes it a plain `fn main`
+# binary. Run: `cargo bench --bench embed_bench -- --help`.
+[[bench]]
+name = "embed_bench"
+harness = false
+
 [features]
 # Opt-in NVIDIA GPU embeddings for non-macOS builds: forwards to fastembed's
 # `cuda` feature (-> `candle-core/cuda`). Off by default because `candle-core/cuda`
@@ -64,7 +71,24 @@ tower = { version = "0.5", features = ["util"] }
 # automatically (it returns CPU when this feature is not compiled in).
 cuda = ["fastembed/cuda"]
 
+# Build dependencies optimized even in dev/test builds. The hot code lives in
+# the dependency graph (lance, candle, arrow); leaving it unoptimized makes
+# `cargo test` and the embed worker crawl. pond's own crate stays unoptimized
+# and incremental, so the edit -> check -> test loop stays fast. One-time cost:
+# the dep graph is rebuilt once under this setting, then cached.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Plain `release` is the iteration profile - no LTO, default codegen-units - so
+# `cargo build --release` and `cargo bench` (which inherits `release`) relink in
+# seconds on a local-crate change. Ship-grade optimization lives in `dist`.
 [profile.release]
+
+# `dist` is the ship profile: whole-program thin-LTO and a single codegen unit.
+# Used only for release artifacts (`cargo build --profile dist`), never the
+# edit loop - it rebuilds the dependency graph once under its own settings.
+[profile.dist]
+inherits = "release"
 lto = "thin"
 codegen-units = 1
 

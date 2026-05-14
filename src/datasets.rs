@@ -87,6 +87,12 @@ pub fn embedding_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         primary_field("message_id", DataType::Utf8, false),
         primary_field("model_id", DataType::Utf8, false),
+        // Part of the PK: `max_embed_tokens` is the tokenizer truncation point,
+        // so it changes which prefix of a long message is embedded and thus the
+        // vector itself. Folding it into the key means a cap change re-embeds
+        // the affected (over-cap) tail under a distinct row instead of silently
+        // leaving a stale vector under `(message_id, model_id)`. See design 3.2.4.
+        primary_field("max_embed_tokens", DataType::Int32, false),
         Field::new("vector", embedding_vector_type(), false),
         Field::new("session_id", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
@@ -137,6 +143,9 @@ pub struct MessageBatchRow<'a> {
 pub struct EmbeddingRow {
     pub message_id: String,
     pub model_id: String,
+    /// Tokenizer truncation point this vector was embedded under - a PK
+    /// component, since it determines which prefix of the message was embedded.
+    pub max_embed_tokens: i32,
     pub vector: Vec<f32>,
     pub session_id: String,
     pub source_agent: String,
@@ -184,6 +193,11 @@ pub fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|row| row.model_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                rows.iter()
+                    .map(|row| row.max_embed_tokens)
                     .collect::<Vec<_>>(),
             )),
             Arc::new(vectors),
