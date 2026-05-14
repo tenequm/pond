@@ -1,15 +1,18 @@
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use pond::{
     adapter::{Adapter, ClaudeCodeAdapter},
-    config::{Config, DEFAULT_CONFIG_TOML, known_model_download_mb},
+    config::{Config, DEFAULT_CONFIG_TOML, MaintenanceConfig, known_model_download_mb},
     embed::{EmbedBackend, EmbedWorker, Qwen3Embedder, model_is_cached},
     substrate::PondStore,
+    transport::{self, AppState},
 };
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -58,6 +61,56 @@ enum Command {
         #[arg(long, default_value = "local")]
         namespace: String,
     },
+    /// Run the HTTP+JSON server, including the streamable-HTTP MCP `/mcp` route.
+    Serve {
+        #[arg(long, env = "POND_HOST", default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, env = "POND_PORT", default_value_t = 9797)]
+        port: u16,
+        #[arg(long, env = "POND_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+    /// Run the stdio MCP server only. stdout is reserved for JSON-RPC frames;
+    /// all diagnostics go to stderr.
+    Mcp {
+        #[arg(long, env = "POND_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+    /// Run cleanup_old_versions + optimize_indices once over all datasets.
+    /// Runs regardless of the `[maintenance].enabled` config flag.
+    Maintenance {
+        #[arg(long, env = "POND_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Override the cleanup retention window, in days.
+        #[arg(long)]
+        older_than_days: Option<u64>,
+        /// Run optimize_indices only; skip cleanup_old_versions.
+        #[arg(long)]
+        skip_cleanup: bool,
+        /// Run cleanup_old_versions only; skip optimize_indices.
+        #[arg(long)]
+        skip_optimize: bool,
+    },
+    /// Inspect configuration.
+    Config {
+        /// Print the fully-annotated config.toml schema.
+        #[arg(long)]
+        print_schema: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -95,10 +148,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let config = Config::load(&config_path)?;
-            let model = match model {
-                Some(id) => config.embeddings.model(&id, &namespace)?,
-                None => config.embeddings.default_model(&namespace)?,
-            };
+            let model = resolve_model(&config, model.as_deref(), &namespace)?;
 
             if model_is_cached(model.load_repo()) {
                 output(&format!(
@@ -154,10 +204,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir);
             let config = Config::load(config_path(config, &data_dir))?;
-            let model = match model {
-                Some(id) => config.embeddings.model(&id, &namespace)?,
-                None => config.embeddings.default_model(&namespace)?,
-            };
+            let model = resolve_model(&config, model.as_deref(), &namespace)?;
             let store = PondStore::open(&data_dir).await?;
             let adapter = match from {
                 SourceName::ClaudeCode => Adapter::ClaudeCode(ClaudeCodeAdapter::new(
@@ -182,9 +229,116 @@ async fn main() -> anyhow::Result<()> {
                 embed.messages,
             ))?;
         }
+        Command::Serve {
+            host,
+            port,
+            data_dir,
+            config,
+            model,
+            namespace,
+        } => {
+            let data_dir = resolve_data_dir(data_dir);
+            let config = Config::load(config_path(config, &data_dir))?;
+            let model = resolve_model(&config, model.as_deref(), &namespace)?;
+            // Load the embedding model at boot: it is required to embed search
+            // queries, so a missing or broken model fails loudly here, not on
+            // the first search.
+            let embedder: Arc<dyn EmbedBackend> = Arc::new(Qwen3Embedder::load(&model)?);
+            let store = Arc::new(PondStore::open(&data_dir).await?);
+            if config.maintenance.enabled {
+                spawn_maintenance(Arc::clone(&store), &config.maintenance);
+            }
+            let state = AppState { store, embedder };
+            transport::http::serve(state, host, port).await?;
+        }
+        Command::Mcp {
+            data_dir,
+            config,
+            model,
+            namespace,
+        } => {
+            let data_dir = resolve_data_dir(data_dir);
+            let config = Config::load(config_path(config, &data_dir))?;
+            let model = resolve_model(&config, model.as_deref(), &namespace)?;
+            let embedder: Arc<dyn EmbedBackend> = Arc::new(Qwen3Embedder::load(&model)?);
+            let store = Arc::new(PondStore::open(&data_dir).await?);
+            // `pond mcp` writes only JSON-RPC frames to stdout; the maintenance
+            // task is `pond serve`-only, so it is not spawned here.
+            transport::mcp::serve_stdio(AppState { store, embedder }).await?;
+        }
+        Command::Maintenance {
+            data_dir,
+            config,
+            older_than_days,
+            skip_cleanup,
+            skip_optimize,
+        } => {
+            let data_dir = resolve_data_dir(data_dir);
+            let config = Config::load(config_path(config, &data_dir))?;
+            let retention_days = older_than_days.unwrap_or(config.maintenance.retention_days);
+            let retention =
+                chrono::Duration::days(i64::try_from(retention_days).unwrap_or(i64::MAX));
+            let store = PondStore::open(&data_dir).await?;
+            let report = store
+                .maintenance(retention, skip_cleanup, skip_optimize)
+                .await;
+            output(&format!(
+                "maintenance: versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
+                report.versions_removed,
+                report.bytes_reclaimed,
+                report.tables_optimized,
+                report.tables_failed,
+            ))?;
+        }
+        Command::Config { print_schema } => {
+            if print_schema {
+                output(DEFAULT_CONFIG_TOML.trim_end())?;
+            } else {
+                output("usage: pond config --print-schema")?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Spawn the background maintenance task: `cleanup_old_versions` +
+/// `optimize_indices` every `interval_secs` (design.md 3.2.0). The first tick
+/// fires immediately, so it is consumed up front - `pond serve` does not run
+/// maintenance at boot. Failures are logged at warn and retried next interval;
+/// they never crash the server.
+fn spawn_maintenance(store: Arc<PondStore>, config: &MaintenanceConfig) {
+    let interval = Duration::from_secs(config.interval_secs);
+    let retention =
+        chrono::Duration::days(i64::try_from(config.retention_days).unwrap_or(i64::MAX));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let report = store.maintenance(retention, false, false).await;
+            tracing::info!(
+                versions_removed = report.versions_removed,
+                bytes_reclaimed = report.bytes_reclaimed,
+                tables_optimized = report.tables_optimized,
+                tables_failed = report.tables_failed,
+                "background maintenance pass complete",
+            );
+        }
+    });
+}
+
+/// Resolve the embedding model from config: an explicit `--model` id, otherwise
+/// the registry default, with any namespace overrides applied.
+fn resolve_model(
+    config: &Config,
+    model: Option<&str>,
+    namespace: &str,
+) -> anyhow::Result<pond::config::EmbeddingModel> {
+    match model {
+        Some(id) => config.embeddings.model(id, namespace),
+        None => config.embeddings.default_model(namespace),
+    }
 }
 
 fn init_tracing() {

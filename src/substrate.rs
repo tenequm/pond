@@ -14,6 +14,7 @@ use lance::deps::arrow_array::{Float32Array, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
 };
@@ -77,6 +78,20 @@ impl Default for RetryPolicy {
 pub enum UpsertStatus {
     Inserted,
     Matched,
+}
+
+/// Aggregate outcome of a [`PondStore::maintenance`] pass over the four
+/// datasets (design.md 3.2.0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    /// Old Lance manifest versions removed by `cleanup_old_versions`.
+    pub versions_removed: u64,
+    /// Bytes reclaimed by `cleanup_old_versions`.
+    pub bytes_reclaimed: u64,
+    /// Datasets that completed cleanup + optimize without error.
+    pub tables_optimized: usize,
+    /// Datasets whose maintenance failed; logged at warn, retried next pass.
+    pub tables_failed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -673,6 +688,88 @@ impl PondStore {
         let dataset = cached.latest().await?;
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().map(|index| index.name.clone()).collect())
+    }
+
+    /// Run one maintenance pass over all four datasets: `cleanup_old_versions`
+    /// (remove manifest versions older than `retention`) then `optimize_indices`
+    /// (extend each index to fragments appended since the last build) - design.md
+    /// 3.2.0. A per-table failure is logged at warn and does not abort the other
+    /// tables; the next pass retries. Never removes logical rows.
+    pub async fn maintenance(
+        &self,
+        retention: chrono::Duration,
+        skip_cleanup: bool,
+        skip_optimize: bool,
+    ) -> MaintenanceReport {
+        let mut report = MaintenanceReport::default();
+        for (label, cached) in [
+            ("sessions", &self.datasets.sessions),
+            ("messages", &self.datasets.messages),
+            ("parts", &self.datasets.parts),
+            ("embeddings", &self.datasets.embeddings),
+        ] {
+            match self
+                .maintain_table(label, cached, retention, skip_cleanup, skip_optimize)
+                .await
+            {
+                Ok((versions_removed, bytes_reclaimed)) => {
+                    report.versions_removed += versions_removed;
+                    report.bytes_reclaimed += bytes_reclaimed;
+                    report.tables_optimized += 1;
+                }
+                Err(error) => {
+                    report.tables_failed += 1;
+                    tracing::warn!(table = label, %error, "maintenance pass failed for table");
+                }
+            }
+        }
+        report
+    }
+
+    /// Maintain one dataset. Cleanup needs `&Dataset`, optimize needs
+    /// `&mut Dataset`; both run on the same checked-out handle, which is then
+    /// stored back so later reads see the optimized indices.
+    async fn maintain_table(
+        &self,
+        label: &str,
+        cached: &Mutex<CachedDataset>,
+        retention: chrono::Duration,
+        skip_cleanup: bool,
+        skip_optimize: bool,
+    ) -> Result<(u64, u64)> {
+        let started = Instant::now();
+        let mut guard = cached.lock().await;
+        let mut dataset = guard.latest().await?;
+
+        let (versions_removed, bytes_reclaimed) = if skip_cleanup {
+            (0, 0)
+        } else {
+            // `delete_unverified: None` keeps the Lance default (false): in-flight
+            // write files newer than the verification threshold are skipped,
+            // avoiding a cleanup-vs-write race (design.md 3.2.0).
+            let stats = dataset
+                .cleanup_old_versions(retention, None, None)
+                .await
+                .with_context(|| format!("cleanup_old_versions failed for {label}"))?;
+            (stats.old_versions, stats.bytes_removed)
+        };
+
+        if !skip_optimize {
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .with_context(|| format!("optimize_indices failed for {label}"))?;
+        }
+
+        guard.replace(dataset);
+        tracing::info!(
+            table = label,
+            versions_removed,
+            bytes_reclaimed,
+            duration_ms = started.elapsed().as_millis(),
+            "maintenance pass complete for table",
+        );
+        Ok((versions_removed, bytes_reclaimed))
     }
 
     async fn row_count(&self, cached: &Mutex<CachedDataset>) -> Result<usize> {

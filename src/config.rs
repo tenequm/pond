@@ -1,9 +1,10 @@
-//! Configuration loading and the embedding-model registry.
+//! Configuration loading: the embedding-model registry and the background
+//! maintenance settings.
 //!
-//! v1 wires up the `[embeddings]` section only; the remaining `config.toml`
-//! schema (`pond config --print-schema` and friends) lands in Stage 3. Built-in
-//! defaults are shipped in the binary so a pond instance with no `config.toml`
-//! still works; user config adds or overrides entries by `id`.
+//! Built-in defaults are shipped in the binary so a pond instance with no
+//! `config.toml` still works; user config adds or overrides entries by `id`.
+//! `pond config --print-schema` emits [`DEFAULT_CONFIG_TOML`], the
+//! fully-annotated example.
 
 use std::{
     collections::BTreeMap,
@@ -36,14 +37,54 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Per-namespace tunable overrides (immutable fields cannot be overridden):
 # [embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]
 # max_embed_tokens = 2048
+
+# Background maintenance: `cleanup_old_versions` + `optimize_indices`, run by
+# `pond serve` on an interval and by the `pond maintenance` one-shot verb.
+# `pond maintenance` runs regardless of `enabled`.
+#
+# [maintenance]
+# enabled = true          # run the background task under `pond serve`
+# interval_secs = 21600   # background pass interval (default 6h)
+# retention_days = 30     # cleanup_old_versions window (default 30 days)
 ";
 
-/// Top-level `config.toml` shape. Only `[embeddings]` is wired in v1.
+/// Top-level `config.toml` shape.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
+}
+
+/// The `[maintenance]` section: background `cleanup_old_versions` +
+/// `optimize_indices` settings (design.md 3.2.0). Durations are plain integers
+/// rather than humanized strings - one fewer parser, and `config.toml` stays
+/// trivially round-trippable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Whether `pond serve` spawns the background maintenance task. The
+    /// `pond maintenance` one-shot verb runs regardless of this flag.
+    #[serde(default = "default_maintenance_enabled")]
+    pub enabled: bool,
+    /// Background pass interval in seconds (default 6h).
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+    /// `cleanup_old_versions` retention window in days (default 30).
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_maintenance_enabled(),
+            interval_secs: default_interval_secs(),
+            retention_days: default_retention_days(),
+        }
+    }
 }
 
 /// The `[embeddings]` section: the model registry plus per-namespace overrides.
@@ -159,6 +200,33 @@ fn default_true() -> bool {
     true
 }
 
+fn default_maintenance_enabled() -> bool {
+    true
+}
+
+fn default_interval_secs() -> u64 {
+    21_600
+}
+
+fn default_retention_days() -> u64 {
+    30
+}
+
+impl MaintenanceConfig {
+    /// Reject a config that would spawn a maintenance task that cannot run:
+    /// a zero interval would busy-loop, a zero retention would be a no-op
+    /// cleanup. Only enforced when the background task is enabled.
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled && self.interval_secs == 0 {
+            bail!("[maintenance] interval_secs must be greater than 0 when enabled");
+        }
+        if self.enabled && self.retention_days == 0 {
+            bail!("[maintenance] retention_days must be greater than 0 when enabled");
+        }
+        Ok(())
+    }
+}
+
 impl EmbeddingModel {
     /// The built-in v1 default: Qwen3-Embedding-0.6B (design.md 3.2.4).
     pub fn qwen3_default() -> Self {
@@ -198,6 +266,7 @@ impl Config {
         };
         config.embeddings.apply_builtin_defaults();
         config.embeddings.validate()?;
+        config.maintenance.validate()?;
         Ok(config)
     }
 
