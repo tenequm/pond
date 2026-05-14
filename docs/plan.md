@@ -120,7 +120,7 @@ the git-pinned `v7.0.0-beta.8` tag (the 7.x beta line is not published to crates
 
   | Crate | Version | Notes |
   |---|---|---|
-  | `lance`, `lance-table`, `lance-io`, `lance-encoding`, `lance-index`, `lance-namespace`, `lance-namespace-impls` | git, tag `v7.0.0-beta.8` | NOT on crates.io - the 7.x beta line is unpublished (latest crates.io stable is 6.0.0). Each crate is a git dependency: `{ git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }` (tag commit `338fc35f`, 2026-05-13 - the latest 7.x beta tag). `Cargo.lock` pins the exact commit; do not float. |
+  | `lance`, `lance-table`, `lance-io`, `lance-encoding`, `lance-index`, `lance-namespace`, `lance-namespace-impls` | git, tag `v7.0.0-beta.8` | NOT on crates.io - the 7.x beta line is unpublished (latest crates.io stable is 6.0.0). Each crate is a git dependency: `{ git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }` - the latest 7.x beta tag. `Cargo.lock` pins the exact commit the tag resolves to; do not float. |
   | `tokio` | `1.52` | `features = ["full"]` |
   | `tokio-stream` | `0.1.18` | the `Stream` trait + `ReceiverStream` / wrappers - `SourceAdapter` returns `impl Stream` |
   | `async-stream` | `0.3.6` | `stream!` macro for writing the adapter's `discover` / `decode` generators ergonomically |
