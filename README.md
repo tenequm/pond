@@ -23,7 +23,8 @@ This repository is currently design-only. Implementation has not started.
 Pre-implementation. The repository contains:
 
 - `docs/design.md` - the locked-in v1 design (sections 1-4 are the source of truth; section 5 is empty).
-- `docs/references/` - frozen snapshots of the upstream schemas pond's design draws from, plus real session samples from eight source harnesses (`docs/references/session-samples/`).
+- `docs/references/` - frozen snapshots of the upstream schemas pond's design draws from.
+- `tests/fixtures/session-samples/` - real session captures from eight source harnesses, used as SourceAdapter test fixtures.
 - `docs/archive/` - historical design notes and the resolved open-questions log.
 
 Implementation begins next.
@@ -55,13 +56,13 @@ Key choices:
 - One adapter trait, `SourceAdapter`, with a deterministic event-ordering contract. Everything else (storage, indexing, OCC, time-travel, namespaces, manifest versioning, blob storage) is Lance direct - no extra "seam" abstractions.
 - Append-only writes. Replay (cross-provider re-projection) is deferred to section 4.
 - v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond ingest`, `pond serve`, `pond status`, `pond embed-worker`, `pond maintenance`.
-- Default embeddings: Qwen3-Embedding-0.6B via fastembed-rs (local, Matryoshka 32-1024, 32K context, Apache 2.0). Embedding registry is config-driven.
+- Default embeddings: Qwen3-Embedding-0.6B via fastembed-rs (local, candle backend behind the `qwen3` feature, fixed 1024-dim, 32K context, Apache 2.0). Embedding registry is config-driven.
 - Multi-tenancy via opaque namespace strings; bucket prefix per namespace; separate buckets when KMS isolation matters.
 - Encryption is operational (bucket SSE + filesystem encryption), not application-level.
 
 ## References
 
-`docs/references/` holds frozen snapshots of upstream schemas and real session samples. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
+`docs/references/` holds frozen snapshots of upstream schemas; real session samples live under `tests/fixtures/session-samples/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
 
 | Path | Source | Why kept |
 |------|--------|----------|
@@ -72,7 +73,7 @@ Key choices:
 | `docs/references/lancedb/` | github.com/lancedb + github.com/lance-format | Capability snapshot and evolution timeline for Lance + LanceDB. |
 | `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
 | `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
-| `docs/references/session-samples/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design and stress-tests the schema. |
+| `tests/fixtures/session-samples/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design, stress-tests the schema, and serves as SourceAdapter test fixtures. |
 
 To refresh a snapshot, see the maintenance instructions in [`docs/references/README.md`](docs/references/README.md).
 

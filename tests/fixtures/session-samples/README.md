@@ -1,8 +1,8 @@
 # Session samples
 
 Curated, anonymized session captures from 8 agentic-client platforms. These files
-ground pond's canonical-type design (see `docs/design.md` section 3.1) and will
-serve as test fixtures for the v1 SourceAdapter implementations (see
+ground pond's canonical-type design (see `docs/design.md` section 3.1) and
+serve as the test fixtures for the v1 SourceAdapter implementations (see
 `docs/design.md` section 3.4).
 
 Snapshot date: 2026-05-13.
