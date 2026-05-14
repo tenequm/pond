@@ -623,7 +623,7 @@ impl PondStore {
 
     /// Create the scalar indexes on `embeddings`, and the IVF_PQ vector index
     /// once the table crosses [`VECTOR_INDEX_ACTIVATION_ROWS`]. Called by
-    /// `pond embed-worker`; idempotent.
+    /// `pond ingest` after the embedding pass; idempotent.
     pub async fn ensure_embedding_indices(&self, model: &EmbeddingModel) -> Result<()> {
         self.ensure_embedding_indices_with_threshold(model, VECTOR_INDEX_ACTIVATION_ROWS)
             .await

@@ -42,7 +42,7 @@ enum Command {
         #[arg(long, env = "POND_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
-    /// Ingest sessions from a source adapter.
+    /// Ingest sessions from a source adapter: parse, store, embed, and index.
     Ingest {
         #[arg(long = "from", value_enum)]
         from: SourceName,
@@ -50,11 +50,6 @@ enum Command {
         data_dir: Option<PathBuf>,
         #[arg(long)]
         source_dir: Option<PathBuf>,
-    },
-    /// Embed ingested messages and build the search indexes.
-    EmbedWorker {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Registry model id to embed with; defaults to the registry default.
@@ -153,25 +148,6 @@ async fn main() -> anyhow::Result<()> {
             from,
             data_dir,
             source_dir,
-        } => {
-            let store = PondStore::open(resolve_data_dir(data_dir)).await?;
-            let adapter = match from {
-                SourceName::ClaudeCode => Adapter::ClaudeCode(ClaudeCodeAdapter::new(
-                    source_dir.unwrap_or_else(default_claude_code_dir),
-                )),
-            };
-            let summary = adapter.ingest(&store).await?;
-            store.ensure_indices().await?;
-            output(&format!(
-                "accepted={} inserted={} matched={} errors={}",
-                summary.accepted(),
-                summary.inserted,
-                summary.matched,
-                summary.errors
-            ))?;
-        }
-        Command::EmbedWorker {
-            data_dir,
             config,
             model,
             namespace,
@@ -182,16 +158,32 @@ async fn main() -> anyhow::Result<()> {
                 Some(id) => config.embeddings.model(&id, &namespace)?,
                 None => config.embeddings.default_model(&namespace)?,
             };
-            let store = PondStore::open(data_dir).await?;
+            let store = PondStore::open(&data_dir).await?;
+            let adapter = match from {
+                SourceName::ClaudeCode => Adapter::ClaudeCode(ClaudeCodeAdapter::new(
+                    source_dir.unwrap_or_else(default_claude_code_dir),
+                )),
+            };
+            let ingest = adapter.ingest(&store).await?;
+            store.ensure_indices().await?;
+
+            // Embedding is part of ingest: a message is either fully in the
+            // system - parsed, stored, indexed, searchable - or not in at all.
             let embedder = Qwen3Embedder::load(&model)?;
             let tokenizer = load_tokenizer(&model.fastembed_code)?;
-            let summary = EmbedWorker::new(&store, &embedder, &tokenizer, &model)?
+            let embed = EmbedWorker::new(&store, &embedder, &tokenizer, &model)?
                 .run()
                 .await?;
             store.ensure_embedding_indices(&model).await?;
+
             output(&format!(
-                "model={} messages={} chunks={} batches={}",
-                model.id, summary.messages, summary.chunks, summary.batches
+                "accepted={} inserted={} matched={} errors={} embedded={} chunks={}",
+                ingest.accepted(),
+                ingest.inserted,
+                ingest.matched,
+                ingest.errors,
+                embed.messages,
+                embed.chunks,
             ))?;
         }
     }

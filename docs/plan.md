@@ -283,8 +283,9 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   `Device::Cpu` elsewhere; the selected device is logged at startup. pond-owned
   `tokenizers::Tokenizer` for the token-aware chunker (1024-token chunks, 128
   overlap), deterministic chunking, writes `embeddings` rows with denormalized filter
-  columns (3.2.4). `pond embed-worker` CLI verb. Reads `messages.search_text` directly
-  - no second concat path.
+  columns (3.2.4). The worker is the embedding stage of `pond ingest` - there is no
+  separate verb; a message is either fully in (parsed, stored, embedded, searchable)
+  or not in at all. Reads `messages.search_text` directly - no second concat path.
   **Batching is load-bearing**: the worker batches chunks across messages and calls
   `Qwen3TextEmbedding::embed(&[...])` with a non-singleton slice whenever more than
   one chunk is pending; it never does one message/chunk -> one model call. The local
@@ -363,7 +364,8 @@ with a comment justifying the number - never a guessed volume.
 - The `explain_plan` prefilter test passes - pushdown confirmed on real data.
 - Hybrid / vector / fts modes all return ranked results over the fixture corpus.
 - All filters verified.
-- `pond embed-worker` populates `embeddings` for an ingested corpus.
+- `pond ingest` populates `embeddings` in the same pass that stores messages - not a
+  separate step.
 - The embedding worker demonstrably batches both model inference and Lance writes:
   multiple pending chunks produce batched `Qwen3TextEmbedding::embed(&[...])` calls and
   batched embedding-row writes. Per-message/per-chunk model calls or per-chunk Lance
@@ -414,7 +416,9 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 - `main.rs` - remaining CLI verbs: `pond serve` (HTTP + `/mcp`), `pond mcp` (stdio MCP
   only), and admin verbs `pond versions list`, `pond checkout <version>`,
   `pond restore <version> --force` (3.6, mapping to Lance `versions()` /
-  `checkout_version()` / `restore()`).
+  `checkout_version()` / `restore()`). `pond serve` and `pond mcp` load the embedding
+  model at startup - it is required to embed search queries - so a missing or broken
+  model fails loudly at boot, not on the first search.
 
 **Tests**:
 - HTTP integration: each `POST /v1/<op>` round-trips against a real ingested dataset;
@@ -445,9 +449,10 @@ replacing `kb` in the MCP config.
 
 **Build**:
 - No new source files. This stage is operational.
-- Run `pond ingest --from claude-code` against the real `~/.claude/projects/` into the
-  personal data dir (`$XDG_DATA_HOME/pond/`).
-- Run `pond embed-worker` to populate embeddings and build the vector index.
+- Run `pond setup` once to resolve the data dir and fetch the model, then
+  `pond ingest --from claude-code` against the real `~/.claude/projects/` into the
+  personal data dir (`$XDG_DATA_HOME/pond/`). Ingest parses, stores, embeds, and
+  builds the indexes in one pass - there is no separate embed step.
 - Swap the MCP server entry in the Claude Code MCP config: `kb` -> `pond mcp` (stdio
   MCP server; stdout reserved for JSON-RPC, all logs to stderr).
 - Parity smoke: a named, written-down checklist re-run against `pond_search` /
