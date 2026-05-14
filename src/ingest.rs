@@ -8,7 +8,14 @@ use crate::{
     adapter::SourceAdapter,
     substrate::{MessageWrite, PondStore, UpsertStatus},
     types::{Message, Part, PartKind, Role, Session},
+    wire::{
+        ErrorCode, IngestEnvelope, IngestRequest, IngestResponse, default_namespace, error,
+        new_request_id, storage_error, validate_protocol,
+    },
 };
+
+/// Hard cap on events per `pond_ingest` batch (design.md 3.6.4).
+pub const MAX_INGEST_EVENTS: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -241,6 +248,90 @@ pub async fn ingest_adapter<A: SourceAdapter>(
         }
     }
 
+    Ok(summary)
+}
+
+/// The `pond_ingest` wire handler (design.md 3.6.4): validate the transport
+/// envelope, then drive the event batch through [`ingest_events`]. Transport
+/// failures (bad protocol, unknown namespace, empty or oversized batch) fail the
+/// whole request via the 3.6.1 error envelope.
+pub async fn pond_ingest(store: &PondStore, request: IngestRequest) -> IngestEnvelope {
+    if let Err(envelope) = validate_protocol(request.protocol_version) {
+        return IngestEnvelope::Error(envelope);
+    }
+    if request.namespace != default_namespace() {
+        return IngestEnvelope::Error(error(
+            ErrorCode::NamespaceUnknown,
+            "unknown namespace",
+            serde_json::json!({ "namespace": request.namespace }),
+        ));
+    }
+    if request.events.is_empty() {
+        return IngestEnvelope::Error(error(
+            ErrorCode::ValidationFailed,
+            "events must be a non-empty array",
+            serde_json::json!({ "field": "events" }),
+        ));
+    }
+    if request.events.len() > MAX_INGEST_EVENTS {
+        return IngestEnvelope::Error(error(
+            ErrorCode::ValidationFailed,
+            "ingest batch exceeds the event cap",
+            serde_json::json!({
+                "field": "events",
+                "value": request.events.len(),
+                "expected": format!("at most {MAX_INGEST_EVENTS} events"),
+            }),
+        ));
+    }
+
+    match ingest_events(store, request.events).await {
+        Ok(summary) => IngestEnvelope::Success(IngestResponse {
+            accepted: summary.accepted(),
+            rejected: summary.errors,
+            inserted: summary.inserted,
+            matched: summary.matched,
+            request_id: new_request_id(),
+        }),
+        Err(failure) => IngestEnvelope::Error(storage_error(failure)),
+    }
+}
+
+/// Drive a flat event batch through [`IngestValidator`], grouped into session
+/// substreams. A substream that fails validation is aborted - its buffered
+/// events are dropped and events are skipped until the next `Session` event -
+/// while later sessions in the batch still process (design.md 3.6.4). The
+/// rejected-substream count lands in [`IngestSummary::errors`].
+pub async fn ingest_events(store: &PondStore, events: Vec<IngestEvent>) -> Result<IngestSummary> {
+    let mut summary = IngestSummary {
+        inserted: 0,
+        matched: 0,
+        errors: 0,
+    };
+    let mut validator = IngestValidator::default();
+    let mut skipping = false;
+    for event in events {
+        if skipping {
+            if matches!(event, IngestEvent::Session(_)) {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        match validator.push(store, event).await {
+            Ok(statuses) => summary.add_statuses(&statuses),
+            Err(failure) => {
+                summary.errors += 1;
+                tracing::warn!(%failure, "aborting invalid session substream");
+                validator = IngestValidator::default();
+                skipping = true;
+            }
+        }
+    }
+    if !skipping {
+        let statuses = validator.finish(store).await?;
+        summary.add_statuses(&statuses);
+    }
     Ok(summary)
 }
 

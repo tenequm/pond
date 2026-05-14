@@ -109,20 +109,20 @@ pub fn model_is_cached(repo_id: &str) -> bool {
         .all(|file| repo.get(file).is_some())
 }
 
-#[cfg(target_os = "macos")]
+/// Select the embedding device: Metal on macOS, CUDA on a non-macOS build with
+/// the `cuda` feature, CPU otherwise. candle's `*_if_available` helpers return
+/// `Cpu` when the matching backend feature is not compiled into `candle-core`;
+/// `new_metal` / `new_cuda` can still fail at runtime (no GPU or driver), so an
+/// `Err` falls back to `Cpu` too. The chosen device is logged in [`Qwen3Embedder::load`].
 fn select_device() -> candle_core::Device {
-    match candle_core::Device::new_metal(0) {
-        Ok(device) => device,
-        Err(error) => {
-            tracing::warn!(%error, "Metal device unavailable, falling back to CPU");
-            candle_core::Device::Cpu
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn select_device() -> candle_core::Device {
-    candle_core::Device::Cpu
+    #[cfg(target_os = "macos")]
+    let device = candle_core::Device::metal_if_available(0);
+    #[cfg(not(target_os = "macos"))]
+    let device = candle_core::Device::cuda_if_available(0);
+    device.unwrap_or_else(|error| {
+        tracing::warn!(%error, "GPU device unavailable, falling back to CPU");
+        candle_core::Device::Cpu
+    })
 }
 
 fn device_label(device: &candle_core::Device) -> &'static str {
@@ -276,4 +276,27 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
 struct StagedMessage {
     message: PendingMessage,
     text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{device_label, select_device};
+
+    // plan.md Stage 2 done-when: the embedding worker runs on the Metal device
+    // on macOS (real Apple hardware), never the CPU fallback; a default
+    // non-macOS build runs on CPU. `select_device` is the device-selection path
+    // the worker takes; exercising it needs no model weights. A `--features cuda`
+    // build can select a GPU at runtime, so the CPU assertion is scoped to the
+    // default (no-`cuda`) build.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selects_the_metal_device() {
+        assert_eq!(device_label(&select_device()), "metal");
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    #[test]
+    fn non_macos_selects_cpu() {
+        assert_eq!(device_label(&select_device()), "cpu");
+    }
 }

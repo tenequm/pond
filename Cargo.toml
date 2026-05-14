@@ -48,6 +48,15 @@ fastembed = { version = "5.13.4", default-features = false, features = ["qwen3",
 lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 tempfile = "3.25"
 
+[features]
+# Opt-in NVIDIA GPU embeddings for non-macOS builds: forwards to fastembed's
+# `cuda` feature (-> `candle-core/cuda`). Off by default because `candle-core/cuda`
+# needs the CUDA toolkit (`nvcc`) at build time - the default non-macOS build is
+# plain CPU candle and CI never enables this. Build on a CUDA host with
+# `cargo build --features cuda`; candle's `cuda_if_available` then selects the GPU
+# automatically (it returns CPU when this feature is not compiled in).
+cuda = ["fastembed/cuda"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

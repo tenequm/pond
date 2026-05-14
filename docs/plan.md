@@ -278,10 +278,13 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
 - `embed.rs` - the embedding worker: fastembed-rs `Qwen3TextEmbedding::from_hf` (the
   `qwen3` / candle path), constructed with a pond-built `candle_core::Device` and
   `DType::BF16` (Qwen3 ships bf16 weights; loading as bf16 rather than upconverting to
-  f32 halves resident memory at no quality cost). Device selection is a
-  `#[cfg(target_os = "macos")]` split:
-  `Device::new_metal(0).unwrap_or(Device::Cpu)` on macOS (Metal GPU, day-one),
-  `Device::Cpu` elsewhere; the selected device is logged at startup.
+  f32 halves resident memory at no quality cost). Device selection uses candle's
+  `Device::metal_if_available(0)` on macOS and `Device::cuda_if_available(0)` on
+  other targets, falling back to CPU on `Err`; the selected device is logged at
+  startup. Metal is on day-one (target-gated `metal` feature); NVIDIA GPUs are
+  reachable on non-macOS via the opt-in `cuda` Cargo feature (-> `fastembed/cuda`),
+  off by default since `candle-core/cuda` needs the CUDA toolkit at build time -
+  the default non-macOS build stays plain CPU candle.
   **One embedding vector per message - no chunking.** Measured against the real
   `~/.claude/projects/` corpus (689,702 messages): `search_text` is 20 tokens at the
   median and ~98% of messages are under 1024 tokens. Chunking would multiply
@@ -346,9 +349,11 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
   files cannot be ingested until those adapters ship - out of v1 scope.)
 - `group_by_conversation` collapses to one summary per session with correct
   `best_score` / `message_count`.
-- Determinism: token-capping is deterministic - the same `search_text` truncates to
-  the same 4096-token prefix every run, so an unchanged message always re-embeds to a
-  stable vector and re-ingest is a no-op.
+- Re-ingest no-op: re-running the embed worker over an already-embedded corpus issues
+  zero model calls and writes zero rows - the `(message_id, model_id)` PK is already
+  populated. Token-capping is enforced inside fastembed via the `from_hf` `max_length`
+  parameter and is deterministic by construction, so pond owns no truncation logic of
+  its own to test.
 - Embedding batching guard: a fake/instrumented embedder records call sizes while the
   worker processes multiple messages; the test fails if it observes a sequence of
   batch-size-1 calls when more than one message was available. A companion write test
@@ -357,9 +362,9 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
 **Tests are one suite - fast, always-run, no model.** There is no tiered split and
 nothing is `#[ignore]`d. Every test runs on every `cargo test` and in the single CI
 job; the whole suite finishes in seconds. The Qwen3 weights are never downloaded in a
-test: the token-cap logic runs against a toy tokenizer, the embedding worker against the
-instrumented `FakeBackend`, and the prefilter / vector-index tests against synthetic
-`embeddings` rows written directly.
+test: the embedding worker and the `pond_search` handler run against the instrumented
+`FakeBackend`, and the prefilter / vector-index tests against synthetic `embeddings`
+rows written directly.
 
 Why this is sufficient (and why a real-model test is not added): the Qwen3 model is a
 pinned, deterministic dependency - it does not regress, and verifying its embedding
@@ -390,7 +395,8 @@ with a comment justifying the number - never a guessed volume.
   and batched embedding-row writes. One model call per message, or one Lance commit
   per message, is not an acceptable Stage 2 implementation.
 - On macOS the embedding worker runs on the Metal device - asserted (the selected
-  device is `Metal`, not the `Cpu` fallback) and logged. On Linux it runs on CPU.
+  device is `Metal`, not the `Cpu` fallback) and logged. A default non-macOS build
+  runs on CPU; a `--features cuda` build selects an NVIDIA GPU when present.
 - Vector-index activation is verified with synthetic `embeddings` rows written
   directly (no model, no ingest) and a *test-supplied low activation threshold*. The
   activation logic is `row_count >= threshold` and is volume-agnostic, so the test

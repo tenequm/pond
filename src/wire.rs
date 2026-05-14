@@ -185,6 +185,33 @@ pub struct Group {
     pub best_score: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IngestEnvelope {
+    Success(IngestResponse),
+    Error(ErrorEnvelope),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestRequest {
+    pub protocol_version: u16,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    pub events: Vec<crate::ingest::IngestEvent>,
+}
+
+/// `pond_ingest` response (design.md 3.6.4). v1 reports the aggregate accounting
+/// the CLI already prints; the per-row `results` array is deferred with the
+/// HTTP/MCP transports (Stage 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestResponse {
+    pub accepted: usize,
+    pub rejected: usize,
+    pub inserted: usize,
+    pub matched: usize,
+    pub request_id: String,
+}
+
 fn default_rrf_k() -> u32 {
     60
 }
