@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  HF_HOME: ${{ github.workspace }}/.cache/huggingface
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt, rust-src
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.15.0"
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-on-failure: true
+
+      - uses: actions/cache@v5.0.5
+        with:
+          path: .cache/huggingface
+          key: qwen3-embedding-0.6b-${{ runner.os }}
+
+      - run: cargo fmt --check
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked

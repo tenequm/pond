@@ -1,0 +1,62 @@
+[package]
+name = "pond"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.102"
+async-stream = "0.3.6"
+axum = "0.8.9"
+candle-core = "0.10.2"
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-table = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.52", features = ["full"] }
+tokio-stream = "0.1.18"
+tokenizers = "0.22"
+toml = "1.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23", features = ["v7"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls"] }
+
+[dev-dependencies]
+reqwest = "0.13"
+tempfile = "3.25"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+expect_used = "warn"
+implicit_clone = "warn"
+print_stdout = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+uninlined_format_args = "warn"
+unwrap_used = "warn"
