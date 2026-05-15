@@ -146,7 +146,14 @@ impl StorageSizes {
         {
             let entry = entry?;
             let name = entry.file_name();
-            let attribute = match name.to_str() {
+            // Lance writes each table as `<name>.lance/`; strip the suffix
+            // before matching so the four known tables are attributed
+            // correctly. Anything else (config.toml, index temp files, ...)
+            // falls through to `other`.
+            let stem = name
+                .to_str()
+                .map(|s| s.strip_suffix(".lance").unwrap_or(s));
+            let attribute = match stem {
                 Some("sessions") => Some("sessions"),
                 Some("messages") => Some("messages"),
                 Some("parts") => Some("parts"),
@@ -735,7 +742,13 @@ impl Store {
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
-        scanner.project(&["id"])?;
+        // Lance ships an autoprojection that silently appends `_score` to FTS
+        // output when the projection omits it. That behavior is going away;
+        // we opt into the future explicit-projection contract here so the
+        // scanner stops emitting a per-call deprecation warning, and we list
+        // `_score` ourselves since the loop below reads it.
+        scanner.disable_scoring_autoprojection();
+        scanner.project(&["id", "_score"])?;
         scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
         let batch = scanner.try_into_batch().await?;
         let mut hits = Vec::with_capacity(batch.num_rows());
@@ -772,7 +785,11 @@ impl Store {
         let mut scanner = scanner_with_prefilter(&dataset, Some(&identity))?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
-        scanner.project(&["message_id"])?;
+        // Mirror the explicit-projection contract from `fts_search`: opt out
+        // of `_distance` autoprojection and list it ourselves since the loop
+        // below reads it.
+        scanner.disable_scoring_autoprojection();
+        scanner.project(&["message_id", "_distance"])?;
         let batch = scanner.try_into_batch().await?;
         let mut hits = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {

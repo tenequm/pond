@@ -51,9 +51,54 @@ impl Default for RetryPolicy {
 }
 
 pub mod output {
-    use std::io::{self, Write};
+    use std::{
+        io::{self, IsTerminal, Write},
+        sync::OnceLock,
+    };
 
+    use anstyle::{AnsiColor, Style};
     use anyhow::Context;
+
+    /// Whether the user-facing CLI surface should emit ANSI styling. Honors
+    /// `NO_COLOR` (no-color.org) and falls back to plain text when stdout is
+    /// not a TTY (piped to a file, captured by tests, ...). Cached so per-call
+    /// overhead is a single pointer load.
+    fn use_color() -> bool {
+        static USE: OnceLock<bool> = OnceLock::new();
+        *USE.get_or_init(|| {
+            std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal()
+        })
+    }
+
+    /// Wrap `text` in `style`'s SGR sequence when color is enabled; return the
+    /// raw text otherwise. The caller writes the result to stdout via
+    /// [`line`].
+    pub fn paint(text: &str, style: Style) -> String {
+        if use_color() {
+            format!("{}{text}{}", style.render(), style.render_reset())
+        } else {
+            text.to_owned()
+        }
+    }
+
+    pub fn bold() -> Style {
+        Style::new().bold()
+    }
+    pub fn dim() -> Style {
+        Style::new().dimmed()
+    }
+    pub fn green() -> Style {
+        Style::new().fg_color(Some(AnsiColor::Green.into()))
+    }
+    pub fn yellow() -> Style {
+        Style::new().fg_color(Some(AnsiColor::Yellow.into()))
+    }
+    pub fn red() -> Style {
+        Style::new().fg_color(Some(AnsiColor::Red.into()))
+    }
+    pub fn cyan() -> Style {
+        Style::new().fg_color(Some(AnsiColor::Cyan.into()))
+    }
 
     #[allow(clippy::print_stdout)]
     pub fn line(message: &str) -> anyhow::Result<()> {

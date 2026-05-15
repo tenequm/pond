@@ -6,15 +6,23 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use comfy_table::{
+    Attribute, Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, presets::NOTHING,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
-    adapter,
+    PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig},
     embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{AdapterStats, CorpusStats, RowTotals, StorageSizes, Store},
     transport::{self, AppState},
+    wire::{
+        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
+        Part, PartKind, ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest, SearchResponse,
+        SearchResultBody,
+    },
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -131,6 +139,99 @@ enum Command {
         #[arg(long)]
         print_schema: bool,
     },
+    /// Hybrid (vector + BM25 + RRF) search over stored messages. Mirrors the
+    /// `pond_search` MCP tool: hybrid mode kicks in automatically when
+    /// embeddings exist for the resolved model, FTS-only otherwise. The
+    /// pretty default is human-readable; `--format json` emits the wire
+    /// envelope verbatim for scripting.
+    Search {
+        /// Free-text query. Semantic concepts work best; project names belong
+        /// in `--project`.
+        query: String,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Registry model id used for the hybrid retriever; defaults to the
+        /// registry default. FTS-only mode ignores this.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Reciprocal-rank-fusion constant. Lower values emphasize top
+        /// retriever ranks; the server default (60) is sane for most queries.
+        #[arg(long, default_value_t = 60)]
+        rrf_k: u32,
+        /// Disable the recency boost. The server defaults to enabled (matches
+        /// the MCP/HTTP surface).
+        #[arg(long)]
+        no_boost_recent: bool,
+        /// Collapse to one row per session, keeping the best-scoring message.
+        #[arg(long)]
+        group_by_conversation: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value_t = ProjectMatchArg::Exact)]
+        project_match: ProjectMatchArg,
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+        #[arg(long)]
+        source_agent: Option<String>,
+        /// ISO date (YYYY-MM-DD) lower bound, inclusive.
+        #[arg(long)]
+        from_date: Option<String>,
+        /// ISO date (YYYY-MM-DD) upper bound, inclusive.
+        #[arg(long)]
+        to_date: Option<String>,
+        /// Restrict to a single role (`user` | `assistant` | `system` | `tool`).
+        #[arg(long)]
+        role: Option<String>,
+        /// Server-side score threshold; hits below this are dropped.
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        format: OutputFormat,
+    },
+    /// Fetch a session or a single message (with optional thread context),
+    /// mirroring the `pond_get` MCP tool. Exactly one of `--session-id` or
+    /// `--message-id` is required.
+    #[command(group(ArgGroup::new("get_selector")
+        .required(true)
+        .args(["session_id", "message_id"])))]
+    Get {
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        /// Fetch an entire session by id. Mutually exclusive with `--message-id`.
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+        /// Fetch a single message by id. Mutually exclusive with `--session-id`.
+        #[arg(long, value_name = "ID")]
+        message_id: Option<String>,
+        /// Truncate session output at this message id. Requires `--session-id`.
+        #[arg(long, value_name = "ID", requires = "session_id", conflicts_with = "message_id")]
+        up_to: Option<String>,
+        /// For `--message-id` mode: include this many surrounding messages
+        /// from the same session. Ignored in session mode.
+        #[arg(long, default_value_t = 0)]
+        context_depth: usize,
+        /// Cap on returned messages.
+        #[arg(long, default_value_t = 100)]
+        max_messages: usize,
+        /// Include reasoning parts in the response (server-side filter).
+        #[arg(long)]
+        include_thinking: bool,
+        /// Include tool-result parts in the response (server-side filter).
+        #[arg(long)]
+        include_tool_results: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        format: OutputFormat,
+    },
     /// Stream every stored session out as JSONL `IngestEvent`s. The output
     /// is byte-identical with what `pond ingest` / `pond_ingest` consume,
     /// so `pond export -o backup.jsonl` plus `pond ingest backup.jsonl`
@@ -148,6 +249,38 @@ enum Command {
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
     },
+}
+
+/// CLI projection of [`ProjectMatch`]. Kept as a separate enum so clap's
+/// derive can attach `value_enum` without polluting the wire type.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProjectMatchArg {
+    /// Equality match against `sessions.project`.
+    Exact,
+    /// Substring match (`LIKE '%<value>%'`).
+    Contains,
+    /// Match rows whose `project` is NULL. The `--project` value is ignored.
+    IsNull,
+}
+
+impl From<ProjectMatchArg> for ProjectMatch {
+    fn from(value: ProjectMatchArg) -> Self {
+        match value {
+            ProjectMatchArg::Exact => ProjectMatch::Exact,
+            ProjectMatchArg::Contains => ProjectMatch::Contains,
+            ProjectMatchArg::IsNull => ProjectMatch::IsNull,
+        }
+    }
+}
+
+/// Output mode for `pond search` and `pond get`. Pretty is the human default;
+/// Json emits the wire envelope verbatim (including error envelopes), so
+/// scripts can `--format json | jq ...` against the same surface as the HTTP
+/// transport.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Pretty,
+    Json,
 }
 
 #[tokio::main]
@@ -179,8 +312,9 @@ async fn main() -> anyhow::Result<()> {
             for (name, config) in sources {
                 let summary = sync_with_progress(&store, &name, config).await?;
                 output(&format!(
-                    "sync {name}: inserted={} matched={} dropped_events={} \
+                    "{} inserted={} matched={} dropped_events={} \
                      dropped_sessions={} skipped_files={} storage_errors={}",
+                    pond::output::paint(&format!("sync {name}:"), pond::output::dim()),
                     summary.inserted,
                     summary.matched,
                     summary.dropped_events,
@@ -230,8 +364,11 @@ async fn main() -> anyhow::Result<()> {
                 summary.batches, summary.messages
             ));
             output(&format!(
-                "embed: model={} batches={} messages={}",
-                model.id, summary.batches, summary.messages,
+                "{} model={} batches={} messages={}",
+                pond::output::paint("embed:", pond::output::dim()),
+                model.id,
+                summary.batches,
+                summary.messages,
             ))?;
         }
         Command::Serve {
@@ -286,6 +423,97 @@ async fn main() -> anyhow::Result<()> {
             // task is `pond serve`-only, so it is not spawned here.
             transport::mcp::serve_stdio(AppState { store, embedder }).await?;
         }
+        Command::Search {
+            query,
+            data_dir,
+            config,
+            model,
+            namespace,
+            limit,
+            rrf_k,
+            no_boost_recent,
+            group_by_conversation,
+            project,
+            project_match,
+            session_id,
+            source_agent,
+            from_date,
+            to_date,
+            role,
+            min_score,
+            format,
+        } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let resolved_model = config::resolve_model(&loaded, model.as_deref(), &namespace)?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            // Match `pond serve` / `pond mcp`: load weights only when the
+            // store actually has embeddings for this model identity. Otherwise
+            // `pond_search` runs FTS-only and skips a multi-second model load.
+            let embedder: Option<Arc<dyn EmbedBackend>> = if store
+                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
+                .await?
+            {
+                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+            } else {
+                None
+            };
+            let request = SearchRequest {
+                protocol_version: PROTOCOL_VERSION,
+                namespace: Some(namespace),
+                query,
+                rrf_k,
+                filters: SearchFilters {
+                    project,
+                    project_match: project_match.into(),
+                    session_id,
+                    source_agent,
+                    from_date,
+                    to_date,
+                    role,
+                    min_score,
+                },
+                boost_recent: !no_boost_recent,
+                group_by_conversation,
+                limit,
+            };
+            let envelope = handlers::pond_search(&store, embedder.as_deref(), request).await;
+            if !render_search_envelope(format, &envelope)? {
+                std::process::exit(1);
+            }
+        }
+        Command::Get {
+            data_dir,
+            config,
+            namespace,
+            session_id,
+            message_id,
+            up_to,
+            context_depth,
+            max_messages,
+            include_thinking,
+            include_tool_results,
+            format,
+        } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let request = GetRequest {
+                protocol_version: PROTOCOL_VERSION,
+                namespace: Some(namespace),
+                session_id,
+                message_id,
+                up_to,
+                context_depth,
+                max_messages,
+                include_thinking,
+                include_tool_results,
+            };
+            let envelope = handlers::pond_get(&store, request).await;
+            if !render_get_envelope(format, &envelope)? {
+                std::process::exit(1);
+            }
+        }
         Command::Maintenance {
             data_dir,
             config,
@@ -303,7 +531,8 @@ async fn main() -> anyhow::Result<()> {
                 .maintenance(retention, skip_cleanup, skip_optimize)
                 .await;
             output(&format!(
-                "maintenance: versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
+                "{} versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
+                pond::output::paint("maintenance:", pond::output::dim()),
                 report.versions_removed,
                 report.bytes_reclaimed,
                 report.tables_optimized,
@@ -343,8 +572,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             output(&format!(
-                "export: sessions={} messages={} parts={}",
-                summary.sessions, summary.messages, summary.parts,
+                "{} sessions={} messages={} parts={}",
+                pond::output::paint("export:", pond::output::dim()),
+                summary.sessions,
+                summary.messages,
+                summary.parts,
             ))?;
         }
     }
@@ -522,18 +754,15 @@ async fn sync_with_progress(
             // actually has missing events.
             let dropped_count: usize;
             let optional_reason: Option<String>;
-            let tag: &str;
             let status_label: &str;
             match &outcome.status {
                 SyncStatus::Ok => {
-                    tag = "ok  ";
                     status_label = "ok";
                     dropped_count = 0;
                     optional_reason = None;
                 }
                 SyncStatus::Partial { dropped_events } => {
                     drops += *dropped_events as u64;
-                    tag = "part";
                     status_label = "partial";
                     dropped_count = *dropped_events;
                     optional_reason =
@@ -541,14 +770,12 @@ async fn sync_with_progress(
                 }
                 SyncStatus::Skipped { reason } => {
                     errors += 1;
-                    tag = "skip";
                     status_label = "skipped";
                     dropped_count = 0;
                     optional_reason = Some(reason.clone());
                 }
                 SyncStatus::Rejected { reason } => {
                     errors += 1;
-                    tag = "rej ";
                     status_label = "rejected";
                     dropped_count = 0;
                     optional_reason = Some(reason.clone());
@@ -557,7 +784,6 @@ async fn sync_with_progress(
             messages += outcome.messages as u64;
             bar_ref.println(format_sync_line(
                 name,
-                tag,
                 &outcome,
                 optional_reason.as_deref(),
             ));
@@ -616,12 +842,16 @@ async fn sync_with_progress(
 /// [00:04:32] claude-code ok    project=/Users/tenequm/Projects/pond  session=58a96901-4a4f-40be-a3c1-62419ec8c580  msgs=512
 /// [00:04:33] claude-code skip  /Users/tenequm/.../58a96901-....jsonl: empty jsonl session
 /// ```
-fn format_sync_line(
-    adapter: &str,
-    tag: &str,
-    outcome: &SessionOutcome,
-    reason: Option<&str>,
-) -> String {
+fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str>) -> String {
+    use pond::output::{green, paint, red, yellow};
+
+    let (raw_tag, tag_style) = match &outcome.status {
+        SyncStatus::Ok => ("ok  ", green()),
+        SyncStatus::Partial { .. } => ("part", yellow()),
+        SyncStatus::Skipped { .. } => ("skip", red()),
+        SyncStatus::Rejected { .. } => ("rej ", red()),
+    };
+    let tag = paint(raw_tag, tag_style);
     let ts = chrono::Local::now().format("%H:%M:%S");
     let project = outcome.project.as_deref().unwrap_or("-");
     let session = outcome.session_id.as_deref().unwrap_or("-");
@@ -697,40 +927,44 @@ async fn storage_sizes_for(data_dir: &Url) -> anyhow::Result<Option<StorageSizes
     }
 }
 
-/// Render `pond status` as a tree: data-dir + per-table sizes on top, then
-/// totals, then one section per adapter in registry order with its projects.
+/// Render `pond status` as: a header + storage breakdown table on top, a
+/// totals line, and one section per adapter in registry order with a project
+/// table. Tables width-adapt via comfy-table; on non-TTY stdout (piped to a
+/// file or test) coloring strips automatically via `pond::output::paint`.
 fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::Result<()> {
-    output("pond status")?;
-    output(&format!(
-        "\u{2514}\u{2500}\u{2500} data-dir: {}",
-        stats.data_url
-    ))?;
+    use pond::output::{bold, dim, paint};
+
+    output(&paint("pond status", bold()))?;
+    output(&format!("{}  {}", paint("data-dir", dim()), stats.data_url))?;
+
     match sizes {
         Some(sizes) => {
-            output(&format!("    ({} on disk)", format_bytes(sizes.total())))?;
-            output(&format!(
-                "    \u{251C}\u{2500}\u{2500} sessions    {:>10}",
-                format_bytes(sizes.sessions),
-            ))?;
-            output(&format!(
-                "    \u{251C}\u{2500}\u{2500} messages    {:>10}",
-                format_bytes(sizes.messages),
-            ))?;
-            output(&format!(
-                "    \u{251C}\u{2500}\u{2500} parts       {:>10}",
-                format_bytes(sizes.parts),
-            ))?;
-            output(&format!(
-                "    \u{251C}\u{2500}\u{2500} embeddings  {:>10}",
-                format_bytes(sizes.embeddings),
-            ))?;
-            output(&format!(
-                "    \u{2514}\u{2500}\u{2500} other       {:>10}",
-                format_bytes(sizes.other),
-            ))?;
+            let mut table = new_table();
+            for (label, bytes) in [
+                ("sessions", sizes.sessions),
+                ("messages", sizes.messages),
+                ("parts", sizes.parts),
+                ("embeddings", sizes.embeddings),
+                ("other", sizes.other),
+            ] {
+                table.add_row(vec![
+                    Cell::new(format!("  {label}")),
+                    Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
+                ]);
+            }
+            table.add_row(vec![
+                Cell::new("  total").add_attribute(Attribute::Bold),
+                Cell::new(format_bytes(sizes.total()))
+                    .set_alignment(CellAlignment::Right)
+                    .add_attribute(Attribute::Bold),
+            ]);
+            output(&table.to_string())?;
         }
         None => {
-            output("    (size on disk unavailable for remote backends; wired with S3 stage)")?;
+            output(&paint(
+                "  (size on disk unavailable for remote backends; wired with S3 stage)",
+                dim(),
+            ))?;
         }
     }
 
@@ -742,14 +976,15 @@ fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::R
     } = stats.totals;
     output("")?;
     output(&format!(
-        "totals: {} sessions  {} messages  {} parts  {} embeddings",
-        format_thousands(sessions),
-        format_thousands(messages),
-        format_thousands(parts),
-        format_thousands(embeddings),
+        "{}  {} sessions  {} messages  {} parts  {} embeddings",
+        paint("totals", dim()),
+        paint(&format_thousands(sessions), bold()),
+        paint(&format_thousands(messages), bold()),
+        paint(&format_thousands(parts), bold()),
+        paint(&format_thousands(embeddings), bold()),
     ))?;
 
-    // Render adapters in registry order so the tree matches the discovery
+    // Render adapters in registry order so the layout matches the discovery
     // picker; adapters present in the data but not in the registry append at
     // the bottom (defensive: catches deleted adapters whose data is still on
     // disk).
@@ -770,27 +1005,436 @@ fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::R
 }
 
 fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
+    use pond::output::{bold, cyan, paint};
+
     output("")?;
     output(&format!(
-        "{}  ({} sessions, {} messages, {} projects)",
-        stat.adapter,
-        format_thousands(stat.sessions),
-        format_thousands(stat.messages),
-        format_thousands(stat.projects.len() as u64),
+        "{}  {} sessions  {} messages  {} projects",
+        paint(&stat.adapter, cyan().bold()),
+        paint(&format_thousands(stat.sessions), bold()),
+        paint(&format_thousands(stat.messages), bold()),
+        paint(&format_thousands(stat.projects.len() as u64), bold()),
     ))?;
-    let last_index = stat.projects.len().saturating_sub(1);
-    for (idx, project) in stat.projects.iter().enumerate() {
-        let glyph = if idx == last_index {
-            "\u{2514}\u{2500}\u{2500}"
-        } else {
-            "\u{251C}\u{2500}\u{2500}"
-        };
+    if stat.projects.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("project")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Dim),
+        Cell::new("sessions")
+            .set_alignment(CellAlignment::Right)
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Dim),
+        Cell::new("messages")
+            .set_alignment(CellAlignment::Right)
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Dim),
+    ]);
+    for project in &stat.projects {
         let label = project.project.as_deref().unwrap_or("(no project)");
-        output(&format!(
-            "{glyph} {label:<60}  {:>7} sessions   {:>9} msgs",
-            format_thousands(project.sessions),
-            format_thousands(project.messages),
-        ))?;
+        table.add_row(vec![
+            Cell::new(label),
+            Cell::new(format_thousands(project.sessions)).set_alignment(CellAlignment::Right),
+            Cell::new(format_thousands(project.messages)).set_alignment(CellAlignment::Right),
+        ]);
+    }
+    // Let the project column flex; right-size the numeric columns to their
+    // content so the long path takes the remaining width and truncates with
+    // an ellipsis on narrow terminals.
+    if let Some(col) = table.column_mut(1) {
+        col.set_constraint(ColumnConstraint::ContentWidth);
+    }
+    if let Some(col) = table.column_mut(2) {
+        col.set_constraint(ColumnConstraint::ContentWidth);
+    }
+    output(&table.to_string())?;
+    Ok(())
+}
+
+/// House style for `pond status` tables: borderless, dynamic-width, no inner
+/// rules. Centralized so future tabular commands match without copy-paste.
+fn new_table() -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    table
+}
+
+/// Dispatch an envelope through the chosen format. Returns `true` when the
+/// envelope was a `Success` (callers exit non-zero on `false`). JSON mode
+/// always emits the envelope to stdout so scripts can pipe both success and
+/// error bodies through `jq`; pretty mode routes errors to stderr so stdout
+/// stays parseable.
+fn render_search_envelope(
+    format: OutputFormat,
+    envelope: &SearchEnvelope,
+) -> anyhow::Result<bool> {
+    match format {
+        OutputFormat::Json => {
+            output(
+                &serde_json::to_string_pretty(envelope)
+                    .context("serialize search envelope as JSON")?,
+            )?;
+            Ok(matches!(envelope, SearchEnvelope::Success(_)))
+        }
+        OutputFormat::Pretty => match envelope {
+            SearchEnvelope::Success(response) => {
+                render_search_pretty(response)?;
+                Ok(true)
+            }
+            SearchEnvelope::Error(error) => {
+                render_error_pretty(error);
+                Ok(false)
+            }
+        },
+    }
+}
+
+fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::Result<bool> {
+    match format {
+        OutputFormat::Json => {
+            output(
+                &serde_json::to_string_pretty(envelope)
+                    .context("serialize get envelope as JSON")?,
+            )?;
+            Ok(matches!(envelope, GetEnvelope::Success(_)))
+        }
+        OutputFormat::Pretty => match envelope {
+            GetEnvelope::Success(response) => {
+                render_get_pretty(response)?;
+                Ok(true)
+            }
+            GetEnvelope::Error(error) => {
+                render_error_pretty(error);
+                Ok(false)
+            }
+        },
+    }
+}
+
+fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
+
+    match &response.result {
+        SearchResultBody::Hits { hits } => {
+            output(&format!(
+                "{} {} {}",
+                paint("search:", dim()),
+                paint(&format_thousands(response.total as u64), bold()),
+                if response.total == 1 { "hit" } else { "hits" },
+            ))?;
+            if hits.is_empty() {
+                return Ok(());
+            }
+            for (idx, hit) in hits.iter().enumerate() {
+                output("")?;
+                render_hit(idx + 1, hit)?;
+            }
+        }
+        SearchResultBody::Groups { groups } => {
+            output(&format!(
+                "{} {} {}",
+                paint("search:", dim()),
+                paint(&format_thousands(response.total as u64), bold()),
+                if response.total == 1 {
+                    "session"
+                } else {
+                    "sessions"
+                },
+            ))?;
+            if groups.is_empty() {
+                return Ok(());
+            }
+            for (idx, group) in groups.iter().enumerate() {
+                output("")?;
+                render_group(idx + 1, group)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
+
+    let matched = if hit.matched_via.is_empty() {
+        "-".to_owned()
+    } else {
+        hit.matched_via.join("+")
+    };
+    output(&format!(
+        "{}  {}  {}",
+        paint(&format!("[{rank}]"), dim()),
+        paint(&format!("{:.4}", hit.score), bold()),
+        paint(&matched, dim()),
+    ))?;
+    output(&format!(
+        "    {}  {}  {}  {}",
+        paint(
+            &hit.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            dim(),
+        ),
+        paint_role(&hit.role),
+        paint(hit.project.as_deref().unwrap_or("-"), dim()),
+        paint(&hit.message_id, dim()),
+    ))?;
+    render_preview(&hit.preview)?;
+    Ok(())
+}
+
+fn render_group(rank: usize, group: &Group) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
+
+    output(&format!(
+        "{}  best={}  {} messages",
+        paint(&format!("[{rank}]"), dim()),
+        paint(&format!("{:.4}", group.best_score), bold()),
+        paint(&format_thousands(group.message_count as u64), bold()),
+    ))?;
+    output(&format!(
+        "    {} -> {}  {}  {}  {}",
+        paint(
+            &group.first_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
+            dim(),
+        ),
+        paint(
+            &group.last_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
+            dim(),
+        ),
+        paint(group.project.as_deref().unwrap_or("-"), dim()),
+        paint(&group.source_agent, dim()),
+        paint(&group.session_id, dim()),
+    ))?;
+    render_preview(&group.preview)?;
+    Ok(())
+}
+
+fn render_preview(preview: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    if preview.is_empty() {
+        return Ok(());
+    }
+    let prefix = paint(">", dim());
+    for line in preview.lines() {
+        output(&format!("    {prefix} {line}"))?;
+    }
+    Ok(())
+}
+
+fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
+
+    let (session, messages, parts) = match &response.result {
+        GetResult::Session {
+            session,
+            messages,
+            parts,
+        }
+        | GetResult::Message {
+            session,
+            messages,
+            parts,
+        } => (session, messages, parts),
+    };
+
+    output(&format!(
+        "{} {}  source={}  project={}",
+        paint("session", dim()),
+        paint(&session.id, bold()),
+        session.source_agent,
+        session.project.as_deref().unwrap_or("-"),
+    ))?;
+    output(&format!(
+        "{} {}",
+        paint("created:", dim()),
+        paint(
+            &session
+                .created_at
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            dim(),
+        ),
+    ))?;
+
+    // Group parts by message_id, sorted by ordinal, so each message renders
+    // its parts in order without re-scanning the parts vec per message.
+    let mut parts_by_msg: std::collections::HashMap<&str, Vec<&Part>> =
+        std::collections::HashMap::new();
+    for part in parts {
+        parts_by_msg
+            .entry(part.message_id.as_str())
+            .or_default()
+            .push(part);
+    }
+    for parts_for_msg in parts_by_msg.values_mut() {
+        parts_for_msg.sort_by_key(|p| p.ordinal);
+    }
+
+    for (idx, message) in messages.iter().enumerate() {
+        output("")?;
+        let parts_for_msg = parts_by_msg
+            .get(message.id())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        render_message(idx + 1, message, parts_for_msg)?;
+    }
+
+    output("")?;
+    output(&format!(
+        "{} {} messages, {} parts{}",
+        paint("(total:", dim()),
+        paint(&format_thousands(messages.len() as u64), bold()),
+        paint(&format_thousands(parts.len() as u64), bold()),
+        paint(")", dim()),
+    ))?;
+    Ok(())
+}
+
+fn render_message(rank: usize, message: &Message, parts: &[&Part]) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+
+    output(&format!(
+        "{}  {}  {}  {}",
+        paint(&format!("[{rank}]"), dim()),
+        paint(
+            &message
+                .timestamp()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            dim(),
+        ),
+        paint_role(message.role().as_str()),
+        paint(message.id(), dim()),
+    ))?;
+    if let Some(content) = message.system_content() {
+        render_preview(content)?;
+        return Ok(());
+    }
+    for part in parts {
+        render_part(part)?;
+    }
+    Ok(())
+}
+
+fn render_part(part: &Part) -> anyhow::Result<()> {
+    use pond::output::{dim, paint, yellow};
+
+    let prefix = paint(">", dim());
+    match &part.kind {
+        PartKind::Text { text } => {
+            for line in text.lines() {
+                output(&format!("    {prefix} {line}"))?;
+            }
+        }
+        PartKind::Reasoning { text } => {
+            let tag = paint("[reasoning]", dim());
+            for line in text.lines() {
+                output(&format!("    {tag} {prefix} {line}"))?;
+            }
+        }
+        PartKind::File {
+            media_type,
+            file_name,
+            ..
+        } => {
+            output(&format!(
+                "    {} media_type={media_type} file_name={}",
+                paint("[file]", yellow()),
+                file_name.as_deref().unwrap_or("-"),
+            ))?;
+        }
+        PartKind::ToolCall { call_id, name, .. } => {
+            output(&format!(
+                "    {} {name} call_id={call_id}",
+                paint("[tool_call]", yellow()),
+            ))?;
+        }
+        PartKind::ToolResult {
+            call_id,
+            name,
+            is_failure,
+            ..
+        } => {
+            output(&format!(
+                "    {} {name} call_id={call_id}{}",
+                paint("[tool_result]", yellow()),
+                if *is_failure { " (failure)" } else { "" },
+            ))?;
+        }
+        PartKind::ToolApprovalRequest {
+            approval_id,
+            tool_call_id,
+        } => {
+            output(&format!(
+                "    {} approval_id={approval_id} tool_call_id={tool_call_id}",
+                paint("[approval_request]", yellow()),
+            ))?;
+        }
+        PartKind::ToolApprovalResponse {
+            approval_id,
+            approved,
+            reason,
+        } => {
+            let suffix = reason
+                .as_deref()
+                .map(|r| format!(" reason={r}"))
+                .unwrap_or_default();
+            output(&format!(
+                "    {} approval_id={approval_id} approved={approved}{suffix}",
+                paint("[approval_response]", yellow()),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn render_error_pretty(error: &ErrorEnvelope) {
+    use pond::output::{bold, dim, paint, red};
+
+    let code = match error.error.code {
+        wire::ErrorCode::ValidationFailed => "validation_failed",
+        wire::ErrorCode::VersionUnsupported => "version_unsupported",
+        wire::ErrorCode::NotFound => "not_found",
+        wire::ErrorCode::NamespaceUnknown => "namespace_unknown",
+        wire::ErrorCode::StorageUnavailable => "storage_unavailable",
+        wire::ErrorCode::Conflict => "conflict",
+        wire::ErrorCode::Internal => "internal",
+    };
+    eprintln!(
+        "{} {} {}",
+        paint("error", red().bold()),
+        paint(code, bold()),
+        error.error.message,
+    );
+    let details_present = !error.error.details.is_null()
+        && !error
+            .error
+            .details
+            .as_object()
+            .map(|map| map.is_empty())
+            .unwrap_or(false);
+    if details_present {
+        eprintln!(
+            "{}",
+            paint(&format!("  details: {}", error.error.details), dim()),
+        );
+    }
+    eprintln!(
+        "{}",
+        paint(&format!("  request_id: {}", error.request_id), dim()),
+    );
+}
+
+fn paint_role(role: &str) -> String {
+    use pond::output::{cyan, dim, green, paint, yellow};
+    let style = match role {
+        "user" => green(),
+        "assistant" => cyan(),
+        "tool" => yellow(),
+        _ => dim(),
+    };
+    paint(role, style)
 }
