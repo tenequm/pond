@@ -42,7 +42,7 @@ async fn rm_and_resync_round_trips_to_identical_state() -> anyhow::Result<()> {
     // First ingest: build the canonical state.
     let original = TempDir::new()?;
     let store = Arc::new(Store::open_local(original.path()).await?);
-    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
     let original_counts = store.row_counts().await?;
     let original_export = full_export(&store).await?;
     drop(store);
@@ -52,7 +52,7 @@ async fn rm_and_resync_round_trips_to_identical_state() -> anyhow::Result<()> {
     // state is byte-identical to the old state.
     let recovered = TempDir::new()?;
     let store = Store::open_local(recovered.path()).await?;
-    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
     let recovered_counts = store.row_counts().await?;
     let recovered_export = full_export(&store).await?;
 
@@ -73,7 +73,7 @@ async fn export_then_ingest_round_trips_canonical_events() -> anyhow::Result<()>
     // Build the source state from a real adapter.
     let source = TempDir::new()?;
     let source_store = Store::open_local(source.path()).await?;
-    ingest_adapter(&source_store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&source_store, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
     let source_export = full_export(&source_store).await?;
     let source_counts = source_store.row_counts().await?;
 
@@ -104,7 +104,7 @@ async fn export_then_ingest_round_trips_canonical_events() -> anyhow::Result<()>
 async fn export_filtered_to_one_session_carries_only_that_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
 
     let session_id = store
         .session_ids()
@@ -115,7 +115,10 @@ async fn export_filtered_to_one_session_carries_only_that_session() -> anyhow::R
 
     let mut buffer = Vec::new();
     let summary = pond_export(&store, Some(&session_id), &mut buffer).await?;
-    assert_eq!(summary.sessions, 1, "filter must restrict to exactly one session");
+    assert_eq!(
+        summary.sessions, 1,
+        "filter must restrict to exactly one session"
+    );
     let events = parse_events(&buffer)?;
     for event in &events {
         let event_session = match event {

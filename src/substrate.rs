@@ -5,8 +5,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use lance::Dataset;
-use lance::dataset::MergeInsertBuilder;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{MergeInsertBuilder, WhenMatched};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
@@ -149,8 +149,11 @@ pub struct Handle {
     /// `Dataset::write` call so refresh / index-creation paths inherit the
     /// same credentials and region as the initial open. Empty on local-FS
     /// installs.
-    #[allow(dead_code)]
     storage_options: HashMap<String, String>,
+    /// Data-dir URL the handle was opened against. `pond status` reads this
+    /// to display where the bytes live and to decide whether to walk a local
+    /// directory or issue a remote `LIST` for sizing.
+    location: Url,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -286,8 +289,21 @@ impl Handle {
             retry: RetryPolicy::default(),
             session,
             storage_options,
+            location: location.clone(),
         })
     }
+
+    pub fn location(&self) -> &Url {
+        &self.location
+    }
+
+    /// Read-only view of the `storage_options` the handle was opened with.
+    /// `pond status` needs them to instantiate a raw `object_store` client
+    /// that can `LIST` the remote bucket for sizing.
+    pub fn storage_options(&self) -> &HashMap<String, String> {
+        &self.storage_options
+    }
+
     pub async fn row_counts(&self) -> Result<(usize, usize, usize, usize)> {
         Ok((
             self.count_rows(Table::Sessions, None).await?,
@@ -305,18 +321,55 @@ impl Handle {
         if row_count == 0 {
             return Ok(0);
         }
-        self.retry_lance(table.label(), || async {
-            let mut cached = self.cached(table).lock().await;
-            let existing = cached.latest().await?;
-            let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-            let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?
-                .try_build()?
-                .execute_reader(Box::new(reader))
-                .await?;
-            cached.replace(dataset.as_ref().clone());
-            Ok(stats.num_inserted_rows)
-        })
-        .await
+        let label = table.label();
+        let started = Instant::now();
+        // Level 2 self-heal (design.md 2.3 invariant): rows that already
+        // exist (matched by the schema's `lance-schema:unenforced-primary-key`
+        // columns) have their non-PK fields *refreshed* from source on
+        // every sync. Insertions still happen as before. This means a bug
+        // in an earlier pond version that wrote stale field values gets
+        // corrected on the next `pond sync` against the same source -
+        // without re-syncing requiring a wipe, and without the operator
+        // having to think about which version of pond wrote which row.
+        //
+        // Adapters must never produce a *subset* of what a prior version
+        // produced for the same source - that invariant is what makes the
+        // omission of `when_not_matched_by_source` safe (no orphan-purge
+        // step needed). See design.md 2.3.
+        //
+        // Embeddings are excluded: their data column is the computed vector
+        // and re-running `pond sync` should never silently re-emit them.
+        // `pond embed` is the only owner of that table's data.
+        let when_matched = match table {
+            Table::Sessions | Table::Messages | Table::Parts => WhenMatched::UpdateAll,
+            Table::Embeddings => WhenMatched::DoNothing,
+        };
+        let result = self
+            .retry_lance(label, || async {
+                let mut cached = self.cached(table).lock().await;
+                let existing = cached.latest().await?;
+                let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+                let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
+                builder.when_matched(when_matched.clone());
+                let (dataset, stats) = builder
+                    .try_build()?
+                    .execute_reader(Box::new(reader))
+                    .await?;
+                cached.replace(dataset.as_ref().clone());
+                Ok(stats.num_inserted_rows)
+            })
+            .await;
+        // One info line per merge_insert: aggregating these in a perf probe
+        // run (`POND_LOG=pond=info pond sync ...`) tells us how time splits
+        // across the three tables and across batches.
+        tracing::info!(
+            target: "pond::perf",
+            table = %label,
+            rows = row_count,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "merge_insert"
+        );
+        result
     }
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
         let mut cached = self.cached(table).lock().await;
@@ -516,9 +569,9 @@ async fn open_or_create(
     // session's default registry (env-var-driven object_store).
     if !storage_options.is_empty() {
         write_params.store_params = Some(ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                StorageOptionsAccessor::with_static_options(storage_options.clone()),
-            )),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage_options.clone(),
+            ))),
             ..Default::default()
         });
     }

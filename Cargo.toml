@@ -67,6 +67,13 @@ tower = { version = "0.5", features = ["util"] }
 name = "embed_bench"
 harness = false
 
+# `benches/ingest_bench.rs` measures the ingest path: per-stage timing plus a
+# per-table merge_insert breakdown captured via a `pond::perf` tracing layer.
+# Run: `cargo bench --bench ingest_bench -- --source-dir <PATH> [--source-dir <PATH>...]`
+[[bench]]
+name = "ingest_bench"
+harness = false
+
 [features]
 # Opt-in NVIDIA GPU embeddings for non-macOS builds: forwards to fastembed's
 # `cuda` feature (-> `candle-core/cuda`). Off by default because `candle-core/cuda`

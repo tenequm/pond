@@ -500,7 +500,7 @@ fn pseudo_vector(text: &str, dim: usize) -> Vec<f32> {
 async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
-    ingest_adapter(&store, &adapter).await?;
+    ingest_adapter(&store, &adapter, |_| {}).await?;
     store.ensure_indices().await?;
 
     let model = Config::builtin().embeddings.default_model("local")?;
@@ -620,7 +620,7 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
     // the FTS index but no embed pass.
     let temp2 = TempDir::new()?;
     let store2 = Store::open_local(temp2.path()).await?;
-    ingest_adapter(&store2, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&store2, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
     store2.ensure_indices().await?;
     let hits = body_hits(
         success_of(pond_search(&store2, Some(&backend), search_request(&phrase)).await).result,

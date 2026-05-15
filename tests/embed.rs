@@ -270,9 +270,7 @@ fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
     let resolved = resolve_data_dir(None, None, None).unwrap();
     assert!(is_local(&resolved));
     assert!(
-        local_path(&resolved)
-            .unwrap()
-            .ends_with(".pond"),
+        local_path(&resolved).unwrap().ends_with(".pond"),
         "fallback path should end with .pond: {resolved}",
     );
 }
@@ -282,7 +280,7 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
-    ingest_adapter(&store, &adapter).await?;
+    ingest_adapter(&store, &adapter, |_| {}).await?;
 
     let model = Config::builtin().embeddings.default_model("local")?;
     let backend = FakeBackend::new(model.dim as usize);

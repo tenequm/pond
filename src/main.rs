@@ -12,8 +12,8 @@ use pond::{
     adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig},
     embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
-    handlers::{self, IngestSummary},
-    sessions::Store,
+    handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
+    sessions::{AdapterStats, CorpusStats, RowTotals, StorageSizes, Store},
     transport::{self, AppState},
 };
 use serde_json::{Value, json};
@@ -160,10 +160,9 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            let (sessions, messages, parts, embeddings) = store.row_counts().await?;
-            output(&format!(
-                "sessions={sessions} messages={messages} parts={parts} embeddings={embeddings}"
-            ))?;
+            let stats = store.corpus_stats().await?;
+            let sizes = storage_sizes_for(&data_dir).await?;
+            render_status(&stats, sizes.as_ref())?;
         }
         Command::Sync {
             adapter,
@@ -178,13 +177,16 @@ async fn main() -> anyhow::Result<()> {
             let sources =
                 resolve_sync_sources(&loaded, &config_file, adapter.as_deref(), source_dir)?;
             for (name, config) in sources {
-                let summary = sync_one(&store, &name, config).await?;
+                let summary = sync_with_progress(&store, &name, config).await?;
                 output(&format!(
-                    "sync {name}: accepted={} inserted={} matched={} errors={}",
-                    summary.accepted(),
+                    "sync {name}: inserted={} matched={} dropped_events={} \
+                     dropped_sessions={} skipped_files={} storage_errors={}",
                     summary.inserted,
                     summary.matched,
-                    summary.errors,
+                    summary.dropped_events,
+                    summary.dropped_sessions,
+                    summary.skipped_files,
+                    summary.storage_errors,
                 ))?;
             }
             store.ensure_indices().await?;
@@ -243,8 +245,7 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
-            let store =
-                Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             // Probe the embeddings table: if there's at least one row for the
             // default model identity, load the model so hybrid search works;
             // otherwise boot without weights and let `pond_search` run
@@ -272,8 +273,7 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
-            let store =
-                Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             let embedder: Option<Arc<dyn EmbedBackend>> = if store
                 .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
                 .await?
@@ -412,21 +412,19 @@ fn resolve_data_dir(explicit: Option<Url>) -> anyhow::Result<Url> {
     )
 }
 
-/// The config path: an explicit `--config` wins; otherwise local data dirs
-/// default to `<data_dir>/config.toml` and remote data dirs fall back to
-/// `$XDG_CONFIG_HOME/pond/config.toml` (the config file is always local -
-/// you can't read the bucket without the config that names the bucket).
-fn config_path(explicit: Option<PathBuf>, data_dir: &Url) -> PathBuf {
+/// The config path: an explicit `--config` (or `POND_CONFIG`) wins; otherwise
+/// `$XDG_CONFIG_HOME/pond/config.toml` (default `~/.config/pond/config.toml`),
+/// regardless of where the data dir lives. Config and data are different XDG
+/// categories - they always live in different directories, even when both are
+/// local.
+fn config_path(explicit: Option<PathBuf>, _data_dir: &Url) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
-    match pond::config::local_path(data_dir) {
-        Some(path) => path.join("config.toml"),
-        None => pond::config::default_config_path(
-            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-            std::env::var_os("HOME").map(PathBuf::from),
-        ),
-    }
+    pond::config::default_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 
 /// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
@@ -479,9 +477,13 @@ fn resolve_sync_sources(
     Ok(picks.into_iter().map(|c| (c.name, c.config)).collect())
 }
 
-/// Run one adapter's ingest pass into `store`. Looks up the factory by name,
-/// opens it against the provided config blob, and drains its events stream.
-async fn sync_one(store: &Store, name: &str, config: Value) -> anyhow::Result<IngestSummary> {
+/// Run one adapter's ingest pass into `store` with a live progress bar and
+/// one greppable log line per finished (or skipped) session.
+async fn sync_with_progress(
+    store: &Store,
+    name: &str,
+    config: Value,
+) -> anyhow::Result<IngestSummary> {
     let factory = adapter::by_name(name).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown adapter {name:?}; known: {}",
@@ -489,5 +491,306 @@ async fn sync_one(store: &Store, name: &str, config: Value) -> anyhow::Result<In
         )
     })?;
     let adapter = factory.open(config)?;
-    handlers::ingest_adapter(store, adapter.as_ref()).await
+
+    let bar = ProgressBar::new(0);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "sync {prefix} [{elapsed_precise}] [{bar:24}] {pos}/{len} sessions  {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("##-"),
+    );
+    bar.set_prefix(name.to_owned());
+    bar.enable_steady_tick(Duration::from_millis(250));
+
+    let mut messages: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut drops: u64 = 0;
+    let started = std::time::Instant::now();
+    let bar_ref = &bar;
+
+    let summary = handlers::ingest_adapter(store, adapter.as_ref(), |event| match event {
+        SyncEvent::Discovered { total } => {
+            if let Some(total) = total {
+                bar_ref.set_length(total as u64);
+            }
+        }
+        SyncEvent::SessionDone(outcome) => {
+            // Map the four-class status to a compact bar tag + a tracing
+            // status label. `dropped` is shown for Partial sessions so the
+            // operator can see when one of the bar's "ok-ish" sessions
+            // actually has missing events.
+            let dropped_count: usize;
+            let optional_reason: Option<String>;
+            let tag: &str;
+            let status_label: &str;
+            match &outcome.status {
+                SyncStatus::Ok => {
+                    tag = "ok  ";
+                    status_label = "ok";
+                    dropped_count = 0;
+                    optional_reason = None;
+                }
+                SyncStatus::Partial { dropped_events } => {
+                    drops += *dropped_events as u64;
+                    tag = "part";
+                    status_label = "partial";
+                    dropped_count = *dropped_events;
+                    optional_reason =
+                        Some(format!("dropped {dropped_events} event(s) mid-session"));
+                }
+                SyncStatus::Skipped { reason } => {
+                    errors += 1;
+                    tag = "skip";
+                    status_label = "skipped";
+                    dropped_count = 0;
+                    optional_reason = Some(reason.clone());
+                }
+                SyncStatus::Rejected { reason } => {
+                    errors += 1;
+                    tag = "rej ";
+                    status_label = "rejected";
+                    dropped_count = 0;
+                    optional_reason = Some(reason.clone());
+                }
+            }
+            messages += outcome.messages as u64;
+            bar_ref.println(format_sync_line(
+                name,
+                tag,
+                &outcome,
+                optional_reason.as_deref(),
+            ));
+            // The bar's `println` only renders when stderr is a TTY; in
+            // piped runs (CI, `pond sync 2>&1 | tee`) operators still need
+            // visibility per session. The same data goes out as a `tracing`
+            // event on `pond::sync` at INFO. Default verbosity is `warn` so
+            // this is silent unless the operator asks via `POND_LOG=info`
+            // (or `POND_LOG=pond::sync=info` for sync-only detail).
+            match optional_reason.as_deref() {
+                None => tracing::info!(
+                    target: "pond::sync",
+                    adapter = name,
+                    status = status_label,
+                    project = outcome.project.as_deref().unwrap_or("-"),
+                    session = outcome.session_id.as_deref().unwrap_or("-"),
+                    messages = outcome.messages,
+                    dropped = dropped_count,
+                    "session done"
+                ),
+                Some(reason) => tracing::info!(
+                    target: "pond::sync",
+                    adapter = name,
+                    status = status_label,
+                    project = outcome.project.as_deref().unwrap_or("-"),
+                    session = outcome.session_id.as_deref().unwrap_or("-"),
+                    messages = outcome.messages,
+                    dropped = dropped_count,
+                    %reason,
+                    "session done"
+                ),
+            }
+            bar_ref.inc(1);
+            bar_ref.set_message(format_bar_message(
+                messages,
+                drops,
+                errors,
+                started.elapsed(),
+            ));
+        }
+    })
+    .await?;
+
+    bar.finish_with_message(format!(
+        "{} msgs  {} dropped  {} err  done",
+        format_thousands(messages),
+        format_thousands(drops),
+        format_thousands(errors),
+    ));
+    Ok(summary)
+}
+
+/// One greppable per-session log line. Examples:
+///
+/// ```text
+/// [00:04:32] claude-code ok    project=/Users/tenequm/Projects/pond  session=58a96901-4a4f-40be-a3c1-62419ec8c580  msgs=512
+/// [00:04:33] claude-code skip  /Users/tenequm/.../58a96901-....jsonl: empty jsonl session
+/// ```
+fn format_sync_line(
+    adapter: &str,
+    tag: &str,
+    outcome: &SessionOutcome,
+    reason: Option<&str>,
+) -> String {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let project = outcome.project.as_deref().unwrap_or("-");
+    let session = outcome.session_id.as_deref().unwrap_or("-");
+    match reason {
+        None => format!(
+            "[{ts}] {adapter} {tag}  project={project}  session={session}  msgs={}",
+            outcome.messages,
+        ),
+        Some(reason) => format!("[{ts}] {adapter} {tag}  {reason}"),
+    }
+}
+
+fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let msg_per_sec = (messages as f64) / secs;
+    format!(
+        "{} msgs  {} dropped  {} err  {:.0} msg/s",
+        format_thousands(messages),
+        format_thousands(drops),
+        format_thousands(errors),
+        msg_per_sec,
+    )
+}
+
+/// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
+fn format_thousands(value: u64) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (idx, ch) in raw.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// Pretty-print a byte count: `2_589_934_592 -> "2.41 GiB"`. Plain function
+/// rather than a humansize-crate add: the spec is small, deterministic, and
+/// the dep would land just to format one line of `pond status`.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 100.0 {
+        format!("{:.0} {}", value, UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{:.1} {}", value, UNITS[unit])
+    } else {
+        format!("{:.2} {}", value, UNITS[unit])
+    }
+}
+
+/// Walk the data dir when it's local; for remote data dirs return `None` and
+/// note in `pond status` that sizes are unavailable until the S3 backend
+/// lands (see plan.md S3 backend stage). The remote `LIST` plumbing is wired
+/// alongside the rest of the S3 work, where it can be tested end-to-end.
+async fn storage_sizes_for(data_dir: &Url) -> anyhow::Result<Option<StorageSizes>> {
+    if let Some(path) = config::local_path(data_dir) {
+        let sizes = tokio::task::spawn_blocking(move || StorageSizes::from_local_dir(&path))
+            .await
+            .context("storage size walk panicked")??;
+        Ok(Some(sizes))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Render `pond status` as a tree: data-dir + per-table sizes on top, then
+/// totals, then one section per adapter in registry order with its projects.
+fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::Result<()> {
+    output("pond status")?;
+    output(&format!(
+        "\u{2514}\u{2500}\u{2500} data-dir: {}",
+        stats.data_url
+    ))?;
+    match sizes {
+        Some(sizes) => {
+            output(&format!("    ({} on disk)", format_bytes(sizes.total())))?;
+            output(&format!(
+                "    \u{251C}\u{2500}\u{2500} sessions    {:>10}",
+                format_bytes(sizes.sessions),
+            ))?;
+            output(&format!(
+                "    \u{251C}\u{2500}\u{2500} messages    {:>10}",
+                format_bytes(sizes.messages),
+            ))?;
+            output(&format!(
+                "    \u{251C}\u{2500}\u{2500} parts       {:>10}",
+                format_bytes(sizes.parts),
+            ))?;
+            output(&format!(
+                "    \u{251C}\u{2500}\u{2500} embeddings  {:>10}",
+                format_bytes(sizes.embeddings),
+            ))?;
+            output(&format!(
+                "    \u{2514}\u{2500}\u{2500} other       {:>10}",
+                format_bytes(sizes.other),
+            ))?;
+        }
+        None => {
+            output("    (size on disk unavailable for remote backends; wired with S3 stage)")?;
+        }
+    }
+
+    let RowTotals {
+        sessions,
+        messages,
+        parts,
+        embeddings,
+    } = stats.totals;
+    output("")?;
+    output(&format!(
+        "totals: {} sessions  {} messages  {} parts  {} embeddings",
+        format_thousands(sessions),
+        format_thousands(messages),
+        format_thousands(parts),
+        format_thousands(embeddings),
+    ))?;
+
+    // Render adapters in registry order so the tree matches the discovery
+    // picker; adapters present in the data but not in the registry append at
+    // the bottom (defensive: catches deleted adapters whose data is still on
+    // disk).
+    let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
+        .adapters
+        .iter()
+        .map(|stat| (stat.adapter.as_str(), stat))
+        .collect();
+    for factory in adapter::registry() {
+        if let Some(stat) = by_name.remove(factory.name()) {
+            render_adapter_block(stat)?;
+        }
+    }
+    for stat in by_name.values() {
+        render_adapter_block(stat)?;
+    }
+    Ok(())
+}
+
+fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
+    output("")?;
+    output(&format!(
+        "{}  ({} sessions, {} messages, {} projects)",
+        stat.adapter,
+        format_thousands(stat.sessions),
+        format_thousands(stat.messages),
+        format_thousands(stat.projects.len() as u64),
+    ))?;
+    let last_index = stat.projects.len().saturating_sub(1);
+    for (idx, project) in stat.projects.iter().enumerate() {
+        let glyph = if idx == last_index {
+            "\u{2514}\u{2500}\u{2500}"
+        } else {
+            "\u{251C}\u{2500}\u{2500}"
+        };
+        let label = project.project.as_deref().unwrap_or("(no project)");
+        output(&format!(
+            "{glyph} {label:<60}  {:>7} sessions   {:>9} msgs",
+            format_thousands(project.sessions),
+            format_thousands(project.messages),
+        ))?;
+    }
+    Ok(())
 }

@@ -22,8 +22,8 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, Env, EventStream, collect_jsonl_files, compact_json,
-    empty_options, part_id,
+    Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
+    compact_json, empty_options, part_id,
 };
 
 /// Stable adapter name. Surfaces as the `[sources.claude-code]` config key,
@@ -74,6 +74,21 @@ impl ClaudeCodeAdapter {
 }
 
 impl Adapter for ClaudeCodeAdapter {
+    fn discover(&self) -> DiscoverFuture<'_> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            // Count files only - do not pre-parse headers. Headers are read
+            // once at stream time, where any decode failure is the canonical
+            // skip path. Pre-reading here would error out twice for the same
+            // bad file (once in discover, once in events) and would charge
+            // every healthy file two opens instead of one.
+            let paths = collect_jsonl_files(&root)
+                .await
+                .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
+            Ok(paths.len())
+        })
+    }
+
     fn events(&self) -> EventStream<'_> {
         let root = self.root.clone();
         Box::pin(stream! {
@@ -124,13 +139,18 @@ impl Adapter for ClaudeCodeAdapter {
                     let value = match serde_json::from_str::<Value>(&line) {
                         Ok(value) => value,
                         Err(source) => {
+                            // Per-line skip: surface the bad line via the
+                            // SyncEvent channel (one `Skipped` per occurrence)
+                            // but keep parsing the rest of the file. Recovers
+                            // the ~98% of lines around a single corrupted one
+                            // (NUL holes, truncated UTF-16 surrogates, etc.).
                             yield Err(AdapterError::parse(
                                 NAME,
                                 path_display.clone(),
                                 line_number,
                                 source,
                             ));
-                            break;
+                            continue;
                         }
                     };
                     match events_from_row(&session_id, line_number, &value, default_timestamp) {
@@ -140,12 +160,15 @@ impl Adapter for ClaudeCodeAdapter {
                             }
                         }
                         Err(message) => {
+                            // Same skip-and-continue policy for schema errors
+                            // at the row level: the rest of the file is still
+                            // recoverable.
                             yield Err(AdapterError::schema(
                                 NAME,
                                 format!("{path_display}:{line_number}"),
                                 message,
                             ));
-                            break;
+                            continue;
                         }
                     }
                 }

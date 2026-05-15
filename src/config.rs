@@ -45,7 +45,11 @@ pub fn is_local(url: &Url) -> bool {
 /// the `<data_dir>/config.toml` co-location default, and the local-FS
 /// existence probe in `open_or_create`.
 pub fn local_path(url: &Url) -> Option<PathBuf> {
-    if is_local(url) { url.to_file_path().ok() } else { None }
+    if is_local(url) {
+        url.to_file_path().ok()
+    } else {
+        None
+    }
 }
 
 /// URI string for a child of this location (typically one Lance dataset under

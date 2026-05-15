@@ -68,7 +68,21 @@ pub trait Adapter: Send + Sync {
     /// so callers can pass `&adapter` or hold a `Box<dyn Adapter>` and
     /// invoke this through `as_ref()`.
     fn events(&self) -> EventStream<'_>;
+
+    /// Count how many sessions [`Self::events`] will produce, used by the
+    /// CLI bar to set its length up front. A filesystem adapter walks its
+    /// root and counts `.jsonl` files; an API adapter calls its list
+    /// endpoint. Cheap and best-effort: errors here only mean we run with
+    /// an unknown total (the bar still ticks per session), so callers
+    /// fall back to a rolling counter rather than failing the sync.
+    fn discover(&self) -> DiscoverFuture<'_>;
 }
+
+/// Boxed future returning the number of sessions an adapter will emit. The
+/// shape mirrors [`EventStream`] - one alias per async trait method so the
+/// trait stays `dyn`-compatible without per-adapter associated types.
+pub type DiscoverFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, AdapterError>> + Send + 'a>>;
 
 /// Environment slice handed to [`AdapterFactory::probe_default`]. Kept
 /// deliberately small - just `home`, because env-var lookups for API creds

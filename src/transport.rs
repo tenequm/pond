@@ -78,7 +78,10 @@ pub mod http {
             .route("/v1/search", post(search))
             .route("/v1/get", post(get))
             .route("/v1/ingest", post(ingest))
-            .route("/v1/sessions/{session_id}/events", get_route(session_events))
+            .route(
+                "/v1/sessions/{session_id}/events",
+                get_route(session_events),
+            )
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
@@ -213,9 +216,7 @@ pub mod http {
             Ok(events) => {
                 let stream = tokio_stream::iter(events.into_iter().map(|sse| {
                     let payload = sse.data.to_string();
-                    Ok::<_, Infallible>(
-                        Event::default().event(sse.event).id(sse.id).data(payload),
-                    )
+                    Ok::<_, Infallible>(Event::default().event(sse.event).id(sse.id).data(payload))
                 }));
                 Sse::new(stream)
                     .keep_alive(

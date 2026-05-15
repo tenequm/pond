@@ -68,7 +68,7 @@ fn fake_vector(text: &str, dim: usize) -> Vec<f32> {
 async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), |_| {}).await?;
     store.ensure_indices().await?;
 
     let model = Config::builtin().embeddings.default_model("local")?;

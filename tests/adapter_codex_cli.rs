@@ -15,9 +15,14 @@ async fn codex_cli_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyh
     let store = Store::open_local(temp.path()).await?;
     let adapter = CodexCliAdapter::new(FIXTURES);
 
-    let summary = ingest_adapter(&store, &adapter).await?;
+    let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
     assert!(summary.accepted() > 0, "ingest must accept rows");
-    assert_eq!(summary.errors, 0, "no per-row validation errors expected");
+    assert_eq!(summary.dropped_events, 0, "no per-event drops expected");
+    assert_eq!(
+        summary.dropped_sessions, 0,
+        "no session-level rejections expected"
+    );
+    assert_eq!(summary.skipped_files, 0, "no whole-file skips expected");
 
     let (sessions, messages, parts, _) = store.row_counts().await?;
     assert!(sessions > 0, "at least one codex-cli session");

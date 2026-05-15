@@ -36,9 +36,7 @@ mod ingest_handler {
 
     use crate::{
         adapter::Adapter,
-        sessions::{
-            IngestEvent, IngestSummary, IngestValidator, OutcomeStatus, RowOutcome, Store,
-        },
+        sessions::{IngestEvent, IngestSummary, IngestValidator, OutcomeStatus, RowOutcome, Store},
         wire::{
             ErrorBody, ErrorCode, IngestEnvelope, IngestRequest, IngestResponse, IngestResult,
             IngestStatus, new_request_id, validate_protocol,
@@ -50,44 +48,356 @@ mod ingest_handler {
     /// Hard cap on events per `pond_ingest` batch (design.md 3.6.4).
     pub const MAX_INGEST_EVENTS: usize = 1000;
 
-    /// Drain `adapter.events()` into `store`, accumulating an [`IngestSummary`].
-    /// The adapter path is CLI-driven (`pond sync`) and reports aggregates,
-    /// not per-row results - the wire-level [`pond_ingest`] handler keeps the
-    /// per-row contract for HTTP clients.
-    pub async fn ingest_adapter(store: &Store, adapter: &dyn Adapter) -> Result<IngestSummary> {
-        let mut summary = IngestSummary {
-            inserted: 0,
-            matched: 0,
-            errors: 0,
-        };
+    /// Progress signals emitted by [`ingest_adapter`] for the CLI bar (and
+    /// any other observer). One [`SyncEvent::Discovered`] fires up front
+    /// once `adapter.discover()` returns; then one [`SyncEvent::SessionDone`]
+    /// fires per session as the validator commits it or the adapter skips
+    /// it. The adapter path never errors at the event level - every
+    /// per-session outcome is surfaced through this enum.
+    #[derive(Debug, Clone)]
+    pub enum SyncEvent {
+        /// Up-front session count from `adapter.discover()`. Emitted exactly
+        /// once before any `SessionDone`. When discovery fails, the field is
+        /// `None` and the bar runs in rolling-counter mode.
+        Discovered { total: Option<usize> },
+        /// One session finished: committed, skipped (undecodable source),
+        /// or rejected by the validator.
+        SessionDone(SessionOutcome),
+    }
+
+    /// What happened to one session in an adapter-driven sync.
+    #[derive(Debug, Clone)]
+    pub struct SessionOutcome {
+        /// Project/cwd the session ran in, when the adapter could parse it.
+        pub project: Option<String>,
+        /// Session id, when the source was decodable far enough to read one.
+        /// `None` means the file was unreadable before any `Session` event.
+        pub session_id: Option<String>,
+        /// Messages observed in the source stream (not the same as rows
+        /// written: validator-rejected sessions still report the count).
+        pub messages: usize,
+        pub status: SyncStatus,
+    }
+
+    /// Per-session outcome class.
+    ///
+    /// - `Ok` - committed cleanly, zero drops.
+    /// - `Partial` - committed, but the validator dropped N events from this
+    ///   session (per-event drop policy: bad-line skips, ordering violations,
+    ///   duplicate ids). The non-bad events landed.
+    /// - `Skipped` - the adapter couldn't extract a Session header from this
+    ///   file at all (empty `.jsonl`, header corruption). Nothing written.
+    /// - `Rejected` - the validator rejected the session at flush time on a
+    ///   Session-level invariant (`source_agent` / `project` immutability).
+    ///   The substream is dropped wholesale. This is the rare case where the
+    ///   *whole* session is lost; for everything else use `Partial`.
+    #[derive(Debug, Clone)]
+    pub enum SyncStatus {
+        Ok,
+        Partial { dropped_events: usize },
+        Skipped { reason: String },
+        Rejected { reason: String },
+    }
+
+    #[derive(Debug, Default)]
+    struct InFlight {
+        project: Option<String>,
+        session_id: String,
+        messages: usize,
+        /// Events the adapter dropped mid-stream (skip-bad-line) that belong
+        /// to this in-flight session. Summed with the validator's per-event
+        /// drops at flush time to compute the final `SyncStatus::Partial`
+        /// count.
+        dropped_events: usize,
+        /// The `index` value used when the Session event was pushed to the
+        /// validator. After batched flush, `RowOutcome.index` lets us match
+        /// per-session outcomes back to the originating session.
+        session_index: usize,
+    }
+
+    /// One session that has been fully observed but whose write hasn't
+    /// completed yet (queued in the validator's batched-flush buffer).
+    /// Emitted as `SyncEvent::SessionDone` after the corresponding flush
+    /// returns its outcomes.
+    #[derive(Debug)]
+    struct PendingDone {
+        project: Option<String>,
+        session_id: String,
+        messages: usize,
+        dropped_events: usize,
+        session_index: usize,
+    }
+
+    /// Batch size used by the adapter ingest loop: flush every N completed
+    /// substreams to amortize per-commit cost. 100 is the value validated in
+    /// `benches/ingest_bench.rs` against the measured profile (substream
+    /// flushes were 78-88% of wall time at batch=1; ~25x fewer commits at
+    /// batch=100 closes most of that gap). Memory bound: ~N x (avg events
+    /// per session) staged in RAM, ~tens of MB at this scale.
+    const ADAPTER_FLUSH_BATCH: usize = 100;
+
+    /// Drain `adapter.events()` into `store`, accumulating an [`IngestSummary`]
+    /// and reporting progress through `on_event`. The adapter path is
+    /// CLI-driven (`pond sync`) and reports aggregates, not per-row results -
+    /// the wire-level [`pond_ingest`] handler keeps the per-row contract for
+    /// HTTP clients.
+    ///
+    /// Undecodable session substreams are skipped, not warned: the design
+    /// contract (no silent drops) is met by surfacing each skip through
+    /// `on_event` as [`SyncStatus::Skipped`]. The tracing line stays available
+    /// at DEBUG for deep-debug; default verbosity is silent.
+    pub async fn ingest_adapter<F>(
+        store: &Store,
+        adapter: &dyn Adapter,
+        mut on_event: F,
+    ) -> Result<IngestSummary>
+    where
+        F: FnMut(SyncEvent),
+    {
+        let mut summary = IngestSummary::default();
+        // Discovery is best-effort: a failure (no read perm, bad config)
+        // still lets the bar run as a rolling counter. We surface the count
+        // upfront when we can; otherwise the bar uses `set_length(0)`.
+        let total = adapter
+            .discover()
+            .await
+            .map_err(|error| tracing::debug!(%error, "adapter discover failed"))
+            .ok();
+        on_event(SyncEvent::Discovered { total });
+
         let mut events = adapter.events();
         let mut validator = IngestValidator::default();
         // Adapter events have no stable input index (they stream from disk);
         // assign a monotonic counter so RowOutcome.index stays unique even
         // though the values aren't surfaced anywhere.
         let mut index = 0usize;
+        let mut in_flight: Option<InFlight> = None;
+        // Sessions whose end-of-stream we've observed but whose write is
+        // still pending in the validator's batch buffer. Drained in FIFO
+        // order against `validator.flush()`'s outcome stream.
+        let mut pending_dones: std::collections::VecDeque<PendingDone> =
+            std::collections::VecDeque::new();
+        // Perf probe accumulators. Logged once at the end of the run under
+        // `POND_LOG=pond=info` so a single sync emits one tidy summary plus
+        // per-merge_insert lines from substrate. Visible only at INFO; never
+        // affects normal output.
+        let mut decode_total = std::time::Duration::ZERO;
+        let mut decode_count = 0u64;
+        let mut validator_total = std::time::Duration::ZERO;
+        let mut validator_count = 0u64;
+        let run_started = std::time::Instant::now();
 
-        while let Some(event) = events.next().await {
+        loop {
+            let decode_start = std::time::Instant::now();
+            let next = events.next().await;
+            decode_total += decode_start.elapsed();
+            decode_count += 1;
+            let event = match next {
+                Some(event) => event,
+                None => break,
+            };
             match event {
                 Ok(event) => {
-                    let outcomes = validator.push(store, index, event).await?;
-                    summary.add_outcomes(&outcomes);
+                    // A new Session means the previous one is being closed
+                    // out by the validator (moved to its `completed` buffer
+                    // for batched flush). Stage the PendingDone so we can
+                    // emit SessionDone with proper status after flush.
+                    if matches!(&event, IngestEvent::Session(_))
+                        && let Some(prev) = in_flight.take()
+                    {
+                        pending_dones.push_back(PendingDone {
+                            project: prev.project,
+                            session_id: prev.session_id,
+                            messages: prev.messages,
+                            dropped_events: prev.dropped_events,
+                            session_index: prev.session_index,
+                        });
+                    }
+                    let event_index = index;
+                    match &event {
+                        IngestEvent::Session(session) => {
+                            in_flight = Some(InFlight {
+                                project: session.project.clone(),
+                                session_id: session.id.clone(),
+                                messages: 0,
+                                dropped_events: 0,
+                                session_index: event_index,
+                            });
+                        }
+                        IngestEvent::Message(_) => {
+                            if let Some(slot) = in_flight.as_mut() {
+                                slot.messages += 1;
+                            }
+                        }
+                        IngestEvent::Part(_) => {}
+                    }
+
+                    let validator_start = std::time::Instant::now();
+                    let push_outcomes = validator.push(store, index, event).await?;
+                    validator_total += validator_start.elapsed();
+                    validator_count += 1;
+                    // Per-event drops returned synchronously by push (ordering
+                    // / dup-id violations) attribute to the in-flight
+                    // session's drop count. Session-level errors (e.g. empty
+                    // source_agent) come back here too; we don't currently
+                    // distinguish them - they're rare and end up in
+                    // `summary.dropped_events`.
+                    for outcome in &push_outcomes {
+                        if matches!(outcome.status, OutcomeStatus::Error)
+                            && outcome.kind != "session"
+                            && let Some(slot) = in_flight.as_mut()
+                        {
+                            slot.dropped_events += 1;
+                        }
+                    }
+                    summary.add_outcomes(&push_outcomes);
                     index += 1;
+
+                    // Drain the batch periodically. The validator's
+                    // `pending_substreams()` count grows by one each time we
+                    // close a substream; once it hits the batch threshold we
+                    // commit them in one parallel 3-table merge_insert.
+                    if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH {
+                        let flush_start = std::time::Instant::now();
+                        let flush_outcomes = validator.flush(store).await?;
+                        validator_total += flush_start.elapsed();
+                        validator_count += 1;
+                        summary.add_outcomes(&flush_outcomes);
+                        drain_pending_dones(&mut pending_dones, &flush_outcomes, &mut on_event);
+                    }
                 }
                 Err(error) => {
-                    summary.errors += 1;
-                    tracing::warn!(%error, "aborting undecodable session substream");
-                    // The validator stays usable: subsequent events of the
-                    // failed substream get tagged via the substream-failure
-                    // path on next push. To keep adapter ingest fail-closed
-                    // for the offender, reset state so we don't carry buffer.
-                    validator = IngestValidator::default();
+                    // Per-event drop semantics: the adapter's error is either
+                    // a pre-Session header failure (whole file unusable) or a
+                    // mid-session bad-line skip. We never reset the validator
+                    // on these any more - subsequent good lines from the same
+                    // file should still land.
+                    tracing::debug!(
+                        %error,
+                        "adapter event error (per-line drop by design)"
+                    );
+                    match in_flight.as_mut() {
+                        Some(slot) => {
+                            // Mid-session bad line. Charge one dropped event
+                            // to this session; the bar will render the per-
+                            // session summary at SessionDone time.
+                            slot.dropped_events += 1;
+                            summary.dropped_events += 1;
+                        }
+                        None => {
+                            // Pre-Session decode failure: no in-flight
+                            // session to attribute to. This is a whole-file
+                            // skip - surface it as a SessionDone with
+                            // session_id=None and status=Skipped.
+                            summary.skipped_files += 1;
+                            on_event(SyncEvent::SessionDone(SessionOutcome {
+                                project: None,
+                                session_id: None,
+                                messages: 0,
+                                status: SyncStatus::Skipped {
+                                    reason: error.to_string(),
+                                },
+                            }));
+                        }
+                    }
                 }
             }
         }
-        let outcomes = validator.finish(store).await?;
-        summary.add_outcomes(&outcomes);
+
+        // Close the last in-flight substream (if any) and final-flush all
+        // pending substreams in one batched write.
+        if let Some(prev) = in_flight.take() {
+            pending_dones.push_back(PendingDone {
+                project: prev.project,
+                session_id: prev.session_id,
+                messages: prev.messages,
+                dropped_events: prev.dropped_events,
+                session_index: prev.session_index,
+            });
+        }
+        let validator_start = std::time::Instant::now();
+        let final_outcomes = validator.finish(store).await?;
+        validator_total += validator_start.elapsed();
+        validator_count += 1;
+        summary.add_outcomes(&final_outcomes);
+        drain_pending_dones(&mut pending_dones, &final_outcomes, &mut on_event);
+
+        let total = run_started.elapsed();
+        let other = total
+            .saturating_sub(decode_total)
+            .saturating_sub(validator_total);
+        tracing::info!(
+            target: "pond::perf",
+            total_ms = total.as_millis() as u64,
+            decode_ms = decode_total.as_millis() as u64,
+            validator_ms = validator_total.as_millis() as u64,
+            other_ms = other.as_millis() as u64,
+            decode_calls = decode_count,
+            validator_calls = validator_count,
+            rows_inserted = summary.inserted as u64,
+            rows_matched = summary.matched as u64,
+            dropped_events = summary.dropped_events as u64,
+            dropped_sessions = summary.dropped_sessions as u64,
+            skipped_files = summary.skipped_files as u64,
+            "ingest_adapter complete"
+        );
         Ok(summary)
+    }
+
+    /// Match the validator's flush outcomes back to the queued PendingDone
+    /// entries (FIFO; `RowOutcome.index` aligns with `PendingDone.session_index`).
+    /// Each matched PendingDone yields one `SyncEvent::SessionDone`. The queue
+    /// drains in order; if outcomes are missing for any (shouldn't happen with
+    /// a well-formed validator path), the SessionDone is emitted as Ok using
+    /// only the adapter-side drop count.
+    fn drain_pending_dones<F>(
+        queue: &mut std::collections::VecDeque<PendingDone>,
+        outcomes: &[RowOutcome],
+        on_event: &mut F,
+    ) where
+        F: FnMut(SyncEvent),
+    {
+        // Index session-kind outcomes by their `index` value so we can look
+        // them up by `session_index` regardless of relative ordering.
+        let mut session_outcome_by_index: std::collections::HashMap<usize, &RowOutcome> =
+            std::collections::HashMap::new();
+        for outcome in outcomes {
+            if outcome.kind == "session" {
+                session_outcome_by_index.insert(outcome.index, outcome);
+            }
+        }
+
+        while let Some(done) = queue.pop_front() {
+            let session_outcome = session_outcome_by_index.get(&done.session_index).copied();
+            let rejection_reason = session_outcome.and_then(|outcome| {
+                if matches!(outcome.status, OutcomeStatus::Error) {
+                    Some(
+                        outcome
+                            .error
+                            .as_ref()
+                            .map(|err| err.message.clone())
+                            .unwrap_or_else(|| "session-level rejection".to_owned()),
+                    )
+                } else {
+                    None
+                }
+            });
+            let status = if let Some(reason) = rejection_reason {
+                SyncStatus::Rejected { reason }
+            } else if done.dropped_events > 0 {
+                SyncStatus::Partial {
+                    dropped_events: done.dropped_events,
+                }
+            } else {
+                SyncStatus::Ok
+            };
+            on_event(SyncEvent::SessionDone(SessionOutcome {
+                project: done.project,
+                session_id: Some(done.session_id),
+                messages: done.messages,
+                status,
+            }));
+        }
     }
 
     /// The `pond_ingest` wire handler (design.md 3.6.4): validate the transport
@@ -149,10 +459,7 @@ mod ingest_handler {
     /// every one of its events tagged with [`OutcomeStatus::Error`] (the
     /// offending event and any others in the same substream); ingest of later
     /// sessions in the batch continues (design.md 3.6.4).
-    pub async fn ingest_events(
-        store: &Store,
-        events: Vec<IngestEvent>,
-    ) -> Result<Vec<RowOutcome>> {
+    pub async fn ingest_events(store: &Store, events: Vec<IngestEvent>) -> Result<Vec<RowOutcome>> {
         let mut validator = IngestValidator::default();
         let mut outcomes = Vec::with_capacity(events.len());
         for (index, event) in events.into_iter().enumerate() {
@@ -204,7 +511,10 @@ mod ingest_handler {
 }
 
 pub use crate::sessions::{IngestEvent, IngestSummary, IngestValidator, search_text};
-pub use ingest_handler::{MAX_INGEST_EVENTS, ingest_adapter, ingest_events, pond_ingest};
+pub use ingest_handler::{
+    MAX_INGEST_EVENTS, SessionOutcome, SyncEvent, SyncStatus, ingest_adapter, ingest_events,
+    pond_ingest,
+};
 
 mod session_events_handler {
     //! `pond_session_events` (design.md 3.6.5): catch-up SSE stream over a
@@ -328,7 +638,11 @@ mod session_events_handler {
         };
 
         for message in &messages[start_at..] {
-            events.push(message_event(message, include_thinking, include_tool_results));
+            events.push(message_event(
+                message,
+                include_thinking,
+                include_tool_results,
+            ));
         }
         events.push(end_event(session_id));
         Ok(events)
@@ -416,11 +730,7 @@ mod export_handler {
             write_event(writer, &IngestEvent::Session(stored.session)).await?;
             summary.sessions += 1;
             for message_with_parts in stored.messages {
-                write_event(
-                    writer,
-                    &IngestEvent::Message(message_with_parts.message),
-                )
-                .await?;
+                write_event(writer, &IngestEvent::Message(message_with_parts.message)).await?;
                 summary.messages += 1;
                 for part in message_with_parts.parts {
                     write_event(writer, &IngestEvent::Part(part)).await?;

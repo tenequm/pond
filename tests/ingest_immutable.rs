@@ -38,8 +38,8 @@ fn count_status(outcomes: &[pond::sessions::RowOutcome], target: OutcomeStatus) 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn re_ingesting_a_session_with_unchanged_immutable_fields_is_idempotent()
--> anyhow::Result<()> {
+async fn re_ingesting_a_session_with_unchanged_immutable_fields_is_idempotent() -> anyhow::Result<()>
+{
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
 

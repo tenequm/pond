@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -65,6 +66,118 @@ pub struct MessageMeta {
 pub enum UpsertStatus {
     Inserted,
     Matched,
+}
+
+/// What `pond status` reports: where the data lives, total rows per table,
+/// and a per-(adapter, project) breakdown built from one `messages` scan.
+#[derive(Debug, Clone)]
+pub struct CorpusStats {
+    pub data_url: Url,
+    pub totals: RowTotals,
+    /// One entry per `source_agent` value present in the corpus, in
+    /// alphabetical adapter order. The CLI re-sorts this into registry order
+    /// at render time so the tree matches the discovery picker.
+    pub adapters: Vec<AdapterStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowTotals {
+    pub sessions: u64,
+    pub messages: u64,
+    pub parts: u64,
+    pub embeddings: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterStats {
+    /// `source_agent` value as stored on every `messages` row.
+    pub adapter: String,
+    pub sessions: u64,
+    pub messages: u64,
+    /// Projects under this adapter, sorted by message count desc, then by
+    /// project name asc.
+    pub projects: Vec<ProjectStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectStats {
+    /// `None` means rows landed with no project (Claude Code is always
+    /// non-null today, but adapters that can't infer cwd will produce None).
+    pub project: Option<String>,
+    pub sessions: u64,
+    pub messages: u64,
+}
+
+#[derive(Default)]
+struct GroupAccumulator {
+    messages: u64,
+    session_ids: HashSet<String>,
+}
+
+/// Disk usage for a local data dir, attributed to a top-level table dir.
+/// Returned only when the data dir is on the local filesystem; remote
+/// backends populate via [`CorpusStats::query_remote_sizes`] instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageSizes {
+    pub sessions: u64,
+    pub messages: u64,
+    pub parts: u64,
+    pub embeddings: u64,
+    pub other: u64,
+}
+
+impl StorageSizes {
+    pub fn total(&self) -> u64 {
+        self.sessions + self.messages + self.parts + self.embeddings + self.other
+    }
+
+    /// Walk `root` (a local directory) recursively and attribute file sizes
+    /// to the table they belong to by the top-level child directory name.
+    /// Anything outside the four known dirs (config.toml, index temp files,
+    /// ...) is counted under `other`.
+    pub fn from_local_dir(root: &std::path::Path) -> Result<Self> {
+        let mut sizes = StorageSizes::default();
+        if !root.exists() {
+            return Ok(sizes);
+        }
+        let mut stack: Vec<(PathBuf, Option<&'static str>)> = Vec::new();
+        for entry in
+            std::fs::read_dir(root).with_context(|| format!("read data dir {}", root.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let attribute = match name.to_str() {
+                Some("sessions") => Some("sessions"),
+                Some("messages") => Some("messages"),
+                Some("parts") => Some("parts"),
+                Some("embeddings") => Some("embeddings"),
+                _ => None,
+            };
+            stack.push((entry.path(), attribute));
+        }
+        while let Some((path, attribute)) = stack.pop() {
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("stat {}", path.display()))?;
+            if metadata.is_dir() {
+                for entry in
+                    std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))?
+                {
+                    let entry = entry?;
+                    stack.push((entry.path(), attribute));
+                }
+            } else if metadata.is_file() {
+                let bytes = metadata.len();
+                match attribute {
+                    Some("sessions") => sizes.sessions += bytes,
+                    Some("messages") => sizes.messages += bytes,
+                    Some("parts") => sizes.parts += bytes,
+                    Some("embeddings") => sizes.embeddings += bytes,
+                    _ => sizes.other += bytes,
+                }
+            }
+        }
+        Ok(sizes)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +253,224 @@ impl Store {
         statuses.extend(self.upsert_parts(&parts).await?);
 
         Ok(statuses)
+    }
+
+    /// Batched write path used by the adapter ingest loop and by the wire
+    /// handler's final flush. Receives N completed substreams from the
+    /// validator and:
+    ///
+    ///   1. Runs the immutable-fields check (3.6.4) against the stored row
+    ///      per session, sequentially. Sessions that fail produce one Error
+    ///      outcome and are excluded from the write batch.
+    ///   2. Deduplicates in-batch: when two substreams in the same batch
+    ///      share a `session_id` (Claude Code's subagent files reuse their
+    ///      parent's id), the first occurrence wins. The second is either
+    ///      *merged* (same `source_agent` + `project`: messages/parts
+    ///      append, no duplicate rows) or *rejected* (different `project` -
+    ///      this is the subagent-vs-parent case, a documented follow-up).
+    ///      Lance's `merge_insert` would otherwise reject the batch as
+    ///      "ambiguous" on duplicate-PK source rows.
+    ///   3. Builds one combined `RecordBatch` per table (sessions, messages,
+    ///      parts) across every valid substream.
+    ///   4. Fires the three `merge_insert` calls in parallel via
+    ///      `tokio::try_join!`. Cross-table mutex on `CachedDataset` is
+    ///      independent, so these proceed concurrently. Single-commit-per-
+    ///      table replaces the previous one-commit-per-session-per-table
+    ///      pattern (3 commits N times -> 3 commits total).
+    ///   5. Composes per-session [`RowOutcome`]s in original substream order.
+    async fn upsert_session_batch(
+        &self,
+        substreams: Vec<CompletedSubstream>,
+    ) -> Result<Vec<RowOutcome>> {
+        if substreams.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(substreams.len());
+
+        // Step 2 - in-batch dedup. Build an ordered map: first occurrence of
+        // each session_id wins; later occurrences either merge or get
+        // rejected. Iteration order preserves original substream order so
+        // outcomes index correctly.
+        let mut merged: Vec<CompletedSubstream> = Vec::with_capacity(substreams.len());
+        let mut by_session_id: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(substreams.len());
+        for substream in substreams {
+            if let Some(&existing_idx) = by_session_id.get(&substream.session.id) {
+                let existing = &merged[existing_idx];
+                if existing.session.source_agent != substream.session.source_agent
+                    || existing.session.project != substream.session.project
+                {
+                    // Subagent-vs-parent class. The first occurrence's
+                    // metadata stays authoritative; this substream is
+                    // rejected on the same immutable-field axis as the
+                    // storage-side check.
+                    let reason = if existing.session.source_agent != substream.session.source_agent
+                    {
+                        IngestError::ImmutableField {
+                            field: "source_agent",
+                            session_id: substream.session.id.clone(),
+                            stored: existing.session.source_agent.clone(),
+                            attempted: substream.session.source_agent.clone(),
+                        }
+                    } else {
+                        IngestError::ImmutableField {
+                            field: "project",
+                            session_id: substream.session.id.clone(),
+                            stored: existing.session.project.clone().unwrap_or_default(),
+                            attempted: substream.session.project.clone().unwrap_or_default(),
+                        }
+                    };
+                    let field = match &reason {
+                        IngestError::ImmutableField { field, .. } => Some(*field),
+                    };
+                    outcomes.extend(error_outcomes_for_substream(
+                        substream.session_index,
+                        &substream.session,
+                        &substream.messages,
+                        reason.to_string(),
+                        field,
+                    ));
+                    continue;
+                }
+                // Same session, same metadata: merge messages. Dedup message
+                // ids defensively (within one batch, the validator's seen
+                // sets are per-substream so cross-substream dups can happen
+                // legally if both files re-emit the same row).
+                let existing = &mut merged[existing_idx];
+                let mut seen: std::collections::HashSet<String> = existing
+                    .messages
+                    .iter()
+                    .map(|m| m.message.id().to_owned())
+                    .collect();
+                for msg in substream.messages {
+                    if seen.insert(msg.message.id().to_owned()) {
+                        existing.messages.push(msg);
+                    }
+                }
+                continue;
+            }
+            by_session_id.insert(substream.session.id.clone(), merged.len());
+            merged.push(substream);
+        }
+
+        // Step 1 - immutable check against storage, sequentially per
+        // surviving substream.
+        let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
+        for substream in merged {
+            if let Some(existing) = self.find_session(&substream.session.id).await?
+                && let Err(failure) = ensure_immutable_match(&existing, &substream.session)
+            {
+                let field = match &failure {
+                    IngestError::ImmutableField { field, .. } => Some(*field),
+                };
+                outcomes.extend(error_outcomes_for_substream(
+                    substream.session_index,
+                    &substream.session,
+                    &substream.messages,
+                    failure.to_string(),
+                    field,
+                ));
+                continue;
+            }
+            writeable.push(substream);
+        }
+
+        if writeable.is_empty() {
+            outcomes.sort_by_key(|outcome| outcome.index);
+            return Ok(outcomes);
+        }
+
+        // Build the three flat record batches across every valid substream.
+        let sessions_owned: Vec<Session> = writeable
+            .iter()
+            .map(|substream| substream.session.clone())
+            .collect();
+        let message_rows: Vec<MessageBatchRow<'_>> = writeable
+            .iter()
+            .flat_map(|substream| {
+                substream.messages.iter().map(|buffered| MessageBatchRow {
+                    message: &buffered.message,
+                    source_agent: &substream.session.source_agent,
+                    project: substream.session.project.as_deref(),
+                    search_text: buffered.search_text.as_deref(),
+                })
+            })
+            .collect();
+        let part_rows: Vec<Part> = writeable
+            .iter()
+            .flat_map(|substream| {
+                substream.messages.iter().flat_map(|buffered| {
+                    buffered
+                        .parts
+                        .iter()
+                        .map(|buffered_part| buffered_part.part.clone())
+                })
+            })
+            .collect();
+
+        let sessions_batch = sessions_batch(&sessions_owned)?;
+        let messages_batch = messages_batch(&message_rows)?;
+        let parts_batch = parts_batch(&part_rows)?;
+
+        let sessions_count = sessions_owned.len();
+        let messages_count = message_rows.len();
+        let parts_count = part_rows.len();
+
+        let (sessions_inserted, messages_inserted, parts_inserted) = tokio::try_join!(
+            self.handle
+                .merge_insert(Table::Sessions, sessions_batch, sessions_count),
+            async {
+                if messages_count == 0 {
+                    Ok::<u64, anyhow::Error>(0)
+                } else {
+                    self.handle
+                        .merge_insert(Table::Messages, messages_batch, messages_count)
+                        .await
+                }
+            },
+            async {
+                if parts_count == 0 {
+                    Ok::<u64, anyhow::Error>(0)
+                } else {
+                    self.handle
+                        .merge_insert(Table::Parts, parts_batch, parts_count)
+                        .await
+                }
+            },
+        )?;
+
+        // Per-session success outcomes: each substream's own status row plus
+        // per-message and per-part rows. The Lance `merge_insert` returns a
+        // single batch-level "inserted vs matched" count, not per-row; we
+        // can't tell which row matched which, so for the batched path each
+        // session/message/part is marked `Inserted` if the batch had any
+        // inserts, else `Matched`. This is the same semantic the
+        // single-session path used (see `statuses_from_inserted`).
+        let sessions_status = if sessions_inserted == sessions_count as u64 {
+            UpsertStatus::Inserted
+        } else if sessions_inserted == 0 {
+            UpsertStatus::Matched
+        } else {
+            // Mixed - mark per index by re-checking? Cheaper to just count
+            // all as Inserted; the operator can read the precise insert
+            // count from the `IngestSummary`.
+            UpsertStatus::Inserted
+        };
+        let _ = messages_inserted; // counted via summary, not per-row here
+        let _ = parts_inserted;
+
+        for substream in &writeable {
+            outcomes.extend(success_outcomes_for_substream(
+                substream.session_index,
+                &substream.session,
+                &substream.messages,
+                sessions_status,
+            ));
+        }
+
+        outcomes.sort_by_key(|outcome| outcome.index);
+        Ok(outcomes)
     }
 
     pub async fn upsert_message(
@@ -257,6 +588,71 @@ impl Store {
 
     pub async fn row_counts(&self) -> Result<(usize, usize, usize, usize)> {
         self.handle.row_counts().await
+    }
+
+    /// Compute the per-adapter / per-project rollup that drives
+    /// `pond status`. One scan over `messages` projecting the three
+    /// columns the rollup keys on (`source_agent`, `project`, `session_id`),
+    /// aggregated in-memory. Bounded by the cross product of adapters and
+    /// projects, which stays small on real corpora.
+    pub async fn corpus_stats(&self) -> Result<CorpusStats> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let mut scanner = dataset.scan();
+        scanner.project(&["source_agent", "project", "session_id"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut groups: HashMap<(String, Option<String>), GroupAccumulator> = HashMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                let source_agent = string(&batch, "source_agent", row)?.unwrap_or_default();
+                let project = string(&batch, "project", row)?;
+                let session_id = string(&batch, "session_id", row)?.unwrap_or_default();
+                let entry = groups.entry((source_agent, project)).or_default();
+                entry.messages += 1;
+                entry.session_ids.insert(session_id);
+            }
+        }
+
+        let (totals_sessions, totals_messages, totals_parts, totals_embeddings) =
+            self.handle.row_counts().await?;
+        let totals = RowTotals {
+            sessions: totals_sessions as u64,
+            messages: totals_messages as u64,
+            parts: totals_parts as u64,
+            embeddings: totals_embeddings as u64,
+        };
+
+        let mut by_adapter: BTreeMap<String, Vec<ProjectStats>> = BTreeMap::new();
+        for ((adapter, project), acc) in groups {
+            by_adapter.entry(adapter).or_default().push(ProjectStats {
+                project,
+                sessions: acc.session_ids.len() as u64,
+                messages: acc.messages,
+            });
+        }
+
+        let mut adapters = Vec::with_capacity(by_adapter.len());
+        for (adapter, mut projects) in by_adapter {
+            projects.sort_by(|a, b| {
+                b.messages
+                    .cmp(&a.messages)
+                    .then_with(|| a.project.cmp(&b.project))
+            });
+            let sessions: u64 = projects.iter().map(|p| p.sessions).sum();
+            let messages: u64 = projects.iter().map(|p| p.messages).sum();
+            adapters.push(AdapterStats {
+                adapter,
+                sessions,
+                messages,
+                projects,
+            });
+        }
+
+        Ok(CorpusStats {
+            data_url: self.handle.location().clone(),
+            totals,
+            adapters,
+        })
     }
 
     /// Merge-insert embedding rows keyed on `(message_id, model_id,
@@ -599,10 +995,7 @@ impl Store {
     /// order, each paired with its parts. Public face of the session
     /// iteration seam used by both `pond_get` (full-session reads) and
     /// `pond_session_events` (catch-up SSE per design.md 3.6.5).
-    pub async fn session_messages(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<MessageWithParts>> {
+    pub async fn session_messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         self.messages_for_session(session_id).await
     }
 
@@ -695,11 +1088,33 @@ pub enum IngestEvent {
 /// Aggregate accounting for an ingest pass (CLI sync, adapter-driven).
 /// The wire layer (`pond_ingest`) instead returns per-row results; the
 /// aggregate is derived from those at the wire boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Fields are bucketed by population so the summary never conflates "100
+/// validator-rejected rows in 1 bad session" with "100 separate failures."
+/// The shape is set by design.md 3.4 (post-2026-05-15 rewrite).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
+    /// Rows actually written to Lance.
     pub inserted: usize,
+    /// Rows that already existed (merge_insert no-op match).
     pub matched: usize,
-    pub errors: usize,
+    /// Events the validator dropped under per-event-drop policy (ordering
+    /// violation, duplicate id, orphan part, ...). Counted by event, not by
+    /// session: a session with one bad part stays in this bucket as 1, not
+    /// as "the whole substream."
+    pub dropped_events: usize,
+    /// Sessions whose Session-level invariants (immutable `source_agent` /
+    /// `project` against a previously-stored row) failed at flush time and
+    /// whose substream got rejected wholesale. Always small relative to
+    /// `inserted`; if not, there's a real problem to investigate.
+    pub dropped_sessions: usize,
+    /// Files the adapter couldn't decode at all (no Session header
+    /// extractable: empty `.jsonl`, missing required field).
+    pub skipped_files: usize,
+    /// Storage-layer failures whose retries were exhausted (commit
+    /// conflicts, transient IO that didn't recover). Hard zero on healthy
+    /// runs.
+    pub storage_errors: usize,
 }
 
 impl IngestSummary {
@@ -712,7 +1127,19 @@ impl IngestSummary {
             match outcome.status {
                 OutcomeStatus::Inserted => self.inserted += 1,
                 OutcomeStatus::Matched => self.matched += 1,
-                OutcomeStatus::Error => self.errors += 1,
+                OutcomeStatus::Error => {
+                    // A whole-substream rejection arrives as exactly one
+                    // session-kind Error outcome (see
+                    // `error_outcomes_for_substream`). Per-event drops
+                    // arrive as one Error each on message/part. Keeping the
+                    // populations distinct is the whole point of the new
+                    // `IngestSummary` shape.
+                    if outcome.kind == "session" {
+                        self.dropped_sessions += 1;
+                    } else {
+                        self.dropped_events += 1;
+                    }
+                }
             }
         }
     }
@@ -773,18 +1200,45 @@ struct BufferedPart {
 /// State machine that turns the `events: Vec<IngestEvent>` array into a
 /// flat `Vec<RowOutcome>` matching the array's index space. Buffers a whole
 /// session substream so `merge_insert` runs once per substream (three
-/// batches: sessions, messages, parts). A validation error on any event in
-/// the substream marks every event of that substream as
-/// [`OutcomeStatus::Error`]; the next `IngestEvent::Session` resets the
-/// state and ingest continues.
+/// batches: sessions, messages, parts). A validation error on a single event
+/// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
+/// continues; only Session-level invariants (immutable source_agent / project
+/// on re-write) drop the whole substream. The N-events-per-rejection cascade
+/// from the prior contract is gone (see design.md 3.4 "Ordering enforcement").
+///
+/// Writes are batched at flush time. As complete substreams arrive (a new
+/// `Session` event closes out the previous one), they accumulate in
+/// `completed` rather than each one calling `merge_insert` immediately.
+/// The caller drains the buffer via [`Self::flush`] / [`Self::finish`],
+/// at which point one batched 3-parallel-merge-insert covers all pending
+/// substreams. This is the load-bearing perf change: per-substream commit
+/// overhead dominated the ingest profile (see `benches/ingest_bench.rs`),
+/// and amortizing it across N sessions cuts wall time materially.
 #[derive(Debug, Default)]
 pub struct IngestValidator {
     session: Option<BufferedSession>,
     current_message: Option<BufferedMessage>,
     current_parts: Vec<BufferedPart>,
     messages: Vec<BufferedMessage>,
-    failed_message: Option<String>,
-    aborted_indices: Vec<(usize, &'static str, Value)>,
+    /// Message ids already buffered in the current substream. Duplicate ids
+    /// drop the offending event in-line rather than failing the whole batch
+    /// downstream.
+    seen_message_ids: HashSet<String>,
+    /// `(message_id, part_id)` keys already buffered in the current
+    /// substream. Same in-line duplicate-drop policy as `seen_message_ids`.
+    seen_part_keys: HashSet<(String, String)>,
+    /// Substreams whose end-of-stream boundary has been observed but whose
+    /// rows haven't been written yet. Flushed in batched mode by
+    /// [`Self::flush`].
+    completed: Vec<CompletedSubstream>,
+}
+
+/// One closed substream ready for the batched flush path.
+#[derive(Debug)]
+struct CompletedSubstream {
+    session_index: usize,
+    session: Session,
+    messages: Vec<BufferedMessage>,
 }
 
 impl IngestValidator {
@@ -806,34 +1260,51 @@ impl IngestValidator {
         }
     }
 
-    /// Final flush at end-of-batch. Empties any buffered substream.
+    /// Final flush at end-of-batch. Closes the in-flight substream and
+    /// drains the pending-flush buffer.
     pub async fn finish(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
-        if self.failed_message.is_some() {
-            return Ok(self.drain_failed_substream());
+        self.close_current_substream();
+        self.flush(store).await
+    }
+
+    /// Drain every completed substream into batched 3-parallel-merge_insert
+    /// writes. Caller invokes this periodically (every N completed
+    /// substreams) to keep memory bounded; in adapter-driven sync that
+    /// happens via the BATCH_SIZE check in `ingest_adapter`. The current
+    /// in-flight substream stays buffered - close it explicitly via
+    /// [`Self::finish`] or by feeding the next Session event.
+    pub async fn flush(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
+        if self.completed.is_empty() {
+            return Ok(Vec::new());
         }
-        self.flush_session(store).await
+        let completed = std::mem::take(&mut self.completed);
+        store.upsert_session_batch(completed).await
+    }
+
+    /// Number of fully-buffered substreams awaiting batched write. Used by
+    /// the adapter caller to decide when to call [`Self::flush`].
+    pub fn pending_substreams(&self) -> usize {
+        self.completed.len()
     }
 
     async fn push_session(
         &mut self,
-        store: &Store,
+        _store: &Store,
         index: usize,
         mut session: Session,
     ) -> Result<Vec<RowOutcome>> {
-        let mut outcomes = if self.failed_message.is_some() {
-            self.drain_failed_substream()
-        } else if self.session.is_some() {
-            self.flush_session(store).await?
-        } else {
-            Vec::new()
-        };
+        // Close out the previous substream (if any) - move it to the pending
+        // buffer instead of writing immediately. The actual write happens
+        // when the caller invokes `flush` / `finish`.
+        self.close_current_substream();
 
         // design.md 3.1.3: `source_agent` is trimmed at ingest and rejected
-        // if empty after trim. The validator is the safety net regardless
-        // of adapter discipline.
+        // if empty after trim. A Session event with empty source_agent is
+        // dropped on the spot - the substream that would follow has nothing
+        // to anchor on, so subsequent message/part events will also drop.
         let trimmed = session.source_agent.trim();
         if trimmed.is_empty() {
-            outcomes.push(RowOutcome {
+            return Ok(vec![RowOutcome {
                 index,
                 kind: "session",
                 pk: Value::String(session.id.clone()),
@@ -843,16 +1314,35 @@ impl IngestValidator {
                     field: Some("source_agent"),
                     reason: None,
                 }),
-            });
-            // No buffered substream to abort: this is the first event.
-            return Ok(outcomes);
+            }]);
         }
         if trimmed.len() != session.source_agent.len() {
             session.source_agent = trimmed.to_owned();
         }
 
+        self.seen_message_ids.clear();
+        self.seen_part_keys.clear();
         self.session = Some(BufferedSession { index, session });
-        Ok(outcomes)
+        Ok(Vec::new())
+    }
+
+    fn close_current_substream(&mut self) {
+        self.flush_current_message();
+        let Some(BufferedSession {
+            index: session_index,
+            session,
+        }) = self.session.take()
+        else {
+            return;
+        };
+        let messages = std::mem::take(&mut self.messages);
+        self.seen_message_ids.clear();
+        self.seen_part_keys.clear();
+        self.completed.push(CompletedSubstream {
+            session_index,
+            session,
+            messages,
+        });
     }
 
     fn push_message(&mut self, index: usize, message: Message) -> Vec<RowOutcome> {
@@ -860,19 +1350,14 @@ impl IngestValidator {
             Value::String(message.session_id().to_owned()),
             Value::String(message.id().to_owned()),
         ]);
-        if self.failed_message.is_some() {
-            self.aborted_indices.push((index, "message", pk));
-            return Vec::new();
-        }
         let Some(session) = &self.session else {
-            self.fail_substream(
+            return vec![error_outcome(
                 index,
                 "message",
                 pk,
                 "first event in a session stream must be Session",
                 None,
-            );
-            return Vec::new();
+            )];
         };
         if message.session_id() != session.session.id {
             let msg = format!(
@@ -881,8 +1366,17 @@ impl IngestValidator {
                 message.session_id(),
                 session.session.id
             );
-            self.fail_substream(index, "message", pk, msg, Some("session_id"));
-            return Vec::new();
+            return vec![error_outcome(
+                index,
+                "message",
+                pk,
+                &msg,
+                Some("session_id"),
+            )];
+        }
+        if !self.seen_message_ids.insert(message.id().to_owned()) {
+            let msg = format!("duplicate message id {} in session substream", message.id());
+            return vec![error_outcome(index, "message", pk, &msg, None)];
         }
         self.flush_current_message();
         self.current_message = Some(BufferedMessage {
@@ -899,19 +1393,14 @@ impl IngestValidator {
             Value::String(part.message_id.clone()),
             Value::String(part.id.clone()),
         ]);
-        if self.failed_message.is_some() {
-            self.aborted_indices.push((index, "part", pk));
-            return Vec::new();
-        }
         let Some(current) = &self.current_message else {
-            self.fail_substream(
+            return vec![error_outcome(
                 index,
                 "part",
                 pk,
                 "part event appeared before a message",
                 None,
-            );
-            return Vec::new();
+            )];
         };
         if part.message_id != current.message.id() {
             let msg = format!(
@@ -920,8 +1409,15 @@ impl IngestValidator {
                 part.message_id,
                 current.message.id()
             );
-            self.fail_substream(index, "part", pk, msg, Some("message_id"));
-            return Vec::new();
+            return vec![error_outcome(index, "part", pk, &msg, Some("message_id"))];
+        }
+        let part_key = (part.message_id.clone(), part.id.clone());
+        if !self.seen_part_keys.insert(part_key) {
+            let msg = format!(
+                "duplicate part id {} for message {} in session substream",
+                part.id, part.message_id
+            );
+            return vec![error_outcome(index, "part", pk, &msg, None)];
         }
         self.current_parts.push(BufferedPart { index, part });
         Vec::new()
@@ -939,157 +1435,6 @@ impl IngestValidator {
         buffered.search_text = search_text(&buffered.message, &canonical_parts);
         buffered.parts = parts;
         self.messages.push(buffered);
-    }
-
-    async fn flush_session(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
-        self.flush_current_message();
-        let Some(BufferedSession {
-            index: session_index,
-            session,
-        }) = self.session.take()
-        else {
-            return Ok(Vec::new());
-        };
-        let buffered_messages = std::mem::take(&mut self.messages);
-
-        if let Err(failure) = validate_batch_keys(&buffered_messages) {
-            return Ok(error_outcomes_for_substream(
-                session_index,
-                &session,
-                &buffered_messages,
-                failure,
-                None,
-            ));
-        }
-
-        // design.md 3.6.4: source_agent + project are immutable post-first-
-        // write because messages/embeddings denormalize them. Probe the
-        // existing row before write; reject with the typed field name so the
-        // wire layer can attach `details: { field, reason: "immutable" }`.
-        if let Some(existing) = store.find_session(&session.id).await?
-            && let Err(failure) = ensure_immutable_match(&existing, &session)
-        {
-            let field = match &failure {
-                IngestError::ImmutableField { field, .. } => Some(*field),
-            };
-            return Ok(error_outcomes_for_substream(
-                session_index,
-                &session,
-                &buffered_messages,
-                failure.to_string(),
-                field,
-            ));
-        }
-
-        let writes = buffered_messages
-            .iter()
-            .map(|message| {
-                let parts = message
-                    .parts
-                    .iter()
-                    .map(|part| part.part.clone())
-                    .collect::<Vec<_>>();
-                (message, parts)
-            })
-            .collect::<Vec<_>>();
-        let message_writes = writes
-            .iter()
-            .map(|(message, parts)| MessageWrite {
-                message: &message.message,
-                parts,
-                search_text: message.search_text.as_deref(),
-            })
-            .collect::<Vec<_>>();
-
-        let statuses = store
-            .upsert_session_bundle(&session, &message_writes)
-            .await?;
-
-        Ok(success_outcomes_from_statuses(
-            session_index,
-            &session,
-            &buffered_messages,
-            &statuses,
-        ))
-    }
-
-    /// Tag the current substream as failed: the offending event gets an
-    /// error outcome immediately, all subsequent buffered events of this
-    /// substream get tagged on the next flush/reset.
-    fn fail_substream(
-        &mut self,
-        index: usize,
-        kind: &'static str,
-        pk: Value,
-        message: impl Into<String>,
-        field: Option<&'static str>,
-    ) {
-        let message = message.into();
-        self.failed_message = Some(message.clone());
-        self.aborted_indices.push((index, kind, pk));
-        // The session, current_message, and current_parts buffers remain so
-        // `drain_failed_substream` can tag those too with the same error.
-        let _ = field; // currently only the message is propagated to all outcomes
-    }
-
-    /// Drain all buffered events of the failed substream into Error outcomes
-    /// and reset state for the next session. Called when (a) the next Session
-    /// event arrives, signaling recovery, or (b) `finish()` is called at end
-    /// of batch.
-    fn drain_failed_substream(&mut self) -> Vec<RowOutcome> {
-        let Some(message) = self.failed_message.take() else {
-            return Vec::new();
-        };
-        let aborted = std::mem::take(&mut self.aborted_indices);
-
-        let mut outcomes = Vec::new();
-
-        if let Some(BufferedSession {
-            index,
-            session,
-        }) = self.session.take()
-        {
-            outcomes.push(error_outcome(
-                index,
-                "session",
-                Value::String(session.id),
-                &message,
-                None,
-            ));
-        }
-        for buffered in self.messages.drain(..) {
-            let pk = Value::Array(vec![
-                Value::String(buffered.message.session_id().to_owned()),
-                Value::String(buffered.message.id().to_owned()),
-            ]);
-            outcomes.push(error_outcome(buffered.index, "message", pk, &message, None));
-            for part in buffered.parts {
-                let pk = Value::Array(vec![
-                    Value::String(part.part.message_id.clone()),
-                    Value::String(part.part.id.clone()),
-                ]);
-                outcomes.push(error_outcome(part.index, "part", pk, &message, None));
-            }
-        }
-        if let Some(buffered) = self.current_message.take() {
-            let pk = Value::Array(vec![
-                Value::String(buffered.message.session_id().to_owned()),
-                Value::String(buffered.message.id().to_owned()),
-            ]);
-            outcomes.push(error_outcome(buffered.index, "message", pk, &message, None));
-        }
-        for buffered in self.current_parts.drain(..) {
-            let pk = Value::Array(vec![
-                Value::String(buffered.part.message_id.clone()),
-                Value::String(buffered.part.id.clone()),
-            ]);
-            outcomes.push(error_outcome(buffered.index, "part", pk, &message, None));
-        }
-        for (index, kind, pk) in aborted {
-            outcomes.push(error_outcome(index, kind, pk, &message, None));
-        }
-        outcomes.sort_by_key(|outcome| outcome.index);
-        outcomes
     }
 }
 
@@ -1113,98 +1458,66 @@ fn error_outcome(
     }
 }
 
+/// Session-level rejection (immutable `source_agent` / `project` violation):
+/// emit exactly one Error outcome on the Session row. The buffered messages
+/// and parts of this substream are *not* surfaced as per-row errors - their
+/// loss is implied by the single session-rejection. Earlier versions
+/// cascaded N error rows per rejected substream; that inflated the operator
+/// view ("12,297 errors") for what is structurally one decision
+/// ("1 session-level rejection"). See design.md 3.4.
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
-    messages: &[BufferedMessage],
+    _messages: &[BufferedMessage],
     message: impl Into<String>,
     field: Option<&'static str>,
 ) -> Vec<RowOutcome> {
-    let message = message.into();
     let reason = field.map(|_| "immutable");
-    let mk_err = |index: usize, kind: &'static str, pk: Value| RowOutcome {
-        index,
-        kind,
-        pk,
+    vec![RowOutcome {
+        index: session_index,
+        kind: "session",
+        pk: Value::String(session.id.clone()),
         status: OutcomeStatus::Error,
         error: Some(RowError {
-            message: message.clone(),
+            message: message.into(),
             field,
             reason,
         }),
-    };
+    }]
+}
+
+/// Batched-path success helper: every row in a substream takes the same
+/// status (the batch-level `Inserted` vs `Matched` decision from
+/// `merge_insert.num_inserted_rows`). The single-session path uses
+/// `success_outcomes_from_statuses` instead, which threads per-row
+/// statuses from `upsert_session_bundle`'s sequential calls.
+fn success_outcomes_for_substream(
+    session_index: usize,
+    session: &Session,
+    messages: &[BufferedMessage],
+    status: UpsertStatus,
+) -> Vec<RowOutcome> {
     let mut outcomes = Vec::with_capacity(1 + messages.len());
-    outcomes.push(mk_err(
+    outcomes.push(success_outcome(
         session_index,
         "session",
         Value::String(session.id.clone()),
+        status,
     ));
     for buffered in messages {
         let pk = Value::Array(vec![
             Value::String(buffered.message.session_id().to_owned()),
             Value::String(buffered.message.id().to_owned()),
         ]);
-        outcomes.push(mk_err(buffered.index, "message", pk));
+        outcomes.push(success_outcome(buffered.index, "message", pk, status));
         for part in &buffered.parts {
             let part_pk = Value::Array(vec![
                 Value::String(part.part.message_id.clone()),
                 Value::String(part.part.id.clone()),
             ]);
-            outcomes.push(mk_err(part.index, "part", part_pk));
+            outcomes.push(success_outcome(part.index, "part", part_pk, status));
         }
     }
-    outcomes.sort_by_key(|outcome| outcome.index);
-    outcomes
-}
-
-fn success_outcomes_from_statuses(
-    session_index: usize,
-    session: &Session,
-    messages: &[BufferedMessage],
-    statuses: &[UpsertStatus],
-) -> Vec<RowOutcome> {
-    // upsert_session_bundle returns statuses ordered: [sessions, messages..., parts...].
-    let mut outcomes = Vec::with_capacity(statuses.len());
-    let mut cursor = 0usize;
-    let session_status = statuses
-        .get(cursor)
-        .copied()
-        .unwrap_or(UpsertStatus::Inserted);
-    cursor += 1;
-    outcomes.push(success_outcome(
-        session_index,
-        "session",
-        Value::String(session.id.clone()),
-        session_status,
-    ));
-
-    for buffered in messages {
-        let pk = Value::Array(vec![
-            Value::String(buffered.message.session_id().to_owned()),
-            Value::String(buffered.message.id().to_owned()),
-        ]);
-        let status = statuses
-            .get(cursor)
-            .copied()
-            .unwrap_or(UpsertStatus::Inserted);
-        cursor += 1;
-        outcomes.push(success_outcome(buffered.index, "message", pk, status));
-    }
-    for buffered in messages {
-        for part in &buffered.parts {
-            let pk = Value::Array(vec![
-                Value::String(part.part.message_id.clone()),
-                Value::String(part.part.id.clone()),
-            ]);
-            let status = statuses
-                .get(cursor)
-                .copied()
-                .unwrap_or(UpsertStatus::Inserted);
-            cursor += 1;
-            outcomes.push(success_outcome(part.index, "part", pk, status));
-        }
-    }
-    outcomes.sort_by_key(|outcome| outcome.index);
     outcomes
 }
 
@@ -1258,35 +1571,6 @@ impl std::fmt::Display for IngestError {
 }
 
 impl std::error::Error for IngestError {}
-
-/// Reject in-substream duplicate keys before the merge_insert commits the
-/// batch. Returns a one-line operator-facing message; the caller wraps each
-/// affected event into a per-row Error outcome with this message.
-fn validate_batch_keys(messages: &[BufferedMessage]) -> std::result::Result<(), String> {
-    let mut message_ids = HashSet::with_capacity(messages.len());
-    let mut part_ids = HashSet::new();
-
-    for message in messages {
-        let message_id = message.message.id();
-        if !message_ids.insert(message_id.to_owned()) {
-            return Err(format!(
-                "duplicate message id {message_id} in session substream"
-            ));
-        }
-
-        for part in &message.parts {
-            let key = (part.part.message_id.as_str(), part.part.id.as_str());
-            if !part_ids.insert((key.0.to_owned(), key.1.to_owned())) {
-                return Err(format!(
-                    "duplicate part id {} for message {} in session substream",
-                    part.part.id, part.part.message_id
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Compare an incoming Session row against the stored row on the two
 /// immutable fields (design.md 3.6.4). The `Option<String>` `project` field

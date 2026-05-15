@@ -96,6 +96,9 @@ async fn concurrent_writers_on_same_data_dir_serialize_without_conflict() -> any
     // refresh window is zero (design.md 2.3 inv 4), so a long-lived reader
     // picks up another writer's commit on the next read without waiting.
     let (sessions, _, _, _) = store_a.row_counts().await?;
-    assert_eq!(sessions, 20, "concurrent writers must produce union of rows");
+    assert_eq!(
+        sessions, 20,
+        "concurrent writers must produce union of rows"
+    );
     Ok(())
 }

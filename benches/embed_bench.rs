@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     let ingest_start = Instant::now();
-    ingest_adapter(&store, &ClaudeCodeAdapter::new(&corpus)).await?;
+    ingest_adapter(&store, &ClaudeCodeAdapter::new(&corpus), |_| {}).await?;
     store.ensure_indices().await?;
     let ingest_elapsed = ingest_start.elapsed();
     let (sessions, messages, parts, _) = store.row_counts().await?;

@@ -22,8 +22,8 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, Env, EventStream, collect_jsonl_files, compact_json,
-    empty_options, part_id,
+    Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
+    compact_json, empty_options, part_id,
 };
 
 const NAME: &str = "codex-cli";
@@ -69,6 +69,17 @@ impl CodexCliAdapter {
 }
 
 impl Adapter for CodexCliAdapter {
+    fn discover(&self) -> DiscoverFuture<'_> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            // Header-free count: see the matching note on ClaudeCodeAdapter.
+            let paths = collect_jsonl_files(&root)
+                .await
+                .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
+            Ok(paths.len())
+        })
+    }
+
     fn events(&self) -> EventStream<'_> {
         let root = self.root.clone();
         Box::pin(stream! {
@@ -123,13 +134,15 @@ impl Adapter for CodexCliAdapter {
                     let row = match serde_json::from_str::<Value>(&line) {
                         Ok(value) => value,
                         Err(source) => {
+                            // Same per-line skip policy as the claude-code
+                            // adapter: surface the bad line, continue parsing.
                             yield Err(AdapterError::parse(
                                 NAME,
                                 path_display.clone(),
                                 line_number,
                                 source,
                             ));
-                            break;
+                            continue;
                         }
                     };
                     match events_from_row(&session_id, line_number, &row, default_timestamp) {
@@ -144,7 +157,7 @@ impl Adapter for CodexCliAdapter {
                                 format!("{path_display}:{line_number}"),
                                 message,
                             ));
-                            break;
+                            continue;
                         }
                     }
                 }
