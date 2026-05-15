@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    config::{EmbeddingModel, StorageLocation},
+    config::{self, EmbeddingModel},
     embed,
     substrate::{
         Handle, MaintenanceReport, Predicate, ScalarValue, Table, VECTOR_INDEX_ACTIVATION_ROWS,
@@ -29,6 +29,7 @@ use crate::{
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
+use url::Url;
 
 #[derive(Debug)]
 pub struct Store {
@@ -74,10 +75,35 @@ pub struct MessageWrite<'a> {
 }
 
 impl Store {
-    pub async fn open(location: impl Into<StorageLocation>) -> Result<Self> {
+    /// Open against a local filesystem URL or a remote one for which the
+    /// caller has no extra options to pass (env vars suffice). CLI verbs
+    /// that load `[storage]` from config should call
+    /// [`Store::open_with_options`] instead so the same options flow into
+    /// every dataset open and write.
+    pub async fn open(location: &Url) -> Result<Self> {
         Ok(Self {
             handle: Handle::open(location).await?,
         })
+    }
+
+    /// Open with object-store options (S3 creds, region, endpoint, ...)
+    /// threaded through Lance verbatim. Keys are the standard `object_store`
+    /// config names; pond does not parse them. Empty options is equivalent
+    /// to [`Store::open`].
+    pub async fn open_with_options(
+        location: &Url,
+        storage_options: std::collections::HashMap<String, String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            handle: Handle::open_with_options(location, storage_options).await?,
+        })
+    }
+
+    /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
+    /// a `file://...` URL via [`config::url_for_path`] before opening.
+    pub async fn open_local(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let url = config::url_for_path(path)?;
+        Self::open(&url).await
     }
 
     pub async fn upsert_session(&self, session: &Session) -> Result<UpsertStatus> {
@@ -569,6 +595,17 @@ impl Store {
         }
     }
 
+    /// Return every message of `session_id` in canonical `(timestamp, id)`
+    /// order, each paired with its parts. Public face of the session
+    /// iteration seam used by both `pond_get` (full-session reads) and
+    /// `pond_session_events` (catch-up SSE per design.md 3.6.5).
+    pub async fn session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MessageWithParts>> {
+        self.messages_for_session(session_id).await
+    }
+
     async fn messages_for_session(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         let batch = self
             .handle
@@ -655,6 +692,9 @@ pub enum IngestEvent {
     Part(Part),
 }
 
+/// Aggregate accounting for an ingest pass (CLI sync, adapter-driven).
+/// The wire layer (`pond_ingest`) instead returns per-row results; the
+/// aggregate is derived from those at the wire boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestSummary {
     pub inserted: usize,
@@ -667,174 +707,610 @@ impl IngestSummary {
         self.inserted + self.matched
     }
 
-    pub fn add_statuses(&mut self, statuses: &[UpsertStatus]) {
-        for status in statuses {
-            match status {
-                UpsertStatus::Inserted => self.inserted += 1,
-                UpsertStatus::Matched => self.matched += 1,
+    pub fn add_outcomes(&mut self, outcomes: &[RowOutcome]) {
+        for outcome in outcomes {
+            match outcome.status {
+                OutcomeStatus::Inserted => self.inserted += 1,
+                OutcomeStatus::Matched => self.matched += 1,
+                OutcomeStatus::Error => self.errors += 1,
             }
         }
     }
 }
 
+/// Per-row outcome surfaced by [`IngestValidator`] (design.md 3.6.4). One
+/// row per input event from the request's `events` array. The validator
+/// returns these in array order so the wire layer can pack them directly
+/// into [`crate::wire::IngestResult`] entries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowOutcome {
+    pub index: usize,
+    pub kind: &'static str,
+    pub pk: Value,
+    pub status: OutcomeStatus,
+    pub error: Option<RowError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeStatus {
+    Inserted,
+    Matched,
+    Error,
+}
+
+/// Structured per-row error body. Mirrors the wire shape so the handler
+/// can pass it straight through.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IngestError {
-    ValidationFailed(String),
+pub struct RowError {
+    pub message: String,
+    pub field: Option<&'static str>,
+    pub reason: Option<&'static str>,
+}
+
+/// Buffered session events tagged with their input array index, so the
+/// per-row outcomes can be re-attributed once `merge_insert` returns its
+/// per-row Inserted/Matched stats.
+#[derive(Debug)]
+struct BufferedSession {
+    index: usize,
+    session: Session,
+}
+
+#[derive(Debug)]
+struct BufferedMessage {
+    index: usize,
+    message: Message,
+    parts: Vec<BufferedPart>,
+    search_text: Option<String>,
+}
+
+#[derive(Debug)]
+struct BufferedPart {
+    index: usize,
+    part: Part,
+}
+
+/// State machine that turns the `events: Vec<IngestEvent>` array into a
+/// flat `Vec<RowOutcome>` matching the array's index space. Buffers a whole
+/// session substream so `merge_insert` runs once per substream (three
+/// batches: sessions, messages, parts). A validation error on any event in
+/// the substream marks every event of that substream as
+/// [`OutcomeStatus::Error`]; the next `IngestEvent::Session` resets the
+/// state and ingest continues.
+#[derive(Debug, Default)]
+pub struct IngestValidator {
+    session: Option<BufferedSession>,
+    current_message: Option<BufferedMessage>,
+    current_parts: Vec<BufferedPart>,
+    messages: Vec<BufferedMessage>,
+    failed_message: Option<String>,
+    aborted_indices: Vec<(usize, &'static str, Value)>,
+}
+
+impl IngestValidator {
+    /// Drive one input event through the validator. Returns the per-row
+    /// outcomes the event triggered: empty when the event is just buffered,
+    /// or N entries when a session substream just flushed (success or
+    /// failure). `Err` is reserved for catastrophic storage failures that
+    /// should fail the whole `pond_ingest` request.
+    pub async fn push(
+        &mut self,
+        store: &Store,
+        index: usize,
+        event: IngestEvent,
+    ) -> Result<Vec<RowOutcome>> {
+        match event {
+            IngestEvent::Session(session) => self.push_session(store, index, session).await,
+            IngestEvent::Message(message) => Ok(self.push_message(index, message)),
+            IngestEvent::Part(part) => Ok(self.push_part(index, part)),
+        }
+    }
+
+    /// Final flush at end-of-batch. Empties any buffered substream.
+    pub async fn finish(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
+        if self.failed_message.is_some() {
+            return Ok(self.drain_failed_substream());
+        }
+        self.flush_session(store).await
+    }
+
+    async fn push_session(
+        &mut self,
+        store: &Store,
+        index: usize,
+        mut session: Session,
+    ) -> Result<Vec<RowOutcome>> {
+        let mut outcomes = if self.failed_message.is_some() {
+            self.drain_failed_substream()
+        } else if self.session.is_some() {
+            self.flush_session(store).await?
+        } else {
+            Vec::new()
+        };
+
+        // design.md 3.1.3: `source_agent` is trimmed at ingest and rejected
+        // if empty after trim. The validator is the safety net regardless
+        // of adapter discipline.
+        let trimmed = session.source_agent.trim();
+        if trimmed.is_empty() {
+            outcomes.push(RowOutcome {
+                index,
+                kind: "session",
+                pk: Value::String(session.id.clone()),
+                status: OutcomeStatus::Error,
+                error: Some(RowError {
+                    message: format!("session {} has empty source_agent after trim", session.id),
+                    field: Some("source_agent"),
+                    reason: None,
+                }),
+            });
+            // No buffered substream to abort: this is the first event.
+            return Ok(outcomes);
+        }
+        if trimmed.len() != session.source_agent.len() {
+            session.source_agent = trimmed.to_owned();
+        }
+
+        self.session = Some(BufferedSession { index, session });
+        Ok(outcomes)
+    }
+
+    fn push_message(&mut self, index: usize, message: Message) -> Vec<RowOutcome> {
+        let pk = Value::Array(vec![
+            Value::String(message.session_id().to_owned()),
+            Value::String(message.id().to_owned()),
+        ]);
+        if self.failed_message.is_some() {
+            self.aborted_indices.push((index, "message", pk));
+            return Vec::new();
+        }
+        let Some(session) = &self.session else {
+            self.fail_substream(
+                index,
+                "message",
+                pk,
+                "first event in a session stream must be Session",
+                None,
+            );
+            return Vec::new();
+        };
+        if message.session_id() != session.session.id {
+            let msg = format!(
+                "message {} references session {}, expected {}",
+                message.id(),
+                message.session_id(),
+                session.session.id
+            );
+            self.fail_substream(index, "message", pk, msg, Some("session_id"));
+            return Vec::new();
+        }
+        self.flush_current_message();
+        self.current_message = Some(BufferedMessage {
+            index,
+            message,
+            parts: Vec::new(),
+            search_text: None,
+        });
+        Vec::new()
+    }
+
+    fn push_part(&mut self, index: usize, part: Part) -> Vec<RowOutcome> {
+        let pk = Value::Array(vec![
+            Value::String(part.message_id.clone()),
+            Value::String(part.id.clone()),
+        ]);
+        if self.failed_message.is_some() {
+            self.aborted_indices.push((index, "part", pk));
+            return Vec::new();
+        }
+        let Some(current) = &self.current_message else {
+            self.fail_substream(
+                index,
+                "part",
+                pk,
+                "part event appeared before a message",
+                None,
+            );
+            return Vec::new();
+        };
+        if part.message_id != current.message.id() {
+            let msg = format!(
+                "part {} references message {}, expected {}",
+                part.id,
+                part.message_id,
+                current.message.id()
+            );
+            self.fail_substream(index, "part", pk, msg, Some("message_id"));
+            return Vec::new();
+        }
+        self.current_parts.push(BufferedPart { index, part });
+        Vec::new()
+    }
+
+    fn flush_current_message(&mut self) {
+        let Some(mut buffered) = self.current_message.take() else {
+            return;
+        };
+        let parts = std::mem::take(&mut self.current_parts);
+        let mut canonical_parts = Vec::with_capacity(parts.len());
+        for part in &parts {
+            canonical_parts.push(part.part.clone());
+        }
+        buffered.search_text = search_text(&buffered.message, &canonical_parts);
+        buffered.parts = parts;
+        self.messages.push(buffered);
+    }
+
+    async fn flush_session(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
+        self.flush_current_message();
+        let Some(BufferedSession {
+            index: session_index,
+            session,
+        }) = self.session.take()
+        else {
+            return Ok(Vec::new());
+        };
+        let buffered_messages = std::mem::take(&mut self.messages);
+
+        if let Err(failure) = validate_batch_keys(&buffered_messages) {
+            return Ok(error_outcomes_for_substream(
+                session_index,
+                &session,
+                &buffered_messages,
+                failure,
+                None,
+            ));
+        }
+
+        // design.md 3.6.4: source_agent + project are immutable post-first-
+        // write because messages/embeddings denormalize them. Probe the
+        // existing row before write; reject with the typed field name so the
+        // wire layer can attach `details: { field, reason: "immutable" }`.
+        if let Some(existing) = store.find_session(&session.id).await?
+            && let Err(failure) = ensure_immutable_match(&existing, &session)
+        {
+            let field = match &failure {
+                IngestError::ImmutableField { field, .. } => Some(*field),
+            };
+            return Ok(error_outcomes_for_substream(
+                session_index,
+                &session,
+                &buffered_messages,
+                failure.to_string(),
+                field,
+            ));
+        }
+
+        let writes = buffered_messages
+            .iter()
+            .map(|message| {
+                let parts = message
+                    .parts
+                    .iter()
+                    .map(|part| part.part.clone())
+                    .collect::<Vec<_>>();
+                (message, parts)
+            })
+            .collect::<Vec<_>>();
+        let message_writes = writes
+            .iter()
+            .map(|(message, parts)| MessageWrite {
+                message: &message.message,
+                parts,
+                search_text: message.search_text.as_deref(),
+            })
+            .collect::<Vec<_>>();
+
+        let statuses = store
+            .upsert_session_bundle(&session, &message_writes)
+            .await?;
+
+        Ok(success_outcomes_from_statuses(
+            session_index,
+            &session,
+            &buffered_messages,
+            &statuses,
+        ))
+    }
+
+    /// Tag the current substream as failed: the offending event gets an
+    /// error outcome immediately, all subsequent buffered events of this
+    /// substream get tagged on the next flush/reset.
+    fn fail_substream(
+        &mut self,
+        index: usize,
+        kind: &'static str,
+        pk: Value,
+        message: impl Into<String>,
+        field: Option<&'static str>,
+    ) {
+        let message = message.into();
+        self.failed_message = Some(message.clone());
+        self.aborted_indices.push((index, kind, pk));
+        // The session, current_message, and current_parts buffers remain so
+        // `drain_failed_substream` can tag those too with the same error.
+        let _ = field; // currently only the message is propagated to all outcomes
+    }
+
+    /// Drain all buffered events of the failed substream into Error outcomes
+    /// and reset state for the next session. Called when (a) the next Session
+    /// event arrives, signaling recovery, or (b) `finish()` is called at end
+    /// of batch.
+    fn drain_failed_substream(&mut self) -> Vec<RowOutcome> {
+        let Some(message) = self.failed_message.take() else {
+            return Vec::new();
+        };
+        let aborted = std::mem::take(&mut self.aborted_indices);
+
+        let mut outcomes = Vec::new();
+
+        if let Some(BufferedSession {
+            index,
+            session,
+        }) = self.session.take()
+        {
+            outcomes.push(error_outcome(
+                index,
+                "session",
+                Value::String(session.id),
+                &message,
+                None,
+            ));
+        }
+        for buffered in self.messages.drain(..) {
+            let pk = Value::Array(vec![
+                Value::String(buffered.message.session_id().to_owned()),
+                Value::String(buffered.message.id().to_owned()),
+            ]);
+            outcomes.push(error_outcome(buffered.index, "message", pk, &message, None));
+            for part in buffered.parts {
+                let pk = Value::Array(vec![
+                    Value::String(part.part.message_id.clone()),
+                    Value::String(part.part.id.clone()),
+                ]);
+                outcomes.push(error_outcome(part.index, "part", pk, &message, None));
+            }
+        }
+        if let Some(buffered) = self.current_message.take() {
+            let pk = Value::Array(vec![
+                Value::String(buffered.message.session_id().to_owned()),
+                Value::String(buffered.message.id().to_owned()),
+            ]);
+            outcomes.push(error_outcome(buffered.index, "message", pk, &message, None));
+        }
+        for buffered in self.current_parts.drain(..) {
+            let pk = Value::Array(vec![
+                Value::String(buffered.part.message_id.clone()),
+                Value::String(buffered.part.id.clone()),
+            ]);
+            outcomes.push(error_outcome(buffered.index, "part", pk, &message, None));
+        }
+        for (index, kind, pk) in aborted {
+            outcomes.push(error_outcome(index, kind, pk, &message, None));
+        }
+        outcomes.sort_by_key(|outcome| outcome.index);
+        outcomes
+    }
+}
+
+fn error_outcome(
+    index: usize,
+    kind: &'static str,
+    pk: Value,
+    message: &str,
+    field: Option<&'static str>,
+) -> RowOutcome {
+    RowOutcome {
+        index,
+        kind,
+        pk,
+        status: OutcomeStatus::Error,
+        error: Some(RowError {
+            message: message.to_owned(),
+            field,
+            reason: None,
+        }),
+    }
+}
+
+fn error_outcomes_for_substream(
+    session_index: usize,
+    session: &Session,
+    messages: &[BufferedMessage],
+    message: impl Into<String>,
+    field: Option<&'static str>,
+) -> Vec<RowOutcome> {
+    let message = message.into();
+    let reason = field.map(|_| "immutable");
+    let mk_err = |index: usize, kind: &'static str, pk: Value| RowOutcome {
+        index,
+        kind,
+        pk,
+        status: OutcomeStatus::Error,
+        error: Some(RowError {
+            message: message.clone(),
+            field,
+            reason,
+        }),
+    };
+    let mut outcomes = Vec::with_capacity(1 + messages.len());
+    outcomes.push(mk_err(
+        session_index,
+        "session",
+        Value::String(session.id.clone()),
+    ));
+    for buffered in messages {
+        let pk = Value::Array(vec![
+            Value::String(buffered.message.session_id().to_owned()),
+            Value::String(buffered.message.id().to_owned()),
+        ]);
+        outcomes.push(mk_err(buffered.index, "message", pk));
+        for part in &buffered.parts {
+            let part_pk = Value::Array(vec![
+                Value::String(part.part.message_id.clone()),
+                Value::String(part.part.id.clone()),
+            ]);
+            outcomes.push(mk_err(part.index, "part", part_pk));
+        }
+    }
+    outcomes.sort_by_key(|outcome| outcome.index);
+    outcomes
+}
+
+fn success_outcomes_from_statuses(
+    session_index: usize,
+    session: &Session,
+    messages: &[BufferedMessage],
+    statuses: &[UpsertStatus],
+) -> Vec<RowOutcome> {
+    // upsert_session_bundle returns statuses ordered: [sessions, messages..., parts...].
+    let mut outcomes = Vec::with_capacity(statuses.len());
+    let mut cursor = 0usize;
+    let session_status = statuses
+        .get(cursor)
+        .copied()
+        .unwrap_or(UpsertStatus::Inserted);
+    cursor += 1;
+    outcomes.push(success_outcome(
+        session_index,
+        "session",
+        Value::String(session.id.clone()),
+        session_status,
+    ));
+
+    for buffered in messages {
+        let pk = Value::Array(vec![
+            Value::String(buffered.message.session_id().to_owned()),
+            Value::String(buffered.message.id().to_owned()),
+        ]);
+        let status = statuses
+            .get(cursor)
+            .copied()
+            .unwrap_or(UpsertStatus::Inserted);
+        cursor += 1;
+        outcomes.push(success_outcome(buffered.index, "message", pk, status));
+    }
+    for buffered in messages {
+        for part in &buffered.parts {
+            let pk = Value::Array(vec![
+                Value::String(part.part.message_id.clone()),
+                Value::String(part.part.id.clone()),
+            ]);
+            let status = statuses
+                .get(cursor)
+                .copied()
+                .unwrap_or(UpsertStatus::Inserted);
+            cursor += 1;
+            outcomes.push(success_outcome(part.index, "part", pk, status));
+        }
+    }
+    outcomes.sort_by_key(|outcome| outcome.index);
+    outcomes
+}
+
+fn success_outcome(
+    index: usize,
+    kind: &'static str,
+    pk: Value,
+    status: UpsertStatus,
+) -> RowOutcome {
+    let status = match status {
+        UpsertStatus::Inserted => OutcomeStatus::Inserted,
+        UpsertStatus::Matched => OutcomeStatus::Matched,
+    };
+    RowOutcome {
+        index,
+        kind,
+        pk,
+        status,
+        error: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IngestError {
+    /// design.md 3.6.4: `Session.source_agent` and `Session.project` are
+    /// immutable post-first-write because the denormalized copies on
+    /// `messages` and `embeddings` were stamped from the prior Session at
+    /// first ingest. A re-write that changes either would silently desync.
+    ImmutableField {
+        field: &'static str,
+        session_id: String,
+        stored: String,
+        attempted: String,
+    },
 }
 
 impl std::fmt::Display for IngestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ValidationFailed(message) => write!(formatter, "{message}"),
+            Self::ImmutableField {
+                field,
+                session_id,
+                stored,
+                attempted,
+            } => write!(
+                formatter,
+                "session {session_id} {field} is immutable: stored {stored:?}, attempted {attempted:?}",
+            ),
         }
     }
 }
 
 impl std::error::Error for IngestError {}
 
-#[derive(Debug, Default)]
-pub struct IngestValidator {
-    session: Option<Session>,
-    current_message: Option<Message>,
-    current_parts: Vec<Part>,
-    messages: Vec<BufferedMessage>,
-    failed: bool,
-}
-
-#[derive(Debug)]
-struct BufferedMessage {
-    message: Message,
-    parts: Vec<Part>,
-    search_text: Option<String>,
-}
-
-impl IngestValidator {
-    pub async fn push(&mut self, store: &Store, event: IngestEvent) -> Result<Vec<UpsertStatus>> {
-        if self.failed {
-            return Err(IngestError::ValidationFailed(
-                "session substream already failed validation".to_owned(),
-            )
-            .into());
-        }
-
-        match event {
-            IngestEvent::Session(session) => {
-                if self.session.is_some() {
-                    let statuses = self.flush_session(store).await?;
-                    self.session = Some(session);
-                    Ok(statuses)
-                } else {
-                    self.session = Some(session);
-                    Ok(Vec::new())
-                }
-            }
-            IngestEvent::Message(message) => {
-                let Some(session) = &self.session else {
-                    self.failed = true;
-                    return Err(IngestError::ValidationFailed(
-                        "first event in a session stream must be Session".to_owned(),
-                    )
-                    .into());
-                };
-                if message.session_id() != session.id {
-                    self.failed = true;
-                    return Err(IngestError::ValidationFailed(format!(
-                        "message {} references session {}, expected {}",
-                        message.id(),
-                        message.session_id(),
-                        session.id
-                    ))
-                    .into());
-                }
-                self.flush_message();
-                self.current_message = Some(message);
-                Ok(Vec::new())
-            }
-            IngestEvent::Part(part) => {
-                let Some(message) = &self.current_message else {
-                    self.failed = true;
-                    return Err(IngestError::ValidationFailed(
-                        "part event appeared before a message".to_owned(),
-                    )
-                    .into());
-                };
-                if part.message_id != message.id() {
-                    self.failed = true;
-                    return Err(IngestError::ValidationFailed(format!(
-                        "part {} references message {}, expected {}",
-                        part.id,
-                        part.message_id,
-                        message.id()
-                    ))
-                    .into());
-                }
-                self.current_parts.push(part);
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    pub async fn finish(&mut self, store: &Store) -> Result<Vec<UpsertStatus>> {
-        self.flush_session(store).await
-    }
-
-    fn flush_message(&mut self) {
-        let Some(message) = self.current_message.take() else {
-            return;
-        };
-        let parts = std::mem::take(&mut self.current_parts);
-        let search_text = search_text(&message, &parts);
-        self.messages.push(BufferedMessage {
-            message,
-            parts,
-            search_text,
-        });
-    }
-
-    async fn flush_session(&mut self, store: &Store) -> Result<Vec<UpsertStatus>> {
-        self.flush_message();
-        let Some(session) = self.session.take() else {
-            return Ok(Vec::new());
-        };
-        let messages = std::mem::take(&mut self.messages);
-        validate_batch_keys(&messages)?;
-        let writes = messages
-            .iter()
-            .map(|message| MessageWrite {
-                message: &message.message,
-                parts: &message.parts,
-                search_text: message.search_text.as_deref(),
-            })
-            .collect::<Vec<_>>();
-        store.upsert_session_bundle(&session, &writes).await
-    }
-}
-
-fn validate_batch_keys(messages: &[BufferedMessage]) -> Result<()> {
+/// Reject in-substream duplicate keys before the merge_insert commits the
+/// batch. Returns a one-line operator-facing message; the caller wraps each
+/// affected event into a per-row Error outcome with this message.
+fn validate_batch_keys(messages: &[BufferedMessage]) -> std::result::Result<(), String> {
     let mut message_ids = HashSet::with_capacity(messages.len());
     let mut part_ids = HashSet::new();
 
     for message in messages {
         let message_id = message.message.id();
         if !message_ids.insert(message_id.to_owned()) {
-            return Err(IngestError::ValidationFailed(format!(
+            return Err(format!(
                 "duplicate message id {message_id} in session substream"
-            ))
-            .into());
+            ));
         }
 
         for part in &message.parts {
-            let key = (part.message_id.as_str(), part.id.as_str());
+            let key = (part.part.message_id.as_str(), part.part.id.as_str());
             if !part_ids.insert((key.0.to_owned(), key.1.to_owned())) {
-                return Err(IngestError::ValidationFailed(format!(
+                return Err(format!(
                     "duplicate part id {} for message {} in session substream",
-                    part.id, part.message_id
-                ))
-                .into());
+                    part.part.id, part.part.message_id
+                ));
             }
         }
     }
 
+    Ok(())
+}
+
+/// Compare an incoming Session row against the stored row on the two
+/// immutable fields (design.md 3.6.4). The `Option<String>` `project` field
+/// counts a NULL-vs-non-NULL change as a mismatch.
+fn ensure_immutable_match(
+    existing: &Session,
+    incoming: &Session,
+) -> std::result::Result<(), IngestError> {
+    if existing.source_agent != incoming.source_agent {
+        return Err(IngestError::ImmutableField {
+            field: "source_agent",
+            session_id: incoming.id.clone(),
+            stored: existing.source_agent.clone(),
+            attempted: incoming.source_agent.clone(),
+        });
+    }
+    if existing.project != incoming.project {
+        return Err(IngestError::ImmutableField {
+            field: "project",
+            session_id: incoming.id.clone(),
+            stored: existing.project.clone().unwrap_or_default(),
+            attempted: incoming.project.clone().unwrap_or_default(),
+        });
+    }
     Ok(())
 }
 
@@ -1034,14 +1510,19 @@ pub(crate) const EMBEDDINGS: &str = "embeddings.lance";
 /// A future model with a different dim activates a second `embeddings` table.
 pub const EMBEDDING_DIM: usize = 1024;
 
-pub(crate) fn write_params() -> WriteParams {
+/// `auto_cleanup` retention is scheme-keyed (design.md 3.2.0): local-FS gets
+/// 30 days; object stores get 90 days because hosted recovery scenarios
+/// (sources deleted, sessions expired, re-ingest impossible) need a longer
+/// rollback window and storage cost is negligible for append-only workloads.
+pub(crate) fn write_params(location: &Url) -> WriteParams {
+    let retention_days = if config::is_local(location) { 30 } else { 90 };
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_2),
         enable_v2_manifest_paths: true,
         enable_stable_row_ids: true,
         auto_cleanup: Some(AutoCleanupParams {
             interval: 20,
-            older_than: chrono::TimeDelta::days(30),
+            older_than: chrono::TimeDelta::days(retention_days),
         }),
         ..WriteParams::default()
     }

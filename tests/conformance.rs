@@ -5,7 +5,7 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     handlers::pond_get,
     handlers::{IngestEvent, IngestValidator, ingest_adapter},
-    sessions::Store,
+    sessions::{OutcomeStatus, Store},
     wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
     wire::{GetEnvelope, GetRequest},
 };
@@ -14,7 +14,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     let summary = ingest_adapter(&store, &adapter).await?;
@@ -78,7 +78,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     ingest_adapter(&store, &adapter).await?;
@@ -97,7 +97,7 @@ async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ordering_contract_rejects_part_before_message() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let session = synthetic_session("ordering");
     let part = Part {
         id: "part-1".to_owned(),
@@ -110,18 +110,31 @@ async fn ordering_contract_rejects_part_before_message() -> anyhow::Result<()> {
     };
 
     let mut validator = IngestValidator::default();
-    validator
-        .push(&store, IngestEvent::Session(session))
-        .await
-        .expect("session writes");
-    let error = validator
-        .push(&store, IngestEvent::Part(part))
-        .await
-        .expect_err("part before message must fail");
+    let session_outcomes = validator
+        .push(&store, 0, IngestEvent::Session(session))
+        .await?;
     assert!(
-        error
-            .to_string()
-            .contains("part event appeared before a message")
+        session_outcomes.is_empty(),
+        "Session event is buffered until flush",
+    );
+    let part_outcomes = validator.push(&store, 1, IngestEvent::Part(part)).await?;
+    assert!(
+        part_outcomes.is_empty(),
+        "the per-event error is emitted at substream flush, not inline",
+    );
+    let tail = validator.finish(&store).await?;
+    let part_outcome = tail
+        .iter()
+        .find(|outcome| outcome.kind == "part")
+        .expect("part event must be reported in the per-row results");
+    assert_eq!(part_outcome.status, OutcomeStatus::Error);
+    assert!(
+        part_outcome
+            .error
+            .as_ref()
+            .map(|e| e.message.contains("part event appeared before a message"))
+            .unwrap_or(false),
+        "error message must explain the ordering violation"
     );
 
     Ok(())
@@ -130,7 +143,7 @@ async fn ordering_contract_rejects_part_before_message() -> anyhow::Result<()> {
 #[tokio::test]
 async fn duplicate_message_id_aborts_session_before_write() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let session = synthetic_session("duplicate-message");
     let first = Message::User {
         id: "message-1".to_owned(),
@@ -147,16 +160,27 @@ async fn duplicate_message_id_aborts_session_before_write() -> anyhow::Result<()
 
     let mut validator = IngestValidator::default();
     validator
-        .push(&store, IngestEvent::Session(session.clone()))
+        .push(&store, 0, IngestEvent::Session(session.clone()))
         .await?;
-    validator.push(&store, IngestEvent::Message(first)).await?;
-    validator.push(&store, IngestEvent::Message(second)).await?;
+    validator
+        .push(&store, 1, IngestEvent::Message(first))
+        .await?;
+    validator
+        .push(&store, 2, IngestEvent::Message(second))
+        .await?;
 
-    let error = validator
-        .finish(&store)
-        .await
-        .expect_err("duplicate message id must fail the session");
-    assert!(error.to_string().contains("duplicate message id message-1"));
+    let tail = validator.finish(&store).await?;
+    assert!(
+        tail.iter().any(|outcome| {
+            outcome.status == OutcomeStatus::Error
+                && outcome
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.contains("duplicate message id message-1"))
+                    .unwrap_or(false)
+        }),
+        "duplicate-message rejection must surface in the per-row results: {tail:?}",
+    );
     assert_eq!(store.row_counts().await?, (0, 0, 0, 0));
 
     Ok(())
@@ -165,7 +189,7 @@ async fn duplicate_message_id_aborts_session_before_write() -> anyhow::Result<()
 #[tokio::test]
 async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let session = synthetic_session("blob");
     let message = Message::User {
         id: "message-1".to_owned(),
@@ -187,13 +211,13 @@ async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
 
     let mut validator = IngestValidator::default();
     validator
-        .push(&store, IngestEvent::Session(session.clone()))
+        .push(&store, 0, IngestEvent::Session(session.clone()))
         .await?;
     validator
-        .push(&store, IngestEvent::Message(message.clone()))
+        .push(&store, 1, IngestEvent::Message(message.clone()))
         .await?;
     validator
-        .push(&store, IngestEvent::Part(part.clone()))
+        .push(&store, 2, IngestEvent::Part(part.clone()))
         .await?;
     validator.finish(&store).await?;
 

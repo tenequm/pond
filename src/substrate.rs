@@ -1,22 +1,63 @@
 use crate::{
     RetryPolicy,
-    config::StorageLocation,
+    config::{self},
     sessions::{self},
 };
 use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::MergeInsertBuilder;
+use lance::dataset::builder::DatasetBuilder;
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
+use lance::session::Session;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+use url::Url;
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 10_000;
+
+/// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
+/// against an OCC commit-conflict failure (design.md 3.6.1). The wire layer
+/// downcasts to this type to classify the outcome as `conflict` rather than
+/// the generic `storage_unavailable`.
+#[derive(Debug, Clone, Copy)]
+pub struct ConflictExhausted {
+    pub attempts: u8,
+}
+
+impl std::fmt::Display for ConflictExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "commit conflict exhausted after {} attempt(s)",
+            self.attempts
+        )
+    }
+}
+
+impl std::error::Error for ConflictExhausted {}
+
+/// True when the chain root is one of Lance's commit-conflict variants
+/// (`CommitConflict`, `RetryableCommitConflict`, `TooMuchWriteContention`).
+/// Everything else (timeouts, IAM denials, disk errors) is not a conflict.
+pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<lance::Error>().is_some_and(|err| {
+        matches!(
+            err,
+            lance::Error::CommitConflict { .. }
+                | lance::Error::RetryableCommitConflict { .. }
+                | lance::Error::TooMuchWriteContention { .. }
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
     pub versions_removed: u64,
@@ -95,6 +136,21 @@ impl ScalarValue {
 pub struct Handle {
     datasets: DatasetSet,
     retry: RetryPolicy,
+    /// One `lance::Session` shared across all four datasets. Carries the
+    /// metadata + index caches and the `ObjectStoreRegistry` (which holds
+    /// the underlying object_store / S3 client). Sharing the session means
+    /// one cache pool covers all four tables and one S3 client serves all
+    /// four datasets - load-bearing on object-store backends where a
+    /// per-dataset client would mean 4x the connection pools and 4x the
+    /// credential refreshes (lance/src/dataset/builder.rs:509-517).
+    #[allow(dead_code)]
+    session: Arc<Session>,
+    /// Object-store options threaded through every `DatasetBuilder` and
+    /// `Dataset::write` call so refresh / index-creation paths inherit the
+    /// same credentials and region as the initial open. Empty on local-FS
+    /// installs.
+    #[allow(dead_code)]
+    storage_options: HashMap<String, String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -140,21 +196,51 @@ impl CachedDataset {
     }
 }
 impl Handle {
-    pub async fn open(location: impl Into<StorageLocation>) -> Result<Self> {
-        let location = location.into();
-        if let Some(path) = location.local_path() {
-            tokio::fs::create_dir_all(path)
+    /// Open without storage options (local FS or backends that don't need
+    /// auth). Most tests and the no-config CLI path land here.
+    pub async fn open(location: &Url) -> Result<Self> {
+        Self::open_with_options(location, HashMap::new()).await
+    }
+
+    /// Open with object-store options handed through to Lance verbatim.
+    /// Keys are the `object_store` crate's standard config names; pond does
+    /// not parse them. Used by `pond serve --data-dir s3://...` once
+    /// `config.toml` carries an `[storage]` block (design.md 3.2.0 storage
+    /// block / 3.6 "Recovery model").
+    pub async fn open_with_options(
+        location: &Url,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Self> {
+        if let Some(path) = config::local_path(location) {
+            tokio::fs::create_dir_all(&path)
                 .await
                 .with_context(|| format!("failed to create data dir {}", path.display()))?;
         }
-        let refresh_after = Duration::from_millis(250);
+        // One Session shared across all four datasets so metadata/index
+        // caches and the object_store registry (and thus any S3 client) are
+        // pooled rather than duplicated four times. `Session::default()`
+        // ships sensible cache capacities (lance/src/dataset.rs:149,153)
+        // and a default ObjectStoreRegistry that knows file/s3/gs/az.
+        let session = Arc::new(Session::default());
+        // design.md 2.3 inv 4: refresh window is scheme-keyed. Local-FS
+        // manifest reads are microsecond-cheap, so `0` (always-refresh) is
+        // essentially free and removes the stale-read window entirely. Object
+        // stores have real per-call cost; `5s` caps manifest fetch overhead at
+        // acceptable lag for human-driven queries.
+        let refresh_after = if config::is_local(location) {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(5)
+        };
         Ok(Self {
             datasets: DatasetSet {
                 sessions: Mutex::new(CachedDataset {
                     dataset: open_or_create(
-                        &location,
+                        location,
                         sessions::SESSIONS,
                         sessions::session_schema(),
+                        &session,
+                        &storage_options,
                     )
                     .await?,
                     last_refresh: Instant::now(),
@@ -162,25 +248,35 @@ impl Handle {
                 }),
                 messages: Mutex::new(CachedDataset {
                     dataset: open_or_create(
-                        &location,
+                        location,
                         sessions::MESSAGES,
                         sessions::message_schema(),
+                        &session,
+                        &storage_options,
                     )
                     .await?,
                     last_refresh: Instant::now(),
                     refresh_after,
                 }),
                 parts: Mutex::new(CachedDataset {
-                    dataset: open_or_create(&location, sessions::PARTS, sessions::part_schema())
-                        .await?,
+                    dataset: open_or_create(
+                        location,
+                        sessions::PARTS,
+                        sessions::part_schema(),
+                        &session,
+                        &storage_options,
+                    )
+                    .await?,
                     last_refresh: Instant::now(),
                     refresh_after,
                 }),
                 embeddings: Mutex::new(CachedDataset {
                     dataset: open_or_create(
-                        &location,
+                        location,
                         sessions::EMBEDDINGS,
                         sessions::embedding_schema(),
+                        &session,
+                        &storage_options,
                     )
                     .await?,
                     last_refresh: Instant::now(),
@@ -188,6 +284,8 @@ impl Handle {
                 }),
             },
             retry: RetryPolicy::default(),
+            session,
+            storage_options,
         })
     }
     pub async fn row_counts(&self) -> Result<(usize, usize, usize, usize)> {
@@ -198,7 +296,7 @@ impl Handle {
             self.count_rows(Table::Embeddings, None).await?,
         ))
     }
-    pub async fn merge_insert(
+    pub(crate) async fn merge_insert(
         &self,
         table: Table,
         batch: RecordBatch,
@@ -220,11 +318,11 @@ impl Handle {
         })
         .await
     }
-    pub async fn dataset(&self, table: Table) -> Result<Dataset> {
+    pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
         let mut cached = self.cached(table).lock().await;
         cached.latest().await
     }
-    pub async fn scan_batch(
+    pub(crate) async fn scan_batch(
         &self,
         table: Table,
         predicate: Option<&Predicate>,
@@ -244,7 +342,7 @@ impl Handle {
             .await
             .map_err(Into::into)
     }
-    pub async fn ensure_scalar_index(
+    pub(crate) async fn ensure_scalar_index(
         &self,
         table: Table,
         column: &str,
@@ -259,7 +357,7 @@ impl Handle {
         self.ensure_index(table, column, name, index_type, &params)
             .await
     }
-    pub async fn ensure_index(
+    pub(crate) async fn ensure_index(
         &self,
         table: Table,
         column: &str,
@@ -376,6 +474,15 @@ impl Handle {
                 }
                 Err(error) => {
                     tracing::warn!(label, attempt, %error, "Lance operation exhausted retries");
+                    // design.md 3.6.1: surface OCC failures as a typed `conflict`
+                    // rather than the generic `storage_unavailable` bucket. The
+                    // chain root is a `lance::Error` (commit-conflict family) when
+                    // pond's retry layer exhausted because the manifest could not
+                    // be advanced; everything else (timeouts, IAM, disk) stays
+                    // `storage_unavailable`.
+                    if is_commit_conflict(&error) {
+                        return Err(error.context(ConflictExhausted { attempts: attempt }));
+                    }
                     return Err(error);
                 }
             }
@@ -385,48 +492,93 @@ impl Handle {
         let shift = u32::from(attempt.saturating_sub(1));
         let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
         let base = self.retry.initial_backoff.saturating_mul(multiplier);
-        base.min(self.retry.max_backoff)
+        // Symmetric +/- `jitter` factor de-correlates concurrent retriers on
+        // a contended manifest (design.md 2.3 inv 3); clamped to `max_backoff`.
+        let factor = (1.0 + self.retry.jitter * (fastrand::f64() * 2.0 - 1.0)).max(0.0);
+        base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
 async fn open_or_create(
-    location: &StorageLocation,
+    location: &Url,
     suffix: &str,
     schema: Arc<lance::deps::arrow_schema::Schema>,
+    session: &Arc<Session>,
+    storage_options: &HashMap<String, String>,
 ) -> Result<Dataset> {
-    let uri = location.child_uri(suffix);
-    match location {
-        StorageLocation::LocalPath(base) => {
-            let path = base.join(suffix);
-            if path.exists() {
-                let dataset = Dataset::open(&uri)
-                    .await
-                    .with_context(|| format!("failed to open dataset {uri}"))?;
-                ensure_schema_matches(&dataset, &schema, &uri)?;
-                Ok(dataset)
-            } else {
-                let reader = sessions::empty_reader(schema)?;
-                Dataset::write(reader, &uri, Some(sessions::write_params()))
-                    .await
-                    .with_context(|| format!("failed to create dataset {uri}"))
-            }
+    let uri = config::child_uri(location, suffix);
+    let mut write_params = sessions::write_params(location);
+    // Tie new-dataset writes to the shared Session so the created dataset
+    // inherits the same caches + ObjectStoreRegistry the open path uses.
+    write_params.session = Some(session.clone());
+    // For object-store backends pond hands raw `storage_options` (S3 creds,
+    // region, endpoint, ...) verbatim to Lance via the `ObjectStoreParams`
+    // accessor (lance/src/dataset/builder.rs:305 doc). Empty map = use the
+    // session's default registry (env-var-driven object_store).
+    if !storage_options.is_empty() {
+        write_params.store_params = Some(ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options.clone()),
+            )),
+            ..Default::default()
+        });
+    }
+    if let Some(local_base) = config::local_path(location) {
+        // Local-FS fast path: a plain `Path::exists` check keeps the
+        // missing-dataset branch cheap and surfaces real open errors as
+        // open errors (not as misclassified "needs create" cases).
+        let path = local_base.join(suffix);
+        if path.exists() {
+            let dataset = open_with_session(&uri, session, storage_options).await?;
+            ensure_schema_matches(&dataset, &schema, &uri)?;
+            Ok(dataset)
+        } else {
+            let reader = sessions::empty_reader(schema)?;
+            Dataset::write(reader, &uri, Some(write_params))
+                .await
+                .with_context(|| format!("failed to create dataset {uri}"))
         }
-        StorageLocation::Uri(_) => match Dataset::open(&uri).await {
+    } else {
+        // Object-store path: no portable cheap "exists" predicate, so try
+        // open first and fall back to write. If write also fails we surface
+        // both errors so the operator sees the underlying transport problem
+        // rather than a misleading "already exists" from the create attempt.
+        match open_with_session(&uri, session, storage_options).await {
             Ok(dataset) => {
                 ensure_schema_matches(&dataset, &schema, &uri)?;
                 Ok(dataset)
             }
             Err(open_err) => {
                 let reader = sessions::empty_reader(schema)?;
-                Dataset::write(reader, &uri, Some(sessions::write_params()))
+                Dataset::write(reader, &uri, Some(write_params))
                     .await
                     .with_context(|| {
                         format!("failed to open or create dataset {uri} (open error: {open_err})")
                     })
             }
-        },
+        }
     }
 }
-pub fn scanner_with_prefilter(
+
+/// Open a dataset bound to the shared `Session` and any object-store options.
+/// Routes through `DatasetBuilder::with_session` + `with_storage_options`
+/// rather than `Dataset::open(&str)` so the returned dataset reuses the
+/// pooled metadata/index caches and the `ObjectStoreRegistry` (which holds
+/// the S3/local object_store client).
+async fn open_with_session(
+    uri: &str,
+    session: &Arc<Session>,
+    storage_options: &HashMap<String, String>,
+) -> Result<Dataset> {
+    let mut builder = DatasetBuilder::from_uri(uri).with_session(session.clone());
+    if !storage_options.is_empty() {
+        builder = builder.with_storage_options(storage_options.clone());
+    }
+    builder
+        .load()
+        .await
+        .with_context(|| format!("failed to open dataset {uri}"))
+}
+pub(crate) fn scanner_with_prefilter(
     dataset: &Dataset,
     predicate: Option<&Predicate>,
 ) -> Result<lance::dataset::scanner::Scanner> {

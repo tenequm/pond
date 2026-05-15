@@ -13,6 +13,7 @@ candle-core = "0.10.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 dialoguer = { version = "0.12", default-features = false }
+fastrand = "2"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
@@ -34,6 +35,7 @@ toml = "1.1"
 toml_edit = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 
 # `ort` is a non-optional dependency of fastembed 5.13.4; `ort-load-dynamic`

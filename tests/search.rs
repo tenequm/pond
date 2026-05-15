@@ -13,8 +13,8 @@ use pond::{
     handlers::pond_get,
     handlers::{IngestEvent, ingest_adapter, pond_ingest},
     handlers::{
-        RankedList, RetrieverKind, build_filter, make_preview, pond_search, recency_boost,
-        rrf_merge,
+        RankedList, RetrieverKind, SearchMode, build_filter, make_preview, plan_search,
+        pond_search, recency_boost, rrf_merge,
     },
     sessions::Store,
     sessions::{EMBEDDING_DIM, EmbeddingRow},
@@ -168,6 +168,76 @@ fn metric_type_maps_each_registry_distance() {
     assert_eq!(metric_type(Distance::Dot), MetricType::Dot);
 }
 
+#[test]
+fn plan_search_trims_query_caps_limit_and_sizes_pools() {
+    let mut request = search_request("  vector memory  ");
+    request.limit = 500;
+    request.group_by_conversation = true;
+    request.boost_recent = false;
+    request.filters.min_score = 0.42;
+
+    let plan = plan_search(request, SearchMode::Hybrid).unwrap();
+
+    assert_eq!(plan.mode, SearchMode::Hybrid);
+    assert_eq!(plan.query, "vector memory");
+    assert_eq!(plan.limit, 200);
+    assert_eq!(plan.pool, 1000);
+    assert_eq!(plan.vector_pool, 2000);
+    assert!(plan.group_by_conversation);
+    assert!(!plan.boost_recent);
+    assert_eq!(plan.min_score, 0.42);
+}
+
+#[test]
+fn plan_search_keeps_small_limits_from_starving_retrievers() {
+    let mut request = search_request("tiny pool");
+    request.limit = 1;
+
+    let plan = plan_search(request, SearchMode::Fts).unwrap();
+
+    assert_eq!(plan.mode, SearchMode::Fts);
+    assert_eq!(plan.limit, 1);
+    assert_eq!(plan.pool, 50);
+    assert_eq!(plan.vector_pool, 100);
+}
+
+#[test]
+fn plan_search_builds_the_shared_filter_predicate() {
+    let mut request = search_request("filtered");
+    request.filters.project = Some("/Users/me/pond".to_owned());
+    request.filters.project_match = ProjectMatch::Contains;
+    request.filters.role = Some("assistant".to_owned());
+
+    let plan = plan_search(request, SearchMode::Fts).unwrap();
+    let sql = plan.filter.to_lance();
+
+    assert!(sql.contains("project LIKE"));
+    assert!(sql.contains("role = 'assistant'"));
+}
+
+#[test]
+fn plan_search_rejects_invalid_composition_before_execution() {
+    let mut blank = search_request("   ");
+    let error = plan_search(blank.clone(), SearchMode::Fts)
+        .unwrap_err()
+        .error;
+    assert_eq!(error.code, pond::wire::ErrorCode::ValidationFailed);
+    assert_eq!(error.details["field"], "query");
+
+    blank.query = "valid".to_owned();
+    blank.limit = 0;
+    let error = plan_search(blank.clone(), SearchMode::Fts)
+        .unwrap_err()
+        .error;
+    assert_eq!(error.details["field"], "limit");
+
+    blank.limit = 1;
+    blank.namespace = Some("remote".to_owned());
+    let error = plan_search(blank, SearchMode::Fts).unwrap_err().error;
+    assert_eq!(error.code, pond::wire::ErrorCode::NamespaceUnknown);
+    assert_eq!(error.details["namespace"], "remote");
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic datasets (no model, no ingest)
 // ---------------------------------------------------------------------------
@@ -206,7 +276,7 @@ fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
 #[tokio::test]
 async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // 4 synthetic rows: `synthetic_rows` cycles `session-{i % 8}`, so 4 is the
@@ -250,7 +320,7 @@ async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow
 #[tokio::test]
 async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // 256 rows is the hard floor: the IVF_PQ index uses `num_bits = 8`, so its
@@ -308,7 +378,7 @@ async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<(
     // the identity that produced the query vector - never mix caps, never return
     // a message_id twice (RRF would double-count it).
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // Same message, two caps, deliberately opposite vectors so the result
@@ -428,7 +498,7 @@ fn pseudo_vector(text: &str, dim: usize) -> Vec<f32> {
 /// with the fake backend - the `pond_search` handler then runs end to end
 /// without model weights, exactly as `pond ingest` wires it (main.rs).
 async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter).await?;
     store.ensure_indices().await?;
@@ -549,7 +619,7 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
     // identity -> auto-degrade to FTS. Build a fresh store with messages and
     // the FTS index but no embed pass.
     let temp2 = TempDir::new()?;
-    let store2 = Store::open(temp2.path()).await?;
+    let store2 = Store::open_local(temp2.path()).await?;
     ingest_adapter(&store2, &ClaudeCodeAdapter::new(FIXTURES)).await?;
     store2.ensure_indices().await?;
     let hits = body_hits(

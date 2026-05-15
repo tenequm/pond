@@ -5,19 +5,30 @@ use std::{
     time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     adapter,
-    config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig, StorageLocation},
+    config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig},
     embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
     handlers::{self, IngestSummary},
     sessions::Store,
     transport::{self, AppState},
 };
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::{EnvFilter, fmt};
+use url::Url;
+
+/// Adapter clap can call to parse `--data-dir` / `POND_DATA_DIR`. clap's
+/// default value parser uses `FromStr`, which `Url` does provide - but
+/// `Url::from_str("/srv/pond")` rejects bare paths. This indirection runs
+/// every input through Lance's `uri_to_url` (which converts bare paths to
+/// `file://...`) so pond accepts both forms transparently.
+fn parse_data_dir(input: &str) -> anyhow::Result<Url> {
+    config::parse_data_dir(input)
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "pond", version, about = "Session storage and retrieval")]
@@ -30,8 +41,10 @@ struct Cli {
 enum Command {
     /// Print basic binary status.
     Status {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
     },
     /// Import sessions from one or more configured source adapters. With no
     /// `<adapter>` arg, syncs every entry in `[sources.*]`. With an empty
@@ -39,15 +52,15 @@ enum Command {
     /// canonical install location, the operator picks which to register, and
     /// the picks are written back to `config.toml` before the sync proceeds.
     Sync {
-        /// Optional adapter name (`claude-code`, `codex`, ...). Omit to sync
+        /// Optional adapter name (`claude-code`, `codex-cli`, ...). Omit to sync
         /// every configured source.
         adapter: Option<String>,
         /// One-off source-path override. Bypasses `[sources.<adapter>]` and
         /// does not modify `config.toml`. Requires `<adapter>` to be set.
         #[arg(long)]
         source_dir: Option<PathBuf>,
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
@@ -55,8 +68,8 @@ enum Command {
     /// Idempotent: the PK is `(message_id, model_id, max_embed_tokens)`, so a
     /// re-run picks up where the last one left off.
     Embed {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Registry model id to embed with; defaults to the registry default.
@@ -74,8 +87,8 @@ enum Command {
         host: String,
         #[arg(long, env = "POND_PORT", default_value_t = 9797)]
         port: u16,
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -86,8 +99,8 @@ enum Command {
     /// Run the stdio MCP server only. stdout is reserved for JSON-RPC frames;
     /// all diagnostics go to stderr.
     Mcp {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -98,8 +111,8 @@ enum Command {
     /// Run cleanup_old_versions + optimize_indices once over all datasets.
     /// Runs regardless of the `[maintenance].enabled` config flag.
     Maintenance {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Override the cleanup retention window, in days.
@@ -118,6 +131,23 @@ enum Command {
         #[arg(long)]
         print_schema: bool,
     },
+    /// Stream every stored session out as JSONL `IngestEvent`s. The output
+    /// is byte-identical with what `pond ingest` / `pond_ingest` consume,
+    /// so `pond export -o backup.jsonl` plus `pond ingest backup.jsonl`
+    /// (or piping into `POST /v1/ingest`) is a portable backup loop -
+    /// useful for migration and as a snapshot before risky operations.
+    Export {
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Filter the export to a single session id. Default: every session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Write JSONL to this path. Default: stdout.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -126,8 +156,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Status { data_dir } => {
-            let store = Store::open(resolve_data_dir(data_dir)).await?;
+        Command::Status { data_dir, config } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let (sessions, messages, parts, embeddings) = store.row_counts().await?;
             output(&format!(
                 "sessions={sessions} messages={messages} parts={parts} embeddings={embeddings}"
@@ -139,10 +171,10 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             config,
         } => {
-            let data_dir = resolve_data_dir(data_dir);
+            let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
             let loaded = Config::load(&config_file)?;
-            let store = Store::open(&data_dir).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let sources =
                 resolve_sync_sources(&loaded, &config_file, adapter.as_deref(), source_dir)?;
             for (name, config) in sources {
@@ -164,10 +196,10 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             limit,
         } => {
-            let data_dir = resolve_data_dir(data_dir);
+            let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let model = config::resolve_model(&config, model.as_deref(), &namespace)?;
-            let store = Store::open(&data_dir).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
             let embedder = Qwen3Embedder::load(&model)?;
             // `indicatif` auto-detects tty and degrades to log-line output in
             // CI / non-tty contexts, so this is safe to always wire.
@@ -208,10 +240,11 @@ async fn main() -> anyhow::Result<()> {
             model,
             namespace,
         } => {
-            let data_dir = resolve_data_dir(data_dir);
+            let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
-            let store = Arc::new(Store::open(&data_dir).await?);
+            let store =
+                Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             // Probe the embeddings table: if there's at least one row for the
             // default model identity, load the model so hybrid search works;
             // otherwise boot without weights and let `pond_search` run
@@ -236,10 +269,11 @@ async fn main() -> anyhow::Result<()> {
             model,
             namespace,
         } => {
-            let data_dir = resolve_data_dir(data_dir);
+            let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
-            let store = Arc::new(Store::open(&data_dir).await?);
+            let store =
+                Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             let embedder: Option<Arc<dyn EmbedBackend>> = if store
                 .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
                 .await?
@@ -259,12 +293,12 @@ async fn main() -> anyhow::Result<()> {
             skip_cleanup,
             skip_optimize,
         } => {
-            let data_dir = resolve_data_dir(data_dir);
+            let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let retention_days = older_than_days.unwrap_or(config.maintenance.retention_days);
             let retention =
                 chrono::Duration::days(i64::try_from(retention_days).unwrap_or(i64::MAX));
-            let store = Store::open(&data_dir).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
             let report = store
                 .maintenance(retention, skip_cleanup, skip_optimize)
                 .await;
@@ -282,6 +316,36 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 output("usage: pond config --print-schema")?;
             }
+        }
+        Command::Export {
+            data_dir,
+            config,
+            session,
+            out,
+        } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let summary = match out {
+                Some(path) => {
+                    let file = tokio::fs::File::create(&path)
+                        .await
+                        .with_context(|| format!("failed to open {}", path.display()))?;
+                    let mut writer = tokio::io::BufWriter::new(file);
+                    let summary =
+                        handlers::pond_export(&store, session.as_deref(), &mut writer).await?;
+                    writer.flush().await.context("export: flush")?;
+                    summary
+                }
+                None => {
+                    let mut stdout = tokio::io::stdout();
+                    handlers::pond_export(&store, session.as_deref(), &mut stdout).await?
+                }
+            };
+            output(&format!(
+                "export: sessions={} messages={} parts={}",
+                summary.sessions, summary.messages, summary.parts,
+            ))?;
         }
     }
 
@@ -327,9 +391,20 @@ fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
 }
 
+/// Materialize `Config.storage` (a sorted `BTreeMap` for round-tripping) into
+/// the `HashMap<String, String>` Lance accepts. Empty by default; populated
+/// from `config.toml [storage]` on installs that need S3/GCS/Azure creds.
+fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
+    config
+        .storage
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Resolve the data dir from the CLI/env argument, falling back to the XDG
 /// location (see [`pond::config::resolve_data_dir`]).
-fn resolve_data_dir(explicit: Option<StorageLocation>) -> StorageLocation {
+fn resolve_data_dir(explicit: Option<Url>) -> anyhow::Result<Url> {
     pond::config::resolve_data_dir(
         explicit,
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
@@ -338,14 +413,14 @@ fn resolve_data_dir(explicit: Option<StorageLocation>) -> StorageLocation {
 }
 
 /// The config path: an explicit `--config` wins; otherwise local data dirs
-/// default to `<data_dir>/config.toml` and URI-backed data dirs fall back to
+/// default to `<data_dir>/config.toml` and remote data dirs fall back to
 /// `$XDG_CONFIG_HOME/pond/config.toml` (the config file is always local -
 /// you can't read the bucket without the config that names the bucket).
-fn config_path(explicit: Option<PathBuf>, data_dir: &StorageLocation) -> PathBuf {
+fn config_path(explicit: Option<PathBuf>, data_dir: &Url) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
-    match data_dir.local_path() {
+    match pond::config::local_path(data_dir) {
         Some(path) => path.join("config.toml"),
         None => pond::config::default_config_path(
             std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),

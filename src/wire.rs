@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::PROTOCOL_VERSION;
@@ -397,16 +397,47 @@ pub struct IngestRequest {
     pub events: Vec<crate::sessions::IngestEvent>,
 }
 
-/// `pond_ingest` response (design.md 3.6.4). v1 reports the aggregate accounting
-/// the CLI already prints; the per-row `results` array is deferred with the
-/// HTTP/MCP transports (Stage 3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `pond_ingest` response (design.md 3.6.4). `accepted = inserted + matched`,
+/// `rejected = error`; both derived from `results`. Per-row `results[]` is
+/// the contract clients rely on to reconcile retries (the PK is echoed so
+/// the client can match outcomes back to its input even when `index` is not
+/// enough). Each result reports the input event's `index`, `kind`, `pk`,
+/// `status`, and an `error` body when `status = "error"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IngestResponse {
     pub accepted: usize,
     pub rejected: usize,
-    pub inserted: usize,
-    pub matched: usize,
+    pub results: Vec<IngestResult>,
     pub request_id: String,
+}
+
+/// One row of `pond_ingest` per-row output (design.md 3.6.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestResult {
+    /// Position in the request's `events` array (0-based).
+    pub index: usize,
+    /// `"session"` | `"message"` | `"part"`, matching `IngestEvent::kind`.
+    pub kind: String,
+    /// Echoed primary key: scalar for session, `[session_id, message_id]` for
+    /// message, `[message_id, part_id]` for part. Lets clients reconcile
+    /// against their own state on retry.
+    pub pk: Value,
+    pub status: IngestStatus,
+    /// Set only when `status = "error"`. Carries the same shape as the
+    /// envelope-level error body in 3.6.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestStatus {
+    /// New PK; `merge_insert` wrote a fresh row.
+    Inserted,
+    /// PK existed; `merge_insert` matched it (no-op per invariant 2).
+    Matched,
+    /// Per-row failure: validation or storage error. See `error` field.
+    Error,
 }
 
 fn default_rrf_k() -> u32 {
@@ -464,21 +495,55 @@ pub fn error(code: ErrorCode, message: impl Into<String>, details: Value) -> Err
 impl From<crate::Error> for ErrorEnvelope {
     fn from(error_value: crate::Error) -> Self {
         match error_value {
-            crate::Error::Validation(message) => {
-                error(ErrorCode::ValidationFailed, message, serde_json::json!({}))
-            }
-            crate::Error::NotFound(message) => {
-                error(ErrorCode::NotFound, message, serde_json::json!({}))
-            }
-            crate::Error::NamespaceUnknown(message) => {
-                error(ErrorCode::NamespaceUnknown, message, serde_json::json!({}))
-            }
+            crate::Error::Validation {
+                message,
+                field,
+                value,
+                expected,
+            } => error(
+                ErrorCode::ValidationFailed,
+                message,
+                validation_details(field, value, expected),
+            ),
+            crate::Error::NotFound { message, kind, pk } => error(
+                ErrorCode::NotFound,
+                message,
+                serde_json::json!({ "kind": kind, "pk": pk }),
+            ),
+            crate::Error::NamespaceUnknown { namespace } => error(
+                ErrorCode::NamespaceUnknown,
+                "namespace unknown",
+                serde_json::json!({ "namespace": namespace }),
+            ),
+            crate::Error::Conflict { attempts } => error(
+                ErrorCode::Conflict,
+                "commit conflict after retries exhausted",
+                serde_json::json!({ "attempts": attempts }),
+            ),
             crate::Error::Storage(error_value) => storage_error(error_value),
             crate::Error::Internal(message) => {
                 error(ErrorCode::Internal, message, serde_json::json!({}))
             }
         }
     }
+}
+
+fn validation_details(
+    field: Option<String>,
+    value: Option<Value>,
+    expected: Option<String>,
+) -> Value {
+    let mut details = Map::new();
+    if let Some(field) = field {
+        details.insert("field".to_owned(), Value::String(field));
+    }
+    if let Some(value) = value {
+        details.insert("value".to_owned(), value);
+    }
+    if let Some(expected) = expected {
+        details.insert("expected".to_owned(), Value::String(expected));
+    }
+    Value::Object(details)
 }
 
 pub fn storage_error(error_value: anyhow::Error) -> ErrorEnvelope {

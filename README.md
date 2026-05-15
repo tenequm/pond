@@ -7,8 +7,6 @@ Your own small-scale data lake.
 
 A unified storage and retrieval layer for sessions produced by any agentic client (Claude Code, Codex, OpenCode, Cursor, aider, ChatGPT, Gemini CLI, ...). One Rust binary, two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. Lance file format on object storage. No SQL.
 
-This repository is currently design-only. Implementation has not started.
-
 ## Table of Contents
 
 - [Status](#status)
@@ -20,14 +18,15 @@ This repository is currently design-only. Implementation has not started.
 
 ## Status
 
-Pre-implementation. The repository contains:
+Pre-v1. The Rust crate builds clean and the v1 surface is in place: eight CLI verbs, HTTP+JSON and MCP transports, hybrid search (BM25 + vector + RRF) over four Lance datasets, Qwen3 embeddings via fastembed-rs, and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. A background maintenance loop runs `cleanup_old_versions` + `optimize_indices` on a configurable interval. Schemas, wire shapes, and config keys are subject to breaking change until v1.
 
+Repository layout:
+
+- `src/` - the pond Rust crate (modules: `adapter/`, `embed/`, `config`, `handlers`, `sessions`, `substrate`, `transport`, `wire`).
 - `docs/design.md` - the locked-in v1 design (sections 1-4 are the source of truth; section 5 is empty).
 - `docs/references/` - frozen snapshots of the upstream schemas pond's design draws from.
-- `tests/fixtures/session-samples/` - real session captures from eight source harnesses, used as SourceAdapter test fixtures.
+- `tests/` - integration tests; `tests/fixtures/session-samples/` holds real session captures from eight source harnesses, used as SourceAdapter test fixtures.
 - `docs/archive/` - historical design notes and the resolved open-questions log.
-
-Implementation begins next.
 
 ## Background
 
@@ -55,7 +54,7 @@ Key choices:
 - Four Lance datasets: `sessions`, `messages`, `parts`, `embeddings`. Hot filter columns are denormalized onto search rows for single-stage filter pushdown (`messages` and `embeddings` carry `source_agent` / `project` / `role` / `timestamp` for prefilter on hybrid search).
 - One adapter trait, `SourceAdapter`, with a deterministic event-ordering contract. Everything else (storage, indexing, OCC, time-travel, namespaces, manifest versioning, blob storage) is Lance direct - no extra "seam" abstractions.
 - Append-only writes. Replay (cross-provider re-projection) is deferred to section 4.
-- v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond ingest`, `pond serve`, `pond status`, `pond embed-worker`, `pond maintenance`.
+- v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond status`, `pond sync`, `pond embed`, `pond serve`, `pond mcp`, `pond maintenance`, `pond config`, `pond export`.
 - Default embeddings: Qwen3-Embedding-0.6B via fastembed-rs (local, candle backend behind the `qwen3` feature, fixed 1024-dim, 32K context, Apache 2.0). Embedding registry is config-driven.
 - Multi-tenancy via opaque namespace strings; bucket prefix per namespace; separate buckets when KMS isolation matters.
 - Encryption is operational (bucket SSE + filesystem encryption), not application-level.
@@ -79,10 +78,11 @@ To refresh a snapshot, see the maintenance instructions in [`docs/references/REA
 
 ## Contributing
 
-Issues and pull requests are welcome. Because the project is pre-implementation, the most useful contributions right now are:
+Issues and pull requests are welcome. The most useful contributions right now are:
 
 - Design feedback on `docs/design.md`.
 - Pointers to additional reference schemas or session samples worth snapshotting under `docs/references/`.
+- Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
 - Corrections to the design doc.
 
 For larger changes, please open an issue first to discuss the direction.

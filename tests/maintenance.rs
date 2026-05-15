@@ -12,7 +12,7 @@ const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
 #[tokio::test]
 async fn maintenance_runs_without_removing_logical_rows() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter).await?;
     store.ensure_indices().await?;

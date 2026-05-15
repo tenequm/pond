@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
     // measurement, so the RSS sampler is not running yet.
     let corpus = args.corpus();
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let ingest_start = Instant::now();
     ingest_adapter(&store, &ClaudeCodeAdapter::new(&corpus)).await?;
     store.ensure_indices().await?;

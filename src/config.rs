@@ -9,98 +9,88 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use lance_io::object_store::uri_to_url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::embed::DEFAULT_BATCH_TOKEN_SQ_BUDGET;
 
-/// Where pond keeps its Lance datasets: a local directory or an object-store
-/// URI (`s3://...`, `gs://...`, `az://...`, ...). Lance accepts URIs directly
-/// for every supported backend; this type keeps the local-vs-remote branches
-/// type-checked rather than string-sniffed at each call site. Load-bearing in
-/// three places: opening (only local pre-creates the dir), the `config.toml`
-/// default (only local inherits the data dir; URI installs fall back to
-/// `$XDG_CONFIG_HOME/pond/config.toml` because the config file is always
-/// local - it names the bucket), and display.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StorageLocation {
-    LocalPath(PathBuf),
-    Uri(String),
+/// Parse a CLI / env `--data-dir` argument into a `Url`. Delegates to Lance's
+/// own `uri_to_url`, which handles every form pond cares about:
+/// - bare paths like `/srv/pond` -> `file:///srv/pond`
+/// - explicit `file://...` URIs
+/// - object-store URIs (`s3://`, `gs://`, `az://`, ...)
+/// - tilde expansion (`~/...`)
+/// - Windows drive letters (we don't ship Windows, but the parser handles it)
+///
+/// Using Lance's parser keeps pond's CLI parse path identical to what Lance
+/// uses internally - no risk of pond accepting a string Lance later rejects.
+pub fn parse_data_dir(input: &str) -> Result<Url> {
+    uri_to_url(input).with_context(|| format!("invalid --data-dir {input:?}"))
 }
 
-impl StorageLocation {
-    /// URI for a child of this location (typically one Lance dataset under
-    /// the data dir). Local paths use `Path::join`; URIs concatenate with a
-    /// single `/` separator after trimming any trailing slash on the base.
-    pub fn child_uri(&self, suffix: &str) -> String {
-        match self {
-            Self::LocalPath(path) => path.join(suffix).display().to_string(),
-            Self::Uri(uri) => format!("{}/{suffix}", uri.trim_end_matches('/')),
-        }
-    }
-
-    /// `Some(path)` only when this location is local. Used by the local-only
-    /// branches (`create_dir_all`, the `<data_dir>/config.toml` default).
-    pub fn local_path(&self) -> Option<&Path> {
-        match self {
-            Self::LocalPath(path) => Some(path),
-            Self::Uri(_) => None,
-        }
-    }
+/// True when the URL is on the local filesystem. Mirrors Lance's
+/// `ObjectStore::is_local` (lance-io/src/object_store.rs:541): the `file` and
+/// `file+uring` schemes are local; everything else (incl. `memory://`) is not.
+pub fn is_local(url: &Url) -> bool {
+    matches!(url.scheme(), "file" | "file+uring")
 }
 
-impl FromStr for StorageLocation {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        if let Some((scheme, rest)) = s.split_once("://") {
-            // file:// reduces to a local path; everything else (s3, gs, az,
-            // abfs, https, ...) is a remote URI. Lance validates the scheme
-            // on first dataset open, so we don't gatekeep here.
-            if scheme.eq_ignore_ascii_case("file") {
-                return Ok(Self::LocalPath(PathBuf::from(rest)));
-            }
-            return Ok(Self::Uri(s.to_owned()));
-        }
-        Ok(Self::LocalPath(PathBuf::from(s)))
-    }
+/// Extract the filesystem `PathBuf` for local URLs. `None` for remote.
+/// Used by the filesystem-only branches: `create_dir_all` on the data dir,
+/// the `<data_dir>/config.toml` co-location default, and the local-FS
+/// existence probe in `open_or_create`.
+pub fn local_path(url: &Url) -> Option<PathBuf> {
+    if is_local(url) { url.to_file_path().ok() } else { None }
 }
 
-impl std::fmt::Display for StorageLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LocalPath(path) => path.display().fmt(f),
-            Self::Uri(uri) => f.write_str(uri),
-        }
+/// URI string for a child of this location (typically one Lance dataset under
+/// the data dir). Trims a single trailing slash on the base, then concatenates
+/// with a `/` separator. This keeps `Dataset::open` / `Dataset::write` happy
+/// on both filesystem and object-store backends - they want the URI form, not
+/// a `url::Url`.
+pub fn child_uri(base: &Url, suffix: &str) -> String {
+    // For local URLs we strip the `file://` prefix so log lines and error
+    // messages render as plain paths (`/srv/pond/sessions.lance`), matching
+    // what pond used to emit before the URL migration.
+    if let Some(path) = local_path(base) {
+        return path.join(suffix).display().to_string();
+    }
+    format!("{}/{suffix}", base.as_str().trim_end_matches('/'))
+}
+
+/// Render a `Url` for human-readable log/diagnostic output: local URLs come
+/// back as plain paths (no `file://` prefix); remote URLs stay verbatim.
+pub fn display(url: &Url) -> String {
+    if let Some(path) = local_path(url) {
+        path.display().to_string()
+    } else {
+        url.to_string()
     }
 }
 
-impl From<PathBuf> for StorageLocation {
-    fn from(path: PathBuf) -> Self {
-        Self::LocalPath(path)
-    }
-}
-
-impl From<&Path> for StorageLocation {
-    fn from(path: &Path) -> Self {
-        Self::LocalPath(path.to_path_buf())
-    }
-}
-
-impl From<&PathBuf> for StorageLocation {
-    fn from(path: &PathBuf) -> Self {
-        Self::LocalPath(path.clone())
-    }
-}
-
-impl From<&StorageLocation> for StorageLocation {
-    fn from(location: &StorageLocation) -> Self {
-        location.clone()
-    }
+/// Build a `Url` from a filesystem path. Convenience for tests and for
+/// `resolve_data_dir` callers that hold a `PathBuf` already. The path must be
+/// absolute (`url::Url::from_file_path` is a hard requirement on Unix); a
+/// relative path gets canonicalized via `std::path::absolute` first.
+pub fn url_for_path(path: impl AsRef<Path>) -> Result<Url> {
+    let path = path.as_ref();
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path)
+            .with_context(|| format!("failed to absolutize {}", path.display()))?
+    };
+    Url::from_file_path(&absolute).map_err(|()| {
+        anyhow!(
+            "failed to convert path {} into a file:// URL",
+            absolute.display()
+        )
+    })
 }
 
 /// Default `config.toml` body emitted by `pond config --print-schema`. Every
@@ -113,15 +103,21 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # file and pond still works. Uncomment and edit to override.
 
 # Where pond looks for source data to import. One entry per adapter type
-# (`claude-code`, `codex`, ...). `pond sync` with no arguments syncs every
+# (`claude-code`, `codex-cli`, ...). `pond sync` with no arguments syncs every
 # entry; `pond sync <adapter>` syncs just one. With an empty `[sources]`,
 # `pond sync` runs an interactive discovery against the known default paths
 # and writes the picks back here.
 #
+# Future wrap: pond is single-namespace in v1 (design.md 2.6); `[sources]` is
+# flat here. When multi-namespace pond lands, source registration becomes
+# per-tenant under `[namespaces.<ns>.sources.<adapter>]`. Pre-v1 the schema
+# is breakable; the rename is operationally free until a real second tenant
+# exists.
+#
 # [sources.claude-code]
 # path = \"~/.claude/projects\"
 #
-# [sources.codex]
+# [sources.codex-cli]
 # path = \"~/.codex/sessions\"
 
 # Register or tune an embedding model. pond validates each entry against its
@@ -151,6 +147,26 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # enabled = true          # run the background task under `pond serve`
 # interval_secs = 21600   # background pass interval (default 6h)
 # retention_days = 30     # cleanup_old_versions window (default 30 days)
+
+# Object-store credentials and tuning, passed verbatim to Lance's
+# `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
+# an `s3://` / `gs://` / `az://` URI that needs auth or a non-default region.
+# Keys follow the `object_store` crate's standard names. Environment
+# variables of the same name are read by `object_store` automatically;
+# values in this block override them. pond does not parse these.
+#
+# Future wrap: pond is single-namespace in v1 (design.md 2.6); `[storage]` is
+# flat here on the assumption of one bucket per pond. When multi-namespace
+# pond lands and tenants need separate buckets/regions, this becomes
+# `[namespaces.<ns>.storage]`. Pre-v1 the schema is breakable; the rename is
+# operationally free until a real second tenant exists.
+#
+# [storage]
+# AWS_ACCESS_KEY_ID = \"...\"
+# AWS_SECRET_ACCESS_KEY = \"...\"
+# AWS_REGION = \"us-east-1\"
+# AWS_ENDPOINT = \"https://minio.example.com\"  # for self-hosted MinIO
+# allow_http = \"true\"                          # only for non-TLS endpoints
 ";
 
 /// Top-level `config.toml` shape.
@@ -168,6 +184,17 @@ pub struct Config {
     /// default; `pond sync` runs discovery into this map on first use.
     #[serde(default)]
     pub sources: BTreeMap<String, Value>,
+    /// `[storage]` key=value pairs handed verbatim to Lance's
+    /// `DatasetBuilder::with_storage_options` and `WriteParams.store_params`.
+    /// Keys are the standard `object_store` config names
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT`, etc.); see Lance's
+    /// `DatasetBuilder::with_storage_options` doc for the per-scheme variants
+    /// (S3 / GCS / Azure). pond does not parse or validate these; Lance does.
+    /// Empty by default; required only when `--data-dir` is an object-store
+    /// URI that needs credentials or a non-default region/endpoint. Values
+    /// here override any matching environment variables.
+    #[serde(default)]
+    pub storage: BTreeMap<String, String>,
 }
 
 /// The `[maintenance]` section: background `cleanup_old_versions` +
@@ -280,21 +307,21 @@ const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
 /// then `.pond`). `xdg_data_home` is honored only if absolute, per the XDG
 /// base-directory spec.
 pub fn resolve_data_dir(
-    explicit: Option<StorageLocation>,
+    explicit: Option<Url>,
     xdg_data_home: Option<PathBuf>,
     home: Option<PathBuf>,
-) -> StorageLocation {
+) -> Result<Url> {
     if let Some(location) = explicit {
-        return location;
+        return Ok(location);
     }
     if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
-        return StorageLocation::LocalPath(xdg.join("pond"));
+        return url_for_path(xdg.join("pond"));
     }
     if let Some(home) = home {
-        return StorageLocation::LocalPath(home.join(".local").join("share").join("pond"));
+        return url_for_path(home.join(".local").join("share").join("pond"));
     }
     // No HOME and no usable XDG var - stay usable rather than panic.
-    StorageLocation::LocalPath(PathBuf::from(".pond"))
+    url_for_path(PathBuf::from(".pond"))
 }
 
 /// Local default path for `config.toml`. URI-backed data dirs always land

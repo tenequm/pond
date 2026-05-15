@@ -28,21 +28,41 @@ pub mod http {
 
     use std::net::{IpAddr, SocketAddr};
 
+    use std::{convert::Infallible, time::Duration};
+
     use anyhow::Context;
-    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+    use axum::{
+        Json, Router,
+        extract::{DefaultBodyLimit, Path, Query, State},
+        http::StatusCode,
+        response::{
+            IntoResponse, Response,
+            sse::{Event, KeepAlive, Sse},
+        },
+        routing::{get as get_route, post},
+    };
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
+    use serde::Deserialize;
     use tokio::net::TcpListener;
 
     use super::AppState;
     use crate::{
-        handlers::pond_get,
-        handlers::pond_search,
+        handlers::{
+            parse_since, pond_get, pond_ingest, pond_search, pond_session_events, resolve_namespace,
+        },
         wire::{
-            ErrorCode, GetEnvelope, GetRequest, SearchEnvelope, SearchRequest, default_namespace,
+            ErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, IngestEnvelope, IngestRequest,
+            SearchEnvelope, SearchRequest, default_namespace,
         },
     };
+
+    /// HTTP body cap for `POST /v1/*` JSON handlers (design.md 3.6.4): 8 MB.
+    /// Replaces axum's 2 MB default - that default is more restrictive than the
+    /// design's intent and would surface oversize ingests as a generic 413
+    /// instead of pond's typed `validation_failed`.
+    pub const HTTP_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
@@ -57,6 +77,9 @@ pub mod http {
         Router::new()
             .route("/v1/search", post(search))
             .route("/v1/get", post(get))
+            .route("/v1/ingest", post(ingest))
+            .route("/v1/sessions/{session_id}/events", get_route(session_events))
+            .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
     }
@@ -116,6 +139,98 @@ pub mod http {
             GetEnvelope::Error(error) => status_for(&error.error.code),
         };
         (status, Json(envelope))
+    }
+
+    async fn ingest(
+        State(state): State<AppState>,
+        Json(mut request): Json<IngestRequest>,
+    ) -> (StatusCode, Json<IngestEnvelope>) {
+        request.namespace.get_or_insert_with(default_namespace);
+        let envelope = pond_ingest(&state.store, request).await;
+        // Per-row errors in `results[]` are not request-level failures, so
+        // the envelope success path always returns 200; only transport-level
+        // failures (validation_failed, namespace_unknown, etc.) map to 4xx/5xx.
+        let status = match &envelope {
+            IngestEnvelope::Success(_) => StatusCode::OK,
+            IngestEnvelope::Error(error) => status_for(&error.error.code),
+        };
+        (status, Json(envelope))
+    }
+
+    /// Query string for `GET /v1/sessions/{session_id}/events` (design.md
+    /// 3.6.5). `since` resumes after a prior event id; the `Last-Event-ID`
+    /// HTTP header is honored as a fallback when the query param is absent
+    /// (EventSource auto-reconnect path).
+    #[derive(Debug, Deserialize)]
+    struct SessionEventsQuery {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default)]
+        include_thinking: Option<bool>,
+        #[serde(default)]
+        include_tool_results: Option<bool>,
+        #[serde(default)]
+        namespace: Option<String>,
+    }
+
+    /// `GET /v1/sessions/{session_id}/events` SSE handler. Catch-up only in
+    /// v1: scans `messages` (and their `parts`) strictly after `since`,
+    /// emits them in `(timestamp, message_id)` order, then emits an `end`
+    /// event and closes. SSE keepalive every 15s.
+    async fn session_events(
+        State(state): State<AppState>,
+        Path(session_id): Path<String>,
+        headers: axum::http::HeaderMap,
+        Query(params): Query<SessionEventsQuery>,
+    ) -> Response {
+        if let Err(envelope) = resolve_namespace(params.namespace.as_deref()) {
+            let code = envelope.error.code.clone();
+            return error_response(code, envelope);
+        }
+
+        // `since` query param wins over `Last-Event-ID` header (per 3.6.5
+        // "Explicit `since` wins if both set.").
+        let since_raw = params.since.clone().or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned)
+        });
+        let since = parse_since(since_raw.as_deref());
+
+        let include_thinking = params.include_thinking.unwrap_or(false);
+        let include_tool_results = params.include_tool_results.unwrap_or(false);
+
+        match pond_session_events(
+            &state.store,
+            &session_id,
+            since,
+            include_thinking,
+            include_tool_results,
+        )
+        .await
+        {
+            Ok(events) => {
+                let stream = tokio_stream::iter(events.into_iter().map(|sse| {
+                    let payload = sse.data.to_string();
+                    Ok::<_, Infallible>(
+                        Event::default().event(sse.event).id(sse.id).data(payload),
+                    )
+                }));
+                Sse::new(stream)
+                    .keep_alive(
+                        KeepAlive::new()
+                            .interval(Duration::from_secs(15))
+                            .text("keepalive"),
+                    )
+                    .into_response()
+            }
+            Err(envelope) => error_response(envelope.error.code.clone(), envelope),
+        }
+    }
+
+    fn error_response(code: ErrorCode, envelope: ErrorEnvelope) -> Response {
+        (status_for(&code), Json(envelope)).into_response()
     }
 
     /// Map a wire error code to an HTTP status. The envelope body still carries

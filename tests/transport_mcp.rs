@@ -71,7 +71,7 @@ impl ClientHandler for TestClient {}
 /// text part. Built via the `pond_ingest` handler directly - the claude-code
 /// fixtures carry no reasoning parts, and placeholder rendering needs one.
 async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
 
     let session = Session {
         id: SESSION_ID.to_owned(),

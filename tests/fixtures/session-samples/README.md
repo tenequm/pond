@@ -41,7 +41,7 @@ session-samples/
   claude-app/                Claude Desktop (macOS), Cowork / local-agent-mode
   claude-code/               Claude Code CLI
   claude-managed-agents/     Anthropic API Managed Agents (playground export)
-  codex/                     OpenAI Codex CLI
+  codex-cli/                 OpenAI Codex CLI
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   openclaw/                  openclaw runtime
   opencode/                  opencode CLI
@@ -121,7 +121,7 @@ sample tree.
 - See `claude-managed-agents/schema-notes.md` for a detailed event-stream
   walkthrough.
 
-### codex (OpenAI Codex CLI)
+### codex-cli (OpenAI Codex CLI)
 
 - Source path: `~/.codex/sessions/<year>/<month>/<day>/rollout-<ts>-<uuid>.jsonl`
 - Layout: date-partitioned. Each line is an envelope `{timestamp, type, payload}`.
@@ -135,8 +135,8 @@ sample tree.
   `encrypted_content` Fernet-encrypted opaque payloads (pond cannot decrypt
   them; preserved for schema fidelity). MCP tools appear as flattened names
   like `surf__surf_amazon_search`.
-- Samples: 3 sessions across 3 dates, 2 originators (`codex_cli_rs`
-  interactive vs `codex_exec` headless), models `gpt-5` and `gpt-5-codex`.
+- Samples: 2 sessions across 2 dates from the interactive `codex_cli_rs`
+  originator, models `gpt-5` and `gpt-5-codex`.
 
 ### nanoclaw
 

@@ -26,13 +26,13 @@ use super::{
     empty_options, part_id,
 };
 
-const NAME: &str = "codex";
+const NAME: &str = "codex-cli";
 
-/// Stateless factory: opens [`CodexAdapter`] instances and probes for the
+/// Stateless factory: opens [`CodexCliAdapter`] instances and probes for the
 /// canonical install location under `~/.codex/sessions`.
-pub struct CodexFactory;
+pub struct CodexCliFactory;
 
-impl AdapterFactory for CodexFactory {
+impl AdapterFactory for CodexCliFactory {
     fn name(&self) -> &'static str {
         NAME
     }
@@ -48,7 +48,7 @@ impl AdapterFactory for CodexFactory {
             Some(home) => expand_home_under(&cfg.path, Path::new(&home)),
             None => cfg.path,
         };
-        Ok(Box::new(CodexAdapter::new(path)))
+        Ok(Box::new(CodexCliAdapter::new(path)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -58,17 +58,17 @@ impl AdapterFactory for CodexFactory {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodexAdapter {
+pub struct CodexCliAdapter {
     root: PathBuf,
 }
 
-impl CodexAdapter {
+impl CodexCliAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 }
 
-impl Adapter for CodexAdapter {
+impl Adapter for CodexCliAdapter {
     fn events(&self) -> EventStream<'_> {
         let root = self.root.clone();
         Box::pin(stream! {
@@ -212,7 +212,7 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
     options.insert(
         "source".to_owned(),
         json!({
-            "adapter": "codex",
+            "adapter": "codex-cli",
             "originator": payload.get("originator"),
             "cli_version": payload.get("cli_version"),
             "model_provider": payload.get("model_provider"),
@@ -224,14 +224,14 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
         id,
         parent_session_id: None,
         parent_message_id: None,
-        source_agent: "codex".to_owned(),
+        source_agent: "codex-cli".to_owned(),
         created_at,
         project,
         options,
     })
 }
 
-/// Map one codex JSONL record into zero-or-more `IngestEvent`s. Records pond
+/// Map one codex-cli JSONL record into zero-or-more `IngestEvent`s. Records pond
 /// keeps: `response_item` with `payload.type = "message"` (User/Assistant/
 /// System message + text Parts), `function_call` (Assistant + ToolCall),
 /// `function_call_output` (Tool + ToolResult), `reasoning` (Assistant +
@@ -277,7 +277,7 @@ fn events_from_row(
             timestamp,
             payload,
         )),
-        // Unknown response_item subtypes (newer codex versions) - skip
+        // Unknown response_item subtypes (newer codex-cli versions) - skip
         // rather than fail the session.
         _ => Ok(Vec::new()),
     }
@@ -333,7 +333,7 @@ fn message_events(
             },
             true,
         ),
-        // `developer` rows are codex's system-prompt frames; map to System
+        // `developer` rows are codex-cli's system-prompt frames; map to System
         // and collapse text Parts into the Message's `content` per pond's
         // canonical shape, so they don't double-store and don't add to FTS.
         "developer" | "system" => (
@@ -353,7 +353,7 @@ fn message_events(
             },
             false,
         ),
-        other => return Err(format!("unsupported codex role {other}")),
+        other => return Err(format!("unsupported codex-cli role {other}")),
     };
 
     let mut events = Vec::with_capacity(parts.len() + 1);

@@ -67,7 +67,7 @@ fn fake_vector(text: &str, dim: usize) -> Vec<f32> {
 /// `pond serve` would expose - and wrap it in an `AppState` + router.
 async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
     store.ensure_indices().await?;
 
@@ -188,5 +188,124 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     };
     assert_eq!(error.error.code, ErrorCode::NotFound);
 
+    Ok(())
+}
+
+async fn sse_text(app: &Router, uri: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_events_emits_session_message_and_end() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    let session_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .next()
+        .expect("fixture corpus has at least one session");
+
+    let (status, body) = sse_text(&app, &format!("/v1/sessions/{session_id}/events")).await;
+    assert_eq!(status, StatusCode::OK);
+    // No `since` -> the `session` header is the first event the client sees.
+    assert!(
+        body.contains(&format!("event: session\nid: session:{session_id}\n")),
+        "expected a leading session event: {body}",
+    );
+    assert!(body.contains("event: message\n"), "expected message events");
+    assert!(
+        body.contains(&format!("event: end\nid: end:{session_id}\n")),
+        "expected a trailing end event",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_events_with_session_since_skips_header() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    let session_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .next()
+        .expect("session id");
+
+    let (status, body) = sse_text(
+        &app,
+        &format!("/v1/sessions/{session_id}/events?since=session:{session_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("event: session\n"),
+        "since=session:<id> must omit the header event: {body}",
+    );
+    assert!(body.contains("event: message\n"), "messages still flow");
+    assert!(body.contains("event: end\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_events_with_end_since_is_idempotent() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    let session_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .next()
+        .expect("session id");
+
+    let (status, body) = sse_text(
+        &app,
+        &format!("/v1/sessions/{session_id}/events?since=end:{session_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("event: message\n"),
+        "since=end:<id> must not re-emit messages: {body}",
+    );
+    assert!(body.contains("event: end\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_events_with_unknown_since_message_id_400s() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    let session_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .next()
+        .expect("session id");
+
+    let (status, body) = sse_text(
+        &app,
+        &format!("/v1/sessions/{session_id}/events?since=not-a-real-message-id"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("validation_failed"), "got: {body}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_events_for_unknown_session_404s() -> anyhow::Result<()> {
+    let (_temp, _store, app) = router().await?;
+
+    let (status, body) = sse_text(&app, "/v1/sessions/does-not-exist/events").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found"), "got: {body}");
     Ok(())
 }

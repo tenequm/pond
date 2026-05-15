@@ -227,94 +227,60 @@ fn default_config_toml_loads_to_the_builtin_registry() {
 
 #[test]
 fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
-    use pond::config::StorageLocation;
+    use pond::config::{is_local, local_path, parse_data_dir};
     use std::path::PathBuf;
-
-    let local = |s: &str| StorageLocation::LocalPath(PathBuf::from(s));
 
     // An explicit `--data-dir` / `POND_DATA_DIR` wins over everything. The
-    // explicit value carries its own `StorageLocation` (path or URI); here we
-    // test the path form. URI forms parse through `StorageLocation::FromStr`
-    // and are covered by `storage_location_parses_uri_and_path_forms` below.
-    assert_eq!(
-        resolve_data_dir(
-            Some(local("/explicit")),
-            Some(PathBuf::from("/xdg")),
-            Some(PathBuf::from("/home")),
-        ),
-        local("/explicit"),
-    );
+    // explicit value can carry any URI form Lance accepts; here we test the
+    // local-path form (parsing is delegated to Lance's `uri_to_url`).
+    let explicit = parse_data_dir("/explicit").unwrap();
+    let resolved = resolve_data_dir(
+        Some(explicit.clone()),
+        Some(PathBuf::from("/xdg")),
+        Some(PathBuf::from("/home")),
+    )
+    .unwrap();
+    assert_eq!(resolved, explicit);
+
     // An absolute XDG_DATA_HOME is used next.
-    assert_eq!(
-        resolve_data_dir(
-            None,
-            Some(PathBuf::from("/xdg")),
-            Some(PathBuf::from("/home"))
-        ),
-        local("/xdg/pond"),
-    );
+    let resolved = resolve_data_dir(
+        None,
+        Some(PathBuf::from("/xdg")),
+        Some(PathBuf::from("/home")),
+    )
+    .unwrap();
+    assert!(is_local(&resolved));
+    assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
+
     // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
+    let resolved = resolve_data_dir(
+        None,
+        Some(PathBuf::from("relative")),
+        Some(PathBuf::from("/home")),
+    )
+    .unwrap();
     assert_eq!(
-        resolve_data_dir(
-            None,
-            Some(PathBuf::from("relative")),
-            Some(PathBuf::from("/home")),
-        ),
-        local("/home/.local/share/pond"),
-    );
-    // No XDG and no HOME - stays usable rather than panicking.
-    assert_eq!(resolve_data_dir(None, None, None), local(".pond"));
-}
-
-#[test]
-fn storage_location_parses_uri_and_path_forms() {
-    use pond::config::StorageLocation;
-    use std::path::PathBuf;
-    use std::str::FromStr;
-
-    // Plain path -> LocalPath.
-    assert_eq!(
-        StorageLocation::from_str("/srv/pond").unwrap(),
-        StorageLocation::LocalPath(PathBuf::from("/srv/pond")),
-    );
-    // `file://` reduces to a local path - it's not a remote URI.
-    assert_eq!(
-        StorageLocation::from_str("file:///srv/pond").unwrap(),
-        StorageLocation::LocalPath(PathBuf::from("/srv/pond")),
-    );
-    // Object-store schemes preserved verbatim; Lance validates them on open.
-    assert_eq!(
-        StorageLocation::from_str("s3://bucket/pond").unwrap(),
-        StorageLocation::Uri("s3://bucket/pond".to_owned()),
-    );
-    assert_eq!(
-        StorageLocation::from_str("gs://bucket/pond").unwrap(),
-        StorageLocation::Uri("gs://bucket/pond".to_owned()),
+        local_path(&resolved).unwrap(),
+        PathBuf::from("/home/.local/share/pond"),
     );
 
-    // `child_uri` joins via `Path::join` for local; via single-slash concat
-    // for URIs (trimming any trailing slash on the base).
-    let local = StorageLocation::LocalPath(PathBuf::from("/srv/pond"));
-    assert_eq!(
-        local.child_uri("sessions.lance"),
-        "/srv/pond/sessions.lance"
+    // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
+    // The result is absolute (Lance's URL conversion requires it), so we
+    // just check that the URL ends with the relative path's components.
+    let resolved = resolve_data_dir(None, None, None).unwrap();
+    assert!(is_local(&resolved));
+    assert!(
+        local_path(&resolved)
+            .unwrap()
+            .ends_with(".pond"),
+        "fallback path should end with .pond: {resolved}",
     );
-    let uri = StorageLocation::Uri("s3://bucket/pond/".to_owned());
-    assert_eq!(
-        uri.child_uri("sessions.lance"),
-        "s3://bucket/pond/sessions.lance"
-    );
-
-    // `local_path` lights up only on the LocalPath variant - the local-only
-    // branches in `Store::open` and `config_path` rely on this.
-    assert!(local.local_path().is_some());
-    assert!(uri.local_path().is_none());
 }
 
 #[tokio::test]
 async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter).await?;
 
@@ -393,7 +359,7 @@ fn text_message_events(session_id: &str, message_id: &str, text: &str) -> Vec<In
 #[tokio::test]
 async fn embed_worker_caps_batch_cost_for_long_messages() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
 
     // One session: 10 tiny messages and one very long one. The long message's
     // `search_text` is far past the token cap; the rest are a handful of bytes.
@@ -470,7 +436,7 @@ async fn embed_worker_caps_batch_cost_for_long_messages() -> anyhow::Result<()> 
 #[tokio::test]
 async fn embed_worker_buckets_messages_by_length() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
 
     // 12 short + 12 long messages, strictly interleaved in ingest order. Without
     // length-sorting, batching in stream order would mix short and long in the
@@ -550,7 +516,7 @@ async fn embed_worker_buckets_messages_by_length() -> anyhow::Result<()> {
 #[tokio::test]
 async fn embed_worker_respects_cost_budget() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = Store::open(temp.path()).await?;
+    let store = Store::open_local(temp.path()).await?;
 
     // 16 short messages and 4 long ones. With the budget below, the shorts must
     // co-batch (count > 1) while staying within the budget, and each long

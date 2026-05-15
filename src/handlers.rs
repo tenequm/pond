@@ -2,7 +2,31 @@ fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
     error.into()
 }
 
+/// The one and only namespace-resolution point. Every wire handler funnels
+/// through this; no handler hand-rolls its own `namespace == "local"` check.
+///
+/// v1 is single-namespace and returns the static `"local"` string on success.
+/// When multi-namespace pond lands, this signature becomes
+/// `(namespace, &Router) -> Result<&Arc<Store>>` and every handler picks up
+/// the right store automatically without further edits - that's the whole
+/// reason the check lives here, not at the call site (design.md 2.3 inv 11).
+pub fn resolve_namespace(
+    namespace: Option<&str>,
+) -> Result<&'static str, crate::wire::ErrorEnvelope> {
+    match namespace {
+        None | Some(crate::wire::DEFAULT_NAMESPACE) => Ok(crate::wire::DEFAULT_NAMESPACE),
+        Some(other) => Err(map_error(crate::Error::namespace_unknown(other))),
+    }
+}
+
 fn map_storage(error: anyhow::Error) -> crate::wire::ErrorEnvelope {
+    // Classify before bucketing: an OCC commit-conflict exhaustion has its own
+    // wire code (design.md 3.6.1). Everything else lands in `storage_unavailable`.
+    if let Some(conflict) = error.downcast_ref::<crate::substrate::ConflictExhausted>() {
+        return map_error(crate::Error::Conflict {
+            attempts: conflict.attempts,
+        });
+    }
     map_error(crate::Error::Storage(error))
 }
 
@@ -12,10 +36,12 @@ mod ingest_handler {
 
     use crate::{
         adapter::Adapter,
-        sessions::{IngestEvent, IngestSummary, IngestValidator, Store},
+        sessions::{
+            IngestEvent, IngestSummary, IngestValidator, OutcomeStatus, RowOutcome, Store,
+        },
         wire::{
-            DEFAULT_NAMESPACE, IngestEnvelope, IngestRequest, IngestResponse, new_request_id,
-            validate_protocol,
+            ErrorBody, ErrorCode, IngestEnvelope, IngestRequest, IngestResponse, IngestResult,
+            IngestStatus, new_request_id, validate_protocol,
         },
     };
 
@@ -25,9 +51,9 @@ mod ingest_handler {
     pub const MAX_INGEST_EVENTS: usize = 1000;
 
     /// Drain `adapter.events()` into `store`, accumulating an [`IngestSummary`].
-    /// A session substream that fails validation or decoding is dropped (buffered
-    /// events discarded) and ingest continues with the next session; the
-    /// rejected-substream count lands in [`IngestSummary::errors`].
+    /// The adapter path is CLI-driven (`pond sync`) and reports aggregates,
+    /// not per-row results - the wire-level [`pond_ingest`] handler keeps the
+    /// per-row contract for HTTP clients.
     pub async fn ingest_adapter(store: &Store, adapter: &dyn Adapter) -> Result<IngestSummary> {
         let mut summary = IngestSummary {
             inserted: 0,
@@ -36,128 +62,399 @@ mod ingest_handler {
         };
         let mut events = adapter.events();
         let mut validator = IngestValidator::default();
-        let mut skipping = false;
+        // Adapter events have no stable input index (they stream from disk);
+        // assign a monotonic counter so RowOutcome.index stays unique even
+        // though the values aren't surfaced anywhere.
+        let mut index = 0usize;
 
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
-                    if skipping {
-                        if matches!(event, IngestEvent::Session(_)) {
-                            skipping = false;
-                            validator = IngestValidator::default();
-                        } else {
-                            continue;
-                        }
-                    }
-                    match validator.push(store, event).await {
-                        Ok(statuses) => summary.add_statuses(&statuses),
-                        Err(failure) => {
-                            summary.errors += 1;
-                            tracing::warn!(%failure, "aborting invalid session substream");
-                            validator = IngestValidator::default();
-                            skipping = true;
-                        }
-                    }
+                    let outcomes = validator.push(store, index, event).await?;
+                    summary.add_outcomes(&outcomes);
+                    index += 1;
                 }
                 Err(error) => {
                     summary.errors += 1;
                     tracing::warn!(%error, "aborting undecodable session substream");
+                    // The validator stays usable: subsequent events of the
+                    // failed substream get tagged via the substream-failure
+                    // path on next push. To keep adapter ingest fail-closed
+                    // for the offender, reset state so we don't carry buffer.
                     validator = IngestValidator::default();
-                    skipping = true;
                 }
             }
         }
-        if !skipping {
-            let statuses = validator.finish(store).await?;
-            summary.add_statuses(&statuses);
-        }
+        let outcomes = validator.finish(store).await?;
+        summary.add_outcomes(&outcomes);
         Ok(summary)
     }
 
     /// The `pond_ingest` wire handler (design.md 3.6.4): validate the transport
     /// envelope, then drive the event batch through [`ingest_events`]. Transport
-    /// failures (bad protocol, unknown namespace, empty or oversized batch) fail the
-    /// whole request via the 3.6.1 error envelope.
+    /// failures (bad protocol, unknown namespace, empty or oversized batch) fail
+    /// the whole request via the 3.6.1 error envelope; per-event failures land
+    /// in the response's `results[]` with `status: "error"`.
     pub async fn pond_ingest(store: &Store, request: IngestRequest) -> IngestEnvelope {
         if let Err(envelope) = validate_protocol(request.protocol_version) {
             return IngestEnvelope::Error(envelope);
         }
-        if request.namespace.as_deref() != Some(DEFAULT_NAMESPACE) {
-            return IngestEnvelope::Error(map_error(crate::Error::NamespaceUnknown(
-                request.namespace.unwrap_or_else(|| "<missing>".to_owned()),
-            )));
+        if let Err(envelope) = super::resolve_namespace(request.namespace.as_deref()) {
+            return IngestEnvelope::Error(envelope);
         }
         if request.events.is_empty() {
-            return IngestEnvelope::Error(map_error(crate::Error::Validation(
-                "events must be a non-empty array".to_owned(),
+            return IngestEnvelope::Error(map_error(crate::Error::validation_field(
+                "events must be a non-empty array",
+                "events",
+                Some(serde_json::json!([])),
+                Some("non-empty array".to_owned()),
             )));
         }
         if request.events.len() > MAX_INGEST_EVENTS {
-            return IngestEnvelope::Error(map_error(crate::Error::Validation(format!(
-                "ingest batch exceeds the event cap: at most {MAX_INGEST_EVENTS} events"
-            ))));
+            return IngestEnvelope::Error(map_error(crate::Error::validation_field(
+                format!("ingest batch exceeds the event cap: at most {MAX_INGEST_EVENTS} events"),
+                "events",
+                Some(serde_json::json!(request.events.len())),
+                Some(format!("at most {MAX_INGEST_EVENTS} events")),
+            )));
         }
 
         match ingest_events(store, request.events).await {
-            Ok(summary) => IngestEnvelope::Success(IngestResponse {
-                accepted: summary.accepted(),
-                rejected: summary.errors,
-                inserted: summary.inserted,
-                matched: summary.matched,
-                request_id: new_request_id(),
-            }),
+            Ok(outcomes) => {
+                let mut accepted = 0;
+                let mut rejected = 0;
+                for outcome in &outcomes {
+                    match outcome.status {
+                        OutcomeStatus::Inserted | OutcomeStatus::Matched => accepted += 1,
+                        OutcomeStatus::Error => rejected += 1,
+                    }
+                }
+                let results = outcomes
+                    .into_iter()
+                    .map(outcome_to_result)
+                    .collect::<Vec<_>>();
+                IngestEnvelope::Success(IngestResponse {
+                    accepted,
+                    rejected,
+                    results,
+                    request_id: new_request_id(),
+                })
+            }
             Err(failure) => IngestEnvelope::Error(map_storage(failure)),
         }
     }
 
-    /// Drive a flat event batch through [`IngestValidator`], grouped into session
-    /// substreams. A substream that fails validation is aborted - its buffered
-    /// events are dropped and events are skipped until the next `Session` event -
-    /// while later sessions in the batch still process (design.md 3.6.4). The
-    /// rejected-substream count lands in [`IngestSummary::errors`].
-    pub async fn ingest_events(store: &Store, events: Vec<IngestEvent>) -> Result<IngestSummary> {
-        let mut summary = IngestSummary {
-            inserted: 0,
-            matched: 0,
-            errors: 0,
-        };
+    /// Drive a flat event batch through [`IngestValidator`], returning per-row
+    /// outcomes in input-array order. A substream that fails validation has
+    /// every one of its events tagged with [`OutcomeStatus::Error`] (the
+    /// offending event and any others in the same substream); ingest of later
+    /// sessions in the batch continues (design.md 3.6.4).
+    pub async fn ingest_events(
+        store: &Store,
+        events: Vec<IngestEvent>,
+    ) -> Result<Vec<RowOutcome>> {
         let mut validator = IngestValidator::default();
-        let mut skipping = false;
-        for event in events {
-            if skipping {
-                if matches!(event, IngestEvent::Session(_)) {
-                    skipping = false;
-                } else {
-                    continue;
-                }
-            }
-            match validator.push(store, event).await {
-                Ok(statuses) => summary.add_statuses(&statuses),
-                Err(failure) => {
-                    summary.errors += 1;
-                    tracing::warn!(%failure, "aborting invalid session substream");
-                    validator = IngestValidator::default();
-                    skipping = true;
-                }
-            }
+        let mut outcomes = Vec::with_capacity(events.len());
+        for (index, event) in events.into_iter().enumerate() {
+            let mut chunk = validator.push(store, index, event).await?;
+            outcomes.append(&mut chunk);
         }
-        if !skipping {
-            let statuses = validator.finish(store).await?;
-            summary.add_statuses(&statuses);
+        let mut tail = validator.finish(store).await?;
+        outcomes.append(&mut tail);
+        outcomes.sort_by_key(|outcome| outcome.index);
+        Ok(outcomes)
+    }
+
+    fn outcome_to_result(outcome: RowOutcome) -> IngestResult {
+        let (status, error) = match (outcome.status, outcome.error) {
+            (OutcomeStatus::Inserted, _) => (IngestStatus::Inserted, None),
+            (OutcomeStatus::Matched, _) => (IngestStatus::Matched, None),
+            (OutcomeStatus::Error, error) => {
+                let body = error
+                    .map(|err| {
+                        let mut details = serde_json::Map::new();
+                        if let Some(field) = err.field {
+                            details.insert("field".to_owned(), serde_json::json!(field));
+                        }
+                        if let Some(reason) = err.reason {
+                            details.insert("reason".to_owned(), serde_json::json!(reason));
+                        }
+                        ErrorBody {
+                            code: ErrorCode::ValidationFailed,
+                            message: err.message,
+                            details: serde_json::Value::Object(details),
+                        }
+                    })
+                    .unwrap_or_else(|| ErrorBody {
+                        code: ErrorCode::ValidationFailed,
+                        message: "ingest failed".to_owned(),
+                        details: serde_json::json!({}),
+                    });
+                (IngestStatus::Error, Some(body))
+            }
+        };
+        IngestResult {
+            index: outcome.index,
+            kind: outcome.kind.to_owned(),
+            pk: outcome.pk,
+            status,
+            error,
         }
-        Ok(summary)
     }
 }
 
-pub use crate::sessions::{IngestError, IngestEvent, IngestSummary, IngestValidator, search_text};
+pub use crate::sessions::{IngestEvent, IngestSummary, IngestValidator, search_text};
 pub use ingest_handler::{MAX_INGEST_EVENTS, ingest_adapter, ingest_events, pond_ingest};
+
+mod session_events_handler {
+    //! `pond_session_events` (design.md 3.6.5): catch-up SSE stream over a
+    //! stored session's messages. v1 scope is read-after-`since`: scan
+    //! messages strictly after the resume point in `(timestamp, message_id)`
+    //! order, emit one `message` event per row (with its parts, filtered by
+    //! include_thinking / include_tool_results), then emit `end` and close.
+    //! Live-tail activates with live-write (section 4) on the same endpoint
+    //! without a wire change.
+
+    use crate::{
+        sessions::{MessageWithParts, Store},
+        wire::{ErrorEnvelope, PartKind},
+    };
+    use serde_json::{Value, json};
+
+    use super::{map_error, map_storage};
+
+    /// Parsed `since` query parameter.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Since {
+        /// No `since`: emit `session` header + every message + `end`.
+        None,
+        /// `since=session:<id>`: emit every message + `end`; the client has
+        /// already seen the header from a prior connection.
+        Header,
+        /// `since=end:<id>`: idempotent terminator; emit `end` and close.
+        End,
+        /// `since=<message_id>`: resume from `(timestamp, id) > since.row`.
+        Message(String),
+    }
+
+    /// Decode a `since` query value. Empty / missing -> `None`. Prefixes
+    /// `session:` / `end:` map to the matching `Header` / `End` variants
+    /// regardless of the value carried after the colon (the server already
+    /// knows the session id from the path). A bare value is treated as a
+    /// message id; `since=unknown` cases bubble up to the per-row resume
+    /// logic, which surfaces them as `validation_failed`.
+    pub fn parse_since(value: Option<&str>) -> Since {
+        match value {
+            None => Since::None,
+            Some(raw) => {
+                if raw.is_empty() {
+                    Since::None
+                } else if let Some(rest) = raw.strip_prefix("session:") {
+                    let _ = rest;
+                    Since::Header
+                } else if let Some(rest) = raw.strip_prefix("end:") {
+                    let _ = rest;
+                    Since::End
+                } else {
+                    Since::Message(raw.to_owned())
+                }
+            }
+        }
+    }
+
+    /// Server-Sent Events event ready to encode by the transport layer.
+    /// Identity (`event` + `id` + `data`) is design.md 3.6.5 verbatim.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SseEvent {
+        pub event: &'static str,
+        pub id: String,
+        pub data: Value,
+    }
+
+    /// Plan a session-events response: validate the session exists, parse
+    /// `since`, locate the cutoff, and emit the ordered list of events the
+    /// transport will stream. Returns a typed error envelope on `not_found`
+    /// (unknown session id) or `validation_failed` (unknown `since`); all
+    /// storage errors map to `storage_unavailable`.
+    pub async fn pond_session_events(
+        store: &Store,
+        session_id: &str,
+        since: Since,
+        include_thinking: bool,
+        include_tool_results: bool,
+    ) -> Result<Vec<SseEvent>, ErrorEnvelope> {
+        let stored = store.get_session(session_id).await.map_err(map_storage)?;
+        let Some(stored) = stored else {
+            return Err(map_error(crate::Error::not_found(
+                "session",
+                json!(session_id),
+                "session not found",
+            )));
+        };
+
+        // `end:<id>` is idempotent - emit terminator + close, no scan.
+        if since == Since::End {
+            return Ok(vec![end_event(session_id)]);
+        }
+
+        let mut events = Vec::new();
+        if since == Since::None {
+            events.push(SseEvent {
+                event: "session",
+                id: format!("session:{session_id}"),
+                data: serde_json::to_value(&stored.session).unwrap_or(Value::Null),
+            });
+        }
+
+        let messages = stored.messages;
+        let start_at = match &since {
+            Since::None | Since::Header | Since::End => 0,
+            Since::Message(message_id) => {
+                let position = messages
+                    .iter()
+                    .position(|message| message.message.id() == message_id);
+                match position {
+                    Some(index) => index + 1,
+                    None => {
+                        return Err(map_error(crate::Error::validation_field(
+                            "since references a message id that does not exist in this session",
+                            "since",
+                            Some(json!(message_id)),
+                            Some("message_id present in this session".to_owned()),
+                        )));
+                    }
+                }
+            }
+        };
+
+        for message in &messages[start_at..] {
+            events.push(message_event(message, include_thinking, include_tool_results));
+        }
+        events.push(end_event(session_id));
+        Ok(events)
+    }
+
+    fn message_event(
+        message: &MessageWithParts,
+        include_thinking: bool,
+        include_tool_results: bool,
+    ) -> SseEvent {
+        let mut parts = message.parts.clone();
+        parts.retain(|part| match &part.kind {
+            PartKind::Reasoning { .. } => include_thinking,
+            PartKind::ToolResult { .. } => include_tool_results,
+            PartKind::ToolApprovalRequest { .. } | PartKind::ToolApprovalResponse { .. } => false,
+            PartKind::Text { .. } | PartKind::File { .. } | PartKind::ToolCall { .. } => true,
+        });
+
+        SseEvent {
+            event: "message",
+            id: message.message.id().to_owned(),
+            data: json!({
+                "message": message.message,
+                "parts": parts,
+            }),
+        }
+    }
+
+    fn end_event(session_id: &str) -> SseEvent {
+        SseEvent {
+            event: "end",
+            id: format!("end:{session_id}"),
+            data: json!({ "reason": "caught_up" }),
+        }
+    }
+}
+
+pub use session_events_handler::{Since, SseEvent, parse_since, pond_session_events};
+
+mod export_handler {
+    //! `pond_export` (design.md 3.6.6): walk every session in the store and
+    //! emit its canonical event stream as JSONL - one `IngestEvent` per line.
+    //! The output is byte-identical with what `pond ingest` / `pond_ingest`
+    //! accepts on input, so `export | ingest` is a portable backup loop.
+    //! Sessions are emitted in lexicographic id order; within each session,
+    //! messages run in `(timestamp, message_id)` order and each message's
+    //! parts immediately follow in `ordinal` order. Matches the 3.4 event
+    //! ordering contract so the output re-imports without re-ordering.
+
+    use anyhow::{Context, Result};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+    use crate::sessions::{IngestEvent, Store};
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ExportSummary {
+        pub sessions: usize,
+        pub messages: usize,
+        pub parts: usize,
+    }
+
+    pub async fn pond_export<W>(
+        store: &Store,
+        session_filter: Option<&str>,
+        writer: &mut W,
+    ) -> Result<ExportSummary>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut session_ids = match session_filter {
+            Some(id) => vec![id.to_owned()],
+            None => store.session_ids().await?,
+        };
+        session_ids.sort();
+
+        let mut summary = ExportSummary::default();
+        for session_id in session_ids {
+            let Some(stored) = store
+                .get_session(&session_id)
+                .await
+                .with_context(|| format!("export: failed to load session {session_id}"))?
+            else {
+                continue;
+            };
+            write_event(writer, &IngestEvent::Session(stored.session)).await?;
+            summary.sessions += 1;
+            for message_with_parts in stored.messages {
+                write_event(
+                    writer,
+                    &IngestEvent::Message(message_with_parts.message),
+                )
+                .await?;
+                summary.messages += 1;
+                for part in message_with_parts.parts {
+                    write_event(writer, &IngestEvent::Part(part)).await?;
+                    summary.parts += 1;
+                }
+            }
+        }
+        writer.flush().await.context("export: flush failed")?;
+        Ok(summary)
+    }
+
+    async fn write_event<W>(writer: &mut W, event: &IngestEvent) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let line = serde_json::to_string(event).context("export: serialize event")?;
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("export: write event")?;
+        writer
+            .write_all(b"\n")
+            .await
+            .context("export: write newline")?;
+        Ok(())
+    }
+}
+
+pub use export_handler::{ExportSummary, pond_export};
 
 mod get_handler {
     use crate::{
         sessions::{MessageWithParts, SessionWithMessages, Store},
-        wire::{
-            DEFAULT_NAMESPACE, GetEnvelope, GetRequest, GetResponse, GetResult, validate_protocol,
-        },
+        wire::{GetEnvelope, GetRequest, GetResponse, GetResult, validate_protocol},
         wire::{Message, Part, PartKind},
     };
 
@@ -167,10 +464,8 @@ mod get_handler {
         if let Err(error) = validate_protocol(request.protocol_version) {
             return GetEnvelope::Error(error);
         }
-        if request.namespace.as_deref() != Some(DEFAULT_NAMESPACE) {
-            return GetEnvelope::Error(map_error(crate::Error::NamespaceUnknown(
-                request.namespace.unwrap_or_else(|| "<missing>".to_owned()),
-            )));
+        if let Err(envelope) = super::resolve_namespace(request.namespace.as_deref()) {
+            return GetEnvelope::Error(envelope);
         }
 
         let result = match (&request.session_id, &request.message_id, &request.up_to) {
@@ -178,14 +473,20 @@ mod get_handler {
                 session_scope(store, &request, session_id, up_to.as_deref()).await
             }
             (None, Some(message_id), None) => message_scope(store, &request, message_id).await,
-            (None, Some(_), Some(_)) => Err(map_error(crate::Error::Validation(
-                "up_to is valid only with session_id".to_owned(),
+            (None, Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
+                "up_to is valid only with session_id",
+                "up_to",
+                request.up_to.clone().map(serde_json::Value::String),
+                Some("only valid with session_id".to_owned()),
             ))),
-            (Some(_), Some(_), _) => Err(map_error(crate::Error::Validation(
-                "session_id and message_id are mutually exclusive".to_owned(),
+            (Some(_), Some(_), _) => Err(map_error(crate::Error::validation_field(
+                "session_id and message_id are mutually exclusive",
+                "message_id",
+                request.message_id.clone().map(serde_json::Value::String),
+                Some("omit when session_id is present".to_owned()),
             ))),
-            (None, None, _) => Err(map_error(crate::Error::Validation(
-                "one of session_id or message_id is required".to_owned(),
+            (None, None, _) => Err(map_error(crate::Error::validation(
+                "one of session_id or message_id is required",
             ))),
         };
 
@@ -205,9 +506,11 @@ mod get_handler {
         up_to: Option<&str>,
     ) -> Result<GetResult, crate::wire::ErrorEnvelope> {
         let Some(mut stored) = store.get_session(session_id).await.map_err(map_storage)? else {
-            return Err(map_error(crate::Error::NotFound(format!(
-                "session not found: {session_id}"
-            ))));
+            return Err(map_error(crate::Error::not_found(
+                "session",
+                serde_json::json!(session_id),
+                format!("session not found: {session_id}"),
+            )));
         };
 
         if let Some(up_to) = up_to {
@@ -216,9 +519,11 @@ mod get_handler {
                 .iter()
                 .position(|message| message.message.id() == up_to)
             else {
-                return Err(map_error(crate::Error::NotFound(format!(
-                    "up_to message not found in session: {session_id}/{up_to}"
-                ))));
+                return Err(map_error(crate::Error::not_found(
+                    "message",
+                    serde_json::json!([session_id, up_to]),
+                    format!("up_to message not found in session: {session_id}/{up_to}"),
+                )));
             };
             stored.messages.truncate(index + 1);
         }
@@ -251,9 +556,11 @@ mod get_handler {
             .await
             .map_err(map_storage)?
         else {
-            return Err(map_error(crate::Error::NotFound(format!(
-                "message not found: {message_id}"
-            ))));
+            return Err(map_error(crate::Error::not_found(
+                "message",
+                serde_json::json!(message_id),
+                format!("message not found: {message_id}"),
+            )));
         };
         filter_messages(
             &mut messages,
@@ -325,9 +632,8 @@ mod search_handler {
         sessions::{MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
-            DEFAULT_NAMESPACE, ErrorEnvelope, Group, Hit, ProjectMatch, SearchEnvelope,
-            SearchFilters, SearchRequest, SearchResponse, SearchResultBody, new_request_id,
-            validate_protocol,
+            ErrorEnvelope, Group, Hit, ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest,
+            SearchResponse, SearchResultBody, new_request_id, validate_protocol,
         },
     };
     use chrono::{DateTime, NaiveDate, Utc};
@@ -338,9 +644,23 @@ mod search_handler {
     /// expose this - per-hit `matched_via` already tells clients which retrievers
     /// ranked a row, and the request never asks for a specific mode.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum EffectiveMode {
+    pub enum SearchMode {
         Hybrid,
         Fts,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SearchPlan {
+        pub mode: SearchMode,
+        pub query: String,
+        pub filter: Predicate,
+        pub pool: usize,
+        pub vector_pool: usize,
+        pub limit: usize,
+        pub rrf_k: u32,
+        pub boost_recent: bool,
+        pub group_by_conversation: bool,
+        pub min_score: f64,
     }
 
     /// Server-enforced cap on `limit` (design.md 3.6.2).
@@ -376,59 +696,35 @@ mod search_handler {
         request: SearchRequest,
         clock: &dyn Clock,
     ) -> Result<SearchResponse, ErrorEnvelope> {
-        validate_protocol(request.protocol_version)?;
-
-        // v1 serves a single namespace; reject anything else loudly rather than
-        // silently treating it as `local`.
-        if request.namespace.as_deref() != Some(DEFAULT_NAMESPACE) {
-            return Err(map_error(crate::Error::NamespaceUnknown(
-                request.namespace.unwrap_or_else(|| "<missing>".to_owned()),
-            )));
-        }
-
-        let query = request.query.trim().to_owned();
-        if query.is_empty() {
-            return Err(map_error(crate::Error::Validation(
-                "query must be non-empty after trim".to_owned(),
-            )));
-        }
-        if request.limit == 0 {
-            return Err(map_error(crate::Error::Validation(
-                "limit must be at least 1".to_owned(),
-            )));
-        }
-        let limit = request.limit.min(LIMIT_CAP);
-        let filter = build_filter(&request.filters)?;
-        // Retriever candidate pool: wider than `limit` so RRF has material to merge.
-        let pool = limit.saturating_mul(5).max(50);
+        let mut plan = plan_search(request, SearchMode::Fts)?;
 
         // The mode is server-determined: hybrid only when both the embedder is
         // loaded AND embeddings exist for its identity. Anything else degrades to
         // FTS-only - a vector retriever over zero rows would just be wasted work.
-        let effective_mode = resolve_effective_mode(store, embedder).await?;
-        let candidates = match effective_mode {
-            EffectiveMode::Fts => {
+        plan.mode = resolve_effective_mode(store, embedder).await?;
+        let candidates = match plan.mode {
+            SearchMode::Fts => {
                 let hits = store
-                    .fts_search(&query, pool, &filter)
+                    .fts_search(&plan.query, plan.pool, &plan.filter)
                     .await
                     .map_err(map_storage)?;
                 normalize_fts(hits)
             }
-            EffectiveMode::Hybrid => {
+            SearchMode::Hybrid => {
                 // `resolve_effective_mode` only returns Hybrid when `embedder` is
                 // `Some` and `has_embeddings` returned true; an `Internal` error
                 // here would only fire under a logic bug.
                 let Some(embedder) = embedder else {
-                    return Err(map_error(crate::Error::Internal(
-                        "hybrid mode resolved without an embedder".to_owned(),
+                    return Err(map_error(crate::Error::internal(
+                        "hybrid mode resolved without an embedder",
                     )));
                 };
-                let vector = embed_query(embedder, &query)?;
+                let vector = embed_query(embedder, &plan.query)?;
                 // The two retrievers hit disjoint datasets (and disjoint mutexes),
                 // so run them concurrently rather than back-to-back.
                 let fts_fut = async {
                     store
-                        .fts_search(&query, pool, &filter)
+                        .fts_search(&plan.query, plan.pool, &plan.filter)
                         .await
                         .map_err(map_storage)
                 };
@@ -436,8 +732,8 @@ mod search_handler {
                     store
                         .vector_search(
                             &vector,
-                            pool.saturating_mul(2),
-                            &filter,
+                            plan.vector_pool,
+                            &plan.filter,
                             embedder.model_id(),
                             embedder.max_embed_tokens(),
                         )
@@ -457,7 +753,7 @@ mod search_handler {
                         ids: fts.into_iter().map(|(id, _)| id).collect(),
                     },
                 ];
-                rrf_merge(&lists, request.rrf_k)
+                rrf_merge(&lists, plan.rrf_k)
                     .into_iter()
                     .map(|hit| Candidate {
                         message_id: hit.message_id,
@@ -469,7 +765,7 @@ mod search_handler {
         };
 
         if candidates.is_empty() {
-            return Ok(empty_response(request.group_by_conversation));
+            return Ok(empty_response(plan.group_by_conversation));
         }
 
         // Hydrate hit metadata (timestamp, role, project, preview source) from the
@@ -494,13 +790,13 @@ mod search_handler {
             let Some(meta) = meta_index.get(candidate.message_id.as_str()) else {
                 continue;
             };
-            let recency_boost = if request.boost_recent {
+            let recency_boost = if plan.boost_recent {
                 recency_boost(meta.timestamp, now)
             } else {
                 0.0
             };
             let score = candidate.base_score + recency_boost;
-            if score < request.filters.min_score {
+            if score < plan.min_score {
                 continue;
             }
             scored.push(ScoredHit {
@@ -519,8 +815,8 @@ mod search_handler {
                 .then_with(|| left.meta.message_id.cmp(&right.meta.message_id))
         });
 
-        if request.group_by_conversation {
-            let groups = build_groups(store, &scored, limit).await?;
+        if plan.group_by_conversation {
+            let groups = build_groups(store, &scored, plan.limit).await?;
             let total = groups.len();
             Ok(SearchResponse {
                 result: SearchResultBody::Groups { groups },
@@ -530,7 +826,7 @@ mod search_handler {
         } else {
             let hits = scored
                 .into_iter()
-                .take(limit)
+                .take(plan.limit)
                 .map(ScoredHit::into_hit)
                 .collect::<Vec<_>>();
             let total = hits.len();
@@ -548,21 +844,64 @@ mod search_handler {
     async fn resolve_effective_mode(
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
-    ) -> Result<EffectiveMode, ErrorEnvelope> {
+    ) -> Result<SearchMode, ErrorEnvelope> {
         match embedder {
-            None => Ok(EffectiveMode::Fts),
+            None => Ok(SearchMode::Fts),
             Some(backend) => {
                 let has = store
                     .has_embeddings(backend.model_id(), backend.max_embed_tokens())
                     .await
                     .map_err(map_storage)?;
                 Ok(if has {
-                    EffectiveMode::Hybrid
+                    SearchMode::Hybrid
                 } else {
-                    EffectiveMode::Fts
+                    SearchMode::Fts
                 })
             }
         }
+    }
+
+    pub fn plan_search(
+        request: SearchRequest,
+        mode: SearchMode,
+    ) -> Result<SearchPlan, ErrorEnvelope> {
+        validate_protocol(request.protocol_version)?;
+
+        super::resolve_namespace(request.namespace.as_deref())?;
+
+        let query = request.query.trim().to_owned();
+        if query.is_empty() {
+            return Err(map_error(crate::Error::validation_field(
+                "query must be non-empty after trim",
+                "query",
+                Some(serde_json::json!(request.query)),
+                Some("non-empty string after trim".to_owned()),
+            )));
+        }
+        if request.limit == 0 {
+            return Err(map_error(crate::Error::validation_field(
+                "limit must be at least 1",
+                "limit",
+                Some(serde_json::json!(request.limit)),
+                Some("integer >= 1".to_owned()),
+            )));
+        }
+        let limit = request.limit.min(LIMIT_CAP);
+        let filter = build_filter(&request.filters)?;
+        // Retriever candidate pool: wider than `limit` so RRF has material to merge.
+        let pool = limit.saturating_mul(5).max(50);
+        Ok(SearchPlan {
+            mode,
+            query,
+            filter,
+            pool,
+            vector_pool: pool.saturating_mul(2),
+            limit,
+            rrf_k: request.rrf_k,
+            boost_recent: request.boost_recent,
+            group_by_conversation: request.group_by_conversation,
+            min_score: request.filters.min_score,
+        })
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,13 +1064,13 @@ mod search_handler {
         // multi-threaded runtime - see `pond_search`.)
         let vectors =
             tokio::task::block_in_place(|| embedder.embed(&[prompt])).map_err(|error_value| {
-                map_error(crate::Error::Internal(format!(
+                map_error(crate::Error::internal(format!(
                     "failed to embed query: {error_value}"
                 )))
             })?;
         vectors.into_iter().next().ok_or_else(|| {
-            map_error(crate::Error::Internal(
-                "embedder returned no vector for query".to_owned(),
+            map_error(crate::Error::internal(
+                "embedder returned no vector for query",
             ))
         })
     }
@@ -828,9 +1167,14 @@ mod search_handler {
         }
         if let Some(role) = &filters.role {
             if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool") {
-                return Err(map_error(crate::Error::Validation(format!(
-                    "filters.role must be one of: user, assistant, system, tool; got {role}"
-                ))));
+                return Err(map_error(crate::Error::validation_field(
+                    format!(
+                        "filters.role must be one of: user, assistant, system, tool; got {role}"
+                    ),
+                    "filters.role",
+                    Some(serde_json::json!(role)),
+                    Some("one of: user, assistant, system, tool".to_owned()),
+                )));
             }
             clauses.push(Predicate::Eq("role", role.clone().into()));
         }
@@ -854,9 +1198,12 @@ mod search_handler {
     /// pushes `to_date` to the inclusive end of the day.
     fn date_bound(date: &str, field: &str, end_of_day: bool) -> Result<String, ErrorEnvelope> {
         NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
-            map_error(crate::Error::Validation(format!(
-                "{field} must be in YYYY-MM-DD format; got {date}"
-            )))
+            map_error(crate::Error::validation_field(
+                format!("{field} must be in YYYY-MM-DD format; got {date}"),
+                field,
+                Some(serde_json::json!(date)),
+                Some("YYYY-MM-DD".to_owned()),
+            ))
         })?;
         let time = if end_of_day { "23:59:59" } else { "00:00:00" };
         Ok(format!("timestamp '{date} {time}'"))
@@ -877,6 +1224,6 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    RankedList, RetrieverKind, RrfHit, build_filter, make_preview, pond_search, recency_boost,
-    rrf_merge,
+    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, make_preview,
+    plan_search, pond_search, recency_boost, rrf_merge,
 };

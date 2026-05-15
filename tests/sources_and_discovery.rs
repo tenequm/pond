@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use pond::{
-    adapter::{self, ClaudeCodeFactory, CodexFactory, Env},
+    adapter::{self, ClaudeCodeFactory, CodexCliFactory, Env},
     config::{Config, expand_home_under},
 };
 use serde_json::{Value, json};
@@ -50,7 +50,7 @@ fn resolve_sources_returns_one_or_all_or_errors() {
 [sources.claude-code]
 path = \"/srv/claude\"
 
-[sources.codex]
+[sources.codex-cli]
 path = \"/srv/codex\"
 ";
     let path = write_config(temp.path(), body);
@@ -61,12 +61,12 @@ path = \"/srv/codex\"
     assert_eq!(all.len(), 2);
     let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names.contains(&"claude-code"));
-    assert!(names.contains(&"codex"));
+    assert!(names.contains(&"codex-cli"));
 
     // Some(name) -> one entry, opaque JSON blob
-    let one = config.resolve_sources(Some("codex")).unwrap();
+    let one = config.resolve_sources(Some("codex-cli")).unwrap();
     assert_eq!(one.len(), 1);
-    assert_eq!(one[0].0, "codex");
+    assert_eq!(one[0].0, "codex-cli");
     assert_eq!(
         one[0].1.get("path").and_then(Value::as_str),
         Some("/srv/codex"),
@@ -101,7 +101,7 @@ fn each_factory_probes_its_default_under_an_injected_home() {
         Some(claude_dir.to_str().unwrap()),
     );
 
-    let codex_probe = CodexFactory.probe_default(&env);
+    let codex_probe = CodexCliFactory.probe_default(&env);
     assert_eq!(
         codex_probe
             .as_ref()
@@ -112,7 +112,7 @@ fn each_factory_probes_its_default_under_an_injected_home() {
 
     // Removing the codex marker dir drops just that factory's probe.
     std::fs::remove_dir_all(&codex_dir).unwrap();
-    assert!(CodexFactory.probe_default(&env).is_none());
+    assert!(CodexCliFactory.probe_default(&env).is_none());
     assert!(ClaudeCodeFactory.probe_default(&env).is_some());
 }
 
@@ -122,7 +122,7 @@ fn known_names_covers_every_registered_adapter() {
     // dispatch and the discovery picker. A new adapter must show up here.
     let names = adapter::known_names();
     assert!(names.contains(&"claude-code"));
-    assert!(names.contains(&"codex"));
+    assert!(names.contains(&"codex-cli"));
 }
 
 #[test]

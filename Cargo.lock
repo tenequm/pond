@@ -6381,6 +6381,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "fastembed",
+ "fastrand",
  "hf-hub",
  "indicatif",
  "lance",
@@ -6404,6 +6405,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

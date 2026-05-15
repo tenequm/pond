@@ -30,10 +30,10 @@ use toml_edit::{DocumentMut, Item, Table};
 use crate::{sessions::IngestEvent, wire::ProviderOptions};
 
 mod claude_code;
-mod codex;
+mod codex_cli;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
-pub use codex::{CodexAdapter, CodexFactory};
+pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
 
 /// Stateless face of an adapter type: how the registry knows about it without
 /// instantiating it. One implementation per known format, registered in
@@ -226,7 +226,7 @@ impl std::error::Error for AdapterError {
 /// adds one `&Factory` here plus one file under `src/adapter/`. Order is the
 /// order discovery presents to the operator.
 pub fn registry() -> &'static [&'static dyn AdapterFactory] {
-    &[&ClaudeCodeFactory, &CodexFactory]
+    &[&ClaudeCodeFactory, &CodexCliFactory]
 }
 
 /// Look up a factory by name. Returns `None` for unknown names; callers
@@ -262,7 +262,7 @@ pub(crate) struct IoAtPath {
 
 /// Walk `root` recursively and collect every `*.jsonl` file under it, sorted
 /// for deterministic ingest order. Shared between the file-tree adapters
-/// (claude-code, codex, pi, nanoclaw, openclaw); fan-out tree adapters
+/// (claude-code, codex-cli, pi, nanoclaw, openclaw); fan-out tree adapters
 /// (opencode) and file-pair adapters (claude-app) walk their own shapes.
 pub(crate) async fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath> {
     use std::ffi::OsStr;
