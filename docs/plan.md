@@ -448,11 +448,12 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
   streamable-HTTP MCP transport. Binds `127.0.0.1:9797`, env overrides, `--port 0`
   support, `0.0.0.0` security notice (2.1.1).
 - `transport.rs::mcp` - the rmcp MCP layer, transport-agnostic: exposes `pond_search`
-  / `pond_get` / `pond_ingest` tools and `schema://pond` / `stats://pond` resources as
-  thin adapters over the same wire handlers, mounted both on the `/mcp` HTTP route
-  (via `pond serve`) and on stdio (via `pond mcp`). Renders the `[... N chars]`
-  placeholders for stripped Parts (design.md 3.6.3 MCP-transport note). Defines its
-  own `-32000`-family error codes (rmcp ships none).
+  / `pond_get` tools (the kb-parity surface; ingest stays HTTP-only and CLI-only)
+  and `schema://pond` / `stats://pond` resources as thin adapters over the same
+  wire handlers, mounted both on the `/mcp` HTTP route (via `pond serve`) and on
+  stdio (via `pond mcp`). Renders the `[... N chars]` placeholders for stripped
+  Parts (design.md 3.6.3 MCP-transport note). Defines its own `-32000`-family
+  error codes (rmcp ships none).
 - Transport / logging split: `pond serve` runs the HTTP server (with `/mcp`) and logs
   normally (stdout = output, stderr = tracing). `pond mcp` runs a stdio MCP server
   only and routes ALL logging - tracing, diagnostics, everything - to stderr; stdout
@@ -490,8 +491,8 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 
 ## Stage 4 - Cutover
 
-**Goal**: pond is live as the personal knowledge base, fed from real local data,
-replacing `kb` in the MCP config.
+**Goal**: pond runs side-by-side with `kb` against real local data, so the two
+can be compared in a live Claude Code session before any swap.
 
 **Build**:
 - No new source files. This stage is operational.
@@ -502,15 +503,17 @@ replacing `kb` in the MCP config.
   to `[sources.<adapter>]`, and continues into sync. Subsequent runs sync
   incrementally (`merge_insert` PK makes it idempotent). The data dir is
   created on first `Store::open`.
-- Run `pond embed` once to populate the `embeddings` table. Hybrid search
-  goes live on the next `pond serve` / `pond mcp` boot - those probe the
-  `embeddings` table and load the model only when rows exist for the default
-  identity. The model is fetched via hf-hub on first load.
-- Swap the MCP server entry in the Claude Code MCP config: `kb` -> `pond mcp` (stdio
-  MCP server; stdout reserved for JSON-RPC, all logs to stderr).
-- Parity smoke: a named, written-down checklist re-run against `pond_search` /
-  `pond_get` and compared to the `kb` baseline. The checklist (committed to the repo,
-  e.g. `docs/parity-checklist.md`, so parity does not depend on memory):
+- Skip `pond embed` at cutover - `pond serve` / `pond mcp` boot FTS-only when
+  the `embeddings` table is empty, which is enough to replace `kb`. Embeddings
+  are an opt-in later step, not a cutover prerequisite.
+- Register `pond mcp` as an additional MCP entry in the repo's `.mcp.json`,
+  alongside the existing `kb` entry - not in place of it. Side-by-side lets a
+  Claude session call both servers in the same turn and diff the answers.
+  Stdio MCP server; stdout reserved for JSON-RPC, all logs to stderr. The full
+  `kb` -> `pond` swap is a later decision, after the parity smoke convinces.
+- Parity smoke: walk the checklist below against `pond_search` / `pond_get` and
+  compare to the `kb` baseline. It is one-shot cutover work, not a recurring
+  test - it lives here in `plan.md` and does not get its own committed doc:
   1. `pond_search` plain query, default filters - top hits are relevant and ranked.
   2. `pond_search` with `project` filter (`exact`) - results scoped to one project.
   3. `pond_search` with `project_match: is_null` - expect EMPTY on a real
@@ -531,11 +534,12 @@ replacing `kb` in the MCP config.
   equivalence is a human judgement but the cases are fixed, not improvised.
 
 **Done when**:
-- A Claude Code session uses `pond_*` tools in place of `kb_*` with no loss of
-  function on the parity checklist.
-- The full local corpus is searchable.
+- A Claude Code session can call both `kb_*` and `pond_*` tools from the same
+  `.mcp.json` and the parity checklist comparison records no loss of function.
+- The full local corpus is searchable via `pond_*`.
 
-**design.md coverage**: 1.1 personal deployment ("replaces the personal kb MCP").
+**design.md coverage**: 1.1 personal deployment ("replaces the personal kb MCP" -
+the replacement itself is a later, post-parity decision).
 
 ---
 

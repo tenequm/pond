@@ -1,11 +1,11 @@
 //! The HTTP+JSON and stdio-MCP transports: thin adapters over the shared wire
-//! handlers (`pond_search`, `pond_get`). Both transports dispatch to the exact
-//! same handler functions - the only intentional divergence is the MCP
-//! placeholder rendering in [`mcp::render_placeholders`] (design.md 3.6.3).
+//! handlers. Both transports dispatch to the exact same handler functions - the
+//! only intentional divergence is the MCP placeholder rendering in
+//! [`mcp::render_placeholders`] (design.md 3.6.3).
 //!
-//! Ingest has no transport in v1: only the `pond ingest` CLI verb writes to the
-//! store, and it does its own batching. There is no `POST /v1/ingest` and no
-//! `pond_ingest` MCP tool.
+//! HTTP exposes `POST /v1/search`, `POST /v1/get`, `POST /v1/ingest`, and the
+//! SSE `GET /v1/sessions/{id}/events` stream. MCP exposes only `pond_search` /
+//! `pond_get` (the kb-parity surface); ingest stays HTTP-only and CLI-only.
 
 use std::sync::Arc;
 
