@@ -10,11 +10,11 @@ use pond::{
     PROTOCOL_VERSION,
     config::Config,
     embed::{EmbedBackend, EmbedWorker},
-    ingest::{IngestEvent, pond_ingest},
-    substrate::PondStore,
+    handlers::{IngestEvent, pond_ingest},
+    sessions::Store,
     transport::{AppState, mcp::PondMcp},
-    types::{Message, Part, PartKind, Session},
     wire::{GetResponse, GetResult, IngestEnvelope, IngestRequest, SearchResponse},
+    wire::{Message, Part, PartKind, Session},
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -71,7 +71,7 @@ impl ClientHandler for TestClient {}
 /// text part. Built via the `pond_ingest` handler directly - the claude-code
 /// fixtures carry no reasoning parts, and placeholder rendering needs one.
 async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
 
     let session = Session {
         id: SESSION_ID.to_owned(),
@@ -111,7 +111,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         &store,
         IngestRequest {
             protocol_version: PROTOCOL_VERSION,
-            namespace: "local".to_owned(),
+            namespace: Some("local".to_owned()),
             events: vec![
                 IngestEvent::Session(session),
                 IngestEvent::Message(message),
@@ -136,7 +136,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
 
     Ok(AppState {
         store: Arc::new(store),
-        embedder: Arc::new(backend),
+        embedder: Some(Arc::new(backend)),
     })
 }
 
@@ -192,14 +192,10 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         )
         .await?;
     let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session(stored) = response.result else {
+    let GetResult::Session { session, parts, .. } = response.result else {
         panic!("expected a session result");
     };
-    assert_eq!(
-        stored.session.id, SESSION_ID,
-        "conversation_id -> session_id"
-    );
-    let parts = &stored.messages[0].parts;
+    assert_eq!(session.id, SESSION_ID, "conversation_id -> session_id");
     assert!(
         parts
             .iter()
@@ -228,11 +224,11 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         )
         .await?;
     let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session(stored) = response.result else {
+    let GetResult::Session { parts, .. } = response.result else {
         panic!("expected a session result");
     };
     assert!(
-        stored.messages[0].parts.iter().any(|part| matches!(
+        parts.iter().any(|part| matches!(
             &part.kind,
             PartKind::Reasoning { text } if text == REASONING_TEXT
         )),

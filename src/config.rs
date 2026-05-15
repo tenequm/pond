@@ -9,23 +9,126 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::embed::DEFAULT_BATCH_TOKEN_SQ_BUDGET;
 
-/// Default `config.toml` body written by `pond setup`. Every line is commented:
-/// pond ships built-in defaults, so the file is purely a discoverable template.
+/// Where pond keeps its Lance datasets: a local directory or an object-store
+/// URI (`s3://...`, `gs://...`, `az://...`, ...). Lance accepts URIs directly
+/// for every supported backend; this type keeps the local-vs-remote branches
+/// type-checked rather than string-sniffed at each call site. Load-bearing in
+/// three places: opening (only local pre-creates the dir), the `config.toml`
+/// default (only local inherits the data dir; URI installs fall back to
+/// `$XDG_CONFIG_HOME/pond/config.toml` because the config file is always
+/// local - it names the bucket), and display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageLocation {
+    LocalPath(PathBuf),
+    Uri(String),
+}
+
+impl StorageLocation {
+    /// URI for a child of this location (typically one Lance dataset under
+    /// the data dir). Local paths use `Path::join`; URIs concatenate with a
+    /// single `/` separator after trimming any trailing slash on the base.
+    pub fn child_uri(&self, suffix: &str) -> String {
+        match self {
+            Self::LocalPath(path) => path.join(suffix).display().to_string(),
+            Self::Uri(uri) => format!("{}/{suffix}", uri.trim_end_matches('/')),
+        }
+    }
+
+    /// `Some(path)` only when this location is local. Used by the local-only
+    /// branches (`create_dir_all`, the `<data_dir>/config.toml` default).
+    pub fn local_path(&self) -> Option<&Path> {
+        match self {
+            Self::LocalPath(path) => Some(path),
+            Self::Uri(_) => None,
+        }
+    }
+}
+
+impl FromStr for StorageLocation {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if let Some((scheme, rest)) = s.split_once("://") {
+            // file:// reduces to a local path; everything else (s3, gs, az,
+            // abfs, https, ...) is a remote URI. Lance validates the scheme
+            // on first dataset open, so we don't gatekeep here.
+            if scheme.eq_ignore_ascii_case("file") {
+                return Ok(Self::LocalPath(PathBuf::from(rest)));
+            }
+            return Ok(Self::Uri(s.to_owned()));
+        }
+        Ok(Self::LocalPath(PathBuf::from(s)))
+    }
+}
+
+impl std::fmt::Display for StorageLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalPath(path) => path.display().fmt(f),
+            Self::Uri(uri) => f.write_str(uri),
+        }
+    }
+}
+
+impl From<PathBuf> for StorageLocation {
+    fn from(path: PathBuf) -> Self {
+        Self::LocalPath(path)
+    }
+}
+
+impl From<&Path> for StorageLocation {
+    fn from(path: &Path) -> Self {
+        Self::LocalPath(path.to_path_buf())
+    }
+}
+
+impl From<&PathBuf> for StorageLocation {
+    fn from(path: &PathBuf) -> Self {
+        Self::LocalPath(path.clone())
+    }
+}
+
+impl From<&StorageLocation> for StorageLocation {
+    fn from(location: &StorageLocation) -> Self {
+        location.clone()
+    }
+}
+
+/// Default `config.toml` body emitted by `pond config --print-schema`. Every
+/// line is commented: pond ships built-in defaults, so the file is purely a
+/// discoverable template and pond still works with no `config.toml` on disk.
 pub const DEFAULT_CONFIG_TOML: &str = "\
 # pond configuration.
 #
 # pond ships built-in defaults, so every setting here is optional - delete this
 # file and pond still works. Uncomment and edit to override.
 
+# Where pond looks for source data to import. One entry per adapter type
+# (`claude-code`, `codex`, ...). `pond sync` with no arguments syncs every
+# entry; `pond sync <adapter>` syncs just one. With an empty `[sources]`,
+# `pond sync` runs an interactive discovery against the known default paths
+# and writes the picks back here.
+#
+# [sources.claude-code]
+# path = \"~/.claude/projects\"
+#
+# [sources.codex]
+# path = \"~/.codex/sessions\"
+
 # Register or tune an embedding model. pond validates each entry against its
-# known-model set (model id, dimension, distance metric).
+# known-model set (model id, dimension, distance metric). `pond serve` and
+# `pond mcp` probe the embeddings table at boot and load the model only when
+# rows exist for the default identity, so embeddings stay fully opt-in: run
+# `pond embed` once to fill the backlog.
 #
 # [[embeddings.models]]
 # id = \"Qwen/Qwen3-Embedding-0.6B\"
@@ -58,6 +161,13 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// `[sources.<adapter>]` map: per-adapter config blobs the matching
+    /// factory deserializes inside its `open()`. The shape is adapter-defined
+    /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
+    /// expect endpoint + auth keys), so this layer stays opaque. Empty by
+    /// default; `pond sync` runs discovery into this map on first use.
+    #[serde(default)]
+    pub sources: BTreeMap<String, Value>,
 }
 
 /// The `[maintenance]` section: background `cleanup_old_versions` +
@@ -90,6 +200,9 @@ impl Default for MaintenanceConfig {
 }
 
 /// The `[embeddings]` section: the model registry plus per-namespace overrides.
+/// Embeddings are opt-in by data: `pond serve` / `pond mcp` probe the
+/// `embeddings` table at boot and load the model only when rows exist for the
+/// default identity. Run `pond embed` once to populate the backlog.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingsConfig {
@@ -150,8 +263,6 @@ struct KnownModel {
     code: &'static str,
     dim: u32,
     distance: Distance,
-    /// Approximate first-download size, surfaced by `pond setup`.
-    download_mb: u32,
 }
 
 /// v1 ships a single loader path: the Qwen3 candle backend via
@@ -161,37 +272,43 @@ const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
     code: "Qwen/Qwen3-Embedding-0.6B",
     dim: 1024,
     distance: Distance::Cosine,
-    download_mb: 1190,
 }];
 
-/// Approximate first-download size in MB for a known model's load repo.
-pub fn known_model_download_mb(repo: &str) -> Option<u32> {
-    KNOWN_MODELS
-        .iter()
-        .find(|known| known.code == repo)
-        .map(|known| known.download_mb)
-}
-
 /// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
-/// wins; otherwise `$XDG_DATA_HOME/pond`, falling back to
-/// `$HOME/.local/share/pond`. `xdg_data_home` is honored only if absolute, per
-/// the XDG base-directory spec.
+/// wins (and may carry an `s3://` / `gs://` / `az://` URI); otherwise the
+/// XDG-local fallback (`$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`,
+/// then `.pond`). `xdg_data_home` is honored only if absolute, per the XDG
+/// base-directory spec.
 pub fn resolve_data_dir(
-    explicit: Option<PathBuf>,
+    explicit: Option<StorageLocation>,
     xdg_data_home: Option<PathBuf>,
     home: Option<PathBuf>,
-) -> PathBuf {
-    if let Some(dir) = explicit {
-        return dir;
+) -> StorageLocation {
+    if let Some(location) = explicit {
+        return location;
     }
     if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
-        return xdg.join("pond");
+        return StorageLocation::LocalPath(xdg.join("pond"));
     }
     if let Some(home) = home {
-        return home.join(".local").join("share").join("pond");
+        return StorageLocation::LocalPath(home.join(".local").join("share").join("pond"));
     }
     // No HOME and no usable XDG var - stay usable rather than panic.
-    PathBuf::from(".pond")
+    StorageLocation::LocalPath(PathBuf::from(".pond"))
+}
+
+/// Local default path for `config.toml`. URI-backed data dirs always land
+/// here because the config file has to be local (it names the bucket and
+/// any creds). XDG hierarchy: `$XDG_CONFIG_HOME/pond/config.toml`, then
+/// `$HOME/.config/pond/config.toml`, then `.pond.toml` in cwd.
+pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(xdg) = xdg_config_home.filter(|path| path.is_absolute()) {
+        return xdg.join("pond").join("config.toml");
+    }
+    if let Some(home) = home {
+        return home.join(".config").join("pond").join("config.toml");
+    }
+    PathBuf::from(".pond.toml")
 }
 
 fn default_distance() -> Distance {
@@ -258,8 +375,8 @@ impl EmbeddingModel {
 
 impl Config {
     /// Load `config.toml` from `path` if it exists, merge user `[[embeddings.models]]`
-    /// over the built-in defaults by `id`, and validate the resolved registry.
-    /// A missing file yields the built-in defaults.
+    /// over the built-in defaults by `id`, expand `~` in source paths, and
+    /// validate the resolved registry. A missing file yields the built-in defaults.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut config = if path.exists() {
@@ -273,6 +390,9 @@ impl Config {
         config.embeddings.apply_builtin_defaults();
         config.embeddings.validate()?;
         config.maintenance.validate()?;
+        // Tilde expansion is per-adapter (inside each factory's `open()`):
+        // an API-backed adapter has no path to expand, and only the
+        // filesystem-shaped adapters need the helper. See `expand_home_under`.
         Ok(config)
     }
 
@@ -282,6 +402,47 @@ impl Config {
         config.embeddings.apply_builtin_defaults();
         config
     }
+
+    /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. With
+    /// `adapter = None` returns every entry (the no-arg sync path); with
+    /// `Some(name)` returns just that one or errors if it's not in config.
+    /// The caller is responsible for the discovery fallback when this returns
+    /// an empty list. Each tuple's `Value` is the opaque config blob to hand
+    /// to the matching factory's `open()`.
+    pub fn resolve_sources(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
+        match adapter {
+            None => Ok(self
+                .sources
+                .iter()
+                .map(|(name, blob)| (name.clone(), blob.clone()))
+                .collect()),
+            Some(name) => {
+                let blob = self
+                    .sources
+                    .get(name)
+                    .ok_or_else(|| anyhow!("no [sources.{name}] entry in config"))?;
+                Ok(vec![(name.to_owned(), blob.clone())])
+            }
+        }
+    }
+}
+
+/// Tilde-expand `path` against an explicit `home`. Filesystem-shaped adapters
+/// call this from inside their factory's `open()`. Tests use it directly to
+/// exercise the rule without mutating the process-wide `HOME` env var
+/// (`std::env::set_var` is `unsafe` under edition 2024 and pond forbids
+/// unsafe code).
+pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if text == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 impl EmbeddingsConfig {
@@ -395,6 +556,17 @@ impl EmbeddingsConfig {
             }
         }
         model
+    }
+}
+
+pub fn resolve_model(
+    config: &Config,
+    model: Option<&str>,
+    namespace: &str,
+) -> anyhow::Result<EmbeddingModel> {
+    match model {
+        Some(id) => config.embeddings.model(id, namespace),
+        None => config.embeddings.default_model(namespace),
     }
 }
 

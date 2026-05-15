@@ -8,13 +8,17 @@
 //! never one `merge_insert` per message.
 
 use anyhow::{Result, anyhow};
+use lance::index::vector::VectorIndexParams;
+use lance_linalg::distance::MetricType;
 use tokio_stream::StreamExt;
 
 use crate::{
-    config::EmbeddingModel,
-    datasets::{self, EmbeddingRow},
-    substrate::{PendingMessage, PondStore},
+    config::{Distance, EmbeddingModel},
+    sessions::{EmbeddingRow, PendingMessage, Store},
 };
+
+pub mod qwen3;
+pub use qwen3::Qwen3Embedder;
 
 /// Default ceiling on the number of messages in one model-inference + write
 /// batch. The cost budget below is the other, usually-binding, limiter.
@@ -74,6 +78,34 @@ pub const DEFAULT_WINDOW_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 /// safety bound - see [`cost_upper_bound`] for the bound the budget enforces.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 3;
 
+pub fn index_params(model: &EmbeddingModel, num_rows: usize) -> VectorIndexParams {
+    VectorIndexParams::ivf_pq(
+        ivf_num_partitions(num_rows),
+        8,
+        model.num_sub_vectors,
+        metric_type(model.distance),
+        15,
+    )
+}
+
+pub fn metric_type(distance: Distance) -> MetricType {
+    match distance {
+        Distance::Cosine => MetricType::Cosine,
+        Distance::L2 => MetricType::L2,
+        Distance::Dot => MetricType::Dot,
+    }
+}
+
+fn ivf_num_partitions(num_rows: usize) -> usize {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let sqrt = (num_rows as f64).sqrt().round() as usize;
+    sqrt.clamp(32, 4096)
+}
+
 /// A message's relative length, the key the length-sort window is ordered on.
 /// Bytes over the typical bytes-per-token ratio: a cheap monotonic proxy that
 /// groups similar-length messages so each batch pads to barely above its own
@@ -130,109 +162,6 @@ pub trait EmbedBackend: Send + Sync {
     fn max_embed_tokens(&self) -> i32;
 }
 
-/// The Qwen3 candle backend, loaded via `fastembed`'s `Qwen3TextEmbedding`.
-pub struct Qwen3Embedder {
-    inner: fastembed::Qwen3TextEmbedding,
-    dim: usize,
-    model_id: String,
-    max_embed_tokens: i32,
-}
-
-impl Qwen3Embedder {
-    /// Load the model weights from HuggingFace (cached after first download)
-    /// onto the Metal device on macOS, CPU elsewhere. The selected device is
-    /// logged at startup.
-    pub fn load(model: &EmbeddingModel) -> Result<Self> {
-        let device = select_device();
-        let label = device_label(&device);
-        // The Qwen3-Embedding weights ship as bf16; loading them as bf16 (rather
-        // than upconverting to f32) halves resident memory at no quality cost
-        // and keeps the full f32 exponent range, so no overflow risk.
-        //
-        // `max_embed_tokens` is the tokenizer `max_length`: input past it is
-        // truncated before inference, which is exactly the per-message cap - one
-        // message, one vector, bounded embed cost (plan.md Stage 2).
-        let inner = fastembed::Qwen3TextEmbedding::from_hf(
-            model.load_repo(),
-            &device,
-            candle_core::DType::BF16,
-            model.max_embed_tokens,
-        )
-        .map_err(|error| {
-            anyhow!(
-                "failed to load embedding model {}: {error}",
-                model.load_repo()
-            )
-        })?;
-        tracing::info!(model = %model.id, device = label, "loaded embedding model");
-        Ok(Self {
-            inner,
-            dim: model.dim as usize,
-            model_id: model.id.clone(),
-            max_embed_tokens: model.max_embed_tokens as i32,
-        })
-    }
-
-    /// The device the weights were loaded onto (`"metal"`, `"cuda"`, or `"cpu"`).
-    pub fn device(&self) -> &'static str {
-        device_label(self.inner.device())
-    }
-}
-
-impl EmbedBackend for Qwen3Embedder {
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.inner
-            .embed(texts)
-            .map_err(|error| anyhow!("embedding inference failed: {error}"))
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        self.max_embed_tokens
-    }
-}
-
-/// Whether `repo_id`'s weights and tokenizer are already in the local
-/// HuggingFace cache. Lets `pond setup` report "present" vs "downloading"
-/// without triggering a fetch.
-pub fn model_is_cached(repo_id: &str) -> bool {
-    let repo = hf_hub::Cache::from_env().model(repo_id.to_owned());
-    ["config.json", "tokenizer.json", "model.safetensors"]
-        .iter()
-        .all(|file| repo.get(file).is_some())
-}
-
-/// Select the embedding device: Metal on macOS, CUDA on a non-macOS build with
-/// the `cuda` feature, CPU otherwise. candle's `*_if_available` helpers return
-/// `Cpu` when the matching backend feature is not compiled into `candle-core`;
-/// `new_metal` / `new_cuda` can still fail at runtime (no GPU or driver), so an
-/// `Err` falls back to `Cpu` too. The chosen device is logged in [`Qwen3Embedder::load`].
-fn select_device() -> candle_core::Device {
-    #[cfg(target_os = "macos")]
-    let device = candle_core::Device::metal_if_available(0);
-    #[cfg(not(target_os = "macos"))]
-    let device = candle_core::Device::cuda_if_available(0);
-    device.unwrap_or_else(|error| {
-        tracing::warn!(%error, "GPU device unavailable, falling back to CPU");
-        candle_core::Device::Cpu
-    })
-}
-
-fn device_label(device: &candle_core::Device) -> &'static str {
-    match device {
-        candle_core::Device::Cpu => "cpu",
-        candle_core::Device::Cuda(_) => "cuda",
-        candle_core::Device::Metal(_) => "metal",
-    }
-}
-
 /// Outcome of an [`EmbedWorker::run`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedSummary {
@@ -242,12 +171,26 @@ pub struct EmbedSummary {
     pub batches: usize,
 }
 
+/// Per-batch stats handed to a progress callback. Lets `pond embed` drive an
+/// `indicatif` bar without leaking the crate into this module's API.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchProgress {
+    /// Messages embedded in this batch.
+    pub batch_messages: usize,
+    /// Running message total across the run.
+    pub total_messages: usize,
+    /// Running batch count across the run.
+    pub total_batches: usize,
+}
+
+type ProgressFn = Box<dyn Fn(BatchProgress) + Send + Sync>;
+
 /// Populates the `embeddings` dataset for one registry model. Reads
 /// `messages.search_text` directly (no second concatenation path), batches
 /// messages through the backend one vector each, and writes embedding rows in
 /// batches.
 pub struct EmbedWorker<'a, B: EmbedBackend> {
-    store: &'a PondStore,
+    store: &'a Store,
     backend: &'a B,
     model_id: String,
     /// Token cap applied per message before estimating its batch cost; mirrors
@@ -274,12 +217,15 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
     /// production (embed everything), set by the benchmark harness to a fixed
     /// count so a run is a stable, comparable workload.
     limit: Option<usize>,
+    /// Optional per-batch progress callback. Called once per `flush()` with
+    /// the running totals; `pond embed` wires this to an `indicatif` bar.
+    progress: Option<ProgressFn>,
 }
 
 impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
     /// Build a worker for `model`. The backend's [`dim`](EmbedBackend::dim) must
     /// match the model's declared `dim`.
-    pub fn new(store: &'a PondStore, backend: &'a B, model: &EmbeddingModel) -> Result<Self> {
+    pub fn new(store: &'a Store, backend: &'a B, model: &EmbeddingModel) -> Result<Self> {
         if backend.dim() != model.dim as usize {
             return Err(anyhow!(
                 "backend dim {} does not match model {} dim {}",
@@ -298,7 +244,19 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             window_size: DEFAULT_LENGTH_WINDOW,
             window_byte_budget: DEFAULT_WINDOW_BYTE_BUDGET,
             limit: None,
+            progress: None,
         })
+    }
+
+    /// Register a per-batch progress callback. Called once after each
+    /// `flush()` with the messages in the just-finished batch and the running
+    /// totals. `pond embed` uses this to drive an `indicatif` progress bar.
+    pub fn with_progress(
+        mut self,
+        callback: impl Fn(BatchProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = Some(Box::new(callback));
+        self
     }
 
     /// Override the message-count ceiling per batch (default
@@ -359,42 +317,40 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         // does not blow short messages up to a long one's length.
         let mut window: Vec<StagedMessage> = Vec::with_capacity(self.window_size);
         let mut window_bytes = 0usize;
-        let mut stream = self.store.pending_messages_stream().await?;
-        'pull: while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            for row in 0..batch.num_rows() {
-                let mut pending = datasets::pending_message_from_batch(&batch, row)?;
-                if embedded.contains(&pending.message_id) {
-                    continue;
-                }
-                summary.messages += 1;
-                // Move `search_text` out of the message: it is handed to the
-                // backend, and the embedding row never carries it.
-                let text = std::mem::take(&mut pending.search_text);
-                window_bytes += text.len();
-                let tokens = estimate_tokens(&text, self.max_embed_tokens);
-                let cost_tokens = cost_upper_bound(&text, self.max_embed_tokens);
-                window.push(StagedMessage {
-                    message: pending,
-                    text,
-                    tokens,
-                    cost_tokens,
-                });
+        let stream = self.store.pending_messages_stream();
+        tokio::pin!(stream);
+        'pull: while let Some(pending) = stream.next().await {
+            let mut pending = pending?;
+            if embedded.contains(&pending.message_id) {
+                continue;
+            }
+            summary.messages += 1;
+            // Move `search_text` out of the message: it is handed to the
+            // backend, and the embedding row never carries it.
+            let text = std::mem::take(&mut pending.search_text);
+            window_bytes += text.len();
+            let tokens = estimate_tokens(&text, self.max_embed_tokens);
+            let cost_tokens = cost_upper_bound(&text, self.max_embed_tokens);
+            window.push(StagedMessage {
+                message: pending,
+                text,
+                tokens,
+                cost_tokens,
+            });
 
-                // Drain on whichever fills first: the count cap bounds the sort
-                // cost, the byte cap bounds host RSS (the window holds
-                // untruncated `search_text`, so a run of large messages could
-                // otherwise spike memory before any model call).
-                if window.len() >= self.window_size || window_bytes >= self.window_byte_budget {
-                    self.drain_window(&mut window, &mut summary).await?;
-                    window_bytes = 0;
-                }
+            // Drain on whichever fills first: the count cap bounds the sort
+            // cost, the byte cap bounds host RSS (the window holds
+            // untruncated `search_text`, so a run of large messages could
+            // otherwise spike memory before any model call).
+            if window.len() >= self.window_size || window_bytes >= self.window_byte_budget {
+                self.drain_window(&mut window, &mut summary).await?;
+                window_bytes = 0;
+            }
 
-                // Stop pulling once the message cap is reached; the window is
-                // still drained below, so exactly `limit` messages are embedded.
-                if self.limit.is_some_and(|limit| summary.messages >= limit) {
-                    break 'pull;
-                }
+            // Stop pulling once the message cap is reached; the window is
+            // still drained below, so exactly `limit` messages are embedded.
+            if self.limit.is_some_and(|limit| summary.messages >= limit) {
+                break 'pull;
             }
         }
         self.drain_window(&mut window, &mut summary).await?;
@@ -496,8 +452,16 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             });
         }
 
+        let batch_messages = rows.len();
         self.store.upsert_embeddings(&rows).await?;
         summary.batches += 1;
+        if let Some(progress) = &self.progress {
+            progress(BatchProgress {
+                batch_messages,
+                total_messages: summary.messages,
+                total_batches: summary.batches,
+            });
+        }
         Ok(())
     }
 }
@@ -510,27 +474,4 @@ struct StagedMessage {
     /// Conservative upper bound on token count - what the cost budget is
     /// enforced against, so the budget can never be under-counted past.
     cost_tokens: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{device_label, select_device};
-
-    // plan.md Stage 2 done-when: the embedding worker runs on the Metal device
-    // on macOS (real Apple hardware), never the CPU fallback; a default
-    // non-macOS build runs on CPU. `select_device` is the device-selection path
-    // the worker takes; exercising it needs no model weights. A `--features cuda`
-    // build can select a GPU at runtime, so the CPU assertion is scoped to the
-    // default (no-`cuda`) build.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_selects_the_metal_device() {
-        assert_eq!(device_label(&select_device()), "metal");
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
-    #[test]
-    fn non_macos_selects_cpu() {
-        assert_eq!(device_label(&select_device()), "cpu");
-    }
 }

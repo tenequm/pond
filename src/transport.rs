@@ -9,15 +9,17 @@
 
 use std::sync::Arc;
 
-use crate::{embed::EmbedBackend, substrate::PondStore};
+use crate::{embed::EmbedBackend, sessions::Store};
 
-/// Shared state handed to both transports: the store and the embedding backend
-/// (`pond_search` needs the backend to embed the query). `Arc<dyn EmbedBackend>`
-/// so tests can inject a fake backend without loading model weights.
+/// Shared state handed to both transports: the store and an optional embedding
+/// backend. `embedder` is `None` when the store has no embeddings for the
+/// configured model (see `Store::has_embeddings`) - in that mode
+/// `pond serve` / `pond mcp` boot without loading the model and `pond_search`
+/// runs FTS-only.
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<PondStore>,
-    pub embedder: Arc<dyn EmbedBackend>,
+    pub store: Arc<Store>,
+    pub embedder: Option<Arc<dyn EmbedBackend>>,
 }
 
 pub mod http {
@@ -35,9 +37,11 @@ pub mod http {
 
     use super::AppState;
     use crate::{
-        get::pond_get,
-        search::pond_search,
-        wire::{ErrorCode, GetEnvelope, GetRequest, SearchEnvelope, SearchRequest},
+        handlers::pond_get,
+        handlers::pond_search,
+        wire::{
+            ErrorCode, GetEnvelope, GetRequest, SearchEnvelope, SearchRequest, default_namespace,
+        },
     };
 
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
@@ -90,9 +94,10 @@ pub mod http {
 
     async fn search(
         State(state): State<AppState>,
-        Json(request): Json<SearchRequest>,
+        Json(mut request): Json<SearchRequest>,
     ) -> (StatusCode, Json<SearchEnvelope>) {
-        let envelope = pond_search(&state.store, state.embedder.as_ref(), request).await;
+        request.namespace.get_or_insert_with(default_namespace);
+        let envelope = pond_search(&state.store, state.embedder.as_deref(), request).await;
         let status = match &envelope {
             SearchEnvelope::Success(_) => StatusCode::OK,
             SearchEnvelope::Error(error) => status_for(&error.error.code),
@@ -102,8 +107,9 @@ pub mod http {
 
     async fn get(
         State(state): State<AppState>,
-        Json(request): Json<GetRequest>,
+        Json(mut request): Json<GetRequest>,
     ) -> (StatusCode, Json<GetEnvelope>) {
+        request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_get(&state.store, request).await;
         let status = match &envelope {
             GetEnvelope::Success(_) => StatusCode::OK,
@@ -151,14 +157,13 @@ pub mod mcp {
     use super::AppState;
     use crate::{
         PROTOCOL_VERSION,
-        get::pond_get as run_get,
-        search::pond_search as run_search,
-        types::{PartKind, StoredMessage},
+        handlers::pond_get as run_get,
+        handlers::pond_search as run_search,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResult,
-            ProjectMatch, SearchEnvelope, SearchFilters, SearchMode, SearchRequest,
-            default_namespace,
+            ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
         },
+        wire::{Part, PartKind},
     };
 
     /// Static documentation served as the `schema://pond` resource.
@@ -262,7 +267,10 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
 
         #[tool(
             description = "Hybrid search (vector + full-text + RRF) over stored conversation \
-                           history. Returns ranked message hits. Keep `query` semantic; use \
+                           history. Returns ranked message hits. Auto-degrades to FTS-only \
+                           when embeddings are disabled or absent for this store; the response \
+                           carries no top-level mode field - each hit's `matched_via` array \
+                           reports which retriever(s) ranked it. Keep `query` semantic; use \
                            the `project` / `conversation_id` filters for scope."
         )]
         async fn pond_search(
@@ -271,9 +279,8 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         ) -> Result<CallToolResult, ErrorData> {
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
-                namespace: default_namespace(),
+                namespace: Some(default_namespace()),
                 query: params.query,
-                search_mode: SearchMode::default(),
                 rrf_k: 60,
                 filters: SearchFilters {
                     project: params.project,
@@ -289,7 +296,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 group_by_conversation: params.group_by_conversation.unwrap_or(false),
                 limit: params.limit.unwrap_or(10),
             };
-            match run_search(&self.state.store, self.state.embedder.as_ref(), request).await {
+            match run_search(&self.state.store, self.state.embedder.as_deref(), request).await {
                 SearchEnvelope::Success(response) => json_result(&response),
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
@@ -314,7 +321,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             // not in the handler.
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
-                namespace: default_namespace(),
+                namespace: Some(default_namespace()),
                 session_id: params.conversation_id,
                 message_id: params.message_id,
                 up_to: params.up_to,
@@ -426,25 +433,22 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         include_thinking: bool,
         include_tool_results: bool,
     ) {
-        let messages: &mut Vec<StoredMessage> = match result {
-            GetResult::Session(session) => &mut session.messages,
-            GetResult::Message { messages, .. } => messages,
+        let parts: &mut Vec<Part> = match result {
+            GetResult::Session { parts, .. } | GetResult::Message { parts, .. } => parts,
         };
-        for stored in messages.iter_mut() {
-            for part in stored.parts.iter_mut() {
-                let placeholder = match &part.kind {
-                    PartKind::Reasoning { text } if !include_thinking => {
-                        Some(format!("[reasoning: {} chars]", text.chars().count()))
-                    }
-                    PartKind::ToolResult { result, .. } if !include_tool_results => Some(format!(
-                        "[tool_result: {} chars]",
-                        result.to_string().chars().count()
-                    )),
-                    _ => None,
-                };
-                if let Some(text) = placeholder {
-                    part.kind = PartKind::Text { text };
+        for part in parts.iter_mut() {
+            let placeholder = match &part.kind {
+                PartKind::Reasoning { text } if !include_thinking => {
+                    Some(format!("[reasoning: {} chars]", text.chars().count()))
                 }
+                PartKind::ToolResult { result, .. } if !include_tool_results => Some(format!(
+                    "[tool_result: {} chars]",
+                    result.to_string().chars().count()
+                )),
+                _ => None,
+            };
+            if let Some(text) = placeholder {
+                part.kind = PartKind::Text { text };
             }
         }
     }

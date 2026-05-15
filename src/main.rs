@@ -1,19 +1,22 @@
 use std::{
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::bail;
+use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
-    adapter::{Adapter, ClaudeCodeAdapter},
-    config::{Config, DEFAULT_CONFIG_TOML, MaintenanceConfig, known_model_download_mb},
-    embed::{EmbedBackend, EmbedWorker, Qwen3Embedder, model_is_cached},
-    substrate::PondStore,
+    adapter,
+    config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig, StorageLocation},
+    embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
+    handlers::{self, IngestSummary},
+    sessions::Store,
     transport::{self, AppState},
 };
+use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
@@ -25,34 +28,35 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Resolve the data dir, write a default config, fetch and verify the model.
-    Setup {
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
-        #[arg(long, env = "POND_CONFIG")]
-        config: Option<PathBuf>,
-        /// Registry model id to set up; defaults to the registry default.
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value = "local")]
-        namespace: String,
-        /// Skip the download confirmation prompt (scripts, CI, package hooks).
-        #[arg(long)]
-        yes: bool,
-    },
     /// Print basic binary status.
     Status {
         #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+        data_dir: Option<StorageLocation>,
     },
-    /// Ingest sessions from a source adapter: parse, store, embed, and index.
-    Ingest {
-        #[arg(long = "from", value_enum)]
-        from: SourceName,
-        #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+    /// Import sessions from one or more configured source adapters. With no
+    /// `<adapter>` arg, syncs every entry in `[sources.*]`. With an empty
+    /// `[sources]` config, runs adapter discovery: each adapter probes its
+    /// canonical install location, the operator picks which to register, and
+    /// the picks are written back to `config.toml` before the sync proceeds.
+    Sync {
+        /// Optional adapter name (`claude-code`, `codex`, ...). Omit to sync
+        /// every configured source.
+        adapter: Option<String>,
+        /// One-off source-path override. Bypasses `[sources.<adapter>]` and
+        /// does not modify `config.toml`. Requires `<adapter>` to be set.
         #[arg(long)]
         source_dir: Option<PathBuf>,
+        #[arg(long, env = "POND_DATA_DIR")]
+        data_dir: Option<StorageLocation>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+    },
+    /// Embed the un-embedded message backlog under the registered model.
+    /// Idempotent: the PK is `(message_id, model_id, max_embed_tokens)`, so a
+    /// re-run picks up where the last one left off.
+    Embed {
+        #[arg(long, env = "POND_DATA_DIR")]
+        data_dir: Option<StorageLocation>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Registry model id to embed with; defaults to the registry default.
@@ -60,6 +64,9 @@ enum Command {
         model: Option<String>,
         #[arg(long, default_value = "local")]
         namespace: String,
+        /// Optional cap on messages embedded this run (mostly for benchmarks).
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Run the HTTP+JSON server, including the streamable-HTTP MCP `/mcp` route.
     Serve {
@@ -68,7 +75,7 @@ enum Command {
         #[arg(long, env = "POND_PORT", default_value_t = 9797)]
         port: u16,
         #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+        data_dir: Option<StorageLocation>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -80,7 +87,7 @@ enum Command {
     /// all diagnostics go to stderr.
     Mcp {
         #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+        data_dir: Option<StorageLocation>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -92,7 +99,7 @@ enum Command {
     /// Runs regardless of the `[maintenance].enabled` config flag.
     Maintenance {
         #[arg(long, env = "POND_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+        data_dir: Option<StorageLocation>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Override the cleanup retention window, in days.
@@ -113,120 +120,84 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SourceName {
-    ClaudeCode,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Setup {
-            data_dir,
-            config,
-            model,
-            namespace,
-            yes,
-        } => {
-            let data_dir = resolve_data_dir(data_dir);
-            tokio::fs::create_dir_all(&data_dir)
-                .await
-                .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
-            output(&format!("data dir: {}", data_dir.display()))?;
-
-            let config_path = config_path(config, &data_dir);
-            if config_path.exists() {
-                output(&format!("config:   {} (exists)", config_path.display()))?;
-            } else {
-                tokio::fs::write(&config_path, DEFAULT_CONFIG_TOML)
-                    .await
-                    .with_context(|| format!("failed to write config {}", config_path.display()))?;
-                output(&format!("config:   {} (created)", config_path.display()))?;
-            }
-
-            let config = Config::load(&config_path)?;
-            let model = resolve_model(&config, model.as_deref(), &namespace)?;
-
-            if model_is_cached(model.load_repo()) {
-                output(&format!(
-                    "model:    {} (present, skipping download)",
-                    model.id
-                ))?;
-            } else {
-                let size = known_model_download_mb(model.load_repo())
-                    .map_or_else(|| "unknown size".to_owned(), |mb| format!("~{mb} MB"));
-                output(&format!(
-                    "model:    {} (not cached - downloading {size} to the HuggingFace cache)",
-                    model.id
-                ))?;
-                if !yes && !confirm("proceed with download?")? {
-                    output("setup aborted")?;
-                    return Ok(());
-                }
-            }
-
-            // Load on the selected device and embed a probe: this verifies the
-            // weights, the output dimension, and the device path in one shot.
-            let embedder = Qwen3Embedder::load(&model)?;
-            let probe = embedder.embed(&["pond setup readiness probe".to_owned()])?;
-            let probe_dim = probe.first().map_or(0, Vec::len);
-            if probe_dim != model.dim as usize {
-                anyhow::bail!(
-                    "model {} produced dim {probe_dim}, registry declares {}",
-                    model.id,
-                    model.dim,
-                );
-            }
-            output(&format!("device:   {}", embedder.device()))?;
-            output(&format!(
-                "ready:    model {} verified at {} dim",
-                model.id, model.dim
-            ))?;
-            output("next:     pond ingest --from claude-code")?;
-        }
         Command::Status { data_dir } => {
-            let store = PondStore::open(resolve_data_dir(data_dir)).await?;
+            let store = Store::open(resolve_data_dir(data_dir)).await?;
             let (sessions, messages, parts, embeddings) = store.row_counts().await?;
             output(&format!(
                 "sessions={sessions} messages={messages} parts={parts} embeddings={embeddings}"
             ))?;
         }
-        Command::Ingest {
-            from,
-            data_dir,
+        Command::Sync {
+            adapter,
             source_dir,
+            data_dir,
+            config,
+        } => {
+            let data_dir = resolve_data_dir(data_dir);
+            let config_file = config_path(config, &data_dir);
+            let loaded = Config::load(&config_file)?;
+            let store = Store::open(&data_dir).await?;
+            let sources =
+                resolve_sync_sources(&loaded, &config_file, adapter.as_deref(), source_dir)?;
+            for (name, config) in sources {
+                let summary = sync_one(&store, &name, config).await?;
+                output(&format!(
+                    "sync {name}: accepted={} inserted={} matched={} errors={}",
+                    summary.accepted(),
+                    summary.inserted,
+                    summary.matched,
+                    summary.errors,
+                ))?;
+            }
+            store.ensure_indices().await?;
+        }
+        Command::Embed {
+            data_dir,
             config,
             model,
             namespace,
+            limit,
         } => {
             let data_dir = resolve_data_dir(data_dir);
             let config = Config::load(config_path(config, &data_dir))?;
-            let model = resolve_model(&config, model.as_deref(), &namespace)?;
-            let store = PondStore::open(&data_dir).await?;
-            let adapter = match from {
-                SourceName::ClaudeCode => Adapter::ClaudeCode(ClaudeCodeAdapter::new(
-                    source_dir.unwrap_or_else(default_claude_code_dir),
-                )),
-            };
-            let ingest = adapter.ingest(&store).await?;
-            store.ensure_indices().await?;
-
-            // Embedding is part of ingest: a message is either fully in the
-            // system - parsed, stored, indexed, searchable - or not in at all.
+            let model = config::resolve_model(&config, model.as_deref(), &namespace)?;
+            let store = Store::open(&data_dir).await?;
             let embedder = Qwen3Embedder::load(&model)?;
-            let embed = EmbedWorker::new(&store, &embedder, &model)?.run().await?;
+            // `indicatif` auto-detects tty and degrades to log-line output in
+            // CI / non-tty contexts, so this is safe to always wire.
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.green} embed: {msg} ({elapsed_precise})")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+            );
+            bar.enable_steady_tick(Duration::from_millis(120));
+            let bar_for_callback = bar.clone();
+            let mut worker = EmbedWorker::new(&store, &embedder, &model)?.with_progress(
+                move |progress: BatchProgress| {
+                    bar_for_callback.set_message(format!(
+                        "batches={} messages={} (+{} this batch)",
+                        progress.total_batches, progress.total_messages, progress.batch_messages,
+                    ));
+                },
+            );
+            if let Some(limit) = limit {
+                worker = worker.with_limit(limit);
+            }
+            let summary = worker.run().await?;
             store.ensure_embedding_indices(&model).await?;
-
+            bar.finish_with_message(format!(
+                "done: batches={} messages={}",
+                summary.batches, summary.messages
+            ));
             output(&format!(
-                "accepted={} inserted={} matched={} errors={} embedded={}",
-                ingest.accepted(),
-                ingest.inserted,
-                ingest.matched,
-                ingest.errors,
-                embed.messages,
+                "embed: model={} batches={} messages={}",
+                model.id, summary.batches, summary.messages,
             ))?;
         }
         Command::Serve {
@@ -239,12 +210,20 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir);
             let config = Config::load(config_path(config, &data_dir))?;
-            let model = resolve_model(&config, model.as_deref(), &namespace)?;
-            // Load the embedding model at boot: it is required to embed search
-            // queries, so a missing or broken model fails loudly here, not on
-            // the first search.
-            let embedder: Arc<dyn EmbedBackend> = Arc::new(Qwen3Embedder::load(&model)?);
-            let store = Arc::new(PondStore::open(&data_dir).await?);
+            let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
+            let store = Arc::new(Store::open(&data_dir).await?);
+            // Probe the embeddings table: if there's at least one row for the
+            // default model identity, load the model so hybrid search works;
+            // otherwise boot without weights and let `pond_search` run
+            // FTS-only. Operators opt in via `pond embed`, not a config flag.
+            let embedder: Option<Arc<dyn EmbedBackend>> = if store
+                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
+                .await?
+            {
+                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+            } else {
+                None
+            };
             if config.maintenance.enabled {
                 spawn_maintenance(Arc::clone(&store), &config.maintenance);
             }
@@ -259,9 +238,16 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir);
             let config = Config::load(config_path(config, &data_dir))?;
-            let model = resolve_model(&config, model.as_deref(), &namespace)?;
-            let embedder: Arc<dyn EmbedBackend> = Arc::new(Qwen3Embedder::load(&model)?);
-            let store = Arc::new(PondStore::open(&data_dir).await?);
+            let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
+            let store = Arc::new(Store::open(&data_dir).await?);
+            let embedder: Option<Arc<dyn EmbedBackend>> = if store
+                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
+                .await?
+            {
+                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+            } else {
+                None
+            };
             // `pond mcp` writes only JSON-RPC frames to stdout; the maintenance
             // task is `pond serve`-only, so it is not spawned here.
             transport::mcp::serve_stdio(AppState { store, embedder }).await?;
@@ -278,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
             let retention_days = older_than_days.unwrap_or(config.maintenance.retention_days);
             let retention =
                 chrono::Duration::days(i64::try_from(retention_days).unwrap_or(i64::MAX));
-            let store = PondStore::open(&data_dir).await?;
+            let store = Store::open(&data_dir).await?;
             let report = store
                 .maintenance(retention, skip_cleanup, skip_optimize)
                 .await;
@@ -307,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
 /// fires immediately, so it is consumed up front - `pond serve` does not run
 /// maintenance at boot. Failures are logged at warn and retried next interval;
 /// they never crash the server.
-fn spawn_maintenance(store: Arc<PondStore>, config: &MaintenanceConfig) {
+fn spawn_maintenance(store: Arc<Store>, config: &MaintenanceConfig) {
     let interval = Duration::from_secs(config.interval_secs);
     let retention =
         chrono::Duration::days(i64::try_from(config.retention_days).unwrap_or(i64::MAX));
@@ -328,19 +314,6 @@ fn spawn_maintenance(store: Arc<PondStore>, config: &MaintenanceConfig) {
     });
 }
 
-/// Resolve the embedding model from config: an explicit `--model` id, otherwise
-/// the registry default, with any namespace overrides applied.
-fn resolve_model(
-    config: &Config,
-    model: Option<&str>,
-    namespace: &str,
-) -> anyhow::Result<pond::config::EmbeddingModel> {
-    match model {
-        Some(id) => config.embeddings.model(id, namespace),
-        None => config.embeddings.default_model(namespace),
-    }
-}
-
 fn init_tracing() {
     let filter = EnvFilter::try_from_env("POND_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
@@ -351,25 +324,12 @@ fn init_tracing() {
 
 #[allow(clippy::print_stdout)]
 fn output(message: &str) -> anyhow::Result<()> {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{message}").context("failed to write command output")
-}
-
-/// Prompt on stdout for a yes/no answer; anything but an explicit yes is no.
-#[allow(clippy::print_stdout)]
-fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush().context("failed to flush prompt")?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .context("failed to read confirmation")?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+    pond::output::line(message)
 }
 
 /// Resolve the data dir from the CLI/env argument, falling back to the XDG
 /// location (see [`pond::config::resolve_data_dir`]).
-fn resolve_data_dir(explicit: Option<PathBuf>) -> PathBuf {
+fn resolve_data_dir(explicit: Option<StorageLocation>) -> StorageLocation {
     pond::config::resolve_data_dir(
         explicit,
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
@@ -377,15 +337,82 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> PathBuf {
     )
 }
 
-/// The config path: an explicit `--config` wins, otherwise `<data_dir>/config.toml`.
-fn config_path(explicit: Option<PathBuf>, data_dir: &Path) -> PathBuf {
-    explicit.unwrap_or_else(|| data_dir.join("config.toml"))
+/// The config path: an explicit `--config` wins; otherwise local data dirs
+/// default to `<data_dir>/config.toml` and URI-backed data dirs fall back to
+/// `$XDG_CONFIG_HOME/pond/config.toml` (the config file is always local -
+/// you can't read the bucket without the config that names the bucket).
+fn config_path(explicit: Option<PathBuf>, data_dir: &StorageLocation) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    match data_dir.local_path() {
+        Some(path) => path.join("config.toml"),
+        None => pond::config::default_config_path(
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        ),
+    }
 }
 
-fn default_claude_code_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-        .join("projects")
+/// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
+///
+/// Precedence:
+/// 1. `--source-dir <path>` with `<adapter>` set: one-off run, no config writes.
+/// 2. `<adapter>` set, `[sources.<adapter>].path` present: use that.
+/// 3. `<adapter>` set, no config entry: run per-adapter discovery (one
+///    candidate), prompt to add it, persist, then use it.
+/// 4. No `<adapter>`, `[sources]` non-empty: sync every entry.
+/// 5. No `<adapter>`, empty `[sources]`: discover across every adapter,
+///    prompt, persist, then sync the picks.
+fn resolve_sync_sources(
+    config: &Config,
+    config_file: &Path,
+    name: Option<&str>,
+    source_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<(String, Value)>> {
+    if let Some(source_dir) = source_dir {
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!("--source-dir requires an explicit <adapter> positional argument")
+        })?;
+        let known = adapter::known_names();
+        if !known.contains(&name) {
+            bail!("unknown adapter {name:?}; known: {}", known.join(", "));
+        }
+        // `--source-dir` is a filesystem-shaped override. Adapters that need
+        // a richer config blob can't use this path; they must edit config.toml.
+        return Ok(vec![(name.to_owned(), json!({ "path": source_dir }))]);
+    }
+
+    if let Some(name) = name {
+        let known = adapter::known_names();
+        if !known.contains(&name) {
+            bail!("unknown adapter {name:?}; known: {}", known.join(", "));
+        }
+        if let Some(blob) = config.sources.get(name) {
+            return Ok(vec![(name.to_owned(), blob.clone())]);
+        }
+        let candidates = adapter::discover(Some(name));
+        let picks = adapter::prompt_and_persist(config_file, &candidates)?;
+        return Ok(picks.into_iter().map(|c| (c.name, c.config)).collect());
+    }
+
+    if !config.sources.is_empty() {
+        return config.resolve_sources(None);
+    }
+    let candidates = adapter::discover(None);
+    let picks = adapter::prompt_and_persist(config_file, &candidates)?;
+    Ok(picks.into_iter().map(|c| (c.name, c.config)).collect())
+}
+
+/// Run one adapter's ingest pass into `store`. Looks up the factory by name,
+/// opens it against the provided config blob, and drains its events stream.
+async fn sync_one(store: &Store, name: &str, config: Value) -> anyhow::Result<IngestSummary> {
+    let factory = adapter::by_name(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown adapter {name:?}; known: {}",
+            adapter::known_names().join(", "),
+        )
+    })?;
+    let adapter = factory.open(config)?;
+    handlers::ingest_adapter(store, adapter.as_ref()).await
 }

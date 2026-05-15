@@ -16,8 +16,8 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     config::Config,
     embed::{EmbedBackend, EmbedWorker},
-    ingest::ingest_adapter,
-    substrate::PondStore,
+    handlers::ingest_adapter,
+    sessions::Store,
     transport::{AppState, http},
     wire::{ErrorCode, GetEnvelope, SearchEnvelope},
 };
@@ -65,9 +65,9 @@ fn fake_vector(text: &str, dim: usize) -> Vec<f32> {
 
 /// Ingest the claude-code fixtures, index, embed - exactly the corpus
 /// `pond serve` would expose - and wrap it in an `AppState` + router.
-async fn router() -> anyhow::Result<(TempDir, Arc<PondStore>, Router)> {
+async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES)).await?;
     store.ensure_indices().await?;
 
@@ -81,7 +81,7 @@ async fn router() -> anyhow::Result<(TempDir, Arc<PondStore>, Router)> {
     let store = Arc::new(store);
     let state = AppState {
         store: Arc::clone(&store),
-        embedder: Arc::new(backend),
+        embedder: Some(Arc::new(backend)),
     };
     Ok((temp, store, http::router(state)))
 }
@@ -137,10 +137,10 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
     let GetEnvelope::Success(response) = envelope else {
         panic!("expected a successful get");
     };
-    let pond::wire::GetResult::Session(stored) = response.result else {
+    let pond::wire::GetResult::Session { session, .. } = response.result else {
         panic!("expected a session result");
     };
-    assert_eq!(stored.session.id, session_id);
+    assert_eq!(session.id, session_id);
 
     Ok(())
 }

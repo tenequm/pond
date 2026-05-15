@@ -333,8 +333,11 @@ envelope, 3.6.3 pond_get, 3.6.4 pond_ingest handler logic.
 - `mod search` - the `pond_search` handler: vector kNN + BM25 FTS retrievers, each
   with `Scanner::prefilter(true)` (load-bearing - design.md 3.3 implementation note),
   RRF merge on `message_id` (k=60), recency boost (3.3 formula), `min_score`
-  postfilter, `group_by_conversation` collapse, `search_mode` override
-  (hybrid/vector/fts). All filters: `project` + `project_match`, `session_id`,
+  postfilter, `group_by_conversation` collapse, and server-determined mode with
+  auto-degrade (hybrid when the embedder is loaded AND has embeddings for its
+  identity, FTS-only otherwise; per-hit `matched_via` carries the retriever
+  provenance, no top-level `search_mode` field on the response). All
+  filters: `project` + `project_match`, `session_id`,
   `from_date` / `to_date`, `role`, `source_agent`, `limit` (cap 200).
 - Embedding model registry: config-driven `[[embeddings.models]]`, validated against
   pond's own known-model set, built-in Qwen3 default (design.md 3.2.4, as corrected).
@@ -492,10 +495,17 @@ replacing `kb` in the MCP config.
 
 **Build**:
 - No new source files. This stage is operational.
-- Run `pond setup` once to resolve the data dir and fetch the model, then
-  `pond ingest --from claude-code` against the real `~/.claude/projects/` into the
-  personal data dir (`$XDG_DATA_HOME/pond/`). Ingest parses, stores, embeds, and
-  builds the indexes in one pass - there is no separate embed step.
+- Run `pond sync` (no args). With an empty `[sources]` block in
+  `$XDG_DATA_HOME/pond/config.toml`, pond runs interactive adapter discovery
+  against each known adapter's canonical install location (`~/.claude/projects`
+  for claude-code, `~/.codex/sessions` for codex, ...), writes the picked rows
+  to `[sources.<adapter>]`, and continues into sync. Subsequent runs sync
+  incrementally (`merge_insert` PK makes it idempotent). The data dir is
+  created on first `Store::open`.
+- Run `pond embed` once to populate the `embeddings` table. Hybrid search
+  goes live on the next `pond serve` / `pond mcp` boot - those probe the
+  `embeddings` table and load the model only when rows exist for the default
+  identity. The model is fetched via hf-hub on first load.
 - Swap the MCP server entry in the Claude Code MCP config: `kb` -> `pond mcp` (stdio
   MCP server; stdout reserved for JSON-RPC, all logs to stderr).
 - Parity smoke: a named, written-down checklist re-run against `pond_search` /

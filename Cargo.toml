@@ -12,7 +12,9 @@ axum = "0.8.9"
 candle-core = "0.10.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+dialoguer = { version = "0.12", default-features = false }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
+indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
 lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
@@ -29,6 +31,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1.18"
 toml = "1.1"
+toml_edit = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23", features = ["v7"] }

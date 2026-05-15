@@ -9,17 +9,21 @@ use lance_linalg::distance::MetricType;
 use pond::{
     adapter::ClaudeCodeAdapter,
     config::{Config, Distance},
-    datasets::{EMBEDDING_DIM, EmbeddingRow},
-    embed::{EmbedBackend, EmbedWorker},
-    get::pond_get,
-    ingest::{IngestEvent, ingest_adapter, pond_ingest},
-    search::{RankedList, build_filter, make_preview, pond_search, recency_boost, rrf_merge},
-    substrate::{PondStore, metric_type},
-    types::{Message, Part, PartKind, ProviderOptions, Session},
+    embed::{EmbedBackend, EmbedWorker, metric_type},
+    handlers::pond_get,
+    handlers::{IngestEvent, ingest_adapter, pond_ingest},
+    handlers::{
+        RankedList, RetrieverKind, build_filter, make_preview, pond_search, recency_boost,
+        rrf_merge,
+    },
+    sessions::Store,
+    sessions::{EMBEDDING_DIM, EmbeddingRow},
+    substrate::Predicate,
     wire::{
         GetEnvelope, GetRequest, GetResult, Hit, IngestEnvelope, IngestRequest, ProjectMatch,
-        SearchEnvelope, SearchFilters, SearchMode, SearchRequest, SearchResultBody,
+        SearchEnvelope, SearchFilters, SearchRequest, SearchResultBody,
     },
+    wire::{Message, Part, PartKind, ProviderOptions, Session},
 };
 use tempfile::TempDir;
 
@@ -31,11 +35,11 @@ use tempfile::TempDir;
 fn rrf_merge_fuses_retrievers_and_reports_provenance() {
     let lists = [
         RankedList {
-            retriever: "vector",
+            retriever: RetrieverKind::Vector,
             ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         },
         RankedList {
-            retriever: "fts",
+            retriever: RetrieverKind::Fts,
             ids: vec!["b".to_owned(), "a".to_owned(), "d".to_owned()],
         },
     ];
@@ -92,7 +96,7 @@ fn build_filter_pushes_down_each_predicate() {
         to_date: Some("2026-05-01".to_owned()),
         min_score: 0.0,
     };
-    let sql = build_filter(&filters).unwrap();
+    let sql = build_filter(&filters).unwrap().to_lance();
     assert!(sql.contains("project = '/Users/me/pond'"));
     assert!(sql.contains("session_id = '01HXY'"));
     assert!(sql.contains("source_agent = 'claude-code'"));
@@ -108,7 +112,10 @@ fn build_filter_is_null_ignores_the_project_value() {
         project_match: ProjectMatch::IsNull,
         ..SearchFilters::default()
     };
-    assert_eq!(build_filter(&filters).unwrap(), "project IS NULL");
+    assert_eq!(
+        build_filter(&filters).unwrap().to_lance(),
+        "project IS NULL"
+    );
 }
 
 #[test]
@@ -128,7 +135,10 @@ fn build_filter_rejects_bad_role_and_date() {
 
 #[test]
 fn empty_filters_produce_no_predicate() {
-    assert_eq!(build_filter(&SearchFilters::default()).unwrap(), "");
+    assert_eq!(
+        build_filter(&SearchFilters::default()).unwrap().to_lance(),
+        ""
+    );
 }
 
 #[test]
@@ -138,7 +148,7 @@ fn build_filter_contains_escapes_like_wildcards() {
         project_match: ProjectMatch::Contains,
         ..SearchFilters::default()
     };
-    let sql = build_filter(&filters).unwrap();
+    let sql = build_filter(&filters).unwrap().to_lance();
     // `_` is a LIKE wildcard and is everywhere in real paths; it must be escaped
     // so `my_project` matches literally, with an ESCAPE clause naming the char.
     assert!(
@@ -196,7 +206,7 @@ fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
 #[tokio::test]
 async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // 4 synthetic rows: `synthetic_rows` cycles `session-{i % 8}`, so 4 is the
@@ -214,7 +224,7 @@ async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow
         .explain_vector_plan(
             &query,
             10,
-            "session_id = 'session-3'",
+            &Predicate::Eq("session_id", "session-3".into()),
             &model.id,
             model.max_embed_tokens as i32,
         )
@@ -240,7 +250,7 @@ async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow
 #[tokio::test]
 async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // 256 rows is the hard floor: the IVF_PQ index uses `num_bits = 8`, so its
@@ -279,7 +289,7 @@ async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
         .vector_search(
             &planted.vector,
             10,
-            "",
+            &Predicate::And(Vec::new()),
             &model.id,
             model.max_embed_tokens as i32,
         )
@@ -298,14 +308,16 @@ async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<(
     // the identity that produced the query vector - never mix caps, never return
     // a message_id twice (RRF would double-count it).
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let model = Config::builtin().embeddings.default_model("local")?;
 
     // Same message, two caps, deliberately opposite vectors so the result
     // distance tells us which row the scan actually ranked.
     let near = vec![0.1_f32; EMBEDDING_DIM];
     let far = vec![-0.1_f32; EMBEDDING_DIM];
-    let base = synthetic_rows(1, &model.id).pop().expect("one synthetic row");
+    let base = synthetic_rows(1, &model.id)
+        .pop()
+        .expect("one synthetic row");
     let row_1024 = EmbeddingRow {
         max_embed_tokens: 1024,
         vector: near.clone(),
@@ -322,7 +334,7 @@ async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<(
     // Scoped to cap 1024: the message appears exactly once - not once per cap -
     // ranked against the cap-1024 (near) vector, so distance ~0.
     let hits_1024 = store
-        .vector_search(&near, 10, "", &model.id, 1024)
+        .vector_search(&near, 10, &Predicate::And(Vec::new()), &model.id, 1024)
         .await?;
     assert_eq!(
         hits_1024.len(),
@@ -340,7 +352,7 @@ async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<(
     // (far) vector - so the same query is now distant. Proves the scan switched
     // rows on the cap, rather than just deduplicating.
     let hits_4096 = store
-        .vector_search(&near, 10, "", &model.id, 4096)
+        .vector_search(&near, 10, &Predicate::And(Vec::new()), &model.id, 4096)
         .await?;
     assert_eq!(hits_4096.len(), 1);
     assert_eq!(hits_4096[0].0, base.message_id);
@@ -415,8 +427,8 @@ fn pseudo_vector(text: &str, dim: usize) -> Vec<f32> {
 /// Ingest the claude-code fixtures, build the indices, and embed every message
 /// with the fake backend - the `pond_search` handler then runs end to end
 /// without model weights, exactly as `pond ingest` wires it (main.rs).
-async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(PondStore, FakeBackend)> {
-    let store = PondStore::open(temp.path()).await?;
+async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
+    let store = Store::open(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter).await?;
     store.ensure_indices().await?;
@@ -431,9 +443,8 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(PondStore, FakeBac
 fn search_request(query: &str) -> SearchRequest {
     SearchRequest {
         protocol_version: pond::PROTOCOL_VERSION,
-        namespace: "local".to_owned(),
+        namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        search_mode: SearchMode::Hybrid,
         rrf_k: 60,
         filters: SearchFilters::default(),
         boost_recent: true,
@@ -445,7 +456,7 @@ fn search_request(query: &str) -> SearchRequest {
 fn get_request(session_id: &str) -> GetRequest {
     GetRequest {
         protocol_version: pond::PROTOCOL_VERSION,
-        namespace: "local".to_owned(),
+        namespace: Some("local".to_owned()),
         session_id: Some(session_id.to_owned()),
         message_id: None,
         up_to: None,
@@ -469,21 +480,19 @@ fn hits_of(envelope: SearchEnvelope) -> Vec<Hit> {
 
 /// A phrase taken verbatim from an ingested message - guaranteed to produce FTS
 /// hits without hard-coding fixture content.
-async fn corpus_phrase(store: &PondStore) -> anyhow::Result<String> {
+async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
     for session_id in store.session_ids().await? {
         let GetEnvelope::Success(response) = pond_get(store, get_request(&session_id)).await else {
             continue;
         };
-        let GetResult::Session(stored) = response.result else {
+        let GetResult::Session { parts, .. } = response.result else {
             continue;
         };
-        for message in &stored.messages {
-            for part in &message.parts {
-                if let PartKind::Text { text } = &part.kind {
-                    let words = text.split_whitespace().take(8).collect::<Vec<_>>();
-                    if words.len() >= 4 {
-                        return Ok(words.join(" "));
-                    }
+        for part in &parts {
+            if let PartKind::Text { text } = &part.kind {
+                let words = text.split_whitespace().take(8).collect::<Vec<_>>();
+                if words.len() >= 4 {
+                    return Ok(words.join(" "));
                 }
             }
         }
@@ -491,44 +500,81 @@ async fn corpus_phrase(store: &PondStore) -> anyhow::Result<String> {
     anyhow::bail!("no usable text part in the fixture corpus")
 }
 
+/// The retrieval mode is server-determined: hybrid when the embedder is loaded
+/// AND has embeddings for its identity, FTS otherwise. The wire surface no
+/// longer carries a `search_mode` field; per-hit `matched_via` is the only
+/// retriever-provenance signal. This test exercises all three branches and
+/// asserts the right retrievers ranked the hits.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_modes_each_execute_and_report_matched_via() -> anyhow::Result<()> {
+async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<()> {
+    // Case 1: embedder + embeddings -> hybrid (both retrievers contribute).
     let temp = TempDir::new()?;
     let (store, backend) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
-    for mode in [SearchMode::Hybrid, SearchMode::Vector, SearchMode::Fts] {
-        let mut request = search_request(&phrase);
-        request.search_mode = mode;
-        let hits = hits_of(pond_search(&store, &backend, request).await);
+    let hits = body_hits(
+        success_of(pond_search(&store, Some(&backend), search_request(&phrase)).await).result,
+    );
+    assert!(!hits.is_empty(), "hybrid search must return hits");
+    for pair in hits.windows(2) {
+        assert!(pair[0].score >= pair[1].score, "hits must be score-ordered");
+    }
+    let saw_vector = hits
+        .iter()
+        .any(|hit| hit.matched_via.iter().any(|v| v == "vector"));
+    assert!(
+        saw_vector,
+        "hybrid must surface at least one vector-ranked hit"
+    );
+    for hit in &hits {
+        assert!(!hit.matched_via.is_empty());
         assert!(
-            !hits.is_empty(),
-            "{mode:?} search must return hits over the corpus",
+            hit.matched_via
+                .iter()
+                .all(|via| via == "vector" || via == "fts"),
+            "hybrid matched_via must be a subset of {{vector, fts}}: {:?}",
+            hit.matched_via,
         );
-        // Results are score-ordered, descending.
-        for pair in hits.windows(2) {
-            assert!(
-                pair[0].score >= pair[1].score,
-                "{mode:?} hits must be score-ordered",
-            );
-        }
-        // `matched_via` names only retrievers valid for the mode.
-        for hit in &hits {
-            assert!(!hit.matched_via.is_empty());
-            match mode {
-                SearchMode::Vector => assert_eq!(hit.matched_via, ["vector"]),
-                SearchMode::Fts => assert_eq!(hit.matched_via, ["fts"]),
-                SearchMode::Hybrid => assert!(
-                    hit.matched_via
-                        .iter()
-                        .all(|via| via == "vector" || via == "fts"),
-                    "hybrid matched_via must be a subset of {{vector, fts}}: {:?}",
-                    hit.matched_via,
-                ),
-            }
-        }
+    }
+
+    // Case 2: embedder is `None` -> FTS-only.
+    let hits =
+        body_hits(success_of(pond_search(&store, None, search_request(&phrase)).await).result);
+    assert!(!hits.is_empty(), "fts must still return hits");
+    for hit in &hits {
+        assert_eq!(hit.matched_via, ["fts"]);
+    }
+
+    // Case 3: embedder present but the embeddings table has no rows for its
+    // identity -> auto-degrade to FTS. Build a fresh store with messages and
+    // the FTS index but no embed pass.
+    let temp2 = TempDir::new()?;
+    let store2 = Store::open(temp2.path()).await?;
+    ingest_adapter(&store2, &ClaudeCodeAdapter::new(FIXTURES)).await?;
+    store2.ensure_indices().await?;
+    let hits = body_hits(
+        success_of(pond_search(&store2, Some(&backend), search_request(&phrase)).await).result,
+    );
+    for hit in &hits {
+        assert_eq!(hit.matched_via, ["fts"]);
     }
     Ok(())
+}
+
+/// Unwrap a successful search envelope, panicking on errors.
+fn success_of(envelope: SearchEnvelope) -> pond::wire::SearchResponse {
+    match envelope {
+        SearchEnvelope::Success(response) => response,
+        SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
+    }
+}
+
+/// Pull the hits body out of a response, panicking on grouped results.
+fn body_hits(body: SearchResultBody) -> Vec<Hit> {
+    match body {
+        SearchResultBody::Hits { hits } => hits,
+        SearchResultBody::Groups { .. } => panic!("expected hits, got groups"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -540,7 +586,7 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     // role: every hit carries the requested role.
     let mut request = search_request(&phrase);
     request.filters.role = Some("assistant".to_owned());
-    let hits = hits_of(pond_search(&store, &backend, request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
     assert!(!hits.is_empty(), "the corpus has assistant messages");
     assert!(hits.iter().all(|hit| hit.role == "assistant"));
 
@@ -553,30 +599,30 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
         .expect("the corpus has at least one session");
     let mut request = search_request(&phrase);
     request.filters.session_id = Some(session_id.clone());
-    let hits = hits_of(pond_search(&store, &backend, request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
     assert!(hits.iter().all(|hit| hit.session_id == session_id));
 
     // source_agent: the real agent returns hits; an unknown one returns none.
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("claude-code".to_owned());
-    assert!(!hits_of(pond_search(&store, &backend, request).await).is_empty());
+    assert!(!hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("no-such-agent".to_owned());
-    assert!(hits_of(pond_search(&store, &backend, request).await).is_empty());
+    assert!(hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
 
     // date window: a far-future lower bound excludes the whole corpus.
     let mut request = search_request(&phrase);
     request.filters.from_date = Some("2099-01-01".to_owned());
-    assert!(hits_of(pond_search(&store, &backend, request).await).is_empty());
+    assert!(hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
 
     // project (exact): every hit is scoped to the requested project.
-    let project = hits_of(pond_search(&store, &backend, search_request(&phrase)).await)
+    let project = hits_of(pond_search(&store, Some(&backend), search_request(&phrase)).await)
         .into_iter()
         .find_map(|hit| hit.project)
         .expect("fixture hits carry a project");
     let mut request = search_request(&phrase);
     request.filters.project = Some(project.clone());
-    let hits = hits_of(pond_search(&store, &backend, request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
     assert!(!hits.is_empty());
     assert!(
         hits.iter()
@@ -633,7 +679,7 @@ async fn project_match_is_null_pushes_down_and_returns_injected_rows() -> anyhow
         &store,
         IngestRequest {
             protocol_version: pond::PROTOCOL_VERSION,
-            namespace: "local".to_owned(),
+            namespace: Some("local".to_owned()),
             events,
         },
     )
@@ -652,7 +698,7 @@ async fn project_match_is_null_pushes_down_and_returns_injected_rows() -> anyhow
 
     let mut request = search_request("null project sentinel");
     request.filters.project_match = ProjectMatch::IsNull;
-    let hits = hits_of(pond_search(&store, &backend, request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
 
     assert_eq!(
         hits.len(),
@@ -679,7 +725,8 @@ async fn group_by_conversation_collapses_to_one_summary_per_session() -> anyhow:
 
     let mut request = search_request(&phrase);
     request.group_by_conversation = true;
-    let SearchEnvelope::Success(response) = pond_search(&store, &backend, request).await else {
+    let SearchEnvelope::Success(response) = pond_search(&store, Some(&backend), request).await
+    else {
         panic!("grouped search must succeed");
     };
     let SearchResultBody::Groups { groups } = response.result else {

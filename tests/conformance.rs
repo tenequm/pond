@@ -3,10 +3,10 @@
 use chrono::Utc;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    get::pond_get,
-    ingest::{IngestEvent, IngestValidator, ingest_adapter},
-    substrate::PondStore,
-    types::{FileData, Message, Part, PartKind, ProviderOptions, Session},
+    handlers::pond_get,
+    handlers::{IngestEvent, IngestValidator, ingest_adapter},
+    sessions::Store,
+    wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
     wire::{GetEnvelope, GetRequest},
 };
 use tempfile::TempDir;
@@ -14,7 +14,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     let summary = ingest_adapter(&store, &adapter).await?;
@@ -30,7 +30,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
             &store,
             GetRequest {
                 protocol_version: pond::PROTOCOL_VERSION,
-                namespace: "local".to_owned(),
+                namespace: Some("local".to_owned()),
                 session_id: Some(session_id.clone()),
                 message_id: None,
                 up_to: None,
@@ -44,18 +44,21 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
         let GetEnvelope::Success(response) = envelope else {
             panic!("expected successful pond_get for {session_id}");
         };
-        let pond::wire::GetResult::Session(stored) = response.result else {
+        let pond::wire::GetResult::Session {
+            session, messages, ..
+        } = response.result
+        else {
             panic!("expected session result");
         };
-        assert_eq!(stored.session.id, *session_id);
-        assert!(!stored.messages.is_empty());
+        assert_eq!(session.id, *session_id);
+        assert!(!messages.is_empty());
 
-        let target = stored.messages[0].message.id().to_owned();
+        let target = messages[0].id().to_owned();
         let envelope = pond_get(
             &store,
             GetRequest {
                 protocol_version: pond::PROTOCOL_VERSION,
-                namespace: "local".to_owned(),
+                namespace: Some("local".to_owned()),
                 session_id: None,
                 message_id: Some(target),
                 up_to: None,
@@ -75,7 +78,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     ingest_adapter(&store, &adapter).await?;
@@ -94,7 +97,7 @@ async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ordering_contract_rejects_part_before_message() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let session = synthetic_session("ordering");
     let part = Part {
         id: "part-1".to_owned(),
@@ -127,7 +130,7 @@ async fn ordering_contract_rejects_part_before_message() -> anyhow::Result<()> {
 #[tokio::test]
 async fn duplicate_message_id_aborts_session_before_write() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let session = synthetic_session("duplicate-message");
     let first = Message::User {
         id: "message-1".to_owned(),
@@ -162,7 +165,7 @@ async fn duplicate_message_id_aborts_session_before_write() -> anyhow::Result<()
 #[tokio::test]
 async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let session = synthetic_session("blob");
     let message = Message::User {
         id: "message-1".to_owned(),

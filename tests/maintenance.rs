@@ -1,10 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! `PondStore::maintenance` (design.md 3.2.0): a pass runs `cleanup_old_versions`
+//! `Store::maintenance` (design.md 3.2.0): a pass runs `cleanup_old_versions`
 //! then `optimize_indices` over all four datasets, never removes logical rows,
 //! and a per-table failure does not abort the others.
 
-use pond::{adapter::ClaudeCodeAdapter, ingest::ingest_adapter, substrate::PondStore};
+use pond::{adapter::ClaudeCodeAdapter, handlers::ingest_adapter, sessions::Store};
 use tempfile::TempDir;
 
 const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
@@ -12,7 +12,7 @@ const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
 #[tokio::test]
 async fn maintenance_runs_without_removing_logical_rows() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter).await?;
     store.ensure_indices().await?;

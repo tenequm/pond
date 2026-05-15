@@ -40,8 +40,8 @@ use pond::{
         DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_SQ_BUDGET, DEFAULT_LENGTH_WINDOW,
         DEFAULT_WINDOW_BYTE_BUDGET, EmbedBackend, EmbedWorker, Qwen3Embedder,
     },
-    ingest::ingest_adapter,
-    substrate::PondStore,
+    handlers::ingest_adapter,
+    sessions::Store,
 };
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
     // measurement, so the RSS sampler is not running yet.
     let corpus = args.corpus();
     let temp = TempDir::new()?;
-    let store = PondStore::open(temp.path()).await?;
+    let store = Store::open(temp.path()).await?;
     let ingest_start = Instant::now();
     ingest_adapter(&store, &ClaudeCodeAdapter::new(&corpus)).await?;
     store.ensure_indices().await?;

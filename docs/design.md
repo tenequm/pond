@@ -102,9 +102,11 @@ No in-process write queue. Concurrent HTTP requests dispatch to handlers in para
 
 ### 2.5 Search defaults
 
-- **Hybrid by default.** Every search runs vector kNN plus BM25 FTS, merged with RRF (`k=60`, no weighting), unless the request specifies otherwise.
-- **Wire-level override.** Optional `search_mode` enum field on search requests: `hybrid` (default), `vector`, `fts`. Optional `rrf_k` integer field overrides the default `k`.
-- **Both indexes always present.** FTS index on `messages.search_text` (3.2.2) and vector index on `embeddings.vector` (3.2.4) are created at table creation. Both retrievers operate at message granularity over the same input string; the schema does not branch on whether an embedding model is configured. Turning a model on or off does not require a schema migration.
+- **Embeddings are opt-in by data.** Sync is the standalone CLI verb (`pond sync`); embedding the backlog is a separate verb (`pond embed`). With no embed rows present, `pond serve` / `pond mcp` boot without loading the model and `pond_search` runs FTS-only. Run `pond embed` once to populate the backlog; subsequent server boots probe the `embeddings` table and load the model only when rows exist for the default `(model_id, max_embed_tokens)` identity.
+- **Hybrid when available.** With at least one embedding row present for the active identity, every search runs vector kNN plus BM25 FTS, merged with RRF (`k=60`, no weighting).
+- **Server-determined mode with auto-degrade, no wire field.** The mode is not a request input and the response does not carry a `search_mode` field. The server picks hybrid or FTS based on the embedder state and reports retriever provenance per-hit via `matched_via` (`"vector"` and/or `"fts"`). A vector-only mode is intentionally absent for v1: hybrid is monotonically >= vector-only at any embedding coverage > 0%. Optional `rrf_k` integer field on requests overrides the default `k` (consulted only in hybrid mode).
+- **Both indexes always present.** FTS index on `messages.search_text` (3.2.2) and vector index on `embeddings.vector` (3.2.4) are created at table creation. Both retrievers operate at message granularity over the same input string; the schema does not branch on whether an embedding model is configured. Turning embeddings on or off does not require a schema migration.
+- **kb parity is a starting reference, not a strict contract.** kb exposes mode as a request parameter; pond v1 chooses to lift that off the client surface in favor of auto-resolution from server state. Clients read `matched_via` per hit when they want to know which retriever ranked a row.
 - **Search corpus is fixed by concatenation policy.** What gets indexed is determined by 3.3.1 (TextPart, ToolCallPart name+string-leaf params, FilePart name/media/url; reasoning, tool results, approvals, system messages excluded). Excluded Parts remain canonically stored and retrievable via `pond_get` (3.6).
 
 ---
@@ -510,7 +512,21 @@ Concat policy changes require re-ingest (run the SourceAdapter again); re-ingest
 
 ### 3.4 Ingest surface
 
-`SourceAdapter` is pond's per-source plug-in trait. v1 ships the Claude Code adapter; section 4 lists the others on the roadmap.
+`SourceAdapter` is pond's per-source plug-in trait. v1 ships the Claude Code and Codex adapters; section 4 lists the others on the roadmap.
+
+**Source configuration.** Each adapter type gets one `[sources.<adapter>]` block in `config.toml`:
+
+```toml
+[sources.claude-code]
+path = "~/.claude/projects"
+
+[sources.codex]
+path = "~/.codex/sessions"
+```
+
+`~` and `$HOME/` prefixes in `path` are expanded at load time. `pond sync` with no `<adapter>` argument syncs every registered entry; `pond sync <adapter>` syncs just that one. An empty `[sources]` block triggers interactive discovery: each adapter probes its own canonical install location (`<Adapter>::discover_under(home)`), `pond sync` presents a multi-select prompt over the candidates, and the chosen rows are written back to `config.toml` via `toml_edit` (preserves user comments) before the sync proceeds. Non-tty stdin errors with a "configure manually" message rather than hanging on the prompt.
+
+Per-adapter discovery rules live on each adapter type, not in a centralized name->path table: a new adapter ships its own `discover()` heuristic alongside its parse code.
 
 ```rust
 // IngestEvent is the canonical-shape unit the adapter emits.
@@ -609,7 +625,17 @@ Operations:
 
 Every request body carries `protocol_version: 1` (per 2.2) and an optional `namespace` (defaults to `"local"`). Every response body (success or error) carries `request_id` (server-generated UUIDv7) for log correlation.
 
-CLI verbs (out-of-band): `pond setup` (resolve the data dir, write a default config, fetch + verify the model), `pond ingest --from <adapter>` (parse, store, embed, and index in one pass - embedding is a stage of ingest, not a separate verb), `pond status`, `pond serve` (HTTP server, including the `/mcp` streamable-HTTP MCP route), `pond mcp` (stdio MCP server only; stdout reserved for JSON-RPC frames), `pond maintenance` (runs cleanup_old_versions + optimize_indices one-shot per 3.2.0).
+CLI verbs (out-of-band):
+
+- `pond sync [<adapter>]` - parse, store, and index data from one configured `[sources.<adapter>]` (or every entry, with no arg). On an empty `[sources]` block runs interactive adapter discovery against each adapter's canonical install location, writes the picks back to `config.toml`, and continues. Wire layer stays `ingest`-named (`pond_ingest`, `IngestRequest`, `IngestEvent`); only the CLI verb is `sync`.
+- `pond embed` - walk the un-embedded message backlog and produce vectors under the default model identity. Idempotent on `(message_id, model_id, max_embed_tokens)`; safe to re-run.
+- `pond status` - row counts across the four datasets.
+- `pond serve` - HTTP server, including the `/mcp` streamable-HTTP MCP route. Probes the `embeddings` table at boot and loads the model only when rows exist for the default identity.
+- `pond mcp` - stdio MCP server only; stdout reserved for JSON-RPC frames. Same embed-on-demand probe as `pond serve`.
+- `pond maintenance` - one-shot cleanup_old_versions + optimize_indices per 3.2.0.
+- `pond config --print-schema` - emit the annotated config.toml template.
+
+pond has no separate `setup` verb: the data dir is created on first `Store::open`, and the embedding model is fetched on the first run that loads it (hf-hub cache).
 
 Admin CLI verbs (for recovery / inspection, not user-facing search):
 
@@ -667,7 +693,6 @@ Request `POST /v1/search`:
   "protocol_version": 1,
   "namespace": "local",
   "query": "rust lifetime error",
-  "search_mode": "hybrid",
   "rrf_k": 60,
   "filters": {
     "project": null,
@@ -686,8 +711,8 @@ Request `POST /v1/search`:
 ```
 
 - `query`: required, non-empty after trim.
-- `search_mode`: `"hybrid"` (default) | `"vector"` | `"fts"`. Per 2.5.
-- `rrf_k`: default 60. Consulted only when `search_mode = hybrid`.
+- The mode is not a request input. The server picks hybrid or fts based on the embedder state; the response carries no top-level mode field - per-hit `matched_via` reports which retriever(s) ranked each row (see 2.5).
+- `rrf_k`: default 60. Consulted only when the server runs hybrid mode.
 - `filters.project_match`: `"exact"` (default) | `"contains"` | `"is_null"`. `is_null` ignores the `project` value field and emits `project IS NULL` (required for filtering anthropic-managed-agents per 3.3 / 3.4).
 - `filters.role`: `"user"` | `"assistant"` | `"system"` | `"tool"`. System/tool always return empty (NULL search_text).
 - `filters.min_score`: default `0.0` (no threshold).
@@ -720,10 +745,10 @@ Response (default):
 ```
 
 - `preview`: first 500 chars of `messages.search_text`, truncated at code-point boundary, `"..."` appended if truncated. v1 does not generate matched-token-highlighted snippets (Lance FTS does not surface token offsets); upgrade is deferred.
-- `score`: final ranking score. `hybrid` = RRF + recency_boost; `vector` = normalized cosine + recency; `fts` = normalized BM25 + recency.
+- `score`: final ranking score. Hybrid mode = RRF + recency_boost; FTS-only mode = normalized BM25 + recency.
+- `matched_via`: per-hit retriever provenance (`["vector"]`, `["fts"]`, or `["vector", "fts"]`). Carries the retriever-state signal that previous drafts duplicated as a top-level `search_mode` response field, and is also useful for debugging hybrid ranking.
 - `base_score`: score before recency boost. Always reported.
 - `recency_boost`: additive bump; `0` when `boost_recent: false`.
-- `matched_via`: which retriever(s) ranked this row in their top-K. Useful for debugging hybrid.
 - `total`: count of returned hits (= `hits.length`); not the global match count.
 
 Response (`group_by_conversation: true`): the `hits` field is replaced by `groups` per 3.3 shape.
@@ -878,4 +903,3 @@ Each entry: what it is, why deferred, activation condition. None require schema 
 ## 5. Open Questions
 
 Empty. Sections 1-4 are the source of truth; git history preserves the trail of resolved questions (OQ1-OQ10).
-

@@ -1,33 +1,67 @@
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
+//! Claude Code CLI adapter.
+//!
+//! Source path: `~/.claude/projects/<encoded-project-path>/<session-uuid>.jsonl`.
+//! Each `.jsonl` file is one session; lines are typed entries linked via a
+//! `parentUuid` -> `uuid` chain. Tool results arrive as `user` entries whose
+//! `message.content[]` contains `tool_result` blocks with a parallel
+//! `toolUseResult` field carrying structured data.
 
-use anyhow::Context;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 use async_stream::stream;
 use chrono::{DateTime, Utc};
-use serde_json::{Map, Value, json};
-use thiserror::Error;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio_stream::Stream;
 
 use crate::{
-    ingest::IngestEvent,
-    types::{FileData, Message, Part, PartKind, ProviderOptions, Session},
+    config::expand_home_under,
+    sessions::IngestEvent,
+    wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
 };
 
-pub trait SourceAdapter: Send + Sync {
-    type SessionRef: Send + Sync;
-    type Error: std::error::Error + Send + Sync + 'static;
+use super::{
+    Adapter, AdapterError, AdapterFactory, Env, EventStream, collect_jsonl_files, compact_json,
+    empty_options, part_id,
+};
 
-    fn discover(&self) -> impl Stream<Item = Result<Self::SessionRef, Self::Error>> + Send;
+/// Stable adapter name. Surfaces as the `[sources.claude-code]` config key,
+/// the `pond sync claude-code` CLI arg, and `Session.source_agent` on every
+/// emitted row.
+const NAME: &str = "claude-code";
 
-    fn decode(
-        &self,
-        session: Self::SessionRef,
-    ) -> impl Stream<Item = Result<IngestEvent, Self::Error>> + Send;
+/// Stateless factory: opens [`ClaudeCodeAdapter`] instances from config and
+/// probes for the canonical install location under `~/.claude/projects`.
+pub struct ClaudeCodeFactory;
+
+impl AdapterFactory for ClaudeCodeFactory {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
+        #[derive(Deserialize)]
+        struct Cfg {
+            path: PathBuf,
+        }
+        let cfg: Cfg = serde_json::from_value(config)
+            .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
+        let path = match std::env::var_os("HOME") {
+            Some(home) => expand_home_under(&cfg.path, Path::new(&home)),
+            None => cfg.path,
+        };
+        Ok(Box::new(ClaudeCodeAdapter::new(path)))
+    }
+
+    fn probe_default(&self, env: &Env) -> Option<Value> {
+        let path = env.home.join(".claude").join("projects");
+        path.exists().then(|| json!({ "path": path }))
+    }
 }
 
+/// Configured claude-code reader. Walks a tree of `*.jsonl` files under
+/// [`Self::root`] and yields canonical events in source order per session.
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
     root: PathBuf,
@@ -39,183 +73,91 @@ impl ClaudeCodeAdapter {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ClaudeCodeError {
-    #[error("io error at {path}: {source}")]
-    Io {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("json parse error at {path}:{line}: {source}")]
-    Json {
-        path: String,
-        line: usize,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("validation error at {path}:{line}: {message}")]
-    Validation {
-        path: String,
-        line: usize,
-        message: String,
-    },
-}
-
-impl SourceAdapter for ClaudeCodeAdapter {
-    type Error = ClaudeCodeError;
-    type SessionRef = PathBuf;
-
-    fn discover(&self) -> impl Stream<Item = Result<Self::SessionRef, Self::Error>> + Send {
+impl Adapter for ClaudeCodeAdapter {
+    fn events(&self) -> EventStream<'_> {
         let root = self.root.clone();
-        stream! {
-            match discover_jsonl(&root).await {
-                Ok(paths) => {
-                    for path in paths {
-                        yield Ok(path);
-                    }
-                }
-                Err(error) => yield Err(error),
-            }
-        }
-    }
-
-    fn decode(
-        &self,
-        session: Self::SessionRef,
-    ) -> impl Stream<Item = Result<IngestEvent, Self::Error>> + Send {
-        stream! {
-            let path_display = session.display().to_string();
-            let session_event = match session_from_file(&session, &path_display).await {
-                Ok(session) => session,
-                Err(error) => {
-                    yield Err(error);
+        Box::pin(stream! {
+            let paths = match collect_jsonl_files(&root).await {
+                Ok(paths) => paths,
+                Err(io) => {
+                    yield Err(AdapterError::io(NAME, io.path, io.source));
                     return;
                 }
             };
-            let session_id = session_event.id.clone();
-            let default_timestamp = session_event.created_at;
-            yield Ok(IngestEvent::Session(session_event));
-
-            let file = match tokio::fs::File::open(&session).await {
-                Ok(file) => file,
-                Err(source) => {
-                    yield Err(ClaudeCodeError::Io { path: path_display, source });
-                    return;
-                }
-            };
-
-            let mut lines = BufReader::new(file).lines();
-            let mut line_number = 0usize;
-            loop {
-                let Some(line) = (match lines.next_line().await {
-                    Ok(line) => line,
-                    Err(source) => {
-                        yield Err(ClaudeCodeError::Io {
-                            path: path_display,
-                            source,
-                        });
-                        return;
-                    }
-                }) else {
-                    break;
-                };
-                line_number += 1;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let value = match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => value,
-                    Err(source) => {
-                        yield Err(ClaudeCodeError::Json {
-                            path: path_display,
-                            line: line_number,
-                            source,
-                        });
-                        return;
+            for path in paths {
+                let path_display = path.display().to_string();
+                let session_event = match session_from_file(&path, &path_display).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        yield Err(error);
+                        continue;
                     }
                 };
-                match events_from_row(&session_id, line_number, &value, default_timestamp) {
-                    Ok(events) => {
-                        for event in events {
-                            yield Ok(event);
+                let session_id = session_event.id.clone();
+                let default_timestamp = session_event.created_at;
+                yield Ok(IngestEvent::Session(session_event));
+
+                let file = match tokio::fs::File::open(&path).await {
+                    Ok(file) => file,
+                    Err(source) => {
+                        yield Err(AdapterError::io(NAME, path_display, source));
+                        continue;
+                    }
+                };
+
+                let mut lines = BufReader::new(file).lines();
+                let mut line_number = 0usize;
+                loop {
+                    let next = lines.next_line().await;
+                    let line = match next {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(source) => {
+                            yield Err(AdapterError::io(NAME, path_display.clone(), source));
+                            break;
+                        }
+                    };
+                    line_number += 1;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let value = match serde_json::from_str::<Value>(&line) {
+                        Ok(value) => value,
+                        Err(source) => {
+                            yield Err(AdapterError::parse(
+                                NAME,
+                                path_display.clone(),
+                                line_number,
+                                source,
+                            ));
+                            break;
+                        }
+                    };
+                    match events_from_row(&session_id, line_number, &value, default_timestamp) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(message) => {
+                            yield Err(AdapterError::schema(
+                                NAME,
+                                format!("{path_display}:{line_number}"),
+                                message,
+                            ));
+                            break;
                         }
                     }
-                    Err(message) => {
-                        yield Err(ClaudeCodeError::Validation {
-                            path: path_display,
-                            line: line_number,
-                            message,
-                        });
-                        return;
-                    }
                 }
             }
-        }
+        })
     }
 }
 
-pub enum Adapter {
-    ClaudeCode(ClaudeCodeAdapter),
-}
-
-impl Adapter {
-    pub async fn ingest(
-        &self,
-        store: &crate::substrate::PondStore,
-    ) -> anyhow::Result<crate::ingest::IngestSummary> {
-        match self {
-            Self::ClaudeCode(adapter) => crate::ingest::ingest_adapter(store, adapter).await,
-        }
-    }
-}
-
-async fn discover_jsonl(root: &Path) -> Result<Vec<PathBuf>, ClaudeCodeError> {
-    let mut paths = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let mut entries =
-            tokio::fs::read_dir(&path)
-                .await
-                .map_err(|source| ClaudeCodeError::Io {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-        while let Some(entry) =
-            entries
-                .next_entry()
-                .await
-                .map_err(|source| ClaudeCodeError::Io {
-                    path: path.display().to_string(),
-                    source,
-                })?
-        {
-            let file_type = entry
-                .file_type()
-                .await
-                .map_err(|source| ClaudeCodeError::Io {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            let child = entry.path();
-            if file_type.is_dir() {
-                stack.push(child);
-            } else if child.extension() == Some(OsStr::new("jsonl")) {
-                paths.push(child);
-            }
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, ClaudeCodeError> {
+async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, AdapterError> {
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|source| ClaudeCodeError::Io {
-            path: path_display.to_owned(),
-            source,
-        })?;
+        .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?;
     let mut lines = BufReader::new(file).lines();
     let mut first = None::<(usize, Value)>;
     let mut created_at = None;
@@ -227,10 +169,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, C
         let Some(line) = lines
             .next_line()
             .await
-            .map_err(|source| ClaudeCodeError::Io {
-                path: path_display.to_owned(),
-                source,
-            })?
+            .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?
         else {
             break;
         };
@@ -238,10 +177,8 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, C
         if line.trim().is_empty() {
             continue;
         }
-        let row = serde_json::from_str::<Value>(&line).map_err(|source| ClaudeCodeError::Json {
-            path: path_display.to_owned(),
-            line: line_number,
-            source,
+        let row = serde_json::from_str::<Value>(&line).map_err(|source| {
+            AdapterError::parse(NAME, path_display.to_owned(), line_number, source)
         })?;
 
         if first.is_none() {
@@ -265,26 +202,30 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, C
     }
 
     let Some((first_line, first)) = first else {
-        return Err(ClaudeCodeError::Validation {
-            path: path_display.to_owned(),
-            line: 0,
-            message: "empty jsonl session".to_owned(),
-        });
+        return Err(AdapterError::schema(
+            NAME,
+            path_display.to_owned(),
+            "empty jsonl session",
+        ));
     };
 
     let id = first
         .get("sessionId")
         .and_then(Value::as_str)
-        .ok_or_else(|| ClaudeCodeError::Validation {
-            path: path_display.to_owned(),
-            line: first_line,
-            message: format!("line {first_line} missing sessionId"),
+        .ok_or_else(|| {
+            AdapterError::schema(
+                NAME,
+                format!("{path_display}:{first_line}"),
+                format!("line {first_line} missing sessionId"),
+            )
         })?
         .to_owned();
-    let created_at = created_at.ok_or_else(|| ClaudeCodeError::Validation {
-        path: path_display.to_owned(),
-        line: first_line,
-        message: "session has no parseable timestamp".to_owned(),
+    let created_at = created_at.ok_or_else(|| {
+        AdapterError::schema(
+            NAME,
+            format!("{path_display}:{first_line}"),
+            "session has no parseable timestamp",
+        )
     })?;
     let mut options = ProviderOptions::new();
     options.insert(
@@ -437,7 +378,7 @@ fn text_part(message_id: &str, ordinal: usize, text: &str) -> Part {
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-        options: ProviderOptions::new(),
+        options: empty_options(),
         kind: PartKind::Text {
             text: text.to_owned(),
         },
@@ -487,7 +428,7 @@ fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-            options: ProviderOptions::new(),
+            options: empty_options(),
             kind: PartKind::ToolCall {
                 call_id: value
                     .get("id")
@@ -507,7 +448,7 @@ fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-            options: ProviderOptions::new(),
+            options: empty_options(),
             kind: PartKind::ToolCall {
                 call_id: value
                     .get("id")
@@ -549,7 +490,7 @@ fn tool_result_part(
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-        options: ProviderOptions::new(),
+        options: empty_options(),
         kind: PartKind::ToolResult {
             call_id: value
                 .get("tool_use_id")
@@ -596,7 +537,7 @@ fn file_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-        options: ProviderOptions::new(),
+        options: empty_options(),
         kind: PartKind::File {
             media_type,
             file_name,
@@ -661,19 +602,6 @@ fn parse_timestamp(value: &Value) -> anyhow::Result<DateTime<Utc>> {
         .with_timezone(&Utc))
 }
 
-fn part_id(message_id: &str, ordinal: usize) -> String {
-    format!("{message_id}:{ordinal:04}")
-}
-
 fn is_tool_result(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("tool_result")
-}
-
-fn compact_json(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
-}
-
-#[allow(dead_code)]
-fn object(value: Value) -> Map<String, Value> {
-    value.as_object().cloned().unwrap_or_default()
 }
