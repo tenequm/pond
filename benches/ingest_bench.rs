@@ -141,6 +141,13 @@ async fn main() -> Result<()> {
         if args.show_rejections {
             print_top_reasons("validator-error reasons", &error_reasons);
             print_top_reasons("adapter-skip reasons", &skip_reasons);
+            // The `summary.drop_reasons` histogram (new in 2026-05-16) is
+            // the authoritative breakdown of WHY the `dropped_events +
+            // dropped_sessions` populations were dropped, including the
+            // Partial-event drops that `SyncEvent` couldn't reason about
+            // before. Surface it here so the bench's `--show-rejections`
+            // answers "why" not just "how many."
+            print_drop_reasons("summary.drop_reasons", &summary.drop_reasons);
         }
     }
     Ok(())
@@ -161,17 +168,45 @@ fn print_top_reasons(label: &str, reasons: &HashMap<String, u64>) {
     }
     let mut entries: Vec<(&String, &u64)> = reasons.iter().collect();
     entries.sort_by(|a, b| b.1.cmp(a.1));
-    println!("  {label}:");
     let total: u64 = reasons.values().sum();
-    for (reason, count) in entries.into_iter().take(10) {
+    // Fix for the pre-2026-05-16 miscount: the "shown" sum was computed
+    // off `reasons.iter().take(10)` (HashMap iteration order), not the
+    // SORTED top-10, so the remainder line was nonsense. Sum from
+    // `entries[..10]` which is the actual top-10 the loop below prints.
+    let shown_count = entries.len().min(10);
+    let shown_sum: u64 = entries.iter().take(shown_count).map(|(_, c)| **c).sum();
+    println!("  {label}:");
+    for (reason, count) in entries.iter().take(shown_count) {
         println!("    {count:>5}  {reason}");
     }
-    if reasons.len() > 10 {
-        let shown: u64 = reasons.iter().take(10).map(|(_, c)| *c).sum();
+    if reasons.len() > shown_count {
         println!(
             "    {:>5}  (... {} more reasons)",
-            total - shown,
-            reasons.len() - 10
+            total - shown_sum,
+            reasons.len() - shown_count,
+        );
+    }
+    println!();
+}
+
+fn print_drop_reasons(label: &str, reasons: &std::collections::BTreeMap<&'static str, usize>) {
+    if reasons.is_empty() {
+        return;
+    }
+    let mut entries: Vec<(&&'static str, &usize)> = reasons.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1));
+    let total: usize = reasons.values().sum();
+    let shown_count = entries.len().min(10);
+    let shown_sum: usize = entries.iter().take(shown_count).map(|(_, c)| **c).sum();
+    println!("  {label}:");
+    for (reason, count) in entries.iter().take(shown_count) {
+        println!("    {count:>5}  {reason}");
+    }
+    if reasons.len() > shown_count {
+        println!(
+            "    {:>5}  (... {} more reasons)",
+            total - shown_sum,
+            reasons.len() - shown_count,
         );
     }
     println!();

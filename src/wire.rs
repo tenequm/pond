@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::PROTOCOL_VERSION;
+use crate::adapter::Extracted;
 
 pub type ProviderOptions = BTreeMap<String, Value>;
 
@@ -31,7 +32,14 @@ pub enum Message {
         id: String,
         session_id: String,
         timestamp: DateTime<Utc>,
-        content: String,
+        /// `None` when the source row carried no content. The seal on
+        /// `Extracted<String>` means adapters CANNOT pass a synthesized
+        /// or sentinel string here - the value either flows from a
+        /// `Source` extraction or the field is `None`. Distinguishes
+        /// "source said content=''" (Some(extracted_empty)) from
+        /// "source had no content field" (None).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<Extracted<String>>,
         #[serde(default)]
         options: ProviderOptions,
     },
@@ -106,7 +114,10 @@ impl Message {
 
     pub fn system_content(&self) -> Option<&str> {
         match self {
-            Self::System { content, .. } => Some(content),
+            // Two layers of `as_deref`: the outer `Option<Extracted<String>>`
+            // becomes `Option<&Extracted<String>>`, then `Extracted: Deref`
+            // unwraps to `&str`.
+            Self::System { content, .. } => content.as_deref().map(|e| &**e),
             Self::User { .. } | Self::Assistant { .. } | Self::Tool { .. } => None,
         }
     }
@@ -147,10 +158,20 @@ pub struct Part {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartKind {
     Text {
-        text: String,
+        /// `None` when the source row had no text field. The seal on
+        /// `Extracted<String>` means adapters CANNOT pass a synthesized
+        /// empty string or any other placeholder here - the value either
+        /// flows from a `Source` extraction or the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Extracted<String>>,
     },
     Reasoning {
-        text: String,
+        /// `None` when the source row had no reasoning text. Type-system
+        /// guard against `unwrap_or_default()`-style fallbacks: the
+        /// `Extracted<String>` seal forces the adapter to either get the
+        /// value from a `Source` or admit it is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Extracted<String>>,
     },
     File {
         media_type: String,
@@ -159,14 +180,35 @@ pub enum PartKind {
         data: FileData,
     },
     ToolCall {
-        call_id: String,
-        name: String,
+        /// `None` when the source carried no call_id (rare; malformed).
+        /// Sealed via `Extracted<String>` - empty-string sentinels are
+        /// not constructable from adapter code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<Extracted<String>>,
+        /// `None` when the source carried no tool name. claude-code
+        /// always carries it on `tool_use` rows; codex-cli sometimes
+        /// has placeholder shapes. The seal blocks the previous
+        /// "unknown" / "function" / "server_tool" synthesis patterns
+        /// (design.md 2.3 invariant 15) - the only way to populate
+        /// this is via `extract_str` against a real source row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<Extracted<String>>,
         params: Value,
         provider_executed: bool,
     },
     ToolResult {
-        call_id: String,
-        name: String,
+        /// `None` when the source carried no `tool_use_id` link.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<Extracted<String>>,
+        /// `None` when the adapter could not resolve the tool name.
+        /// In claude-code, name lives only on the prior `tool_use` row;
+        /// the adapter resolves via a per-file `tool_use_id -> name`
+        /// map and surfaces a miss (e.g. compaction pruned the originating
+        /// call) as `None`. The seal prevents the previous "unknown"
+        /// sentinel: a misresolution flows as `None`, never as a
+        /// fabricated string (design.md 2.3 invariants 15-16).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<Extracted<String>>,
         is_failure: bool,
         result: Value,
     },

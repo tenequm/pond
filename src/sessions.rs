@@ -150,9 +150,7 @@ impl StorageSizes {
             // before matching so the four known tables are attributed
             // correctly. Anything else (config.toml, index temp files, ...)
             // falls through to `other`.
-            let stem = name
-                .to_str()
-                .map(|s| s.strip_suffix(".lance").unwrap_or(s));
+            let stem = name.to_str().map(|s| s.strip_suffix(".lance").unwrap_or(s));
             let attribute = match stem {
                 Some("sessions") => Some("sessions"),
                 Some("messages") => Some("messages"),
@@ -331,12 +329,18 @@ impl Store {
                     let field = match &reason {
                         IngestError::ImmutableField { field, .. } => Some(*field),
                     };
+                    let reason_key = match field {
+                        Some("project") => DROP_REASON_IMMUTABLE_PROJECT,
+                        Some("source_agent") => DROP_REASON_IMMUTABLE_SOURCE_AGENT,
+                        _ => DROP_REASON_UNCATEGORIZED,
+                    };
                     outcomes.extend(error_outcomes_for_substream(
                         substream.session_index,
                         &substream.session,
                         &substream.messages,
                         reason.to_string(),
                         field,
+                        reason_key,
                     ));
                     continue;
                 }
@@ -371,12 +375,18 @@ impl Store {
                 let field = match &failure {
                     IngestError::ImmutableField { field, .. } => Some(*field),
                 };
+                let reason_key = match field {
+                    Some("project") => DROP_REASON_IMMUTABLE_PROJECT,
+                    Some("source_agent") => DROP_REASON_IMMUTABLE_SOURCE_AGENT,
+                    _ => DROP_REASON_UNCATEGORIZED,
+                };
                 outcomes.extend(error_outcomes_for_substream(
                     substream.session_index,
                     &substream.session,
                     &substream.messages,
                     failure.to_string(),
                     field,
+                    reason_key,
                 ));
                 continue;
             }
@@ -1116,9 +1126,14 @@ pub struct IngestSummary {
     /// Rows that already existed (merge_insert no-op match).
     pub matched: usize,
     /// Events the validator dropped under per-event-drop policy (ordering
-    /// violation, duplicate id, orphan part, ...). Counted by event, not by
-    /// session: a session with one bad part stays in this bucket as 1, not
-    /// as "the whole substream."
+    /// violation, orphan part, mismatched parent, adapter parse failure,
+    /// duplicate-id collision, ...). Counted by event, not by session: a
+    /// session with one bad part stays in this bucket as 1, not as "the
+    /// whole substream." Per design.md 3.x, adapters SHOULD dedupe their
+    /// own emissions upstream when source replay is expected; the
+    /// validator's in-batch HashSet is a safety net, not a feature
+    /// adapters may rely on. If this bucket grows on a clean adapter,
+    /// inspect `drop_reasons` for the top contributors.
     pub dropped_events: usize,
     /// Sessions whose Session-level invariants (immutable `source_agent` /
     /// `project` against a previously-stored row) failed at flush time and
@@ -1132,7 +1147,33 @@ pub struct IngestSummary {
     /// conflicts, transient IO that didn't recover). Hard zero on healthy
     /// runs.
     pub storage_errors: usize,
+    /// Histogram of stable reason keys for the combined `dropped_events +
+    /// dropped_sessions` populations. Keys are `&'static str` (see the
+    /// `DROP_REASON_*` constants) so consumers can match by identity.
+    /// Empty on a clean run. Used by `pond sync` to print the top reasons
+    /// and by `benches/ingest_bench.rs` to bucket Partial drops (which
+    /// previously carried only a count, no reason).
+    pub drop_reasons: BTreeMap<&'static str, usize>,
 }
+
+/// Stable reason keys for the `IngestSummary::drop_reasons` histogram and
+/// the per-row `RowError::reason_key`. `&'static str` so consumers can
+/// match by identity rather than prose. Adding a new variant: pick a short
+/// snake_case identifier, route it from the validator/adapter, and update
+/// the doc table in `docs/design.md` 3.4.
+pub const DROP_REASON_DUPLICATE_MESSAGE_ID: &str = "duplicate_message_id";
+pub const DROP_REASON_DUPLICATE_PART_KEY: &str = "duplicate_part_key";
+pub const DROP_REASON_MESSAGE_BEFORE_SESSION: &str = "message_before_session";
+pub const DROP_REASON_MESSAGE_SESSION_MISMATCH: &str = "message_session_mismatch";
+pub const DROP_REASON_PART_BEFORE_MESSAGE: &str = "part_before_message";
+pub const DROP_REASON_PART_MESSAGE_MISMATCH: &str = "part_message_mismatch";
+pub const DROP_REASON_EMPTY_SOURCE_AGENT: &str = "empty_source_agent";
+pub const DROP_REASON_IMMUTABLE_PROJECT: &str = "immutable_project";
+pub const DROP_REASON_IMMUTABLE_SOURCE_AGENT: &str = "immutable_source_agent";
+pub const DROP_REASON_ADAPTER_PARSE: &str = "adapter_parse";
+pub const DROP_REASON_ADAPTER_IO: &str = "adapter_io";
+pub const DROP_REASON_ADAPTER_SCHEMA: &str = "adapter_schema";
+pub const DROP_REASON_UNCATEGORIZED: &str = "uncategorized";
 
 impl IngestSummary {
     pub fn accepted(&self) -> usize {
@@ -1156,9 +1197,22 @@ impl IngestSummary {
                     } else {
                         self.dropped_events += 1;
                     }
+                    let reason = outcome
+                        .error
+                        .as_ref()
+                        .and_then(|e| e.reason_key)
+                        .unwrap_or(DROP_REASON_UNCATEGORIZED);
+                    *self.drop_reasons.entry(reason).or_insert(0) += 1;
                 }
             }
         }
+    }
+
+    /// Record a drop-reason charge that did not flow through a `RowOutcome`
+    /// (currently used by the adapter path for bad-line parse failures
+    /// mid-session, where `handlers.rs` bumps `dropped_events` directly).
+    pub fn record_drop_reason(&mut self, reason: &'static str) {
+        *self.drop_reasons.entry(reason).or_insert(0) += 1;
     }
 }
 
@@ -1189,6 +1243,11 @@ pub struct RowError {
     pub message: String,
     pub field: Option<&'static str>,
     pub reason: Option<&'static str>,
+    /// Stable key for histogramming - see `DROP_REASON_*` constants. The
+    /// `reason` field above is human-prose; `reason_key` is the machine
+    /// bucket. `None` means uncategorized; consumers attribute to
+    /// `DROP_REASON_UNCATEGORIZED`.
+    pub reason_key: Option<&'static str>,
 }
 
 /// Buffered session events tagged with their input array index, so the
@@ -1330,6 +1389,7 @@ impl IngestValidator {
                     message: format!("session {} has empty source_agent after trim", session.id),
                     field: Some("source_agent"),
                     reason: None,
+                    reason_key: Some(DROP_REASON_EMPTY_SOURCE_AGENT),
                 }),
             }]);
         }
@@ -1374,6 +1434,7 @@ impl IngestValidator {
                 pk,
                 "first event in a session stream must be Session",
                 None,
+                DROP_REASON_MESSAGE_BEFORE_SESSION,
             )];
         };
         if message.session_id() != session.session.id {
@@ -1389,11 +1450,26 @@ impl IngestValidator {
                 pk,
                 &msg,
                 Some("session_id"),
+                DROP_REASON_MESSAGE_SESSION_MISMATCH,
             )];
         }
         if !self.seen_message_ids.insert(message.id().to_owned()) {
+            // Safety-net: Lance's `merge_insert` rejects same-PK rows in
+            // one batch, so we have to drop here regardless. Per design.md
+            // 3.x the adapter is expected to dedupe upstream (see
+            // claude-code adapter's per-file `seen_uuids`); when this
+            // branch fires there is an adapter bug or an unrecognized
+            // replay pattern worth investigating. Classified as Error so
+            // it surfaces in `dropped_events` and the operator notices.
             let msg = format!("duplicate message id {} in session substream", message.id());
-            return vec![error_outcome(index, "message", pk, &msg, None)];
+            return vec![error_outcome(
+                index,
+                "message",
+                pk,
+                &msg,
+                None,
+                DROP_REASON_DUPLICATE_MESSAGE_ID,
+            )];
         }
         self.flush_current_message();
         self.current_message = Some(BufferedMessage {
@@ -1417,6 +1493,7 @@ impl IngestValidator {
                 pk,
                 "part event appeared before a message",
                 None,
+                DROP_REASON_PART_BEFORE_MESSAGE,
             )];
         };
         if part.message_id != current.message.id() {
@@ -1426,15 +1503,31 @@ impl IngestValidator {
                 part.message_id,
                 current.message.id()
             );
-            return vec![error_outcome(index, "part", pk, &msg, Some("message_id"))];
+            return vec![error_outcome(
+                index,
+                "part",
+                pk,
+                &msg,
+                Some("message_id"),
+                DROP_REASON_PART_MESSAGE_MISMATCH,
+            )];
         }
         let part_key = (part.message_id.clone(), part.id.clone());
         if !self.seen_part_keys.insert(part_key) {
+            // Same safety-net rationale as `push_message`: Lance requires
+            // unique PKs per batch, but the adapter SHOULD dedupe upstream.
             let msg = format!(
                 "duplicate part id {} for message {} in session substream",
                 part.id, part.message_id
             );
-            return vec![error_outcome(index, "part", pk, &msg, None)];
+            return vec![error_outcome(
+                index,
+                "part",
+                pk,
+                &msg,
+                None,
+                DROP_REASON_DUPLICATE_PART_KEY,
+            )];
         }
         self.current_parts.push(BufferedPart { index, part });
         Vec::new()
@@ -1461,6 +1554,7 @@ fn error_outcome(
     pk: Value,
     message: &str,
     field: Option<&'static str>,
+    reason_key: &'static str,
 ) -> RowOutcome {
     RowOutcome {
         index,
@@ -1471,6 +1565,7 @@ fn error_outcome(
             message: message.to_owned(),
             field,
             reason: None,
+            reason_key: Some(reason_key),
         }),
     }
 }
@@ -1488,6 +1583,7 @@ fn error_outcomes_for_substream(
     _messages: &[BufferedMessage],
     message: impl Into<String>,
     field: Option<&'static str>,
+    reason_key: &'static str,
 ) -> Vec<RowOutcome> {
     let reason = field.map(|_| "immutable");
     vec![RowOutcome {
@@ -1499,6 +1595,7 @@ fn error_outcomes_for_substream(
             message: message.into(),
             field,
             reason,
+            reason_key: Some(reason_key),
         }),
     }]
 }
@@ -1616,14 +1713,19 @@ fn ensure_immutable_match(
 }
 
 pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
-    let mut chunks = Vec::new();
+    let mut chunks: Vec<String> = Vec::new();
     for part in parts {
         match (message.role(), &part.kind) {
             (Role::User | Role::Assistant, PartKind::Text { text }) => {
-                chunks.push(text.clone());
+                // `Option<Extracted<String>>` derefs to `&String` for read.
+                if let Some(text) = text {
+                    chunks.push(text.to_string());
+                }
             }
             (Role::Assistant, PartKind::ToolCall { name, params, .. }) => {
-                chunks.push(name.clone());
+                if let Some(name) = name {
+                    chunks.push(name.to_string());
+                }
                 collect_string_leaves(params, &mut chunks);
             }
             (
@@ -2213,7 +2315,13 @@ pub(crate) fn message_from_batch(batch: &RecordBatch, row: usize) -> Result<Mess
             id,
             session_id,
             timestamp,
-            content: string(batch, "content", row)?.unwrap_or_default(),
+            // `content` is nullable in the schema; preserve the distinction
+            // between "no content row stored" (`None`) and "empty string
+            // stored" (`Some(extracted_empty)`). The value originally
+            // came from a `Source` extraction at ingest time; rewrap via
+            // the storage-internal `from_stored` so the type-system seal
+            // for adapters stays intact.
+            content: string(batch, "content", row)?.map(crate::adapter::Extracted::from_stored),
             options,
         }),
         "user" => Ok(Message::User {
@@ -2352,4 +2460,329 @@ fn part_kind_from_json(type_name: &str, variant_data: &str) -> Result<PartKind> 
         .context("part variant data is not an object")?;
     object.insert("type".to_owned(), Value::String(type_name.to_owned()));
     serde_json::from_value(value).context("failed to parse part kind")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::{
+        adapter::Extracted,
+        handlers::ingest_events,
+        wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
+    };
+    use chrono::Utc;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn synthetic_session(id: &str) -> Session {
+        Session {
+            id: id.to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Some("/tmp/pond".to_owned()),
+            options: ProviderOptions::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordering_violation_drops_only_the_offending_event() -> anyhow::Result<()> {
+        // Per-event drop semantics (design.md 3.4): a Part with no preceding
+        // Message is dropped on the spot, with one Error outcome surfaced. The
+        // rest of the substream continues normally - subsequent valid messages
+        // and parts get written.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("ordering");
+        let orphan_part = Part {
+            id: "orphan-part".to_owned(),
+            message_id: "missing-message".to_owned(),
+            ordinal: 0,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value("orphan".to_owned())),
+            },
+        };
+        let valid_message = Message::User {
+            id: "valid-message".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let valid_part = Part {
+            id: "valid-part".to_owned(),
+            message_id: valid_message.id().to_owned(),
+            ordinal: 0,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value("kept".to_owned())),
+            },
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        let part_outcomes = validator
+            .push(&store, 1, IngestEvent::Part(orphan_part))
+            .await?;
+        assert_eq!(part_outcomes.len(), 1);
+        assert_eq!(part_outcomes[0].kind, "part");
+        assert_eq!(part_outcomes[0].status, OutcomeStatus::Error);
+        assert!(
+            part_outcomes[0]
+                .error
+                .as_ref()
+                .map(|e| e.message.contains("part event appeared before a message"))
+                .unwrap_or(false),
+            "error message must explain the ordering violation: {part_outcomes:?}"
+        );
+        validator
+            .push(&store, 2, IngestEvent::Message(valid_message))
+            .await?;
+        validator
+            .push(&store, 3, IngestEvent::Part(valid_part))
+            .await?;
+        validator.finish(&store).await?;
+
+        let (sessions, messages, parts, _) = store.row_counts().await?;
+        assert_eq!(sessions, 1, "session committed despite the orphan part");
+        assert_eq!(messages, 1, "valid message committed");
+        assert_eq!(parts, 1, "valid part committed; the orphan was dropped");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_message_id_drops_the_second_keeps_the_first() -> anyhow::Result<()> {
+        // Per-event drop: a duplicate message id within a substream drops the
+        // *duplicate* and surfaces an Error outcome for it. The first wins; the
+        // session still commits.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("duplicate-message");
+        let first = Message::User {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let second = Message::Assistant {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(first))
+            .await?;
+        let dup_outcomes = validator
+            .push(&store, 2, IngestEvent::Message(second))
+            .await?;
+        assert_eq!(dup_outcomes.len(), 1);
+        assert_eq!(dup_outcomes[0].status, OutcomeStatus::Error);
+        assert!(
+            dup_outcomes[0]
+                .error
+                .as_ref()
+                .map(|e| e.message.contains("duplicate message id message-1"))
+                .unwrap_or(false),
+            "duplicate-id rejection must name the offending id: {dup_outcomes:?}"
+        );
+
+        validator.finish(&store).await?;
+        let (sessions, messages, _, _) = store.row_counts().await?;
+        assert_eq!(sessions, 1, "session committed");
+        assert_eq!(messages, 1, "only the first message committed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("blob");
+        let message = Message::User {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let part = Part {
+            id: "part-1".to_owned(),
+            message_id: message.id().to_owned(),
+            ordinal: 0,
+            options: ProviderOptions::new(),
+            kind: PartKind::File {
+                media_type: "text/plain".to_owned(),
+                file_name: Some("payload.txt".to_owned()),
+                data: FileData::Bytes(b"pond".to_vec()),
+            },
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message.clone()))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Part(part.clone()))
+            .await?;
+        validator.finish(&store).await?;
+
+        let stored = store
+            .get_session(&session.id)
+            .await?
+            .expect("session should exist");
+        let stored_part = &stored.messages[0].parts[0];
+        assert_eq!(stored_part, &part);
+
+        Ok(())
+    }
+
+    // -- ingest_immutable: Session-level immutable field checks ---------------
+    //
+    // `Session.source_agent` and `Session.project` are immutable
+    // post-first-write because messages/embeddings denormalize them at
+    // first ingest; a silent overwrite would desync the denormalized
+    // copies. pond core's `IngestValidator` probes the existing session
+    // before the merge_insert and emits a per-row `validation_failed`
+    // outcome with the typed field name when either changes. Other Session
+    // fields (options, parent_session_id, created_at, parent_message_id)
+    // re-write idempotently via merge_insert.
+
+    fn base_session() -> Session {
+        Session {
+            id: "01HXY00000000001".to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Some("/home/me/proj".to_owned()),
+            options: ProviderOptions::new(),
+        }
+    }
+
+    fn count_status(outcomes: &[RowOutcome], target: OutcomeStatus) -> usize {
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == target)
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_ingesting_a_session_with_unchanged_immutable_fields_is_idempotent()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        let first = ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
+        assert_eq!(count_status(&first, OutcomeStatus::Inserted), 1);
+
+        let mut again = base_session();
+        again.options.insert("title".to_owned(), json!("renamed"));
+        let second = ingest_events(&store, vec![IngestEvent::Session(again)]).await?;
+        assert_eq!(
+            count_status(&second, OutcomeStatus::Error),
+            0,
+            "options is mutable; the re-ingest must not surface an error: {second:?}",
+        );
+        assert_eq!(
+            count_status(&second, OutcomeStatus::Matched),
+            1,
+            "unchanged immutable fields must match-insert via merge_insert",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_ingesting_with_changed_source_agent_is_rejected() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        let first = ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
+        assert_eq!(count_status(&first, OutcomeStatus::Error), 0);
+
+        let mut tampered = base_session();
+        tampered.source_agent = "codex-cli".to_owned();
+        let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
+        assert_eq!(count_status(&second, OutcomeStatus::Error), 1);
+        let err_row = second
+            .iter()
+            .find(|outcome| outcome.status == OutcomeStatus::Error)
+            .expect("error outcome present");
+        let err = err_row.error.as_ref().expect("error body present");
+        assert_eq!(err.field, Some("source_agent"));
+        assert_eq!(err.reason, Some("immutable"));
+
+        // The stored row stayed on the original adapter - no silent rewrite.
+        let stored = store
+            .get_session(&base_session().id)
+            .await?
+            .expect("session row survives the rejected re-ingest");
+        assert_eq!(stored.session.source_agent, "claude-code");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_ingesting_with_changed_project_is_rejected() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        let first = ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
+        assert_eq!(count_status(&first, OutcomeStatus::Error), 0);
+
+        let mut tampered = base_session();
+        tampered.project = Some("/somewhere/else".to_owned());
+        let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
+        let err_row = second
+            .iter()
+            .find(|outcome| outcome.status == OutcomeStatus::Error)
+            .expect("project change must surface an error outcome");
+        assert_eq!(err_row.error.as_ref().unwrap().field, Some("project"));
+
+        let stored = store
+            .get_session(&base_session().id)
+            .await?
+            .expect("session row survives");
+        assert_eq!(
+            stored.session.project.as_deref(),
+            Some("/home/me/proj"),
+            "stored project must remain the original",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_ingesting_a_null_project_when_stored_value_exists_is_rejected() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
+
+        let mut tampered = base_session();
+        tampered.project = None;
+        let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
+        assert_eq!(
+            count_status(&second, OutcomeStatus::Error),
+            1,
+            "NULL-vs-non-NULL project change must also be rejected",
+        );
+        Ok(())
+    }
 }

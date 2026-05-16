@@ -7,7 +7,10 @@
 //! model interaction: subtypes `message`, `reasoning`, `function_call`,
 //! `function_call_output`, `custom_tool_call`).
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use async_stream::stream;
 use chrono::{DateTime, Utc};
@@ -23,7 +26,9 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
-    compact_json, empty_options, part_id,
+    empty_options,
+    extract::{Extracted, extract_compact_repr, extract_str},
+    part_id,
 };
 
 const NAME: &str = "codex-cli";
@@ -115,8 +120,17 @@ impl Adapter for CodexCliAdapter {
                 // function_call / function_call_output / reasoning rows
                 // synthesize Assistant/Tool messages so they still hang off
                 // a Part in pond's schema.
+                //
+                // Per-file `tool_call_names`: `function_call` rows carry the
+                // tool name on the call side, but the matching
+                // `function_call_output` row only carries `call_id`. Build
+                // a map as we go so `tool_result_events` can resolve the
+                // name from the prior call rather than synthesising
+                // `"function"` (the previous sentinel). Misses yield
+                // `name: None`. Per design.md invariant N.
                 let mut lines = BufReader::new(file).lines();
                 let mut line_number = 0usize;
+                let mut tool_call_names: HashMap<String, Extracted<String>> = HashMap::new();
                 loop {
                     let next = lines.next_line().await;
                     let line = match next {
@@ -145,7 +159,18 @@ impl Adapter for CodexCliAdapter {
                             continue;
                         }
                     };
-                    match events_from_row(&session_id, line_number, &row, default_timestamp) {
+                    // Capture (call_id -> name) for `function_call` rows
+                    // before we hand the row off to events_from_row, so the
+                    // matching `function_call_output` row downstream can
+                    // resolve the tool name.
+                    capture_tool_call_name(&row, &mut tool_call_names);
+                    match events_from_row(
+                        &session_id,
+                        line_number,
+                        &row,
+                        default_timestamp,
+                        &tool_call_names,
+                    ) {
                         Ok(events) => {
                             for event in events {
                                 yield Ok(event);
@@ -255,6 +280,7 @@ fn events_from_row(
     line: usize,
     row: &Value,
     default_timestamp: DateTime<Utc>,
+    tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Result<Vec<IngestEvent>, String> {
     let kind = row.get("type").and_then(Value::as_str).unwrap_or_default();
     if kind != "response_item" {
@@ -283,6 +309,7 @@ fn events_from_row(
             &message_id,
             timestamp,
             payload,
+            tool_call_names,
         )),
         "reasoning" => Ok(reasoning_events(
             session_id,
@@ -294,6 +321,28 @@ fn events_from_row(
         // rather than fail the session.
         _ => Ok(Vec::new()),
     }
+}
+
+/// Stash one row's `function_call` (call_id -> name) into the per-file
+/// map so the matching `function_call_output` row downstream can resolve
+/// the tool name rather than fall back to a sentinel.
+fn capture_tool_call_name(row: &Value, map: &mut HashMap<String, Extracted<String>>) {
+    if row.get("type").and_then(Value::as_str) != Some("response_item") {
+        return;
+    }
+    let Some(payload) = row.get("payload") else {
+        return;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(name) = extract_str(payload, "name") else {
+        return;
+    };
+    map.insert(call_id.to_owned(), name);
 }
 
 fn message_events(
@@ -313,11 +362,11 @@ fn message_events(
         .unwrap_or_default();
     let mut parts = Vec::with_capacity(content.len());
     for (ordinal, item) in content.iter().enumerate() {
-        let text = item
-            .get("text")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| compact_json(item));
+        // Faithful encoding of one content item: prefer the raw `text`
+        // field when present; otherwise compact-encode the structured
+        // body as a JSON string. The fallback is lossless (preserves the
+        // item bytes) and explicit (not a synthesised "unknown" or "").
+        let text = extract_str(item, "text").or_else(|| Some(extract_compact_repr(item)));
         parts.push(Part {
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
@@ -347,24 +396,19 @@ fn message_events(
             true,
         ),
         // `developer` rows are codex-cli's system-prompt frames; map to System
-        // and collapse text Parts into the Message's `content` per pond's
-        // canonical shape, so they don't double-store and don't add to FTS.
+        // with `content: None` and let the inner Text Parts carry the
+        // body. The previous join-aggregation hack double-stored data and
+        // can't reconstruct an `Extracted<String>` from synthesised text
+        // under the new adapter seam; dropping it is a simplification.
         "developer" | "system" => (
             Message::System {
                 id: message_id.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                content: parts
-                    .iter()
-                    .filter_map(|part| match &part.kind {
-                        PartKind::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                content: None,
                 options: empty_options(),
             },
-            false,
+            true,
         ),
         other => return Err(format!("unsupported codex-cli role {other}")),
     };
@@ -383,16 +427,8 @@ fn tool_call_events(
     timestamp: DateTime<Utc>,
     payload: &Value,
 ) -> Vec<IngestEvent> {
-    let call_id = payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let name = payload
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("function")
-        .to_owned();
+    let call_id = extract_str(payload, "call_id");
+    let name = extract_str(payload, "name");
     let params = match payload.get("arguments") {
         Some(Value::String(text)) => {
             serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.clone()))
@@ -428,12 +464,17 @@ fn tool_result_events(
     message_id: &str,
     timestamp: DateTime<Utc>,
     payload: &Value,
+    tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Vec<IngestEvent> {
-    let call_id = payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let call_id = extract_str(payload, "call_id");
+    // Resolve tool name from the prior `function_call` row via the
+    // per-file `call_id -> name` map. Misses (e.g. compaction pruned the
+    // originating call) yield `None`, a faithful "unresolved" rather than
+    // the previous `"function"` sentinel.
+    let name = call_id
+        .as_ref()
+        .and_then(|id| tool_call_names.get(id.as_str()))
+        .cloned();
     let result = payload.get("output").cloned().unwrap_or(Value::Null);
     let part = Part {
         id: part_id(message_id, 0),
@@ -442,7 +483,7 @@ fn tool_result_events(
         options: empty_options(),
         kind: PartKind::ToolResult {
             call_id,
-            name: "function".to_owned(),
+            name,
             is_failure: false,
             result,
         },
@@ -464,17 +505,25 @@ fn reasoning_events(
     timestamp: DateTime<Utc>,
     payload: &Value,
 ) -> Vec<IngestEvent> {
+    // The source `summary` array is the only place reasoning text lives in
+    // codex-cli's format. Empty array (or missing field) -> `None`. Joined
+    // text -> `Some(...)`. Don't synthesize an empty string.
     let summary = payload
         .get("summary")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
+        .and_then(|items| {
+            let joined = items
                 .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .filter_map(|item| extract_str(item, "text"))
+                .map(|e| (*e).clone())
                 .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+                .join("\n");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(extract_compact_repr(payload))
+            }
+        });
     let part = Part {
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
@@ -491,4 +540,65 @@ fn reasoning_events(
         }),
         IngestEvent::Part(part),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end test for the codex-cli adapter: ingest the committed fixture
+    //! corpus and assert pond's canonical Session/Message/Part shape comes out
+    //! the other side. The fixture lives under
+    //! `tests/fixtures/session-samples/codex-cli/`.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
+    use tempfile::TempDir;
+
+    const FIXTURES: &str = "tests/fixtures/session-samples/codex-cli/sessions";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_cli_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let adapter = CodexCliAdapter::new(FIXTURES);
+
+        let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        assert!(summary.accepted() > 0, "ingest must accept rows");
+        assert_eq!(summary.dropped_events, 0, "no per-event drops expected");
+        assert_eq!(
+            summary.dropped_sessions, 0,
+            "no session-level rejections expected"
+        );
+        assert_eq!(summary.skipped_files, 0, "no whole-file skips expected");
+
+        let (sessions, messages, parts, _) = store.row_counts().await?;
+        assert!(sessions > 0, "at least one codex-cli session");
+        assert!(messages > 0, "at least one codex-cli message");
+        assert!(parts > 0, "at least one codex-cli Part");
+
+        let mut saw_text_part = false;
+        for session_id in store.session_ids().await? {
+            let session = store
+                .get_session(&session_id)
+                .await?
+                .expect("session round-trips");
+            assert_eq!(session.session.source_agent, "codex-cli");
+            assert!(
+                !session.messages.is_empty(),
+                "session {session_id} must carry messages",
+            );
+            for stored in &session.messages {
+                for part in &stored.parts {
+                    if matches!(part.kind, PartKind::Text { .. }) {
+                        saw_text_part = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_text_part,
+            "codex-cli corpus must contain at least one Text Part",
+        );
+        Ok(())
+    }
 }

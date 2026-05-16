@@ -18,6 +18,14 @@ use pond::{
 };
 use tempfile::TempDir;
 
+/// Build an `Option<Extracted<String>>` for test fixtures. Integration tests
+/// can't see `Extracted::from_test_value` (cfg-test-gated inside the pond
+/// crate), so we go through the public `extract_str` producer on a
+/// synthetic JSON source.
+fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
+    pond::adapter::extract_str(&serde_json::json!({"x": value}), "x")
+}
+
 /// A single fixture project subdir - enough sessions to fill more than one
 /// embedding batch without ingesting the whole fixture corpus.
 const FIXTURES: &str =
@@ -347,9 +355,7 @@ fn text_message_events(session_id: &str, message_id: &str, text: &str) -> Vec<In
             message_id: message_id.to_owned(),
             ordinal: 0,
             options: Default::default(),
-            kind: PartKind::Text {
-                text: text.to_owned(),
-            },
+            kind: PartKind::Text { text: s(text) },
         }),
     ]
 }

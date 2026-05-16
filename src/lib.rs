@@ -65,9 +65,7 @@ pub mod output {
     /// overhead is a single pointer load.
     fn use_color() -> bool {
         static USE: OnceLock<bool> = OnceLock::new();
-        *USE.get_or_init(|| {
-            std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal()
-        })
+        *USE.get_or_init(|| std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal())
     }
 
     /// Wrap `text` in `style`'s SGR sequence when color is enabled; return the

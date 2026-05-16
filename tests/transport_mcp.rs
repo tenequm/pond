@@ -28,6 +28,14 @@ const SESSION_ID: &str = "mcp-test-session";
 const MESSAGE_ID: &str = "mcp-test-message";
 const REASONING_TEXT: &str = "weighing the options before answering";
 
+/// Build an `Option<Extracted<String>>` for test fixtures. Integration tests
+/// can't see `Extracted::from_test_value` (cfg-test-gated inside the pond
+/// crate), so we go through the public `extract_str` producer on a
+/// synthetic JSON source.
+fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
+    pond::adapter::extract_str(&serde_json::json!({"x": value}), "x")
+}
+
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
 struct FakeBackend {
     dim: usize,
@@ -94,7 +102,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         ordinal: 0,
         options: Default::default(),
         kind: PartKind::Reasoning {
-            text: REASONING_TEXT.to_owned(),
+            text: s(REASONING_TEXT),
         },
     };
     let text = Part {
@@ -103,7 +111,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         ordinal: 1,
         options: Default::default(),
         kind: PartKind::Text {
-            text: "the answer is forty-two".to_owned(),
+            text: s("the answer is forty-two"),
         },
     };
 
@@ -203,7 +211,9 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         "default include_thinking=false: no raw reasoning parts over MCP",
     );
     let placeholder = parts.iter().find_map(|part| match &part.kind {
-        PartKind::Text { text } if text.starts_with("[reasoning:") => Some(text.as_str()),
+        PartKind::Text { text: Some(text) } if text.starts_with("[reasoning:") => {
+            Some(text.as_str())
+        }
         _ => None,
     });
     assert_eq!(
@@ -230,7 +240,7 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
     assert!(
         parts.iter().any(|part| matches!(
             &part.kind,
-            PartKind::Reasoning { text } if text == REASONING_TEXT
+            PartKind::Reasoning { text: Some(text) } if text.as_str() == REASONING_TEXT
         )),
         "include_thinking=true returns the raw reasoning part",
     );

@@ -31,9 +31,14 @@ use crate::{sessions::IngestEvent, wire::ProviderOptions};
 
 mod claude_code;
 mod codex_cli;
+pub mod extract;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
+pub use extract::{
+    Extracted, Source, extract_bool, extract_compact_repr, extract_self_str, extract_str,
+    extract_value,
+};
 
 /// Stateless face of an adapter type: how the registry knows about it without
 /// instantiating it. One implementation per known format, registered in

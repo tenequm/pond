@@ -24,7 +24,16 @@ use pond::{
     sessions::{IngestEvent, OutcomeStatus, Store},
     wire::{Message, Part, PartKind, ProviderOptions, Session},
 };
+
 use url::Url;
+
+/// Build an `Option<Extracted<String>>` for test fixtures. Integration tests
+/// can't see `Extracted::from_test_value` (cfg-test-gated inside the pond
+/// crate), so we go through the public `extract_str` producer on a
+/// synthetic JSON source.
+fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
+    pond::adapter::extract_str(&serde_json::json!({"x": value}), "x")
+}
 
 fn memory_url() -> Url {
     parse_data_dir("memory:///pond-remote-test").expect("memory uri parses")
@@ -69,7 +78,7 @@ async fn store_open_against_memory_uri_round_trips_a_session() -> anyhow::Result
         ordinal: 0,
         options: ProviderOptions::new(),
         kind: PartKind::Text {
-            text: "hello from a remote-backed pond".to_owned(),
+            text: s("hello from a remote-backed pond"),
         },
     };
 

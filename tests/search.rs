@@ -27,6 +27,14 @@ use pond::{
 };
 use tempfile::TempDir;
 
+/// Build an `Option<Extracted<String>>` for test fixtures. Integration tests
+/// can't see `Extracted::from_test_value` (cfg-test-gated inside the pond
+/// crate), so we go through the public `extract_str` producer on a
+/// synthetic JSON source.
+fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
+    pond::adapter::extract_str(&serde_json::json!({"x": value}), "x")
+}
+
 // ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------
@@ -559,7 +567,7 @@ async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
             continue;
         };
         for part in &parts {
-            if let PartKind::Text { text } = &part.kind {
+            if let PartKind::Text { text: Some(text) } = &part.kind {
                 let words = text.split_whitespace().take(8).collect::<Vec<_>>();
                 if words.len() >= 4 {
                     return Ok(words.join(" "));
@@ -740,7 +748,7 @@ async fn project_match_is_null_pushes_down_and_returns_injected_rows() -> anyhow
             ordinal: 0,
             options: ProviderOptions::new(),
             kind: PartKind::Text {
-                text: format!("null project sentinel message {n}"),
+                text: s(&format!("null project sentinel message {n}")),
             },
         }));
     }

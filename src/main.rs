@@ -214,7 +214,12 @@ enum Command {
         #[arg(long, value_name = "ID")]
         message_id: Option<String>,
         /// Truncate session output at this message id. Requires `--session-id`.
-        #[arg(long, value_name = "ID", requires = "session_id", conflicts_with = "message_id")]
+        #[arg(
+            long,
+            value_name = "ID",
+            requires = "session_id",
+            conflicts_with = "message_id"
+        )]
         up_to: Option<String>,
         /// For `--message-id` mode: include this many surrounding messages
         /// from the same session. Ignored in session mode.
@@ -322,6 +327,31 @@ async fn main() -> anyhow::Result<()> {
                     summary.skipped_files,
                     summary.storage_errors,
                 ))?;
+                // Top-N drop reasons follow the summary line. Empty when
+                // nothing dropped, which is the common case. The bucket
+                // keys are stable `&'static str` (DROP_REASON_*) so the
+                // operator can grep for them in the sync log or use them
+                // as predicates in scripted post-sync analysis.
+                if !summary.drop_reasons.is_empty() {
+                    let mut reasons: Vec<(&&'static str, &usize)> =
+                        summary.drop_reasons.iter().collect();
+                    reasons.sort_by(|a, b| b.1.cmp(a.1));
+                    let top = reasons
+                        .iter()
+                        .take(3)
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let suffix = if reasons.len() > 3 {
+                        format!(" (+{} more)", reasons.len() - 3)
+                    } else {
+                        String::new()
+                    };
+                    output(&format!(
+                        "  {} {top}{suffix}",
+                        pond::output::paint("top drop reasons:", pond::output::dim()),
+                    ))?;
+                }
             }
             store.ensure_indices().await?;
         }
@@ -782,11 +812,7 @@ async fn sync_with_progress(
                 }
             }
             messages += outcome.messages as u64;
-            bar_ref.println(format_sync_line(
-                name,
-                &outcome,
-                optional_reason.as_deref(),
-            ));
+            bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
             // The bar's `println` only renders when stderr is a TTY; in
             // piped runs (CI, `pond sync 2>&1 | tee`) operators still need
             // visibility per session. The same data goes out as a `tracing`
@@ -1068,10 +1094,7 @@ fn new_table() -> Table {
 /// always emits the envelope to stdout so scripts can pipe both success and
 /// error bodies through `jq`; pretty mode routes errors to stderr so stdout
 /// stays parseable.
-fn render_search_envelope(
-    format: OutputFormat,
-    envelope: &SearchEnvelope,
-) -> anyhow::Result<bool> {
+fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
             output(
@@ -1251,10 +1274,7 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
         "{} {}",
         paint("created:", dim()),
         paint(
-            &session
-                .created_at
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string(),
+            &session.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
     ))?;
@@ -1300,10 +1320,7 @@ fn render_message(rank: usize, message: &Message, parts: &[&Part]) -> anyhow::Re
         "{}  {}  {}  {}",
         paint(&format!("[{rank}]"), dim()),
         paint(
-            &message
-                .timestamp()
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string(),
+            &message.timestamp().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
         paint_role(message.role().as_str()),
@@ -1324,15 +1341,22 @@ fn render_part(part: &Part) -> anyhow::Result<()> {
 
     let prefix = paint(">", dim());
     match &part.kind {
+        // `Option<String>`: render only what's there. A `None` text part
+        // means the source row carried no text field; printing nothing is
+        // the faithful representation - no "<unresolved>" placeholder.
         PartKind::Text { text } => {
-            for line in text.lines() {
-                output(&format!("    {prefix} {line}"))?;
+            if let Some(text) = text {
+                for line in text.lines() {
+                    output(&format!("    {prefix} {line}"))?;
+                }
             }
         }
         PartKind::Reasoning { text } => {
             let tag = paint("[reasoning]", dim());
-            for line in text.lines() {
-                output(&format!("    {tag} {prefix} {line}"))?;
+            if let Some(text) = text {
+                for line in text.lines() {
+                    output(&format!("    {tag} {prefix} {line}"))?;
+                }
             }
         }
         PartKind::File {
@@ -1346,9 +1370,19 @@ fn render_part(part: &Part) -> anyhow::Result<()> {
                 file_name.as_deref().unwrap_or("-"),
             ))?;
         }
+        // For tool_call / tool_result: omit the field entirely when None.
+        // Concretely: a tool_result with no resolvable name prints as
+        // `[tool_result] call_id=toolu_01...` (no name token), not
+        // `[tool_result] unknown call_id=toolu_01...` (which lied) and
+        // not `[tool_result] - call_id=toolu_01...` (which translates).
         PartKind::ToolCall { call_id, name, .. } => {
+            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+            let call_id_token = call_id
+                .as_deref()
+                .map(|id| format!(" call_id={id}"))
+                .unwrap_or_default();
             output(&format!(
-                "    {} {name} call_id={call_id}",
+                "    {}{name_token}{call_id_token}",
                 paint("[tool_call]", yellow()),
             ))?;
         }
@@ -1358,8 +1392,13 @@ fn render_part(part: &Part) -> anyhow::Result<()> {
             is_failure,
             ..
         } => {
+            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+            let call_id_token = call_id
+                .as_deref()
+                .map(|id| format!(" call_id={id}"))
+                .unwrap_or_default();
             output(&format!(
-                "    {} {name} call_id={call_id}{}",
+                "    {}{name_token}{call_id_token}{}",
                 paint("[tool_result]", yellow()),
                 if *is_failure { " (failure)" } else { "" },
             ))?;

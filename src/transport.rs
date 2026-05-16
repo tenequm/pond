@@ -554,9 +554,10 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         };
         for part in parts.iter_mut() {
             let placeholder = match &part.kind {
-                PartKind::Reasoning { text } if !include_thinking => {
-                    Some(format!("[reasoning: {} chars]", text.chars().count()))
-                }
+                PartKind::Reasoning { text } if !include_thinking => Some(format!(
+                    "[reasoning: {} chars]",
+                    text.as_deref().map(|t| (**t).chars().count()).unwrap_or(0)
+                )),
                 PartKind::ToolResult { result, .. } if !include_tool_results => Some(format!(
                     "[tool_result: {} chars]",
                     result.to_string().chars().count()
@@ -564,7 +565,15 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 _ => None,
             };
             if let Some(text) = placeholder {
-                part.kind = PartKind::Text { text };
+                // Synthesized placeholder is a transport-layer rewrite (the
+                // user-facing redaction for clients that opted out of
+                // reasoning / tool_result content), not adapter output. Use
+                // the storage-internal constructor since the value isn't
+                // coming from a real `Source`. Same channel that
+                // `message_from_batch` uses on read-back.
+                part.kind = PartKind::Text {
+                    text: Some(crate::adapter::Extracted::from_stored(text)),
+                };
             }
         }
     }
