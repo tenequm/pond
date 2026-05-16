@@ -699,6 +699,60 @@ individual Part field, counted and surfaced, never silent.
 
 ---
 
+## Open questions (for consideration)
+
+### Lossless claude-code ingest: should we close two adapter losses?
+
+Intent is lossless storage so we can replay a session verbatim. Audit of
+`src/adapter/claude_code.rs` found two real losses that contradict that intent.
+The 2.39 GiB pond / ~5 GB source ratio is mostly columnar compression - these
+losses are small in bytes but real in content.
+
+**Loss 1 - metadata-only rows lose their payload.** Rows with no `message`
+field (`permission-mode`, `last-prompt`, `queue-operation`, `custom-title`,
+`progress`, `system`, ...) currently store only the `subtype`/`type` label as
+`System.content`. The full row body (the actual permission value, the actual
+last-prompt text, etc.) is dropped. `events_from_row` in `claude_code.rs:521-547`
+has a doc comment claiming compact JSON is stored - the code disagrees with the
+comment for the non-attachment branch.
+
+**Loss 2 - top-level row fields outside the allowlist.** `row_options` in
+`claude_code.rs:786-801` is a fixed allowlist (`parentUuid`, `isSidechain`,
+`userType`, `entrypoint`, `cwd`, `version`, `gitBranch`, `requestId`,
+`type`). Anything else on the row (`agentId`, `summary`, `leafUuid`, plus any
+field a future claude-code adds) is silently dropped.
+
+Proposed shape:
+
+- **Fix 1**: keep `subtype`/`type` as `System.content` (the human label, FTS
+  stays clean, display stays clean) AND attach the full compact JSON of the
+  row to `options.source.raw_row` so replay can reconstruct it. Strictly
+  preferable to swapping the content field, which would pollute the BM25 index
+  with JSON keys and regress `pond search`/`pond get` rendering.
+- **Fix 2**: add a catch-all (`options.source.unknown_fields` or similar) that
+  captures any top-level row keys not already consumed elsewhere. Allowlist of
+  exclusions: `uuid`, `sessionId`, `timestamp`, `message`, `toolUseResult`,
+  `attachment`, `type`, plus everything `row_options` already pulls.
+
+Risks:
+
+- Neither fix moves the Lance schema; both write into existing columns
+  (`messages.content` text, `options` JSON blob). No migration needed (pond is
+  pre-release per `CLAUDE.md`).
+- Fix 2 carries a storage tail-risk if claude-code ever puts a large blob at
+  the row top level - we'd now capture it. That's the intent of "lossless",
+  but worth knowing.
+- A couple of System-content test assertions in `claude_code.rs` tests may
+  need updating; existing tests mostly check parts/sessions, not System body
+  shape.
+- Aligns with invariant 15 ("no synthesized values") - raw row JSON is the
+  original data, not synthesis.
+
+Decision needed: do both fixes in the recommended shape, or defer until a
+concrete replay consumer forces the question?
+
+---
+
 ## What this plan deliberately excludes
 
 Per `design.md` section 4, all of these stay deferred and are NOT in any stage above:
