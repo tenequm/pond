@@ -22,9 +22,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use serde_json::Value;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::{sessions::IngestEvent, wire::ProviderOptions};
@@ -81,7 +82,52 @@ pub trait Adapter: Send + Sync {
     /// an unknown total (the bar still ticks per session), so callers
     /// fall back to a rolling counter rather than failing the sync.
     fn discover(&self) -> DiscoverFuture<'_>;
+
+    /// Stream events with a [`SkipOracle`] the adapter MAY consult to
+    /// short-circuit per-session re-decoding (design.md 3.4). Default impl
+    /// ignores the oracle.
+    fn events_with<'a>(&'a self, _oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
+        Box::pin(self.events().map(|res| res.map(AdapterYield::Event)))
+    }
 }
+
+/// Per-session watermark lookup: when did pond last write this session?
+/// Backed by Lance's `_row_last_updated_at_version` joined to the manifest
+/// commit timestamp (design.md 3.4). Adapter compares this to the source
+/// file's mtime to decide whether to re-decode.
+pub trait SkipOracle: Send + Sync {
+    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
+}
+
+/// `SkipOracle` that always returns `None`. Used by tests and benches that
+/// don't want skip behavior interfering with their assertions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopOracle;
+
+impl SkipOracle for NoopOracle {
+    fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AdapterYield {
+    Event(IngestEvent),
+    Skipped {
+        session_id: String,
+        project: Option<String>,
+        reason: SkipReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    Fresh,
+}
+
+pub type AdapterYieldStream<'a> = std::pin::Pin<
+    Box<dyn Stream<Item = Result<AdapterYield, AdapterError>> + Send + 'a>,
+>;
 
 /// Boxed future returning the number of sessions an adapter will emit. The
 /// shape mirrors [`EventStream`] - one alias per async trait method so the

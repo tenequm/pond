@@ -15,7 +15,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
-    let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+    let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     assert_eq!(summary.dropped_events, 0);
     assert_eq!(summary.dropped_sessions, 0);
     assert_eq!(summary.skipped_files, 0);
@@ -81,9 +81,9 @@ async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
-    ingest_adapter(&store, &adapter, |_| {}).await?;
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     let first_counts = store.row_counts().await?;
-    let second = ingest_adapter(&store, &adapter, |_| {}).await?;
+    let second = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     let second_counts = store.row_counts().await?;
 
     assert_eq!(first_counts, second_counts);
@@ -103,7 +103,13 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     let mut events: Vec<SyncEvent> = Vec::new();
-    ingest_adapter(&store, &adapter, |event| events.push(event)).await?;
+    ingest_adapter(
+        &store,
+        &adapter,
+        &pond::adapter::NoopOracle,
+        |event| events.push(event),
+    )
+    .await?;
 
     let first = events.first().expect("at least one progress event");
     let discovered_total = match first {
@@ -137,7 +143,7 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
-    ingest_adapter(&store, &adapter, |_| {}).await?;
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
     let stats = store.corpus_stats().await?;
     assert!(stats.totals.sessions > 0);

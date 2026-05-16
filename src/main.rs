@@ -1,9 +1,12 @@
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+
+use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
@@ -28,6 +31,23 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
+
+/// `SkipOracle` backed by a pre-loaded `Store::last_message_timestamps` map.
+struct StoredWatermarks {
+    map: HashMap<String, DateTime<Utc>>,
+}
+
+impl StoredWatermarks {
+    fn new(map: HashMap<String, DateTime<Utc>>) -> Self {
+        Self { map }
+    }
+}
+
+impl pond::adapter::SkipOracle for StoredWatermarks {
+    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+        self.map.get(session_id).copied()
+    }
+}
 
 /// Adapter clap can call to parse `--data-dir` / `POND_DATA_DIR`. clap's
 /// default value parser uses `FromStr`, which `Url` does provide - but
@@ -289,17 +309,27 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let sources =
                 resolve_sync_sources(&loaded, &config_file, adapter.as_deref(), source_dir)?;
+            let started = std::time::Instant::now();
+            let map = store.session_last_ingested_at().await?;
+            tracing::info!(
+                target: "pond::sync",
+                sessions = map.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "loaded staleness-skip watermarks",
+            );
+            let oracle = StoredWatermarks::new(map);
             for (name, config) in sources {
-                let summary = sync_with_progress(&store, &name, config).await?;
+                let summary = sync_with_progress(&store, &name, config, &oracle).await?;
                 output(&format!(
                     "{} inserted={} matched={} dropped_events={} \
-                     dropped_sessions={} skipped_files={} storage_errors={}",
+                     dropped_sessions={} skipped_files={} skipped_fresh={} storage_errors={}",
                     pond::output::paint(&format!("sync {name}:"), pond::output::dim()),
                     summary.inserted,
                     summary.matched,
                     summary.dropped_events,
                     summary.dropped_sessions,
                     summary.skipped_files,
+                    summary.skipped_fresh,
                     summary.storage_errors,
                 ))?;
                 // Top-N drop reasons follow the summary line. Empty when
@@ -689,6 +719,7 @@ async fn sync_with_progress(
     store: &Store,
     name: &str,
     config: Value,
+    oracle: &dyn pond::adapter::SkipOracle,
 ) -> anyhow::Result<IngestSummary> {
     let factory = adapter::by_name(name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -715,7 +746,7 @@ async fn sync_with_progress(
     let started = std::time::Instant::now();
     let bar_ref = &bar;
 
-    let summary = handlers::ingest_adapter(store, adapter.as_ref(), |event| match event {
+    let summary = handlers::ingest_adapter(store, adapter.as_ref(), oracle, |event| match event {
         SyncEvent::Discovered { total } => {
             if let Some(total) = total {
                 bar_ref.set_length(total as u64);
@@ -753,6 +784,11 @@ async fn sync_with_progress(
                     status_label = "rejected";
                     dropped_count = 0;
                     optional_reason = Some(reason.clone());
+                }
+                SyncStatus::Fresh => {
+                    status_label = "fresh";
+                    dropped_count = 0;
+                    optional_reason = None;
                 }
             }
             messages += outcome.messages as u64;
@@ -820,8 +856,14 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Partial { .. } => ("part", yellow()),
         SyncStatus::Skipped { .. } => ("skip", red()),
         SyncStatus::Rejected { .. } => ("rej ", red()),
+        SyncStatus::Fresh => ("fresh", green()),
     };
     let tag = paint(raw_tag, tag_style);
+    if matches!(outcome.status, SyncStatus::Fresh) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        let session = outcome.session_id.as_deref().unwrap_or("-");
+        return format!("[{ts}] {adapter} {tag}  session={session}  (cached)");
+    }
     let ts = chrono::Local::now().format("%H:%M:%S");
     let project = outcome.project.as_deref().unwrap_or("-");
     let session = outcome.session_id.as_deref().unwrap_or("-");

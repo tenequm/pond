@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_stream::StreamExt;
 
 use crate::{
     config::expand_home_under,
@@ -25,8 +26,8 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
+    EventStream, SkipOracle, SkipReason, collect_jsonl_files, empty_options,
     extract::{Extracted, extract_compact_repr, extract_self_str, extract_str},
     part_id,
 };
@@ -86,6 +87,15 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn events(&self) -> EventStream<'_> {
+        let stream = self.events_with(&crate::adapter::NoopOracle);
+        Box::pin(stream.filter_map(|res| match res {
+            Ok(AdapterYield::Event(event)) => Some(Ok(event)),
+            Ok(AdapterYield::Skipped { .. }) => None,
+            Err(error) => Some(Err(error)),
+        }))
+    }
+
+    fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let root = self.root.clone();
         Box::pin(stream! {
             let paths = match collect_jsonl_files(&root).await {
@@ -97,6 +107,19 @@ impl Adapter for CodexCliAdapter {
             };
             for path in paths {
                 let path_display = path.display().to_string();
+
+                if let Some((id, mtime)) = peek_id_and_mtime(&path).await
+                    && let Some(ingested_at) = oracle.last_ingested_at(&id)
+                    && mtime <= ingested_at
+                {
+                    yield Ok(AdapterYield::Skipped {
+                        session_id: id,
+                        project: None,
+                        reason: SkipReason::Fresh,
+                    });
+                    continue;
+                }
+
                 let meta = match session_meta(&path, &path_display).await {
                     Ok(meta) => meta,
                     Err(error) => {
@@ -106,7 +129,7 @@ impl Adapter for CodexCliAdapter {
                 };
                 let session_id = meta.id.clone();
                 let default_timestamp = meta.created_at;
-                yield Ok(IngestEvent::Session(meta));
+                yield Ok(AdapterYield::Event(IngestEvent::Session(meta)));
 
                 let file = match tokio::fs::File::open(&path).await {
                     Ok(file) => file,
@@ -116,18 +139,6 @@ impl Adapter for CodexCliAdapter {
                     }
                 };
 
-                // One logical "message" per `response_item` record; the
-                // function_call / function_call_output / reasoning rows
-                // synthesize Assistant/Tool messages so they still hang off
-                // a Part in pond's schema.
-                //
-                // Per-file `tool_call_names`: `function_call` rows carry the
-                // tool name on the call side, but the matching
-                // `function_call_output` row only carries `call_id`. Build
-                // a map as we go so `tool_result_events` can resolve the
-                // name from the prior call rather than synthesising
-                // `"function"` (the previous sentinel). Misses yield
-                // `name: None`. Per design.md invariant N.
                 let mut lines = BufReader::new(file).lines();
                 let mut line_number = 0usize;
                 let mut tool_call_names: HashMap<String, Extracted<String>> = HashMap::new();
@@ -148,8 +159,6 @@ impl Adapter for CodexCliAdapter {
                     let row = match serde_json::from_str::<Value>(&line) {
                         Ok(value) => value,
                         Err(source) => {
-                            // Same per-line skip policy as the claude-code
-                            // adapter: surface the bad line, continue parsing.
                             yield Err(AdapterError::parse(
                                 NAME,
                                 path_display.clone(),
@@ -159,10 +168,6 @@ impl Adapter for CodexCliAdapter {
                             continue;
                         }
                     };
-                    // Capture (call_id -> name) for `function_call` rows
-                    // before we hand the row off to events_from_row, so the
-                    // matching `function_call_output` row downstream can
-                    // resolve the tool name.
                     capture_tool_call_name(&row, &mut tool_call_names);
                     match events_from_row(
                         &session_id,
@@ -173,7 +178,7 @@ impl Adapter for CodexCliAdapter {
                     ) {
                         Ok(events) => {
                             for event in events {
-                                yield Ok(event);
+                                yield Ok(AdapterYield::Event(event));
                             }
                         }
                         Err(message) => {
@@ -189,6 +194,20 @@ impl Adapter for CodexCliAdapter {
             }
         })
     }
+}
+
+async fn peek_id_and_mtime(path: &Path) -> Option<(String, DateTime<Utc>)> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let mtime = DateTime::<Utc>::from(metadata.modified().ok()?);
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let line = lines.next_line().await.ok()??;
+    let row: Value = serde_json::from_str(&line).ok()?;
+    if row.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let id = row.get("payload")?.get("id")?.as_str()?.to_owned();
+    Some((id, mtime))
 }
 
 async fn session_meta(path: &Path, path_display: &str) -> Result<Session, AdapterError> {
@@ -575,7 +594,7 @@ mod tests {
         let store = Store::open_local(temp.path()).await?;
         let adapter = CodexCliAdapter::new(FIXTURES);
 
-        let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert!(summary.accepted() > 0, "ingest must accept rows");
         assert_eq!(summary.dropped_events, 0, "no per-event drops expected");
         assert_eq!(

@@ -332,27 +332,10 @@ impl Handle {
         }
         let label = table.label();
         let started = Instant::now();
-        // Level 2 self-heal (design.md 2.3 invariant): rows that already
-        // exist (matched by the schema's `lance-schema:unenforced-primary-key`
-        // columns) have their non-PK fields *refreshed* from source on
-        // every sync. Insertions still happen as before. This means a bug
-        // in an earlier pond version that wrote stale field values gets
-        // corrected on the next `pond sync` against the same source -
-        // without re-syncing requiring a wipe, and without the operator
-        // having to think about which version of pond wrote which row.
-        //
-        // Adapters must never produce a *subset* of what a prior version
-        // produced for the same source - that invariant is what makes the
-        // omission of `when_not_matched_by_source` safe (no orphan-purge
-        // step needed). See design.md 2.3.
-        //
-        // Embeddings are excluded: their data column is the computed vector
-        // and re-running `pond sync` should never silently re-emit them.
-        // `pond embed` is the only owner of that table's data.
-        let when_matched = match table {
-            Table::Sessions | Table::Messages | Table::Parts => WhenMatched::UpdateAll,
-            Table::Embeddings => WhenMatched::DoNothing,
-        };
+        // Insert-only: pond is durable storage, not a source-derived
+        // cache. Sync fills gaps; matched rows are never overwritten.
+        // Field-level migrations are a separate, deferred operation.
+        let when_matched = WhenMatched::DoNothing;
         let result = self
             .retry_lance(label, || async {
                 let mut cached = self.cached(table).lock().await;

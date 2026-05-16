@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         let started = Instant::now();
         let mut sync_partial = 0u64;
         let mut sync_partial_drops = 0u64;
-        let summary = ingest_adapter(&store, &adapter, |event| {
+        let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
             if let SyncEvent::SessionDone(outcome) = event {
                 match &outcome.status {
                     SyncStatus::Skipped { reason } => {
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
                         sync_partial += 1;
                         sync_partial_drops += *dropped_events as u64;
                     }
-                    SyncStatus::Ok => {}
+                    SyncStatus::Ok | SyncStatus::Fresh => {}
                 }
             }
         })

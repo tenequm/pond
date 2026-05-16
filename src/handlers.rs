@@ -35,7 +35,7 @@ mod ingest_handler {
     use tokio_stream::StreamExt;
 
     use crate::{
-        adapter::Adapter,
+        adapter::{Adapter, AdapterYield, SkipOracle, SkipReason},
         sessions::{IngestEvent, IngestSummary, IngestValidator, OutcomeStatus, RowOutcome, Store},
         wire::{
             ErrorBody, ErrorCode, IngestEnvelope, IngestRequest, IngestResponse, IngestResult,
@@ -97,6 +97,9 @@ mod ingest_handler {
         Partial { dropped_events: usize },
         Skipped { reason: String },
         Rejected { reason: String },
+        /// Per-session staleness skip (design.md 3.4): adapter short-circuited
+        /// the file decode because `mtime < MAX(messages.timestamp)`.
+        Fresh,
     }
 
     #[derive(Debug, Default)]
@@ -149,6 +152,7 @@ mod ingest_handler {
     pub async fn ingest_adapter<F>(
         store: &Store,
         adapter: &dyn Adapter,
+        oracle: &dyn SkipOracle,
         mut on_event: F,
     ) -> Result<IngestSummary>
     where
@@ -165,7 +169,7 @@ mod ingest_handler {
             .ok();
         on_event(SyncEvent::Discovered { total });
 
-        let mut events = adapter.events();
+        let mut events = adapter.events_with(oracle);
         let mut validator = IngestValidator::default();
         // Adapter events have no stable input index (they stream from disk);
         // assign a monotonic counter so RowOutcome.index stays unique even
@@ -197,7 +201,19 @@ mod ingest_handler {
                 None => break,
             };
             match event {
-                Ok(event) => {
+                Ok(AdapterYield::Skipped { session_id, project, reason }) => {
+                    let status = match reason {
+                        SkipReason::Fresh => SyncStatus::Fresh,
+                    };
+                    summary.skipped_fresh += 1;
+                    on_event(SyncEvent::SessionDone(SessionOutcome {
+                        project,
+                        session_id: Some(session_id),
+                        messages: 0,
+                        status,
+                    }));
+                }
+                Ok(AdapterYield::Event(event)) => {
                     // A new Session means the previous one is being closed
                     // out by the validator (moved to its `completed` buffer
                     // for batched flush). Stage the PendingDone so we can
@@ -339,6 +355,7 @@ mod ingest_handler {
             dropped_events = summary.dropped_events as u64,
             dropped_sessions = summary.dropped_sessions as u64,
             skipped_files = summary.skipped_files as u64,
+            skipped_fresh = summary.skipped_fresh as u64,
             "ingest_adapter complete"
         );
         Ok(summary)

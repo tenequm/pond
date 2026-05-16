@@ -580,6 +580,50 @@ impl Store {
         Ok(ids)
     }
 
+    /// `session_id -> wall-clock time of the Lance manifest version that
+    /// last wrote the row` for the per-session staleness skip
+    /// (design.md 3.4). Reads Lance's `_row_last_updated_at_version` system
+    /// column (available because pond enables stable row ids per 3.2.0)
+    /// and joins it against `Dataset::versions()` for commit timestamps.
+    pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        use lance::deps::arrow_array::UInt64Array;
+
+        let dataset = self.handle.dataset(Table::Sessions).await?;
+        let versions: HashMap<u64, DateTime<Utc>> = dataset
+            .versions()
+            .await?
+            .into_iter()
+            .map(|v| (v.version, v.timestamp))
+            .collect();
+
+        let mut scanner = dataset.scan();
+        scanner.project(&["id", "_row_last_updated_at_version"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut out: HashMap<String, DateTime<Utc>> = HashMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let version_array = batch
+                .column_by_name("_row_last_updated_at_version")
+                .context("missing _row_last_updated_at_version column")?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("_row_last_updated_at_version is not UInt64")?;
+            for row in 0..batch.num_rows() {
+                let Some(id) = string(&batch, "id", row)? else {
+                    continue;
+                };
+                if version_array.is_null(row) {
+                    continue;
+                }
+                let version = version_array.value(row);
+                if let Some(ts) = versions.get(&version).copied() {
+                    out.insert(id, ts);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn get_message_context(
         &self,
         message_id: &str,
@@ -1136,6 +1180,10 @@ pub struct IngestSummary {
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
+    /// Sessions short-circuited via the per-session staleness skip
+    /// (design.md 3.4): file `mtime` was at or before the wall-clock time
+    /// pond last wrote that session's row, so re-decode was bypassed.
+    pub skipped_fresh: usize,
     /// Storage-layer failures whose retries were exhausted (commit
     /// conflicts, transient IO that didn't recover). Hard zero on healthy
     /// runs.
@@ -1731,16 +1779,9 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
     for part in parts {
         match (message.role(), &part.kind) {
             (Role::User | Role::Assistant, PartKind::Text { text }) => {
-                // `Option<Extracted<String>>` derefs to `&String` for read.
                 if let Some(text) = text {
                     chunks.push(text.to_string());
                 }
-            }
-            (Role::Assistant, PartKind::ToolCall { name, params, .. }) => {
-                if let Some(name) = name {
-                    chunks.push(name.to_string());
-                }
-                collect_string_leaves(params, &mut chunks);
             }
             (
                 Role::User | Role::Assistant,
@@ -1771,11 +1812,11 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
             | (
                 Role::User | Role::Assistant,
                 PartKind::Reasoning { .. }
+                | PartKind::ToolCall { .. }
                 | PartKind::ToolResult { .. }
                 | PartKind::ToolApprovalRequest { .. }
                 | PartKind::ToolApprovalResponse { .. },
-            )
-            | (Role::User, PartKind::ToolCall { .. }) => {}
+            ) => {}
         }
     }
 
@@ -1785,23 +1826,6 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     if text.is_empty() { None } else { Some(text) }
-}
-
-fn collect_string_leaves(value: &serde_json::Value, chunks: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(text) => chunks.push(text.clone()),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_string_leaves(value, chunks);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values() {
-                collect_string_leaves(value, chunks);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

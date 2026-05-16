@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_stream::StreamExt;
 
 use crate::{
     config::expand_home_under,
@@ -25,8 +26,8 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
-    compact_json, empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
+    EventStream, SkipOracle, SkipReason, collect_jsonl_files, compact_json, empty_options,
     extract::{Extracted, Source, extract_compact_repr, extract_self_str, extract_str},
     part_id,
 };
@@ -121,6 +122,15 @@ impl Adapter for ClaudeCodeAdapter {
     }
 
     fn events(&self) -> EventStream<'_> {
+        let stream = self.events_with(&crate::adapter::NoopOracle);
+        Box::pin(stream.filter_map(|res| match res {
+            Ok(AdapterYield::Event(event)) => Some(Ok(event)),
+            Ok(AdapterYield::Skipped { .. }) => None,
+            Err(error) => Some(Err(error)),
+        }))
+    }
+
+    fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let root = self.root.clone();
         Box::pin(stream! {
             let paths = match collect_jsonl_files(&root).await {
@@ -132,6 +142,19 @@ impl Adapter for ClaudeCodeAdapter {
             };
             for path in paths {
                 let path_display = path.display().to_string();
+
+                if let Some((id, mtime)) = peek_id_and_mtime(&path).await
+                    && let Some(ingested_at) = oracle.last_ingested_at(&id)
+                    && mtime <= ingested_at
+                {
+                    yield Ok(AdapterYield::Skipped {
+                        session_id: id,
+                        project: None,
+                        reason: SkipReason::Fresh,
+                    });
+                    continue;
+                }
+
                 let session_event = match session_from_file(&path, &path_display).await {
                     Ok(session) => session,
                     Err(error) => {
@@ -141,7 +164,7 @@ impl Adapter for ClaudeCodeAdapter {
                 };
                 let session_id = session_event.id.clone();
                 let default_timestamp = session_event.created_at;
-                yield Ok(IngestEvent::Session(session_event));
+                yield Ok(AdapterYield::Event(IngestEvent::Session(session_event)));
 
                 let file = match tokio::fs::File::open(&path).await {
                     Ok(file) => file,
@@ -171,11 +194,6 @@ impl Adapter for ClaudeCodeAdapter {
                     let value = match serde_json::from_str::<Value>(&line) {
                         Ok(value) => value,
                         Err(source) => {
-                            // Per-line skip: surface the bad line via the
-                            // SyncEvent channel (one `Skipped` per occurrence)
-                            // but keep parsing the rest of the file. Recovers
-                            // the ~98% of lines around a single corrupted one
-                            // (NUL holes, truncated UTF-16 surrogates, etc.).
                             yield Err(AdapterError::parse(
                                 NAME,
                                 path_display.clone(),
@@ -185,12 +203,6 @@ impl Adapter for ClaudeCodeAdapter {
                             continue;
                         }
                     };
-                    // Replay dedup: claude-code's `/resume` and `/compact`
-                    // paths occasionally re-emit identical rows with the
-                    // same `uuid`. Skip here so the validator's safety-net
-                    // HashSet never fires on benign replays. Per design.md
-                    // invariant N+2, adapter-level dedup is the contract;
-                    // validator drops are reserved for real bugs.
                     if let Some(uuid) = value.get("uuid").and_then(Value::as_str)
                         && !state.seen_uuids.insert(uuid.to_owned())
                     {
@@ -203,13 +215,6 @@ impl Adapter for ClaudeCodeAdapter {
                         );
                         continue;
                     }
-                    // Snapshot `tool_use_id -> name` mappings BEFORE we
-                    // emit events for this row. A `tool_use` part on an
-                    // assistant row in this batch must populate the map
-                    // so the matching `tool_result` part (which may
-                    // arrive in the same `message_events` call when the
-                    // user is replying with both tool_results inline)
-                    // can look the name up.
                     capture_tool_call_names(&value, &mut state.tool_call_names);
                     match events_from_row(
                         &session_id,
@@ -220,13 +225,10 @@ impl Adapter for ClaudeCodeAdapter {
                     ) {
                         Ok(events) => {
                             for event in events {
-                                yield Ok(event);
+                                yield Ok(AdapterYield::Event(event));
                             }
                         }
                         Err(message) => {
-                            // Same skip-and-continue policy for schema errors
-                            // at the row level: the rest of the file is still
-                            // recoverable.
                             yield Err(AdapterError::schema(
                                 NAME,
                                 format!("{path_display}:{line_number}"),
@@ -239,6 +241,21 @@ impl Adapter for ClaudeCodeAdapter {
             }
         })
     }
+}
+
+async fn peek_id_and_mtime(path: &Path) -> Option<(String, DateTime<Utc>)> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let mtime = DateTime::<Utc>::from(metadata.modified().ok()?);
+    if let Some(descriptor) = subagent_descriptor(path).await {
+        let id = format!("{}/agent-{}", descriptor.parent_uuid, descriptor.agent_hash);
+        return Some((id, mtime));
+    }
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let line = lines.next_line().await.ok()??;
+    let row: Value = serde_json::from_str(&line).ok()?;
+    let id = row.get("sessionId")?.as_str()?.to_owned();
+    Some((id, mtime))
 }
 
 /// Walk one raw row's `message.content[]` array (if any) and stash every
@@ -903,7 +920,7 @@ mod tests {
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
 
-        let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert_eq!(
             summary.dropped_sessions, 0,
             "subagent file must NOT collide with parent (pre-fix this was the project-immutable rejection)"
@@ -976,7 +993,7 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         let child = store
             .get_session(&format!("{parent_uuid}/agent-{agent_hash}"))
@@ -1012,7 +1029,7 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         assert_eq!(
             summary.dropped_events, 0,
@@ -1077,7 +1094,7 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         let session = store
             .get_session(session_uuid)
             .await?
@@ -1152,7 +1169,7 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, |_| {}).await?;
+        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         let session = store
             .get_session(session_uuid)
             .await?
