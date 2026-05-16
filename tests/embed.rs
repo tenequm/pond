@@ -374,7 +374,8 @@ async fn embed_worker_caps_batch_cost_for_long_messages() -> anyhow::Result<()> 
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some("pond-cost-test".to_owned()),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "pond-cost-test"}), "x")
+            .unwrap(),
         options: Default::default(),
     })];
     for i in 0..11 {
@@ -454,7 +455,8 @@ async fn embed_worker_buckets_messages_by_length() -> anyhow::Result<()> {
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some("pond-length-test".to_owned()),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "pond-length-test"}), "x")
+            .unwrap(),
         options: Default::default(),
     })];
     for i in 0..24 {
@@ -535,7 +537,8 @@ async fn embed_worker_respects_cost_budget() -> anyhow::Result<()> {
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some("pond-cost-invariant".to_owned()),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "pond-cost-invariant"}), "x")
+            .unwrap(),
         options: Default::default(),
     })];
     for i in 0..20 {

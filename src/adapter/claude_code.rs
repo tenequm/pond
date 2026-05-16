@@ -272,7 +272,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
     let mut lines = BufReader::new(file).lines();
     let mut first = None::<(usize, Value)>;
     let mut created_at = None;
-    let mut project = None;
+    let mut project: Option<Extracted<String>> = None;
     let mut version = None;
     let mut line_number = 0usize;
 
@@ -299,10 +299,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
             created_at = parse_timestamp(&row).ok();
         }
         if project.is_none() {
-            project = row
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
+            project = extract_str(&row, "cwd");
         }
         if version.is_none() {
             version = row
@@ -370,13 +367,38 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
         None => (raw_session_id, None, "claude-code".to_owned(), None),
     };
 
+    let project = match project {
+        Some(value) => value,
+        None => {
+            let decoded = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.replace('-', "/"))
+                .ok_or_else(|| {
+                    AdapterError::schema(
+                        NAME,
+                        path_display.to_owned(),
+                        "no `cwd` field in any row and source path is not UTF-8",
+                    )
+                })?;
+            extract_self_str(&Value::String(decoded)).ok_or_else(|| {
+                AdapterError::schema(
+                    NAME,
+                    path_display.to_owned(),
+                    "internal: Value::String produced None from Source::as_str",
+                )
+            })?
+        }
+    };
+
     let mut options = ProviderOptions::new();
     options.insert(
         "source".to_owned(),
         json!({
             "adapter": "claude-code",
             "version": version,
-            "workspace_path": project,
+            "workspace_path": &*project,
         }),
     );
     if let Some(metadata) = subagent_options {
@@ -1180,7 +1202,7 @@ mod tests {
             parent_message_id: None,
             source_agent: "test-shim".to_owned(),
             created_at: chrono::Utc::now(),
-            project: Some("/tmp/pond-test".to_owned()),
+            project: crate::adapter::Extracted::from_test_value("/tmp/pond-test".to_owned()),
             options: Default::default(),
         };
         let message = Message::System {

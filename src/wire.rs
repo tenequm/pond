@@ -15,12 +15,15 @@ pub struct Session {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Constrained by invariant 19: when set, `parent_session_id`
+    /// MUST also be set. Spawn-only sources (claude-code subagents,
+    /// nanoclaw) leave this `None`; fork-with-cut-point sources
+    /// (pi-mono) populate both pointers together.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_message_id: Option<String>,
     pub source_agent: String,
     pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    pub project: Extracted<String>,
     #[serde(default)]
     pub options: ProviderOptions,
 }
@@ -329,13 +332,13 @@ pub enum SearchEnvelope {
     Error(ErrorEnvelope),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// JSON shape is externally tagged: `{"contains": "pond"}` or
+/// `{"regex": "^/Users/.*"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectMatch {
-    #[default]
-    Exact,
-    Contains,
-    IsNull,
+pub enum ProjectFilter {
+    Contains(String),
+    Regex(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,9 +366,7 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SearchFilters {
     #[serde(default)]
-    pub project: Option<String>,
-    #[serde(default)]
-    pub project_match: ProjectMatch,
+    pub project: Option<ProjectFilter>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -401,8 +402,7 @@ pub struct Hit {
     pub message_id: String,
     pub role: String,
     pub timestamp: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    pub project: String,
     pub source_agent: String,
     pub preview: String,
     pub score: f64,
@@ -414,8 +414,7 @@ pub struct Hit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    pub project: String,
     pub source_agent: String,
     pub first_timestamp: DateTime<Utc>,
     pub last_timestamp: DateTime<Utc>,

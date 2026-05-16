@@ -44,7 +44,7 @@ pub struct PendingMessage {
     pub message_id: String,
     pub session_id: String,
     pub source_agent: String,
-    pub project: Option<String>,
+    pub project: String,
     pub role: String,
     pub timestamp: DateTime<Utc>,
     pub search_text: String,
@@ -56,7 +56,7 @@ pub struct MessageMeta {
     pub message_id: String,
     pub session_id: String,
     pub role: String,
-    pub project: Option<String>,
+    pub project: String,
     pub source_agent: String,
     pub timestamp: DateTime<Utc>,
     pub search_text: String,
@@ -101,9 +101,7 @@ pub struct AdapterStats {
 
 #[derive(Debug, Clone)]
 pub struct ProjectStats {
-    /// `None` means rows landed with no project (Claude Code is always
-    /// non-null today, but adapters that can't infer cwd will produce None).
-    pub project: Option<String>,
+    pub project: String,
     pub sessions: u64,
     pub messages: u64,
 }
@@ -267,14 +265,16 @@ impl Store {
     ///   1. Runs the immutable-fields check (3.6.4) against the stored row
     ///      per session, sequentially. Sessions that fail produce one Error
     ///      outcome and are excluded from the write batch.
-    ///   2. Deduplicates in-batch: when two substreams in the same batch
-    ///      share a `session_id` (Claude Code's subagent files reuse their
-    ///      parent's id), the first occurrence wins. The second is either
-    ///      *merged* (same `source_agent` + `project`: messages/parts
-    ///      append, no duplicate rows) or *rejected* (different `project` -
-    ///      this is the subagent-vs-parent case, a documented follow-up).
-    ///      Lance's `merge_insert` would otherwise reject the batch as
-    ///      "ambiguous" on duplicate-PK source rows.
+    ///   2. Deduplicates in-batch at the substream level: when two substreams
+    ///      in the same batch share a `session_id` (Claude Code's subagent
+    ///      files reuse their parent's id), the first occurrence wins. The
+    ///      second is either *merged* (same `source_agent` + `project`:
+    ///      messages/parts append, no duplicate rows) or *rejected*
+    ///      (different `project` - the subagent-vs-parent case). Row-level
+    ///      duplicates that slip past here are caught downstream by Lance's
+    ///      `SourceDedupeBehavior::FirstSeen` in `substrate::merge_insert`
+    ///      (invariant 17): this layer's job is preserving substream merge
+    ///      semantics, not policing the PK uniqueness Lance handles itself.
     ///   3. Builds one combined `RecordBatch` per table (sessions, messages,
     ///      parts) across every valid substream.
     ///   4. Fires the three `merge_insert` calls in parallel via
@@ -322,8 +322,8 @@ impl Store {
                         IngestError::ImmutableField {
                             field: "project",
                             session_id: substream.session.id.clone(),
-                            stored: existing.session.project.clone().unwrap_or_default(),
-                            attempted: substream.session.project.clone().unwrap_or_default(),
+                            stored: (*existing.session.project).clone(),
+                            attempted: (*substream.session.project).clone(),
                         }
                     };
                     let field = match &reason {
@@ -409,7 +409,7 @@ impl Store {
                 substream.messages.iter().map(|buffered| MessageBatchRow {
                     message: &buffered.message,
                     source_agent: &substream.session.source_agent,
-                    project: substream.session.project.as_deref(),
+                    project: &substream.session.project,
                     search_text: buffered.search_text.as_deref(),
                 })
             })
@@ -526,7 +526,7 @@ impl Store {
             .map(|write| MessageBatchRow {
                 message: write.message,
                 source_agent: &session.source_agent,
-                project: session.project.as_deref(),
+                project: &session.project,
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
@@ -617,12 +617,12 @@ impl Store {
         let mut scanner = dataset.scan();
         scanner.project(&["source_agent", "project", "session_id"])?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut groups: HashMap<(String, Option<String>), GroupAccumulator> = HashMap::new();
+        let mut groups: HashMap<(String, String), GroupAccumulator> = HashMap::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
                 let source_agent = string(&batch, "source_agent", row)?.unwrap_or_default();
-                let project = string(&batch, "project", row)?;
+                let project = string(&batch, "project", row)?.unwrap_or_default();
                 let session_id = string(&batch, "session_id", row)?.unwrap_or_default();
                 let entry = groups.entry((source_agent, project)).or_default();
                 entry.messages += 1;
@@ -856,7 +856,7 @@ impl Store {
                 message_id: string(&batch, "id", row)?.context("id is null")?,
                 session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
                 role: string(&batch, "role", row)?.context("role is null")?,
-                project: string(&batch, "project", row)?,
+                project: string(&batch, "project", row)?.context("project is null")?,
                 source_agent: string(&batch, "source_agent", row)?
                     .context("source_agent is null")?,
                 timestamp: datetime(&batch, "timestamp", row)?,
@@ -1168,6 +1168,8 @@ pub const DROP_REASON_MESSAGE_SESSION_MISMATCH: &str = "message_session_mismatch
 pub const DROP_REASON_PART_BEFORE_MESSAGE: &str = "part_before_message";
 pub const DROP_REASON_PART_MESSAGE_MISMATCH: &str = "part_message_mismatch";
 pub const DROP_REASON_EMPTY_SOURCE_AGENT: &str = "empty_source_agent";
+pub const DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION: &str = "parent_message_without_session";
+pub const DROP_REASON_MISSING_PROJECT: &str = "missing_project";
 pub const DROP_REASON_IMMUTABLE_PROJECT: &str = "immutable_project";
 pub const DROP_REASON_IMMUTABLE_SOURCE_AGENT: &str = "immutable_source_agent";
 pub const DROP_REASON_ADAPTER_PARSE: &str = "adapter_parse";
@@ -1397,6 +1399,24 @@ impl IngestValidator {
             session.source_agent = trimmed.to_owned();
         }
 
+        if session.parent_message_id.is_some() && session.parent_session_id.is_none() {
+            return Ok(vec![RowOutcome {
+                index,
+                kind: "session",
+                pk: Value::String(session.id.clone()),
+                status: OutcomeStatus::Error,
+                error: Some(RowError {
+                    message: format!(
+                        "session {} has parent_message_id without parent_session_id",
+                        session.id,
+                    ),
+                    field: Some("parent_message_id"),
+                    reason: None,
+                    reason_key: Some(DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION),
+                }),
+            }]);
+        }
+
         self.seen_message_ids.clear();
         self.seen_part_keys.clear();
         self.session = Some(BufferedSession { index, session });
@@ -1454,13 +1474,13 @@ impl IngestValidator {
             )];
         }
         if !self.seen_message_ids.insert(message.id().to_owned()) {
-            // Safety-net: Lance's `merge_insert` rejects same-PK rows in
-            // one batch, so we have to drop here regardless. Per design.md
-            // 3.x the adapter is expected to dedupe upstream (see
-            // claude-code adapter's per-file `seen_uuids`); when this
-            // branch fires there is an adapter bug or an unrecognized
-            // replay pattern worth investigating. Classified as Error so
-            // it surfaces in `dropped_events` and the operator notices.
+            // Per invariant 17, substrate FirstSeen would silently drop a
+            // same-PK row at the storage layer; we still trap here so the
+            // duplicate stays visible in `dropped_events` instead of being
+            // absorbed into the substrate's `skipped` counter. Adapters
+            // are expected to dedupe upstream (see claude-code's per-file
+            // `seen_uuids`); a hit here means an unrecognized replay
+            // pattern worth investigating.
             let msg = format!("duplicate message id {} in session substream", message.id());
             return vec![error_outcome(
                 index,
@@ -1514,8 +1534,9 @@ impl IngestValidator {
         }
         let part_key = (part.message_id.clone(), part.id.clone());
         if !self.seen_part_keys.insert(part_key) {
-            // Same safety-net rationale as `push_message`: Lance requires
-            // unique PKs per batch, but the adapter SHOULD dedupe upstream.
+            // Same visibility rationale as `push_message`: substrate FirstSeen
+            // would absorb this silently; trapping here keeps it in
+            // `dropped_events` for operator-visible signal.
             let msg = format!(
                 "duplicate part id {} for message {} in session substream",
                 part.id, part.message_id
@@ -1705,8 +1726,8 @@ fn ensure_immutable_match(
         return Err(IngestError::ImmutableField {
             field: "project",
             session_id: incoming.id.clone(),
-            stored: existing.project.clone().unwrap_or_default(),
-            attempted: incoming.project.clone().unwrap_or_default(),
+            stored: (*existing.project).clone(),
+            attempted: (*incoming.project).clone(),
         });
     }
     Ok(())
@@ -1942,7 +1963,7 @@ pub(crate) fn session_schema() -> Arc<Schema> {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
-        Field::new("project", DataType::Utf8, true),
+        Field::new("project", DataType::Utf8, false),
         Field::new("options", DataType::Utf8, false),
     ]))
 }
@@ -1958,7 +1979,7 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         ),
         Field::new("role", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
-        Field::new("project", DataType::Utf8, true),
+        Field::new("project", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
         Field::new("options", DataType::Utf8, false),
@@ -1990,7 +2011,7 @@ pub(crate) fn embedding_schema() -> Arc<Schema> {
         Field::new("vector", embedding_vector_type(), false),
         Field::new("session_id", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
-        Field::new("project", DataType::Utf8, true),
+        Field::new("project", DataType::Utf8, false),
         Field::new("role", DataType::Utf8, false),
         Field::new(
             "timestamp",
@@ -2026,7 +2047,7 @@ pub(crate) fn empty_reader(
 pub(crate) struct MessageBatchRow<'a> {
     pub message: &'a Message,
     pub source_agent: &'a str,
-    pub project: Option<&'a str>,
+    pub project: &'a str,
     pub search_text: Option<&'a str>,
 }
 
@@ -2043,7 +2064,7 @@ pub struct EmbeddingRow {
     pub vector: Vec<f32>,
     pub session_id: String,
     pub source_agent: String,
-    pub project: Option<String>,
+    pub project: String,
     pub role: String,
     pub timestamp: DateTime<Utc>,
 }
@@ -2107,7 +2128,7 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
             )),
             Arc::new(StringArray::from(
                 rows.iter()
-                    .map(|row| row.project.as_deref())
+                    .map(|row| row.project.as_str())
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -2167,7 +2188,7 @@ pub(crate) fn sessions_batch(sessions: &[Session]) -> Result<RecordBatch> {
             Arc::new(StringArray::from(
                 sessions
                     .iter()
-                    .map(|session| session.project.as_deref())
+                    .map(|session| session.project.as_str())
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -2296,7 +2317,9 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
         parent_message_id: string(batch, "parent_message_id", row)?,
         source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
         created_at: datetime(batch, "created_at", row)?,
-        project: string(batch, "project", row)?,
+        project: crate::adapter::Extracted::from_stored(
+            string(batch, "project", row)?.context("project is null")?,
+        ),
         options: json_parse(&string(batch, "options", row)?.context("options is null")?)?,
     })
 }
@@ -2356,7 +2379,7 @@ pub(crate) fn pending_message_from_batch(
         message_id: string(batch, "id", row)?.context("message id is null")?,
         session_id: string(batch, "session_id", row)?.context("session_id is null")?,
         source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
-        project: string(batch, "project", row)?,
+        project: string(batch, "project", row)?.context("project is null")?,
         role: string(batch, "role", row)?.context("role is null")?,
         timestamp: datetime(batch, "timestamp", row)?,
         search_text: string(batch, "search_text", row)?.context("search_text is null")?,
@@ -2483,7 +2506,7 @@ mod tests {
             parent_message_id: None,
             source_agent: "claude-code".to_owned(),
             created_at: Utc::now(),
-            project: Some("/tmp/pond".to_owned()),
+            project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
     }
@@ -2669,7 +2692,7 @@ mod tests {
             parent_message_id: None,
             source_agent: "claude-code".to_owned(),
             created_at: Utc::now(),
-            project: Some("/home/me/proj".to_owned()),
+            project: crate::adapter::Extracted::from_test_value("/home/me/proj".to_owned()),
             options: ProviderOptions::new(),
         }
     }
@@ -2746,7 +2769,7 @@ mod tests {
         assert_eq!(count_status(&first, OutcomeStatus::Error), 0);
 
         let mut tampered = base_session();
-        tampered.project = Some("/somewhere/else".to_owned());
+        tampered.project = crate::adapter::Extracted::from_test_value("/somewhere/else".to_owned());
         let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
         let err_row = second
             .iter()
@@ -2759,30 +2782,11 @@ mod tests {
             .await?
             .expect("session row survives");
         assert_eq!(
-            stored.session.project.as_deref(),
-            Some("/home/me/proj"),
+            stored.session.project.as_str(),
+            "/home/me/proj",
             "stored project must remain the original",
         );
 
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn re_ingesting_a_null_project_when_stored_value_exists_is_rejected() -> anyhow::Result<()>
-    {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-
-        ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
-
-        let mut tampered = base_session();
-        tampered.project = None;
-        let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
-        assert_eq!(
-            count_status(&second, OutcomeStatus::Error),
-            1,
-            "NULL-vs-non-NULL project change must also be rejected",
-        );
         Ok(())
     }
 }

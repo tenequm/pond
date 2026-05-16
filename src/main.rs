@@ -20,8 +20,8 @@ use pond::{
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
-        Part, PartKind, ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest, SearchResponse,
-        SearchResultBody,
+        Part, PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest,
+        SearchResponse, SearchResultBody,
     },
 };
 use serde_json::{Value, json};
@@ -171,10 +171,11 @@ enum Command {
         /// Collapse to one row per session, keeping the best-scoring message.
         #[arg(long)]
         group_by_conversation: bool,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long, value_enum, default_value_t = ProjectMatchArg::Exact)]
-        project_match: ProjectMatchArg,
+        /// Substring match by default (`--project pond` -> contains "pond"). Prefix
+        /// with `re:` for regex (`--project 're:^/Users/.*/x402'`); `lit:` escapes
+        /// a literal value that would otherwise be parsed as a prefix.
+        #[arg(long, value_parser = parse_project_filter)]
+        project: Option<ProjectFilter>,
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
         #[arg(long)]
@@ -256,25 +257,16 @@ enum Command {
     },
 }
 
-/// CLI projection of [`ProjectMatch`]. Kept as a separate enum so clap's
-/// derive can attach `value_enum` without polluting the wire type.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ProjectMatchArg {
-    /// Equality match against `sessions.project`.
-    Exact,
-    /// Substring match (`LIKE '%<value>%'`).
-    Contains,
-    /// Match rows whose `project` is NULL. The `--project` value is ignored.
-    IsNull,
-}
-
-impl From<ProjectMatchArg> for ProjectMatch {
-    fn from(value: ProjectMatchArg) -> Self {
-        match value {
-            ProjectMatchArg::Exact => ProjectMatch::Exact,
-            ProjectMatchArg::Contains => ProjectMatch::Contains,
-            ProjectMatchArg::IsNull => ProjectMatch::IsNull,
-        }
+/// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
+/// regex; `lit:<text>` escapes a literal value that would otherwise be
+/// parsed as a prefix; everything else is a substring match.
+fn parse_project_filter(input: &str) -> Result<ProjectFilter, String> {
+    if let Some(pattern) = input.strip_prefix("re:") {
+        Ok(ProjectFilter::Regex(pattern.to_owned()))
+    } else if let Some(literal) = input.strip_prefix("lit:") {
+        Ok(ProjectFilter::Contains(literal.to_owned()))
+    } else {
+        Ok(ProjectFilter::Contains(input.to_owned()))
     }
 }
 
@@ -464,7 +456,6 @@ async fn main() -> anyhow::Result<()> {
             no_boost_recent,
             group_by_conversation,
             project,
-            project_match,
             session_id,
             source_agent,
             from_date,
@@ -495,7 +486,6 @@ async fn main() -> anyhow::Result<()> {
                 rrf_k,
                 filters: SearchFilters {
                     project,
-                    project_match: project_match.into(),
                     session_id,
                     source_agent,
                     from_date,
@@ -1059,7 +1049,7 @@ fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
             .add_attribute(Attribute::Dim),
     ]);
     for project in &stat.projects {
-        let label = project.project.as_deref().unwrap_or("(no project)");
+        let label = project.project.as_str();
         table.add_row(vec![
             Cell::new(label),
             Cell::new(format_thousands(project.sessions)).set_alignment(CellAlignment::Right),
@@ -1201,7 +1191,7 @@ fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
             dim(),
         ),
         paint_role(&hit.role),
-        paint(hit.project.as_deref().unwrap_or("-"), dim()),
+        paint(&hit.project, dim()),
         paint(&hit.message_id, dim()),
     ))?;
     render_preview(&hit.preview)?;
@@ -1227,7 +1217,7 @@ fn render_group(rank: usize, group: &Group) -> anyhow::Result<()> {
             &group.last_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
             dim(),
         ),
-        paint(group.project.as_deref().unwrap_or("-"), dim()),
+        paint(&group.project, dim()),
         paint(&group.source_agent, dim()),
         paint(&group.session_id, dim()),
     ))?;
@@ -1268,7 +1258,7 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
         paint("session", dim()),
         paint(&session.id, bold()),
         session.source_agent,
-        session.project.as_deref().unwrap_or("-"),
+        session.project.as_str(),
     ))?;
     output(&format!(
         "{} {}",

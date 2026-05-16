@@ -59,7 +59,8 @@ fn make_session(id: usize) -> Session {
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some(format!("/tmp/p/{id}")),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": format!("/tmp/p/{id}")}), "x")
+            .unwrap(),
         options: ProviderOptions::new(),
     }
 }

@@ -10,8 +10,8 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     config::{Config, Distance},
     embed::{EmbedBackend, EmbedWorker, metric_type},
+    handlers::ingest_adapter,
     handlers::pond_get,
-    handlers::{IngestEvent, ingest_adapter, pond_ingest},
     handlers::{
         RankedList, RetrieverKind, SearchMode, build_filter, make_preview, plan_search,
         pond_search, recency_boost, rrf_merge,
@@ -19,21 +19,13 @@ use pond::{
     sessions::Store,
     sessions::{EMBEDDING_DIM, EmbeddingRow},
     substrate::Predicate,
+    wire::PartKind,
     wire::{
-        GetEnvelope, GetRequest, GetResult, Hit, IngestEnvelope, IngestRequest, ProjectMatch,
-        SearchEnvelope, SearchFilters, SearchRequest, SearchResultBody,
+        GetEnvelope, GetRequest, GetResult, Hit, ProjectFilter, SearchEnvelope, SearchFilters,
+        SearchRequest, SearchResultBody,
     },
-    wire::{Message, Part, PartKind, ProviderOptions, Session},
 };
 use tempfile::TempDir;
-
-/// Build an `Option<Extracted<String>>` for test fixtures. Integration tests
-/// can't see `Extracted::from_test_value` (cfg-test-gated inside the pond
-/// crate), so we go through the public `extract_str` producer on a
-/// synthetic JSON source.
-fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
-    pond::adapter::extract_str(&serde_json::json!({"x": value}), "x")
-}
 
 // ---------------------------------------------------------------------------
 // Pure functions
@@ -95,8 +87,7 @@ fn make_preview_truncates_at_code_point_boundary() {
 #[test]
 fn build_filter_pushes_down_each_predicate() {
     let filters = SearchFilters {
-        project: Some("/Users/me/pond".to_owned()),
-        project_match: ProjectMatch::Exact,
+        project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
         session_id: Some("01HXY".to_owned()),
         source_agent: Some("claude-code".to_owned()),
         role: Some("assistant".to_owned()),
@@ -105,25 +96,12 @@ fn build_filter_pushes_down_each_predicate() {
         min_score: 0.0,
     };
     let sql = build_filter(&filters).unwrap().to_lance();
-    assert!(sql.contains("project = '/Users/me/pond'"));
+    assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
     assert!(sql.contains("session_id = '01HXY'"));
     assert!(sql.contains("source_agent = 'claude-code'"));
     assert!(sql.contains("role = 'assistant'"));
     assert!(sql.contains("timestamp >="));
     assert!(sql.contains("timestamp <="));
-}
-
-#[test]
-fn build_filter_is_null_ignores_the_project_value() {
-    let filters = SearchFilters {
-        project: Some("ignored".to_owned()),
-        project_match: ProjectMatch::IsNull,
-        ..SearchFilters::default()
-    };
-    assert_eq!(
-        build_filter(&filters).unwrap().to_lance(),
-        "project IS NULL"
-    );
 }
 
 #[test]
@@ -152,8 +130,7 @@ fn empty_filters_produce_no_predicate() {
 #[test]
 fn build_filter_contains_escapes_like_wildcards() {
     let filters = SearchFilters {
-        project: Some("/Users/me/my_project".to_owned()),
-        project_match: ProjectMatch::Contains,
+        project: Some(ProjectFilter::Contains("/Users/me/my_project".to_owned())),
         ..SearchFilters::default()
     };
     let sql = build_filter(&filters).unwrap().to_lance();
@@ -212,8 +189,7 @@ fn plan_search_keeps_small_limits_from_starving_retrievers() {
 #[test]
 fn plan_search_builds_the_shared_filter_predicate() {
     let mut request = search_request("filtered");
-    request.filters.project = Some("/Users/me/pond".to_owned());
-    request.filters.project_match = ProjectMatch::Contains;
+    request.filters.project = Some(ProjectFilter::Contains("/Users/me/pond".to_owned()));
     request.filters.role = Some("assistant".to_owned());
 
     let plan = plan_search(request, SearchMode::Fts).unwrap();
@@ -273,7 +249,7 @@ fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
                 vector,
                 session_id: format!("session-{}", i % 8),
                 source_agent: "claude-code".to_owned(),
-                project: Some(format!("/proj/{}", i % 4)),
+                project: format!("/proj/{}", i % 4),
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_owned(),
                 timestamp: now - Duration::seconds(i as i64),
             }
@@ -693,104 +669,20 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     request.filters.from_date = Some("2099-01-01".to_owned());
     assert!(hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
 
-    // project (exact): every hit is scoped to the requested project.
+    // project (contains): every hit is scoped to the requested project.
     let project = hits_of(pond_search(&store, Some(&backend), search_request(&phrase)).await)
         .into_iter()
-        .find_map(|hit| hit.project)
+        .map(|hit| hit.project)
+        .find(|p| !p.is_empty())
         .expect("fixture hits carry a project");
     let mut request = search_request(&phrase);
-    request.filters.project = Some(project.clone());
+    request.filters.project = Some(ProjectFilter::Contains(project.clone()));
     let hits = hits_of(pond_search(&store, Some(&backend), request).await);
     assert!(!hits.is_empty());
     assert!(
         hits.iter()
-            .all(|hit| hit.project.as_deref() == Some(project.as_str())),
+            .all(|hit| hit.project.contains(project.as_str())),
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn project_match_is_null_pushes_down_and_returns_injected_rows() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    // The fixture corpus is all non-null `project` (Claude Code always derives
-    // it from `cwd`); the only null-project rows are the ones injected below.
-    let (store, _) = searchable_corpus(&temp).await?;
-    let model = Config::builtin().embeddings.default_model("local")?;
-
-    // No v1 adapter produces null-project rows, so inject canonical
-    // `Session { project: None, .. }` events straight through the pond_ingest
-    // handler - `is_null` lives downstream of any adapter (design.md 3.4).
-    let mut events = Vec::new();
-    let mut injected_ids = Vec::new();
-    for n in 0..3 {
-        let session_id = format!("null-project-session-{n}");
-        let message_id = format!("null-project-message-{n}");
-        injected_ids.push(message_id.clone());
-        events.push(IngestEvent::Session(Session {
-            id: session_id.clone(),
-            parent_session_id: None,
-            parent_message_id: None,
-            source_agent: "synthetic".to_owned(),
-            created_at: Utc::now(),
-            project: None,
-            options: ProviderOptions::new(),
-        }));
-        events.push(IngestEvent::Message(Message::User {
-            id: message_id.clone(),
-            session_id: session_id.clone(),
-            timestamp: Utc::now(),
-            options: ProviderOptions::new(),
-        }));
-        events.push(IngestEvent::Part(Part {
-            id: format!("{message_id}:0000"),
-            message_id: message_id.clone(),
-            ordinal: 0,
-            options: ProviderOptions::new(),
-            kind: PartKind::Text {
-                text: s(&format!("null project sentinel message {n}")),
-            },
-        }));
-    }
-
-    let IngestEnvelope::Success(response) = pond_ingest(
-        &store,
-        IngestRequest {
-            protocol_version: pond::PROTOCOL_VERSION,
-            namespace: Some("local".to_owned()),
-            events,
-        },
-    )
-    .await
-    else {
-        panic!("pond_ingest must accept the injected events");
-    };
-    assert_eq!(response.accepted, 9);
-    assert_eq!(response.rejected, 0);
-
-    // Embed the freshly ingested messages and refresh the indices.
-    let backend = FakeBackend::new(model.dim as usize);
-    EmbedWorker::new(&store, &backend, &model)?.run().await?;
-    store.ensure_indices().await?;
-    store.ensure_embedding_indices(&model).await?;
-
-    let mut request = search_request("null project sentinel");
-    request.filters.project_match = ProjectMatch::IsNull;
-    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
-
-    assert_eq!(
-        hits.len(),
-        injected_ids.len(),
-        "is_null returns exactly the null-project rows, not the fixture corpus",
-    );
-    assert!(hits.iter().all(|hit| hit.project.is_none()));
-    let returned = hits
-        .iter()
-        .map(|hit| hit.message_id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    for id in &injected_ids {
-        assert!(returned.contains(id.as_str()), "missing injected row {id}");
-    }
 
     Ok(())
 }

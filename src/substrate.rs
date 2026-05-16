@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
@@ -92,6 +93,11 @@ pub enum Predicate {
     IsNull(&'static str),
     In(&'static str, Vec<ScalarValue>),
     LikeContains(&'static str, String),
+    /// Regex match. Emitted as `regexp_like(<col>, '<pat>')`. Never pushes
+    /// down to BTREE indexes (Lance's scalar-index-expr parser ignores it),
+    /// so the filter is a full-scan-with-predicate - acceptable for
+    /// human-driven `--project re:...` queries, not for hot paths.
+    Regex(&'static str, String),
     Gte(&'static str, ScalarValue),
     Lte(&'static str, ScalarValue),
     And(Vec<Predicate>),
@@ -111,6 +117,9 @@ impl Predicate {
             }
             Self::LikeContains(column, value) => {
                 format!("{column} LIKE {} ESCAPE '\\'", like_contains(value))
+            }
+            Self::Regex(column, pattern) => {
+                format!("regexp_like({column}, {})", quoted_string(pattern))
             }
             Self::Gte(column, value) => format!("{column} >= {}", value.to_lance()),
             Self::Lte(column, value) => format!("{column} <= {}", value.to_lance()),
@@ -351,25 +360,29 @@ impl Handle {
                 let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
                 let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
                 builder.when_matched(when_matched.clone());
+                // pond's ingest contract is idempotent at the PK: callers may
+                // present the same row more than once in a single batch and
+                // the substrate keeps the first occurrence. Lance's default
+                // is to fail; FirstSeen aligns it with the contract.
+                builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
                 let (dataset, stats) = builder
                     .try_build()?
                     .execute_reader(Box::new(reader))
                     .await?;
                 cached.replace(dataset.as_ref().clone());
-                Ok(stats.num_inserted_rows)
+                Ok((stats.num_inserted_rows, stats.num_skipped_duplicates))
             })
             .await;
-        // One info line per merge_insert: aggregating these in a perf probe
-        // run (`POND_LOG=pond=info pond sync ...`) tells us how time splits
-        // across the three tables and across batches.
+        let skipped = result.as_ref().map(|(_, s)| *s).unwrap_or(0);
         tracing::info!(
             target: "pond::perf",
             table = %label,
             rows = row_count,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            skipped,
             "merge_insert"
         );
-        result
+        result.map(|(inserted, _)| inserted)
     }
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
         let mut cached = self.cached(table).lock().await;

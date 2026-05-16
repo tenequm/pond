@@ -98,8 +98,10 @@ These are constraints every pond write and read must satisfy. Code review rules.
 14. **Adapter output is monotone over versions.** For the same source data, a new adapter version MUST produce a superset (not a subset) of the canonical rows the prior version produced. Bug fixes that add rows are fine. Bug fixes that *drop* rows the previous version emitted require a schema-level coordination - they are not a pure adapter-version change. This invariant is what makes pond's `merge_insert` use `WhenMatched::UpdateAll` (Level 2 self-heal): existing rows refresh from source on re-sync, new rows insert, and there is no `when_not_matched_by_source: Delete` orphan-purge step needed because adapters never produce orphans relative to a previous run. If a future bug fix legitimately needs to drop previously-emitted rows, the fix must either bump a per-row `source_agent_version` column (forcing the old rows out via predicate) or rebuild the affected dataset (`pond export` round-trip), not silently emit fewer events. See `src/substrate.rs::merge_insert` for the enforcement point.
 15. **No synthesized values - enforced by the seam types, not by convention.** Adapters cannot substitute sentinels, defaults, or placeholder strings (`"unknown"`, `""`, `"default"`, `"function"`, `"server_tool"`, ...) for missing source data, because the schema fields that hold such data are typed as `Option<Extracted<T>>` and `Extracted<T>` has no public constructor reachable from adapter code. The only producers of an `Extracted<T>` are the `extract_*` helpers in `src/adapter/extract.rs`, which take a `&dyn Source` and return `Option<Extracted<T>>` for a real field lookup, `extract_self_str` for "the source itself viewed as a string," and `extract_compact_repr` for lossless whole-row encoding fallbacks. There is no `unwrap_or("unknown")` path that compiles - synthesis is a type error, not a code review violation. Sensible non-sentinel defaults remain fine: timestamps falling back to the session anchor, `is_failure: false` when the source row carries no error marker (typed as plain `bool`, not `Option<Extracted<bool>>`), `ordinal` clamps, MIME type fallbacks like `"application/octet-stream"` (those describe transport defaults, not invented field values). What this invariant locks in is "couldn't resolve, so I made one up" must not compile. See `src/adapter/extract.rs` for the closed seam.
 16. **Schema-honesty corollary.** A non-`Option<Extracted<T>>` field in the canonical schema is the adapter contract asserting "the source data always carries this in a form `Source` can extract." If any supported adapter cannot guarantee that, the schema MUST become `Option<Extracted<T>>`, not the adapter MUST invent a value. Concretely: `PartKind::ToolResult.name` is `Option<Extracted<String>>` because the source tool_result row doesn't carry the name itself - it's resolved via a per-file `tool_use_id -> name` map (`HashMap<String, Extracted<String>>`) and misses surface as `None`, never as a fabricated string. The CLI / wire layer renders `None` as nothing-at-all (the absent field is simply omitted from output), never as a translated placeholder.
-17. **Adapter-level dedup is the contract; validator dedup is a safety net.** Adapters SHOULD detect and skip duplicate-PK emissions at the adapter layer, using the source format's own dedup mechanism where one exists (e.g. claude-code's `messageSet` cache, which we mirror with a per-file `seen_uuids: HashSet<String>` because claude-code's own dedup occasionally races on `/resume`). The validator's in-batch HashSet exists to keep Lance's `merge_insert` invariant intact (same-PK rows in one batch are rejected with "Ambiguous merge inserts"), not as a feature adapters may rely on. If `IngestSummary.drop_reasons["duplicate_message_id"]` grows on a clean adapter run, that's a real bug worth investigating, not noise to silence.
+17. **Adapter-level dedup is the contract; substrate FirstSeen is the floor.** Adapters SHOULD detect and skip duplicate-PK emissions at the adapter layer, using the source format's own dedup mechanism where one exists (e.g. claude-code's `messageSet` cache, mirrored as `seen_uuids: HashSet<String>` because claude-code's own dedup occasionally races on `/resume`). The substrate runs `merge_insert` with `SourceDedupeBehavior::FirstSeen` (`src/substrate.rs::merge_insert`), so storage correctness no longer depends on the adapter or validator catching every in-batch duplicate - same-PK rows are silently kept-first, and the skip count surfaces on the `pond::perf` info line so the dedup remains observable. The validator's in-batch HashSet stays as an accounting layer: it charges duplicates to `dropped_events` with `drop_reasons["duplicate_*"]` so a noisy adapter is visible in the summary, not hidden inside the substrate's `skipped` counter. If those buckets grow on an adapter that already implements its source's dedup mechanism, that's an unrecognized replay pattern worth investigating.
 18. **Adapter seam is transport-agnostic.** The `Source` trait abstracts one row of source data behind four primitive accessors (`str_field`, `bool_field`, `value_field`, `nested`) plus two optional self-views (`as_str`, `compact_repr`). Adapter authors `impl Source for MyRow` where `MyRow` is whatever shape one event has in their format - a `serde_json::Value` (pond ships this impl for JSON-flavored adapters like claude-code and codex-cli), a deserialized struct (managed-agent stream frames), an HTTP response body type, a database row, anything. No file-system, JSON, or transport assumption lives in the seam itself. The `Adapter::events` stream is similarly source-agnostic - it returns `Stream<Item = Result<IngestEvent, AdapterError>>` regardless of whether events arrive from a file walker, a long-poll loop, a WebSocket, or a queue subscription. This is what lets `pond` accommodate the non-file adapters (nanoclaw API pulls, managed-agent live streams) without bending the canonical types.
+19. **`Session.parent_message_id` implies `Session.parent_session_id`.** The two pointers capture different relationships: `parent_session_id` alone covers the spawn case (claude-code subagents, nanoclaw subagents - the dominant case across real corpora); both together cover the fork-with-cut-point case (pi-mono DAG branches projected into separate pond Sessions). A `parent_message_id` without a `parent_session_id` is incoherent (a cut-point without a session to cut from), so the validator rejects such Session events with `DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION`.
+20. **`Session.project` is non-empty.** Adapters MUST emit a non-empty extracted project string for every session. The schema field is `Extracted<String>` (not `Option<Extracted<String>>`), so the seam refuses synthesized sentinels and adapter authors compose extraction chains that end in a deterministic source-derived terminator. Per-adapter chains live in each adapter's source docstring, not in this doc; the canonical fallback patterns are: scan rows for a `cwd` / `directory` / `userSelectedFolders[0]` field; fall back to a path-derived value for file-based sources; fall back to `agent.name@agent.id` for the Anthropic Managed Agents case. An adapter that genuinely cannot extract a project for a given session MUST drop it with `DROP_REASON_MISSING_PROJECT`, never invent one.
 
 ### 2.4 Concurrency model
 
@@ -168,9 +170,14 @@ alias ProviderOptions = Record<string, JsonValue | null>;
 model Session {
   id: SessionID;
 
-  // Session-level fork pointers. Both null for fresh (non-forked) sessions - the common case.
-  parent_session_id?: SessionID;     // session this one forked from
-  parent_message_id?: MessageID;     // cut-point: the last message in the parent that's part of this session's ancestry
+  // Session-level parent pointers. Both null for root sessions (most
+  // captures). Spawn-only sources (claude-code subagents, nanoclaw - the
+  // dominant case in real corpora) populate `parent_session_id` while
+  // leaving `parent_message_id` null. Fork-with-cut-point sources
+  // (pi-mono DAG branches) populate both. Invariant 19 forbids the
+  // inverse (cut-point without a parent session).
+  parent_session_id?: SessionID;     // session this one spawned from / forked from
+  parent_message_id?: MessageID;     // cut-point in the parent session (fork-with-cut-point only)
 
   // Provenance: the source harness brand. One source per session.
   // Common values: "claude-code", "opencode", "pi-mono", "anthropic-managed-agents",
@@ -189,10 +196,10 @@ model Session {
   created_at: utcDateTime;
 
   // User attribution: the shared-state scope this session belongs to.
-  // Adapter-derived from the source's native mechanism (cwd for most harnesses;
-  // explicit projectID for opencode; null for sources with no project notion
-  // such as claude-managed-agents). Case-preserved verbatim. See 3.4.
-  project?: string;
+  // Non-empty per invariant 20. Each adapter chooses an extraction chain
+  // ending in a deterministic source-derived value (cwd, repo URL, agent
+  // id). Case-preserved verbatim.
+  project: string;
 
   // Extensibility bag. See 3.1.1 for namespacing.
   options: ProviderOptions;
@@ -411,7 +418,7 @@ One row per Session.
 | parent_message_id | Utf8? | cut-point in parent session |
 | source_agent | Utf8 | NOT NULL; Bitmap (low cardinality per 3.4 canonical-strings table) |
 | created_at | timestamp_micros | source-recorded |
-| project | Utf8? | user attribution per 3.1.3; BTREE (case-sensitive equality and prefix filter pushable) |
+| project | Utf8 | NOT NULL per invariant 20; BTREE (case-sensitive equality and prefix filter pushable) |
 | options | Utf8 | JSON-serialized ProviderOptions |
 
 #### 3.2.2 messages
@@ -425,7 +432,7 @@ One row per Message (any role).
 | timestamp | timestamp_micros | clustering pos=2; source-recorded; BTREE |
 | role | Utf8 | "system" / "user" / "assistant" / "tool"; Bitmap (4-value low-cardinality column; BTREE would prune nothing because every page's [min,max] covers every value) |
 | source_agent | Utf8 | NOT NULL; denormalized from `sessions.source_agent` at ingest by pond core; Bitmap (typically 5-20 distinct values across the corpus). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
-| project | Utf8? | denormalized from `sessions.project` at ingest by pond core; BTREE (moderate cardinality, supports exact and prefix predicates). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
+| project | Utf8 | NOT NULL; denormalized from `sessions.project` at ingest by pond core; BTREE (moderate cardinality, supports exact and prefix predicates). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
 | content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in 3.2.3 |
 | search_text | Utf8? | indexed retrieval surface; populated at ingest by pond core via the concatenation policy in 3.3.1. Non-null for user and assistant roles when at least one indexable Part exists; null for system and tool roles. FTS-indexed and consumed by the embedding worker (same string feeds both retrievers). |
 | options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*`. Stored as JSON string (not Lance Struct) for additive-only evolution: any new provider key requires zero schema change. Empty options serialize as `"{}"` (no NULLs). Hot keys may be promoted to dedicated typed sibling columns additively (e.g. `messages.input_tokens Int64?` populated forward at ingest); the JSON column stays intact, promotion is reversible. |
@@ -462,7 +469,7 @@ One row per (Message, embedding model). Granularity is the Message - not the Par
 | vector | FixedSizeList&lt;Float32, N&gt; | dim N is per-model |
 | session_id | Utf8 | NOT NULL; denormalized from `messages.session_id` at ingest by pond core; BTREE (high cardinality, supports `session_id = X` prefilter on vector kNN) |
 | source_agent | Utf8 | NOT NULL; denormalized from `messages.source_agent` at ingest by pond core; Bitmap (low cardinality) |
-| project | Utf8? | denormalized from `messages.project` at ingest by pond core; BTREE |
+| project | Utf8 | NOT NULL; denormalized from `messages.project` at ingest by pond core; BTREE |
 | role | Utf8 | NOT NULL; denormalized from `messages.role` at ingest by pond core; Bitmap (4-value column; only `user` and `assistant` rows actually exist in this table since system/tool produce no embeddings per 3.3.1, but the column is declared for filter-pushdown completeness) |
 | timestamp | timestamp_micros | denormalized from `messages.timestamp` at ingest by pond core; BTREE (supports `from_date`/`to_date` prefilter on vector kNN) |
 
@@ -484,13 +491,9 @@ Embedding model registry: TOML at `[[embeddings.models]]`, with built-in default
 
 Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index keyed on message_id per 3.2.4; FTS index on `messages.search_text` per 3.2.2). Filters: `project`, `session_id`, `from_date` / `to_date`, `role`, `source_agent`, `min_score`, `boost_recent`, `group_by_conversation`, `limit`. The kb-inherited `include_tool_results` / `include_thinking` toggles are NOT search filters; they live on `pond_get` (3.6) and govern which Part types are returned at retrieval time. The search corpus is fixed by the concatenation policy in 3.3.1 - what isn't in `search_text` cannot be found via search.
 
-`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim, denormalized onto `messages` and `embeddings` for filter pushdown (3.2.2 / 3.2.4). The filter accepts `project: <value>` plus `project_match: "exact" | "contains" | "is_null"` (default `exact`).
+`project` is a canonical Session field (3.1.3) stored case-sensitive verbatim, denormalized onto `messages` and `embeddings` for filter pushdown (3.2.2 / 3.2.4). The filter is a tagged enum: `{"contains": "<substring>"}` or `{"regex": "<pattern>"}`. The `contains` form emits `LIKE '%<value>%' ESCAPE '\\'` and is the CLI default (`pond search --project pond` -> contains "pond"). The `regex` form emits `regexp_like(project, '<pattern>')` for cases callers can't express as a substring; regex never pushes down to BTREE so it's a full-fragment scan-with-predicate, acceptable for human-driven queries but not for hot paths. There is no `is_null` variant - invariant 20 requires `Session.project` to be non-empty, so no rows match.
 
-- `exact`: pushes down to the BTREE prefilter on the queried table's `project` column.
-- `contains`: falls back to expression-engine substring match (no index pushdown).
-- `is_null`: emits `project IS NULL` (Lance BTREE supports this natively per `rust/lance-index/src/scalar/btree.rs:1537, 824-830`); the `project` value field is ignored when `is_null` is set. Required for filtering source harnesses that have no project notion (claude-managed-agents per 3.4).
-
-Case-insensitive search is the caller's responsibility (fold case before submitting); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id` (without `is_null`; both are NOT NULL).
+Case-insensitive search is the caller's responsibility (fold case before submitting, or use a `(?i)` prefix in the regex form); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id`.
 
 `role` accepts a single value (`"user"` | `"assistant"` | `"system"` | `"tool"`). System and tool values are accepted on the wire but always return empty (those rows have NULL `search_text` and no embeddings per 3.2.2 / 3.2.4).
 
@@ -621,15 +624,7 @@ Invariant 5 (no silent drops) is met by surfacing every drop via a `SyncEvent` (
 
 Additional source surfaces ship adapter-defined strings; the table here is amendment-only.
 
-**Per-adapter `Session.project` derivation rules.** Each adapter populates `Session.project` from its source's native attribution mechanism. Concrete rules (motivated by stress-testing real source samples in `tests/fixtures/session-samples/`):
-
-- **claude-code, codex-cli, pi, nanoclaw**: session-level `cwd` field. For codex-cli, the session-level `cwd` from `session_meta` is canonical; per-turn `turn_context.cwd` drift goes to `options.source.codex.turn_cwd[]` (preserved verbatim, not promoted to `project`). For nanoclaw, container `cwd` (e.g. `/workspace/agent`) is acceptable as `project` since it identifies the agent's working root.
-- **opencode**: per-session `directory` field (the user-meaningful working dir), NOT the source's `projectID` hash. The `projectID` value is stashed under `options.source.opencode_project_id` for cross-reference; three real samples (`opencode/storage/session/0c929829.../ses_*.json`) collapse three different repos under one hashed `projectID`, so it's unusable as a filter. Per-message `path.cwd` drift goes to `options.source.opencode.message_cwd[]`.
-- **openclaw**: session header `cwd` field, with a denylist: when `cwd` matches `$HOME`, `/`, `/tmp`, `/var/tmp`, `/private/tmp` (resolved at ingest), the adapter emits `project = null` with an info-level log. The raw value goes to `options.source.openclaw.cwd_raw`. Rationale: a real sample (`openclaw/agents/main/sessions/a5ecbacb-...jsonl.reset.2026-04-03T16-08-18.440Z`) has `cwd=/Users/user`, which is not a meaningful project filter.
-- **claude-app**: `userSelectedFolders[0]` from the metadata sidecar (the "primary folder"). The full array goes to `options.source.claude_app.user_selected_folders[]`. A single audit.jsonl file can contain rows for multiple inner `session_id` values (real sample `local_4f2429ff-.../audit.jsonl` has three); the adapter splits per-inner-session_id and projects each as a separate pond Session, applying the sidecar's `cwd`/`userSelectedFolders`/`systemPrompt` only to the Session whose id matches the sidecar's `cliSessionId`. Other inner sessions get `project = null` plus an `options.source.claude_app.split_origin` marker.
-- **anthropic-managed-agents**: `project = null`. No source attribution mechanism exists; `memory_store_id` (when attached) goes to `options.source.anthropic.memory_store_id` (not `project`, since `memory_store_id` doesn't identify a project).
-
-**openclaw `.reset.<ts>` rotation handling (E6c).** OpenClaw rotates active session files to `<id>.jsonl.reset.<iso8601>` and starts fresh files reusing the same inner `Session.id`. When `discover` enumerates rotated files alongside the live file, the adapter emits events from both into the same `Session.id`; per-event `merge_insert` on canonical PKs deduplicates message and part rows by content. Each event from a rotated file carries `options.source.openclaw.rotation_origin = "<basename of source file>"` so consumers can partition by rotation epoch later (the v1 search and get surface ignores this tag; a future rotation-aware view can read it without re-ingest). The resulting Session's message log is the union of rotation epochs, ordered by `(timestamp, message_id)` per the canonical Message ordering rule (3.1.4).
+**Per-adapter `Session.project` derivation rules** live as docstrings on each adapter's source-decode function (the implementation is the documentation; design.md stays focused on the cross-adapter contract). Invariant 20 fixes the contract: every adapter MUST emit a non-empty `Extracted<String>`. The `Source` / `Extracted<T>` seam (3.1.7) makes synthesized sentinels a compile error - the chain ends in a deterministic source-derived value (a path-encoded directory name, an agent id, a repo URL) or the session is dropped with `DROP_REASON_MISSING_PROJECT`.
 
 **`parent_session_id` is a soft foreign key.** Pond core does not validate that a forked session's `parent_session_id` references an existing session row at ingest. Forks against missing parents (real case: nanoclaw subagent files referencing parent sessions absent from disk) are stored as-is; consumers traversing fork lineage handle dangling pointers. This avoids ordering constraints between independent adapter runs and matches the append-only invariant (the parent might land in a later ingest pass).
 
@@ -677,8 +672,8 @@ Error body:
 {
   "error": {
     "code": "validation_failed",
-    "message": "filters.project_match must be one of: exact, contains",
-    "details": { "field": "filters.project_match", "value": "wildcard" }
+    "message": "filters.project must be one of: {contains: string} | {regex: string}",
+    "details": { "field": "filters.project", "value": "wildcard" }
   },
   "request_id": "req_01HXY..."
 }
@@ -719,8 +714,7 @@ Request `POST /v1/search`:
   "query": "rust lifetime error",
   "rrf_k": 60,
   "filters": {
-    "project": null,
-    "project_match": "exact",
+    "project": { "contains": "pond" },
     "session_id": null,
     "source_agent": null,
     "from_date": null,
@@ -737,7 +731,7 @@ Request `POST /v1/search`:
 - `query`: required, non-empty after trim.
 - The mode is not a request input. The server picks hybrid or fts based on the embedder state; the response carries no top-level mode field - per-hit `matched_via` reports which retriever(s) ranked each row (see 2.5).
 - `rrf_k`: default 60. Consulted only when the server runs hybrid mode.
-- `filters.project_match`: `"exact"` (default) | `"contains"` | `"is_null"`. `is_null` ignores the `project` value field and emits `project IS NULL` (required for filtering anthropic-managed-agents per 3.3 / 3.4).
+- `filters.project`: `null` (no filter) | `{ "contains": "<substring>" }` | `{ "regex": "<pattern>" }`. Regex never pushes down to the BTREE index (full-fragment scan); contains uses LIKE pushdown. There is no `is_null` form - invariant 20 makes `Session.project` non-empty.
 - `filters.role`: `"user"` | `"assistant"` | `"system"` | `"tool"`. System/tool always return empty (NULL search_text).
 - `filters.min_score`: default `0.0` (no threshold).
 - `boost_recent`: default `true`; formula in 3.3.

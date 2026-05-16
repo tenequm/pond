@@ -87,7 +87,8 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some("pond-mcp-test".to_owned()),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "pond-mcp-test"}), "x")
+            .unwrap(),
         options: Default::default(),
     };
     let message = Message::Assistant {

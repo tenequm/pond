@@ -277,7 +277,7 @@ pub mod mcp {
         handlers::pond_search as run_search,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResult,
-            ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
+            ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
         },
         wire::{Part, PartKind},
     };
@@ -399,8 +399,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 query: params.query,
                 rrf_k: 60,
                 filters: SearchFilters {
-                    project: params.project,
-                    project_match: ProjectMatch::default(),
+                    project: params.project.map(ProjectFilter::Contains),
                     session_id: params.conversation_id,
                     source_agent: params.source_agent,
                     from_date: params.from_date,

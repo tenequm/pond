@@ -27,7 +27,7 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, DiscoverFuture, Env, EventStream, collect_jsonl_files,
     empty_options,
-    extract::{Extracted, extract_compact_repr, extract_str},
+    extract::{Extracted, extract_compact_repr, extract_self_str, extract_str},
     part_id,
 };
 
@@ -242,10 +242,23 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
                 "session_meta has no parseable timestamp",
             )
         })?;
-    let project = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let project = match extract_str(&payload, "cwd") {
+        Some(value) => value,
+        None => {
+            let path_str = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path_display)
+                .to_owned();
+            extract_self_str(&Value::String(path_str)).ok_or_else(|| {
+                AdapterError::schema(
+                    NAME,
+                    path_display.to_owned(),
+                    "internal: Value::String produced None from Source::as_str",
+                )
+            })?
+        }
+    };
     let mut options = ProviderOptions::new();
     options.insert(
         "source".to_owned(),

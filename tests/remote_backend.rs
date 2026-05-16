@@ -63,7 +63,8 @@ async fn store_open_against_memory_uri_round_trips_a_session() -> anyhow::Result
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: Utc::now(),
-        project: Some("/tmp/remote-test".to_owned()),
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "/tmp/remote-test"}), "x")
+            .unwrap(),
         options: ProviderOptions::new(),
     };
     let message = Message::User {

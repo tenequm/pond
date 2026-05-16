@@ -217,7 +217,7 @@ mod ingest_handler {
                     match &event {
                         IngestEvent::Session(session) => {
                             in_flight = Some(InFlight {
-                                project: session.project.clone(),
+                                project: Some((*session.project).clone()),
                                 session_id: session.id.clone(),
                                 messages: 0,
                                 dropped_events: 0,
@@ -942,7 +942,7 @@ mod search_handler {
         sessions::{MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
-            ErrorEnvelope, Group, Hit, ProjectMatch, SearchEnvelope, SearchFilters, SearchRequest,
+            ErrorEnvelope, Group, Hit, ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest,
             SearchResponse, SearchResultBody, new_request_id, validate_protocol,
         },
     };
@@ -1395,7 +1395,7 @@ mod search_handler {
         // `scored` is already sorted by score descending, so the first hit seen for
         // a session is its best-scoring match.
         struct Acc {
-            project: Option<String>,
+            project: String,
             source_agent: String,
             first_timestamp: DateTime<Utc>,
             last_timestamp: DateTime<Utc>,
@@ -1455,17 +1455,13 @@ mod search_handler {
     pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
         let mut clauses = Vec::new();
 
-        match filters.project_match {
-            ProjectMatch::IsNull => clauses.push(Predicate::IsNull("project")),
-            ProjectMatch::Exact => {
-                if let Some(project) = &filters.project {
-                    clauses.push(Predicate::Eq("project", project.clone().into()));
-                }
+        match &filters.project {
+            None => {}
+            Some(ProjectFilter::Contains(value)) => {
+                clauses.push(Predicate::LikeContains("project", value.clone()));
             }
-            ProjectMatch::Contains => {
-                if let Some(project) = &filters.project {
-                    clauses.push(Predicate::LikeContains("project", project.clone()));
-                }
+            Some(ProjectFilter::Regex(pattern)) => {
+                clauses.push(Predicate::Regex("project", pattern.clone()));
             }
         }
 
