@@ -491,6 +491,42 @@ fn tool_call_events(
     ]
 }
 
+/// Stopgap guard against pathological codex-cli `function_call_output.output`
+/// values - a 0.121.0 sandbox-denial path was observed dumping ~4GB of
+/// captured stdout into a single JSON string field, which then overflows the
+/// i32 offset accumulator in `parts.variant_data` (StringArray). Cap at 10MB
+/// and replace with a sentinel that preserves the head bytes plus the
+/// original size. See `plan.md` Stage 6 for the proper storage-seam fix.
+const MAX_TOOL_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+const TOOL_OUTPUT_HEAD_BYTES: usize = 2048;
+
+fn cap_tool_output(value: Value) -> Value {
+    if let Value::String(s) = &value
+        && s.len() > MAX_TOOL_OUTPUT_BYTES
+    {
+        let original = s.len();
+        let head_end = s
+            .char_indices()
+            .take_while(|(i, _)| *i <= TOOL_OUTPUT_HEAD_BYTES)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        let head = &s[..head_end];
+        tracing::warn!(
+            adapter = NAME,
+            original_bytes = original,
+            cap_bytes = MAX_TOOL_OUTPUT_BYTES,
+            "function_call_output.output exceeded cap; truncated to sentinel"
+        );
+        return json!({
+            "__pond_truncated": true,
+            "original_bytes": original,
+            "head": head,
+        });
+    }
+    value
+}
+
 fn tool_result_events(
     session_id: &str,
     message_id: &str,
@@ -507,7 +543,7 @@ fn tool_result_events(
         .as_ref()
         .and_then(|id| tool_call_names.get(id.as_str()))
         .cloned();
-    let result = payload.get("output").cloned().unwrap_or(Value::Null);
+    let result = cap_tool_output(payload.get("output").cloned().unwrap_or(Value::Null));
     let part = Part {
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),

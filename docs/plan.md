@@ -579,6 +579,126 @@ surface.
 
 ---
 
+## Stage 6 - Per-Part oversize guard at the storage seam
+
+> Follow-up to the codex-cli adapter stopgap in `src/adapter/codex_cli.rs`
+> (`cap_tool_output` / `MAX_TOOL_OUTPUT_BYTES`). That stopgap is adapter-local
+> and only guards `function_call_output.output`. Stage 6 moves the guard one
+> layer down so every adapter is protected at one enforcement point, and
+> wires the truncation count into the sync summary.
+
+**Goal**: a single byte-cap on per-Part variable-size payload, enforced at the
+storage seam, with truncation counted and surfaced. Eliminates the need for any
+adapter to know about Arrow's i32-offset cap on `StringArray` columns.
+
+**Why this is needed at all**: `parts.variant_data` is a `StringArray` (i32
+offsets), so a single Part value > i32::MAX bytes overflows in `parts_batch`
+(see `sessions.rs:parts_batch` and `part_variant_json`). A real codex-cli 0.121.0
+SandboxDenied capture dumped ~4GB of stdout into one `function_call_output.output`
+and panicked pond's ingest at `arrow-array/byte_array.rs:236` ("offset overflow").
+Pond must not propagate that, regardless of what the upstream adapter emits.
+
+**Threshold**: 1 MB per variable-size Part field. Calibrated from the
+per-adapter size survey across the local corpus (codex-cli / claude-code /
+opencode):
+
+| Adapter | Field | Max observed | p99.9 |
+|---|---|---:|---:|
+| codex-cli | function_call_output.output | 392 KB | 80 KB |
+| codex-cli | message.content | 937 KB | 440 KB |
+| claude-code | tool_result.content | 518 KB | 93 KB |
+| claude-code | text | 594 KB | 33 KB |
+| claude-code | tool_use.input | 82 KB | 21 KB |
+| opencode | tool.output | 103 KB | - |
+
+Largest legitimate per-Part value on this machine: ~600 KB. 1 MB gives 2x
+headroom over observed worst-case, sits well above p99.9 for every adapter,
+and is small enough to keep cumulative `parts.variant_data` bytes per flush
+comfortably under i32::MAX (100 sessions x typical part counts x 1 MB worst
+case). The single observed cap trigger in the survey is a codex-cli 0.121.0
+SandboxDenied capture at **3.97 GB** - 10,000x past any legitimate Part.
+
+The cap is a `pub(crate) const` in `sessions.rs`, not config-tunable in v1.
+If a future survey turns up real corpora with >1 MB Parts, raise the const
+with a documented data point in this section, not via runtime config.
+
+**Build** (`sessions.rs` + `handlers.rs` + `main.rs`):
+
+- `sessions.rs::part_variant_json` (line 2486) returns `(String, bool)` instead
+  of `String`; the bool reports whether truncation fired. A new helper
+  `cap_oversize_string_leaves(&mut Value, cap) -> bool` walks the Value tree
+  and replaces any `Value::String(s)` where `s.len() > cap` with the
+  sentinel:
+
+  ```json
+  {"__pond_truncated": true, "original_bytes": <n>, "head": <first 2 KiB>}
+  ```
+
+  Returns `true` if any replacement happened. Mutation is in place.
+
+- Variants guarded (one walk per variant, applied to the variable-size fields
+  only):
+  - `Text.text` (Option<String>) - cap the string when present.
+  - `Reasoning.text` (Option<String>) - same.
+  - `ToolCall.params` (Value) - recursive walk.
+  - `ToolResult.result` (Value) - recursive walk.
+  - `File.data` - **not via this path**. `File.data` is byte-typed and
+    written through `BlobArrayBuilder` (sessions.rs:2278-2282), which lives
+    outside `variant_data`. Blob v2 columns are not i32-offset-bound. Out of
+    scope here; if it turns out blobs need a separate cap, it's a follow-up.
+  - `ToolApprovalRequest` / `ToolApprovalResponse` - small by construction;
+    skip.
+
+- `sessions.rs::parts_batch` (line 2271) returns `(RecordBatch, usize)` where
+  the usize is the truncation count for the batch. Caller of `parts_batch`
+  (the validator flush path in `handlers.rs`) adds to a running counter.
+
+- `handlers.rs::SyncSummary` (or equivalent type around line 88) gains a
+  `truncated_parts: usize` field, mirroring `dropped_events`. Set during
+  flush, reported in the final summary log line.
+
+- `main.rs` sync-event-line formatter (line ~870) renders
+  `truncated=N` alongside the existing `dropped=N` when N > 0.
+
+- `src/adapter/codex_cli.rs` - delete `cap_tool_output` / `MAX_TOOL_OUTPUT_BYTES`
+  / `TOOL_OUTPUT_HEAD_BYTES` once Stage 6 lands. The storage-seam guard
+  subsumes them.
+
+**Tests** (`sessions.rs` `#[cfg(test)] mod tests`):
+
+- Under-cap Part round-trips byte-identically (no false truncation).
+- Over-cap `ToolResult.result` becomes the sentinel; head bytes preserved;
+  `original_bytes` matches the original; `__pond_truncated == true`.
+- Sentinel survives the read path: `pond_get` returns a Part whose `result`
+  is the sentinel JSON, not a parse failure.
+- Truncation count is plumbed: a synthetic batch with one over-cap Part
+  produces `truncated_parts == 1` in the summary; two produce 2.
+- Recursive walk: an over-cap string nested inside a JSON object inside
+  `ToolResult.result` gets capped at the leaf, the object structure stays.
+
+**Done when**:
+- A Part carrying a multi-GB string field ingests without panic, lands as
+  the truncation sentinel, and the sync summary reports `truncated=N`.
+- The codex-cli adapter no longer carries its own cap helper.
+- All four adapters benefit from the guard (claude-code, codex-cli,
+  opencode, and any future addition) without per-adapter code.
+- clippy + fmt + CI green.
+
+**design.md coverage**: invariant 1 ("no silent drops") and 3.4 ingest
+("per-event drop") - truncation is the explicit equivalent of a drop for an
+individual Part field, counted and surfaced, never silent.
+
+**Out of scope (deferred)**:
+- `LargeStringArray` migration for `variant_data`. The 10 MB per-Part cap
+  keeps cumulative column bytes under i32::MAX for any realistic flush;
+  schema-level i64 offsets are only needed if you want to preserve
+  multi-GB Parts verbatim, which Stage 6 explicitly chooses not to.
+- Cumulative-byte flush trigger (`ADAPTER_FLUSH_BYTES`). Memory polish,
+  separable from the correctness fix.
+- Per-adapter cap tuning. One cap, applied at the seam, across all adapters.
+
+---
+
 ## What this plan deliberately excludes
 
 Per `design.md` section 4, all of these stay deferred and are NOT in any stage above:
