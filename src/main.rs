@@ -116,23 +116,6 @@ enum Command {
         #[arg(long, default_value = "local")]
         namespace: String,
     },
-    /// Run cleanup_old_versions + optimize_indices once over all datasets.
-    /// Runs regardless of the `[maintenance].enabled` config flag.
-    Maintenance {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
-        #[arg(long, env = "POND_CONFIG")]
-        config: Option<PathBuf>,
-        /// Override the cleanup retention window, in days.
-        #[arg(long)]
-        older_than_days: Option<u64>,
-        /// Run optimize_indices only; skip cleanup_old_versions.
-        #[arg(long)]
-        skip_cleanup: bool,
-        /// Run cleanup_old_versions only; skip optimize_indices.
-        #[arg(long)]
-        skip_optimize: bool,
-    },
     /// Inspect configuration.
     Config {
         /// Print the fully-annotated config.toml schema.
@@ -346,6 +329,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             store.ensure_indices().await?;
+            let retention = chrono::Duration::days(
+                i64::try_from(loaded.maintenance.retention_days).unwrap_or(i64::MAX),
+            );
+            let report = store.maintenance(retention).await;
+            output(&format!(
+                "{} versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
+                pond::output::paint("maintenance:", pond::output::dim()),
+                report.versions_removed,
+                report.bytes_reclaimed,
+                report.tables_optimized,
+                report.tables_failed,
+            ))?;
         }
         Command::Embed {
             data_dir,
@@ -405,14 +400,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            // Probe the embeddings table: if there's at least one row for the
-            // default model identity, load the model so hybrid search works;
-            // otherwise boot without weights and let `pond_search` run
-            // FTS-only. Operators opt in via `pond embed`, not a config flag.
-            let embedder: Option<Arc<dyn EmbedBackend>> = if store
-                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
-                .await?
-            {
+            let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
                 Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
             } else {
                 None
@@ -433,10 +421,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            let embedder: Option<Arc<dyn EmbedBackend>> = if store
-                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
-                .await?
-            {
+            let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
                 Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
             } else {
                 None
@@ -468,13 +453,7 @@ async fn main() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config, &data_dir))?;
             let resolved_model = config::resolve_model(&loaded, model.as_deref(), &namespace)?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            // Match `pond serve` / `pond mcp`: load weights only when the
-            // store actually has embeddings for this model identity. Otherwise
-            // `pond_search` runs FTS-only and skips a multi-second model load.
-            let embedder: Option<Arc<dyn EmbedBackend>> = if store
-                .has_embeddings(&resolved_model.id, resolved_model.max_embed_tokens as i32)
-                .await?
-            {
+            let embedder: Option<Arc<dyn EmbedBackend>> = if loaded.embeddings.enabled {
                 Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
             } else {
                 None
@@ -533,31 +512,6 @@ async fn main() -> anyhow::Result<()> {
             if !render_get_envelope(format, &envelope)? {
                 std::process::exit(1);
             }
-        }
-        Command::Maintenance {
-            data_dir,
-            config,
-            older_than_days,
-            skip_cleanup,
-            skip_optimize,
-        } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config = Config::load(config_path(config, &data_dir))?;
-            let retention_days = older_than_days.unwrap_or(config.maintenance.retention_days);
-            let retention =
-                chrono::Duration::days(i64::try_from(retention_days).unwrap_or(i64::MAX));
-            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
-            let report = store
-                .maintenance(retention, skip_cleanup, skip_optimize)
-                .await;
-            output(&format!(
-                "{} versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
-                pond::output::paint("maintenance:", pond::output::dim()),
-                report.versions_removed,
-                report.bytes_reclaimed,
-                report.tables_optimized,
-                report.tables_failed,
-            ))?;
         }
         Command::Config { print_schema } => {
             if print_schema {
@@ -618,7 +572,7 @@ fn spawn_maintenance(store: Arc<Store>, config: &MaintenanceConfig) {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let report = store.maintenance(retention, false, false).await;
+            let report = store.maintenance(retention).await;
             tracing::info!(
                 versions_removed = report.versions_removed,
                 bytes_reclaimed = report.bytes_reclaimed,

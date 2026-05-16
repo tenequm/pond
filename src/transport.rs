@@ -11,11 +11,8 @@ use std::sync::Arc;
 
 use crate::{embed::EmbedBackend, sessions::Store};
 
-/// Shared state handed to both transports: the store and an optional embedding
-/// backend. `embedder` is `None` when the store has no embeddings for the
-/// configured model (see `Store::has_embeddings`) - in that mode
-/// `pond serve` / `pond mcp` boot without loading the model and `pond_search`
-/// runs FTS-only.
+/// Shared state handed to both transports. `embedder` is `None` when
+/// `[embeddings] enabled = false` (the default); search runs FTS-only.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,

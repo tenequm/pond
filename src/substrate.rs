@@ -450,12 +450,7 @@ impl Handle {
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().map(|index| index.name.clone()).collect())
     }
-    pub async fn maintenance(
-        &self,
-        retention: chrono::Duration,
-        skip_cleanup: bool,
-        skip_optimize: bool,
-    ) -> MaintenanceReport {
+    pub async fn maintenance(&self, retention: chrono::Duration) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
         for table in [
             Table::Sessions,
@@ -463,10 +458,7 @@ impl Handle {
             Table::Parts,
             Table::Embeddings,
         ] {
-            match self
-                .maintain_table(table, retention, skip_cleanup, skip_optimize)
-                .await
-            {
+            match self.maintain_table(table, retention).await {
                 Ok((versions_removed, bytes_reclaimed)) => {
                     report.versions_removed += versions_removed;
                     report.bytes_reclaimed += bytes_reclaimed;
@@ -484,27 +476,19 @@ impl Handle {
         &self,
         table: Table,
         retention: chrono::Duration,
-        skip_cleanup: bool,
-        skip_optimize: bool,
     ) -> Result<(u64, u64)> {
         let started = Instant::now();
         let mut guard = self.cached(table).lock().await;
         let mut dataset = guard.latest().await?;
-        let (versions_removed, bytes_reclaimed) = if skip_cleanup {
-            (0, 0)
-        } else {
-            let stats = dataset
-                .cleanup_old_versions(retention, None, None)
-                .await
-                .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
-            (stats.old_versions, stats.bytes_removed)
-        };
-        if !skip_optimize {
-            dataset
-                .optimize_indices(&OptimizeOptions::default())
-                .await
-                .with_context(|| format!("optimize_indices failed for {}", table.label()))?;
-        }
+        let stats = dataset
+            .cleanup_old_versions(retention, None, None)
+            .await
+            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
+        let (versions_removed, bytes_reclaimed) = (stats.old_versions, stats.bytes_removed);
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .with_context(|| format!("optimize_indices failed for {}", table.label()))?;
         guard.replace(dataset);
         tracing::info!(
             table = table.label(),

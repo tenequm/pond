@@ -461,8 +461,9 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 - `config.rs` (scaffolded in Stage 2 with the embedding registry) - extend to the
   full `config.toml` schema + load/validate, `pond config --print-schema` (2.1.1).
 - `substrate.rs` - the maintenance task: `cleanup_old_versions` + `optimize_indices`
-  background tokio task spawned by `pond serve`, `[maintenance]` config block, and the
-  `pond maintenance` one-shot verb (3.2.0).
+  background tokio task spawned by `pond serve`, `[maintenance]` config block, and a
+  tail-call from `pond sync` so CLI-only operators get a queryable index without a
+  second verb (3.2.0).
 - `main.rs` - remaining CLI verbs: `pond serve` (HTTP + `/mcp`) and `pond mcp` (stdio
   MCP only). Both load the embedding model at startup - it is required to embed search
   queries - so a missing or broken model fails loudly at boot, not on the first
@@ -476,7 +477,7 @@ operational verbs. After this stage `pond serve` is a working `kb` replacement.
 - MCP integration: drive the rmcp stdio server, call `pond_search` and `pond_get`,
   assert the responses match the kb parity contract (including placeholder rendering).
 - Maintenance: the task runs `cleanup_old_versions` + `optimize_indices` without
-  crashing `serve`; `pond maintenance` one-shot produces the same effect.
+  crashing `serve`; `pond sync` tail-calls the same logic.
 
 **Done when**:
 - `pond serve` runs; HTTP and MCP both answer over the same handlers.

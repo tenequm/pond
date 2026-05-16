@@ -124,11 +124,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [sources.codex-cli]
 # path = \"~/.codex/sessions\"
 
-# Register or tune an embedding model. pond validates each entry against its
-# known-model set (model id, dimension, distance metric). `pond serve` and
-# `pond mcp` probe the embeddings table at boot and load the model only when
-# rows exist for the default identity, so embeddings stay fully opt-in: run
-# `pond embed` once to fill the backlog.
+# Embeddings master switch. Default `false`: search runs FTS-only and the
+# model never loads. Set `true` to enable hybrid search. `pond embed` always
+# runs regardless, so vectors can be pre-populated before flipping the switch.
+#
+# [embeddings]
+# enabled = false
+#
+# Register or tune an embedding model.
 #
 # [[embeddings.models]]
 # id = \"Qwen/Qwen3-Embedding-0.6B\"
@@ -144,8 +147,8 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # max_embed_tokens = 2048
 
 # Background maintenance: `cleanup_old_versions` + `optimize_indices`, run by
-# `pond serve` on an interval and by the `pond maintenance` one-shot verb.
-# `pond maintenance` runs regardless of `enabled`.
+# `pond serve` on an interval and at the end of every `pond sync` (sync runs
+# regardless of `enabled`).
 #
 # [maintenance]
 # enabled = true          # run the background task under `pond serve`
@@ -208,8 +211,8 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
-    /// Whether `pond serve` spawns the background maintenance task. The
-    /// `pond maintenance` one-shot verb runs regardless of this flag.
+    /// Whether `pond serve` spawns the background maintenance task. Sync's
+    /// tail-call to maintenance runs regardless of this flag.
     #[serde(default = "default_maintenance_enabled")]
     pub enabled: bool,
     /// Background pass interval in seconds (default 6h).
@@ -230,13 +233,14 @@ impl Default for MaintenanceConfig {
     }
 }
 
-/// The `[embeddings]` section: the model registry plus per-namespace overrides.
-/// Embeddings are opt-in by data: `pond serve` / `pond mcp` probe the
-/// `embeddings` table at boot and load the model only when rows exist for the
-/// default identity. Run `pond embed` once to populate the backlog.
+/// `[embeddings]`: master switch, model registry, per-namespace overrides.
+/// With `enabled = false` (the default), the search path never loads the
+/// model; `pond embed` runs regardless.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingsConfig {
+    #[serde(default)]
+    pub enabled: bool,
     /// `[[embeddings.models]]` entries. User entries merge over built-ins by `id`.
     #[serde(default)]
     pub models: Vec<EmbeddingModel>,

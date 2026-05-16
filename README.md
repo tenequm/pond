@@ -54,7 +54,7 @@ Key choices:
 - Four Lance datasets: `sessions`, `messages`, `parts`, `embeddings`. Hot filter columns are denormalized onto search rows for single-stage filter pushdown (`messages` and `embeddings` carry `source_agent` / `project` / `role` / `timestamp` for prefilter on hybrid search).
 - One adapter trait, `SourceAdapter`, with a deterministic event-ordering contract. Everything else (storage, indexing, OCC, time-travel, namespaces, manifest versioning, blob storage) is Lance direct - no extra "seam" abstractions.
 - Append-only writes. Replay (cross-provider re-projection) is deferred to section 4.
-- v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond status`, `pond sync`, `pond embed`, `pond serve`, `pond mcp`, `pond maintenance`, `pond config`, `pond export`.
+- v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond status`, `pond sync`, `pond embed`, `pond serve`, `pond mcp`, `pond config`, `pond export`.
 - Default embeddings: Qwen3-Embedding-0.6B via fastembed-rs (local, candle backend behind the `qwen3` feature, fixed 1024-dim, 32K context, Apache 2.0). Embedding registry is config-driven.
 - Multi-tenancy via opaque namespace strings; bucket prefix per namespace; separate buckets when KMS isolation matters.
 - Encryption is operational (bucket SSE + filesystem encryption), not application-level.

@@ -968,15 +968,8 @@ impl Store {
         self.handle.embedding_index_names().await
     }
 
-    pub async fn maintenance(
-        &self,
-        retention: chrono::Duration,
-        skip_cleanup: bool,
-        skip_optimize: bool,
-    ) -> MaintenanceReport {
-        self.handle
-            .maintenance(retention, skip_cleanup, skip_optimize)
-            .await
+    pub async fn maintenance(&self, retention: chrono::Duration) -> MaintenanceReport {
+        self.handle.maintenance(retention).await
     }
 
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
