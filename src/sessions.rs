@@ -74,10 +74,18 @@ pub enum UpsertStatus {
 pub struct CorpusStats {
     pub data_url: Url,
     pub totals: RowTotals,
-    /// One entry per `source_agent` value present in the corpus, in
-    /// alphabetical adapter order. The CLI re-sorts this into registry order
-    /// at render time so the tree matches the discovery picker.
+    /// One entry per adapter present in the corpus. When `include_subagents`
+    /// is false (the CLI default), sub-agent rows (`source_agent` containing
+    /// `/`) are filtered out so only the main-agent sessions appear. When
+    /// true, each distinct `source_agent` (e.g. `claude-code/general-purpose`)
+    /// gets its own entry. Always in alphabetical order; the CLI re-sorts
+    /// this into registry order at render time so the tree matches the
+    /// discovery picker.
     pub adapters: Vec<AdapterStats>,
+    /// Whether the rollup includes sub-agent sessions. The renderer prints a
+    /// hint about `--include-subagents` when this is false so users know the
+    /// `totals` row above counts sessions that aren't broken down below.
+    pub include_subagents: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +98,9 @@ pub struct RowTotals {
 
 #[derive(Debug, Clone)]
 pub struct AdapterStats {
-    /// `source_agent` value as stored on every `messages` row.
+    /// Either the main-agent name (`claude-code`) when sub-agents are filtered
+    /// out, or the full `source_agent` (`claude-code/general-purpose`) when
+    /// `include_subagents` is on.
     pub adapter: String,
     pub sessions: u64,
     pub messages: u64,
@@ -656,7 +666,7 @@ impl Store {
     /// columns the rollup keys on (`source_agent`, `project`, `session_id`),
     /// aggregated in-memory. Bounded by the cross product of adapters and
     /// projects, which stays small on real corpora.
-    pub async fn corpus_stats(&self) -> Result<CorpusStats> {
+    pub async fn corpus_stats(&self, include_subagents: bool) -> Result<CorpusStats> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         let mut scanner = dataset.scan();
         scanner.project(&["source_agent", "project", "session_id"])?;
@@ -668,6 +678,10 @@ impl Store {
                 let source_agent = string(&batch, "source_agent", row)?.unwrap_or_default();
                 let project = string(&batch, "project", row)?.unwrap_or_default();
                 let session_id = string(&batch, "session_id", row)?.unwrap_or_default();
+                let is_subagent = source_agent.contains('/');
+                if is_subagent && !include_subagents {
+                    continue;
+                }
                 let entry = groups.entry((source_agent, project)).or_default();
                 entry.messages += 1;
                 entry.session_ids.insert(session_id);
@@ -713,6 +727,7 @@ impl Store {
             data_url: self.handle.location().clone(),
             totals,
             adapters,
+            include_subagents,
         })
     }
 

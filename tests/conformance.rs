@@ -103,12 +103,9 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
 
     let mut events: Vec<SyncEvent> = Vec::new();
-    ingest_adapter(
-        &store,
-        &adapter,
-        &pond::adapter::NoopOracle,
-        |event| events.push(event),
-    )
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
+        events.push(event);
+    })
     .await?;
 
     let first = events.first().expect("at least one progress event");
@@ -145,7 +142,7 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
-    let stats = store.corpus_stats().await?;
+    let stats = store.corpus_stats(false).await?;
     assert!(stats.totals.sessions > 0);
     assert!(stats.totals.messages > 0);
 

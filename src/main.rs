@@ -73,6 +73,11 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
+        /// Show one section per `source_agent` (including sub-agents like
+        /// `claude-code/general-purpose`). Default rolls sessions up to the
+        /// main agent only.
+        #[arg(long)]
+        include_subagents: bool,
     },
     /// Import sessions from one or more configured source adapters. With no
     /// `<adapter>` arg, syncs every entry in `[sources.*]`. With an empty
@@ -289,11 +294,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Status { data_dir, config } => {
+        Command::Status {
+            data_dir,
+            config,
+            include_subagents,
+        } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            let stats = store.corpus_stats().await?;
+            let stats = store.corpus_stats(include_subagents).await?;
             let sizes = storage_sizes_for(&data_dir).await?;
             render_status(&stats, sizes.as_ref())?;
         }
@@ -995,6 +1004,12 @@ fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::R
         paint(&format_thousands(parts), bold()),
         paint(&format_thousands(embeddings), bold()),
     ))?;
+    if !stats.include_subagents {
+        output(&paint(
+            "  note: totals above include sub-agent sessions; the rollup below shows main-agent only. Pass `--include-subagents` for the per-agent breakdown.",
+            dim(),
+        ))?;
+    }
 
     // Render adapters in registry order so the layout matches the discovery
     // picker; adapters present in the data but not in the registry append at
