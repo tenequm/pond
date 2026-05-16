@@ -125,9 +125,8 @@ pub enum SkipReason {
     Fresh,
 }
 
-pub type AdapterYieldStream<'a> = std::pin::Pin<
-    Box<dyn Stream<Item = Result<AdapterYield, AdapterError>> + Send + 'a>,
->;
+pub type AdapterYieldStream<'a> =
+    std::pin::Pin<Box<dyn Stream<Item = Result<AdapterYield, AdapterError>> + Send + 'a>>;
 
 /// Boxed future returning the number of sessions an adapter will emit. The
 /// shape mirrors [`EventStream`] - one alias per async trait method so the

@@ -993,7 +993,8 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        let _summary =
+            ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         let child = store
             .get_session(&format!("{parent_uuid}/agent-{agent_hash}"))
@@ -1094,7 +1095,8 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        let _summary =
+            ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         let session = store
             .get_session(session_uuid)
             .await?
@@ -1169,7 +1171,8 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = ClaudeCodeAdapter::new(corpus.path());
-        let _summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        let _summary =
+            ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         let session = store
             .get_session(session_uuid)
             .await?

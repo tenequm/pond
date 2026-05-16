@@ -94,9 +94,15 @@ mod ingest_handler {
     #[derive(Debug, Clone)]
     pub enum SyncStatus {
         Ok,
-        Partial { dropped_events: usize },
-        Skipped { reason: String },
-        Rejected { reason: String },
+        Partial {
+            dropped_events: usize,
+        },
+        Skipped {
+            reason: String,
+        },
+        Rejected {
+            reason: String,
+        },
         /// Per-session staleness skip (design.md 3.4): adapter short-circuited
         /// the file decode because `mtime < MAX(messages.timestamp)`.
         Fresh,
@@ -201,7 +207,11 @@ mod ingest_handler {
                 None => break,
             };
             match event {
-                Ok(AdapterYield::Skipped { session_id, project, reason }) => {
+                Ok(AdapterYield::Skipped {
+                    session_id,
+                    project,
+                    reason,
+                }) => {
                     let status = match reason {
                         SkipReason::Fresh => SyncStatus::Fresh,
                     };
