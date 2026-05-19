@@ -1,5 +1,32 @@
 # Pond - project instructions
 
+## Commands
+
+- Build:  `cargo build --locked`
+- Test:   `cargo test --locked`
+- Lint:   `cargo clippy --locked -- -D warnings`
+- Format: `cargo fmt --check` (use `cargo fmt` to fix)
+
+## Toolchain
+
+- Pinned to Rust 1.91.0, edition 2024 (see `rust-toolchain.toml`). Don't suggest unstable features.
+
+## Source of truth
+
+- `docs/design.md` is the spec (sections 1-8: status, scope, invariants, schemas, protocol, alternatives, open questions, deferred). Read the relevant section before changing behavior.
+
+## Dependencies
+
+- Lance crates are pinned to git tag `v7.0.0-beta.14`. Don't bump or switch to crates.io without explicit ask.
+
+## Errors
+
+- `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
+
+## Repo layout
+
+- One flat crate. `src/` holds module folders (`adapter/`, `embed/`) alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
+
 ## Documentation
 
 - **Prefer ASCII.** Default to plain ASCII in Markdown and other repo docs - it keeps diffs clean, greps simple, and rendering predictable across terminals.
