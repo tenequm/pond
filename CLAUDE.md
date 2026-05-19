@@ -2,18 +2,19 @@
 
 ## Commands
 
-- Build:  `cargo build --locked`
-- Test:   `cargo test --locked`
-- Lint:   `cargo clippy --locked -- -D warnings`
+- Build:  `cargo build`
+- Test:   `cargo test`
+- Lint:   `cargo clippy -- -D warnings`
 - Format: `cargo fmt --check` (use `cargo fmt` to fix)
+- Lockfile is enforced in CI with `--locked`; locally, plain commands are fine. If `Cargo.lock` changes unexpectedly, `git status` will show it.
 
 ## Tests
 
 - Layout: unit tests live in `#[cfg(test)] mod tests` next to the code they test (`src/...`). All integration tests are bundled into one binary at `tests/integration.rs`, with each suite as a module under `tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
-- Run everything: `cargo test --locked`.
-- Run one integration suite: `cargo test --locked --test integration -- <module>::` (e.g. `... -- search::`).
-- Run one unit-test module: `cargo test --locked --lib <module>::` (e.g. `... --lib sessions::tests::`).
-- Run one test by name: `cargo test --locked <name>` (substring match across all binaries; add `-- --exact` to require a full match).
+- Run everything: `cargo test`.
+- Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
+- Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
+- Run one test by name: `cargo test <name>` (substring match across all binaries; add `-- --exact` to require a full match).
 
 ## Toolchain
 
