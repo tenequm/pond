@@ -17,7 +17,7 @@
 //! payload, database row). pond ships `impl Source for serde_json::Value`
 //! for JSON-flavored adapters; the trait carries no transport assumptions.
 //!
-//! See design.md §2.3 invariants 15-17 for the underlying principles.
+//! See design.md#inv-15 through #inv-17 for the underlying principles.
 
 use serde_json::Value;
 

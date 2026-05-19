@@ -359,7 +359,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
     // The subagent file shares the parent's `sessionId` in row content (so
     // the validator's "project is immutable" rule rejects it under the
     // pre-2026-05-16 layering). The fix is to derive a child id and link
-    // back via `parent_session_id`. See design.md 3.x "subagent files".
+    // back via `parent_session_id`. See design.md#schemas-session.
     let subagent = subagent_descriptor(path).await;
     let (session_id, parent_session_id, source_agent, subagent_options) = match subagent {
         Some(SubagentDescriptor {
@@ -712,12 +712,11 @@ fn tool_result_part(
     state: &FileState,
 ) -> Part {
     let call_id = extract_str(value, "tool_use_id");
-    // Resolve tool name via the per-file `tool_use_id -> name` map. The
-    // raw `tool_result` row never carries the name itself; if the prior
-    // `tool_use` row is in this file (the common case), the map has it.
-    // Misses (compaction pruned the originating `tool_use`) yield `None`,
-    // a faithful "unresolved" record rather than the old `"unknown"`
-    // sentinel. See design.md invariant N.
+    // `tool_result` source rows don't carry the tool name; it's resolved
+    // via the per-file `tool_use_id -> name` map. Misses (compaction pruned
+    // the originating `tool_use`) surface as `None` per design.md#inv-16
+    // (schema-honesty: the field is `Option<Extracted<T>>`, not a fabricated
+    // string).
     let name = value
         .str_field("tool_use_id")
         .and_then(|id| state.tool_call_names.get(id))
@@ -843,7 +842,7 @@ fn is_tool_result(value: &Value) -> bool {
 mod tests {
     //! Conformance tests for the claude-code adapter's data-shape contract:
     //! subagent path derivation, replay dedup, tool-name resolution, and the
-    //! "no synthesized values" invariant (design.md 2.3 #15-#17).
+    //! "no synthesized values" invariant (design.md#inv-15 through #inv-17).
     //!
     //! Each test builds a tiny synthetic corpus under a `TempDir` so the
     //! assertions exercise the real adapter end-to-end without depending on

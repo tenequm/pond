@@ -12,10 +12,10 @@
 ## Comments
 
 <comments>
-A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to `design.md <section>` or `invariant N` when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
+A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to `design.md#<anchor>` or `design.md#inv-N` when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
 
 <example>
-// design.md 3.6.1: typed `conflict` for OCC failures, not `storage_unavailable`.
+// design.md#protocol-error-envelope: typed `conflict` for OCC failures, not `storage_unavailable`.
 </example>
 <example>
 // Opt out of Lance's `_score` autoprojection; that default is being removed upstream.

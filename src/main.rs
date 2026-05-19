@@ -598,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Spawn the background maintenance task: `cleanup_old_versions` +
-/// `optimize_indices` every `interval_secs` (design.md 3.2.0). The first tick
+/// `optimize_indices` every `interval_secs` (design.md#schemas-write-params). The first tick
 /// fires immediately, so it is consumed up front - `pond serve` does not run
 /// maintenance at boot. Failures are logged at warn and retried next interval;
 /// they never crash the server.

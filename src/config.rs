@@ -112,7 +112,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # `pond sync` runs an interactive discovery against the known default paths
 # and writes the picks back here.
 #
-# Future wrap: pond is single-namespace in v1 (design.md 2.6); `[sources]` is
+# Future wrap: pond is single-namespace in v1 (design.md#inv-11); `[sources]` is
 # flat here. When multi-namespace pond lands, source registration becomes
 # per-tenant under `[namespaces.<ns>.sources.<adapter>]`. Pre-v1 the schema
 # is breakable; the rename is operationally free until a real second tenant
@@ -162,7 +162,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # variables of the same name are read by `object_store` automatically;
 # values in this block override them. pond does not parse these.
 #
-# Future wrap: pond is single-namespace in v1 (design.md 2.6); `[storage]` is
+# Future wrap: pond is single-namespace in v1 (design.md#inv-11); `[storage]` is
 # flat here on the assumption of one bucket per pond. When multi-namespace
 # pond lands and tenants need separate buckets/regions, this becomes
 # `[namespaces.<ns>.storage]`. Pre-v1 the schema is breakable; the rename is
@@ -205,7 +205,7 @@ pub struct Config {
 }
 
 /// The `[maintenance]` section: background `cleanup_old_versions` +
-/// `optimize_indices` settings (design.md 3.2.0). Durations are plain integers
+/// `optimize_indices` settings (design.md#schemas-write-params). Durations are plain integers
 /// rather than humanized strings - one fewer parser, and `config.toml` stays
 /// trivially round-trippable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,7 +249,7 @@ pub struct EmbeddingsConfig {
     pub overrides: BTreeMap<String, BTreeMap<String, EmbeddingOverride>>,
 }
 
-/// One `[[embeddings.models]]` registry entry (design.md 3.2.4).
+/// One `[[embeddings.models]]` registry entry (design.md#schemas-embedding).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingModel {
@@ -277,7 +277,7 @@ pub struct EmbeddingModel {
 
 /// Per-namespace tunable overrides. Immutable fields (`dim`, `distance`,
 /// `normalize`) cannot be overridden - they would invalidate stored vectors
-/// (design.md 3.2.4).
+/// (design.md#schemas-embedding).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingOverride {
@@ -302,7 +302,7 @@ struct KnownModel {
 
 /// v1 ships a single loader path: the Qwen3 candle backend via
 /// `Qwen3TextEmbedding::from_hf`. Adding a model pond already knows how to load
-/// is config-only; a new loader still requires code (design.md 3.2.4).
+/// is config-only; a new loader still requires code (design.md#schemas-embedding).
 const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
     code: "Qwen/Qwen3-Embedding-0.6B",
     dim: 1024,
@@ -382,7 +382,7 @@ impl MaintenanceConfig {
 }
 
 impl EmbeddingModel {
-    /// The built-in v1 default: Qwen3-Embedding-0.6B (design.md 3.2.4).
+    /// The built-in v1 default: Qwen3-Embedding-0.6B (design.md#schemas-embedding).
     pub fn qwen3_default() -> Self {
         Self {
             id: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
@@ -492,7 +492,7 @@ impl EmbeddingsConfig {
 
     /// Validate the resolved registry against pond's known-model set: unknown
     /// load repo, dim mismatch, unsupported distance, or not exactly one
-    /// `default = true` entry all fail startup with a clear error (design.md 3.2.4).
+    /// `default = true` entry all fail startup with a clear error (design.md#schemas-embedding).
     pub fn validate(&self) -> Result<()> {
         if self.models.is_empty() {
             bail!("embeddings registry is empty");

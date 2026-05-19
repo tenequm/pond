@@ -29,7 +29,7 @@ use url::Url;
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 10_000;
 
 /// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
-/// against an OCC commit-conflict failure (design.md 3.6.1). The wire layer
+/// against an OCC commit-conflict failure (design.md#protocol-error-envelope). The wire layer
 /// downcasts to this type to classify the outcome as `conflict` rather than
 /// the generic `storage_unavailable`.
 #[derive(Debug, Clone, Copy)]
@@ -187,12 +187,12 @@ pub struct Handle {
     session: Arc<Session>,
     /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
     /// future hosted pond swaps to "rest" without touching read/write paths
-    /// (design.md 2.3 inv 21).
+    /// (design.md#inv-21).
     #[allow(dead_code)]
     nm: Arc<dyn LanceNamespace>,
     /// Namespace identifier this handle binds to. v1 is always `root()`; the
     /// typed seam matches `resolve_namespace`'s return so multi-namespace
-    /// routing can land without churning call sites (design.md 2.3 inv 11).
+    /// routing can land without churning call sites (design.md#inv-11).
     nm_ident: NamespaceIdent,
     /// Object-store options threaded through every `DatasetBuilder` and
     /// `Dataset::write` call so refresh / index-creation paths inherit the
@@ -270,7 +270,7 @@ impl Handle {
     /// Open with object-store options handed through to Lance verbatim.
     /// Keys are the `object_store` crate's standard config names; pond does
     /// not parse them. Used by `pond serve --data-dir s3://...` once
-    /// `config.toml` carries an `[storage]` block (design.md 3.2.0 storage
+    /// `config.toml` carries an `[storage]` block (design.md#schemas-write-params storage
     /// block / 3.6 "Recovery model").
     pub async fn open_with_options(
         location: &Url,
@@ -287,7 +287,7 @@ impl Handle {
         // ships sensible cache capacities (lance/src/dataset.rs:149,153)
         // and a default ObjectStoreRegistry that knows file/s3/gs/az.
         let session = Arc::new(Session::default());
-        // Build the lance-namespace catalog seam once (design.md 2.3 inv 21).
+        // Build the lance-namespace catalog seam once (design.md#inv-21).
         // The `root` property is whatever URL the Directory impl understands;
         // for local paths Lance accepts both `file://...` and bare paths, and
         // for object stores the scheme-qualified URL is required.
@@ -306,7 +306,7 @@ impl Handle {
             .await
             .context("failed to connect lance Directory namespace")?;
         let nm_ident = NamespaceIdent::root();
-        // design.md 2.3 inv 4: refresh window is scheme-keyed. Local-FS
+        // design.md#inv-4: refresh window is scheme-keyed. Local-FS
         // manifest reads are microsecond-cheap, so `0` (always-refresh) is
         // essentially free and removes the stale-read window entirely. Object
         // stores have real per-call cost; `5s` caps manifest fetch overhead at
@@ -462,7 +462,7 @@ impl Handle {
         scanner_with_prefilter(&dataset, predicate)
     }
     /// Single read entry point: prefilter via `predicate`, optionally
-    /// project, return the prepared `Scanner` (design.md 2.3 inv 22).
+    /// project, return the prepared `Scanner` (design.md#inv-22).
     pub async fn scan(
         &self,
         table: Table,
@@ -613,7 +613,7 @@ impl Handle {
                 }
                 Err(error) => {
                     tracing::warn!(label, attempt, %error, "Lance operation exhausted retries");
-                    // design.md 3.6.1: surface OCC failures as a typed `conflict`
+                    // design.md#protocol-error-envelope: surface OCC failures as a typed `conflict`
                     // rather than the generic `storage_unavailable` bucket. The
                     // chain root is a `lance::Error` (commit-conflict family) when
                     // pond's retry layer exhausted because the manifest could not
@@ -632,7 +632,7 @@ impl Handle {
         let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
         let base = self.retry.initial_backoff.saturating_mul(multiplier);
         // Symmetric +/- `jitter` factor de-correlates concurrent retriers on
-        // a contended manifest (design.md 2.3 inv 3); clamped to `max_backoff`.
+        // a contended manifest (design.md#inv-3); clamped to `max_backoff`.
         let factor = (1.0 + self.retry.jitter * (fastrand::f64() * 2.0 - 1.0)).max(0.0);
         base.mul_f64(factor).min(self.retry.max_backoff)
     }

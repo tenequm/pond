@@ -38,7 +38,7 @@ pub struct Store {
 }
 
 /// A message awaiting embedding: its `search_text` plus the columns the
-/// `embeddings` rows denormalize (design.md 3.2.4).
+/// `embeddings` rows denormalize (design.md#schemas-embedding).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
     pub message_id: String,
@@ -592,7 +592,7 @@ impl Store {
 
     /// `session_id -> wall-clock time of the Lance manifest version that
     /// last wrote the row` for the per-session staleness skip
-    /// (design.md 3.4). Reads Lance's `_row_last_updated_at_version` system
+    /// (design.md#protocol-ingest-semantics). Reads Lance's `_row_last_updated_at_version` system
     /// column (available because pond enables stable row ids per 3.2.0)
     /// and joins it against `Dataset::versions()` for commit timestamps.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
@@ -1098,7 +1098,7 @@ impl Store {
     /// Return every message of `session_id` in canonical `(timestamp, id)`
     /// order, each paired with its parts. Public face of the session
     /// iteration seam used by both `pond_get` (full-session reads) and
-    /// `pond_session_events` (catch-up SSE per design.md 3.6.5).
+    /// `pond_session_events` (catch-up SSE per design.md#protocol-pond-session-events).
     pub async fn session_messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         self.messages_for_session(session_id).await
     }
@@ -1195,7 +1195,7 @@ pub enum IngestEvent {
 ///
 /// Fields are bucketed by population so the summary never conflates "100
 /// validator-rejected rows in 1 bad session" with "100 separate failures."
-/// The shape is set by design.md 3.4 (post-2026-05-15 rewrite).
+/// The shape is set by design.md#protocol-ingest-semantics (post-2026-05-15 rewrite).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
     /// Rows actually written to Lance.
@@ -1206,7 +1206,7 @@ pub struct IngestSummary {
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
     /// session with one bad part stays in this bucket as 1, not as "the
-    /// whole substream." Per design.md 3.x, adapters SHOULD dedupe their
+    /// whole substream." Per design.md#inv-17, adapters SHOULD dedupe their
     /// own emissions upstream when source replay is expected; the
     /// validator's in-batch HashSet is a safety net, not a feature
     /// adapters may rely on. If this bucket grows on a clean adapter,
@@ -1221,7 +1221,7 @@ pub struct IngestSummary {
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
     /// Sessions short-circuited via the per-session staleness skip
-    /// (design.md 3.4): file `mtime` was at or before the wall-clock time
+    /// (design.md#protocol-ingest-semantics): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
     pub skipped_fresh: usize,
     /// Storage-layer failures whose retries were exhausted (commit
@@ -1241,7 +1241,7 @@ pub struct IngestSummary {
 /// the per-row `RowError::reason_key`. `&'static str` so consumers can
 /// match by identity rather than prose. Adding a new variant: pick a short
 /// snake_case identifier, route it from the validator/adapter, and update
-/// the doc table in `docs/design.md` 3.4.
+/// the doc table in `docs/design.md#protocol-ingest-semantics`.
 pub const DROP_REASON_DUPLICATE_MESSAGE_ID: &str = "duplicate_message_id";
 pub const DROP_REASON_DUPLICATE_PART_KEY: &str = "duplicate_part_key";
 pub const DROP_REASON_MESSAGE_BEFORE_SESSION: &str = "message_before_session";
@@ -1299,7 +1299,7 @@ impl IngestSummary {
     }
 }
 
-/// Per-row outcome surfaced by [`IngestValidator`] (design.md 3.6.4). One
+/// Per-row outcome surfaced by [`IngestValidator`] (design.md#protocol-pond-ingest). One
 /// row per input event from the request's `events` array. The validator
 /// returns these in array order so the wire layer can pack them directly
 /// into [`crate::wire::IngestResult`] entries.
@@ -1363,7 +1363,7 @@ struct BufferedPart {
 /// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
 /// continues; only Session-level invariants (immutable source_agent / project
 /// on re-write) drop the whole substream. The N-events-per-rejection cascade
-/// from the prior contract is gone (see design.md 3.4 "Ordering enforcement").
+/// from the prior contract is gone (see design.md#protocol-ingest-semantics "Ordering enforcement").
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the previous one), they accumulate in
@@ -1457,7 +1457,7 @@ impl IngestValidator {
         // when the caller invokes `flush` / `finish`.
         self.close_current_substream();
 
-        // design.md 3.1.3: `source_agent` is trimmed at ingest and rejected
+        // design.md#schemas-session: `source_agent` is trimmed at ingest and rejected
         // if empty after trim. A Session event with empty source_agent is
         // dropped on the spot - the substream that would follow has nothing
         // to anchor on, so subsequent message/part events will also drop.
@@ -1678,7 +1678,7 @@ fn error_outcome(
 /// loss is implied by the single session-rejection. Earlier versions
 /// cascaded N error rows per rejected substream; that inflated the operator
 /// view ("12,297 errors") for what is structurally one decision
-/// ("1 session-level rejection"). See design.md 3.4.
+/// ("1 session-level rejection"). See design.md#protocol-ingest-semantics.
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -1758,7 +1758,7 @@ fn success_outcome(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IngestError {
-    /// design.md 3.6.4: `Session.source_agent` and `Session.project` are
+    /// design.md#protocol-pond-ingest: `Session.source_agent` and `Session.project` are
     /// immutable post-first-write because the denormalized copies on
     /// `messages` and `embeddings` were stamped from the prior Session at
     /// first ingest. A re-write that changes either would silently desync.
@@ -1789,7 +1789,7 @@ impl std::fmt::Display for IngestError {
 impl std::error::Error for IngestError {}
 
 /// Compare an incoming Session row against the stored row on the two
-/// immutable fields (design.md 3.6.4). The `Option<String>` `project` field
+/// immutable fields (design.md#protocol-pond-ingest). The `Option<String>` `project` field
 /// counts a NULL-vs-non-NULL change as a mismatch.
 fn ensure_immutable_match(
     existing: &Session,
@@ -1880,7 +1880,7 @@ pub struct SessionWithMessages {
     pub messages: Vec<MessageWithParts>,
 }
 
-/// Scalar indexes on `messages` (design.md 3.2.2): BTREE for high-cardinality
+/// Scalar indexes on `messages` (design.md#schemas-message): BTREE for high-cardinality
 /// and range columns, BITMAP for low-cardinality columns.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("id", BuiltinIndexType::BTree, "messages_id_btree"),
@@ -1903,7 +1903,7 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("role", BuiltinIndexType::Bitmap, "messages_role_bitmap"),
 ];
 
-/// Scalar indexes on `embeddings` (design.md 3.2.4): the same filter set,
+/// Scalar indexes on `embeddings` (design.md#schemas-embedding): the same filter set,
 /// denormalized so vector kNN pushes predicates down without a cross-table join.
 const EMBEDDING_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
@@ -1987,7 +1987,7 @@ pub(crate) const MESSAGES: &str = "messages.lance";
 pub(crate) const PARTS: &str = "parts.lance";
 pub(crate) const EMBEDDINGS: &str = "embeddings.lance";
 
-/// Fixed embedding vector dimension (Qwen3-Embedding-0.6B, design.md 3.2.4).
+/// Fixed embedding vector dimension (Qwen3-Embedding-0.6B, design.md#schemas-embedding).
 /// A future model with a different dim activates a second `embeddings` table.
 pub const EMBEDDING_DIM: usize = 1024;
 
@@ -2109,7 +2109,7 @@ pub(crate) struct MessageBatchRow<'a> {
 }
 
 /// One row of the `embeddings` dataset: a (message, model) vector with the
-/// filter columns denormalized from `messages` (design.md 3.2.4). One message
+/// filter columns denormalized from `messages` (design.md#schemas-embedding). One message
 /// produces exactly one vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingRow {
@@ -2570,7 +2570,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordering_violation_drops_only_the_offending_event() -> anyhow::Result<()> {
-        // Per-event drop semantics (design.md 3.4): a Part with no preceding
+        // Per-event drop semantics (design.md#protocol-ingest-semantics): a Part with no preceding
         // Message is dropped on the spot, with one Error outcome surfaced. The
         // rest of the substream continues normally - subsequent valid messages
         // and parts get written.
@@ -2916,7 +2916,7 @@ mod tests {
             )
             .await?;
 
-        // The load-bearing assertion (design.md 3.3): the predicate is served by a
+        // The load-bearing assertion (design.md#protocol-search): the predicate is served by a
         // scalar-index node, not a postfilter `FilterExec`. (A `FilterExec` for the
         // KNN-internal `_distance IS NOT NULL` is expected and unrelated.)
         assert!(

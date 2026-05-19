@@ -5,7 +5,7 @@ fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
 /// Typed identifier for the namespace a wire request targets. v1 is
 /// single-namespace, so every successful resolve returns `root()`; the
 /// type lets future multi-namespace routing land without churning call
-/// sites (design.md 2.3 inv 11).
+/// sites (design.md#inv-11).
 #[derive(Debug, Clone)]
 pub struct NamespaceIdent(pub Vec<String>);
 
@@ -34,7 +34,7 @@ pub fn resolve_namespace(
 
 fn map_storage(error: anyhow::Error) -> crate::wire::ErrorEnvelope {
     // Classify before bucketing: an OCC commit-conflict exhaustion has its own
-    // wire code (design.md 3.6.1). Everything else lands in `storage_unavailable`.
+    // wire code (design.md#protocol-error-envelope). Everything else lands in `storage_unavailable`.
     if let Some(conflict) = error.downcast_ref::<crate::substrate::ConflictExhausted>() {
         return map_error(crate::Error::Conflict {
             attempts: conflict.attempts,
@@ -58,7 +58,7 @@ mod ingest_handler {
 
     use super::{map_error, map_storage};
 
-    /// Hard cap on events per `pond_ingest` batch (design.md 3.6.4).
+    /// Hard cap on events per `pond_ingest` batch (design.md#protocol-pond-ingest).
     pub const MAX_INGEST_EVENTS: usize = 1000;
 
     /// Progress signals emitted by [`ingest_adapter`] for the CLI bar (and
@@ -116,7 +116,7 @@ mod ingest_handler {
         Rejected {
             reason: String,
         },
-        /// Per-session staleness skip (design.md 3.4): adapter short-circuited
+        /// Per-session staleness skip (design.md#protocol-ingest-semantics): adapter short-circuited
         /// the file decode because `mtime < MAX(messages.timestamp)`.
         Fresh,
     }
@@ -440,7 +440,7 @@ mod ingest_handler {
         }
     }
 
-    /// The `pond_ingest` wire handler (design.md 3.6.4): validate the transport
+    /// The `pond_ingest` wire handler (design.md#protocol-pond-ingest): validate the transport
     /// envelope, then drive the event batch through [`ingest_events`]. Transport
     /// failures (bad protocol, unknown namespace, empty or oversized batch) fail
     /// the whole request via the 3.6.1 error envelope; per-event failures land
@@ -498,7 +498,7 @@ mod ingest_handler {
     /// outcomes in input-array order. A substream that fails validation has
     /// every one of its events tagged with [`OutcomeStatus::Error`] (the
     /// offending event and any others in the same substream); ingest of later
-    /// sessions in the batch continues (design.md 3.6.4).
+    /// sessions in the batch continues (design.md#protocol-pond-ingest).
     pub async fn ingest_events(store: &Store, events: Vec<IngestEvent>) -> Result<Vec<RowOutcome>> {
         let mut validator = IngestValidator::default();
         let mut outcomes = Vec::with_capacity(events.len());
@@ -557,7 +557,7 @@ pub use ingest_handler::{
 };
 
 mod session_events_handler {
-    //! `pond_session_events` (design.md 3.6.5): catch-up SSE stream over a
+    //! `pond_session_events` (design.md#protocol-pond-session-events): catch-up SSE stream over a
     //! stored session's messages. v1 scope is read-after-`since`: scan
     //! messages strictly after the resume point in `(timestamp, message_id)`
     //! order, emit one `message` event per row (with its parts, filtered by
@@ -613,7 +613,7 @@ mod session_events_handler {
     }
 
     /// Server-Sent Events event ready to encode by the transport layer.
-    /// Identity (`event` + `id` + `data`) is design.md 3.6.5 verbatim.
+    /// Identity (`event` + `id` + `data`) is design.md#protocol-pond-session-events verbatim.
     #[derive(Debug, Clone, PartialEq)]
     pub struct SseEvent {
         pub event: &'static str,
@@ -723,7 +723,7 @@ mod session_events_handler {
 pub use session_events_handler::{Since, SseEvent, parse_since, pond_session_events};
 
 mod export_handler {
-    //! `pond_export` (design.md 3.6.6): walk every session in the store and
+    //! `pond_export` (design.md#protocol): walk every session in the store and
     //! emit its canonical event stream as JSONL - one `IngestEvent` per line.
     //! The output is byte-identical with what `pond ingest` / `pond_ingest`
     //! accepts on input, so `export | ingest` is a portable backup loop.
@@ -974,7 +974,7 @@ pub use get_handler::pond_get;
 mod search_handler {
     //! The `pond_search` handler: hybrid (vector + BM25 + RRF) retrieval at message
     //! granularity, with filter pushdown, recency boost, and conversation grouping
-    //! (design.md 3.3, 3.6.2).
+    //! (design.md#protocol-search, design.md#protocol-pond-search).
 
     use crate::{
         Clock, SystemClock,
@@ -1013,11 +1013,11 @@ mod search_handler {
         pub min_score: f64,
     }
 
-    /// Server-enforced cap on `limit` (design.md 3.6.2).
+    /// Server-enforced cap on `limit` (design.md#protocol-pond-search).
     const LIMIT_CAP: usize = 200;
-    /// Preview length in code points (design.md 3.6.2).
+    /// Preview length in code points (design.md#protocol-pond-search).
     const PREVIEW_CHARS: usize = 500;
-    /// Recency-boost constants, inherited verbatim from kb (design.md 3.3).
+    /// Recency-boost constants, inherited verbatim from kb (design.md#protocol-search).
     const RECENCY_MAX_BOOST: f64 = 0.2;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
 
@@ -1305,7 +1305,7 @@ mod search_handler {
 
     /// Reciprocal Rank Fusion: `sum(1 / (k + rank))` across the retrievers that
     /// ranked each id (rank is 1-based). Returns hits sorted by score descending,
-    /// ties broken by `message_id` for determinism (design.md 2.5, 3.3).
+    /// ties broken by `message_id` for determinism (design.md#protocol-search).
     pub fn rrf_merge(lists: &[RankedList], k: u32) -> Vec<RrfHit> {
         let k = f64::from(k.max(1));
         let mut merged: std::collections::HashMap<String, (f64, Vec<String>)> =
@@ -1338,7 +1338,7 @@ mod search_handler {
         hits
     }
 
-    /// Additive exponential-decay recency boost (design.md 3.3): caps at `+0.2` at
+    /// Additive exponential-decay recency boost (design.md#protocol-search): caps at `+0.2` at
     /// `age = 0`, decays to near-zero past a few weeks.
     pub fn recency_boost(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
         #[allow(clippy::cast_precision_loss)]
@@ -1347,7 +1347,7 @@ mod search_handler {
     }
 
     /// First [`PREVIEW_CHARS`] code points of `text`, with `"..."` appended when
-    /// truncated (design.md 3.6.2).
+    /// truncated (design.md#protocol-pond-search).
     pub fn make_preview(text: &str) -> String {
         let mut preview = text.chars().take(PREVIEW_CHARS).collect::<String>();
         if text.chars().nth(PREVIEW_CHARS).is_some() {
@@ -1490,8 +1490,9 @@ mod search_handler {
     }
 
     /// Build the shared scalar filter predicate pushed into both retrievers.
-    /// Column names are identical on `messages` and `embeddings` (design.md
-    /// 3.2.2 / 3.2.4) so one predicate serves both.
+    /// Column names are identical on `messages` and `embeddings`
+    /// (design.md#schemas-message / design.md#schemas-embedding) so one
+    /// predicate serves both.
     pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
         let mut clauses = Vec::new();
 
