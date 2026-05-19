@@ -475,3 +475,26 @@ struct StagedMessage {
     /// enforced against, so the budget can never be under-counted past.
     cost_tokens: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn qwen3_query_instruction_wraps_the_query_in_the_model_card_prefix() {
+        let prompt = qwen3_query_instruction("how does retry backoff work");
+        // Model-card format: `Instruct: {task}\nQuery: {query}` - the query sits on
+        // its own line after the instruction and is never mutated, only prefixed.
+        assert!(prompt.starts_with("Instruct: "));
+        assert!(prompt.ends_with("\nQuery: how does retry backoff work"));
+    }
+
+    #[test]
+    fn metric_type_maps_each_registry_distance() {
+        assert_eq!(metric_type(Distance::Cosine), MetricType::Cosine);
+        assert_eq!(metric_type(Distance::L2), MetricType::L2);
+        assert_eq!(metric_type(Distance::Dot), MetricType::Dot);
+    }
+}

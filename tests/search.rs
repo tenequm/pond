@@ -1,24 +1,19 @@
-//! Stage 2 search tests: RRF math, the recency-boost formula, filter-predicate
-//! construction, the distance-metric mapping, the `explain_plan` prefilter
-//! pushdown assertion, and the synthetic IVF_PQ index-activation check. Every
-//! test runs on every `cargo test` - no model weights, no `#[ignore]`.
+//! Handler-level integration tests for `pond_search` over a real fixture
+//! corpus with a deterministic fake embedder. Pure-helper tests (RRF math,
+//! recency boost, filter predicate construction, planner shape, distance
+//! metric mapping) and `Store`-level vector-index tests live inline in
+//! `src/handlers.rs::tests`, `src/embed/mod.rs::tests`, and
+//! `src/sessions.rs::tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{Duration, Utc};
-use lance_linalg::distance::MetricType;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    config::{Config, Distance},
-    embed::{EmbedBackend, EmbedWorker, metric_type},
+    config::Config,
+    embed::{EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
     handlers::pond_get,
-    handlers::{
-        RankedList, RetrieverKind, SearchMode, build_filter, make_preview, plan_search,
-        pond_search, recency_boost, rrf_merge,
-    },
+    handlers::pond_search,
     sessions::Store,
-    sessions::{EMBEDDING_DIM, EmbeddingRow},
-    substrate::Predicate,
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, Hit, ProjectFilter, SearchEnvelope, SearchFilters,
@@ -26,402 +21,6 @@ use pond::{
     },
 };
 use tempfile::TempDir;
-
-// ---------------------------------------------------------------------------
-// Pure functions
-// ---------------------------------------------------------------------------
-
-#[test]
-fn rrf_merge_fuses_retrievers_and_reports_provenance() {
-    let lists = [
-        RankedList {
-            retriever: RetrieverKind::Vector,
-            ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
-        },
-        RankedList {
-            retriever: RetrieverKind::Fts,
-            ids: vec!["b".to_owned(), "a".to_owned(), "d".to_owned()],
-        },
-    ];
-    let merged = rrf_merge(&lists, 60);
-
-    // "a" (ranks 1,2) and "b" (ranks 2,1) have equal fused scores; the tie
-    // breaks on message_id, so "a" sorts first. Both beat the single-retriever
-    // "c" and "d".
-    assert_eq!(merged[0].message_id, "a");
-    assert_eq!(merged[1].message_id, "b");
-    assert_eq!(merged[0].matched_via, vec!["vector", "fts"]);
-    assert!(merged[0].score > merged[2].score);
-
-    let c = merged.iter().find(|hit| hit.message_id == "c").unwrap();
-    assert_eq!(c.matched_via, vec!["vector"]);
-    let d = merged.iter().find(|hit| hit.message_id == "d").unwrap();
-    assert_eq!(d.matched_via, vec!["fts"]);
-}
-
-#[test]
-fn recency_boost_matches_the_kb_formula() {
-    let now = Utc::now();
-    // Caps at +0.2 at age zero.
-    assert!((recency_boost(now, now) - 0.2).abs() < 1e-6);
-    // One half-life (7 days) decays by exactly 1/e.
-    let week = recency_boost(now - Duration::days(7), now);
-    assert!((week - 0.2 / std::f64::consts::E).abs() < 1e-3);
-    // A year out is effectively zero.
-    assert!(recency_boost(now - Duration::days(365), now) < 1e-3);
-    // Future timestamps clamp to the cap rather than exceeding it.
-    assert!((recency_boost(now + Duration::days(1), now) - 0.2).abs() < 1e-6);
-}
-
-#[test]
-fn make_preview_truncates_at_code_point_boundary() {
-    let short = "a short preview";
-    assert_eq!(make_preview(short), short);
-
-    let long = "x".repeat(800);
-    let preview = make_preview(&long);
-    assert!(preview.ends_with("..."));
-    assert_eq!(preview.chars().count(), 503);
-}
-
-#[test]
-fn build_filter_pushes_down_each_predicate() {
-    let filters = SearchFilters {
-        project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
-        session_id: Some("01HXY".to_owned()),
-        source_agent: Some("claude-code".to_owned()),
-        role: Some("assistant".to_owned()),
-        from_date: Some("2026-01-01".to_owned()),
-        to_date: Some("2026-05-01".to_owned()),
-        min_score: 0.0,
-    };
-    let sql = build_filter(&filters).unwrap().to_lance();
-    assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
-    assert!(sql.contains("session_id = '01HXY'"));
-    assert!(sql.contains("source_agent = 'claude-code'"));
-    assert!(sql.contains("role = 'assistant'"));
-    assert!(sql.contains("timestamp >="));
-    assert!(sql.contains("timestamp <="));
-}
-
-#[test]
-fn build_filter_rejects_bad_role_and_date() {
-    let bad_role = SearchFilters {
-        role: Some("wizard".to_owned()),
-        ..SearchFilters::default()
-    };
-    assert!(build_filter(&bad_role).is_err());
-
-    let bad_date = SearchFilters {
-        from_date: Some("01-01-2026".to_owned()),
-        ..SearchFilters::default()
-    };
-    assert!(build_filter(&bad_date).is_err());
-}
-
-#[test]
-fn empty_filters_produce_no_predicate() {
-    assert_eq!(
-        build_filter(&SearchFilters::default()).unwrap().to_lance(),
-        ""
-    );
-}
-
-#[test]
-fn build_filter_contains_escapes_like_wildcards() {
-    let filters = SearchFilters {
-        project: Some(ProjectFilter::Contains("/Users/me/my_project".to_owned())),
-        ..SearchFilters::default()
-    };
-    let sql = build_filter(&filters).unwrap().to_lance();
-    // `_` is a LIKE wildcard and is everywhere in real paths; it must be escaped
-    // so `my_project` matches literally, with an ESCAPE clause naming the char.
-    assert!(
-        sql.contains(r"my\_project"),
-        "underscore must be escaped: {sql}"
-    );
-    assert!(
-        sql.contains(r"ESCAPE '\'"),
-        "predicate must declare the escape char: {sql}"
-    );
-}
-
-#[test]
-fn metric_type_maps_each_registry_distance() {
-    assert_eq!(metric_type(Distance::Cosine), MetricType::Cosine);
-    assert_eq!(metric_type(Distance::L2), MetricType::L2);
-    assert_eq!(metric_type(Distance::Dot), MetricType::Dot);
-}
-
-#[test]
-fn plan_search_trims_query_caps_limit_and_sizes_pools() {
-    let mut request = search_request("  vector memory  ");
-    request.limit = 500;
-    request.group_by_conversation = true;
-    request.boost_recent = false;
-    request.filters.min_score = 0.42;
-
-    let plan = plan_search(request, SearchMode::Hybrid).unwrap();
-
-    assert_eq!(plan.mode, SearchMode::Hybrid);
-    assert_eq!(plan.query, "vector memory");
-    assert_eq!(plan.limit, 200);
-    assert_eq!(plan.pool, 1000);
-    assert_eq!(plan.vector_pool, 2000);
-    assert!(plan.group_by_conversation);
-    assert!(!plan.boost_recent);
-    assert_eq!(plan.min_score, 0.42);
-}
-
-#[test]
-fn plan_search_keeps_small_limits_from_starving_retrievers() {
-    let mut request = search_request("tiny pool");
-    request.limit = 1;
-
-    let plan = plan_search(request, SearchMode::Fts).unwrap();
-
-    assert_eq!(plan.mode, SearchMode::Fts);
-    assert_eq!(plan.limit, 1);
-    assert_eq!(plan.pool, 50);
-    assert_eq!(plan.vector_pool, 100);
-}
-
-#[test]
-fn plan_search_builds_the_shared_filter_predicate() {
-    let mut request = search_request("filtered");
-    request.filters.project = Some(ProjectFilter::Contains("/Users/me/pond".to_owned()));
-    request.filters.role = Some("assistant".to_owned());
-
-    let plan = plan_search(request, SearchMode::Fts).unwrap();
-    let sql = plan.filter.to_lance();
-
-    assert!(sql.contains("project LIKE"));
-    assert!(sql.contains("role = 'assistant'"));
-}
-
-#[test]
-fn plan_search_rejects_invalid_composition_before_execution() {
-    let mut blank = search_request("   ");
-    let error = plan_search(blank.clone(), SearchMode::Fts)
-        .unwrap_err()
-        .error;
-    assert_eq!(error.code, pond::wire::ErrorCode::ValidationFailed);
-    assert_eq!(error.details["field"], "query");
-
-    blank.query = "valid".to_owned();
-    blank.limit = 0;
-    let error = plan_search(blank.clone(), SearchMode::Fts)
-        .unwrap_err()
-        .error;
-    assert_eq!(error.details["field"], "limit");
-
-    blank.limit = 1;
-    blank.namespace = Some("remote".to_owned());
-    let error = plan_search(blank, SearchMode::Fts).unwrap_err().error;
-    assert_eq!(error.code, pond::wire::ErrorCode::NamespaceUnknown);
-    assert_eq!(error.details["namespace"], "remote");
-}
-
-// ---------------------------------------------------------------------------
-// Synthetic datasets (no model, no ingest)
-// ---------------------------------------------------------------------------
-
-/// Build `count` synthetic embedding rows with deterministic pseudo-random
-/// vectors of the production dimension, spread across a handful of sessions.
-fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
-    let now = Utc::now();
-    (0..count)
-        .map(|i| {
-            let mut vector = Vec::with_capacity(EMBEDDING_DIM);
-            let mut state = (i as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(1);
-            for _ in 0..EMBEDDING_DIM {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                #[allow(clippy::cast_precision_loss)]
-                let unit = (state >> 33) as f32 / (1u64 << 31) as f32;
-                vector.push(unit - 1.0);
-            }
-            EmbeddingRow {
-                message_id: format!("msg-{i}"),
-                model_id: model_id.to_owned(),
-                max_embed_tokens: 1024,
-                vector,
-                session_id: format!("session-{}", i % 8),
-                source_agent: "claude-code".to_owned(),
-                project: format!("/proj/{}", i % 4),
-                role: if i % 2 == 0 { "user" } else { "assistant" }.to_owned(),
-                timestamp: now - Duration::seconds(i as i64),
-            }
-        })
-        .collect()
-}
-
-#[tokio::test]
-async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let store = Store::open_local(temp.path()).await?;
-    let model = Config::builtin().embeddings.default_model("local")?;
-
-    // 4 synthetic rows: `synthetic_rows` cycles `session-{i % 8}`, so 4 is the
-    // smallest count where `session-3` (the filter value below) is a real
-    // partition. Scalar-index pushdown is volume-independent - the planner emits
-    // a `ScalarIndexQuery` for an indexed equality whenever the index exists, so
-    // a larger corpus produces the identical plan.
-    store
-        .upsert_embeddings(&synthetic_rows(4, &model.id))
-        .await?;
-    store.ensure_embedding_indices(&model).await?;
-
-    let query = vec![0.01_f32; EMBEDDING_DIM];
-    let plan = store
-        .explain_vector_plan(
-            &query,
-            10,
-            &Predicate::Eq("session_id", "session-3".into()),
-            &model.id,
-            model.max_embed_tokens as i32,
-        )
-        .await?;
-
-    // The load-bearing assertion (design.md 3.3): the predicate is served by a
-    // scalar-index node, not a postfilter `FilterExec`. (A `FilterExec` for the
-    // KNN-internal `_distance IS NOT NULL` is expected and unrelated.)
-    assert!(
-        plan.contains("ScalarIndexQuery"),
-        "expected a ScalarIndexQuery node in the plan:\n{plan}",
-    );
-    let predicate_postfiltered = plan
-        .lines()
-        .any(|line| line.contains("FilterExec") && line.contains("session_id"));
-    assert!(
-        !predicate_postfiltered,
-        "the scalar predicate must not fall back to a FilterExec postfilter:\n{plan}",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let store = Store::open_local(temp.path()).await?;
-    let model = Config::builtin().embeddings.default_model("local")?;
-
-    // 256 rows is the hard floor: the IVF_PQ index uses `num_bits = 8`, so its
-    // PQ trainer needs one row per code centroid (2^8 = 256) - fewer fails with
-    // "Not enough rows to train PQ". The thresholds below straddle that count by
-    // exactly one, so the test exercises the `row_count >= threshold` boundary.
-    let rows = synthetic_rows(256, &model.id);
-    let planted = rows[0].clone();
-    store.upsert_embeddings(&rows).await?;
-
-    // Just below threshold (256 < 257): no vector index yet.
-    store
-        .ensure_embedding_indices_with_threshold(&model, 257)
-        .await?;
-    assert!(
-        !store
-            .embedding_index_names()
-            .await?
-            .iter()
-            .any(|name| name == "embeddings_vector_ivfpq"),
-        "vector index must not build below the activation threshold",
-    );
-
-    // At the threshold (256 >= 256): the IVF_PQ index builds.
-    store
-        .ensure_embedding_indices_with_threshold(&model, 256)
-        .await?;
-    let indices = store.embedding_index_names().await?;
-    assert!(
-        indices.iter().any(|name| name == "embeddings_vector_ivfpq"),
-        "IVF_PQ index should build past the activation threshold: {indices:?}",
-    );
-
-    // A query whose vector is a planted row returns that row.
-    let hits = store
-        .vector_search(
-            &planted.vector,
-            10,
-            &Predicate::And(Vec::new()),
-            &model.id,
-            model.max_embed_tokens as i32,
-        )
-        .await?;
-    assert!(
-        hits.iter().any(|(id, _)| id == &planted.message_id),
-        "planted vector should be retrievable via the index",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<()> {
-    // Regression guard: `max_embed_tokens` is part of the embeddings PK, so one
-    // message can have several rows (one per cap). Vector search must scan only
-    // the identity that produced the query vector - never mix caps, never return
-    // a message_id twice (RRF would double-count it).
-    let temp = TempDir::new()?;
-    let store = Store::open_local(temp.path()).await?;
-    let model = Config::builtin().embeddings.default_model("local")?;
-
-    // Same message, two caps, deliberately opposite vectors so the result
-    // distance tells us which row the scan actually ranked.
-    let near = vec![0.1_f32; EMBEDDING_DIM];
-    let far = vec![-0.1_f32; EMBEDDING_DIM];
-    let base = synthetic_rows(1, &model.id)
-        .pop()
-        .expect("one synthetic row");
-    let row_1024 = EmbeddingRow {
-        max_embed_tokens: 1024,
-        vector: near.clone(),
-        ..base.clone()
-    };
-    let row_4096 = EmbeddingRow {
-        max_embed_tokens: 4096,
-        vector: far,
-        ..base.clone()
-    };
-    // Distinct PKs (same message_id, different cap), so both rows persist.
-    store.upsert_embeddings(&[row_1024, row_4096]).await?;
-
-    // Scoped to cap 1024: the message appears exactly once - not once per cap -
-    // ranked against the cap-1024 (near) vector, so distance ~0.
-    let hits_1024 = store
-        .vector_search(&near, 10, &Predicate::And(Vec::new()), &model.id, 1024)
-        .await?;
-    assert_eq!(
-        hits_1024.len(),
-        1,
-        "the message must appear exactly once, not once per cap: {hits_1024:?}",
-    );
-    assert_eq!(hits_1024[0].0, base.message_id);
-    assert!(
-        hits_1024[0].1 < 0.01,
-        "cap-1024 scan must rank the cap-1024 vector, got distance {}",
-        hits_1024[0].1,
-    );
-
-    // Scoped to cap 4096: same single message, but ranked against the opposite
-    // (far) vector - so the same query is now distant. Proves the scan switched
-    // rows on the cap, rather than just deduplicating.
-    let hits_4096 = store
-        .vector_search(&near, 10, &Predicate::And(Vec::new()), &model.id, 4096)
-        .await?;
-    assert_eq!(hits_4096.len(), 1);
-    assert_eq!(hits_4096[0].0, base.message_id);
-    assert!(
-        hits_4096[0].1 > 1.0,
-        "cap-4096 scan must rank the cap-4096 vector, got distance {}",
-        hits_4096[0].1,
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// End-to-end `pond_search` handler (fixture corpus, no model weights)
-// ---------------------------------------------------------------------------
 
 const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
 
@@ -532,6 +131,22 @@ fn hits_of(envelope: SearchEnvelope) -> Vec<Hit> {
     }
 }
 
+/// Unwrap a successful search envelope, panicking on errors.
+fn success_of(envelope: SearchEnvelope) -> pond::wire::SearchResponse {
+    match envelope {
+        SearchEnvelope::Success(response) => response,
+        SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
+    }
+}
+
+/// Pull the hits body out of a response, panicking on grouped results.
+fn body_hits(body: SearchResultBody) -> Vec<Hit> {
+    match body {
+        SearchResultBody::Hits { hits } => hits,
+        SearchResultBody::Groups { .. } => panic!("expected hits, got groups"),
+    }
+}
+
 /// A phrase taken verbatim from an ingested message - guaranteed to produce FTS
 /// hits without hard-coding fixture content.
 async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
@@ -619,22 +234,6 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
         assert_eq!(hit.matched_via, ["fts"]);
     }
     Ok(())
-}
-
-/// Unwrap a successful search envelope, panicking on errors.
-fn success_of(envelope: SearchEnvelope) -> pond::wire::SearchResponse {
-    match envelope {
-        SearchEnvelope::Success(response) => response,
-        SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
-    }
-}
-
-/// Pull the hits body out of a response, panicking on grouped results.
-fn body_hits(body: SearchResultBody) -> Vec<Hit> {
-    match body {
-        SearchResultBody::Hits { hits } => hits,
-        SearchResultBody::Groups { .. } => panic!("expected hits, got groups"),
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

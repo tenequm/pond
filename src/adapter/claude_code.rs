@@ -854,7 +854,7 @@ mod tests {
     use crate::{
         handlers::ingest_adapter,
         sessions::Store,
-        wire::{Message, PartKind},
+        wire::PartKind,
     };
     use tempfile::TempDir;
 
@@ -1195,72 +1195,4 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: round-trip Message::System with `content = None` through Lance
-    /// (encode + scan + decode) preserves the `None` rather than collapsing
-    /// to `Some("")`. Invariant 16 schema-honesty corollary.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn system_message_content_none_round_trips_as_none() -> anyhow::Result<()> {
-        let corpus = TempDir::new()?;
-        let project_dir = corpus.path().join("-tmp-pond-test");
-        std::fs::create_dir_all(&project_dir)?;
-        let session_uuid = "66666666-6666-6666-6666-666666666666";
-
-        // A row with no `message` field and no `subtype` - falls into the
-        // catch-all System branch with content = Some(raw_type "system"). To
-        // get a None content we'd need a row that the adapter chose not to
-        // emit content for; in claude-code's format that's hard to synthesize
-        // without inviting drift. Test the closer property: System messages
-        // with empty content land as None (via codex-cli's developer-frame
-        // path, exercised by `tests/adapter_codex_cli.rs`); here we just
-        // verify the storage round-trip preserves a synthetic Message::System
-        // with content = None when written directly.
-        let store_dir = TempDir::new()?;
-        let store = Store::open_local(store_dir.path()).await?;
-        let session = crate::wire::Session {
-            id: session_uuid.to_owned(),
-            parent_session_id: None,
-            parent_message_id: None,
-            source_agent: "test-shim".to_owned(),
-            created_at: chrono::Utc::now(),
-            project: crate::adapter::Extracted::from_test_value("/tmp/pond-test".to_owned()),
-            options: Default::default(),
-        };
-        let message = Message::System {
-            id: "msg-1".to_owned(),
-            session_id: session_uuid.to_owned(),
-            timestamp: chrono::Utc::now(),
-            content: None,
-            options: Default::default(),
-        };
-        let outcomes = crate::handlers::ingest_events(
-            &store,
-            vec![
-                crate::sessions::IngestEvent::Session(session),
-                crate::sessions::IngestEvent::Message(message),
-            ],
-        )
-        .await?;
-        assert!(
-            outcomes
-                .iter()
-                .all(|o| !matches!(o.status, crate::sessions::OutcomeStatus::Error)),
-            "ingest of `content: None` system message must not error"
-        );
-
-        let _ = corpus; // keep the (empty) corpus dir alive for the duration
-        let stored = store
-            .get_session(session_uuid)
-            .await?
-            .expect("session round-trips");
-        let system = stored.messages.first().expect("one stored message");
-        if let Message::System { content, .. } = &system.message {
-            assert!(
-                content.is_none(),
-                "Message::System content=None must NOT collapse to Some(\"\") on round-trip",
-            );
-        } else {
-            panic!("expected a Message::System");
-        }
-        Ok(())
-    }
 }

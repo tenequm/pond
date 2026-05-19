@@ -300,24 +300,4 @@ mod tests {
         assert!(row.nested("missing").is_none());
     }
 
-    // The next test pins down the no-public-constructor seal. It is a
-    // documentation test that MUST NOT compile - if it ever does, the
-    // seal has been broken (e.g. someone added a public `pub fn new` or
-    // a `From<T>` impl) and pond's "no synthesized values" invariant is
-    // no longer compile-enforced.
-    //
-    // ```compile_fail
-    // # use pond::adapter::extract::Extracted;
-    // let _: Extracted<String> = Extracted("unknown".to_string());
-    // ```
-    //
-    // (Smoke test - the real assertion is that nothing in this file or
-    // any sibling module exposes a way to create an Extracted<T> from
-    // arbitrary data.)
-    #[test]
-    fn the_seal_documentation_smoke() {
-        // The compile_fail doctest above is the actual check. This test
-        // exists so the documentation rendering picks up the doctest and
-        // runs it via `cargo test --doc`.
-    }
 }

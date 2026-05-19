@@ -594,3 +594,19 @@ pub fn storage_error(error_value: anyhow::Error) -> ErrorEnvelope {
         serde_json::json!({ "underlying": error_value.to_string() }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wire_envelope_carries_conflict_code_and_attempts_detail() {
+        let envelope: ErrorEnvelope = crate::Error::Conflict { attempts: 3 }.into();
+        assert_eq!(envelope.error.code, ErrorCode::Conflict);
+        assert_eq!(envelope.error.details, json!({ "attempts": 3 }));
+        assert!(!envelope.request_id.is_empty(), "request_id must be set");
+    }
+}

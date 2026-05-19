@@ -118,10 +118,10 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
         .iter()
         .filter(|e| matches!(e, SyncEvent::SessionDone(_)))
         .count();
-    assert!(
-        done_count >= discovered_total,
-        "every discovered file must produce one SessionDone (discovered={discovered_total}, \
-         done={done_count}). Re-ingest failures may legitimately add extras.",
+    assert_eq!(
+        done_count, discovered_total,
+        "every discovered file must produce exactly one SessionDone on a fresh ingest \
+         (discovered={discovered_total}, done={done_count})",
     );
     for event in &events {
         if let SyncEvent::SessionDone(outcome) = event {

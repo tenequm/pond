@@ -144,15 +144,25 @@ async fn export_filtered_to_one_session_carries_only_that_session() -> anyhow::R
         "filter must restrict to exactly one session"
     );
     let events = parse_events(&buffer)?;
+    // Build the message_id -> session_id map from the Session and Message
+    // events in the export, then assert every Part's message_id resolves
+    // to the requested session. Parts don't carry session_id directly, so
+    // the map is the only way to verify the filter reaches them too.
+    let mut message_to_session: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for event in &events {
+        if let IngestEvent::Message(message) = event {
+            message_to_session.insert(message.id().to_owned(), message.session_id().to_owned());
+        }
+    }
     for event in &events {
         let event_session = match event {
             IngestEvent::Session(session) => session.id.clone(),
             IngestEvent::Message(message) => message.session_id().to_owned(),
-            IngestEvent::Part(part) => {
-                // Parts carry only message_id, not session_id; skip the check.
-                let _ = part;
-                continue;
-            }
+            IngestEvent::Part(part) => message_to_session
+                .get(part.message_id.as_str())
+                .cloned()
+                .expect("every exported Part must reference a Message in the same export"),
         };
         assert_eq!(
             event_session, session_id,

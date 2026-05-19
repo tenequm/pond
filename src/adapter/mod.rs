@@ -570,3 +570,71 @@ fn json_to_toml_item(value: &Value) -> anyhow::Result<Item> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    #[test]
+    fn each_factory_probes_its_default_under_an_injected_home() {
+        // Per-adapter discovery lives on each factory's `probe_default`, not in
+        // a central name->path table. Driving each one with an injected `home`
+        // proves the rule lives where the format lives.
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let claude_dir = home.join(".claude").join("projects");
+        let codex_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let env = Env::with_home(home);
+
+        let claude_probe = ClaudeCodeFactory.probe_default(&env);
+        assert_eq!(
+            claude_probe
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(Value::as_str),
+            Some(claude_dir.to_str().unwrap()),
+        );
+
+        let codex_probe = CodexCliFactory.probe_default(&env);
+        assert_eq!(
+            codex_probe
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(Value::as_str),
+            Some(codex_dir.to_str().unwrap()),
+        );
+
+        // Removing the codex marker dir drops just that factory's probe.
+        std::fs::remove_dir_all(&codex_dir).unwrap();
+        assert!(CodexCliFactory.probe_default(&env).is_none());
+        assert!(ClaudeCodeFactory.probe_default(&env).is_some());
+    }
+
+    #[test]
+    fn prompt_and_persist_errors_on_non_tty_stdin() {
+        // `cargo test` runs with a piped stdin (non-tty), so this is the path
+        // CI / package-install scripts hit. The picker must surface a clear
+        // "configure manually" error instead of hanging on a prompt.
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let candidates = vec![Candidate {
+            name: "claude-code".to_owned(),
+            hint: "/tmp/dummy".to_owned(),
+            config: json!({ "path": "/tmp/dummy" }),
+        }];
+        let err = prompt_and_persist(&config_path, &candidates)
+            .expect_err("non-tty stdin must error rather than hang");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a terminal"),
+            "error should mention the non-tty branch: {msg}",
+        );
+    }
+}

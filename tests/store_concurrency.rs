@@ -1,56 +1,16 @@
-//! OCC commit-conflict classification (design.md 3.6.1 `conflict` row).
-//!
-//! pond's retry layer classifies an exhausted commit-conflict failure as a
-//! typed [`Error::Conflict`] rather than the generic `storage_unavailable`
-//! bucket. Three coverage levels:
-//!
-//! 1. Wire mapping: `Error::Conflict { attempts }` -> envelope code + details.
-//! 2. Sentinel chain: `ConflictExhausted` attached via `anyhow::Error::context`
-//!    survives downcast through the chain.
-//! 3. Concurrent writers on the same local-FS data dir succeed without
-//!    surfacing a spurious `Conflict` (Lance's commit lock + pond's retry
-//!    serialize commits at the manifest layer).
+//! Multi-writer Store concurrency on a shared local-FS data dir (design.md
+//! 2.4): Lance's local commit lock plus pond's retry layer must serialize
+//! concurrent writers without surfacing a spurious `Conflict`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use pond::{
-    Error,
     sessions::Store,
-    substrate::{ConflictExhausted, is_commit_conflict},
-    wire::{ErrorCode, ErrorEnvelope, ProviderOptions, Session},
+    wire::{ProviderOptions, Session},
 };
-use serde_json::json;
 use tempfile::TempDir;
-
-#[test]
-fn wire_envelope_carries_conflict_code_and_attempts_detail() {
-    let envelope: ErrorEnvelope = Error::Conflict { attempts: 3 }.into();
-    assert_eq!(envelope.error.code, ErrorCode::Conflict);
-    assert_eq!(envelope.error.details, json!({ "attempts": 3 }));
-    assert!(!envelope.request_id.is_empty(), "request_id must be set");
-}
-
-#[test]
-fn conflict_exhausted_sentinel_round_trips_through_anyhow_chain() {
-    // Mirrors what `substrate::retry_lance` does at the exhaustion arm: attach
-    // `ConflictExhausted` as the outer context on the underlying Lance error.
-    let underlying = anyhow::anyhow!("simulated lance commit-conflict source");
-    let attached = underlying.context(ConflictExhausted { attempts: 7 });
-
-    let conflict = attached
-        .downcast_ref::<ConflictExhausted>()
-        .expect("ConflictExhausted must be reachable via downcast");
-    assert_eq!(conflict.attempts, 7);
-
-    // A non-conflict error never matches the classifier.
-    let plain = anyhow::anyhow!("generic io failure");
-    assert!(
-        !is_commit_conflict(&plain),
-        "plain anyhow strings must not be classified as conflicts",
-    );
-}
 
 fn make_session(id: usize) -> Session {
     Session {

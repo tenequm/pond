@@ -1560,3 +1560,199 @@ pub use search_handler::{
     RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, make_preview,
     plan_search, pond_search, recency_boost, rrf_merge,
 };
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use chrono::{Duration, Utc};
+    use crate::wire::{ProjectFilter, SearchFilters, SearchRequest};
+
+    fn search_request(query: &str) -> SearchRequest {
+        SearchRequest {
+            protocol_version: crate::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            query: query.to_owned(),
+            rrf_k: 60,
+            filters: SearchFilters::default(),
+            boost_recent: true,
+            group_by_conversation: false,
+            limit: 20,
+        }
+    }
+
+    #[test]
+    fn rrf_merge_fuses_retrievers_and_reports_provenance() {
+        let lists = [
+            RankedList {
+                retriever: RetrieverKind::Vector,
+                ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            },
+            RankedList {
+                retriever: RetrieverKind::Fts,
+                ids: vec!["b".to_owned(), "a".to_owned(), "d".to_owned()],
+            },
+        ];
+        let merged = rrf_merge(&lists, 60);
+
+        // "a" (ranks 1,2) and "b" (ranks 2,1) have equal fused scores; the tie
+        // breaks on message_id, so "a" sorts first. Both beat the single-retriever
+        // "c" and "d".
+        assert_eq!(merged[0].message_id, "a");
+        assert_eq!(merged[1].message_id, "b");
+        assert_eq!(merged[0].matched_via, vec!["vector", "fts"]);
+        assert!(merged[0].score > merged[2].score);
+
+        let c = merged.iter().find(|hit| hit.message_id == "c").unwrap();
+        assert_eq!(c.matched_via, vec!["vector"]);
+        let d = merged.iter().find(|hit| hit.message_id == "d").unwrap();
+        assert_eq!(d.matched_via, vec!["fts"]);
+    }
+
+    #[test]
+    fn recency_boost_matches_the_kb_formula() {
+        let now = Utc::now();
+        // Caps at +0.2 at age zero.
+        assert!((recency_boost(now, now) - 0.2).abs() < 1e-6);
+        // One half-life (7 days) decays by exactly 1/e.
+        let week = recency_boost(now - Duration::days(7), now);
+        assert!((week - 0.2 / std::f64::consts::E).abs() < 1e-3);
+        // A year out is effectively zero.
+        assert!(recency_boost(now - Duration::days(365), now) < 1e-3);
+        // Future timestamps clamp to the cap rather than exceeding it.
+        assert!((recency_boost(now + Duration::days(1), now) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn make_preview_truncates_at_code_point_boundary() {
+        let short = "a short preview";
+        assert_eq!(make_preview(short), short);
+
+        let long = "x".repeat(800);
+        let preview = make_preview(&long);
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview.chars().count(), 503);
+    }
+
+    #[test]
+    fn build_filter_pushes_down_each_predicate_and_handles_empty() {
+        let filters = SearchFilters {
+            project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
+            session_id: Some("01HXY".to_owned()),
+            source_agent: Some("claude-code".to_owned()),
+            role: Some("assistant".to_owned()),
+            from_date: Some("2026-01-01".to_owned()),
+            to_date: Some("2026-05-01".to_owned()),
+            min_score: 0.0,
+        };
+        let sql = build_filter(&filters).unwrap().to_lance();
+        assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
+        assert!(sql.contains("session_id = '01HXY'"));
+        assert!(sql.contains("source_agent = 'claude-code'"));
+        assert!(sql.contains("role = 'assistant'"));
+        assert!(sql.contains("timestamp >="));
+        assert!(sql.contains("timestamp <="));
+
+        // Empty filters produce no predicate.
+        assert_eq!(
+            build_filter(&SearchFilters::default()).unwrap().to_lance(),
+            "",
+        );
+    }
+
+    #[test]
+    fn build_filter_rejects_bad_role_and_date() {
+        let bad_role = SearchFilters {
+            role: Some("wizard".to_owned()),
+            ..SearchFilters::default()
+        };
+        assert!(build_filter(&bad_role).is_err());
+
+        let bad_date = SearchFilters {
+            from_date: Some("01-01-2026".to_owned()),
+            ..SearchFilters::default()
+        };
+        assert!(build_filter(&bad_date).is_err());
+    }
+
+    #[test]
+    fn build_filter_contains_escapes_like_wildcards() {
+        let filters = SearchFilters {
+            project: Some(ProjectFilter::Contains("/Users/me/my_project".to_owned())),
+            ..SearchFilters::default()
+        };
+        let sql = build_filter(&filters).unwrap().to_lance();
+        // `_` is a LIKE wildcard and is everywhere in real paths; it must be escaped
+        // so `my_project` matches literally, with an ESCAPE clause naming the char.
+        assert!(
+            sql.contains(r"my\_project"),
+            "underscore must be escaped: {sql}"
+        );
+        assert!(
+            sql.contains(r"ESCAPE '\'"),
+            "predicate must declare the escape char: {sql}"
+        );
+    }
+
+    #[test]
+    fn plan_search_shapes_request_for_each_planning_input() {
+        // Case 1: large limit + group + filters + min_score. Query gets trimmed,
+        // limit caps at 200, pools size off `limit * k`.
+        let mut request = search_request("  vector memory  ");
+        request.limit = 500;
+        request.group_by_conversation = true;
+        request.boost_recent = false;
+        request.filters.min_score = 0.42;
+        let plan = plan_search(request, SearchMode::Hybrid).unwrap();
+        assert_eq!(plan.mode, SearchMode::Hybrid);
+        assert_eq!(plan.query, "vector memory");
+        assert_eq!(plan.limit, 200);
+        assert_eq!(plan.pool, 1000);
+        assert_eq!(plan.vector_pool, 2000);
+        assert!(plan.group_by_conversation);
+        assert!(!plan.boost_recent);
+        assert_eq!(plan.min_score, 0.42);
+
+        // Case 2: a tiny limit floors the pools so retrievers don't starve.
+        let mut request = search_request("tiny pool");
+        request.limit = 1;
+        let plan = plan_search(request, SearchMode::Fts).unwrap();
+        assert_eq!(plan.mode, SearchMode::Fts);
+        assert_eq!(plan.limit, 1);
+        assert_eq!(plan.pool, 50);
+        assert_eq!(plan.vector_pool, 100);
+
+        // Case 3: filters get plumbed into the shared filter predicate.
+        let mut request = search_request("filtered");
+        request.filters.project = Some(ProjectFilter::Contains("/Users/me/pond".to_owned()));
+        request.filters.role = Some("assistant".to_owned());
+        let plan = plan_search(request, SearchMode::Fts).unwrap();
+        let sql = plan.filter.to_lance();
+        assert!(sql.contains("project LIKE"));
+        assert!(sql.contains("role = 'assistant'"));
+    }
+
+    #[test]
+    fn plan_search_rejects_invalid_composition_before_execution() {
+        let mut blank = search_request("   ");
+        let error = plan_search(blank.clone(), SearchMode::Fts)
+            .unwrap_err()
+            .error;
+        assert_eq!(error.code, crate::wire::ErrorCode::ValidationFailed);
+        assert_eq!(error.details["field"], "query");
+
+        blank.query = "valid".to_owned();
+        blank.limit = 0;
+        let error = plan_search(blank.clone(), SearchMode::Fts)
+            .unwrap_err()
+            .error;
+        assert_eq!(error.details["field"], "limit");
+
+        blank.limit = 1;
+        blank.namespace = Some("remote".to_owned());
+        let error = plan_search(blank, SearchMode::Fts).unwrap_err().error;
+        assert_eq!(error.code, crate::wire::ErrorCode::NamespaceUnknown);
+        assert_eq!(error.details["namespace"], "remote");
+    }
+}

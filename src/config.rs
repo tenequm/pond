@@ -629,3 +629,256 @@ fn check_max_embed_tokens(value: usize, label: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    #[test]
+    fn registry_rejects_unknown_model() {
+        let config = EmbeddingsConfig {
+            models: vec![EmbeddingModel {
+                id: "bogus/model".to_owned(),
+                ..EmbeddingModel::qwen3_default()
+            }],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn registry_rejects_dim_mismatch() {
+        let config = EmbeddingsConfig {
+            models: vec![EmbeddingModel {
+                dim: 512,
+                ..EmbeddingModel::qwen3_default()
+            }],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn registry_rejects_missing_and_duplicate_defaults() {
+        let no_default = EmbeddingsConfig {
+            models: vec![EmbeddingModel {
+                default: false,
+                ..EmbeddingModel::qwen3_default()
+            }],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(no_default.validate().is_err());
+
+        let two_defaults = EmbeddingsConfig {
+            models: vec![
+                EmbeddingModel {
+                    id: "a".to_owned(),
+                    ..EmbeddingModel::qwen3_default()
+                },
+                EmbeddingModel {
+                    id: "b".to_owned(),
+                    ..EmbeddingModel::qwen3_default()
+                },
+            ],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(two_defaults.validate().is_err());
+    }
+
+    #[test]
+    fn registry_rejects_oversized_max_embed_tokens() {
+        // The built-in 1024 is well within the per-batch cost budget.
+        let ok = EmbeddingsConfig {
+            models: vec![EmbeddingModel {
+                max_embed_tokens: 1024,
+                ..EmbeddingModel::qwen3_default()
+            }],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        // A value whose single-message cost (`max_embed_tokens^2`) exceeds the
+        // batch budget is rejected: cost-aware batching cannot split one message,
+        // so a message that does not fit a batch alone would risk an OOM pass.
+        let oversized = EmbeddingsConfig {
+            models: vec![EmbeddingModel {
+                max_embed_tokens: 8192,
+                ..EmbeddingModel::qwen3_default()
+            }],
+            ..EmbeddingsConfig::default()
+        };
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn config_load_merges_namespace_overrides() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]\nmax_embed_tokens = 2048\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config
+                .embeddings
+                .default_model("local")
+                .unwrap()
+                .max_embed_tokens,
+            2048,
+        );
+        // The override is scoped to its namespace; others keep the built-in value.
+        assert_eq!(
+            config
+                .embeddings
+                .default_model("other")
+                .unwrap()
+                .max_embed_tokens,
+            1024,
+        );
+    }
+
+    #[test]
+    fn config_load_missing_file_falls_back_to_builtin() {
+        let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
+        assert_eq!(config.embeddings.models.len(), 1);
+    }
+
+    #[test]
+    fn default_config_toml_loads_to_the_builtin_registry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
+        // The shipped template is all comments, so it must load and validate as the
+        // built-in registry - a malformed template fails right here.
+        let config = Config::load(&path).unwrap();
+        config.embeddings.validate().unwrap();
+        assert_eq!(
+            config.embeddings.default_model("local").unwrap().id,
+            "Qwen/Qwen3-Embedding-0.6B",
+        );
+    }
+
+    #[test]
+    fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
+        // An explicit `--data-dir` / `POND_DATA_DIR` wins over everything. The
+        // explicit value can carry any URI form Lance accepts; here we test the
+        // local-path form (parsing is delegated to Lance's `uri_to_url`).
+        let explicit = parse_data_dir("/explicit").unwrap();
+        let resolved = resolve_data_dir(
+            Some(explicit.clone()),
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/home")),
+        )
+        .unwrap();
+        assert_eq!(resolved, explicit);
+
+        // An absolute XDG_DATA_HOME is used next.
+        let resolved = resolve_data_dir(
+            None,
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/home")),
+        )
+        .unwrap();
+        assert!(is_local(&resolved));
+        assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
+
+        // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
+        let resolved = resolve_data_dir(
+            None,
+            Some(PathBuf::from("relative")),
+            Some(PathBuf::from("/home")),
+        )
+        .unwrap();
+        assert_eq!(
+            local_path(&resolved).unwrap(),
+            PathBuf::from("/home/.local/share/pond"),
+        );
+
+        // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
+        // The result is absolute (Lance's URL conversion requires it), so we
+        // just check that the URL ends with the relative path's components.
+        let resolved = resolve_data_dir(None, None, None).unwrap();
+        assert!(is_local(&resolved));
+        assert!(
+            local_path(&resolved).unwrap().ends_with(".pond"),
+            "fallback path should end with .pond: {resolved}",
+        );
+    }
+
+    #[test]
+    fn expand_home_under_handles_tilde_forms() {
+        let home = Path::new("/srv/me");
+        assert_eq!(
+            expand_home_under(Path::new("~"), home),
+            PathBuf::from("/srv/me")
+        );
+        assert_eq!(
+            expand_home_under(Path::new("~/.codex/sessions"), home),
+            PathBuf::from("/srv/me/.codex/sessions"),
+        );
+        // Absolute paths pass through unchanged.
+        assert_eq!(
+            expand_home_under(Path::new("/etc/passwd"), home),
+            PathBuf::from("/etc/passwd"),
+        );
+        // A leading `~something` (no slash) is not the home form - leave it.
+        assert_eq!(
+            expand_home_under(Path::new("~user/elsewhere"), home),
+            PathBuf::from("~user/elsewhere"),
+        );
+    }
+
+    #[test]
+    fn resolve_sources_returns_one_or_all_or_errors() {
+        let temp = TempDir::new().unwrap();
+        let body = "\
+[sources.claude-code]
+path = \"/srv/claude\"
+
+[sources.codex-cli]
+path = \"/srv/codex\"
+";
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, body).expect("write config");
+        let config = Config::load(&path).unwrap();
+
+        // None -> everything in [sources.*]
+        let all = config.resolve_sources(None).unwrap();
+        assert_eq!(all.len(), 2);
+        let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"claude-code"));
+        assert!(names.contains(&"codex-cli"));
+
+        // Some(name) -> one entry, opaque JSON blob
+        let one = config.resolve_sources(Some("codex-cli")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, "codex-cli");
+        assert_eq!(
+            one[0].1.get("path").and_then(Value::as_str),
+            Some("/srv/codex"),
+        );
+
+        // Unknown -> error
+        assert!(config.resolve_sources(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn memory_uri_is_classified_as_remote() {
+        let url = parse_data_dir("memory:///pond-remote-test").expect("memory uri parses");
+        assert!(
+            !is_local(&url),
+            "memory:// is not a local-filesystem URL: {url}",
+        );
+        assert!(
+            local_path(&url).is_none(),
+            "local_path must return None for non-file schemes",
+        );
+    }
+}

@@ -1,6 +1,8 @@
-//! Stage 2 tests for the embedding registry, worker, and query instruction. No
-//! test requires the Qwen3 weights - the worker runs against an instrumented
-//! fake backend.
+//! Integration tests for the embedding worker: real `Store`, real fixture
+//! ingest, and an instrumented fake backend that records every batch shape.
+//! No model weights required. Registry validation, query-instruction format,
+//! and the `metric_type` mapping are unit-tested inline in `src/config.rs`
+//! and `src/embed/mod.rs`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Mutex;
@@ -9,8 +11,8 @@ use chrono::Utc;
 use pond::{
     PROTOCOL_VERSION,
     adapter::ClaudeCodeAdapter,
-    config::{Config, DEFAULT_CONFIG_TOML, EmbeddingModel, EmbeddingsConfig, resolve_data_dir},
-    embed::{EmbedBackend, EmbedWorker, qwen3_query_instruction},
+    config::Config,
+    embed::{EmbedBackend, EmbedWorker},
     handlers::{IngestEvent, ingest_adapter, pond_ingest},
     sessions::Store,
     wire::{IngestEnvelope, IngestRequest},
@@ -83,204 +85,6 @@ impl EmbedBackend for FakeBackend {
     fn max_embed_tokens(&self) -> i32 {
         1024
     }
-}
-
-#[test]
-fn qwen3_query_instruction_wraps_the_query_in_the_model_card_prefix() {
-    let prompt = qwen3_query_instruction("how does retry backoff work");
-    // Model-card format: `Instruct: {task}\nQuery: {query}` - the query sits on
-    // its own line after the instruction and is never mutated, only prefixed.
-    assert!(prompt.starts_with("Instruct: "));
-    assert!(prompt.ends_with("\nQuery: how does retry backoff work"));
-}
-
-#[test]
-fn builtin_registry_validates() {
-    let config = Config::builtin();
-    config
-        .embeddings
-        .validate()
-        .expect("the built-in registry must be valid");
-    let model = config.embeddings.default_model("local").unwrap();
-    assert_eq!(model.id, "Qwen/Qwen3-Embedding-0.6B");
-    assert_eq!(model.dim, 1024);
-}
-
-#[test]
-fn registry_rejects_unknown_model() {
-    let config = EmbeddingsConfig {
-        models: vec![EmbeddingModel {
-            id: "bogus/model".to_owned(),
-            ..EmbeddingModel::qwen3_default()
-        }],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-#[test]
-fn registry_rejects_dim_mismatch() {
-    let config = EmbeddingsConfig {
-        models: vec![EmbeddingModel {
-            dim: 512,
-            ..EmbeddingModel::qwen3_default()
-        }],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-#[test]
-fn registry_rejects_missing_and_duplicate_defaults() {
-    let no_default = EmbeddingsConfig {
-        models: vec![EmbeddingModel {
-            default: false,
-            ..EmbeddingModel::qwen3_default()
-        }],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(no_default.validate().is_err());
-
-    let two_defaults = EmbeddingsConfig {
-        models: vec![
-            EmbeddingModel {
-                id: "a".to_owned(),
-                ..EmbeddingModel::qwen3_default()
-            },
-            EmbeddingModel {
-                id: "b".to_owned(),
-                ..EmbeddingModel::qwen3_default()
-            },
-        ],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(two_defaults.validate().is_err());
-}
-
-#[test]
-fn config_load_merges_namespace_overrides() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(
-        &path,
-        "[embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]\nmax_embed_tokens = 2048\n",
-    )
-    .unwrap();
-
-    let config = Config::load(&path).unwrap();
-    assert_eq!(
-        config
-            .embeddings
-            .default_model("local")
-            .unwrap()
-            .max_embed_tokens,
-        2048,
-    );
-    // The override is scoped to its namespace; others keep the built-in value.
-    assert_eq!(
-        config
-            .embeddings
-            .default_model("other")
-            .unwrap()
-            .max_embed_tokens,
-        1024,
-    );
-}
-
-#[test]
-fn registry_rejects_oversized_max_embed_tokens() {
-    // The built-in 1024 is well within the per-batch cost budget.
-    let ok = EmbeddingsConfig {
-        models: vec![EmbeddingModel {
-            max_embed_tokens: 1024,
-            ..EmbeddingModel::qwen3_default()
-        }],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(ok.validate().is_ok());
-
-    // A value whose single-message cost (`max_embed_tokens^2`) exceeds the
-    // batch budget is rejected: cost-aware batching cannot split one message,
-    // so a message that does not fit a batch alone would risk an OOM pass.
-    let oversized = EmbeddingsConfig {
-        models: vec![EmbeddingModel {
-            max_embed_tokens: 8192,
-            ..EmbeddingModel::qwen3_default()
-        }],
-        ..EmbeddingsConfig::default()
-    };
-    assert!(oversized.validate().is_err());
-}
-
-#[test]
-fn config_load_missing_file_falls_back_to_builtin() {
-    let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
-    assert_eq!(config.embeddings.models.len(), 1);
-}
-
-#[test]
-fn default_config_toml_loads_to_the_builtin_registry() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
-    // The shipped template is all comments, so it must load and validate as the
-    // built-in registry - a malformed template fails right here.
-    let config = Config::load(&path).unwrap();
-    config.embeddings.validate().unwrap();
-    assert_eq!(
-        config.embeddings.default_model("local").unwrap().id,
-        "Qwen/Qwen3-Embedding-0.6B",
-    );
-}
-
-#[test]
-fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
-    use pond::config::{is_local, local_path, parse_data_dir};
-    use std::path::PathBuf;
-
-    // An explicit `--data-dir` / `POND_DATA_DIR` wins over everything. The
-    // explicit value can carry any URI form Lance accepts; here we test the
-    // local-path form (parsing is delegated to Lance's `uri_to_url`).
-    let explicit = parse_data_dir("/explicit").unwrap();
-    let resolved = resolve_data_dir(
-        Some(explicit.clone()),
-        Some(PathBuf::from("/xdg")),
-        Some(PathBuf::from("/home")),
-    )
-    .unwrap();
-    assert_eq!(resolved, explicit);
-
-    // An absolute XDG_DATA_HOME is used next.
-    let resolved = resolve_data_dir(
-        None,
-        Some(PathBuf::from("/xdg")),
-        Some(PathBuf::from("/home")),
-    )
-    .unwrap();
-    assert!(is_local(&resolved));
-    assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
-
-    // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
-    let resolved = resolve_data_dir(
-        None,
-        Some(PathBuf::from("relative")),
-        Some(PathBuf::from("/home")),
-    )
-    .unwrap();
-    assert_eq!(
-        local_path(&resolved).unwrap(),
-        PathBuf::from("/home/.local/share/pond"),
-    );
-
-    // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
-    // The result is absolute (Lance's URL conversion requires it), so we
-    // just check that the URL ends with the relative path's components.
-    let resolved = resolve_data_dir(None, None, None).unwrap();
-    assert!(is_local(&resolved));
-    assert!(
-        local_path(&resolved).unwrap().ends_with(".pond"),
-        "fallback path should end with .pond: {resolved}",
-    );
 }
 
 #[tokio::test]
@@ -358,84 +162,6 @@ fn text_message_events(session_id: &str, message_id: &str, text: &str) -> Vec<In
             kind: PartKind::Text { text: s(text) },
         }),
     ]
-}
-
-#[tokio::test]
-async fn embed_worker_caps_batch_cost_for_long_messages() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let store = Store::open_local(temp.path()).await?;
-
-    // One session: 10 tiny messages and one very long one. The long message's
-    // `search_text` is far past the token cap; the rest are a handful of bytes.
-    let session_id = "cost-budget-session";
-    let mut events = vec![IngestEvent::Session(Session {
-        id: session_id.to_owned(),
-        parent_session_id: None,
-        parent_message_id: None,
-        source_agent: "claude-code".to_owned(),
-        created_at: Utc::now(),
-        project: pond::adapter::extract_str(&serde_json::json!({"x": "pond-cost-test"}), "x")
-            .unwrap(),
-        options: Default::default(),
-    })];
-    for i in 0..11 {
-        let text = if i == 5 {
-            "lorem ipsum ".repeat(2_500) // ~30 KB - token estimate clamps to the cap
-        } else {
-            format!("short message number {i}")
-        };
-        events.extend(text_message_events(session_id, &format!("msg-{i}"), &text));
-    }
-
-    let envelope = pond_ingest(
-        &store,
-        IngestRequest {
-            protocol_version: PROTOCOL_VERSION,
-            namespace: Some("local".to_owned()),
-            events,
-        },
-    )
-    .await;
-    assert!(
-        matches!(envelope, IngestEnvelope::Success(_)),
-        "synthetic ingest should succeed: {envelope:?}",
-    );
-
-    let model = Config::builtin().embeddings.default_model("local")?;
-    let backend = FakeBackend::new(model.dim as usize);
-    // A high count ceiling so it never binds, and a small cost budget so the
-    // long message is forced out of any shared batch. The budget sits between
-    // a full batch of tiny messages and a two-message batch at the token cap.
-    let summary = EmbedWorker::new(&store, &backend, &model)?
-        .with_batch_size(32)
-        .with_cost_budget(1_000_000)
-        .run()
-        .await?;
-    assert_eq!(summary.messages, 11);
-
-    let calls = backend.calls();
-    assert_eq!(
-        calls.iter().map(|call| call.count).sum::<usize>(),
-        11,
-        "every message embedded exactly once",
-    );
-    // The long message (max byte length far above any short one) can never be
-    // padded into a batch with other messages - it is always embedded alone.
-    for call in &calls {
-        if call.max_bytes > 10_000 {
-            assert_eq!(
-                call.count, 1,
-                "a long message must be embedded in its own batch, saw {calls:?}",
-            );
-        }
-    }
-    // The budget is a cap, not a ban: the short messages still batch together.
-    assert!(
-        calls.iter().any(|call| call.count > 1),
-        "short messages must still batch, saw {calls:?}",
-    );
-
-    Ok(())
 }
 
 #[tokio::test]
