@@ -16,10 +16,7 @@
 //! together by [`registry`]. A new adapter is one file plus one line in the
 //! registry; no central dispatch table to edit.
 
-use std::{
-    io::IsTerminal,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
@@ -433,13 +430,15 @@ fn hint_for(config: &Value) -> String {
 
 /// Prompt the operator to pick which `candidates` to register, then persist
 /// the chosen entries to `config.toml` and return them. Pre-checks every
-/// candidate (the operator already opted in by running `pond sync`). In a
-/// non-tty context we never prompt - we bail with a clear "configure
+/// candidate (the operator already opted in by running `pond sync`). When
+/// `stdin_is_tty` is false we never prompt - we bail with a clear "configure
 /// manually" message so CI and post-install scripts get a predictable error
-/// instead of a hang.
+/// instead of a hang. The caller injects TTY-ness so tests can drive the
+/// non-tty branch deterministically regardless of how `cargo test` is invoked.
 pub fn prompt_and_persist(
     config_path: &Path,
     candidates: &[Candidate],
+    stdin_is_tty: bool,
 ) -> anyhow::Result<Vec<Candidate>> {
     if candidates.is_empty() {
         bail!(
@@ -447,7 +446,7 @@ pub fn prompt_and_persist(
             known_names().join(", "),
         );
     }
-    if !std::io::stdin().is_terminal() {
+    if !stdin_is_tty {
         bail!(
             "[sources] is empty and stdin is not a terminal; add a [sources.<adapter>] \
              entry to {} (known adapters: {})",
@@ -619,8 +618,8 @@ mod tests {
 
     #[test]
     fn prompt_and_persist_errors_on_non_tty_stdin() {
-        // `cargo test` runs with a piped stdin (non-tty), so this is the path
-        // CI / package-install scripts hit. The picker must surface a clear
+        // Drive the non-tty branch explicitly. This is the path CI and
+        // package-install scripts hit; the picker must surface a clear
         // "configure manually" error instead of hanging on a prompt.
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("config.toml");
@@ -629,7 +628,7 @@ mod tests {
             hint: "/tmp/dummy".to_owned(),
             config: json!({ "path": "/tmp/dummy" }),
         }];
-        let err = prompt_and_persist(&config_path, &candidates)
+        let err = prompt_and_persist(&config_path, &candidates, false)
             .expect_err("non-tty stdin must error rather than hang");
         let msg = err.to_string();
         assert!(

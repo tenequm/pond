@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -710,7 +710,8 @@ fn resolve_sync_sources(
             return Ok(vec![(name.to_owned(), blob.clone())]);
         }
         let candidates = adapter::discover(Some(name));
-        let picks = adapter::prompt_and_persist(config_file, &candidates)?;
+        let picks =
+            adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
         return Ok(picks.into_iter().map(|c| (c.name, c.config)).collect());
     }
 
@@ -718,7 +719,7 @@ fn resolve_sync_sources(
         return config.resolve_sources(None);
     }
     let candidates = adapter::discover(None);
-    let picks = adapter::prompt_and_persist(config_file, &candidates)?;
+    let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
     Ok(picks.into_iter().map(|c| (c.name, c.config)).collect())
 }
 

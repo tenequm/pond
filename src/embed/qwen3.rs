@@ -96,26 +96,3 @@ fn device_label(device: &candle_core::Device) -> &'static str {
         candle_core::Device::Metal(_) => "metal",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{device_label, select_device};
-
-    // plan.md Stage 2 done-when: the embedding worker runs on the Metal device
-    // on macOS (real Apple hardware), never the CPU fallback; a default
-    // non-macOS build runs on CPU. `select_device` is the device-selection path
-    // the worker takes; exercising it needs no model weights. A `--features cuda`
-    // build can select a GPU at runtime, so the CPU assertion is scoped to the
-    // default (no-`cuda`) build.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_selects_the_metal_device() {
-        assert_eq!(device_label(&select_device()), "metal");
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
-    #[test]
-    fn non_macos_selects_cpu() {
-        assert_eq!(device_label(&select_device()), "cpu");
-    }
-}

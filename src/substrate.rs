@@ -785,7 +785,9 @@ mod tests {
             (Table::Embeddings, &["message_id"]),
         ];
         for (table, projection) in cases {
-            let scanner = handle.scan(table, ScanOpts::project_only(projection)).await?;
+            let scanner = handle
+                .scan(table, ScanOpts::project_only(projection))
+                .await?;
             let batch = scanner.try_into_batch().await?;
             assert_eq!(batch.num_rows(), 0, "fresh table should be empty");
         }
