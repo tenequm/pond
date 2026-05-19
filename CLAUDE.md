@@ -18,3 +18,9 @@
 
 - User-facing CLI output uses `clap` (parsing) + `indicatif` (progress + spinners) + `dialoguer` (interactive prompts) + `comfy-table` (width-adaptive tables) + `anstyle` (color, gated through `pond::output::paint` which honors `NO_COLOR` and non-TTY stdout). Don't reach for `crossterm`, `terminal_size`, `owo-colors`, `colored`, or `tabled`; pond standardizes on the stack above.
 - New tabular surfaces should go through `pond::output` and the `new_table()` helper in `src/main.rs` so every command renders the same: borderless, dynamic-width, dim-bold headers.
+
+## Test storage backends
+
+- Use `shared-memory://pond-test-<unique-authority>/` only when a test needs 2+ `Store` instances against the same backing bytes (multi-writer OCC, fencing, future MemWAL). Single-`Store` tests use `tempfile::TempDir`.
+- Authority MUST be unique per test (process-global cache; collisions = cross-test contamination under parallel `cargo test`).
+- Never use `shared-memory://` in production code paths.
