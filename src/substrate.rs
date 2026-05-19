@@ -1,13 +1,14 @@
 use crate::{
     RetryPolicy,
     config::{self},
+    handlers::NamespaceIdent,
     sessions::{self},
 };
 use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
-use lance::dataset::{MergeInsertBuilder, WhenMatched};
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WriteMode};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
@@ -15,6 +16,9 @@ use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
+use lance_namespace_impls::ConnectBuilder;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -91,6 +95,7 @@ impl From<i32> for ScalarValue {
 pub enum Predicate {
     Eq(&'static str, ScalarValue),
     IsNull(&'static str),
+    IsNotNull(&'static str),
     In(&'static str, Vec<ScalarValue>),
     LikeContains(&'static str, String),
     /// Regex match. Emitted as `regexp_like(<col>, '<pat>')`. Never pushes
@@ -107,6 +112,7 @@ impl Predicate {
         match self {
             Self::Eq(column, value) => format!("{column} = {}", value.to_lance()),
             Self::IsNull(column) => format!("{column} IS NULL"),
+            Self::IsNotNull(column) => format!("{column} IS NOT NULL"),
             Self::In(column, values) => {
                 let values = values
                     .iter()
@@ -132,6 +138,32 @@ impl Predicate {
         }
     }
 }
+/// Read-side options for `Handle::scan`: optional prefilter predicate and
+/// optional projection. Default = no filter, all columns.
+#[derive(Default)]
+pub struct ScanOpts<'a> {
+    pub predicate: Option<&'a Predicate>,
+    pub projection: Option<&'a [&'a str]>,
+}
+
+impl<'a> ScanOpts<'a> {
+    pub fn project_only(projection: &'a [&'a str]) -> Self {
+        Self {
+            predicate: None,
+            projection: Some(projection),
+        }
+    }
+    pub fn with_predicate_and_projection(
+        predicate: &'a Predicate,
+        projection: &'a [&'a str],
+    ) -> Self {
+        Self {
+            predicate: Some(predicate),
+            projection: Some(projection),
+        }
+    }
+}
+
 impl ScalarValue {
     fn to_lance(&self) -> String {
         match self {
@@ -141,7 +173,6 @@ impl ScalarValue {
         }
     }
 }
-#[derive(Debug)]
 pub struct Handle {
     datasets: DatasetSet,
     retry: RetryPolicy,
@@ -154,6 +185,15 @@ pub struct Handle {
     /// credential refreshes (lance/src/dataset/builder.rs:509-517).
     #[allow(dead_code)]
     session: Arc<Session>,
+    /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
+    /// future hosted pond swaps to "rest" without touching read/write paths
+    /// (design.md 2.3 inv 21).
+    #[allow(dead_code)]
+    nm: Arc<dyn LanceNamespace>,
+    /// Namespace identifier this handle binds to. v1 is always `root()`; the
+    /// typed seam matches `resolve_namespace`'s return so multi-namespace
+    /// routing can land without churning call sites (design.md 2.3 inv 11).
+    nm_ident: NamespaceIdent,
     /// Object-store options threaded through every `DatasetBuilder` and
     /// `Dataset::write` call so refresh / index-creation paths inherit the
     /// same credentials and region as the initial open. Empty on local-FS
@@ -163,6 +203,19 @@ pub struct Handle {
     /// to display where the bytes live and to decide whether to walk a local
     /// directory or issue a remote `LIST` for sizing.
     location: Url,
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Handle")
+            .field("datasets", &self.datasets)
+            .field("retry", &self.retry)
+            .field("nm_ident", &self.nm_ident)
+            .field("storage_options", &self.storage_options)
+            .field("location", &self.location)
+            .finish()
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -234,6 +287,25 @@ impl Handle {
         // ships sensible cache capacities (lance/src/dataset.rs:149,153)
         // and a default ObjectStoreRegistry that knows file/s3/gs/az.
         let session = Arc::new(Session::default());
+        // Build the lance-namespace catalog seam once (design.md 2.3 inv 21).
+        // The `root` property is whatever URL the Directory impl understands;
+        // for local paths Lance accepts both `file://...` and bare paths, and
+        // for object stores the scheme-qualified URL is required.
+        let root = namespace_root_property(location);
+        let mut connect = ConnectBuilder::new("dir")
+            .property("root", root)
+            .session(session.clone());
+        // Object-store credentials/region/endpoint flow into the namespace
+        // via the `storage.<key>` property convention (lance-namespace-impls
+        // dir.rs from_properties: lines 423-436).
+        for (key, value) in &storage_options {
+            connect = connect.property(format!("storage.{key}"), value.clone());
+        }
+        let nm: Arc<dyn LanceNamespace> = connect
+            .connect()
+            .await
+            .context("failed to connect lance Directory namespace")?;
+        let nm_ident = NamespaceIdent::root();
         // design.md 2.3 inv 4: refresh window is scheme-keyed. Local-FS
         // manifest reads are microsecond-cheap, so `0` (always-refresh) is
         // essentially free and removes the stale-read window entirely. Object
@@ -247,8 +319,9 @@ impl Handle {
         Ok(Self {
             datasets: DatasetSet {
                 sessions: Mutex::new(CachedDataset {
-                    dataset: open_or_create(
-                        location,
+                    dataset: open_or_create_via_ns(
+                        &nm,
+                        &nm_ident,
                         sessions::SESSIONS,
                         sessions::session_schema(),
                         &session,
@@ -259,8 +332,9 @@ impl Handle {
                     refresh_after,
                 }),
                 messages: Mutex::new(CachedDataset {
-                    dataset: open_or_create(
-                        location,
+                    dataset: open_or_create_via_ns(
+                        &nm,
+                        &nm_ident,
                         sessions::MESSAGES,
                         sessions::message_schema(),
                         &session,
@@ -271,8 +345,9 @@ impl Handle {
                     refresh_after,
                 }),
                 parts: Mutex::new(CachedDataset {
-                    dataset: open_or_create(
-                        location,
+                    dataset: open_or_create_via_ns(
+                        &nm,
+                        &nm_ident,
                         sessions::PARTS,
                         sessions::part_schema(),
                         &session,
@@ -283,8 +358,9 @@ impl Handle {
                     refresh_after,
                 }),
                 embeddings: Mutex::new(CachedDataset {
-                    dataset: open_or_create(
-                        location,
+                    dataset: open_or_create_via_ns(
+                        &nm,
+                        &nm_ident,
                         sessions::EMBEDDINGS,
                         sessions::embedding_schema(),
                         &session,
@@ -297,6 +373,8 @@ impl Handle {
             },
             retry: RetryPolicy::default(),
             session,
+            nm,
+            nm_ident,
             storage_options,
             location: location.clone(),
         })
@@ -371,18 +449,46 @@ impl Handle {
         let mut cached = self.cached(table).lock().await;
         cached.latest().await
     }
+    /// Build a prefiltered `Scanner` for `table`. Composable read entry
+    /// point for callers that need to layer extra builder calls
+    /// (`full_text_search`, `nearest`) on top of pond's predicate seam.
+    /// Routine scans should prefer `Handle::scan`.
+    pub(crate) async fn scanner(
+        &self,
+        table: Table,
+        predicate: Option<&Predicate>,
+    ) -> Result<lance::dataset::scanner::Scanner> {
+        let dataset = self.dataset(table).await?;
+        scanner_with_prefilter(&dataset, predicate)
+    }
+    /// Single read entry point: prefilter via `predicate`, optionally
+    /// project, return the prepared `Scanner` (design.md 2.3 inv 22).
+    pub async fn scan(
+        &self,
+        table: Table,
+        opts: ScanOpts<'_>,
+    ) -> Result<lance::dataset::scanner::Scanner> {
+        let mut scanner = self.scanner(table, opts.predicate).await?;
+        if let Some(projection) = opts.projection {
+            scanner.project(projection)?;
+        }
+        Ok(scanner)
+    }
     pub(crate) async fn scan_batch(
         &self,
         table: Table,
         predicate: Option<&Predicate>,
         projection: &[&str],
     ) -> Result<RecordBatch> {
-        let dataset = self.dataset(table).await?;
-        let mut scanner = scanner_with_prefilter(&dataset, predicate)?;
-        if !projection.is_empty() {
-            scanner.project(projection)?;
-        }
-        scanner.try_into_batch().await.context("scan failed")
+        let opts = ScanOpts {
+            predicate,
+            projection: (!projection.is_empty()).then_some(projection),
+        };
+        self.scan(table, opts)
+            .await?
+            .try_into_batch()
+            .await
+            .context("scan failed")
     }
     pub async fn count_rows(&self, table: Table, predicate: Option<String>) -> Result<usize> {
         self.dataset(table)
@@ -531,22 +637,60 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-async fn open_or_create(
-    location: &Url,
-    suffix: &str,
-    schema: Arc<lance::deps::arrow_schema::Schema>,
+/// String the `lance-namespace` Directory impl wants as its `root` property.
+/// Local URLs become plain absolute paths (matching pond's historical
+/// log output); remote URLs pass through verbatim.
+fn namespace_root_property(location: &Url) -> String {
+    if let Some(path) = config::local_path(location) {
+        path.display().to_string()
+    } else {
+        location.as_str().trim_end_matches('/').to_string()
+    }
+}
+
+/// Open the table at `table_name` via the namespace; create + initialize on
+/// `TableNotFound`. Schema-checks the on-disk dataset against pond's
+/// expectation so a stale data dir surfaces early.
+async fn open_or_create_via_ns(
+    nm: &Arc<dyn LanceNamespace>,
+    nm_ident: &NamespaceIdent,
+    table_name: &str,
+    schema: lance::deps::arrow_schema::SchemaRef,
     session: &Arc<Session>,
     storage_options: &HashMap<String, String>,
 ) -> Result<Dataset> {
-    let uri = config::child_uri(location, suffix);
-    let mut write_params = sessions::write_params(location);
-    // Tie new-dataset writes to the shared Session so the created dataset
-    // inherits the same caches + ObjectStoreRegistry the open path uses.
+    let table_id = nm_ident.as_table_id(table_name);
+
+    // Open path: ask the namespace to resolve the table. Anything other than
+    // `TableNotFound` is a real failure; fall through to create only when the
+    // catalog explicitly reports the table is missing.
+    match DatasetBuilder::from_namespace(nm.clone(), table_id.clone()).await {
+        Ok(mut builder) => {
+            builder = builder.with_session(session.clone());
+            if !storage_options.is_empty() {
+                builder = builder.with_storage_options(storage_options.clone());
+            }
+            let dataset = builder
+                .load()
+                .await
+                .with_context(|| format!("failed to open table {table_name}"))?;
+            ensure_schema_matches(&dataset, schema.as_ref(), table_name)?;
+            return Ok(dataset);
+        }
+        Err(error) if is_table_not_found(&error) => {
+            // fall through to create
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("failed to describe table {table_name}"));
+        }
+    }
+
+    // Create path: pond seeds an empty dataset with the canonical schema so
+    // every subsequent open lands on a real Lance dataset, not a phantom.
+    let mut write_params = sessions::write_params_for_create();
     write_params.session = Some(session.clone());
-    // For object-store backends pond hands raw `storage_options` (S3 creds,
-    // region, endpoint, ...) verbatim to Lance via the `ObjectStoreParams`
-    // accessor (lance/src/dataset/builder.rs:305 doc). Empty map = use the
-    // session's default registry (env-var-driven object_store).
+    write_params.mode = WriteMode::Create;
     if !storage_options.is_empty() {
         write_params.store_params = Some(ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -555,63 +699,34 @@ async fn open_or_create(
             ..Default::default()
         });
     }
-    if let Some(local_base) = config::local_path(location) {
-        // Local-FS fast path: a plain `Path::exists` check keeps the
-        // missing-dataset branch cheap and surfaces real open errors as
-        // open errors (not as misclassified "needs create" cases).
-        let path = local_base.join(suffix);
-        if path.exists() {
-            let dataset = open_with_session(&uri, session, storage_options).await?;
-            ensure_schema_matches(&dataset, &schema, &uri)?;
-            Ok(dataset)
-        } else {
-            let reader = sessions::empty_reader(schema)?;
-            Dataset::write(reader, &uri, Some(write_params))
-                .await
-                .with_context(|| format!("failed to create dataset {uri}"))
+    let reader = sessions::empty_reader(schema)?;
+    Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
+        .await
+        .with_context(|| format!("failed to create table {table_name}"))
+}
+
+/// True when the error chain reports `NamespaceError::TableNotFound`.
+/// `DatasetBuilder::from_namespace` wraps the namespace impl's
+/// `lance::Error::Namespace { source: NamespaceError }` in another
+/// `lance::Error::Namespace { source: lance::Error }` layer, so we walk the
+/// `Namespace` source chain until we find a downcastable `NamespaceError`.
+fn is_table_not_found(error: &lance::Error) -> bool {
+    let mut cursor = error;
+    loop {
+        let lance::Error::Namespace { source, .. } = cursor else {
+            return false;
+        };
+        if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
+            return matches!(ns_err, NamespaceError::TableNotFound { .. });
         }
-    } else {
-        // Object-store path: no portable cheap "exists" predicate, so try
-        // open first and fall back to write. If write also fails we surface
-        // both errors so the operator sees the underlying transport problem
-        // rather than a misleading "already exists" from the create attempt.
-        match open_with_session(&uri, session, storage_options).await {
-            Ok(dataset) => {
-                ensure_schema_matches(&dataset, &schema, &uri)?;
-                Ok(dataset)
-            }
-            Err(open_err) => {
-                let reader = sessions::empty_reader(schema)?;
-                Dataset::write(reader, &uri, Some(write_params))
-                    .await
-                    .with_context(|| {
-                        format!("failed to open or create dataset {uri} (open error: {open_err})")
-                    })
-            }
+        match source.downcast_ref::<lance::Error>() {
+            Some(inner) => cursor = inner,
+            None => return false,
         }
     }
 }
 
-/// Open a dataset bound to the shared `Session` and any object-store options.
-/// Routes through `DatasetBuilder::with_session` + `with_storage_options`
-/// rather than `Dataset::open(&str)` so the returned dataset reuses the
-/// pooled metadata/index caches and the `ObjectStoreRegistry` (which holds
-/// the S3/local object_store client).
-async fn open_with_session(
-    uri: &str,
-    session: &Arc<Session>,
-    storage_options: &HashMap<String, String>,
-) -> Result<Dataset> {
-    let mut builder = DatasetBuilder::from_uri(uri).with_session(session.clone());
-    if !storage_options.is_empty() {
-        builder = builder.with_storage_options(storage_options.clone());
-    }
-    builder
-        .load()
-        .await
-        .with_context(|| format!("failed to open dataset {uri}"))
-}
-pub(crate) fn scanner_with_prefilter(
+fn scanner_with_prefilter(
     dataset: &Dataset,
     predicate: Option<&Predicate>,
 ) -> Result<lance::dataset::scanner::Scanner> {
@@ -628,7 +743,7 @@ pub(crate) fn scanner_with_prefilter(
 fn ensure_schema_matches(
     dataset: &Dataset,
     expected: &lance::deps::arrow_schema::Schema,
-    uri: &str,
+    table_name: &str,
 ) -> Result<()> {
     use std::collections::BTreeSet;
     let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
@@ -640,7 +755,7 @@ fn ensure_schema_matches(
         .collect();
     if actual_names != expected_names {
         anyhow::bail!(
-            "dataset {uri} has columns {actual_names:?} but this pond build expects \
+            "table {table_name} has columns {actual_names:?} but this pond build expects \
              {expected_names:?} - the on-disk store predates a schema change; delete the \
              data directory and re-run `pond ingest`",
         );
@@ -657,4 +772,35 @@ fn like_contains(value: &str) -> String {
         .replace('_', "\\_")
         .replace('\'', "''");
     format!("'%{escaped}%'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Round-trip: opening a fresh data dir through `lance-namespace`
+    /// produces all four tables, and `Handle::scan` returns an empty batch
+    /// for each (no spurious schema mismatch, no namespace error).
+    #[tokio::test]
+    async fn store_opens_via_namespace_and_scan_works() -> Result<()> {
+        let temp = TempDir::new()?;
+        let url = Url::from_directory_path(temp.path())
+            .map_err(|()| anyhow::anyhow!("temp path is not absolute"))?;
+        let handle = Handle::open(&url).await?;
+        // Each table has its own PK column; project the canonical one so the
+        // scan is exercised end-to-end (catalog -> dataset -> scanner -> batch).
+        let cases: [(Table, &[&str]); 4] = [
+            (Table::Sessions, &["id"]),
+            (Table::Messages, &["id"]),
+            (Table::Parts, &["id"]),
+            (Table::Embeddings, &["message_id"]),
+        ];
+        for (table, projection) in cases {
+            let scanner = handle.scan(table, ScanOpts::project_only(projection)).await?;
+            let batch = scanner.try_into_batch().await?;
+            assert_eq!(batch.num_rows(), 0, "fresh table should be empty");
+        }
+        Ok(())
+    }
 }

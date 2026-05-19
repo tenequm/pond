@@ -18,15 +18,15 @@ dialoguer = { version = "0.12", default-features = false }
 fastrand = "2"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 indicatif = "0.18"
-lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
-lance-table = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
+lance-table = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -52,7 +52,7 @@ fastembed = { version = "5.13.4", default-features = false, features = ["qwen3",
 [dev-dependencies]
 # Also a regular dependency; declared here so integration tests can name
 # `MetricType` when asserting the distance-metric mapping.
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.8" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.14" }
 # `rmcp` is a regular dependency too; the `client` feature is dev-only so the
 # MCP integration test can drive the server with an in-process client. Cargo
 # unifies it into the test build without adding `client` to the shipped binary.

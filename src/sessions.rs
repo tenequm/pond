@@ -25,8 +25,8 @@ use crate::{
     config::{self, EmbeddingModel},
     embed,
     substrate::{
-        Handle, MaintenanceReport, Predicate, ScalarValue, Table, VECTOR_INDEX_ACTIVATION_ROWS,
-        scanner_with_prefilter,
+        Handle, MaintenanceReport, Predicate, ScalarValue, ScanOpts, Table,
+        VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
@@ -606,8 +606,13 @@ impl Store {
             .map(|v| (v.version, v.timestamp))
             .collect();
 
-        let mut scanner = dataset.scan();
-        scanner.project(&["id", "_row_last_updated_at_version"])?;
+        let scanner = self
+            .handle
+            .scan(
+                Table::Sessions,
+                ScanOpts::project_only(&["id", "_row_last_updated_at_version"]),
+            )
+            .await?;
         let mut stream = scanner.try_into_stream().await?;
         let mut out: HashMap<String, DateTime<Utc>> = HashMap::new();
         while let Some(batch) = stream.next().await {
@@ -667,9 +672,13 @@ impl Store {
     /// aggregated in-memory. Bounded by the cross product of adapters and
     /// projects, which stays small on real corpora.
     pub async fn corpus_stats(&self, include_subagents: bool) -> Result<CorpusStats> {
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let mut scanner = dataset.scan();
-        scanner.project(&["source_agent", "project", "session_id"])?;
+        let scanner = self
+            .handle
+            .scan(
+                Table::Messages,
+                ScanOpts::project_only(&["source_agent", "project", "session_id"]),
+            )
+            .await?;
         let mut stream = scanner.try_into_stream().await?;
         let mut groups: HashMap<(String, String), GroupAccumulator> = HashMap::new();
         while let Some(batch) = stream.next().await {
@@ -753,10 +762,14 @@ impl Store {
         model_id: &str,
         max_embed_tokens: i32,
     ) -> Result<HashSet<String>> {
-        let dataset = self.handle.dataset(Table::Embeddings).await?;
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, None);
-        let mut scanner = scanner_with_prefilter(&dataset, Some(&identity))?;
-        scanner.project(&["message_id"])?;
+        let scanner = self
+            .handle
+            .scan(
+                Table::Embeddings,
+                ScanOpts::with_predicate_and_projection(&identity, &["message_id"]),
+            )
+            .await?;
         let mut stream = scanner.try_into_stream().await?;
         let mut set = HashSet::new();
         while let Some(batch) = stream.next().await {
@@ -773,10 +786,8 @@ impl Store {
     /// Stream every message awaiting embedding as a domain [`PendingMessage`].
     pub fn pending_messages_stream(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
-            let dataset = self.handle.dataset(Table::Messages).await?;
-            let mut scanner = dataset.scan();
-            scanner.filter("search_text IS NOT NULL")?;
-            scanner.project(&[
+            let filter = Predicate::IsNotNull("search_text");
+            let projection: &[&str] = &[
                 "id",
                 "session_id",
                 "source_agent",
@@ -784,7 +795,14 @@ impl Store {
                 "role",
                 "timestamp",
                 "search_text",
-            ])?;
+            ];
+            let scanner = self
+                .handle
+                .scan(
+                    Table::Messages,
+                    ScanOpts::with_predicate_and_projection(&filter, projection),
+                )
+                .await?;
             let mut batches = scanner
                 .try_into_stream()
                 .await
@@ -806,8 +824,7 @@ impl Store {
         limit: usize,
         filter: &Predicate,
     ) -> Result<Vec<(String, f32)>> {
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let mut scanner = scanner_with_prefilter(&dataset, Some(filter))?;
+        let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
@@ -831,10 +848,14 @@ impl Store {
     /// Whether the `embeddings` table holds any row for this `(model_id,
     /// max_embed_tokens)` identity.
     pub async fn has_embeddings(&self, model_id: &str, max_embed_tokens: i32) -> Result<bool> {
-        let dataset = self.handle.dataset(Table::Embeddings).await?;
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, None);
-        let mut scanner = scanner_with_prefilter(&dataset, Some(&identity))?;
-        scanner.project(&["message_id"])?;
+        let mut scanner = self
+            .handle
+            .scan(
+                Table::Embeddings,
+                ScanOpts::with_predicate_and_projection(&identity, &["message_id"]),
+            )
+            .await?;
         scanner.limit(Some(1), None)?;
         let batch = scanner.try_into_batch().await?;
         Ok(batch.num_rows() > 0)
@@ -849,9 +870,11 @@ impl Store {
         model_id: &str,
         max_embed_tokens: i32,
     ) -> Result<Vec<(String, f32)>> {
-        let dataset = self.handle.dataset(Table::Embeddings).await?;
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, Some(filter));
-        let mut scanner = scanner_with_prefilter(&dataset, Some(&identity))?;
+        let mut scanner = self
+            .handle
+            .scanner(Table::Embeddings, Some(&identity))
+            .await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         // Mirror the explicit-projection contract from `fts_search`: opt out
@@ -877,9 +900,11 @@ impl Store {
         model_id: &str,
         max_embed_tokens: i32,
     ) -> Result<String> {
-        let dataset = self.handle.dataset(Table::Embeddings).await?;
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, Some(filter));
-        let mut scanner = scanner_with_prefilter(&dataset, Some(&identity))?;
+        let mut scanner = self
+            .handle
+            .scanner(Table::Embeddings, Some(&identity))
+            .await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         scanner
@@ -1966,19 +1991,19 @@ pub(crate) const EMBEDDINGS: &str = "embeddings.lance";
 /// A future model with a different dim activates a second `embeddings` table.
 pub const EMBEDDING_DIM: usize = 1024;
 
-/// `auto_cleanup` retention is scheme-keyed (design.md 3.2.0): local-FS gets
-/// 30 days; object stores get 90 days because hosted recovery scenarios
-/// (sources deleted, sessions expired, re-ingest impossible) need a longer
+/// Initial-`CREATE` write params for the namespace-mediated path. The
+/// substrate seam stamps in `session`, `mode`, and `store_params`.
+/// `auto_cleanup` window defaults to 90 days; hosted recovery scenarios
+/// (sources deleted, sessions expired, re-ingest impossible) need a long
 /// rollback window and storage cost is negligible for append-only workloads.
-pub(crate) fn write_params(location: &Url) -> WriteParams {
-    let retention_days = if config::is_local(location) { 30 } else { 90 };
+pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_2),
         enable_v2_manifest_paths: true,
         enable_stable_row_ids: true,
         auto_cleanup: Some(AutoCleanupParams {
             interval: 20,
-            older_than: chrono::TimeDelta::days(retention_days),
+            older_than: chrono::TimeDelta::days(90),
         }),
         ..WriteParams::default()
     }

@@ -2,19 +2,32 @@ fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
     error.into()
 }
 
-/// The one and only namespace-resolution point. Every wire handler funnels
-/// through this; no handler hand-rolls its own `namespace == "local"` check.
-///
-/// v1 is single-namespace and returns the static `"local"` string on success.
-/// When multi-namespace pond lands, this signature becomes
-/// `(namespace, &Router) -> Result<&Arc<Store>>` and every handler picks up
-/// the right store automatically without further edits - that's the whole
-/// reason the check lives here, not at the call site (design.md 2.3 inv 11).
+/// Typed identifier for the namespace a wire request targets. v1 is
+/// single-namespace, so every successful resolve returns `root()`; the
+/// type lets future multi-namespace routing land without churning call
+/// sites (design.md 2.3 inv 11).
+#[derive(Debug, Clone)]
+pub struct NamespaceIdent(pub Vec<String>);
+
+impl NamespaceIdent {
+    pub fn root() -> Self {
+        Self(vec![])
+    }
+    pub fn as_table_id(&self, table_name: &str) -> Vec<String> {
+        let mut id = self.0.clone();
+        id.push(table_name.to_string());
+        id
+    }
+}
+
+/// The one and only namespace-resolution point; every wire handler funnels
+/// through this. v1 accepts `None` or the default and returns the singleton
+/// root namespace; everything else is a hard reject.
 pub fn resolve_namespace(
     namespace: Option<&str>,
-) -> Result<&'static str, crate::wire::ErrorEnvelope> {
+) -> Result<NamespaceIdent, crate::wire::ErrorEnvelope> {
     match namespace {
-        None | Some(crate::wire::DEFAULT_NAMESPACE) => Ok(crate::wire::DEFAULT_NAMESPACE),
+        None | Some(crate::wire::DEFAULT_NAMESPACE) => Ok(NamespaceIdent::root()),
         Some(other) => Err(map_error(crate::Error::namespace_unknown(other))),
     }
 }
@@ -1204,7 +1217,7 @@ mod search_handler {
     ) -> Result<SearchPlan, ErrorEnvelope> {
         validate_protocol(request.protocol_version)?;
 
-        super::resolve_namespace(request.namespace.as_deref())?;
+        let _ns = super::resolve_namespace(request.namespace.as_deref())?;
 
         let query = request.query.trim().to_owned();
         if query.is_empty() {
