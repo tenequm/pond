@@ -851,11 +851,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::{
-        handlers::ingest_adapter,
-        sessions::Store,
-        wire::PartKind,
-    };
+    use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
 
     /// `<root>/<encoded-cwd>/<parent_uuid>.jsonl` plus
@@ -1194,5 +1190,4 @@ mod tests {
         // Sanity: even an orphan should not be reported as a drop.
         Ok(())
     }
-
 }

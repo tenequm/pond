@@ -2824,6 +2824,17 @@ mod tests {
 
     // -- vector search and index activation --------------------------------
 
+    /// Open a fresh local-FS store and resolve the built-in default embedding
+    /// model. The three vector tests below share this prelude.
+    async fn vector_test_setup() -> anyhow::Result<(TempDir, Store, EmbeddingModel)> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let model = crate::config::Config::builtin()
+            .embeddings
+            .default_model("local")?;
+        Ok((temp, store, model))
+    }
+
     /// Build `count` synthetic embedding rows with deterministic pseudo-random
     /// vectors of the production dimension, spread across a handful of sessions.
     fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
@@ -2857,11 +2868,7 @@ mod tests {
 
     #[tokio::test]
     async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let model = crate::config::Config::builtin()
-            .embeddings
-            .default_model("local")?;
+        let (_temp, store, model) = vector_test_setup().await?;
 
         // 4 synthetic rows: `synthetic_rows` cycles `session-{i % 8}`, so 4 is the
         // smallest count where `session-3` (the filter value below) is a real
@@ -2903,11 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let model = crate::config::Config::builtin()
-            .embeddings
-            .default_model("local")?;
+        let (_temp, store, model) = vector_test_setup().await?;
 
         // 256 rows is the hard floor: the IVF_PQ index uses `num_bits = 8`, so its
         // PQ trainer needs one row per code centroid (2^8 = 256) - fewer fails with
@@ -2963,11 +2966,7 @@ mod tests {
         // message can have several rows (one per cap). Vector search must scan only
         // the identity that produced the query vector - never mix caps, never return
         // a message_id twice (RRF would double-count it).
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let model = crate::config::Config::builtin()
-            .embeddings
-            .default_model("local")?;
+        let (_temp, store, model) = vector_test_setup().await?;
 
         // Same message, two caps, deliberately opposite vectors so the result
         // distance tells us which row the scan actually ranked.

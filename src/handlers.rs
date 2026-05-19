@@ -1566,8 +1566,8 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use chrono::{Duration, Utc};
     use crate::wire::{ProjectFilter, SearchFilters, SearchRequest};
+    use chrono::{Duration, Utc};
 
     fn search_request(query: &str) -> SearchRequest {
         SearchRequest {

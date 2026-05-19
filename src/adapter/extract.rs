@@ -299,5 +299,4 @@ mod tests {
         assert_eq!(nested.str_field("content"), Some("hi"));
         assert!(row.nested("missing").is_none());
     }
-
 }
