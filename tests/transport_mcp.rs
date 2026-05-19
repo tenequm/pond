@@ -1,9 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! stdio-MCP transport (design.md 3.6, 2.2, kb parity contract): the `pond_search`
-//! / `pond_get` tools are driven by an in-process rmcp client over a `duplex`
-//! pipe. Asserts the kb-parity field mapping (`conversation_id` -> `session_id`)
-//! and the MCP-only placeholder rendering for excluded parts (design.md 3.6.3).
+//! stdio-MCP transport (design.md#protocol, design.md#protocol-wire-interface,
+//! kb parity contract): the `pond_search` / `pond_get` tools are driven by an
+//! in-process rmcp client over a `duplex` pipe. Asserts the kb-parity field
+//! mapping (`conversation_id` -> `session_id`) and the MCP-only placeholder
+//! rendering for excluded parts (design.md#protocol-pond-get).
 
 use chrono::Utc;
 use pond::{

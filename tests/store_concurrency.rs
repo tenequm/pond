@@ -30,7 +30,7 @@ async fn concurrent_writers_on_same_data_dir_serialize_without_conflict() -> any
     // Two pond Stores share one local data dir; Lance's local commit lock
     // plus pond's retry layer must turn the contention into successful
     // serialized commits, not surfaced `Conflict`. This is the v1 invariant
-    // (design.md 2.4): "Local filesystem uses Lance's internal commit lock."
+    // (design.md#invariants-concurrency): "Local filesystem uses Lance's internal commit lock."
     let temp = TempDir::new()?;
     let store_a = Arc::new(Store::open_local(temp.path()).await?);
     let store_b = Arc::new(Store::open_local(temp.path()).await?);
@@ -54,7 +54,7 @@ async fn concurrent_writers_on_same_data_dir_serialize_without_conflict() -> any
     out_b??;
 
     // Either existing store handle sees the converged state. Local-FS
-    // refresh window is zero (design.md 2.3 inv 4), so a long-lived reader
+    // refresh window is zero (design.md#inv-4), so a long-lived reader
     // picks up another writer's commit on the next read without waiting.
     let (sessions, _, _, _) = store_a.row_counts().await?;
     assert_eq!(

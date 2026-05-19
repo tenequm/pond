@@ -1,11 +1,12 @@
-//! Object-store / remote backend integration (design.md 2.3 inv 4, 3.2.0).
+//! Object-store / remote backend integration (design.md#inv-4,
+//! design.md#schemas-write-params).
 //!
 //! Lance's default `ObjectStoreRegistry` ships `memory://`, which we use as
 //! the cheap stand-in for an S3 backend: no daemon, no credentials, no
 //! network. This proves pond's NON-local code paths actually exercise the
-//! object-store branch of `open_or_create`, the 90-day retention window,
-//! and the shared `lance::Session` routing all four datasets through one
-//! ObjectStoreRegistry. The classifier helpers (`is_local`, `local_path`)
+//! object-store path through `open_or_create_via_ns`, the 90-day retention
+//! window, and the shared `lance::Session` routing all four datasets through
+//! one ObjectStoreRegistry. The classifier helpers (`is_local`, `local_path`)
 //! live in `src/config.rs::tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

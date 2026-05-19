@@ -1,4 +1,4 @@
-//! Recovery story (design.md 2.3 inv 10): every byte in pond's datasets is
+//! Recovery story (design.md#inv-10): every byte in pond's datasets is
 //! derivable from the registered adapters' source data. The recovery path
 //! for any corruption is `rm -rf $POND_DATA_DIR && pond sync`; this test
 //! proves the loop actually round-trips identical row counts and identical

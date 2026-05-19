@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! `Store::maintenance` (design.md 3.2.0): a pass runs `cleanup_old_versions`
+//! `Store::maintenance` (design.md#schemas-write-params): a pass runs `cleanup_old_versions`
 //! then `optimize_indices` over all four datasets, never removes logical rows,
 //! and a per-table failure does not abort the others.
 

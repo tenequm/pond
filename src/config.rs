@@ -41,9 +41,6 @@ pub fn is_local(url: &Url) -> bool {
 }
 
 /// Extract the filesystem `PathBuf` for local URLs. `None` for remote.
-/// Used by the filesystem-only branches: `create_dir_all` on the data dir,
-/// the `<data_dir>/config.toml` co-location default, and the local-FS
-/// existence probe in `open_or_create`.
 pub fn local_path(url: &Url) -> Option<PathBuf> {
     if is_local(url) {
         url.to_file_path().ok()

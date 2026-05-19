@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! HTTP+JSON transport (design.md 3.6, 2.2): `POST /v1/search` and `POST /v1/get`
+//! HTTP+JSON transport (design.md#protocol, design.md#protocol-wire-interface):
+//! `POST /v1/search` and `POST /v1/get`
 //! are thin adapters over the shared wire handlers. The router is driven via
 //! `tower::ServiceExt::oneshot` - no socket bind, no HTTP client dependency.
 

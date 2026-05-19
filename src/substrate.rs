@@ -18,6 +18,7 @@ use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
+use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
 use std::{
     collections::HashMap,
@@ -270,8 +271,7 @@ impl Handle {
     /// Open with object-store options handed through to Lance verbatim.
     /// Keys are the `object_store` crate's standard config names; pond does
     /// not parse them. Used by `pond serve --data-dir s3://...` once
-    /// `config.toml` carries an `[storage]` block (design.md#schemas-write-params storage
-    /// block / 3.6 "Recovery model").
+    /// `config.toml` carries an `[storage]` block (design.md#schemas-write-params).
     pub async fn open_with_options(
         location: &Url,
         storage_options: HashMap<String, String>,
@@ -289,9 +289,10 @@ impl Handle {
         let session = Arc::new(Session::default());
         // Build the lance-namespace catalog seam once (design.md#inv-21).
         // The `root` property is whatever URL the Directory impl understands;
-        // for local paths Lance accepts both `file://...` and bare paths, and
-        // for object stores the scheme-qualified URL is required.
-        let root = namespace_root_property(location);
+        // `uri_to_url` (lance-io/object_store.rs) accepts both bare paths and
+        // URLs, so passing the scheme-qualified URL for local FS works the
+        // same as the bare-path form. Trailing slash stripped for clean logs.
+        let root = location.as_str().trim_end_matches('/').to_string();
         let mut connect = ConnectBuilder::new("dir")
             .property("root", root)
             .session(session.clone());
@@ -637,20 +638,17 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-/// String the `lance-namespace` Directory impl wants as its `root` property.
-/// Local URLs become plain absolute paths (matching pond's historical
-/// log output); remote URLs pass through verbatim.
-fn namespace_root_property(location: &Url) -> String {
-    if let Some(path) = config::local_path(location) {
-        path.display().to_string()
-    } else {
-        location.as_str().trim_end_matches('/').to_string()
-    }
-}
-
 /// Open the table at `table_name` via the namespace; create + initialize on
 /// `TableNotFound`. Schema-checks the on-disk dataset against pond's
 /// expectation so a stale data dir surfaces early.
+///
+/// Probes via `nm.describe_table` directly rather than `DatasetBuilder::from_namespace`:
+/// the builder re-wraps an already-`Namespace`-wrapped error
+/// (lance/src/dataset/builder.rs:142), so going through it would force a
+/// chain-walk to classify `TableNotFound`. The direct probe stays at one
+/// wrap level and downcasts cleanly. Managed-versioning hookup (REST
+/// namespace external-manifest commits) is not wired here; v1 ships
+/// Directory v2 only.
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
@@ -661,12 +659,16 @@ async fn open_or_create_via_ns(
 ) -> Result<Dataset> {
     let table_id = nm_ident.as_table_id(table_name);
 
-    // Open path: ask the namespace to resolve the table. Anything other than
-    // `TableNotFound` is a real failure; fall through to create only when the
-    // catalog explicitly reports the table is missing.
-    match DatasetBuilder::from_namespace(nm.clone(), table_id.clone()).await {
-        Ok(mut builder) => {
-            builder = builder.with_session(session.clone());
+    let request = DescribeTableRequest {
+        id: Some(table_id.clone()),
+        ..Default::default()
+    };
+    match nm.describe_table(request).await {
+        Ok(response) => {
+            let location = response.location.with_context(|| {
+                format!("namespace returned no location for table {table_name}")
+            })?;
+            let mut builder = DatasetBuilder::from_uri(&location).with_session(session.clone());
             if !storage_options.is_empty() {
                 builder = builder.with_storage_options(storage_options.clone());
             }
@@ -677,13 +679,20 @@ async fn open_or_create_via_ns(
             ensure_schema_matches(&dataset, schema.as_ref(), table_name)?;
             return Ok(dataset);
         }
-        Err(error) if is_table_not_found(&error) => {
-            // fall through to create
-        }
-        Err(error) => {
-            return Err(anyhow::Error::from(error))
-                .with_context(|| format!("failed to describe table {table_name}"));
-        }
+        Err(error) => match &error {
+            lance::Error::Namespace { source, .. }
+                if matches!(
+                    source.downcast_ref::<NamespaceError>(),
+                    Some(NamespaceError::TableNotFound { .. })
+                ) =>
+            {
+                // fall through to create
+            }
+            _ => {
+                return Err(anyhow::Error::from(error))
+                    .with_context(|| format!("failed to describe table {table_name}"));
+            }
+        },
     }
 
     // Create path: pond seeds an empty dataset with the canonical schema so
@@ -703,27 +712,6 @@ async fn open_or_create_via_ns(
     Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
         .await
         .with_context(|| format!("failed to create table {table_name}"))
-}
-
-/// True when the error chain reports `NamespaceError::TableNotFound`.
-/// `DatasetBuilder::from_namespace` wraps the namespace impl's
-/// `lance::Error::Namespace { source: NamespaceError }` in another
-/// `lance::Error::Namespace { source: lance::Error }` layer, so we walk the
-/// `Namespace` source chain until we find a downcastable `NamespaceError`.
-fn is_table_not_found(error: &lance::Error) -> bool {
-    let mut cursor = error;
-    loop {
-        let lance::Error::Namespace { source, .. } = cursor else {
-            return false;
-        };
-        if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
-            return matches!(ns_err, NamespaceError::TableNotFound { .. });
-        }
-        match source.downcast_ref::<lance::Error>() {
-            Some(inner) => cursor = inner,
-            None => return false,
-        }
-    }
 }
 
 fn scanner_with_prefilter(

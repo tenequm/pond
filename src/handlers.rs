@@ -443,7 +443,7 @@ mod ingest_handler {
     /// The `pond_ingest` wire handler (design.md#protocol-pond-ingest): validate the transport
     /// envelope, then drive the event batch through [`ingest_events`]. Transport
     /// failures (bad protocol, unknown namespace, empty or oversized batch) fail
-    /// the whole request via the 3.6.1 error envelope; per-event failures land
+    /// the whole request via the design.md#protocol-error-envelope; per-event failures land
     /// in the response's `results[]` with `status: "error"`.
     pub async fn pond_ingest(store: &Store, request: IngestRequest) -> IngestEnvelope {
         if let Err(envelope) = validate_protocol(request.protocol_version) {
@@ -729,8 +729,9 @@ mod export_handler {
     //! accepts on input, so `export | ingest` is a portable backup loop.
     //! Sessions are emitted in lexicographic id order; within each session,
     //! messages run in `(timestamp, message_id)` order and each message's
-    //! parts immediately follow in `ordinal` order. Matches the 3.4 event
-    //! ordering contract so the output re-imports without re-ordering.
+    //! parts immediately follow in `ordinal` order. Matches the
+    //! design.md#protocol-ingest-semantics ordering contract so the output
+    //! re-imports without re-ordering.
 
     use anyhow::{Context, Result};
     use tokio::io::{AsyncWrite, AsyncWriteExt};

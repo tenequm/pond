@@ -111,9 +111,7 @@ Invariants 21-28 below are **forward-looking structural seams**: they were delib
 
 25. **MUST: `enable_stable_row_ids: true` on every table.** {#inv-25} Already set on the four v1 tables ([§4.3](#schemas-write-params)) for compaction-friendly index survival. Promoted to invariant because the LSM scanner's dedup key `(_gen, _rowaddr)` (the protocol that lets reads merge across base + flushed + in-memory generations under MemWAL) requires stable row ids to be on universally.
 
-26. **PK position 1 on high-volume tables is a coarse-grain shardable attribute.** {#inv-26}
-    - **Descriptive lead-in**: `session_id` on `messages`, `parts`, `embeddings`; `id` on `sessions`.
-    - **MUST**: New high-volume tables MUST place an attribute at PK pos 1 that can serve as the input to a `bucket(col, N)` (or equivalent DataFusion expression) sharding spec. This keeps the future ShardWriter activation path open without requiring a PK redesign or row migration on existing data: the shard spec attaches to the existing column and new writes route through it from that point forward.
+26. **MUST: PK position 1 on high-volume tables is a coarse-grain shardable attribute.** {#inv-26} `session_id` on `messages`, `parts`, `embeddings`; `id` on `sessions`. New high-volume tables MUST place an attribute at PK pos 1 that can serve as the input to a `bucket(col, N)` (or equivalent DataFusion expression) sharding spec. This keeps the future ShardWriter activation path open without requiring a PK redesign or row migration on existing data: the shard spec attaches to the existing column and new writes route through it from that point forward.
 
 27. **MUST: No wire operation promises reads-see-writes within milliseconds.** {#inv-27} [inv 4](#inv-4) sets the floor (5s on object stores). Pond does not contract sub-second freshness on any read path; features that would require it are out of scope. This keeps the door open for MemWAL's async-merge latency (writes durable on WAL flush, visible to the base table after merger, indexed after async index catchup) to fit the same read-staleness envelope when it activates.
 
@@ -457,9 +455,13 @@ Notes:
 
 No search-layer columns live on `parts` - retrieval is message-level and `search_text` lives on `messages` ([§4.5](#schemas-message)). FilePart content-hashing is deferred ([§8](#deferred)).
 
+**Immutable fields**
+
+- All columns: append-only per [inv 1](#inv-1). No denormalized columns on this table - Part rows hold only canonical Part variants, so the immutability-on-denorm constraint that applies to [§4.5](#schemas-message) and [§4.7](#schemas-embedding) does not arise here.
+
 **Cross-refs**
 
-- Ingest contract: [§5.5](#protocol-pond-ingest)
+- Ingest contract: [§5.5](#protocol-pond-ingest) (writes go through [`Store::merge_insert`](#inv-23))
 - Adapter seam: [§4.9](#schemas-adapter-seam)
 
 ### 4.7 Embedding                                                {#schemas-embedding}
@@ -504,6 +506,10 @@ Embedding granularity: one vector per message, no chunking. On the `~/.claude/pr
 
 Embedding model registry: TOML at `[[embeddings.models]]`, with built-in defaults shipped in the binary (pond runs without a user config). Each entry: `{ id, dim, max_embed_tokens, num_sub_vectors, distance, normalize, default }`; `id` doubles as the HuggingFace repo (minus any `@revision` suffix). pond validates against its known-model set at startup and fails fast on unknown id, dim mismatch, unsupported distance, or zero `default = true` entries. Adding a model pond already knows how to load is config-only; new loaders / remote providers ([§8](#deferred)) still require code. Per-namespace overrides at `[embeddings.overrides.<namespace>.<model_id>]` are limited to `max_embed_tokens` and `num_sub_vectors`; `dim` / `distance` / `normalize` are immutable because changing them would invalidate stored vectors. `max_embed_tokens` is overridable because it is a PK column on `embeddings`: an override produces vectors under a distinct key rather than corrupting existing ones.
 
+**Immutable fields**
+
+- Denormalized columns from `messages` (per the table above) are immutable post-write (same rule as [§4.5](#schemas-message)).
+
 **Cross-refs**
 
 - Search projection: [§5.3](#protocol-pond-search), [§5.8](#protocol-search)
@@ -532,7 +538,7 @@ Behaviors that some references model as first-class Parts or message-level field
 
 ### 4.9 Adapter seam types                                       {#schemas-adapter-seam}
 
-The adapter contract is enforced by three load-bearing types in `src/adapter/extract.rs`. Together they make [inv 15](#inv-15) ("no synthesized values") a compile error rather than a code-review violation, and [inv 18](#inv-18) (transport-agnostic) is true by construction because none of them know or care where source data came from.
+The adapter contract is enforced by three load-bearing types in `src/adapter/extract.rs`. Together they make [inv 15](#inv-15) ("no synthesized values") a compile error rather than a code-review violation; [inv 16](#inv-16) (schema-honesty corollary: a field MUST become `Option<Extracted<T>>` if any supported adapter cannot guarantee it) follows from the same seam; and [inv 18](#inv-18) (transport-agnostic) is true by construction because none of them know or care where source data came from.
 
 **`Extracted<T>` (the seal).** Opaque wrapper around a value pulled from real source data. Has `Deref<Target=T>` for read access. Has **no public constructor reachable from adapter code**: the only producer is a module-private `wrap` function inside `extract.rs`, and the only callers of `wrap` are the `extract_*` helpers in the same module (plus a `#[cfg(test)] from_test_value` for in-crate unit tests and a `pub(crate) from_stored` for the Lance decode path in `src/sessions.rs`). An adapter that wants to put a string into `PartKind::ToolResult.name` cannot construct an `Extracted<String>` from a literal, a `.into()`, a `Default`, or any conversion - the only path is `extract_str(source, "name")`. Synthesis becomes a type error.
 
@@ -1002,15 +1008,15 @@ Rationale for the major design decisions, extracted from invariant bodies and se
 
 Named questions whose answers will shape future activations. Each lives here until a concrete decision lands in [§8](#deferred) or in a numbered invariant.
 
-### 7.1 Multi-namespace router activation conditions             {#oq-multi-namespace}
+### 7.1 Multi-namespace router activation conditions             {#open-questions-multi-namespace}
 
 Single-tenant pond resolves `namespace = "local"` to the root Lance namespace `[]`. Hosted multi-tenant pond resolves wire `namespace = "<tenant>"` to a child Lance namespace `[<tenant>]`. The router seam is already in place ([inv 11](#inv-11), [inv 12](#inv-12)) and the activation is mechanical, but the trigger is not decided: first paying hosted tenant? First hosted integrator's API gateway? First non-`local` namespace string seen on a self-hosted multi-user pond? The activation also forces a decision on whether `[sources]` / `[storage]` in `config.toml` migrate to `[namespaces.<ns>.{sources,storage}]` synchronously with the wire change or lag behind.
 
-### 7.2 Live-write activation conditions                         {#oq-live-write}
+### 7.2 Live-write activation conditions                         {#open-questions-live-write}
 
 End-of-session import is v1; live-write is deferred ([§8](#deferred)) and re-uses the same wire endpoints (`pond_session_events` becomes a tail, `pond_ingest` accepts streaming variants). The substrate activations (MemWAL, LSM scanner, HNSW-on-memtable, ShardWriter) carry implementation cost; the trigger is unclear. Hosted live-write fan-out is one candidate; a personal-pond use case (live indexing of a running session for in-flight search) is another. The choice affects which substrate piece activates first.
 
-### 7.3 Hosted-tier auth model                                   {#oq-hosted-auth}
+### 7.3 Hosted-tier auth model                                   {#open-questions-hosted-auth}
 
 Pond does no authn/authz of its own ([§2.2](#scope-non-goals)); the integrator's gateway is the boundary. But the hosted-tier catalog backend is still a choice: REST namespace with credential vending and listing per tenant, or federated Directory v2 with bucket-per-tenant KMS isolation. The REST path is more flexible (any catalog the integrator already runs - Glue, Unity, Polaris, Iceberg REST) but couples pond's startup to the integrator's catalog availability. The directory path is simpler operationally but assumes a single object-store layout. Decision lands with the first hosted integrator.
 

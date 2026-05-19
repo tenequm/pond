@@ -272,7 +272,7 @@ impl Store {
     /// handler's final flush. Receives N completed substreams from the
     /// validator and:
     ///
-    ///   1. Runs the immutable-fields check (3.6.4) against the stored row
+    ///   1. Runs the immutable-fields check (design.md#protocol-pond-ingest) against the stored row
     ///      per session, sequentially. Sessions that fail produce one Error
     ///      outcome and are excluded from the write batch.
     ///   2. Deduplicates in-batch at the substream level: when two substreams
@@ -593,7 +593,7 @@ impl Store {
     /// `session_id -> wall-clock time of the Lance manifest version that
     /// last wrote the row` for the per-session staleness skip
     /// (design.md#protocol-ingest-semantics). Reads Lance's `_row_last_updated_at_version` system
-    /// column (available because pond enables stable row ids per 3.2.0)
+    /// column (available because pond enables stable row ids per design.md#inv-25)
     /// and joins it against `Dataset::versions()` for commit timestamps.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
         use lance::deps::arrow_array::UInt64Array;

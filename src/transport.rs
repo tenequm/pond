@@ -159,9 +159,8 @@ pub mod http {
 
     /// Query string for `GET /v1/sessions/{session_id}/events`
     /// (design.md#protocol-pond-session-events). `since` resumes after a prior
-    /// event id; the `Last-Event-ID`
-    /// HTTP header is honored as a fallback when the query param is absent
-    /// (EventSource auto-reconnect path).
+    /// event id; the `Last-Event-ID` HTTP header is honored as a fallback when
+    /// the query param is absent (EventSource auto-reconnect path).
     #[derive(Debug, Deserialize)]
     struct SessionEventsQuery {
         #[serde(default)]
@@ -431,8 +430,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             // Always fetch full content from the shared handler; the MCP
             // transport renders placeholders for excluded parts
             // (design.md#protocol-pond-get) instead of dropping them - so the
-            // divergence lives here,
-            // not in the handler.
+            // divergence lives here, not in the handler.
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
