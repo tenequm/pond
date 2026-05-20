@@ -14,12 +14,10 @@ use std::{
 use anyhow::Context as _;
 use async_stream::stream;
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    config::expand_home_under,
     sessions::IngestEvent,
     wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
 };
@@ -27,7 +25,7 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    collect_jsonl_files, compact_json, empty_options,
+    collect_jsonl_files, compact_json, config_path, empty_options,
     extract::{Extracted, Source, extract_compact_repr, extract_self_str, extract_str},
     extracted_text, jsonl_bytes, part_id, raw_record,
 };
@@ -73,17 +71,7 @@ impl AdapterFactory for ClaudeCodeFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        #[derive(Deserialize)]
-        struct Cfg {
-            path: PathBuf,
-        }
-        let cfg: Cfg = serde_json::from_value(config)
-            .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
-        let path = match std::env::var_os("HOME") {
-            Some(home) => expand_home_under(&cfg.path, Path::new(&home)),
-            None => cfg.path,
-        };
-        Ok(Box::new(ClaudeCodeAdapter::new(path)))
+        Ok(Box::new(ClaudeCodeAdapter::new(config_path(NAME, config)?)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -114,6 +102,9 @@ fn serialize_session(
     } else {
         messages.sort_by(by_timestamp_then_id);
     }
+    // Native replays the verbatim `options.source.raw_record`; `claude_record`
+    // below is foreign-only. Replay echoes a frozen snapshot - safe only while
+    // canonical is append-only (spec.md#additive-sync).
     let mut records = Vec::with_capacity(messages.len());
     let mut parent_uuid = None::<String>;
     for message in &messages {

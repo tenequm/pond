@@ -14,12 +14,10 @@ use std::{
 
 use async_stream::stream;
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    config::expand_home_under,
     sessions::IngestEvent,
     wire::{Message, Part, PartKind, ProviderOptions, Session},
 };
@@ -27,7 +25,7 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    collect_jsonl_files, compact_json, empty_options,
+    collect_jsonl_files, compact_json, config_path, empty_options,
     extract::{Extracted, extract_compact_repr, extract_self_str, extract_str},
     extracted_text, jsonl_bytes, part_id, raw_record,
 };
@@ -44,17 +42,7 @@ impl AdapterFactory for CodexCliFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        #[derive(Deserialize)]
-        struct Cfg {
-            path: PathBuf,
-        }
-        let cfg: Cfg = serde_json::from_value(config)
-            .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
-        let path = match std::env::var_os("HOME") {
-            Some(home) => expand_home_under(&cfg.path, Path::new(&home)),
-            None => cfg.path,
-        };
-        Ok(Box::new(CodexCliAdapter::new(path)))
+        Ok(Box::new(CodexCliAdapter::new(config_path(NAME, config)?)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -75,6 +63,10 @@ fn serialize_session(
     session: &crate::sessions::SessionWithMessages,
     fidelity: RestoreFidelity,
 ) -> Result<Vec<RestoredFile>, AdapterError> {
+    // Native replays verbatim `options.source.raw_record` rows (session_meta,
+    // then one per message); `codex_session_meta` / `codex_response_item` below
+    // are foreign-only. Replay echoes a frozen snapshot - safe only while
+    // canonical is append-only (spec.md#additive-sync).
     let mut records = Vec::new();
     if fidelity == RestoreFidelity::Native
         && let Some(raw) = raw_record(&session.session.options)

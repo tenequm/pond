@@ -410,6 +410,22 @@ pub(crate) fn jsonl_bytes(
     Ok(bytes)
 }
 
+/// Shared `AdapterFactory::open` plumbing: parse the config blob's `path` and
+/// expand a leading `~` against `$HOME` once, not per path adapter.
+pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBuf, AdapterError> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Cfg {
+        path: PathBuf,
+    }
+    let cfg: Cfg = serde_json::from_value(config)
+        .map_err(|err| AdapterError::config(adapter, format!("bad config blob: {err}")))?;
+    Ok(match std::env::var_os("HOME") {
+        Some(home) => crate::config::expand_home_under(&cfg.path, Path::new(&home)),
+        None => cfg.path,
+    })
+}
+
 pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {
     options
         .get("source")
