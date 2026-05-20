@@ -1,4 +1,4 @@
-# Pond - Design v1
+# Pond - Specification v1
 
 pond stores agentic-client sessions: it ingests them from many client formats into one canonical form, keeps them in Lance, searches them, and hands them back. One static binary, two transports, two deployments. This document specifies pond v1.
 
@@ -250,7 +250,7 @@ model ToolMessage extends BaseMessage {
 union Message { system: SystemMessage, user: UserMessage, assistant: AssistantMessage, tool: ToolMessage }
 ```
 
-Four role variants with per-role content allowlists enforced at the type level - a tool-result Part inside a user message is a category error. SystemMessage content is a plain string, not Parts. Messages within a session form a linear append-only log ordered by `(timestamp, id)`. Turn-level metadata - model, token usage, finish reason, error - is not a canonical field; sources record it on their assistant turns and adapters route it to `options.<provider>.*`.
+Four role variants with per-role content allowlists enforced at the type level - a tool-result Part inside a user message is a category error. SystemMessage content is a plain string, not Parts; it may be empty when the SystemMessage is a placement-rule-3 carrier (Section 6.5), which records absence and is not synthesis. Messages within a session form a linear append-only log ordered by `(timestamp, id)`. Turn-level metadata - model, token usage, finish reason, error - is not a canonical field; sources record it on their assistant turns and adapters route it to `options.<provider>.*`.
 
 ### 4.7 Part
 
@@ -403,6 +403,8 @@ The two faces have genuinely different shapes - one source-configured and stream
 
 Serializing is restore. Any adapter can restore any stored session, because every session is in canonical form and the serialize face needs only canonical. A session need not return to the client that produced it.
 
+**`lineage-complete-restore`** {#lineage-complete-restore} - Restoring a session MUST also restore its child sessions: the sessions that name it in `parent_session_id`. Why: a restored artifact must stand on its own in the target client - a Claude Code session that called the Task tool, restored without its subagent transcripts, is a set of dangling references rather than a working session. `parent_session_id` records a spawn or a fork (Section 4). The spawn graph is one level deep, capped structurally by the agent model - a Claude Code subagent cannot spawn subagents, and Managed Agents enforces a delegation depth of one. Multi-level fork lineage is deferred (Section 9); no v1 source emits it, so every stored graph is depth-one today. A graph found nesting deeper - a relaxed spawn cap, or fork lineage - MUST surface as a typed error, never a silent partial restore (`no-silent-drops`).
+
 ### 6.3 Origin and restore fidelity
 
 Each session records the brand of the source that produced it (`Session.source_agent`), and each adapter has a matching origin identity. Restore fidelity is decided by the system, by comparing the two - never chosen by the adapter:
@@ -420,8 +422,8 @@ The parse face builds canonical values only through a small set of extractor hel
 To satisfy `lossless-projection` (Section 4), an adapter places every field of every record it ingests by one of three rules:
 
 1. Conversational content becomes a typed Part.
-2. Harness or runtime metadata goes into `options`.
-3. Anything that fits neither is preserved as a whole-record encoding in `options`.
+2. Harness or runtime metadata goes into `options` - on the Message or Part the record maps to. This includes any field of a mapped record left over once its typed fields are taken.
+3. A record that maps to no Message at all - a standalone log entry that is neither a conversational turn nor metadata on one - is carried whole: a system-role Message with empty `content` and the record's whole-record encoding in its `options`, kept in log order by the record's own timestamp. Its id follows `deterministic-pk` (Section 3) and its timestamp the record's own value, or the session-anchor fallback that `no-synthesis` (Section 4) permits.
 
 The third rule is the catch-all that makes losslessness reachable for any record - including record types that did not exist when the adapter was written.
 
@@ -516,7 +518,7 @@ The same handlers back a set of command-line verbs:
 - `pond sync` - parse, store, and index from the configured sources.
 - `pond embed` - embed the backlog of un-embedded messages (Section 8).
 - `pond search`, `pond get` - the read operations from the command line.
-- `pond export` - stream stored sessions as canonical ingest events, a portable snapshot byte-compatible with `pond_ingest` input; `pond export --as <target>` instead restores them into a target client format through that adapter's serializer.
+- `pond export` - export stored sessions as canonical ingest events, a portable snapshot byte-compatible with `pond_ingest` input, for one named session or the whole pond. Restore is a distinct mode: it serializes one named session, with its lineage (`lineage-complete-restore`, 6.2), into a target client format through that adapter's serializer. Restore is always rooted at a single named session - there is no bulk restore-to-client-format - because a restore targets a session the caller has identified, while whole-pond transfer is already served by the canonical snapshot.
 - `pond serve` - run the HTTP server, including the MCP route.
 - `pond mcp` - run the MCP server over stdio.
 - `pond status` - row counts and dataset statistics.

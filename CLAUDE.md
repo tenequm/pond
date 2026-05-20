@@ -16,10 +16,6 @@
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
 - Run one test by name: `cargo test <name>` (substring match across all binaries; add `-- --exact` to require a full match).
 
-## Toolchain
-
-- Pinned to Rust 1.91.0, edition 2024 (see `rust-toolchain.toml`). Don't suggest unstable features.
-
 ## Source of truth
 
 - `docs/spec.md` is the spec (sections 1-10: overview, scope, storage substrate, canonical model, session datasets, adapters, protocol, search and embeddings, deferred, references). Read the relevant section before changing behavior.
