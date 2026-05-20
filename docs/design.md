@@ -46,12 +46,12 @@ These are stable positions, not v1 cuts. They will not be reopened.
 - **Be a zero-knowledge store.** Operators with bucket and KMS access have full visibility. Encryption is bucket SSE plus filesystem encryption. No application-level crypto.
 - **Ship a UI, SQL surface, or sidecar daemon.** Lance embedded is the only engine. v1 surface is HTTP+JSON plus MCP plus CLI verbs.
 
-Items deferred for later (resources, replay, live-write, additional sources, hosted facade extensions) live in §8. Items still uncertain live in §7.
+Items deferred for later (resources, replay, live-write, additional sources, hosted facade extensions) live in Section 8. Items still uncertain live in Section 7.
 
 ### 2.3 Personal pond defaults {#scope-personal-pond}
 
 - **Bind**: `--host 127.0.0.1 --port 9797`. Env overrides: `POND_HOST`, `POND_PORT`. `--port 0` selects an OS-assigned free port. `--host 0.0.0.0` is accepted but logs a security notice at startup (personal pond is single-user; LAN exposure is opt-in).
-- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (§4.7 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace embedding tuning), `[maintenance]` (§4.3 background cleanup + index optimization), `[storage]` (§4.3 object-store credentials/region/endpoint, passed verbatim to Lance; required only when `--data-dir` is an `s3://` / `gs://` / `az://` URI). `[sources]` and `[storage]` are flat in v1 on the single-namespace assumption ([inv 11](#inv-11)); multi-namespace pond will wrap them under `[namespaces.<ns>.{sources,storage}]`. `[[embeddings.models]]` + `[maintenance]` stay process-global.
+- **Config**: `$XDG_CONFIG_HOME/pond/config.toml` (Linux and macOS; XDG-strict so cross-platform path stays consistent). TOML format. Schema is documented in this doc; `pond config --print-schema` emits a fully-annotated example. Key blocks: `[[embeddings.models]]` (Section 4.7 registry; built-in default if absent), `[embeddings.overrides.<namespace>.<model_id>]` (per-namespace embedding tuning), `[maintenance]` (Section 4.3 background cleanup + index optimization), `[storage]` (Section 4.3 object-store credentials/region/endpoint, passed verbatim to Lance; required only when `--data-dir` is an `s3://` / `gs://` / `az://` URI). `[sources]` and `[storage]` are flat in v1 on the single-namespace assumption ([inv 11](#inv-11)); multi-namespace pond will wrap them under `[namespaces.<ns>.{sources,storage}]`. `[[embeddings.models]]` + `[maintenance]` stay process-global.
 - **Data**: `$XDG_DATA_HOME/pond/` (Linux and macOS; XDG-strict). Override via `--data-dir <path>` or `POND_DATA_DIR`. Object-store URIs (`s3://bucket/pond`, `gs://...`, `az://...`) are accepted directly; pair with the `[storage]` config block for credentials/region. The data dir is the root of a **Directory v2 Lance namespace**: pond opens it via `connect("dir", { root: <data-dir-uri>, storage.*: <forwarded> })` and the four tables are registered as `["sessions.lance"]`, `["messages.lance"]`, `["parts.lance"]`, `["embeddings.lance"]` in the root namespace's `__manifest` Lance table, each stored as a readable `<table>.lance/` directory. Operators using `lance-cli` directly can dereference table locations via `__manifest`. The `config.toml` file always lives locally even when the data dir is remote (it names the bucket and any creds).
 - **Logs and output - two channels, each with one owner**:
   - *Diagnostics channel*: all structured logging (spans, debug/info/warn/error) goes through `tracing`. The `tracing-subscriber` is initialized exactly once at process start (env-filter via `RUST_LOG` / `POND_LOG`) and always writes to **stderr**. No module configures logging itself.
@@ -62,7 +62,7 @@ Items deferred for later (resources, replay, live-write, additional sources, hos
 
 ## 3. Invariants {#invariants}
 
-§3.1 sets the substrate stack; §3.2 lists the numbered rules every pond write and read must satisfy; §3.3 covers concurrency.
+Section 3.1 sets the substrate stack; Section 3.2 lists the numbered rules every pond write and read must satisfy; Section 3.3 covers concurrency.
 
 ### 3.1 Stack {#invariants-stack}
 
@@ -71,13 +71,13 @@ Items deferred for later (resources, replay, live-write, additional sources, hos
 | Language | Rust, edition 2024 |
 | Async runtime | tokio |
 | Storage and search engine | `lance-format/lance` crates direct: `lance`, `lance-table`, `lance-io`, `lance-encoding`, `lance-index`. Pinned via git dependency; tag in `Cargo.toml`. No `lancedb` crate dependency. |
-| Catalog / table discovery | `lance-namespace` (the `LanceNamespace` trait) + `lance-namespace-impls` (Directory v2 backend day one; REST / Glue / Unity / Polaris / Iceberg REST adapters activated by hosted-tier per §8). Pond opens every Lance dataset through this trait ([inv 21](#inv-21)). Pond's wire `namespace` field is a tenant routing tag, distinct from the Lance `LanceNamespace` catalog concept; see §5.1. |
+| Catalog / table discovery | `lance-namespace` (the `LanceNamespace` trait) + `lance-namespace-impls` (Directory v2 backend day one; REST / Glue / Unity / Polaris / Iceberg REST adapters activated by hosted-tier per Section 8). Pond opens every Lance dataset through this trait ([inv 21](#inv-21)). Pond's wire `namespace` field is a tenant routing tag, distinct from the Lance `LanceNamespace` catalog concept; see Section 5.1. |
 | Lance file format | `stable` (2.2+) for new datasets. Blob v2 for FilePart payloads. |
 | Object store backends | `object_store` via Lance: local filesystem, S3 (native conditional writes), GCS, Azure. |
 | HTTP server | axum (tokio-native, JSON-first, SSE built in). |
 | MCP server | rmcp (official Anthropic Rust SDK), wrapping the same handlers as HTTP. |
 | Wire format | JSON. Single evolving schema with top-level `protocol_version` field. Additive-only changes; formal `v2` only on breaking changes. |
-| Default embedding model | Qwen3-Embedding-0.6B (1024-dim, 32K context, Apache 2.0) via fastembed-rs `Qwen3TextEmbedding::from_hf` on the candle backend. Full configuration in §4.7. |
+| Default embedding model | Qwen3-Embedding-0.6B (1024-dim, 32K context, Apache 2.0) via fastembed-rs `Qwen3TextEmbedding::from_hf` on the candle backend. Full configuration in Section 4.7. |
 | Output | single static binary via `cargo build --release`. |
 | Code organization | Single Cargo crate. Strict module discipline separates substrate from consumer (sessions) code internally. Workspace split deferred until a second consumer (resources, archives) ships real code. |
 
@@ -94,7 +94,7 @@ These are constraints every pond write and read must satisfy. Code review rules.
 7. **MUST: No SQL.** {#inv-7} Lance scalar predicates and search APIs are the only query mechanism.
 8. **MUST: Encryption is operational.** {#inv-8} Bucket SSE plus filesystem encryption. No application-level crypto, no `is_encrypted` columns, no KeyProvider.
 9. **MUST: Schema versioning at the dataset level.** {#inv-9} Lance manifest version plus dataset-level metadata key. No per-row `schema_version` columns.
-10. **MUST: pond is the durable copy.** {#inv-10} Once a session lands in pond, it MUST survive source rotation, source deletion, and session expiration. Sources are upstream collectors that pond ingests from; pond is the canonical record once ingestion completes. Wipe-and-resync is NOT a general recovery path - it loses any session whose source has since rotated, been deleted, or expired. Recovery for corruption goes through Lance's manifest history (§4.3 `auto_cleanup` retention) and `pond export` snapshots (§5); re-ingest is the contract for landing new rows under [inv 14](#inv-14), not a substitute for durability. Re-ingest stays safe at any time because writes are idempotent on canonical PKs ([inv 1](#inv-1) + [inv 2](#inv-2)), but the durability guarantee comes from pond's own storage, not from the source still being reachable.
+10. **MUST: pond is the durable copy.** {#inv-10} Once a session lands in pond, it MUST survive source rotation, source deletion, and session expiration. Sources are upstream collectors that pond ingests from; pond is the canonical record once ingestion completes. Wipe-and-resync is NOT a general recovery path - it loses any session whose source has since rotated, been deleted, or expired. Recovery for corruption goes through Lance's manifest history (Section 4.3 `auto_cleanup` retention) and `pond export` snapshots (Section 5); re-ingest is the contract for landing new rows under [inv 14](#inv-14), not a substitute for durability. Re-ingest stays safe at any time because writes are idempotent on canonical PKs ([inv 1](#inv-1) + [inv 2](#inv-2)), but the durability guarantee comes from pond's own storage, not from the source still being reachable.
 11. **MUST: Namespace resolution lives in one function.** {#inv-11} `handlers::resolve_namespace(namespace) -> Result<NamespaceIdent, ErrorEnvelope>` is the only code path that decides whether a request's namespace is acceptable, and returns the resolved Lance namespace identifier path (per [inv 21](#inv-21)). No wire handler hand-rolls the check. v1 returns `[]` (root); hosted multi-tenant pond returns `[<tenant>]` and every call site picks up the correct child namespace without further edits. The signature evolves once for multi-tenant; call sites do not.
 12. **MUST: Per-tenant state lives on `Store`.** {#inv-12} `AppState` carries `Store` plus stateless services only (today: `Option<Arc<dyn EmbedBackend>>`). New features that need persistent state take `&Store` or get added through the router seam, not as a sibling field on `AppState`. New backends ship as `Store::open(...)` constructors, not as parallel `S3Store` / `RemoteStore` types.
 13. **MUST: Prefilter pushdown is opt-in on every Lance `Scanner`.** {#inv-13} Pond MUST call `Scanner::prefilter(true)` on every vector kNN and FTS query; the `lance` crate defaults it to `false`. Without it, Lance silently postfilters in memory and ignores the scalar indexes entirely (recall loss; fewer than `limit` results returned). Load-bearing: an integration test on real data MUST assert via `Scanner::explain_plan` that the scalar predicate appears as a `ScalarIndexQuery` / `ScalarIndexExec` node (prefilter) and not as a top-level `FilterExec` (postfilter).
@@ -110,16 +110,16 @@ These are constraints every pond write and read must satisfy. Code review rules.
 19. **MUST: `Session.parent_message_id` implies `Session.parent_session_id`.** {#inv-19} The two pointers capture different relationships: `parent_session_id` alone covers the spawn case (claude-code subagents, nanoclaw subagents - the dominant case across real corpora); both together cover the fork-with-cut-point case (pi-mono DAG branches projected into separate pond Sessions). A `parent_message_id` without a `parent_session_id` is incoherent (a cut-point without a session to cut from), so the validator rejects such Session events with `DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION`.
 20. **MUST: `Session.project` is non-empty.** {#inv-20} Adapters MUST emit a non-empty `Extracted<String>` per session. The schema field is `Extracted<String>` (not `Option<...>`), so the seam refuses synthesized sentinels. Per-adapter extraction chains live in each adapter's source docstring (the implementation is the documentation); an adapter that genuinely cannot resolve a project MUST drop the session with `DROP_REASON_MISSING_PROJECT`, never invent one.
 
-Invariants 21-28 are **forward-looking structural seams**: deliberate v1 choices that keep pond MemWAL- and namespace-eligible by construction. Adopting `lance-namespace` is a §3.1 choice; adopting MemWAL / LSM scanner / HNSW-on-memtable / ShardWriter is deferred (§8). These invariants make those activations a substrate swap behind `Store` rather than a cross-cutting rewrite.
+Invariants 21-28 are **forward-looking structural seams**: deliberate v1 choices that keep pond MemWAL- and namespace-eligible by construction. Adopting `lance-namespace` is a Section 3.1 choice; adopting MemWAL / LSM scanner / HNSW-on-memtable / ShardWriter is deferred (Section 8). These invariants make those activations a substrate swap behind `Store` rather than a cross-cutting rewrite.
 
-21. **MUST: Catalog seam: all dataset opens go through `LanceNamespace::describe_table`.** {#inv-21} No code path constructs a path-based URI to a Lance dataset. The `Handle::open` seam in `src/substrate.rs` calls `nm.describe_table([table_name]) -> location` and only then hands the location to `DatasetBuilder::from_uri`. Swapping Directory v2 for REST / Glue / Unity / Polaris / Iceberg REST (§8 hosted-tier activation) is a `connect("<impl>", props)` change with no call-site edits.
+21. **MUST: Catalog seam: all dataset opens go through `LanceNamespace::describe_table`.** {#inv-21} No code path constructs a path-based URI to a Lance dataset. The `Handle::open` seam in `src/substrate.rs` calls `nm.describe_table([table_name]) -> location` and only then hands the location to `DatasetBuilder::from_uri`. Swapping Directory v2 for REST / Glue / Unity / Polaris / Iceberg REST (Section 8 hosted-tier activation) is a `connect("<impl>", props)` change with no call-site edits.
 22. **MUST: Read seam: all scans go through `Handle::scan(table, opts)` or `Handle::scanner(table, predicate)`.** {#inv-22} Handlers do not call `Dataset::scan()` directly. The two helpers compose: `scan` runs a typed predicate + projection and returns a `Scanner` ready to drive; `scanner` returns a configured `Scanner` for callers that then chain `.full_text_search(...)` or `.nearest(...)` (FTS / vector retrievers). Centralizing scanner construction makes [inv 13](#inv-13) (prefilter pushdown) enforceable in one place, and makes the future swap to the LSM scanner a single-file change. See `src/substrate.rs::Handle::scan` and `Handle::scanner`.
 23. **MUST: Write seam: all writes go through `Store::merge_insert(...)`.** {#inv-23} Handlers do not call `Dataset::merge_insert`, `Dataset::write`, or any other `Dataset` write API directly. The centralized helper at `src/substrate.rs::merge_insert` is what [inv 14](#inv-14) and [inv 17](#inv-17) reference; as a structural invariant it makes MemWAL's merger (itself merge-insert-shaped) a drop-in substrate swap rather than a per-call-site rewrite.
-24. **MUST: Every table declares an unenforced primary key.** {#inv-24} `Field.unenforced_primary_key_position` is set on the PK column(s) at table creation. Already true on the four v1 tables (§4.3); promoted to invariant so future tables (resources, archives, any new substrate consumer) cannot skip it - a hard MemWAL precondition.
-25. **MUST: `enable_stable_row_ids: true` on every table.** {#inv-25} Already set on the four v1 tables (§4.3) for compaction-friendly index survival. Promoted to invariant because the LSM scanner's dedup key `(_gen, _rowaddr)` - the protocol that lets reads merge across base + flushed + in-memory generations under MemWAL - requires stable row ids universally.
+24. **MUST: Every table declares an unenforced primary key.** {#inv-24} `Field.unenforced_primary_key_position` is set on the PK column(s) at table creation. Already true on the four v1 tables (Section 4.3); promoted to invariant so future tables (resources, archives, any new substrate consumer) cannot skip it - a hard MemWAL precondition.
+25. **MUST: `enable_stable_row_ids: true` on every table.** {#inv-25} Already set on the four v1 tables (Section 4.3) for compaction-friendly index survival. Promoted to invariant because the LSM scanner's dedup key `(_gen, _rowaddr)` - the protocol that lets reads merge across base + flushed + in-memory generations under MemWAL - requires stable row ids universally.
 26. **MUST: PK position 1 on high-volume tables is a coarse-grain shardable attribute.** {#inv-26} `session_id` on `messages`, `parts`, `embeddings`; `id` on `sessions`. New high-volume tables MUST place an attribute at PK pos 1 that can serve as the input to a `bucket(col, N)` (or equivalent DataFusion expression) sharding spec. This keeps the future ShardWriter activation path open without a PK redesign or row migration on existing data: the shard spec attaches to the existing column and new writes route through it from that point forward.
 27. **MUST: No wire operation promises reads-see-writes within milliseconds.** {#inv-27} [inv 4](#inv-4) sets the floor (5s on object stores). Pond does not contract sub-second freshness on any read path; features that would require it are out of scope. This keeps the door open for MemWAL's async-merge latency (writes durable on WAL flush, visible to the base table after merger, indexed after async index catchup) to fit the same read-staleness envelope when it activates.
-28. **MUST: No write batch spans multiple PK shards atomically.** {#inv-28} Each batch is keyed on one PK family: `sessions` batch on `Session.id`, `messages` batch on `session_id`, `parts` batch on `message_id` (which colocates with `session_id` via the §5.7 event-ordering contract). Cross-PK-family atomic writes are absent by construction. ShardWriter assigns each PK family to one shard; cross-shard atomicity is structurally unavailable under any MemWAL deployment, and pond's session-batched append granularity already respects this. New write paths MUST too.
+28. **MUST: No write batch spans multiple PK shards atomically.** {#inv-28} Each batch is keyed on one PK family: `sessions` batch on `Session.id`, `messages` batch on `session_id`, `parts` batch on `message_id` (which colocates with `session_id` via the Section 5.7 event-ordering contract). Cross-PK-family atomic writes are absent by construction. ShardWriter assigns each PK family to one shard; cross-shard atomicity is structurally unavailable under any MemWAL deployment, and pond's session-batched append granularity already respects this. New write paths MUST too.
 
 ### 3.3 Concurrency model {#invariants-concurrency}
 
@@ -171,18 +171,18 @@ scalar PartID extends string;
 /** Arbitrary JSON value (string | number | boolean | null | array | object). */
 scalar JsonValue;
 
-/** Universal extensibility bag. See §4.1 for namespacing conventions. */
+/** Universal extensibility bag. See Section 4.1 for namespacing conventions. */
 alias ProviderOptions = Record<string, JsonValue | null>;
 ```
 
 ### 4.3 Lance write parameters {#schemas-write-params}
 
-Applied to all four tables at create time, via the `lance-namespace` catalog seam ([inv 21](#inv-21)); the write params flow through that call into Lance, not via a hand-rolled `Dataset::write`. Each table is registered as `["<name>.lance"]` in the root namespace's `__manifest`. Per-table specifics - PK columns, scalar / FTS / vector indexes, the PK-pos-1 shardable attribute ([inv 26](#inv-26)) - are in each storage table's Notes column in §4.4-§4.7.
+Applied to all four tables at create time, via the `lance-namespace` catalog seam ([inv 21](#inv-21)); the write params flow through that call into Lance, not via a hand-rolled `Dataset::write`. Each table is registered as `["<name>.lance"]` in the root namespace's `__manifest`. Per-table specifics - PK columns, scalar / FTS / vector indexes, the PK-pos-1 shardable attribute ([inv 26](#inv-26)) - are in each storage table's Notes column in Section 4.4-Section 4.7.
 
-- `data_storage_version`: latest stable (2.2+). Per §3.1.
+- `data_storage_version`: latest stable (2.2+). Per Section 3.1.
 - `enable_v2_manifest_paths`: true (Lance default). Constant-time latest-manifest lookups.
 - `enable_stable_row_ids`: true ([inv 25](#inv-25)). Load-bearing for compaction efficiency: with stable row ids, secondary indexes (IVF_PQ vector, BM25 FTS, BTREE / Bitmap scalar) survive compaction without being rewritten to point at new row positions. With it off (the Lance default), every compaction pass remaps every index entry, which on pond's index footprint (one vector index, one FTS index, ~9 scalar indexes across the four datasets) would multiply maintenance cost. The `_rowid`-join use case is a downstream consequence; the index-survival property is the primary reason.
-- `auto_cleanup`: `older_than: 90 days` uniformly (rationale in §6). The longer-than-Lance-default window is defense-in-depth Lance manifest retention - the primary recovery path is "re-ingest from sources" ([inv 10](#inv-10)), this window covers the rare case where source data is no longer reachable (sources deleted, API sessions expired). Cleanup only removes old Lance manifest versions and any fragments referenced only by them; it does NOT delete logical rows. Stored rows accumulate indefinitely until an operator runs an explicit delete operation (not in v1 wire surface). Operators with filesystem access can use `lance-cli` directly to inspect or roll back to a retained manifest version; pond does not expose CLI verbs for this in v1.
+- `auto_cleanup`: `older_than: 90 days` uniformly (rationale in Section 6). The longer-than-Lance-default window is defense-in-depth Lance manifest retention - the primary recovery path is "re-ingest from sources" ([inv 10](#inv-10)), this window covers the rare case where source data is no longer reachable (sources deleted, API sessions expired). Cleanup only removes old Lance manifest versions and any fragments referenced only by them; it does NOT delete logical rows. Stored rows accumulate indefinitely until an operator runs an explicit delete operation (not in v1 wire surface). Operators with filesystem access can use `lance-cli` directly to inspect or roll back to a retained manifest version; pond does not expose CLI verbs for this in v1.
 - One `lance::Session` is constructed at pond startup and shared across the four datasets **and the namespace's `__manifest` Lance table**. The Session carries the metadata + index caches and the `ObjectStoreRegistry` (the underlying object_store / S3 client). Sharing it means one cache pool covers all five Lance opens and one S3 client serves all of them - load-bearing on object-store backends, where per-dataset Sessions would mean 5x connection pools and 5x credential refreshes. Routed through `DatasetBuilder::with_session` on open (under the `Handle` seam from [inv 21](#inv-21)) and `WriteParams.session` on write.
 - Object-store credentials, region, endpoint, and tunables flow from `config.toml [storage]` (or matching environment variables read by `object_store`) into `DatasetBuilder::with_storage_options` on open and `WriteParams.store_params` on write. Keys are the standard `object_store` config names (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT`, etc.); pond does not parse or validate them. Empty block on local-FS installs.
 - Unenforced primary keys declared at the schema level via `Field.unenforced_primary_key_position` ([inv 24](#inv-24)). `merge_insert` defaults to using them, satisfying [inv 2](#inv-2) with no per-call boilerplate.
@@ -233,7 +233,7 @@ model Session {
   // id). Case-preserved verbatim.
   project: string;
 
-  // Extensibility bag. See §4.1 for namespacing.
+  // Extensibility bag. See Section 4.1 for namespacing.
   options: ProviderOptions;
 }
 ```
@@ -255,12 +255,12 @@ What's intentionally NOT on Session (and where it lives instead):
 | id | Utf8 | PK pos=1 |
 | parent_session_id | Utf8? | session fork pointer |
 | parent_message_id | Utf8? | cut-point in parent session |
-| source_agent | Utf8 | NOT NULL; Bitmap (low cardinality per §5.7 canonical-strings table) |
+| source_agent | Utf8 | NOT NULL; Bitmap (low cardinality per Section 5.7 canonical-strings table) |
 | created_at | timestamp_micros | source-recorded |
 | project | Utf8 | NOT NULL per [inv 20](#inv-20); BTREE (case-sensitive equality and prefix filter pushable) |
 | options | Utf8 | JSON-serialized ProviderOptions |
 
-Immutable fields: `source_agent`, `project` (per [inv 14](#inv-14) immutable-field check; enforced at §5.5).
+Immutable fields: `source_agent`, `project` (per [inv 14](#inv-14) immutable-field check; enforced at Section 5.5).
 
 ### 4.5 Message {#schemas-message}
 
@@ -309,32 +309,32 @@ Notes:
 
 - Per-role content allowlists are enforced at the type level: a `ToolResultPart` inside a `UserMessage` is a category error.
 - **Append-only log.** Messages within a session form a linear, append-only log per [inv 1](#inv-1) and the Anthropic Managed Agents session-as-event-log framing. Ordering within a session is `ORDER BY (timestamp, id)` with `id` as tiebreak. The SourceAdapter walks source data in source order and appends in that order.
-- **No `parent_message_id` field.** Branching exists only at the Session level (§4.4). In an append-only linear log, position in the log IS the next-after relationship - no per-message parent pointers are needed.
-- **No turn-level metadata fields** (model, provider, finish_reason, tokens, response_id, error). Effect places these on Response-side Parts (`FinishPart`, `ResponseMetadataPart`, `ErrorPart`) that pond does not store. Sources record this metadata on their assistant turns; SourceAdapters route it to `options.<provider>.*` (e.g. Anthropic-shape usage to `options.anthropic.usage.*`, OpenAI to `options.openai.*`). Cross-source normalization is a search/replay-layer concern (§8), not a storage-shape concern.
+- **No `parent_message_id` field.** Branching exists only at the Session level (Section 4.4). In an append-only linear log, position in the log IS the next-after relationship - no per-message parent pointers are needed.
+- **No turn-level metadata fields** (model, provider, finish_reason, tokens, response_id, error). Effect places these on Response-side Parts (`FinishPart`, `ResponseMetadataPart`, `ErrorPart`) that pond does not store. Sources record this metadata on their assistant turns; SourceAdapters route it to `options.<provider>.*` (e.g. Anthropic-shape usage to `options.anthropic.usage.*`, OpenAI to `options.openai.*`). Cross-source normalization is a search/replay-layer concern (Section 8), not a storage-shape concern.
 
 **Storage** (dataset: `messages.lance`). One row per Message (any role).
 
 | Column | Type | Notes |
 |---|---|---|
 | session_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
-| id | Utf8 | PK pos=2; unique within session (source IDs may be locally-scoped per §4.1) |
+| id | Utf8 | PK pos=2; unique within session (source IDs may be locally-scoped per Section 4.1) |
 | timestamp | timestamp_micros | clustering pos=2; source-recorded; BTREE |
 | role | Utf8 | "system" / "user" / "assistant" / "tool"; Bitmap (4-value low-cardinality column; BTREE would prune nothing because every page's [min,max] covers every value) |
 | source_agent | Utf8 | NOT NULL; denormalized from `sessions.source_agent` at ingest by pond core; Bitmap (typically 5-20 distinct values across the corpus). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
 | project | Utf8 | NOT NULL; denormalized from `sessions.project` at ingest by pond core; BTREE (moderate cardinality, supports exact and prefix predicates). Filter pushdown surface only; `sessions` is the authoritative source for reads outside of search |
-| content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in §4.6 |
-| search_text | Utf8? | indexed retrieval surface; populated at ingest by pond core via the concatenation policy in §5.8. Non-null for user and assistant roles when at least one indexable Part (TextPart or FilePart metadata) exists; null for system and tool roles, and null for any user/assistant message whose only content is non-indexed Part types (e.g. a bare ToolCallPart). FTS-indexed and consumed by the embedding worker (same string feeds both retrievers). |
+| content | Utf8? | non-null only for system role (Effect Prompt convention: SystemMessage.content is a plain string); non-system content lives as Part rows in Section 4.6 |
+| search_text | Utf8? | indexed retrieval surface; populated at ingest by pond core via the concatenation policy in Section 5.8. Non-null for user and assistant roles when at least one indexable Part (TextPart or FilePart metadata) exists; null for system and tool roles, and null for any user/assistant message whose only content is non-indexed Part types (e.g. a bare ToolCallPart). FTS-indexed and consumed by the embedding worker (same string feeds both retrievers). |
 | options | Utf8 | JSON-serialized ProviderOptions; response metadata (model, provider, finish_reason, tokens, response_id, error) lands under `options.<provider>.*` per the source's wire format (Effect's declaration-merging pattern); source/harness facts under `options.source.*`. Stored as JSON string (not Lance Struct) for additive-only evolution: any new provider key requires zero schema change. Empty options serialize as `"{}"` (no NULLs). Hot keys may be promoted to dedicated typed sibling columns additively (e.g. `messages.input_tokens Int64?` populated forward at ingest); the JSON column stays intact, promotion is reversible. |
 
-Composite PK `(session_id, id)` lets pond preserve source-supplied IDs verbatim (per §4.1) without requiring them to be globally unique across sources or sessions. Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
+Composite PK `(session_id, id)` lets pond preserve source-supplied IDs verbatim (per Section 4.1) without requiring them to be globally unique across sources or sessions. Clustering by `(session_id, timestamp)` keeps all messages of a session contiguous on disk for sequential session-walk reads.
 
-Immutable fields: `source_agent`, `project` denormalized at ingest and immutable post-write per [inv 1](#inv-1) (append-only); not user-writable via the wire surface (see §5.5). If a `sessions` row's `project` ever needs correcting, the recovery path is re-ingest, not an in-place column update.
+Immutable fields: `source_agent`, `project` denormalized at ingest and immutable post-write per [inv 1](#inv-1) (append-only); not user-writable via the wire surface (see Section 5.5). If a `sessions` row's `project` ever needs correcting, the recovery path is re-ingest, not an in-place column update.
 
 ### 4.6 Part {#schemas-part}
 
 **Canonical fields**
 
-Pond mirrors Effect v4's Prompt-side Part union: seven variants. Field names follow snake_case per §4.1; one rename from Effect: Effect's `id` on tool-call / tool-result / approval Parts is renamed to `call_id` / `approval_id` in pond to disambiguate from `id: PartID` (the storage-row identity, which Effect doesn't have because Effect models Parts as array members).
+Pond mirrors Effect v4's Prompt-side Part union: seven variants. Field names follow snake_case per Section 4.1; one rename from Effect: Effect's `id` on tool-call / tool-result / approval Parts is renamed to `call_id` / `approval_id` in pond to disambiguate from `id: PartID` (the storage-row identity, which Effect doesn't have because Effect models Parts as array members).
 
 ```typespec
 @discriminator("type")
@@ -419,24 +419,24 @@ Notes:
 | Column | Type | Notes |
 |---|---|---|
 | message_id | Utf8 | PK pos=1; clustering pos=1; BTREE |
-| id | Utf8 | PK pos=2; unique within message (Part IDs in source data, where present, are array-local; otherwise SourceAdapter-generated UUIDv7 per §4.1) |
-| ordinal | Int32 | position within `message.content[]`; preserves the array order canonical to §4.5 |
+| id | Utf8 | PK pos=2; unique within message (Part IDs in source data, where present, are array-local; otherwise SourceAdapter-generated UUIDv7 per Section 4.1) |
+| ordinal | Int32 | position within `message.content[]`; preserves the array order canonical to Section 4.5 |
 | type | Utf8 | Part discriminator (`text` / `reasoning` / `file` / `tool_call` / `tool_result` / `tool_approval_request` / `tool_approval_response`); Bitmap (7-value low-cardinality column) |
 | options | Utf8 | JSON-serialized ProviderOptions |
 | variant_data | Utf8 | JSON-serialized variant-specific fields (TextPart.text, ReasoningPart.text, ToolCallPart.{call_id, name, params, provider_executed}, ToolResultPart.{call_id, name, is_failure, result}, ToolApprovalRequestPart.{approval_id, tool_call_id}, ToolApprovalResponsePart.{approval_id, approved, reason}, FilePart.{media_type, file_name}) |
 | data | Struct&lt;data: LargeBinary?, uri: Utf8?&gt; with `ARROW:extension:name = lance.blob.v2` | FilePart.data only; null on other Part types. Lance Blob v2 carries the inline-bytes-OR-uri union from the canonical type above as a nullable-field struct (exactly-one-of semantics), not an Arrow Union type. Blobs above the per-field `BLOB_DEDICATED_SIZE_THRESHOLD` (Lance default 4 MB) are auto-routed to dedicated `.blob` pack files within the dataset; the pack-file size ceiling is the hardcoded `PACK_FILE_MAX_SIZE` constant (1 GiB), not a configurable parameter. |
 
-No search-layer columns live on `parts` - retrieval is message-level and `search_text` lives on `messages` (§4.5). FilePart content-hashing is deferred (§8).
+No search-layer columns live on `parts` - retrieval is message-level and `search_text` lives on `messages` (Section 4.5). FilePart content-hashing is deferred (Section 8).
 
-Immutable fields: all columns, append-only per [inv 1](#inv-1). No denormalized columns on this table, so the immutability-on-denorm constraint that applies to §4.5 and §4.7 does not arise here.
+Immutable fields: all columns, append-only per [inv 1](#inv-1). No denormalized columns on this table, so the immutability-on-denorm constraint that applies to Section 4.5 and Section 4.7 does not arise here.
 
 ### 4.7 Embedding {#schemas-embedding}
 
 **Canonical fields**
 
-Embeddings have no canonical-type counterpart in §4.4/§4.5/§4.6 - they are denormalized derivatives produced by pond at ingest, not source-supplied facts. The row identity is `(message_id, model_id, max_embed_tokens)`: a vector produced by a given model under a given truncation cap, for a given Message.
+Embeddings have no canonical-type counterpart in Section 4.4/Section 4.5/Section 4.6 - they are denormalized derivatives produced by pond at ingest, not source-supplied facts. The row identity is `(message_id, model_id, max_embed_tokens)`: a vector produced by a given model under a given truncation cap, for a given Message.
 
-**Storage** (dataset: `embeddings.lance`). One row per (Message, embedding model). Granularity is the Message - not the Part, and not a sub-message chunk: retrieval returns messages (per §5.8) and vector + FTS agree on row identity for RRF.
+**Storage** (dataset: `embeddings.lance`). One row per (Message, embedding model). Granularity is the Message - not the Part, and not a sub-message chunk: retrieval returns messages (per Section 5.8) and vector + FTS agree on row identity for RRF.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -447,14 +447,14 @@ Embeddings have no canonical-type counterpart in §4.4/§4.5/§4.6 - they are de
 | session_id | Utf8 | NOT NULL; denormalized from `messages.session_id` at ingest by pond core; BTREE (high cardinality, supports `session_id = X` prefilter on vector kNN) |
 | source_agent | Utf8 | NOT NULL; denormalized from `messages.source_agent` at ingest by pond core; Bitmap (low cardinality) |
 | project | Utf8 | NOT NULL; denormalized from `messages.project` at ingest by pond core; BTREE |
-| role | Utf8 | NOT NULL; denormalized from `messages.role` at ingest by pond core; Bitmap (4-value column; only `user` and `assistant` rows actually exist in this table since system/tool produce no embeddings per §5.8, but the column is declared for filter-pushdown completeness) |
+| role | Utf8 | NOT NULL; denormalized from `messages.role` at ingest by pond core; Bitmap (4-value column; only `user` and `assistant` rows actually exist in this table since system/tool produce no embeddings per Section 5.8, but the column is declared for filter-pushdown completeness) |
 | timestamp | timestamp_micros | denormalized from `messages.timestamp` at ingest by pond core; BTREE (supports `from_date`/`to_date` prefilter on vector kNN) |
 
 Scalar indexes: BTREE on `message_id`, `session_id`, `project`, `timestamp`; BITMAP on `source_agent`, `role`. Vector index: IVF_PQ on `vector` (defaults below). Per [inv 26](#inv-26) the shardable attribute is `session_id` (the canonical PK pos 1 is `message_id`, which colocates with `session_id` via the ingest contract).
 
-Denormalized columns are immutable post-write (same rule as §4.5). They exist to enable single-stage filter pushdown for vector kNN without cross-table joins (Lance has no relational join planner with the crate stack pond uses; see §5.8). Dictionary encoding for low-cardinality denorm columns (`source_agent`, `role`) is auto-detected by Lance v2.2+ at fragment-write time; small ingest batches under the 100-row threshold under-encode until compaction merges fragments (handled by the maintenance task per §4.3).
+Denormalized columns are immutable post-write (same rule as Section 4.5). They exist to enable single-stage filter pushdown for vector kNN without cross-table joins (Lance has no relational join planner with the crate stack pond uses; see Section 5.8). Dictionary encoding for low-cardinality denorm columns (`source_agent`, `role`) is auto-detected by Lance v2.2+ at fragment-write time; small ingest batches under the 100-row threshold under-encode until compaction merges fragments (handled by the maintenance task per Section 4.3).
 
-Input text for embedding is `messages.search_text` (§4.5), produced by the concatenation policy in §5.8. Messages with NULL `search_text` (system and tool rows) produce no embedding rows.
+Input text for embedding is `messages.search_text` (Section 4.5), produced by the concatenation policy in Section 5.8. Messages with NULL `search_text` (system and tool rows) produce no embedding rows.
 
 Vector index: IVF_PQ on `vector`. Distance: cosine (Qwen3 vectors are L2-normalized by the model; matches its training objective). Defaults for the 1024-dim Qwen3-Embedding-0.6B case: `num_partitions = max(32, min(4096, round(sqrt(num_rows))))` (recomputed at each index build); `num_sub_vectors = 64` (16-float PQ codebooks); `num_bits = 8` (Lance default, 256 centroids per codebook). Activation threshold: 10,000 rows in the embeddings table - below that, queries use a flat exact scan (Lance handles this transparently when no index exists). When a future model with a different `dim` lands, the chosen `num_sub_vectors` for that model lives in the registry entry; no universal formula is committed in code.
 
@@ -464,9 +464,9 @@ Multi-model coexistence: multiple rows per message within one table - one per mo
 
 Loader mechanics: Qwen3 is reached via fastembed-rs's `Qwen3TextEmbedding::from_hf` API (distinct from fastembed-rs's standard ort-backed `EmbeddingModel` enum, which does not include Qwen3); the loader runs on the candle backend, gated by fastembed-rs's opt-in `qwen3` Cargo feature. Device selection: Metal GPU on macOS (target-gated `metal` feature, day-one), CPU by default on Linux, NVIDIA GPU on Linux when built with the opt-in `cuda` feature. Pond passes the device via candle's `metal_if_available` / `cuda_if_available` helpers into `Qwen3TextEmbedding::from_hf`.
 
-Embedding granularity: one vector per message, no chunking. On the `~/.claude/projects/` corpus (689,702 messages), `search_text` is 20 tokens at the median and ~98% of messages are under 1024 tokens; chunking would multiply `embeddings` rows for the ~2% over the cap only for RRF to dedup them back to one hit per message. `max_embed_tokens` (default 1024) is passed as `Qwen3TextEmbedding::from_hf`'s tokenizer `max_length`, so fastembed-rs truncates input before inference - pond owns no tokenizer. The cap is a model-cost bound on the p99 tail, not a retrieval-quality knob: FTS (§5.8) indexes the uncapped `search_text` and `pond_get` (§5.4) always returns the full message. Truncation is deterministic, so re-ingest is a no-op; `max_embed_tokens` is a PK column on this table for exactly this reason - changing the cap re-embeds the affected over-cap tail under a distinct row instead of silently overwriting. Output dim is the model's fixed 1024 (no Matryoshka in fastembed-rs); variable dims are deferred (§8).
+Embedding granularity: one vector per message, no chunking. On the `~/.claude/projects/` corpus (689,702 messages), `search_text` is 20 tokens at the median and ~98% of messages are under 1024 tokens; chunking would multiply `embeddings` rows for the ~2% over the cap only for RRF to dedup them back to one hit per message. `max_embed_tokens` (default 1024) is passed as `Qwen3TextEmbedding::from_hf`'s tokenizer `max_length`, so fastembed-rs truncates input before inference - pond owns no tokenizer. The cap is a model-cost bound on the p99 tail, not a retrieval-quality knob: FTS (Section 5.8) indexes the uncapped `search_text` and `pond_get` (Section 5.4) always returns the full message. Truncation is deterministic, so re-ingest is a no-op; `max_embed_tokens` is a PK column on this table for exactly this reason - changing the cap re-embeds the affected over-cap tail under a distinct row instead of silently overwriting. Output dim is the model's fixed 1024 (no Matryoshka in fastembed-rs); variable dims are deferred (Section 8).
 
-Embedding model registry: TOML at `[[embeddings.models]]`, with built-in defaults shipped in the binary (pond runs without a user config). Each entry: `{ id, dim, max_embed_tokens, num_sub_vectors, distance, normalize, default }`; `id` doubles as the HuggingFace repo (minus any `@revision` suffix). pond validates against its known-model set at startup and fails fast on unknown id, dim mismatch, unsupported distance, or zero `default = true` entries. Adding a model pond already knows how to load is config-only; new loaders / remote providers (§8) still require code. Per-namespace overrides at `[embeddings.overrides.<namespace>.<model_id>]` are limited to `max_embed_tokens` and `num_sub_vectors`; `dim` / `distance` / `normalize` are immutable because changing them would invalidate stored vectors. `max_embed_tokens` is overridable because it is a PK column on `embeddings`: an override produces vectors under a distinct key rather than corrupting existing ones.
+Embedding model registry: TOML at `[[embeddings.models]]`, with built-in defaults shipped in the binary (pond runs without a user config). Each entry: `{ id, dim, max_embed_tokens, num_sub_vectors, distance, normalize, default }`; `id` doubles as the HuggingFace repo (minus any `@revision` suffix). pond validates against its known-model set at startup and fails fast on unknown id, dim mismatch, unsupported distance, or zero `default = true` entries. Adding a model pond already knows how to load is config-only; new loaders / remote providers (Section 8) still require code. Per-namespace overrides at `[embeddings.overrides.<namespace>.<model_id>]` are limited to `max_embed_tokens` and `num_sub_vectors`; `dim` / `distance` / `normalize` are immutable because changing them would invalidate stored vectors. `max_embed_tokens` is overridable because it is a PK column on `embeddings`: an override produces vectors under a distinct key rather than corrupting existing ones.
 
 ### 4.8 What's absent + where it lives {#schemas-absent}
 
@@ -487,7 +487,7 @@ Behaviors that some references model as first-class Parts or message-level field
 | Finish reason, token usage, model, provider, response_id | `options.<provider>.*` (e.g. `options.anthropic.usage.input_tokens`, `options.openai.finish_reason`) |
 | Tool approvals as side-table | Pond keeps as Parts (Effect's shape), inside canonical |
 | Per-Part timestamps | `options.source.time.*` on the Part |
-| Synthetic orphan-tool-result sentinels | Not in canonical storage; replay layer (deferred, §8) generates them |
+| Synthetic orphan-tool-result sentinels | Not in canonical storage; replay layer (deferred, Section 8) generates them |
 
 ### 4.9 Adapter seam types {#schemas-adapter-seam}
 
@@ -512,11 +512,11 @@ Operations:
 - `schema://pond` - resource (search fields and filter documentation)
 - `stats://pond` - resource (dataset counts, embedding model, storage stats)
 
-Every request body carries `protocol_version: 1` (per §5.1) and an optional `namespace` (defaults to `"local"`). Every response body (success or error) carries `request_id` (server-generated UUIDv7) for log correlation.
+Every request body carries `protocol_version: 1` (per Section 5.1) and an optional `namespace` (defaults to `"local"`). Every response body (success or error) carries `request_id` (server-generated UUIDv7) for log correlation.
 
 CLI verbs (out-of-band):
 
-- `pond sync [<adapter>]` - parse, store, and index data from one configured `[sources.<adapter>]` (or every entry, with no arg). On an empty `[sources]` block runs interactive adapter discovery against each adapter's canonical install location, writes the picks back to `config.toml`, and continues. Always applies the per-session staleness skip where the adapter supports it (§5.7). Wire layer stays `ingest`-named (`pond_ingest`, `IngestRequest`, `IngestEvent`); only the CLI verb is `sync`.
+- `pond sync [<adapter>]` - parse, store, and index data from one configured `[sources.<adapter>]` (or every entry, with no arg). On an empty `[sources]` block runs interactive adapter discovery against each adapter's canonical install location, writes the picks back to `config.toml`, and continues. Always applies the per-session staleness skip where the adapter supports it (Section 5.7). Wire layer stays `ingest`-named (`pond_ingest`, `IngestRequest`, `IngestEvent`); only the CLI verb is `sync`.
 - `pond embed` - walk the un-embedded message backlog and produce vectors under the default model identity. Idempotent on `(message_id, model_id, max_embed_tokens)`; safe to re-run.
 - `pond search <query>` - run a search from the CLI; same handler as `pond_search`, results rendered to stdout.
 - `pond get` - fetch a session or message from the CLI (`--session` / `--message`, plus the `pond_get` toggles); same handler as `pond_get`.
@@ -528,7 +528,7 @@ CLI verbs (out-of-band):
 
 pond has no separate `setup` verb: the data dir is created on first `Handle::open`, and the embedding model is fetched on the first run that loads it (hf-hub cache).
 
-**Recovery model.** pond is the durable copy ([inv 10](#inv-10)): sessions persist past their source's lifetime, so recovery cannot assume the source is still reachable. The primary recovery surface is Lance's manifest history - §4.3 `auto_cleanup` keeps old manifest versions for 90 days, inspectable and rollback-able via `lance-cli` directly. Beyond that window, the operator's defense is `pond export` ahead of risky operations: a portable JSONL snapshot byte-identical with `pond_ingest` input, so `pond export -o backup.jsonl` plus `pond ingest backup.jsonl` is a clean restore path that does not depend on the original adapter sources. `rm -rf $POND_DATA_DIR && pond sync` is a re-ingest, not a recovery: it is idempotent on the canonical PKs ([inv 1](#inv-1) + [inv 2](#inv-2)) and brings back exactly the sessions whose sources are still reachable, no others. pond does not ship `versions list` / `checkout` / `restore` CLI verbs in v1; the time-travel-as-feature use case is deferred to §8.
+**Recovery model.** pond is the durable copy ([inv 10](#inv-10)): sessions persist past their source's lifetime, so recovery cannot assume the source is still reachable. The primary recovery surface is Lance's manifest history - Section 4.3 `auto_cleanup` keeps old manifest versions for 90 days, inspectable and rollback-able via `lance-cli` directly. Beyond that window, the operator's defense is `pond export` ahead of risky operations: a portable JSONL snapshot byte-identical with `pond_ingest` input, so `pond export -o backup.jsonl` plus `pond ingest backup.jsonl` is a clean restore path that does not depend on the original adapter sources. `rm -rf $POND_DATA_DIR && pond sync` is a re-ingest, not a recovery: it is idempotent on the canonical PKs ([inv 1](#inv-1) + [inv 2](#inv-2)) and brings back exactly the sessions whose sources are still reachable, no others. pond does not ship `versions list` / `checkout` / `restore` CLI verbs in v1; the time-travel-as-feature use case is deferred to Section 8.
 
 ### 5.1 Wire interface {#protocol-wire-interface}
 
@@ -536,9 +536,9 @@ The wire interface is the contract. Internal serde types evolve freely behind a 
 
 - **Transport-agnostic handlers.** Every operation is a function `Json request -> Json response` (with optional streaming response for SSE). HTTP and MCP transports are thin adapters that dispatch to the same handler functions.
 - **Request envelope.** Every request carries a `protocol_version` field at the top level. Value is a positive integer (`1`, `2`, ...); v1 ships `1`. Server validates the field and returns a typed error on unknown version.
-- **Namespace per request.** Every wire request carries a `namespace: string?` field. Omitted means `"local"` (personal pond's hardcoded namespace). Hosted integrators populate it from their own pre-pond auth resolution. Pond performs no authn/authz of its own; the bucket's IAM is the storage boundary and the integrator's gateway is the application boundary. No HTTP middleware seam in pond core. **Name collision warning:** pond's wire `namespace` is a tenant routing tag and is distinct from Lance's `LanceNamespace` catalog concept (the trait that owns table discovery and location resolution; see §3.1). In single-tenant v1 the wire `namespace` is always `"local"` and resolves to the root Lance namespace `[]`. In hosted multi-tenant (deferred, §8) it resolves to a Lance child namespace `[<tenant>]` and table identifiers become `[<tenant>, "sessions.lance"]` etc. Same word, distinct concepts.
+- **Namespace per request.** Every wire request carries a `namespace: string?` field. Omitted means `"local"` (personal pond's hardcoded namespace). Hosted integrators populate it from their own pre-pond auth resolution. Pond performs no authn/authz of its own; the bucket's IAM is the storage boundary and the integrator's gateway is the application boundary. No HTTP middleware seam in pond core. **Name collision warning:** pond's wire `namespace` is a tenant routing tag and is distinct from Lance's `LanceNamespace` catalog concept (the trait that owns table discovery and location resolution; see Section 3.1). In single-tenant v1 the wire `namespace` is always `"local"` and resolves to the root Lance namespace `[]`. In hosted multi-tenant (deferred, Section 8) it resolves to a Lance child namespace `[<tenant>]` and table identifiers become `[<tenant>, "sessions.lance"]` etc. Same word, distinct concepts.
 - **Schema evolution.** Additive-only within a major version. Adding fields is allowed; removing or retyping fields requires a major bump.
-- **Published schema artifacts.** JSON Schema files generated from Rust types, committed to the repo, versioned with the binary. Pond's canonical types derive from Effect's `Prompt` shape (§4), not from OTel GenAI. OTel's `gen-ai-input-messages.json`, `gen-ai-output-messages.json`, `gen-ai-tool-definitions.json`, and related schemas are noted as inspiration where shapes overlap (messages, tool definitions, finish reasons) but pond does not claim derivation. An OTel-compatible projection schema is deferred to §8 for the day a consumer wants OTel observability interop.
+- **Published schema artifacts.** JSON Schema files generated from Rust types, committed to the repo, versioned with the binary. Pond's canonical types derive from Effect's `Prompt` shape (Section 4), not from OTel GenAI. OTel's `gen-ai-input-messages.json`, `gen-ai-output-messages.json`, `gen-ai-tool-definitions.json`, and related schemas are noted as inspiration where shapes overlap (messages, tool definitions, finish reasons) but pond does not claim derivation. An OTel-compatible projection schema is deferred to Section 8 for the day a consumer wants OTel observability interop.
 - **HTTP shape.** `POST /v1/<operation>` with JSON body; RPC-shaped, no REST resource model. Streaming responses use SSE on `GET /v1/sessions/{session_id}/events?since=<event_id>`.
 - **MCP shape.** Only `pond_search` and `pond_get` are exposed as MCP tools (the kb-parity read surface); `pond_ingest` and `pond_session_events` stay HTTP-and-CLI only. MCP `tools/list` returns the two read tools plus the `schema://pond` / `stats://pond` resources.
 
@@ -609,12 +609,12 @@ Request `POST /v1/search`:
 ```
 
 - `query`: required, non-empty after trim.
-- The mode is not a request input. The server picks hybrid or fts based on the embedder state; the response carries no top-level mode field - per-hit `matched_via` reports which retriever(s) ranked each row (see §5.8).
+- The mode is not a request input. The server picks hybrid or fts based on the embedder state; the response carries no top-level mode field - per-hit `matched_via` reports which retriever(s) ranked each row (see Section 5.8).
 - `rrf_k`: default 60. Consulted only when the server runs hybrid mode.
 - `filters.project`: `null` (no filter) | `{ "contains": "<substring>" }` | `{ "regex": "<pattern>" }`. Regex never pushes down to the BTREE index (full-fragment scan); contains uses LIKE pushdown. There is no `is_null` form - [inv 20](#inv-20) makes `Session.project` non-empty.
 - `filters.role`: `"user"` | `"assistant"` | `"system"` | `"tool"`. System/tool always return empty (NULL search_text).
 - `filters.min_score`: default `0.0` (no threshold).
-- `boost_recent`: default `true`; formula in §5.8.
+- `boost_recent`: default `true`; formula in Section 5.8.
 - `group_by_conversation`: default `false`.
 - `limit`: default 10, server-enforced cap 200.
 
@@ -649,7 +649,7 @@ Response (default):
 - `recency_boost`: additive bump; `0` when `boost_recent: false`.
 - `total`: count of returned hits (= `hits.length`); not the global match count.
 
-Response (`group_by_conversation: true`): the `hits` field is replaced by `groups` per §5.8 shape.
+Response (`group_by_conversation: true`): the `hits` field is replaced by `groups` per Section 5.8 shape.
 
 ### 5.4 pond_get {#protocol-pond-get}
 
@@ -679,7 +679,7 @@ Request `POST /v1/get` (one of `session_id` or `message_id` required):
 
 **MCP-transport rendering note.** Over the MCP transport, stripped `ReasoningPart` / `ToolResultPart` Parts are replaced with a compact placeholder string (`[reasoning: N chars]`, `[tool_result: N chars]`) rather than removed silently, so a calling agent knows retrievable content exists and can re-request with the toggle. The HTTP transport strips with no placeholder (structured clients re-request explicitly). This is the only intentional HTTP-vs-MCP response-shape divergence; it lives in the MCP adapter, not the shared handler.
 
-Response shape carries the canonical Session/Message/Part types verbatim plus `request_id`. Specific shape omitted from this section (mirrors §4).
+Response shape carries the canonical Session/Message/Part types verbatim plus `request_id`. Specific shape omitted from this section (mirrors Section 4).
 
 ### 5.5 pond_ingest {#protocol-pond-ingest}
 
@@ -690,9 +690,9 @@ Request `POST /v1/ingest`:
   "protocol_version": 1,
   "namespace": "local",
   "events": [
-    { "kind": "session", "data": { /* Session per §4.4 */ } },
-    { "kind": "message", "data": { /* Message per §4.5 */ } },
-    { "kind": "part",    "data": { /* Part per §4.6 */ } }
+    { "kind": "session", "data": { /* Session per Section 4.4 */ } },
+    { "kind": "message", "data": { /* Message per Section 4.5 */ } },
+    { "kind": "part",    "data": { /* Part per Section 4.6 */ } }
   ]
 }
 ```
@@ -701,9 +701,9 @@ Request `POST /v1/ingest`:
 - Envelope `kind` discriminator (`"session"` | `"message"` | `"part"`) avoids collision with canonical types' internal discriminators (`Message.role`, `Part.type`).
 - Events processed in array order. Pond does not reorder.
 - Batch caps: 1000 events OR 8MB body size, whichever first. Over: `validation_failed`.
-- No batch atomicity across sessions. Events are grouped by session substream and each session is written in at most three batched `merge_insert`s (per §5.7); partial success across sessions is normal and explicit via per-row `status`.
-- Transport-level errors (bad JSON, version_unsupported, namespace_unknown, empty batch) fail the whole request via the §5.2 envelope.
-- **Event ordering enforced** (§5.7): first event in any new-session substream must be `Session`; every `Part` event's `message_id` must match the most recent `Message` in the same substream; every `Message`'s `session_id` must reference a `Session` already seen (this batch or the dataset). A violation surfaces as per-row `validation_failed` and aborts the remaining events of the offending session's substream; events of other sessions in the batch still process. This is the identical semantics the CLI streaming adapter applies - the two transports do not differ.
+- No batch atomicity across sessions. Events are grouped by session substream and each session is written in at most three batched `merge_insert`s (per Section 5.7); partial success across sessions is normal and explicit via per-row `status`.
+- Transport-level errors (bad JSON, version_unsupported, namespace_unknown, empty batch) fail the whole request via the Section 5.2 envelope.
+- **Event ordering enforced** (Section 5.7): first event in any new-session substream must be `Session`; every `Part` event's `message_id` must match the most recent `Message` in the same substream; every `Message`'s `session_id` must reference a `Session` already seen (this batch or the dataset). A violation surfaces as per-row `validation_failed` and aborts the remaining events of the offending session's substream; events of other sessions in the batch still process. This is the identical semantics the CLI streaming adapter applies - the two transports do not differ.
 - **Immutable session-level fields.** `Session.source_agent` and `Session.project` are immutable post-first-write. A `kind: "session"` event whose `data.id` matches an existing session row and whose `source_agent` or `project` differs from the stored row returns per-row `validation_failed` with `details: { field: "source_agent" | "project", reason: "immutable" }`. Other Session fields (`options`, `parent_session_id`, `parent_message_id`, `created_at`) on a re-submitted session are silently ignored (per [inv 14](#inv-14), sync is purely additive: matched rows are no-ops). Recovery from a wrong `source_agent`/`project`: delete the affected session rows and re-ingest (delete is not in the v1 wire surface; admin operation only).
 
 Response:
@@ -730,7 +730,7 @@ Response:
 
 `GET /v1/sessions/{session_id}/events?since=<event_id>&include_thinking=false&include_tool_results=false&namespace=local`
 
-v1 scope: catch-up reads only. The server scans messages + parts strictly after `since`, emits them in `(timestamp, message_id)` order, then closes. Live-tail activates with live-write (§8) on the same endpoint without a wire change.
+v1 scope: catch-up reads only. The server scans messages + parts strictly after `since`, emits them in `(timestamp, message_id)` order, then closes. Live-tail activates with live-write (Section 8) on the same endpoint without a wire change.
 
 Query params:
 - `since`: optional. Falls back to the `Last-Event-ID` HTTP header (EventSource auto-reconnect). Explicit `since` wins if both set.
@@ -775,7 +775,7 @@ MCP equivalent: not exposed in v1. Future deferred.
 
 ### 5.7 Ingest semantics {#protocol-ingest-semantics}
 
-v1 ships the Claude Code and Codex adapters; §8 lists the others on the roadmap.
+v1 ships the Claude Code and Codex adapters; Section 8 lists the others on the roadmap.
 
 **Source configuration.** Each adapter type gets one `[sources.<adapter>]` block in `config.toml`:
 
@@ -791,18 +791,18 @@ path = "~/.codex/sessions"
 
 **The adapter seam.** The seam is two traits in `src/adapter/mod.rs`. `AdapterFactory` is the stateless face each format registers once in `registry()`: it names the format, opens a configured `Adapter` from an opaque JSON config blob, and probes the environment for a default config. `Adapter` is the live instance: `events()` streams canonical `IngestEvent`s in append-only per-session order; `discover()` counts the sessions it will emit (drives the CLI progress bar); `events_with(oracle)` is the staleness-aware variant that may consult a `SkipOracle` to short-circuit per-session re-decoding. Both traits are `dyn`-compatible because the async methods return boxed streams/futures (`EventStream`, `DiscoverFuture`, `AdapterYieldStream`), so multi-adapter dispatch is `Box<dyn Adapter>` selected from the static `registry()` table - a new adapter is one file under `src/adapter/` plus one `registry()` line, no central enum to edit.
 
-`IngestEvent` is the canonical-shape unit an adapter emits - a `Session`, `Message`, or `Part`, each carrying the locked §4 canonical type. Streaming the event methods gives pull-driven backpressure for free (pond core controls flow), bounds memory for huge JSONL files, and maps cleanly to every source shape pond plans to absorb (see `tests/fixtures/session-samples/`). Adapter implementations use tokio I/O primitives (`tokio::fs`, `tokio::io::BufReader::lines` for JSONL) and the `serde` / `serde_json` stack for parsing. Malformed input surfaces as an `AdapterError` carrying adapter + location, never a silent drop ([inv 5](#inv-5)).
+`IngestEvent` is the canonical-shape unit an adapter emits - a `Session`, `Message`, or `Part`, each carrying the locked Section 4 canonical type. Streaming the event methods gives pull-driven backpressure for free (pond core controls flow), bounds memory for huge JSONL files, and maps cleanly to every source shape pond plans to absorb (see `tests/fixtures/session-samples/`). Adapter implementations use tokio I/O primitives (`tokio::fs`, `tokio::io::BufReader::lines` for JSONL) and the `serde` / `serde_json` stack for parsing. Malformed input surfaces as an `AdapterError` carrying adapter + location, never a silent drop ([inv 5](#inv-5)).
 
-**Event ordering contract** (load-bearing for §5.8's search_text-population flow). The event stream MUST emit, for a single session:
+**Event ordering contract** (load-bearing for Section 5.8's search_text-population flow). The event stream MUST emit, for a single session:
 
 1. The `Session` event first (exactly one per session).
 2. For each Message in canonical source order: the `Message` event, then all of its `Part` events in `ordinal` order, before the next `Message` event.
 
-Parts always immediately follow their parent Message; the transition from a Part event to any non-Part event (Session or Message) signals end-of-Parts for the preceding Message. Pond core relies on this boundary to compute `messages.search_text` (§5.8) without buffering across Message boundaries. Adapters that produce events in any other order are non-conformant.
+Parts always immediately follow their parent Message; the transition from a Part event to any non-Part event (Session or Message) signals end-of-Parts for the preceding Message. Pond core relies on this boundary to compute `messages.search_text` (Section 5.8) without buffering across Message boundaries. Adapters that produce events in any other order are non-conformant.
 
 **Ordering enforcement.** Pond core's ingest path validates the contract per-event: (a) the first event of a session's substream must be `Session`; (b) every `Part` event must carry a `message_id` matching the most recent `Message` event since the last boundary; (c) a `Message` event must reference an already-seen `Session.id` (in the current stream or in the dataset); (d) message_ids within a substream are unique; part_ids within a message are unique.
 
-**The unit of abort is the offending event, not the substream.** A violation surfaces as one `validation_failed` outcome (§5.2) for the offending event, and the substream continues from the next valid anchor. A Part with the wrong `message_id` removes that one Part, not the events around it; `IngestSummary` reports `dropped_events` (in-session per-event drops) and `dropped_sessions` (whole-substream rejections) as distinct populations so the operator can tell one corrupted line from one corrupted session. Whole-substream rejection survives only for Session-level invariants: the `source_agent` / `project` immutability check (§5.5) compares the buffered Session against a previously stored row; if they disagree, the buffered Session has no valid anchor to write under and its substream is dropped wholesale.
+**The unit of abort is the offending event, not the substream.** A violation surfaces as one `validation_failed` outcome (Section 5.2) for the offending event, and the substream continues from the next valid anchor. A Part with the wrong `message_id` removes that one Part, not the events around it; `IngestSummary` reports `dropped_events` (in-session per-event drops) and `dropped_sessions` (whole-substream rejections) as distinct populations so the operator can tell one corrupted line from one corrupted session. Whole-substream rejection survives only for Session-level invariants: the `source_agent` / `project` immutability check (Section 5.5) compares the buffered Session against a previously stored row; if they disagree, the buffered Session has no valid anchor to write under and its substream is dropped wholesale.
 
 [inv 5](#inv-5) (no silent drops) is met by surfacing every drop via a `SyncEvent` (CLI sync) or a per-row `validation_failed` outcome (HTTP `pond_ingest`). The CLI `decode` stream carries exactly one session, so drops there happen inline as the file is parsed; the HTTP batch may carry many sessions, with drops scoped per session. Both transports run the identical validator with identical semantics. The check is O(1) per event; the buffered Session, current Message, and seen-id sets are the only state.
 
@@ -821,33 +821,33 @@ Parts always immediately follow their parent Message; the transition from a Part
 
 Additional source surfaces ship adapter-defined strings; the table here is amendment-only.
 
-**Per-adapter `Session.project` derivation rules** live as docstrings on each adapter's source-decode function (the implementation is the documentation). [inv 20](#inv-20) fixes the contract: every adapter MUST emit a non-empty `Extracted<String>`. The `Source` / `Extracted<T>` seam (§4.9) makes synthesized sentinels a compile error - the chain ends in a deterministic source-derived value (a path-encoded directory name, an agent id, a repo URL) or the session is dropped with `DROP_REASON_MISSING_PROJECT`.
+**Per-adapter `Session.project` derivation rules** live as docstrings on each adapter's source-decode function (the implementation is the documentation). [inv 20](#inv-20) fixes the contract: every adapter MUST emit a non-empty `Extracted<String>`. The `Source` / `Extracted<T>` seam (Section 4.9) makes synthesized sentinels a compile error - the chain ends in a deterministic source-derived value (a path-encoded directory name, an agent id, a repo URL) or the session is dropped with `DROP_REASON_MISSING_PROJECT`.
 
 **`parent_session_id` is a soft foreign key.** Pond core does not validate that a forked session's `parent_session_id` references an existing session row at ingest. Forks against missing parents (real case: nanoclaw subagent files referencing parent sessions absent from disk) are stored as-is; consumers traversing fork lineage handle dangling pointers. This avoids ordering constraints between independent adapter runs and matches the append-only invariant (the parent might land in a later ingest pass).
 
 **Session-batched append granularity.** Pond core buffers a whole session's event substream and writes it in at most three `merge_insert` batches per session - one `sessions`, one `messages`, one `parts` - each keyed on the canonical PKs (`Session.id`, `(session_id, Message.id)`, `(message_id, Part.id)`). Per-event / per-row commits are explicitly not used: they multiply Lance manifest versions and fragment rewrites with no benefit. Re-ingest is idempotent ([inv 2](#inv-2)): re-reading an already-ingested session is a no-op for matched rows.
 
-**Per-session staleness skip.** `pond sync` skips re-decoding a session when the source file's `mtime` is at or before the wall-clock time at which pond last wrote that session's row. The watermark is the Lance manifest version timestamp keyed by `sessions._row_last_updated_at_version` (Lance's per-row system column, available because pond enables stable row ids per §4.3): one scan over `sessions` projecting `id` + `_row_last_updated_at_version`, joined against `Dataset::versions()` for commit times. No new column, no checkpoint table, no `Session.options` stamping - the watermark is built-in Lance metadata. Adapters opt in via `events_with`, consulting a `SkipOracle` and emitting a `Skipped` outcome; adapters with no per-session file model (rotation siblings, DAG forks, HTTP-backed live streams) ignore the hook and decode every time.
+**Per-session staleness skip.** `pond sync` skips re-decoding a session when the source file's `mtime` is at or before the wall-clock time at which pond last wrote that session's row. The watermark is the Lance manifest version timestamp keyed by `sessions._row_last_updated_at_version` (Lance's per-row system column, available because pond enables stable row ids per Section 4.3): one scan over `sessions` projecting `id` + `_row_last_updated_at_version`, joined against `Dataset::versions()` for commit times. No new column, no checkpoint table, no `Session.options` stamping - the watermark is built-in Lance metadata. Adapters opt in via `events_with`, consulting a `SkipOracle` and emitting a `Skipped` outcome; adapters with no per-session file model (rotation siblings, DAG forks, HTTP-backed live streams) ignore the hook and decode every time.
 
-**Live-write deferred.** End-of-session import is the v1 default; live-write is deferred (§8) and activates additively by adding a `follow(...)` streaming method (or a separate `LiveSourceAdapter` trait) - same stream shape, infinite stream.
+**Live-write deferred.** End-of-session import is the v1 default; live-write is deferred (Section 8) and activates additively by adding a `follow(...)` streaming method (or a separate `LiveSourceAdapter` trait) - same stream shape, infinite stream.
 
 ### 5.8 Search semantics {#protocol-search}
 
-Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index keyed on message_id per §4.7; FTS index on `messages.search_text` per §4.5). Filters: `project`, `session_id`, `from_date` / `to_date`, `role`, `source_agent`, `min_score`, `boost_recent`, `group_by_conversation`, `limit`. The `include_tool_results` / `include_thinking` toggles are NOT search filters; they live on `pond_get` (§5.4) and govern which Part types are returned at retrieval time. The search corpus is fixed by the concatenation policy below - what isn't in `search_text` cannot be found via search.
+Hybrid (vector + BM25 + RRF) by default, at message granularity (vector index keyed on message_id per Section 4.7; FTS index on `messages.search_text` per Section 4.5). Filters: `project`, `session_id`, `from_date` / `to_date`, `role`, `source_agent`, `min_score`, `boost_recent`, `group_by_conversation`, `limit`. The `include_tool_results` / `include_thinking` toggles are NOT search filters; they live on `pond_get` (Section 5.4) and govern which Part types are returned at retrieval time. The search corpus is fixed by the concatenation policy below - what isn't in `search_text` cannot be found via search.
 
-`project` is a canonical Session field (§4.4) stored case-sensitive verbatim, denormalized onto `messages` and `embeddings` for filter pushdown. The filter is a tagged enum: `{"contains": "<substring>"}` or `{"regex": "<pattern>"}`. The `contains` form emits `LIKE '%<value>%' ESCAPE '\\'` and is the CLI default (`pond search --project pond` -> contains "pond"). The `regex` form emits `regexp_like(project, '<pattern>')` for cases callers can't express as a substring; regex never pushes down to BTREE so it's a full-fragment scan-with-predicate, acceptable for human-driven queries but not for hot paths. There is no `is_null` variant - [inv 20](#inv-20) requires `Session.project` to be non-empty, so no rows match.
+`project` is a canonical Session field (Section 4.4) stored case-sensitive verbatim, denormalized onto `messages` and `embeddings` for filter pushdown. The filter is a tagged enum: `{"contains": "<substring>"}` or `{"regex": "<pattern>"}`. The `contains` form emits `LIKE '%<value>%' ESCAPE '\\'` and is the CLI default (`pond search --project pond` -> contains "pond"). The `regex` form emits `regexp_like(project, '<pattern>')` for cases callers can't express as a substring; regex never pushes down to BTREE so it's a full-fragment scan-with-predicate, acceptable for human-driven queries but not for hot paths. There is no `is_null` variant - [inv 20](#inv-20) requires `Session.project` to be non-empty, so no rows match.
 
 Case-insensitive search is the caller's responsibility (fold case before submitting, or use a `(?i)` prefix in the regex form); pond does not normalize at storage or filter time. Same convention applies to `source_agent` and `session_id`.
 
-`role` accepts a single value (`"user"` | `"assistant"` | `"system"` | `"tool"`). System and tool values are accepted on the wire but always return empty (those rows have NULL `search_text` and no embeddings per §4.5 / §4.7).
+`role` accepts a single value (`"user"` | `"assistant"` | `"system"` | `"tool"`). System and tool values are accepted on the wire but always return empty (those rows have NULL `search_text` and no embeddings per Section 4.5 / Section 4.7).
 
 `boost_recent` is a boolean on the search request (default `true`). When set, an additive exponential-decay boost is applied to each result's base score: `boost = 0.2 * exp(-age_seconds / 604800)` where `age_seconds` is `now - message.timestamp` and `604800` is 7 days in seconds. The boost caps at `+0.2` (at `age = 0`) and decays to near-zero past a few weeks. Constants are not empirically tuned by pond and should be revisited when retrieval-quality measurement is available.
 
 `group_by_conversation` is a boolean on the search request (default `false`). When `true`, results collapse to one summary object per `session_id`, with fields: `session_id`, `project`, `source_agent`, `first_timestamp` and `last_timestamp` (min/max across matching messages), `message_count` (total messages in the session, via a separate count query against the `messages` table - NOT the count of matches), `preview` (truncated `search_text` from the best-scoring matched message), and `best_score` (`max(score)` across matches in the session). Summaries are sorted by `best_score` descending then limited.
 
-Filter pushdown: every search filter column is colocated on the queried table via the denormalization in §4.5 (messages: `project`, `source_agent`, `role`, `session_id`, `timestamp`) and §4.7 (embeddings: same set). The FTS query on `messages.search_text` and the vector kNN on `embeddings.vector` each push their predicates into the table-level scalar indexes (BTREE for `project`/`session_id`/`timestamp`, Bitmap for `source_agent`/`role`) before retriever ranking - produces correct top-k without postfilter underrun and without cross-table joins. RRF merges on `message_id` - with one embedding row per message per model, vector results are already message-unique (no per-chunk dedup). `min_score` is applied postfilter after RRF and recency boost (not a Lance-pushable predicate). The `Scanner::prefilter(true)` call this depends on is required by [inv 13](#inv-13).
+Filter pushdown: every search filter column is colocated on the queried table via the denormalization in Section 4.5 (messages: `project`, `source_agent`, `role`, `session_id`, `timestamp`) and Section 4.7 (embeddings: same set). The FTS query on `messages.search_text` and the vector kNN on `embeddings.vector` each push their predicates into the table-level scalar indexes (BTREE for `project`/`session_id`/`timestamp`, Bitmap for `source_agent`/`role`) before retriever ranking - produces correct top-k without postfilter underrun and without cross-table joins. RRF merges on `message_id` - with one embedding row per message per model, vector results are already message-unique (no per-chunk dedup). `min_score` is applied postfilter after RRF and recency boost (not a Lance-pushable predicate). The `Scanner::prefilter(true)` call this depends on is required by [inv 13](#inv-13).
 
-Retrieval modes (handled by `pond_get` per §5.4, not search): single message, single message with N thread-context messages above and below, full conversation, conversation up to a message.
+Retrieval modes (handled by `pond_get` per Section 5.4, not search): single message, single message with N thread-context messages above and below, full conversation, conversation up to a message.
 
 **Embeddings are opt-in by config.** Sync (`pond sync`) and embed (`pond embed`) are separate verbs. The query-side embedding model loads only when `[embeddings] enabled = true` is set in `config.toml`; the flag defaults to `false`, so `pond serve` / `pond mcp` / `pond search` run FTS-only out of the box and never touch the model. `pond embed` itself is independent of the flag, so vectors can be pre-populated before flipping the switch.
 
@@ -876,18 +876,18 @@ What's deliberately NOT indexed:
 - `ToolCallPart.*` - tool name, params, the lot. Tool calls remain retrievable via `pond_get`.
 - `ToolResultPart.*` - tool output, often megabytes of structured data or scraped content.
 - `ToolApprovalRequestPart`, `ToolApprovalResponsePart` - operational plumbing, never search-relevant.
-- `FilePart.data` payload (decoded base64 / bytes) - indexing file contents is a deferred feature (§8).
+- `FilePart.data` payload (decoded base64 / bytes) - indexing file contents is a deferred feature (Section 8).
 - SystemMessage content - boilerplate harness prompts dominate BM25 IDF and cluster vector embeddings.
 
-Consequence: an assistant message with no `TextPart` and no indexable `FilePart` (e.g. a turn that is one bare tool call) produces empty content; the builder returns `None` and the row's `search_text` is stored as NULL. NULL rows are absent from the FTS index and produce no embedding rows per §4.7 - they vanish from search but are still returned in full by `pond_get`.
+Consequence: an assistant message with no `TextPart` and no indexable `FilePart` (e.g. a turn that is one bare tool call) produces empty content; the builder returns `None` and the row's `search_text` is stored as NULL. NULL rows are absent from the FTS index and produce no embedding rows per Section 4.7 - they vanish from search but are still returned in full by `pond_get`.
 
-The embedding worker reads `messages.search_text` directly (no second concatenation path). Vector input and FTS input are byte-identical. `search_text` is computed at each Message boundary inside pond core's session-substream buffer; the surrounding ingest flow lives in §5.7 "Session-batched append granularity."
+The embedding worker reads `messages.search_text` directly (no second concatenation path). Vector input and FTS input are byte-identical. `search_text` is computed at each Message boundary inside pond core's session-substream buffer; the surrounding ingest flow lives in Section 5.7 "Session-batched append granularity."
 
 Concat policy changes require re-ingest. Per [inv 14](#inv-14) sync is purely additive: `merge_insert` uses `WhenMatched::DoNothing`, so existing rows keep their old `search_text` until they're explicitly migrated (a deferred per-row migration operation, not a sync flag). The clean-store path - drop the affected rows and re-ingest - rebuilds `search_text` and the embeddings that depend on it.
 
 ### 5.9 Conformance fixture set {#protocol-conformance}
 
-v1 conformance tests run against the committed Claude Code session fixtures under `tests/fixtures/session-samples/claude-code/`: ingest a fixture, store it, retrieve it via `pond_get`, assert structural equivalence with a re-parse of the source. Storage round-trip only - the transport-to-provider layer (and pi-mono's cross-provider fixture matrix) reactivates with replay (§8).
+v1 conformance tests run against the committed Claude Code session fixtures under `tests/fixtures/session-samples/claude-code/`: ingest a fixture, store it, retrieve it via `pond_get`, assert structural equivalence with a re-parse of the source. Storage round-trip only - the transport-to-provider layer (and pi-mono's cross-provider fixture matrix) reactivates with replay (Section 8).
 
 ---
 
@@ -909,13 +909,13 @@ Rationale for the major design decisions. Each entry names the chosen path and t
 
 **Append-only at the storage layer over CRUD ([inv 1](#inv-1)).** A relational CRUD shape would have shipped `pond_update_message`, `pond_delete_session`, et al. Append-only forecloses corruption-by-mutation, makes every write idempotent under retry-with-jitter ([inv 3](#inv-3)), and matches Lance's substrate-native shape (manifest versioning, OCC, time-travel). Logical deletion remains a deferred admin operation, not a wire surface.
 
-**Two-trait adapter seam (`AdapterFactory` + `Adapter`) with `registry()` dispatch (§5.7).** Adapter methods are async and stream-shaped; returning boxed streams/futures (`EventStream`, `DiscoverFuture`, `AdapterYieldStream`) keeps both traits `dyn`-compatible, so dispatch is `Box<dyn Adapter>` selected from a static `registry()` table. The discarded alternative was a closed `enum Adapter` - it would monomorphize dispatch but forces every new format to edit a shared enum; the registry keeps a new adapter to one new file plus one line. The runtime cost (one vtable indirection per adapter call) is irrelevant against per-session file IO.
+**Two-trait adapter seam (`AdapterFactory` + `Adapter`) with `registry()` dispatch (Section 5.7).** Adapter methods are async and stream-shaped; returning boxed streams/futures (`EventStream`, `DiscoverFuture`, `AdapterYieldStream`) keeps both traits `dyn`-compatible, so dispatch is `Box<dyn Adapter>` selected from a static `registry()` table. The discarded alternative was a closed `enum Adapter` - it would monomorphize dispatch but forces every new format to edit a shared enum; the registry keeps a new adapter to one new file plus one line. The runtime cost (one vtable indirection per adapter call) is irrelevant against per-session file IO.
 
 ---
 
 ## 7. Open questions {#open-questions}
 
-Named questions whose answers will shape future activations. Each lives here until a concrete decision lands in §8 or in a numbered invariant.
+Named questions whose answers will shape future activations. Each lives here until a concrete decision lands in Section 8 or in a numbered invariant.
 
 ### 7.1 Multi-namespace router activation conditions {#open-questions-multi-namespace}
 
@@ -923,11 +923,11 @@ Single-tenant pond resolves `namespace = "local"` to the root Lance namespace `[
 
 ### 7.2 Live-write activation conditions {#open-questions-live-write}
 
-End-of-session import is v1; live-write is deferred (§8) and re-uses the same wire endpoints (`pond_session_events` becomes a tail, `pond_ingest` accepts streaming variants). The substrate activations (MemWAL, LSM scanner, HNSW-on-memtable, ShardWriter) carry implementation cost; the trigger is unclear. Hosted live-write fan-out is one candidate; a personal-pond use case (live indexing of a running session for in-flight search) is another. The choice affects which substrate piece activates first.
+End-of-session import is v1; live-write is deferred (Section 8) and re-uses the same wire endpoints (`pond_session_events` becomes a tail, `pond_ingest` accepts streaming variants). The substrate activations (MemWAL, LSM scanner, HNSW-on-memtable, ShardWriter) carry implementation cost; the trigger is unclear. Hosted live-write fan-out is one candidate; a personal-pond use case (live indexing of a running session for in-flight search) is another. The choice affects which substrate piece activates first.
 
 ### 7.3 Hosted-tier auth model {#open-questions-hosted-auth}
 
-Pond does no authn/authz of its own (§2.2); the integrator's gateway is the boundary. But the hosted-tier catalog backend is still a choice: REST namespace with credential vending and listing per tenant, or federated Directory v2 with bucket-per-tenant KMS isolation. The REST path is more flexible (any catalog the integrator already runs - Glue, Unity, Polaris, Iceberg REST) but couples pond's startup to the integrator's catalog availability. The directory path is simpler operationally but assumes a single object-store layout. Decision lands with the first hosted integrator.
+Pond does no authn/authz of its own (Section 2.2); the integrator's gateway is the boundary. But the hosted-tier catalog backend is still a choice: REST namespace with credential vending and listing per tenant, or federated Directory v2 with bucket-per-tenant KMS isolation. The REST path is more flexible (any catalog the integrator already runs - Glue, Unity, Polaris, Iceberg REST) but couples pond's startup to the integrator's catalog availability. The directory path is simpler operationally but assumes a single object-store layout. Decision lands with the first hosted integrator.
 
 ---
 
@@ -946,7 +946,7 @@ Each entry: what it is, why deferred, activation condition. None require schema 
 - **Remote embedding providers.** OpenAI, Voyage, Cohere, custom. Activation: model demand beyond local fastembed-rs default.
 - **Cross-session attachment dedup.** Background job over `content_hash` merging duplicate FilePart payloads. Activation: when storage cost from duplicates is measurable.
 - **Graph traversal layer** (Kuzu or `lance-graph`). OpenCypher engine over the same Lance storage when `parent_id` recursive lookups become a bottleneck.
-- **Wire-API-surfaced time-travel / friendly historical queries.** Lance's per-commit versioning is preserved by §4.3 `auto_cleanup` retention but kept out of pond's CLI / wire surface (recovery rides [inv 10](#inv-10), not in-place rollback). Activation: time-string `--as-of` queries, audit endpoints, `pond versions list` / `pond checkout` / `pond restore` verbs. Adds `version: int?` to read-side wire requests and a `pond_versions` operation; no schema changes since Lance owns the mechanism.
+- **Wire-API-surfaced time-travel / friendly historical queries.** Lance's per-commit versioning is preserved by Section 4.3 `auto_cleanup` retention but kept out of pond's CLI / wire surface (recovery rides [inv 10](#inv-10), not in-place rollback). Activation: time-string `--as-of` queries, audit endpoints, `pond versions list` / `pond checkout` / `pond restore` verbs. Adds `version: int?` to read-side wire requests and a `pond_versions` operation; no schema changes since Lance owns the mechanism.
 
 **Hosted multi-tenant deferrals** (activate when the first hosted tenant lands; share the multi-namespace router seam from [inv 11](#inv-11) / [inv 12](#inv-12)):
 
