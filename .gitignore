@@ -19,5 +19,5 @@ Thumbs.db
 .env*
 tmp/
 .claude/*local.json
-.agents/
+.claude/skills/
 /benches/corpus/
