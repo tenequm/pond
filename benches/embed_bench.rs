@@ -96,7 +96,7 @@ struct Args {
 /// The gitignored real-session corpus, if it has been populated.
 const LOCAL_CORPUS: &str = "benches/corpus";
 /// The committed redacted fixture corpus - always present.
-const FIXTURE_CORPUS: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURE_CORPUS: &str = "tests/fixtures/adapter/claude_code/projects";
 
 impl Args {
     /// Resolve the corpus path: an explicit `--source-dir` wins, otherwise the

@@ -13,11 +13,10 @@ use std::{
 };
 
 use async_stream::stream;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio_stream::StreamExt;
 
 use crate::{
     config::expand_home_under,
@@ -27,9 +26,10 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    EventStream, SkipOracle, SkipReason, collect_jsonl_files, empty_options,
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    collect_jsonl_files, compact_json, empty_options,
     extract::{Extracted, extract_compact_repr, extract_self_str, extract_str},
-    part_id,
+    extracted_text, jsonl_bytes, part_id, raw_record,
 };
 
 const NAME: &str = "codex-cli";
@@ -61,6 +61,170 @@ impl AdapterFactory for CodexCliFactory {
         let path = env.home.join(".codex").join("sessions");
         path.exists().then(|| json!({ "path": path }))
     }
+
+    fn serialize(
+        &self,
+        session: &crate::sessions::SessionWithMessages,
+        fidelity: RestoreFidelity,
+    ) -> Result<Vec<RestoredFile>, AdapterError> {
+        serialize_session(session, fidelity)
+    }
+}
+
+fn serialize_session(
+    session: &crate::sessions::SessionWithMessages,
+    fidelity: RestoreFidelity,
+) -> Result<Vec<RestoredFile>, AdapterError> {
+    let mut records = Vec::new();
+    if fidelity == RestoreFidelity::Native
+        && let Some(raw) = raw_record(&session.session.options)
+    {
+        records.push(raw);
+    } else {
+        records.push(codex_session_meta(session));
+    }
+    let mut messages = session.messages.clone();
+    messages.sort_by(by_timestamp_then_id);
+    for message in &messages {
+        if fidelity == RestoreFidelity::Native
+            && let Some(raw) = raw_record(message.message.options())
+        {
+            records.push(raw);
+            continue;
+        }
+        // Foreign restore: a System message (a rule-3 carrier, or a source's
+        // own system/developer turn) has no idiomatic home in another
+        // client's transcript - drop it; the content stays in canonical
+        // (spec.md#native-restore-lossless, foreign clause).
+        if matches!(message.message, Message::System { .. }) {
+            continue;
+        }
+        records.push(codex_response_item(message));
+    }
+    Ok(vec![RestoredFile {
+        relative_path: codex_relative_path(session),
+        bytes: jsonl_bytes(NAME, &records)?,
+    }])
+}
+
+fn codex_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
+    let ts = session.session.created_at;
+    let filename_ts = ts.format("%Y-%m-%dT%H-%M-%S");
+    PathBuf::from("sessions")
+        .join(format!("{:04}", ts.year()))
+        .join(format!("{:02}", ts.month()))
+        .join(format!("{:02}", ts.day()))
+        .join(format!(
+            "rollout-{filename_ts}-{}.jsonl",
+            session.session.id
+        ))
+}
+
+fn codex_session_meta(session: &crate::sessions::SessionWithMessages) -> Value {
+    json!({
+        "timestamp": session.session.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "type": "session_meta",
+        "payload": {
+            "id": session.session.id,
+            "timestamp": session.session.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "cwd": &*session.session.project,
+        }
+    })
+}
+
+fn codex_response_item(message: &crate::sessions::MessageWithParts) -> Value {
+    json!({
+        "timestamp": message.message.timestamp().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "type": "response_item",
+        "payload": codex_payload(message),
+    })
+}
+
+fn codex_payload(message: &crate::sessions::MessageWithParts) -> Value {
+    if let Some(part) = message.parts.first() {
+        match &part.kind {
+            PartKind::ToolCall {
+                call_id,
+                name,
+                params,
+                ..
+            } if matches!(message.message, Message::Assistant { .. }) => {
+                return json!({
+                    "type": "function_call",
+                    "call_id": extracted_text(call_id),
+                    "name": extracted_text(name),
+                    "arguments": compact_json(params),
+                });
+            }
+            PartKind::ToolResult {
+                call_id, result, ..
+            } if matches!(message.message, Message::Tool { .. }) => {
+                return json!({
+                    "type": "function_call_output",
+                    "call_id": extracted_text(call_id),
+                    "output": result,
+                });
+            }
+            PartKind::Reasoning { text }
+                if matches!(message.message, Message::Assistant { .. }) =>
+            {
+                if let Some(text) = text
+                    && let Ok(value) = serde_json::from_str::<Value>(text.as_ref())
+                {
+                    return value;
+                }
+                return json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": extracted_text(text)}],
+                });
+            }
+            _ => {}
+        }
+    }
+    let is_assistant = matches!(message.message, Message::Assistant { .. });
+    json!({
+        "type": "message",
+        "role": match message.message.role() {
+            crate::wire::Role::System => "developer",
+            crate::wire::Role::User => "user",
+            crate::wire::Role::Assistant => "assistant",
+            crate::wire::Role::Tool => "tool",
+        },
+        "content": message
+            .parts
+            .iter()
+            .map(|part| codex_content_part(part, is_assistant))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn codex_content_part(part: &Part, is_assistant: bool) -> Value {
+    // Codex tags an assistant turn's content `output_text` and a user or
+    // developer turn's content `input_text` - the discriminator is the
+    // owning message's role, not the part.
+    let text_type = if is_assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    match &part.kind {
+        PartKind::Text { text } => json!({
+            "type": text_type,
+            "text": extracted_text(text),
+        }),
+        PartKind::File { data, .. } => json!({
+            "type": text_type,
+            "text": match data {
+                crate::wire::FileData::String(value) => value.clone(),
+                crate::wire::FileData::Bytes(value) => format!("<{} bytes>", value.len()),
+                crate::wire::FileData::Url(value) => value.clone(),
+            },
+        }),
+        other => json!({
+            "type": text_type,
+            "text": compact_json(&serde_json::to_value(other).unwrap_or(Value::Null)),
+        }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,15 +248,6 @@ impl Adapter for CodexCliAdapter {
                 .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
             Ok(paths.len())
         })
-    }
-
-    fn events(&self) -> EventStream<'_> {
-        let stream = self.events_with(&crate::adapter::NoopOracle);
-        Box::pin(stream.filter_map(|res| match res {
-            Ok(AdapterYield::Event(event)) => Some(Ok(event)),
-            Ok(AdapterYield::Skipped { .. }) => None,
-            Err(error) => Some(Err(error)),
-        }))
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
@@ -287,6 +442,10 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
             "cli_version": payload.get("cli_version"),
             "model_provider": payload.get("model_provider"),
             "git": payload.get("git"),
+            "base_instructions": payload.get("base_instructions"),
+            "instructions": payload.get("instructions"),
+            "source": payload.get("source"),
+            "raw_record": row,
         }),
     );
 
@@ -315,8 +474,16 @@ fn events_from_row(
     tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Result<Vec<IngestEvent>, String> {
     let kind = row.get("type").and_then(Value::as_str).unwrap_or_default();
-    if kind != "response_item" {
+    if kind == "session_meta" {
         return Ok(Vec::new());
+    }
+    if kind != "response_item" {
+        return Ok(vec![raw_carrier_event(
+            session_id,
+            line,
+            row,
+            default_timestamp,
+        )]);
     }
     let timestamp = row
         .get("timestamp")
@@ -329,18 +496,20 @@ fn events_from_row(
     let message_id = format!("{session_id}:{line:06}");
 
     match payload_type {
-        "message" => message_events(session_id, &message_id, timestamp, payload),
+        "message" => message_events(session_id, &message_id, timestamp, payload, row),
         "function_call" => Ok(tool_call_events(
             session_id,
             &message_id,
             timestamp,
             payload,
+            row,
         )),
         "function_call_output" => Ok(tool_result_events(
             session_id,
             &message_id,
             timestamp,
             payload,
+            row,
             tool_call_names,
         )),
         "reasoning" => Ok(reasoning_events(
@@ -348,11 +517,53 @@ fn events_from_row(
             &message_id,
             timestamp,
             payload,
+            row,
         )),
-        // Unknown response_item subtypes (newer codex-cli versions) - skip
-        // rather than fail the session.
-        _ => Ok(Vec::new()),
+        "custom_tool_call" => Ok(custom_tool_call_events(
+            session_id,
+            &message_id,
+            timestamp,
+            payload,
+            row,
+        )),
+        "custom_tool_call_output" => Ok(custom_tool_result_events(
+            session_id,
+            &message_id,
+            timestamp,
+            payload,
+            row,
+        )),
+        _ => Ok(vec![raw_carrier_event(session_id, line, row, timestamp)]),
     }
+}
+
+fn row_options(row: &Value) -> ProviderOptions {
+    let mut options = ProviderOptions::new();
+    options.insert("source".to_owned(), json!({ "raw_record": row }));
+    options
+}
+
+fn raw_carrier_event(
+    session_id: &str,
+    line: usize,
+    row: &Value,
+    timestamp: DateTime<Utc>,
+) -> IngestEvent {
+    IngestEvent::Message(Message::System {
+        id: row
+            .get("id")
+            .and_then(Value::as_str)
+            .map_or_else(|| format!("{session_id}:{line:06}:raw"), ToOwned::to_owned),
+        session_id: session_id.to_owned(),
+        timestamp: row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(timestamp),
+        content: None,
+        options: row_options(row),
+    })
 }
 
 /// Stash one row's `function_call` (call_id -> name) into the per-file
@@ -382,6 +593,7 @@ fn message_events(
     message_id: &str,
     timestamp: DateTime<Utc>,
     payload: &Value,
+    row: &Value,
 ) -> Result<Vec<IngestEvent>, String> {
     let role = payload
         .get("role")
@@ -414,7 +626,7 @@ fn message_events(
                 id: message_id.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: empty_options(),
+                options: row_options(row),
             },
             true,
         ),
@@ -423,7 +635,7 @@ fn message_events(
                 id: message_id.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: empty_options(),
+                options: row_options(row),
             },
             true,
         ),
@@ -438,7 +650,7 @@ fn message_events(
                 session_id: session_id.to_owned(),
                 timestamp,
                 content: None,
-                options: empty_options(),
+                options: row_options(row),
             },
             true,
         ),
@@ -458,6 +670,7 @@ fn tool_call_events(
     message_id: &str,
     timestamp: DateTime<Utc>,
     payload: &Value,
+    row: &Value,
 ) -> Vec<IngestEvent> {
     let call_id = extract_str(payload, "call_id");
     let name = extract_str(payload, "name");
@@ -485,7 +698,67 @@ fn tool_call_events(
             id: message_id.to_owned(),
             session_id: session_id.to_owned(),
             timestamp,
-            options: empty_options(),
+            options: row_options(row),
+        }),
+        IngestEvent::Part(part),
+    ]
+}
+
+fn custom_tool_call_events(
+    session_id: &str,
+    message_id: &str,
+    timestamp: DateTime<Utc>,
+    payload: &Value,
+    row: &Value,
+) -> Vec<IngestEvent> {
+    let part = Part {
+        id: part_id(message_id, 0),
+        message_id: message_id.to_owned(),
+        ordinal: 0,
+        options: empty_options(),
+        kind: PartKind::ToolCall {
+            call_id: extract_str(payload, "call_id"),
+            name: extract_str(payload, "name"),
+            params: payload.get("input").cloned().unwrap_or(Value::Null),
+            provider_executed: true,
+        },
+    };
+    vec![
+        IngestEvent::Message(Message::Assistant {
+            id: message_id.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp,
+            options: row_options(row),
+        }),
+        IngestEvent::Part(part),
+    ]
+}
+
+fn custom_tool_result_events(
+    session_id: &str,
+    message_id: &str,
+    timestamp: DateTime<Utc>,
+    payload: &Value,
+    row: &Value,
+) -> Vec<IngestEvent> {
+    let part = Part {
+        id: part_id(message_id, 0),
+        message_id: message_id.to_owned(),
+        ordinal: 0,
+        options: empty_options(),
+        kind: PartKind::ToolResult {
+            call_id: extract_str(payload, "call_id"),
+            name: extract_str(payload, "name"),
+            is_failure: false,
+            result: cap_tool_output(payload.get("output").cloned().unwrap_or(Value::Null)),
+        },
+    };
+    vec![
+        IngestEvent::Message(Message::Tool {
+            id: message_id.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp,
+            options: row_options(row),
         }),
         IngestEvent::Part(part),
     ]
@@ -532,6 +805,7 @@ fn tool_result_events(
     message_id: &str,
     timestamp: DateTime<Utc>,
     payload: &Value,
+    row: &Value,
     tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Vec<IngestEvent> {
     let call_id = extract_str(payload, "call_id");
@@ -561,7 +835,7 @@ fn tool_result_events(
             id: message_id.to_owned(),
             session_id: session_id.to_owned(),
             timestamp,
-            options: empty_options(),
+            options: row_options(row),
         }),
         IngestEvent::Part(part),
     ]
@@ -572,6 +846,7 @@ fn reasoning_events(
     message_id: &str,
     timestamp: DateTime<Utc>,
     payload: &Value,
+    row: &Value,
 ) -> Vec<IngestEvent> {
     // The source `summary` array is the only place reasoning text lives in
     // codex-cli's format. Empty array (or missing field) -> `None`. Joined
@@ -604,7 +879,7 @@ fn reasoning_events(
             id: message_id.to_owned(),
             session_id: session_id.to_owned(),
             timestamp,
-            options: empty_options(),
+            options: row_options(row),
         }),
         IngestEvent::Part(part),
     ]
@@ -615,14 +890,29 @@ mod tests {
     //! End-to-end test for the codex-cli adapter: ingest the committed fixture
     //! corpus and assert pond's canonical Session/Message/Part shape comes out
     //! the other side. The fixture lives under
-    //! `tests/fixtures/session-samples/codex-cli/`.
+    //! `tests/fixtures/adapter/codex_cli/`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
 
-    const FIXTURES: &str = "tests/fixtures/session-samples/codex-cli/sessions";
+    const FIXTURES: &str = "tests/fixtures/adapter/codex_cli/sessions";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
+        let adapter = CodexCliAdapter::new(FIXTURES);
+        crate::adapter::test_support::assert_native_restore(
+            &CodexCliFactory,
+            &adapter,
+            // Codex rollout paths embed the `sessions/` segment, so the corpus
+            // root is FIXTURES' parent, not FIXTURES itself.
+            std::path::Path::new(FIXTURES)
+                .parent()
+                .expect("FIXTURES is nested under a corpus root"),
+        )
+        .await
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn codex_cli_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {

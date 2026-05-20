@@ -45,7 +45,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// The committed redacted fixture corpus - the no-arg default so a fresh
 /// clone always has something to bench against.
-const FIXTURE_CORPUS: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURE_CORPUS: &str = "tests/fixtures/adapter/claude_code/projects";
 
 #[derive(Parser)]
 #[command(about = "pond ingest-path microbenchmark: per-stage timing and merge_insert breakdown")]

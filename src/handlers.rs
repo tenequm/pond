@@ -5,7 +5,7 @@ fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
 /// Typed identifier for the namespace a wire request targets. v1 is
 /// single-namespace, so every successful resolve returns `root()`; the
 /// type lets future multi-namespace routing land without churning call
-/// sites (design.md#inv-11).
+/// sites (spec.md#namespace-resolution).
 #[derive(Debug, Clone)]
 pub struct NamespaceIdent(pub Vec<String>);
 
@@ -34,7 +34,7 @@ pub fn resolve_namespace(
 
 fn map_storage(error: anyhow::Error) -> crate::wire::ErrorEnvelope {
     // Classify before bucketing: an OCC commit-conflict exhaustion has its own
-    // wire code (design.md#protocol-error-envelope). Everything else lands in `storage_unavailable`.
+    // wire code (spec.md#protocol). Everything else lands in `storage_unavailable`.
     if let Some(conflict) = error.downcast_ref::<crate::substrate::ConflictExhausted>() {
         return map_error(crate::Error::Conflict {
             attempts: conflict.attempts,
@@ -58,7 +58,7 @@ mod ingest_handler {
 
     use super::{map_error, map_storage};
 
-    /// Hard cap on events per `pond_ingest` batch (design.md#protocol-pond-ingest).
+    /// Hard cap on events per `pond_ingest` batch (spec.md#protocol).
     pub const MAX_INGEST_EVENTS: usize = 1000;
 
     /// Progress signals emitted by [`ingest_adapter`] for the CLI bar (and
@@ -116,7 +116,7 @@ mod ingest_handler {
         Rejected {
             reason: String,
         },
-        /// Per-session staleness skip (design.md#protocol-ingest-semantics): adapter short-circuited
+        /// Per-session staleness skip (spec.md#event-ordering): adapter short-circuited
         /// the file decode because `mtime < MAX(messages.timestamp)`.
         Fresh,
     }
@@ -440,10 +440,10 @@ mod ingest_handler {
         }
     }
 
-    /// The `pond_ingest` wire handler (design.md#protocol-pond-ingest): validate the transport
+    /// The `pond_ingest` wire handler (spec.md#protocol): validate the transport
     /// envelope, then drive the event batch through [`ingest_events`]. Transport
     /// failures (bad protocol, unknown namespace, empty or oversized batch) fail
-    /// the whole request via the design.md#protocol-error-envelope; per-event failures land
+    /// the whole request via the spec.md#protocol; per-event failures land
     /// in the response's `results[]` with `status: "error"`.
     pub async fn pond_ingest(store: &Store, request: IngestRequest) -> IngestEnvelope {
         if let Err(envelope) = validate_protocol(request.protocol_version) {
@@ -498,7 +498,7 @@ mod ingest_handler {
     /// outcomes in input-array order. A substream that fails validation has
     /// every one of its events tagged with [`OutcomeStatus::Error`] (the
     /// offending event and any others in the same substream); ingest of later
-    /// sessions in the batch continues (design.md#protocol-pond-ingest).
+    /// sessions in the batch continues (spec.md#protocol).
     pub async fn ingest_events(store: &Store, events: Vec<IngestEvent>) -> Result<Vec<RowOutcome>> {
         let mut validator = IngestValidator::default();
         let mut outcomes = Vec::with_capacity(events.len());
@@ -557,7 +557,7 @@ pub use ingest_handler::{
 };
 
 mod session_events_handler {
-    //! `pond_session_events` (design.md#protocol-pond-session-events): catch-up SSE stream over a
+    //! `pond_session_events` (spec.md#protocol): catch-up SSE stream over a
     //! stored session's messages. v1 scope is read-after-`since`: scan
     //! messages strictly after the resume point in `(timestamp, message_id)`
     //! order, emit one `message` event per row (with its parts, filtered by
@@ -613,7 +613,7 @@ mod session_events_handler {
     }
 
     /// Server-Sent Events event ready to encode by the transport layer.
-    /// Identity (`event` + `id` + `data`) is design.md#protocol-pond-session-events verbatim.
+    /// Identity (`event` + `id` + `data`) is spec.md#protocol verbatim.
     #[derive(Debug, Clone, PartialEq)]
     pub struct SseEvent {
         pub event: &'static str,
@@ -723,14 +723,14 @@ mod session_events_handler {
 pub use session_events_handler::{Since, SseEvent, parse_since, pond_session_events};
 
 mod export_handler {
-    //! `pond_export` (design.md#protocol): walk every session in the store and
+    //! `pond_export` (spec.md#protocol): walk every session in the store and
     //! emit its canonical event stream as JSONL - one `IngestEvent` per line.
     //! The output is byte-identical with what `pond ingest` / `pond_ingest`
     //! accepts on input, so `export | ingest` is a portable backup loop.
     //! Sessions are emitted in lexicographic id order; within each session,
     //! messages run in `(timestamp, message_id)` order and each message's
     //! parts immediately follow in `ordinal` order. Matches the
-    //! design.md#protocol-ingest-semantics ordering contract so the output
+    //! spec.md#event-ordering ordering contract so the output
     //! re-imports without re-ordering.
 
     use anyhow::{Context, Result};
@@ -766,6 +766,9 @@ mod export_handler {
                 .await
                 .with_context(|| format!("export: failed to load session {session_id}"))?
             else {
+                if session_filter.is_some() {
+                    anyhow::bail!("export: session not found: {session_id}");
+                }
                 continue;
             };
             write_event(writer, &IngestEvent::Session(stored.session)).await?;
@@ -801,6 +804,45 @@ mod export_handler {
 }
 
 pub use export_handler::{ExportSummary, pond_export};
+
+mod restore_handler {
+    //! `restore_lineage` (spec.md#lineage-complete-restore): collect the named
+    //! session plus its direct subagent children for the `pond export session
+    //! --as` restore path. The spawn graph is one level deep; a collected
+    //! child that is itself a parent means a deeper graph, which is a typed
+    //! error - never a silently flattened restore.
+
+    use anyhow::{Context, Result, bail};
+
+    use crate::sessions::{SessionWithMessages, Store};
+
+    pub async fn restore_lineage(
+        store: &Store,
+        session_id: &str,
+    ) -> Result<Vec<SessionWithMessages>> {
+        let Some(parent) = store.get_session(session_id).await? else {
+            bail!("export: session not found: {session_id}");
+        };
+        let mut sessions = vec![parent];
+        for child in store.child_sessions(session_id).await? {
+            if !store.child_sessions(&child.id).await?.is_empty() {
+                bail!(
+                    "lineage-complete-restore supports one subagent level; session {} has child sessions",
+                    child.id
+                );
+            }
+            let child_id = child.id;
+            let stored = store
+                .get_session(&child_id)
+                .await?
+                .with_context(|| format!("export: child session disappeared: {child_id}"))?;
+            sessions.push(stored);
+        }
+        Ok(sessions)
+    }
+}
+
+pub use restore_handler::restore_lineage;
 
 mod get_handler {
     use crate::{
@@ -975,7 +1017,7 @@ pub use get_handler::pond_get;
 mod search_handler {
     //! The `pond_search` handler: hybrid (vector + BM25 + RRF) retrieval at message
     //! granularity, with filter pushdown, recency boost, and conversation grouping
-    //! (design.md#protocol-search, design.md#protocol-pond-search).
+    //! (spec.md#search, spec.md#search).
 
     use crate::{
         Clock, SystemClock,
@@ -1014,11 +1056,11 @@ mod search_handler {
         pub min_score: f64,
     }
 
-    /// Server-enforced cap on `limit` (design.md#protocol-pond-search).
+    /// Server-enforced cap on `limit` (spec.md#search).
     const LIMIT_CAP: usize = 200;
-    /// Preview length in code points (design.md#protocol-pond-search).
+    /// Preview length in code points (spec.md#search).
     const PREVIEW_CHARS: usize = 500;
-    /// Recency-boost constants, inherited verbatim from kb (design.md#protocol-search).
+    /// Recency-boost constants (spec.md#search).
     const RECENCY_MAX_BOOST: f64 = 0.2;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
 
@@ -1092,15 +1134,13 @@ mod search_handler {
                         .map_err(map_storage)
                 };
                 let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
-                let vector_retriever = VectorRetriever;
-                let fts_retriever = FtsRetriever;
                 let lists = [
                     RankedList {
-                        retriever: vector_retriever.kind(),
+                        retriever: RetrieverKind::Vector,
                         ids: vector_raw.into_iter().map(|(id, _)| id).collect(),
                     },
                     RankedList {
-                        retriever: fts_retriever.kind(),
+                        retriever: RetrieverKind::Fts,
                         ids: fts.into_iter().map(|(id, _)| id).collect(),
                     },
                 ];
@@ -1270,26 +1310,6 @@ mod search_handler {
         }
     }
 
-    trait Retriever {
-        fn kind(&self) -> RetrieverKind;
-    }
-
-    struct FtsRetriever;
-
-    impl Retriever for FtsRetriever {
-        fn kind(&self) -> RetrieverKind {
-            RetrieverKind::Fts
-        }
-    }
-
-    struct VectorRetriever;
-
-    impl Retriever for VectorRetriever {
-        fn kind(&self) -> RetrieverKind {
-            RetrieverKind::Vector
-        }
-    }
-
     /// A retriever-ranked list of `message_id`s, best-first.
     pub struct RankedList {
         pub retriever: RetrieverKind,
@@ -1306,7 +1326,7 @@ mod search_handler {
 
     /// Reciprocal Rank Fusion: `sum(1 / (k + rank))` across the retrievers that
     /// ranked each id (rank is 1-based). Returns hits sorted by score descending,
-    /// ties broken by `message_id` for determinism (design.md#protocol-search).
+    /// ties broken by `message_id` for determinism (spec.md#search).
     pub fn rrf_merge(lists: &[RankedList], k: u32) -> Vec<RrfHit> {
         let k = f64::from(k.max(1));
         let mut merged: std::collections::HashMap<String, (f64, Vec<String>)> =
@@ -1339,7 +1359,7 @@ mod search_handler {
         hits
     }
 
-    /// Additive exponential-decay recency boost (design.md#protocol-search): caps at `+0.2` at
+    /// Additive exponential-decay recency boost (spec.md#search): caps at `+0.2` at
     /// `age = 0`, decays to near-zero past a few weeks.
     pub fn recency_boost(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
         #[allow(clippy::cast_precision_loss)]
@@ -1348,7 +1368,7 @@ mod search_handler {
     }
 
     /// First [`PREVIEW_CHARS`] code points of `text`, with `"..."` appended when
-    /// truncated (design.md#protocol-pond-search).
+    /// truncated (spec.md#search).
     pub fn make_preview(text: &str) -> String {
         let mut preview = text.chars().take(PREVIEW_CHARS).collect::<String>();
         if text.chars().nth(PREVIEW_CHARS).is_some() {
@@ -1492,7 +1512,7 @@ mod search_handler {
 
     /// Build the shared scalar filter predicate pushed into both retrievers.
     /// Column names are identical on `messages` and `embeddings`
-    /// (design.md#schemas-message / design.md#schemas-embedding) so one
+    /// (spec.md#datasets / spec.md#datasets) so one
     /// predicate serves both.
     pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
         let mut clauses = Vec::new();
@@ -1648,6 +1668,48 @@ mod tests {
         let preview = make_preview(&long);
         assert!(preview.ends_with("..."));
         assert_eq!(preview.chars().count(), 503);
+    }
+
+    #[tokio::test]
+    async fn restore_lineage_rejects_a_graph_nesting_deeper_than_one_level() {
+        use crate::adapter::Extracted;
+        use crate::sessions::Store;
+        use crate::wire::{ProviderOptions, Session};
+        use tempfile::TempDir;
+
+        let session = |id: &str, parent: Option<&str>| Session {
+            id: id.to_owned(),
+            parent_session_id: parent.map(str::to_owned),
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Extracted::from_test_value("/tmp/pond".to_owned()),
+            options: ProviderOptions::new(),
+        };
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open_local(dir.path()).await.unwrap();
+        // A -> B -> C is a two-level spawn graph; spec 6.2 caps lineage at one.
+        store
+            .upsert_sessions(&[
+                session("a", None),
+                session("b", Some("a")),
+                session("c", Some("b")),
+            ])
+            .await
+            .unwrap();
+
+        // Restoring A reaches child B, then finds B is itself a parent of C.
+        let err = restore_lineage(&store, "a").await.unwrap_err();
+        assert!(
+            err.to_string().contains("one subagent level"),
+            "expected the deeper-graph error, got: {err}"
+        );
+
+        // Restoring B is a clean one-level graph: B plus its single child C.
+        let lineage = restore_lineage(&store, "b").await.unwrap();
+        let ids: Vec<&str> = lineage.iter().map(|s| s.session.id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"]);
     }
 
     #[test]

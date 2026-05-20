@@ -25,7 +25,10 @@ use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 use toml_edit::{DocumentMut, Item, Table};
 
-use crate::{sessions::IngestEvent, wire::ProviderOptions};
+use crate::{
+    sessions::{IngestEvent, MessageWithParts, SessionWithMessages},
+    wire::ProviderOptions,
+};
 
 mod claude_code;
 mod codex_cli;
@@ -60,6 +63,25 @@ pub trait AdapterFactory: Send + Sync {
     /// `env.home`; adapters with no auto-discovery rule (e.g. API adapters
     /// that need explicit creds) return `None`.
     fn probe_default(&self, env: &Env) -> Option<Value>;
+
+    /// Restore one canonical session into this adapter's native file layout.
+    fn serialize(
+        &self,
+        session: &SessionWithMessages,
+        fidelity: RestoreFidelity,
+    ) -> Result<Vec<RestoredFile>, AdapterError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreFidelity {
+    Native,
+    Foreign,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredFile {
+    pub relative_path: PathBuf,
+    pub bytes: Vec<u8>,
 }
 
 /// Live, configured adapter instance. Holds whatever handle the source needs
@@ -70,7 +92,14 @@ pub trait Adapter: Send + Sync {
     /// about, in append-only order per session. The stream borrows `self`
     /// so callers can pass `&adapter` or hold a `Box<dyn Adapter>` and
     /// invoke this through `as_ref()`.
-    fn events(&self) -> EventStream<'_>;
+    fn events(&self) -> EventStream<'_> {
+        let stream = self.events_with(&NoopOracle);
+        Box::pin(stream.filter_map(|res| match res {
+            Ok(AdapterYield::Event(event)) => Some(Ok(event)),
+            Ok(AdapterYield::Skipped { .. }) => None,
+            Err(error) => Some(Err(error)),
+        }))
+    }
 
     /// Count how many sessions [`Self::events`] will produce, used by the
     /// CLI bar to set its length up front. A filesystem adapter walks its
@@ -81,16 +110,14 @@ pub trait Adapter: Send + Sync {
     fn discover(&self) -> DiscoverFuture<'_>;
 
     /// Stream events with a [`SkipOracle`] the adapter MAY consult to
-    /// short-circuit per-session re-decoding (design.md#protocol-ingest-semantics). Default impl
+    /// short-circuit per-session re-decoding (spec.md#event-ordering). Default impl
     /// ignores the oracle.
-    fn events_with<'a>(&'a self, _oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
-        Box::pin(self.events().map(|res| res.map(AdapterYield::Event)))
-    }
+    fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a>;
 }
 
 /// Per-session watermark lookup: when did pond last write this session?
 /// Backed by Lance's `_row_last_updated_at_version` joined to the manifest
-/// commit timestamp (design.md#protocol-ingest-semantics). Adapter compares this to the source
+/// commit timestamp (spec.md#event-ordering). Adapter compares this to the source
 /// file's mtime to decide whether to re-decode.
 pub trait SkipOracle: Send + Sync {
     fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
@@ -368,6 +395,44 @@ pub(crate) fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+pub(crate) fn jsonl_bytes(
+    adapter: &'static str,
+    records: &[Value],
+) -> Result<Vec<u8>, AdapterError> {
+    let mut bytes = Vec::new();
+    for record in records {
+        let line = serde_json::to_vec(record).map_err(|err| {
+            AdapterError::schema(adapter, "serialize", format!("json encode failed: {err}"))
+        })?;
+        bytes.extend(line);
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {
+    options
+        .get("source")
+        .and_then(|source| source.get("raw_record"))
+        .cloned()
+}
+
+pub(crate) fn extracted_text(value: &Option<Extracted<String>>) -> &str {
+    value.as_deref().map(String::as_str).unwrap_or("")
+}
+
+/// Deterministic message ordering for restore: timestamp, then id as a
+/// tiebreaker so equal-timestamp messages always serialize in a stable order.
+pub(crate) fn by_timestamp_then_id(
+    left: &MessageWithParts,
+    right: &MessageWithParts,
+) -> std::cmp::Ordering {
+    left.message
+        .timestamp()
+        .cmp(&right.message.timestamp())
+        .then_with(|| left.message.id().cmp(right.message.id()))
+}
+
 /// `ProviderOptions::new()` shortcut; both adapters reach for an empty
 /// options map often enough that naming the no-op clarifies the call sites.
 #[inline]
@@ -568,6 +633,70 @@ fn json_to_toml_item(value: &Value) -> anyhow::Result<Item> {
             Item::Value(TomlValue::InlineTable(inline))
         }
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::{Adapter, AdapterFactory, NoopOracle, RestoreFidelity};
+    use crate::{handlers::ingest_adapter, sessions::Store};
+
+    pub(crate) async fn assert_native_restore(
+        factory: &dyn AdapterFactory,
+        adapter: &dyn Adapter,
+        source_root: &Path,
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_adapter(&store, adapter, &NoopOracle, |_| {}).await?;
+        for session_id in store.session_ids().await? {
+            let Some(session) = store.get_session(&session_id).await? else {
+                anyhow::bail!("session id listed by store was not readable: {session_id}");
+            };
+            let restored = factory.serialize(&session, RestoreFidelity::Native)?;
+            for file in restored {
+                let expected = source_root.join(&file.relative_path);
+                let expected_bytes = std::fs::read(&expected)
+                    .map_err(|err| anyhow::anyhow!("read {}: {err}", expected.display()))?;
+                assert_json_file_equal(&expected, &expected_bytes, &file.bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_json_file_equal(path: &Path, expected: &[u8], actual: &[u8]) -> anyhow::Result<()> {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            let expected_lines = json_lines(expected)?;
+            let actual_lines = json_lines(actual)?;
+            assert_eq!(
+                actual_lines,
+                expected_lines,
+                "jsonl mismatch at {}",
+                path.display()
+            );
+        } else {
+            let expected_value: serde_json::Value = serde_json::from_slice(expected)?;
+            let actual_value: serde_json::Value = serde_json::from_slice(actual)?;
+            assert_eq!(
+                actual_value,
+                expected_value,
+                "json mismatch at {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn json_lines(bytes: &[u8]) -> anyhow::Result<Vec<serde_json::Value>> {
+        let text = std::str::from_utf8(bytes)?;
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(Into::into))
+            .collect()
+    }
 }
 
 #[cfg(test)]

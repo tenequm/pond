@@ -13,19 +13,20 @@ candle-core = "0.10.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
+cudarc = { version = "0.19.7", default-features = false, features = ["fallback-latest"], optional = true }
 dialoguer = { version = "0.12", default-features = false }
 fastrand = "2"
-hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 indicatif = "0.18"
-lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-encoding = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
+# Vendored protoc (protobuf-src) so builds need no system protoc. `lance`'s `protoc`
+# feature omits lance-datafusion, so it is declared here only to carry the feature.
+lance-datafusion = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
 lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-table = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -56,6 +57,7 @@ lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-be
 # MCP integration test can drive the server with an in-process client. Cargo
 # unifies it into the test build without adding `client` to the shipped binary.
 rmcp = { version = "1.7", features = ["client"] }
+insta = "1.47.2"
 tempfile = "3.25"
 # `oneshot` lets the HTTP integration test drive the axum `Router` directly,
 # with no socket bind and no HTTP client dependency.
@@ -82,7 +84,13 @@ harness = false
 # plain CPU candle and CI never enables this. Build on a CUDA host with
 # `cargo build --features cuda`; candle's `cuda_if_available` then selects the GPU
 # automatically (it returns CPU when this feature is not compiled in).
-cuda = ["fastembed/cuda"]
+cuda = ["fastembed/cuda", "dep:cudarc"]
+
+# `line-tables-only` keeps file/line info for panic and `RUST_BACKTRACE`
+# backtraces but drops the richer per-variable debuginfo only a step-debugger
+# uses. Less debuginfo for rustc to emit means faster codegen on every rebuild.
+[profile.dev]
+debug = "line-tables-only"
 
 # Build dependencies optimized even in dev/test builds. The hot code lives in
 # the dependency graph (lance, candle, arrow); leaving it unoptimized makes

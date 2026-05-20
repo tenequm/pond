@@ -256,10 +256,23 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Filter the export to a single session id. Default: every session.
-        #[arg(long)]
-        session: Option<String>,
         /// Write JSONL to this path. Default: stdout.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<ExportCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExportCommand {
+    /// Export one session as canonical JSONL or restore it to a client format.
+    Session {
+        id: String,
+        /// Restore the session to this adapter's native client format.
+        #[arg(long = "as")]
+        as_adapter: Option<String>,
+        /// Canonical mode: output file. Restore mode: required output directory.
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
     },
@@ -562,43 +575,129 @@ async fn main() -> anyhow::Result<()> {
         Command::Export {
             data_dir,
             config,
-            session,
             out,
+            command,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            let summary = match out {
-                Some(path) => {
-                    let file = tokio::fs::File::create(&path)
-                        .await
-                        .with_context(|| format!("failed to open {}", path.display()))?;
-                    let mut writer = tokio::io::BufWriter::new(file);
-                    let summary =
-                        handlers::pond_export(&store, session.as_deref(), &mut writer).await?;
-                    writer.flush().await.context("export: flush")?;
-                    summary
-                }
+            match command {
                 None => {
-                    let mut stdout = tokio::io::stdout();
-                    handlers::pond_export(&store, session.as_deref(), &mut stdout).await?
+                    let summary = match out {
+                        Some(path) => {
+                            let file = tokio::fs::File::create(&path)
+                                .await
+                                .with_context(|| format!("failed to open {}", path.display()))?;
+                            let mut writer = tokio::io::BufWriter::new(file);
+                            let summary = handlers::pond_export(&store, None, &mut writer).await?;
+                            writer.flush().await.context("export: flush")?;
+                            summary
+                        }
+                        None => {
+                            let mut stdout = tokio::io::stdout();
+                            handlers::pond_export(&store, None, &mut stdout).await?
+                        }
+                    };
+                    output(&format!(
+                        "{} sessions={} messages={} parts={}",
+                        pond::output::paint("export:", pond::output::dim()),
+                        summary.sessions,
+                        summary.messages,
+                        summary.parts,
+                    ))?;
                 }
-            };
-            output(&format!(
-                "{} sessions={} messages={} parts={}",
-                pond::output::paint("export:", pond::output::dim()),
-                summary.sessions,
-                summary.messages,
-                summary.parts,
-            ))?;
+                Some(ExportCommand::Session {
+                    id,
+                    as_adapter,
+                    out,
+                }) => {
+                    if let Some(target) = as_adapter {
+                        let out_dir = out.context("export session --as requires --out <dir>")?;
+                        let (session_count, file_count) =
+                            restore_session(&store, &id, &target, &out_dir).await?;
+                        output(&format!(
+                            "{} sessions={} target={} files={}",
+                            pond::output::paint("restore:", pond::output::dim()),
+                            session_count,
+                            target,
+                            file_count,
+                        ))?;
+                    } else {
+                        let summary = match out {
+                            Some(path) => {
+                                let file =
+                                    tokio::fs::File::create(&path).await.with_context(|| {
+                                        format!("failed to open {}", path.display())
+                                    })?;
+                                let mut writer = tokio::io::BufWriter::new(file);
+                                let summary =
+                                    handlers::pond_export(&store, Some(&id), &mut writer).await?;
+                                writer.flush().await.context("export: flush")?;
+                                summary
+                            }
+                            None => {
+                                let mut stdout = tokio::io::stdout();
+                                handlers::pond_export(&store, Some(&id), &mut stdout).await?
+                            }
+                        };
+                        output(&format!(
+                            "{} sessions={} messages={} parts={}",
+                            pond::output::paint("export:", pond::output::dim()),
+                            summary.sessions,
+                            summary.messages,
+                            summary.parts,
+                        ))?;
+                    }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
+async fn restore_session(
+    store: &Store,
+    session_id: &str,
+    target: &str,
+    out_dir: &Path,
+) -> anyhow::Result<(usize, usize)> {
+    let factory = adapter::by_name(target).with_context(|| {
+        format!(
+            "unknown adapter {target}; known: {}",
+            adapter::known_names().join(", ")
+        )
+    })?;
+    let sessions = handlers::restore_lineage(store, session_id).await?;
+
+    let mut file_count = 0usize;
+    for session in &sessions {
+        // `source_agent` is `brand` or `brand/sub`; the brand prefix picks fidelity.
+        let source_agent = &session.session.source_agent;
+        let brand = source_agent.split('/').next().unwrap_or(source_agent);
+        let fidelity = if brand == factory.name() {
+            adapter::RestoreFidelity::Native
+        } else {
+            adapter::RestoreFidelity::Foreign
+        };
+        for file in factory.serialize(session, fidelity)? {
+            let path = out_dir.join(&file.relative_path);
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            tokio::fs::write(&path, file.bytes)
+                .await
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            file_count += 1;
+        }
+    }
+    Ok((sessions.len(), file_count))
+}
+
 /// Spawn the background maintenance task: `cleanup_old_versions` +
-/// `optimize_indices` every `interval_secs` (design.md#schemas-write-params). The first tick
+/// `optimize_indices` every `interval_secs` (spec.md#substrate). The first tick
 /// fires immediately, so it is consumed up front - `pond serve` does not run
 /// maintenance at boot. Failures are logged at warn and retried next interval;
 /// they never crash the server.

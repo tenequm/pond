@@ -11,7 +11,7 @@ use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::deps::arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, TimestampMicrosecondArray,
+    StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance_file::version::LanceFileVersion;
@@ -38,7 +38,7 @@ pub struct Store {
 }
 
 /// A message awaiting embedding: its `search_text` plus the columns the
-/// `embeddings` rows denormalize (design.md#schemas-embedding).
+/// `embeddings` rows denormalize (spec.md#datasets).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
     pub message_id: String,
@@ -232,13 +232,6 @@ impl Store {
         Self::open(&url).await
     }
 
-    pub async fn upsert_session(&self, session: &Session) -> Result<UpsertStatus> {
-        let mut statuses = self.upsert_sessions(std::slice::from_ref(session)).await?;
-        statuses
-            .pop()
-            .context("single session upsert returned no status")
-    }
-
     pub async fn upsert_sessions(&self, sessions: &[Session]) -> Result<Vec<UpsertStatus>> {
         if sessions.is_empty() {
             return Ok(Vec::new());
@@ -251,28 +244,11 @@ impl Store {
         Ok(statuses_from_inserted(sessions.len(), inserted))
     }
 
-    pub async fn upsert_session_bundle(
-        &self,
-        session: &Session,
-        messages: &[MessageWrite<'_>],
-    ) -> Result<Vec<UpsertStatus>> {
-        let mut statuses = self.upsert_sessions(std::slice::from_ref(session)).await?;
-        statuses.extend(self.upsert_messages(session, messages).await?);
-
-        let mut parts = Vec::with_capacity(messages.iter().map(|write| write.parts.len()).sum());
-        for write in messages {
-            parts.extend_from_slice(write.parts);
-        }
-        statuses.extend(self.upsert_parts(&parts).await?);
-
-        Ok(statuses)
-    }
-
     /// Batched write path used by the adapter ingest loop and by the wire
     /// handler's final flush. Receives N completed substreams from the
     /// validator and:
     ///
-    ///   1. Runs the immutable-fields check (design.md#protocol-pond-ingest) against the stored row
+    ///   1. Runs the immutable-fields check (spec.md#protocol) against the stored row
     ///      per session, sequentially. Sessions that fail produce one Error
     ///      outcome and are excluded from the write batch.
     ///   2. Deduplicates in-batch at the substream level: when two substreams
@@ -500,28 +476,6 @@ impl Store {
         Ok(outcomes)
     }
 
-    pub async fn upsert_message(
-        &self,
-        message: &Message,
-        parts: &[Part],
-        session: &Session,
-        search_text: Option<&str>,
-    ) -> Result<Vec<UpsertStatus>> {
-        let mut statuses = self
-            .upsert_messages(
-                session,
-                &[MessageWrite {
-                    message,
-                    parts,
-                    search_text,
-                }],
-            )
-            .await?;
-        statuses.extend(self.upsert_parts(parts).await?);
-
-        Ok(statuses)
-    }
-
     pub async fn upsert_messages(
         &self,
         session: &Session,
@@ -560,13 +514,6 @@ impl Store {
         Ok(statuses_from_inserted(parts.len(), inserted))
     }
 
-    pub async fn upsert_part(&self, part: &Part) -> Result<UpsertStatus> {
-        let mut statuses = self.upsert_parts(std::slice::from_ref(part)).await?;
-        statuses
-            .pop()
-            .context("single part upsert returned no status")
-    }
-
     pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionWithMessages>> {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(None);
@@ -590,10 +537,38 @@ impl Store {
         Ok(ids)
     }
 
+    pub async fn child_sessions(&self, parent_session_id: &str) -> Result<Vec<Session>> {
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Sessions,
+                Some(&Predicate::Eq(
+                    "parent_session_id",
+                    parent_session_id.into(),
+                )),
+                &[
+                    "id",
+                    "parent_session_id",
+                    "parent_message_id",
+                    "source_agent",
+                    "created_at",
+                    "project",
+                    "options",
+                ],
+            )
+            .await?;
+        let mut sessions = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            sessions.push(session_from_batch(&batch, row)?);
+        }
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(sessions)
+    }
+
     /// `session_id -> wall-clock time of the Lance manifest version that
     /// last wrote the row` for the per-session staleness skip
-    /// (design.md#protocol-ingest-semantics). Reads Lance's `_row_last_updated_at_version` system
-    /// column (available because pond enables stable row ids per design.md#inv-25)
+    /// (spec.md#event-ordering). Reads Lance's `_row_last_updated_at_version` system
+    /// column (available because pond enables stable row ids per spec.md#stable-row-ids)
     /// and joins it against `Dataset::versions()` for commit timestamps.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
         use lance::deps::arrow_array::UInt64Array;
@@ -979,7 +954,7 @@ impl Store {
 
     /// Create the FTS index on `messages` plus scalar indexes on content tables.
     pub async fn ensure_indices(&self) -> Result<()> {
-        if self.handle.count_rows(Table::Messages, None).await? > 0 {
+        if self.handle.count_rows(Table::Messages).await? > 0 {
             self.handle
                 .ensure_index(
                     Table::Messages,
@@ -995,14 +970,14 @@ impl Store {
                     .await?;
             }
         }
-        if self.handle.count_rows(Table::Parts, None).await? > 0 {
+        if self.handle.count_rows(Table::Parts).await? > 0 {
             for (column, kind, name) in PARTS_SCALAR_INDICES {
                 self.handle
                     .ensure_scalar_index(Table::Parts, column, kind, name)
                     .await?;
             }
         }
-        if self.handle.count_rows(Table::Sessions, None).await? > 0 {
+        if self.handle.count_rows(Table::Sessions).await? > 0 {
             for (column, kind, name) in SESSIONS_SCALAR_INDICES {
                 self.handle
                     .ensure_scalar_index(Table::Sessions, column, kind, name)
@@ -1024,7 +999,7 @@ impl Store {
         model: &EmbeddingModel,
         vector_index_threshold: usize,
     ) -> Result<()> {
-        let rows = self.handle.count_rows(Table::Embeddings, None).await?;
+        let rows = self.handle.count_rows(Table::Embeddings).await?;
         if rows == 0 {
             return Ok(());
         }
@@ -1095,14 +1070,6 @@ impl Store {
         }
     }
 
-    /// Return every message of `session_id` in canonical `(timestamp, id)`
-    /// order, each paired with its parts. Public face of the session
-    /// iteration seam used by both `pond_get` (full-session reads) and
-    /// `pond_session_events` (catch-up SSE per design.md#protocol-pond-session-events).
-    pub async fn session_messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
-        self.messages_for_session(session_id).await
-    }
-
     async fn messages_for_session(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         let batch = self
             .handle
@@ -1151,24 +1118,58 @@ impl Store {
         if message_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let batch = self
+        let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
+        let mut scanner = self
             .handle
-            .scan_batch(
+            .scan(
                 Table::Parts,
-                Some(&in_predicate("message_id", message_ids)),
-                &[
-                    "message_id",
-                    "id",
-                    "ordinal",
-                    "type",
-                    "options",
-                    "variant_data",
-                ],
+                ScanOpts::with_predicate_and_projection(
+                    &in_predicate("message_id", message_ids),
+                    &[
+                        "message_id",
+                        "id",
+                        "ordinal",
+                        "type",
+                        "options",
+                        "variant_data",
+                    ],
+                ),
             )
             .await?;
+        scanner.with_row_address();
+        let batch = scanner.try_into_batch().await.context("scan failed")?;
+        let row_addresses = uint64(&batch, "_rowaddr")?;
+        let mut file_payloads = BTreeMap::<usize, FileData>::new();
+        let mut file_rows = Vec::<(usize, u64, String)>::new();
+        for row in 0..batch.num_rows() {
+            if string(&batch, "type", row)?.as_deref() == Some("file") {
+                let variant_data =
+                    string(&batch, "variant_data", row)?.context("variant_data is null")?;
+                file_rows.push((row, row_addresses.value(row), variant_data));
+            }
+        }
+        if !file_rows.is_empty() {
+            let addresses = file_rows
+                .iter()
+                .map(|(_, address, _)| *address)
+                .collect::<Vec<_>>();
+            let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
+            for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                let payload = if file_data_kind(&variant_data)? == "url" {
+                    FileData::Url(
+                        blob.uri()
+                            .context("file URL payload has no blob URI")?
+                            .to_owned(),
+                    )
+                } else {
+                    file_data_from_blob(&variant_data, &blob.read().await?)?
+                };
+                file_payloads.insert(row, payload);
+            }
+        }
         let mut parts_by_message = BTreeMap::<String, Vec<Part>>::new();
         for row in 0..batch.num_rows() {
-            let part = part_from_batch(&batch, row)?;
+            let part = part_from_batch(&batch, row, file_payloads.remove(&row))?;
             parts_by_message
                 .entry(part.message_id.clone())
                 .or_default()
@@ -1195,7 +1196,7 @@ pub enum IngestEvent {
 ///
 /// Fields are bucketed by population so the summary never conflates "100
 /// validator-rejected rows in 1 bad session" with "100 separate failures."
-/// The shape is set by design.md#protocol-ingest-semantics (post-2026-05-15 rewrite).
+/// The shape is set by spec.md#event-ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
     /// Rows actually written to Lance.
@@ -1206,7 +1207,7 @@ pub struct IngestSummary {
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
     /// session with one bad part stays in this bucket as 1, not as "the
-    /// whole substream." Per design.md#inv-17, adapters SHOULD dedupe their
+    /// whole substream." Per spec.md#adapter-dedup, adapters SHOULD dedupe their
     /// own emissions upstream when source replay is expected; the
     /// validator's in-batch HashSet is a safety net, not a feature
     /// adapters may rely on. If this bucket grows on a clean adapter,
@@ -1221,7 +1222,7 @@ pub struct IngestSummary {
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
     /// Sessions short-circuited via the per-session staleness skip
-    /// (design.md#protocol-ingest-semantics): file `mtime` was at or before the wall-clock time
+    /// (spec.md#event-ordering): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
     pub skipped_fresh: usize,
     /// Storage-layer failures whose retries were exhausted (commit
@@ -1241,7 +1242,7 @@ pub struct IngestSummary {
 /// the per-row `RowError::reason_key`. `&'static str` so consumers can
 /// match by identity rather than prose. Adding a new variant: pick a short
 /// snake_case identifier, route it from the validator/adapter, and update
-/// the doc table in `docs/design.md#protocol-ingest-semantics`.
+/// the per-row outcome docs in `docs/spec.md#event-ordering`.
 pub const DROP_REASON_DUPLICATE_MESSAGE_ID: &str = "duplicate_message_id";
 pub const DROP_REASON_DUPLICATE_PART_KEY: &str = "duplicate_part_key";
 pub const DROP_REASON_MESSAGE_BEFORE_SESSION: &str = "message_before_session";
@@ -1250,12 +1251,8 @@ pub const DROP_REASON_PART_BEFORE_MESSAGE: &str = "part_before_message";
 pub const DROP_REASON_PART_MESSAGE_MISMATCH: &str = "part_message_mismatch";
 pub const DROP_REASON_EMPTY_SOURCE_AGENT: &str = "empty_source_agent";
 pub const DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION: &str = "parent_message_without_session";
-pub const DROP_REASON_MISSING_PROJECT: &str = "missing_project";
 pub const DROP_REASON_IMMUTABLE_PROJECT: &str = "immutable_project";
 pub const DROP_REASON_IMMUTABLE_SOURCE_AGENT: &str = "immutable_source_agent";
-pub const DROP_REASON_ADAPTER_PARSE: &str = "adapter_parse";
-pub const DROP_REASON_ADAPTER_IO: &str = "adapter_io";
-pub const DROP_REASON_ADAPTER_SCHEMA: &str = "adapter_schema";
 pub const DROP_REASON_UNCATEGORIZED: &str = "uncategorized";
 
 impl IngestSummary {
@@ -1290,16 +1287,9 @@ impl IngestSummary {
             }
         }
     }
-
-    /// Record a drop-reason charge that did not flow through a `RowOutcome`
-    /// (currently used by the adapter path for bad-line parse failures
-    /// mid-session, where `handlers.rs` bumps `dropped_events` directly).
-    pub fn record_drop_reason(&mut self, reason: &'static str) {
-        *self.drop_reasons.entry(reason).or_insert(0) += 1;
-    }
 }
 
-/// Per-row outcome surfaced by [`IngestValidator`] (design.md#protocol-pond-ingest). One
+/// Per-row outcome surfaced by [`IngestValidator`] (spec.md#protocol). One
 /// row per input event from the request's `events` array. The validator
 /// returns these in array order so the wire layer can pack them directly
 /// into [`crate::wire::IngestResult`] entries.
@@ -1363,7 +1353,7 @@ struct BufferedPart {
 /// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
 /// continues; only Session-level invariants (immutable source_agent / project
 /// on re-write) drop the whole substream. The N-events-per-rejection cascade
-/// from the prior contract is gone (see design.md#protocol-ingest-semantics "Ordering enforcement").
+/// from the prior contract is gone (see spec.md#event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the previous one), they accumulate in
@@ -1457,7 +1447,7 @@ impl IngestValidator {
         // when the caller invokes `flush` / `finish`.
         self.close_current_substream();
 
-        // design.md#schemas-session: `source_agent` is trimmed at ingest and rejected
+        // spec.md#datasets: `source_agent` is trimmed at ingest and rejected
         // if empty after trim. A Session event with empty source_agent is
         // dropped on the spot - the substream that would follow has nothing
         // to anchor on, so subsequent message/part events will also drop.
@@ -1678,7 +1668,7 @@ fn error_outcome(
 /// loss is implied by the single session-rejection. Earlier versions
 /// cascaded N error rows per rejected substream; that inflated the operator
 /// view ("12,297 errors") for what is structurally one decision
-/// ("1 session-level rejection"). See design.md#protocol-ingest-semantics.
+/// ("1 session-level rejection"). See spec.md#event-ordering.
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -1704,9 +1694,7 @@ fn error_outcomes_for_substream(
 
 /// Batched-path success helper: every row in a substream takes the same
 /// status (the batch-level `Inserted` vs `Matched` decision from
-/// `merge_insert.num_inserted_rows`). The single-session path uses
-/// `success_outcomes_from_statuses` instead, which threads per-row
-/// statuses from `upsert_session_bundle`'s sequential calls.
+/// `merge_insert.num_inserted_rows`).
 fn success_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -1758,7 +1746,7 @@ fn success_outcome(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IngestError {
-    /// design.md#protocol-pond-ingest: `Session.source_agent` and `Session.project` are
+    /// spec.md#protocol: `Session.source_agent` and `Session.project` are
     /// immutable post-first-write because the denormalized copies on
     /// `messages` and `embeddings` were stamped from the prior Session at
     /// first ingest. A re-write that changes either would silently desync.
@@ -1789,7 +1777,7 @@ impl std::fmt::Display for IngestError {
 impl std::error::Error for IngestError {}
 
 /// Compare an incoming Session row against the stored row on the two
-/// immutable fields (design.md#protocol-pond-ingest). The `Option<String>` `project` field
+/// immutable fields (spec.md#protocol). The `Option<String>` `project` field
 /// counts a NULL-vs-non-NULL change as a mismatch.
 fn ensure_immutable_match(
     existing: &Session,
@@ -1880,7 +1868,7 @@ pub struct SessionWithMessages {
     pub messages: Vec<MessageWithParts>,
 }
 
-/// Scalar indexes on `messages` (design.md#schemas-message): BTREE for high-cardinality
+/// Scalar indexes on `messages` (spec.md#datasets): BTREE for high-cardinality
 /// and range columns, BITMAP for low-cardinality columns.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("id", BuiltinIndexType::BTree, "messages_id_btree"),
@@ -1903,7 +1891,7 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("role", BuiltinIndexType::Bitmap, "messages_role_bitmap"),
 ];
 
-/// Scalar indexes on `embeddings` (design.md#schemas-embedding): the same filter set,
+/// Scalar indexes on `embeddings` (spec.md#datasets): the same filter set,
 /// denormalized so vector kNN pushes predicates down without a cross-table join.
 const EMBEDDING_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
@@ -1987,7 +1975,7 @@ pub(crate) const MESSAGES: &str = "messages.lance";
 pub(crate) const PARTS: &str = "parts.lance";
 pub(crate) const EMBEDDINGS: &str = "embeddings.lance";
 
-/// Fixed embedding vector dimension (Qwen3-Embedding-0.6B, design.md#schemas-embedding).
+/// Fixed embedding vector dimension for the configured default model (spec.md#search).
 /// A future model with a different dim activates a second `embeddings` table.
 pub const EMBEDDING_DIM: usize = 1024;
 
@@ -2109,7 +2097,7 @@ pub(crate) struct MessageBatchRow<'a> {
 }
 
 /// One row of the `embeddings` dataset: a (message, model) vector with the
-/// filter columns denormalized from `messages` (design.md#schemas-embedding). One message
+/// filter columns denormalized from `messages` (spec.md#datasets). One message
 /// produces exactly one vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingRow {
@@ -2443,7 +2431,11 @@ pub(crate) fn pending_message_from_batch(
     })
 }
 
-pub(crate) fn part_from_batch(batch: &RecordBatch, row: usize) -> Result<Part> {
+pub(crate) fn part_from_batch(
+    batch: &RecordBatch,
+    row: usize,
+    file_data: Option<FileData>,
+) -> Result<Part> {
     let type_name = string(batch, "type", row)?.context("part type is null")?;
     let variant_data = string(batch, "variant_data", row)?.context("variant_data is null")?;
     Ok(Part {
@@ -2451,8 +2443,45 @@ pub(crate) fn part_from_batch(batch: &RecordBatch, row: usize) -> Result<Part> {
         id: string(batch, "id", row)?.context("part id is null")?,
         ordinal: int32(batch, "ordinal", row)?,
         options: json_parse(&string(batch, "options", row)?.context("part options is null")?)?,
-        kind: part_kind_from_json(&type_name, &variant_data)?,
+        kind: part_kind_from_json(&type_name, &variant_data, file_data)?,
     })
+}
+
+fn file_data_from_blob(variant_data: &str, bytes: &[u8]) -> Result<FileData> {
+    let kind = file_data_kind(variant_data)?;
+    match kind.as_str() {
+        "string" => {
+            let text = std::str::from_utf8(bytes)
+                .context("file string payload is not UTF-8")?
+                .to_owned();
+            Ok(FileData::String(text))
+        }
+        "bytes" => Ok(FileData::Bytes(bytes.to_vec())),
+        "url" => Ok(FileData::Url(
+            std::str::from_utf8(bytes)
+                .context("file URL payload is not UTF-8")?
+                .to_owned(),
+        )),
+        other => anyhow::bail!("unknown file data_kind {other}"),
+    }
+}
+
+fn file_data_kind(variant_data: &str) -> Result<String> {
+    let value = json_parse::<Value>(variant_data)?;
+    value
+        .get("data_kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("file part variant_data missing data_kind")
+}
+
+fn uint64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
+    batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .with_context(|| format!("column {name} is not UInt64"))
 }
 
 pub(crate) fn string(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>> {
@@ -2524,6 +2553,24 @@ fn json_parse<T: DeserializeOwned>(value: &str) -> Result<T> {
 }
 
 fn part_variant_json(kind: &PartKind) -> Result<String> {
+    if let PartKind::File {
+        media_type,
+        file_name,
+        data,
+    } = kind
+    {
+        let data_kind = match data {
+            FileData::String(_) => "string",
+            FileData::Bytes(_) => "bytes",
+            FileData::Url(_) => "url",
+        };
+        return serde_json::to_string(&serde_json::json!({
+            "media_type": media_type,
+            "file_name": file_name,
+            "data_kind": data_kind,
+        }))
+        .context("failed to serialize file part variant");
+    }
     let value = serde_json::to_value(kind)?;
     let mut object = value
         .as_object()
@@ -2533,12 +2580,20 @@ fn part_variant_json(kind: &PartKind) -> Result<String> {
     serde_json::to_string(&object).context("failed to serialize part variant")
 }
 
-fn part_kind_from_json(type_name: &str, variant_data: &str) -> Result<PartKind> {
+fn part_kind_from_json(
+    type_name: &str,
+    variant_data: &str,
+    file_data: Option<FileData>,
+) -> Result<PartKind> {
     let mut value = json_parse::<Value>(variant_data)?;
     let object = value
         .as_object_mut()
         .context("part variant data is not an object")?;
     object.insert("type".to_owned(), Value::String(type_name.to_owned()));
+    if let Some(data) = file_data {
+        object.remove("data_kind");
+        object.insert("data".to_owned(), serde_json::to_value(data)?);
+    }
     serde_json::from_value(value).context("failed to parse part kind")
 }
 
@@ -2570,7 +2625,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordering_violation_drops_only_the_offending_event() -> anyhow::Result<()> {
-        // Per-event drop semantics (design.md#protocol-ingest-semantics): a Part with no preceding
+        // Per-event drop semantics (spec.md#event-ordering): a Part with no preceding
         // Message is dropped on the spot, with one Error outcome surfaced. The
         // rest of the substream continues normally - subsequent valid messages
         // and parts get written.
@@ -2916,7 +2971,7 @@ mod tests {
             )
             .await?;
 
-        // The load-bearing assertion (design.md#protocol-search): the predicate is served by a
+        // The load-bearing assertion (spec.md#search): the predicate is served by a
         // scalar-index node, not a postfilter `FilterExec`. (A `FilterExec` for the
         // KNN-internal `_distance IS NOT NULL` is expected and unrelated.)
         assert!(

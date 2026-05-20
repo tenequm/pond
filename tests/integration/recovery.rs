@@ -1,7 +1,6 @@
-//! Recovery story (design.md#inv-10): every byte in pond's datasets is
-//! derivable from the registered adapters' source data. The recovery path
-//! for any corruption is `rm -rf $POND_DATA_DIR && pond sync`; this test
-//! proves the loop actually round-trips identical row counts and identical
+//! Durable-copy story (spec.md#durable-copy): `pond export` produces a portable
+//! snapshot of canonical session rows that can be ingested into a fresh store.
+//! This test proves the loop round-trips identical row counts and identical
 //! `pond export` output.
 //!
 //! Plus: `pond export` produces JSONL `IngestEvent`s that round-trip back
@@ -17,7 +16,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
-const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 async fn full_export(store: &Store) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();

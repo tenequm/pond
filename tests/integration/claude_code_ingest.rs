@@ -13,7 +13,7 @@ use tempfile::TempDir;
 async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
+    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
 
     let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     assert_eq!(summary.dropped_events, 0);
@@ -79,7 +79,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
 async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
+    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
 
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     let first_counts = store.row_counts().await?;
@@ -100,7 +100,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
+    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
 
     let mut events: Vec<SyncEvent> = Vec::new();
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
@@ -139,7 +139,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/session-samples/claude-code/projects");
+    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
     let stats = store.corpus_stats(false).await?;
@@ -156,7 +156,13 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
     let project_messages: u64 = claude.projects.iter().map(|p| p.messages).sum();
     assert_eq!(claude.sessions, project_sessions);
     assert_eq!(claude.messages, project_messages);
-    assert_eq!(claude.messages, stats.totals.messages);
+    // `include_subagents=false` (the CLI default): sub-branded sessions
+    // (`source_agent` with a `/`) are filtered out of the breakdown, so no
+    // adapter row carries a `/` and the breakdown sums to strictly less than
+    // `totals` - the fixture corpus has one subagent session.
+    assert!(stats.adapters.iter().all(|s| !s.adapter.contains('/')));
+    let filtered_messages: u64 = stats.adapters.iter().map(|s| s.messages).sum();
+    assert!(filtered_messages < stats.totals.messages);
 
     // Projects sort by message count desc.
     for pair in claude.projects.windows(2) {
@@ -165,6 +171,17 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
             "projects must be ordered by message count desc",
         );
     }
+
+    // `include_subagents=true`: every `source_agent` gets its own row,
+    // including `claude-code/<type>`, and the breakdown reconciles exactly
+    // with `totals`.
+    let full = store.corpus_stats(true).await?;
+    let full_messages: u64 = full.adapters.iter().map(|s| s.messages).sum();
+    assert_eq!(full_messages, full.totals.messages);
+    assert!(
+        full.adapters.iter().any(|s| s.adapter.contains('/')),
+        "a subagent session must surface as its own claude-code/<type> row",
+    );
 
     Ok(())
 }

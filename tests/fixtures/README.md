@@ -1,11 +1,11 @@
 # Session samples
 
 Curated, anonymized session captures from 8 agentic-client platforms. These files
-ground pond's canonical-type design (see `docs/design.md` section 3.1) and
+ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 SourceAdapter implementations (see
-`docs/design.md` section 3.4).
+`docs/spec.md#adapters`).
 
-Snapshot date: 2026-05-13.
+Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20).
 
 ## Why
 
@@ -36,12 +36,12 @@ Constraints baked in:
 ## Layout
 
 ```
-session-samples/
+adapter/
   README.md                  this file
-  claude-app/                Claude Desktop (macOS), Cowork / local-agent-mode
-  claude-code/               Claude Code CLI
-  claude-managed-agents/     Anthropic API Managed Agents (playground export)
-  codex-cli/                 OpenAI Codex CLI
+  claude_app/                Claude Desktop (macOS), Cowork / local-agent-mode
+  claude_code/               Claude Code CLI
+  claude_managed_agents/     Anthropic API Managed Agents (playground export)
+  codex_cli/                 OpenAI Codex CLI
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   openclaw/                  openclaw runtime
   opencode/                  opencode CLI
@@ -54,7 +54,7 @@ sample tree.
 
 ## Per-platform notes
 
-### claude-app (Claude Desktop, Cowork)
+### claude_app (Claude Desktop, Cowork)
 
 - Source path: `~/Library/Application Support/Claude/local-agent-mode-sessions/<account-uuid>/<workspace-uuid>/`
 - Layout: pair per session. `local_<session-uuid>.json` is the metadata file
@@ -80,10 +80,10 @@ sample tree.
   for all because only one workspace existed on the source machine.
 - The web chat history at
   `~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/`
-  is described in `claude-app/schema-notes.md` but not captured (binary
+  is described in `claude_app/schema-notes.md` but not captured (binary
   LevelDB, separate extraction work).
 
-### claude-code (Claude Code CLI)
+### claude_code (Claude Code CLI)
 
 - Source path: `~/.claude/projects/<encoded-project-path>/<session-uuid>.jsonl`
 - Layout: one JSONL per session, one directory per encoded project path.
@@ -91,8 +91,11 @@ sample tree.
   typed entries with `parentUuid` -> `uuid` chains. Tool results arrive as
   `user` entries whose `message.content[]` contains `tool_result` blocks,
   plus a parallel `toolUseResult` field carrying richer structured data
-  (`structuredPatch` for Edits, file contents for Reads, etc.).
-- Samples: 9 sessions. The original 3 (`myproject-a/b/c`) are one session
+  (`structuredPatch` for Edits, file contents for Reads, etc.). A session
+  that used the Task tool also has a `<session-uuid>/subagents/` sidecar
+  directory: one `agent-<hash>.jsonl` transcript per subagent plus a sibling
+  `agent-<hash>.meta.json` (`{agentType, description, toolUseId}`).
+- Samples: 10 sessions. The original 3 (`myproject-a/b/c`) are one session
   each across 3 projects and 3 CLI versions: 2.1.68 is the older format (no
   SessionStart attachment, no `last-prompt` / `permission-mode` standalone
   events, no per-row `entrypoint` / `gitBranch`); 2.1.104 and 2.1.132 are the
@@ -100,12 +103,17 @@ sample tree.
   `mcp_instructions_delta`, `skill_listing`, `stop_hook_summary`, etc.
   `myproject-d` adds 6 deep-redacted sessions from one real project spanning
   CLI versions 2.1.71 / 2.1.92 / 2.1.98 / 2.1.109, added for Tier-1 search
-  relevance / filter test diversity. Across all 9 sessions the set covers 7
-  distinct CLI versions and includes `queue-operation` entries (the
-  message-queue feature - these carry no uuid / parentUuid and must be
-  skipped in the parentUuid chain).
+  relevance / filter test diversity. The 10th (`pond`, CLI 2.1.144) is a real
+  session on this repo that used the Task tool, added for the subagent
+  on-disk layout the others lack: a `<parent-uuid>/subagents/agent-<hash>.jsonl`
+  transcript plus its sibling `agent-<hash>.meta.json`. Its project is kept as
+  `pond` - the host repo, not an undisclosed third-party project, so no
+  `myproject-*` placeholder. Across all 10 sessions the set covers 8 distinct
+  CLI versions and includes `queue-operation` entries (the message-queue
+  feature - these carry no uuid / parentUuid and must be skipped in the
+  parentUuid chain).
 
-### claude-managed-agents (Anthropic API Managed Agents)
+### claude_managed_agents (Anthropic API Managed Agents)
 
 - Source: API playground export. No local on-disk format.
 - Layout: single JSON file, flat array of events with `type` discriminator.
@@ -118,10 +126,10 @@ sample tree.
 - Samples: 1 (the included session is a comparison of two public GitHub
   repositories via the `web_fetch` tool; preserved verbatim from the
   exporter since it contains no sensitive content).
-- See `claude-managed-agents/schema-notes.md` for a detailed event-stream
+- See `claude_managed_agents/schema-notes.md` for a detailed event-stream
   walkthrough.
 
-### codex-cli (OpenAI Codex CLI)
+### codex_cli (OpenAI Codex CLI)
 
 - Source path: `~/.codex/sessions/<year>/<month>/<day>/rollout-<ts>-<uuid>.jsonl`
 - Layout: date-partitioned. Each line is an envelope `{timestamp, type, payload}`.
@@ -217,18 +225,18 @@ sample tree.
 ## Cross-platform schema variation
 
 Where formats fundamentally disagree (informs canonical type design in
-`docs/design.md` section 3.1):
+`docs/spec.md#adapters`):
 
 | Concern | Variants observed |
 |---|---|
-| Top-level file shape | JSONL stream (claude-code, codex, pi, nanoclaw, openclaw, claude-app audit) vs JSON array (claude-managed-agents) vs fan-out tree (opencode) vs metadata + audit pair (claude-app) |
-| Message-to-event granularity | Coalesced messages (claude-code, opencode, openclaw, claude-app audit) vs per-event stream where one assistant turn produces many events (claude-managed-agents, codex with separate `response_item`s) |
-| Tool call / result linking | Same-line content blocks (claude-code, claude-app, claude-managed-agents) vs separate top-level events (pi, codex) vs side-table parts (opencode) vs inline content with separate `role:"toolResult"` (openclaw) |
-| Inter-message linking | parentUuid chain (claude-code) vs parentId tree (pi, openclaw) vs flat sequence with span IDs (claude-managed-agents) vs file order only (codex, opencode, claude-app audit) |
-| Sidecar files | `tool-results/`, `subagents/` (nanoclaw) vs per-message part dirs (opencode) vs `uploads/` + `outputs/` (claude-app) vs none (most others) |
-| Provider / model recording | Per-assistant-message (most) vs per-span via `span.model_request_*` events (claude-managed-agents) vs per-line `turn_context` (codex) |
+| Top-level file shape | JSONL stream (claude_code, codex_cli, pi, nanoclaw, openclaw, claude_app audit) vs JSON array (claude_managed_agents) vs fan-out tree (opencode) vs metadata + audit pair (claude_app) |
+| Message-to-event granularity | Coalesced messages (claude_code, opencode, openclaw, claude_app audit) vs per-event stream where one assistant turn produces many events (claude_managed_agents, codex_cli with separate `response_item`s) |
+| Tool call / result linking | Same-line content blocks (claude_code, claude_app, claude_managed_agents) vs separate top-level events (pi, codex_cli) vs side-table parts (opencode) vs inline content with separate `role:"toolResult"` (openclaw) |
+| Inter-message linking | parentUuid chain (claude_code) vs parentId tree (pi, openclaw) vs flat sequence with span IDs (claude_managed_agents) vs file order only (codex_cli, opencode, claude_app audit) |
+| Sidecar files | `tool-results/`, `subagents/` (nanoclaw) vs per-message part dirs (opencode) vs `uploads/` + `outputs/` (claude_app) vs none (most others) |
+| Provider / model recording | Per-assistant-message (most) vs per-span via `span.model_request_*` events (claude_managed_agents) vs per-line `turn_context` (codex_cli) |
 | Encrypted opaque payloads | Codex `encrypted_content` Fernet blobs vs none |
-| HMAC over content | claude-app `_audit_hmac` vs none |
+| HMAC over content | claude_app `_audit_hmac` vs none |
 | Streaming on disk | None of the captured samples persists streaming deltas; all are coalesced to final-state |
 
 ## Anonymization rules applied
@@ -265,7 +273,7 @@ be applied to refreshed samples.
 - Long product-internal system prompts beyond standard runtime boilerplate
   -> `<redacted: ~Nk-char product system prompt>` (Cowork system prompts
   are preserved verbatim because they are identical across all Claude
-  Desktop users; see `claude-app/schema-notes.md`)
+  Desktop users; see `claude_app/schema-notes.md`)
 
 ### Preserved verbatim
 
@@ -288,7 +296,7 @@ be applied to refreshed samples.
 - Anthropic and OpenAI API field names
 - Codex `encrypted_content` Fernet payloads (opaque; pond cannot decrypt;
   preserved for schema fidelity)
-- claude-app `_audit_hmac` field values (cryptographically invalid against
+- claude_app `_audit_hmac` field values (cryptographically invalid against
   modified content but the field is kept so SourceAdapters see it)
 - Cowork system prompts (identical across all Claude Desktop users;
   preserved for schema fidelity)
@@ -300,7 +308,7 @@ be applied to refreshed samples.
 Tracked shortfalls where a future SourceAdapter would have untested surface.
 Update as gaps are closed.
 
-- **claude-managed-agents - single session.** All 9 event types are present
+- **claude_managed_agents - single session.** All 9 event types are present
   (enough to design the adapter) but there is no second session for an
   idempotency / round-trip pair and no error or version-skew case. Source is
   an API playground export with no on-disk format, so a refresh requires a
@@ -313,7 +321,7 @@ Closed gaps (kept here briefly for history):
 - **nanoclaw single top-level session** - closed by adding
   `agentgroup-synthetic-001/` (2 synthetic structural-replay sessions; see
   the nanoclaw per-platform note).
-- **claude-app populated `uploads/` sidecar** - closed by adding the
+- **claude_app populated `uploads/` sidecar** - closed by adding the
   `local_5c09adfc` staged session. Also established definitively that
   `outputs/` is not a deliverable sink (the agent writes to the user's
   workspace folder); it stays empty by design, so it is not a gap.

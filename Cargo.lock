@@ -4371,6 +4371,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.47.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4a6248eb93a4401ed2f37dfe8ea592d3cf05b7cf4f8efa867b6895af7e094e"
+dependencies = [
+ "console",
+ "once_cell",
+ "similar",
+ "tempfile",
+]
+
+[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4662,6 +4674,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "rand 0.9.4",
  "rayon",
  "roaring",
@@ -4772,6 +4785,7 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
+ "protobuf-src",
  "tokio",
  "tracing",
 ]
@@ -4823,6 +4837,7 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
+ "protobuf-src",
  "rand 0.9.4",
  "strum",
  "tokio",
@@ -4859,6 +4874,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "tokio",
  "tracing",
 ]
@@ -4931,6 +4947,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "rand 0.9.4",
  "rand_distr",
  "rangemap",
@@ -5084,6 +5101,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "rand 0.9.4",
  "rangemap",
  "roaring",
@@ -6482,20 +6500,20 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "cudarc 0.19.7",
  "dialoguer",
  "fastembed",
  "fastrand",
- "hf-hub",
  "indicatif",
+ "insta",
  "lance",
- "lance-encoding",
+ "lance-datafusion",
  "lance-file",
  "lance-index",
  "lance-io",
  "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
- "lance-table",
  "rmcp",
  "serde",
  "serde_json",
@@ -6647,6 +6665,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "protobuf-src"
+version = "2.1.1+27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6217c3504da19b85a3a4b2e9a5183d635822d83507ba0986624b5c05b83bfc40"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]
@@ -7990,6 +8017,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simple_asn1"

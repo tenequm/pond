@@ -1,7 +1,7 @@
 //! The HTTP+JSON and stdio-MCP transports: thin adapters over the shared wire
 //! handlers. Both transports dispatch to the exact same handler functions - the
 //! only intentional divergence is the MCP placeholder rendering in
-//! [`mcp::render_placeholders`] (design.md#protocol-pond-get).
+//! [`mcp::render_placeholders`] (spec.md#protocol).
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get`, `POST /v1/ingest`, and the
 //! SSE `GET /v1/sessions/{id}/events` stream. MCP exposes only `pond_search` /
@@ -55,7 +55,7 @@ pub mod http {
         },
     };
 
-    /// HTTP body cap for `POST /v1/*` JSON handlers (design.md#protocol-pond-ingest): 8 MB.
+    /// HTTP body cap for `POST /v1/*` JSON handlers (spec.md#protocol): 8 MB.
     /// Replaces axum's 2 MB default - that default is more restrictive than the
     /// design's intent and would surface oversize ingests as a generic 413
     /// instead of pond's typed `validation_failed`.
@@ -86,7 +86,7 @@ pub mod http {
 
     /// Bind and serve until ctrl-c. `--port 0` selects an OS-assigned free port;
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
-    /// personal pond is single-user and LAN exposure is opt-in (design.md#scope-personal-pond).
+    /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     pub async fn serve(state: AppState, host: String, port: u16) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
@@ -158,7 +158,7 @@ pub mod http {
     }
 
     /// Query string for `GET /v1/sessions/{session_id}/events`
-    /// (design.md#protocol-pond-session-events). `since` resumes after a prior
+    /// (spec.md#protocol). `since` resumes after a prior
     /// event id; the `Last-Event-ID` HTTP header is honored as a fallback when
     /// the query param is absent (EventSource auto-reconnect path).
     #[derive(Debug, Deserialize)]
@@ -429,7 +429,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             let include_tool_results = params.include_tool_results.unwrap_or(false);
             // Always fetch full content from the shared handler; the MCP
             // transport renders placeholders for excluded parts
-            // (design.md#protocol-pond-get) instead of dropping them - so the
+            // (spec.md#protocol) instead of dropping them - so the
             // divergence lives here, not in the handler.
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -526,7 +526,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
 
     /// Run the stdio MCP server until the client disconnects. All diagnostics
     /// go to stderr (the shared `tracing` subscriber); stdout carries only
-    /// JSON-RPC frames, written by rmcp's stdio transport (design.md#scope-personal-pond).
+    /// JSON-RPC frames, written by rmcp's stdio transport (spec.md#scope).
     pub async fn serve_stdio(state: AppState) -> anyhow::Result<()> {
         let service = PondMcp::new(state)
             .serve(stdio())
@@ -538,7 +538,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
 
     /// Replace excluded `Reasoning` / `ToolResult` parts with a compact text
     /// placeholder so a calling agent knows retrievable content exists and can
-    /// re-request with the toggle (design.md#protocol-pond-get). This is the one
+    /// re-request with the toggle (spec.md#protocol). This is the one
     /// intentional MCP-vs-HTTP response divergence.
     fn render_placeholders(
         result: &mut GetResult,

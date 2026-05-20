@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! HTTP+JSON transport (design.md#protocol, design.md#protocol-wire-interface):
+//! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
 //! `POST /v1/search` and `POST /v1/get`
 //! are thin adapters over the shared wire handlers. The router is driven via
 //! `tower::ServiceExt::oneshot` - no socket bind, no HTTP client dependency.
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
 struct FakeBackend {
@@ -115,7 +115,10 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
         .session_ids()
         .await?
         .into_iter()
-        .next()
+        // A subagent session id contains a `/`; embedded in a URL path it
+        // would not route. These tests address sessions over HTTP, so pick a
+        // top-level (path-safe) session id.
+        .find(|id| !id.contains('/'))
         .expect("the fixture corpus has at least one session");
 
     // POST /v1/search round-trips to a success envelope.
@@ -213,13 +216,44 @@ async fn sse_text(app: &Router, uri: &str) -> (StatusCode, String) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_events_addresses_a_subagent_id_with_an_encoded_slash() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    // A subagent session id contains a `/` (`<parent>/agent-<hash>`,
+    // spec.md#opaque-ids). Clients percent-encode it in the path; axum decodes
+    // the `{session_id}` segment, so the slashed id round-trips to
+    // `get_session` and the SSE route serves the subagent session.
+    let subagent_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .find(|id| id.contains('/'))
+        .expect("fixture corpus has a subagent session");
+    let encoded = subagent_id.replace('/', "%2F");
+
+    let (status, body) = sse_text(&app, &format!("/v1/sessions/{encoded}/events")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a percent-encoded subagent id must route: {body}",
+    );
+    assert!(
+        body.contains(&format!("event: session\nid: session:{subagent_id}\n")),
+        "expected the subagent's session header event: {body}",
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn session_events_emits_session_message_and_end() -> anyhow::Result<()> {
     let (_temp, store, app) = router().await?;
     let session_id = store
         .session_ids()
         .await?
         .into_iter()
-        .next()
+        // A subagent session id contains a `/`; embedded in a URL path it
+        // would not route. These tests address sessions over HTTP, so pick a
+        // top-level (path-safe) session id.
+        .find(|id| !id.contains('/'))
         .expect("fixture corpus has at least one session");
 
     let (status, body) = sse_text(&app, &format!("/v1/sessions/{session_id}/events")).await;
@@ -245,7 +279,10 @@ async fn session_events_with_session_since_skips_header() -> anyhow::Result<()> 
         .session_ids()
         .await?
         .into_iter()
-        .next()
+        // A subagent session id contains a `/`; embedded in a URL path it
+        // would not route. These tests address sessions over HTTP, so pick a
+        // top-level (path-safe) session id.
+        .find(|id| !id.contains('/'))
         .expect("session id");
 
     let (status, body) = sse_text(
@@ -270,7 +307,10 @@ async fn session_events_with_end_since_is_idempotent() -> anyhow::Result<()> {
         .session_ids()
         .await?
         .into_iter()
-        .next()
+        // A subagent session id contains a `/`; embedded in a URL path it
+        // would not route. These tests address sessions over HTTP, so pick a
+        // top-level (path-safe) session id.
+        .find(|id| !id.contains('/'))
         .expect("session id");
 
     let (status, body) = sse_text(
@@ -294,7 +334,10 @@ async fn session_events_with_unknown_since_message_id_400s() -> anyhow::Result<(
         .session_ids()
         .await?
         .into_iter()
-        .next()
+        // A subagent session id contains a `/`; embedded in a URL path it
+        // would not route. These tests address sessions over HTTP, so pick a
+        // top-level (path-safe) session id.
+        .find(|id| !id.contains('/'))
         .expect("session id");
 
     let (status, body) = sse_text(

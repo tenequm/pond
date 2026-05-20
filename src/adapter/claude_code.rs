@@ -13,11 +13,10 @@ use std::{
 
 use anyhow::Context as _;
 use async_stream::stream;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio_stream::StreamExt;
 
 use crate::{
     config::expand_home_under,
@@ -27,9 +26,10 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    EventStream, SkipOracle, SkipReason, collect_jsonl_files, compact_json, empty_options,
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    collect_jsonl_files, compact_json, empty_options,
     extract::{Extracted, Source, extract_compact_repr, extract_self_str, extract_str},
-    part_id,
+    extracted_text, jsonl_bytes, part_id, raw_record,
 };
 
 /// Per-file streaming state that persists across rows of one JSONL file.
@@ -90,6 +90,213 @@ impl AdapterFactory for ClaudeCodeFactory {
         let path = env.home.join(".claude").join("projects");
         path.exists().then(|| json!({ "path": path }))
     }
+
+    fn serialize(
+        &self,
+        session: &crate::sessions::SessionWithMessages,
+        fidelity: RestoreFidelity,
+    ) -> Result<Vec<RestoredFile>, AdapterError> {
+        serialize_session(session, fidelity)
+    }
+}
+
+fn serialize_session(
+    session: &crate::sessions::SessionWithMessages,
+    fidelity: RestoreFidelity,
+) -> Result<Vec<RestoredFile>, AdapterError> {
+    let mut messages = session.messages.clone();
+    if fidelity == RestoreFidelity::Native {
+        messages.sort_by(|left, right| {
+            source_line(left.message.options())
+                .cmp(&source_line(right.message.options()))
+                .then_with(|| by_timestamp_then_id(left, right))
+        });
+    } else {
+        messages.sort_by(by_timestamp_then_id);
+    }
+    let mut records = Vec::with_capacity(messages.len());
+    let mut parent_uuid = None::<String>;
+    for message in &messages {
+        if fidelity == RestoreFidelity::Native
+            && let Some(raw) = raw_record(message.message.options())
+        {
+            parent_uuid = raw
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or(parent_uuid);
+            records.push(raw);
+            continue;
+        }
+        // `claude_record` returns `None` for a dropped System message;
+        // `parent_uuid` then stays put so the chain skips over the gap.
+        let Some(record) = claude_record(session, message, parent_uuid.as_deref()) else {
+            continue;
+        };
+        parent_uuid = record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        records.push(record);
+    }
+
+    let mut files = vec![RestoredFile {
+        relative_path: claude_relative_path(session),
+        bytes: jsonl_bytes(NAME, &records)?,
+    }];
+    if session.session.parent_session_id.is_some()
+        && let Some(meta) = subagent_meta_record(session)
+    {
+        let mut meta_path = files[0].relative_path.clone();
+        meta_path.set_extension("meta.json");
+        files.push(RestoredFile {
+            relative_path: meta_path,
+            bytes: serde_json::to_vec(&meta).map_err(|err| {
+                AdapterError::schema(
+                    NAME,
+                    &session.session.id,
+                    format!("json encode failed: {err}"),
+                )
+            })?,
+        });
+    }
+    Ok(files)
+}
+
+fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
+    let encoded_project = session
+        .session
+        .options
+        .get("source")
+        .and_then(|source| source.get("project_dir"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| encode_project(&session.session.project));
+    if let Some(parent) = &session.session.parent_session_id {
+        let agent = session
+            .session
+            .id
+            .rsplit('/')
+            .next()
+            .unwrap_or(&session.session.id);
+        return PathBuf::from(encoded_project)
+            .join(parent)
+            .join("subagents")
+            .join(format!("{agent}.jsonl"));
+    }
+    PathBuf::from(encoded_project).join(format!("{}.jsonl", session.session.id))
+}
+
+fn source_line(options: &ProviderOptions) -> Option<u64> {
+    options
+        .get("source")
+        .and_then(|source| source.get("line"))
+        .and_then(Value::as_u64)
+}
+
+fn encode_project(project: &str) -> String {
+    project.replace(['/', '.'], "-")
+}
+
+fn subagent_meta_record(session: &crate::sessions::SessionWithMessages) -> Option<Value> {
+    // Restore the sidecar `.meta.json` verbatim from the stored copy. A
+    // subagent ingested without a meta file stored `meta: null` - nothing
+    // to write back.
+    let meta = session.session.options.get("subagent")?.get("meta")?;
+    meta.is_object().then(|| meta.clone())
+}
+
+fn claude_record(
+    session: &crate::sessions::SessionWithMessages,
+    message: &crate::sessions::MessageWithParts,
+    parent_uuid: Option<&str>,
+) -> Option<Value> {
+    // Foreign restore into Claude Code (native restore re-emits the stored
+    // `raw_record` and never reaches here). Claude Code's transcript has only
+    // `user` and `assistant` rows: a tool result is a `user` row, and there
+    // is no in-transcript system turn - a System message (a rule-3 carrier or
+    // a source's own system/developer turn) has no idiomatic home and is
+    // dropped; the content stays in canonical (spec.md#native-restore-lossless,
+    // foreign clause).
+    let row_role = match &message.message {
+        Message::System { .. } => return None,
+        Message::User { .. } | Message::Tool { .. } => "user",
+        Message::Assistant { .. } => "assistant",
+    };
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("role".to_owned(), Value::String(row_role.to_owned()));
+    if row_role == "assistant" {
+        // `type:"message"` is the Anthropic Messages API object discriminator
+        // - a constant, always present on a real assistant row.
+        envelope.insert("type".to_owned(), Value::String("message".to_owned()));
+    }
+    envelope.insert(
+        "content".to_owned(),
+        Value::Array(message.parts.iter().map(claude_part).collect()),
+    );
+    Some(json!({
+        "parentUuid": parent_uuid,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": &*session.session.project,
+        "sessionId": &session.session.id,
+        "type": row_role,
+        "message": Value::Object(envelope),
+        "uuid": message.message.id(),
+        "timestamp": message.message.timestamp().to_rfc3339_opts(SecondsFormat::Millis, true),
+    }))
+}
+
+fn claude_part(part: &Part) -> Value {
+    match &part.kind {
+        PartKind::Text { text } => json!({"type": "text", "text": extracted_text(text)}),
+        PartKind::Reasoning { text } => {
+            json!({"type": "thinking", "thinking": extracted_text(text)})
+        }
+        PartKind::ToolCall {
+            call_id,
+            name,
+            params,
+            provider_executed,
+        } => json!({
+            "type": if *provider_executed { "server_tool_use" } else { "tool_use" },
+            "id": extracted_text(call_id),
+            "name": extracted_text(name),
+            "input": params,
+        }),
+        PartKind::ToolResult {
+            call_id,
+            is_failure,
+            result,
+            ..
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": extracted_text(call_id),
+            "is_error": is_failure,
+            "content": result,
+        }),
+        PartKind::File {
+            media_type,
+            file_name,
+            data,
+        } => json!({
+            "type": "file",
+            "media_type": media_type,
+            "file_name": file_name,
+            "source": file_source(data),
+        }),
+        other => {
+            json!({"type": "text", "text": compact_json(&serde_json::to_value(other).unwrap_or(Value::Null))})
+        }
+    }
+}
+
+fn file_source(data: &FileData) -> Value {
+    match data {
+        FileData::String(value) => json!({"type": "text", "data": value}),
+        FileData::Bytes(value) => json!({"type": "base64", "data": value}),
+        FileData::Url(value) => json!({"type": "url", "url": value}),
+    }
 }
 
 /// Configured claude-code reader. Walks a tree of `*.jsonl` files under
@@ -119,15 +326,6 @@ impl Adapter for ClaudeCodeAdapter {
                 .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
             Ok(paths.len())
         })
-    }
-
-    fn events(&self) -> EventStream<'_> {
-        let stream = self.events_with(&crate::adapter::NoopOracle);
-        Box::pin(stream.filter_map(|res| match res {
-            Ok(AdapterYield::Event(event)) => Some(Ok(event)),
-            Ok(AdapterYield::Skipped { .. }) => None,
-            Err(error) => Some(Err(error)),
-        }))
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
@@ -359,25 +557,28 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
     // The subagent file shares the parent's `sessionId` in row content (so
     // the validator's "project is immutable" rule rejects it under the
     // pre-2026-05-16 layering). The fix is to derive a child id and link
-    // back via `parent_session_id`. See design.md#schemas-session.
+    // back via `parent_session_id`. See spec.md#datasets.
     let subagent = subagent_descriptor(path).await;
+    let project_dir = source_project_dir(path, subagent.is_some());
     let (session_id, parent_session_id, source_agent, subagent_options) = match subagent {
         Some(SubagentDescriptor {
             parent_uuid,
             agent_hash,
             agent_type,
-            description,
+            meta,
         }) => {
             let child_id = format!("{parent_uuid}/agent-{agent_hash}");
             let agent_label = agent_type
                 .as_deref()
                 .map(|t| format!("claude-code/{t}"))
                 .unwrap_or_else(|| "claude-code/subagent".to_owned());
+            // `meta` is the verbatim `.meta.json`; `hash` and `raw_session_id`
+            // are pond-derived (filename hash + parent sessionId). Storing the
+            // whole meta keeps native restore of the sidecar lossless.
             let metadata = json!({
                 "hash": agent_hash,
-                "agent_type": agent_type,
-                "description": description,
                 "raw_session_id": raw_session_id,
+                "meta": meta,
             });
             (child_id, Some(parent_uuid), agent_label, Some(metadata))
         }
@@ -415,6 +616,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
         json!({
             "adapter": "claude-code",
             "version": version,
+            "project_dir": project_dir,
             "workspace_path": &*project,
         }),
     );
@@ -433,15 +635,28 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
     })
 }
 
-/// Resolved metadata for one subagent JSONL file. `agent_type` and
-/// `description` come from the sibling `.meta.json`; both are `None` when
-/// the meta file is absent or unreadable (fall back to `claude-code/subagent`
-/// for the source agent label).
+fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
+    let project_dir = if is_subagent {
+        path.parent().and_then(Path::parent).and_then(Path::parent)
+    } else {
+        path.parent()
+    };
+    project_dir
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(ToOwned::to_owned)
+}
+
+/// Resolved metadata for one subagent JSONL file. `agent_type` is read from
+/// the sibling `.meta.json` for the `source_agent` label; `meta` keeps that
+/// file's full verbatim content so native restore reproduces it
+/// (spec.md#native-restore-lossless). Both are `None` when the meta file is
+/// absent or unreadable (the label falls back to `claude-code/subagent`).
 struct SubagentDescriptor {
     parent_uuid: String,
     agent_hash: String,
     agent_type: Option<String>,
-    description: Option<String>,
+    meta: Option<Value>,
 }
 
 /// Recognise the on-disk subagent layout:
@@ -463,17 +678,14 @@ async fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
     let parent_uuid = parent_dir.file_name()?.to_str()?.to_owned();
 
     let meta_path = subagents_dir.join(format!("agent-{agent_hash}.meta.json"));
-    let (agent_type, description) = match tokio::fs::read(&meta_path).await {
+    let (agent_type, meta) = match tokio::fs::read(&meta_path).await {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => (
                 value
                     .get("agentType")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-                value
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+                Some(value),
             ),
             Err(error) => {
                 tracing::debug!(
@@ -501,7 +713,7 @@ async fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
         parent_uuid,
         agent_hash,
         agent_type,
-        description,
+        meta,
     })
 }
 
@@ -519,7 +731,15 @@ fn events_from_row(
         .map_or_else(|| format!("{session_id}:{line}"), ToOwned::to_owned);
 
     if let Some(message_value) = row.get("message") {
-        return message_events(session_id, &uuid, timestamp, row, message_value, state);
+        return message_events(
+            session_id,
+            &uuid,
+            timestamp,
+            row,
+            message_value,
+            state,
+            line,
+        );
     }
 
     // Rows with no `message` field are session-metadata records:
@@ -541,7 +761,7 @@ fn events_from_row(
         session_id: session_id.to_owned(),
         timestamp,
         content,
-        options: row_options(row),
+        options: row_options(row, line),
     };
     Ok(vec![IngestEvent::Message(message)])
 }
@@ -553,6 +773,7 @@ fn message_events(
     row: &Value,
     message_value: &Value,
     state: &FileState,
+    line: usize,
 ) -> Result<Vec<IngestEvent>, String> {
     let role = message_value
         .get("role")
@@ -567,7 +788,7 @@ fn message_events(
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: row_options(row),
+                options: row_options(row, line),
             }
         }
         ("user", Value::Array(items)) if items.iter().all(is_tool_result) => {
@@ -579,7 +800,7 @@ fn message_events(
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: row_options(row),
+                options: row_options(row, line),
             }
         }
         ("user", Value::Array(items)) => {
@@ -593,7 +814,7 @@ fn message_events(
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: row_options(row),
+                options: row_options(row, line),
             }
         }
         ("assistant", Value::Array(items)) => {
@@ -607,7 +828,7 @@ fn message_events(
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
                 timestamp,
-                options: assistant_options(row, message_value),
+                options: assistant_options(row, message_value, line),
             }
         }
         ("system", Value::String(_)) => Message::System {
@@ -615,7 +836,7 @@ fn message_events(
             session_id: session_id.to_owned(),
             timestamp,
             content: extract_self_str(content),
-            options: row_options(row),
+            options: row_options(row, line),
         },
         ("system", _) => Message::System {
             id: uuid.to_owned(),
@@ -626,7 +847,7 @@ fn message_events(
             // (the row genuinely had this content), just a lossless string
             // encoding of structured data.
             content: Some(extract_compact_repr(message_value)),
-            options: row_options(row),
+            options: row_options(row, line),
         },
         (other, _) => {
             return Err(format!("unsupported message role {other}"));
@@ -714,7 +935,7 @@ fn tool_result_part(
     let call_id = extract_str(value, "tool_use_id");
     // `tool_result` source rows don't carry the tool name; it's resolved
     // via the per-file `tool_use_id -> name` map. Misses (compaction pruned
-    // the originating `tool_use`) surface as `None` per design.md#inv-16
+    // the originating `tool_use`) surface as `None` per spec.md#no-synthesis
     // (schema-honesty: the field is `Option<Extracted<T>>`, not a fabricated
     // string).
     let name = value
@@ -782,9 +1003,10 @@ fn file_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
     }
 }
 
-fn row_options(row: &Value) -> ProviderOptions {
+fn row_options(row: &Value, line: usize) -> ProviderOptions {
     let mut options = ProviderOptions::new();
     let source = json!({
+        "line": line,
         "parent_uuid": row.get("parentUuid"),
         "is_sidechain": row.get("isSidechain"),
         "user_type": row.get("userType"),
@@ -794,13 +1016,14 @@ fn row_options(row: &Value) -> ProviderOptions {
         "git_branch": row.get("gitBranch"),
         "request_id": row.get("requestId"),
         "raw_type": row.get("type"),
+        "raw_record": row,
     });
     options.insert("source".to_owned(), source);
     options
 }
 
-fn assistant_options(row: &Value, message_value: &Value) -> ProviderOptions {
-    let mut options = row_options(row);
+fn assistant_options(row: &Value, message_value: &Value, line: usize) -> ProviderOptions {
+    let mut options = row_options(row, line);
     let anthropic = json!({
         "id": message_value.get("id"),
         "model": message_value.get("model"),
@@ -842,7 +1065,7 @@ fn is_tool_result(value: &Value) -> bool {
 mod tests {
     //! Conformance tests for the claude-code adapter's data-shape contract:
     //! subagent path derivation, replay dedup, tool-name resolution, and the
-    //! "no synthesized values" invariant (design.md#inv-15 through #inv-17).
+    //! "no synthesized values" invariant (spec.md#no-synthesis, spec.md#schema-honesty, and spec.md#lossless-projection).
     //!
     //! Each test builds a tiny synthetic corpus under a `TempDir` so the
     //! assertions exercise the real adapter end-to-end without depending on
@@ -852,6 +1075,19 @@ mod tests {
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
+
+    const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
+        let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+        crate::adapter::test_support::assert_native_restore(
+            &ClaudeCodeFactory,
+            &adapter,
+            std::path::Path::new(FIXTURE_ROOT),
+        )
+        .await
+    }
 
     /// `<root>/<encoded-cwd>/<parent_uuid>.jsonl` plus
     /// `<root>/<encoded-cwd>/<parent_uuid>/subagents/agent-<hash>.jsonl` plus
@@ -946,14 +1182,14 @@ mod tests {
             .session
             .options
             .get("subagent")
-            .expect("options.subagent must carry the hash + agent_type + description");
+            .expect("options.subagent must carry the hash + verbatim meta.json");
         assert_eq!(subagent_meta["hash"], serde_json::json!(agent_hash));
         assert_eq!(
-            subagent_meta["agent_type"],
+            subagent_meta["meta"]["agentType"],
             serde_json::json!("general-purpose")
         );
         assert_eq!(
-            subagent_meta["description"],
+            subagent_meta["meta"]["description"],
             serde_json::json!("do a thing")
         );
         Ok(())

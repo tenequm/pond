@@ -23,9 +23,9 @@ Pre-v1. The Rust crate builds clean and the v1 surface is in place: eight CLI ve
 Repository layout:
 
 - `src/` - the pond Rust crate (modules: `adapter/`, `embed/`, `config`, `handlers`, `sessions`, `substrate`, `transport`, `wire`).
-- `docs/design.md` - the locked-in v1 design (sections 1-4 are the source of truth; section 5 is empty).
+- `docs/spec.md` - the locked-in v1 specification.
 - `docs/references/` - frozen snapshots of the upstream schemas pond's design draws from.
-- `tests/` - integration tests; `tests/fixtures/session-samples/` holds real session captures from eight source harnesses, used as SourceAdapter test fixtures.
+- `tests/` - integration tests; `tests/fixtures/adapter/` holds real session captures from eight source harnesses, used as SourceAdapter test fixtures.
 - `docs/archive/` - historical design notes and the resolved open-questions log.
 
 ## Background
@@ -39,11 +39,11 @@ Two day-1 use cases:
 1. **Personal**: replace a per-tool knowledge base. Ingest local Claude Code sessions, hybrid-search them, retrieve them for replay.
 2. **Hosted**: storage and search backend for multi-tenant agent deployments. Each namespace is an opaque-string isolation boundary; the integrator owns identity, access, and routing.
 
-See `docs/design.md` for the full rationale.
+See `docs/spec.md` for the full rationale.
 
 ## Design
 
-The design doc lives at [`docs/design.md`](docs/design.md). Sections 1-4 are the source of truth.
+The specification lives at [`docs/spec.md`](docs/spec.md).
 
 Key choices:
 
@@ -61,7 +61,7 @@ Key choices:
 
 ## References
 
-`docs/references/` holds frozen snapshots of upstream schemas; real session samples live under `tests/fixtures/session-samples/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
+`docs/references/` holds frozen snapshots of upstream schemas; real session samples live under `tests/fixtures/adapter/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
 
 | Path | Source | Why kept |
 |------|--------|----------|
@@ -71,7 +71,7 @@ Key choices:
 | `docs/references/pi-mono/` | github.com/badlogic/pi-mono | Leaf-cursor branching and cross-provider conformance test matrix. |
 | `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
 | `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
-| `tests/fixtures/session-samples/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design, stress-tests the schema, and serves as SourceAdapter test fixtures. |
+| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design, stress-tests the schema, and serves as SourceAdapter test fixtures. |
 
 To refresh a snapshot, see the maintenance instructions in [`docs/references/README.md`](docs/references/README.md).
 
@@ -79,7 +79,7 @@ To refresh a snapshot, see the maintenance instructions in [`docs/references/REA
 
 Issues and pull requests are welcome. The most useful contributions right now are:
 
-- Design feedback on `docs/design.md`.
+- Spec feedback on `docs/spec.md`.
 - Pointers to additional reference schemas or session samples worth snapshotting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
 - Corrections to the design doc.

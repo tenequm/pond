@@ -1,5 +1,5 @@
-//! Object-store / remote backend integration (design.md#inv-4,
-//! design.md#schemas-write-params).
+//! Object-store / remote backend integration (spec.md#handle-freshness,
+//! spec.md#substrate).
 //!
 //! Lance's default `ObjectStoreRegistry` ships `memory://`, which we use as
 //! the cheap stand-in for an S3 backend: no daemon, no credentials, no

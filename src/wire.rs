@@ -192,7 +192,7 @@ pub enum PartKind {
         /// always carries it on `tool_use` rows; codex-cli sometimes
         /// has placeholder shapes. The seal blocks the previous
         /// "unknown" / "function" / "server_tool" synthesis patterns
-        /// (design.md#inv-15) - the only way to populate
+        /// (spec.md#no-synthesis) - the only way to populate
         /// this is via `extract_str` against a real source row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
@@ -209,7 +209,7 @@ pub enum PartKind {
         /// map and surfaces a miss (e.g. compaction pruned the originating
         /// call) as `None`. The seal prevents the previous "unknown"
         /// sentinel: a misresolution flows as `None`, never as a
-        /// fabricated string (design.md#inv-15 through #inv-16).
+        /// fabricated string (spec.md#no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         is_failure: bool,
@@ -438,7 +438,7 @@ pub struct IngestRequest {
     pub events: Vec<crate::sessions::IngestEvent>,
 }
 
-/// `pond_ingest` response (design.md#protocol-pond-ingest). `accepted = inserted + matched`,
+/// `pond_ingest` response (spec.md#protocol). `accepted = inserted + matched`,
 /// `rejected = error`; both derived from `results`. Per-row `results[]` is
 /// the contract clients rely on to reconcile retries (the PK is echoed so
 /// the client can match outcomes back to its input even when `index` is not
@@ -452,7 +452,7 @@ pub struct IngestResponse {
     pub request_id: String,
 }
 
-/// One row of `pond_ingest` per-row output (design.md#protocol-pond-ingest).
+/// One row of `pond_ingest` per-row output (spec.md#protocol).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IngestResult {
     /// Position in the request's `events` array (0-based).

@@ -17,6 +17,8 @@ mod maintenance;
 mod recovery;
 #[path = "integration/remote_backend.rs"]
 mod remote_backend;
+#[path = "integration/restore.rs"]
+mod restore;
 #[path = "integration/search.rs"]
 mod search;
 #[path = "integration/store_concurrency.rs"]

@@ -1,13 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! `Store::maintenance` (design.md#schemas-write-params): a pass runs `cleanup_old_versions`
+//! `Store::maintenance` (spec.md#substrate): a pass runs `cleanup_old_versions`
 //! then `optimize_indices` over all four datasets, never removes logical rows,
 //! and a per-table failure does not abort the others.
 
 use pond::{adapter::ClaudeCodeAdapter, handlers::ingest_adapter, sessions::Store};
 use tempfile::TempDir;
 
-const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 #[tokio::test]
 async fn maintenance_runs_without_removing_logical_rows() -> anyhow::Result<()> {

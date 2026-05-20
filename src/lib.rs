@@ -35,7 +35,7 @@ pub struct RetryPolicy {
     /// Symmetric jitter factor applied to the exponential backoff: the sleep
     /// is multiplied by `1.0 + jitter * uniform(-1.0, 1.0)` before clamping
     /// to `max_backoff`. De-correlates concurrent retriers on a contended
-    /// Lance manifest (design.md#inv-3).
+    /// Lance manifest (spec.md#retry-jitter).
     pub jitter: f64,
 }
 

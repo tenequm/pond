@@ -22,7 +22,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
-const FIXTURES: &str = "tests/fixtures/session-samples/claude-code/projects";
+const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 /// An instrumented embedding backend: deterministic, content-dependent vectors,
 /// no model weights. Enough for the vector retriever to produce a stable,

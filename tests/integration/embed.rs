@@ -31,7 +31,7 @@ fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
 /// A single fixture project subdir - enough sessions to fill more than one
 /// embedding batch without ingesting the whole fixture corpus.
 const FIXTURES: &str =
-    "tests/fixtures/session-samples/claude-code/projects/-Users-user-Projects-myproject-d";
+    "tests/fixtures/adapter/claude_code/projects/-Users-user-Projects-myproject-d";
 
 /// One recorded `embed` call: the batch's message count and its shortest /
 /// longest input length in bytes. `min`/`max` together tell whether a batch is
