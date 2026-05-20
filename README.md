@@ -69,7 +69,6 @@ Key choices:
 | `docs/references/opencode/` | github.com/sst/opencode | Effect Schema canonical Part union; SDK types; storage schema. |
 | `docs/references/kilocode/` | github.com/kilo-org/kilocode | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | `docs/references/pi-mono/` | github.com/badlogic/pi-mono | Leaf-cursor branching and cross-provider conformance test matrix. |
-| `docs/references/lancedb/` | github.com/lancedb + github.com/lance-format | Capability snapshot and evolution timeline for Lance + LanceDB. |
 | `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
 | `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
 | `tests/fixtures/session-samples/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design, stress-tests the schema, and serves as SourceAdapter test fixtures. |

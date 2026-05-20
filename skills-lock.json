@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "lance-format": {
+      "source": "tenequm/skills",
+      "sourceType": "github",
+      "skillPath": "skills/lance-format/SKILL.md",
+      "computedHash": "ca0ed0a58790249300d12f78fa63166e37991d3dad941ba9067a5b7bbda60f13"
+    },
     "rust-dev": {
       "source": "tenequm/skills",
       "sourceType": "github",
