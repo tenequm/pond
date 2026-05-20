@@ -22,11 +22,11 @@
 
 ## Source of truth
 
-- `docs/design.md` is the spec (sections 1-8: status, scope, invariants, schemas, protocol, alternatives, open questions, deferred). Read the relevant section before changing behavior.
+- `docs/spec.md` is the spec (sections 1-10: overview, scope, storage substrate, canonical model, session datasets, adapters, protocol, search and embeddings, deferred, references). Read the relevant section before changing behavior.
 
 ## Dependencies
 
-- Lance crates are pinned to git tag `v7.0.0-beta.14`. Don't bump or switch to crates.io without explicit ask.
+- Lance crates are pinned to git tag `v7.0.0-beta.16`. Don't bump or switch to crates.io without explicit ask.
 
 ## Errors
 
@@ -45,13 +45,17 @@
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
 - Don't add or maintain changelog entries; pond has no changelog and doesn't need one.
 
+## Minimalism
+
+The only code that doesn't break is the code that doesn't exist. Keep pond the smallest codebase that satisfies the spec: no abstraction without a second caller, no generality without a second case, delete what stops earning its place. Floor: never cut a spec rule, a documented WHY, or a forward-compatibility seam - they exist precisely so they are not "simplified away."
+
 ## Comments
 
 <comments>
-A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to `design.md#<anchor>` or `design.md#inv-N` when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
+A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
 
 <example>
-// design.md#protocol-error-envelope: typed `conflict` for OCC failures, not `storage_unavailable`.
+// spec.md#protocol: typed `conflict` for OCC failures, not `storage_unavailable`.
 </example>
 <example>
 // Opt out of Lance's `_score` autoprojection; that default is being removed upstream.
