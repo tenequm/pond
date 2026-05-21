@@ -126,6 +126,8 @@ Every interaction with Lance funnels through one of three paths, each a single c
 
 **`write-seam`** {#write-seam} - Every write MUST go through the substrate's merge-insert path. Why: `append-only` and `additive-sync` (Section 6) hold only with a single write chokepoint; a direct write bypasses both.
 
+**`storage-via-lance`** {#storage-via-lance} - Every access to a dataset's stored bytes - open, scan, write, and auxiliary operations such as size accounting - MUST go through Lance's object-store layer. No code reads, lists, or walks dataset files through the operating-system filesystem, and no consumer resolves a dataset to a local path. Why: a filesystem-backed pond and an object-store-backed pond behave identically for every consumer only if there is zero direct-filesystem access to dataset bytes; one direct read against a dataset silently backend-locks that operation and turns object-store support from a configuration change into a code change. This is the invariant the three seams exist to uphold - stated explicitly so an operation that fits none of them, such as status or diagnostics, cannot reach around Lance to the filesystem.
+
 ### 3.3 Data integrity
 
 **`append-only`** {#append-only} - Stored rows MUST NOT be mutated; an update produces a new row or a new manifest version. Why: it forecloses corruption-by-mutation and makes every write idempotent under retry.
