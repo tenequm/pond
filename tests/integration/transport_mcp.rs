@@ -99,6 +99,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         options: Default::default(),
     };
     let reasoning = Part {
+        session_id: SESSION_ID.to_owned(),
         id: "mcp-test-part-reasoning".to_owned(),
         message_id: MESSAGE_ID.to_owned(),
         ordinal: 0,
@@ -108,6 +109,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         },
     };
     let text = Part {
+        session_id: SESSION_ID.to_owned(),
         id: "mcp-test-part-text".to_owned(),
         message_id: MESSAGE_ID.to_owned(),
         ordinal: 1,

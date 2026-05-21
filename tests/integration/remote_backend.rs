@@ -54,6 +54,7 @@ async fn store_open_against_memory_uri_round_trips_a_session() -> anyhow::Result
         options: ProviderOptions::new(),
     };
     let part = Part {
+        session_id: session.id.clone(),
         id: "msg-1:0001".to_owned(),
         message_id: message.id().to_owned(),
         ordinal: 0,

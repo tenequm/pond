@@ -132,7 +132,7 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
         "the worker batches - it does not embed one message per call",
     );
 
-    // Re-run is a no-op: the `(message_id, model_id)` PK is already populated.
+    // Re-run is a no-op: the `(session_id, message_id, model_id)` PK is already populated.
     let backend = FakeBackend::new(model.dim as usize);
     let again = EmbedWorker::new(&store, &backend, &model)?
         .with_batch_size(4)
@@ -155,6 +155,7 @@ fn text_message_events(session_id: &str, message_id: &str, text: &str) -> Vec<In
             options: Default::default(),
         }),
         IngestEvent::Part(Part {
+            session_id: session_id.to_owned(),
             id: format!("{message_id}-part"),
             message_id: message_id.to_owned(),
             ordinal: 0,

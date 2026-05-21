@@ -62,6 +62,12 @@ pub struct MessageMeta {
     pub search_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageKey {
+    pub session_id: String,
+    pub message_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertStatus {
     Inserted,
@@ -687,7 +693,7 @@ impl Store {
         })
     }
 
-    /// Merge-insert embedding rows keyed on `(message_id, model_id,
+    /// Merge-insert embedding rows keyed on `(session_id, message_id, model_id,
     /// max_embed_tokens)`. Re-running over already-embedded messages is a no-op
     /// for matched rows.
     pub async fn upsert_embeddings(&self, rows: &[EmbeddingRow]) -> Result<Vec<UpsertStatus>> {
@@ -702,19 +708,19 @@ impl Store {
         Ok(statuses_from_inserted(rows.len(), inserted))
     }
 
-    /// The set of `message_id`s that already have `embeddings` rows for this
-    /// `(model_id, max_embed_tokens)` identity.
-    pub async fn embedded_message_ids(
+    /// The set of `(session_id, message_id)` pairs that already have
+    /// `embeddings` rows for this `(model_id, max_embed_tokens)` identity.
+    pub async fn embedded_message_keys(
         &self,
         model_id: &str,
         max_embed_tokens: i32,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<HashSet<MessageKey>> {
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, None);
         let scanner = self
             .handle
             .scan(
                 Table::Embeddings,
-                ScanOpts::with_predicate_and_projection(&identity, &["message_id"]),
+                ScanOpts::with_predicate_and_projection(&identity, &["session_id", "message_id"]),
             )
             .await?;
         let mut stream = scanner.try_into_stream().await?;
@@ -722,9 +728,14 @@ impl Store {
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
-                if let Some(id) = string(&batch, "message_id", row)? {
-                    set.insert(id);
-                }
+                let session_id =
+                    string(&batch, "session_id", row)?.context("session_id is null")?;
+                let message_id =
+                    string(&batch, "message_id", row)?.context("message_id is null")?;
+                set.insert(MessageKey {
+                    session_id,
+                    message_id,
+                });
             }
         }
         Ok(set)
@@ -770,7 +781,7 @@ impl Store {
         query: &str,
         limit: usize,
         filter: &Predicate,
-    ) -> Result<Vec<(String, f32)>> {
+    ) -> Result<Vec<(MessageKey, f32)>> {
         let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
@@ -781,13 +792,16 @@ impl Store {
         // scanner stops emitting a per-call deprecation warning, and we list
         // `_score` ourselves since the loop below reads it.
         scanner.disable_scoring_autoprojection();
-        scanner.project(&["id", "_score"])?;
+        scanner.project(&["session_id", "id", "_score"])?;
         scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
         let batch = scanner.try_into_batch().await?;
         let mut hits = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            let id = string(&batch, "id", row)?.context("fts hit id is null")?;
-            hits.push((id, float32(&batch, "_score", row)?));
+            let key = MessageKey {
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id: string(&batch, "id", row)?.context("fts hit id is null")?,
+            };
+            hits.push((key, float32(&batch, "_score", row)?));
         }
         Ok(hits)
     }
@@ -800,7 +814,7 @@ impl Store {
             .handle
             .scan(
                 Table::Embeddings,
-                ScanOpts::with_predicate_and_projection(&identity, &["message_id"]),
+                ScanOpts::with_predicate_and_projection(&identity, &["session_id"]),
             )
             .await?;
         scanner.limit(Some(1), None)?;
@@ -816,7 +830,7 @@ impl Store {
         filter: &Predicate,
         model_id: &str,
         max_embed_tokens: i32,
-    ) -> Result<Vec<(String, f32)>> {
+    ) -> Result<Vec<(MessageKey, f32)>> {
         let identity = embedding_identity_predicate(model_id, max_embed_tokens, Some(filter));
         let mut scanner = self
             .handle
@@ -828,12 +842,15 @@ impl Store {
         // of `_distance` autoprojection and list it ourselves since the loop
         // below reads it.
         scanner.disable_scoring_autoprojection();
-        scanner.project(&["message_id", "_distance"])?;
+        scanner.project(&["session_id", "message_id", "_distance"])?;
         let batch = scanner.try_into_batch().await?;
         let mut hits = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            let id = string(&batch, "message_id", row)?.context("vector hit id is null")?;
-            hits.push((id, float32(&batch, "_distance", row)?));
+            let key = MessageKey {
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id: string(&batch, "message_id", row)?.context("message_id is null")?,
+            };
+            hits.push((key, float32(&batch, "_distance", row)?));
         }
         Ok(hits)
     }
@@ -860,16 +877,29 @@ impl Store {
             .context("explain_plan failed")
     }
 
-    /// Hydrate search hits: fetch message metadata for a set of `message_id`s.
-    pub async fn message_metas_by_ids(&self, ids: &[String]) -> Result<Vec<MessageMeta>> {
-        if ids.is_empty() {
+    /// Hydrate search hits: fetch message metadata for `(session_id, message_id)` keys.
+    pub async fn message_metas_by_keys(&self, keys: &[MessageKey]) -> Result<Vec<MessageMeta>> {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let wanted = keys.iter().cloned().collect::<HashSet<_>>();
+        let session_ids = keys
+            .iter()
+            .map(|key| key.session_id.clone())
+            .collect::<Vec<_>>();
+        let message_ids = keys
+            .iter()
+            .map(|key| key.message_id.clone())
+            .collect::<Vec<_>>();
+        let predicate = Predicate::And(vec![
+            in_predicate("session_id", &session_ids),
+            in_predicate("id", &message_ids),
+        ]);
         let batch = self
             .handle
             .scan_batch(
                 Table::Messages,
-                Some(&in_predicate("id", ids)),
+                Some(&predicate),
                 &[
                     "id",
                     "session_id",
@@ -883,9 +913,17 @@ impl Store {
             .await?;
         let mut metas = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
+            let message_id = string(&batch, "id", row)?.context("id is null")?;
+            let session_id = string(&batch, "session_id", row)?.context("session_id is null")?;
+            if !wanted.contains(&MessageKey {
+                session_id: session_id.clone(),
+                message_id: message_id.clone(),
+            }) {
+                continue;
+            }
             metas.push(MessageMeta {
-                message_id: string(&batch, "id", row)?.context("id is null")?,
-                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id,
+                session_id,
                 role: string(&batch, "role", row)?.context("role is null")?,
                 project: string(&batch, "project", row)?.context("project is null")?,
                 source_agent: string(&batch, "source_agent", row)?
@@ -1072,12 +1110,13 @@ impl Store {
             .iter()
             .map(|message| message.id().to_owned())
             .collect::<Vec<_>>();
-        let mut parts_by_message = self.parts_for_messages(&message_ids).await?;
+        let mut parts_by_message = self.parts_for_messages(session_id, &message_ids).await?;
 
         Ok(messages
             .into_iter()
             .map(|message| {
-                let parts = parts_by_message.remove(message.id()).unwrap_or_default();
+                let key = (message.session_id().to_owned(), message.id().to_owned());
+                let parts = parts_by_message.remove(&key).unwrap_or_default();
                 MessageWithParts { message, parts }
             })
             .collect())
@@ -1085,25 +1124,31 @@ impl Store {
 
     async fn parts_for_messages(
         &self,
+        session_id: &str,
         message_ids: &[String],
-    ) -> Result<BTreeMap<String, Vec<Part>>> {
+    ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
         if message_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
+        let predicate = Predicate::And(vec![
+            Predicate::Eq("session_id", session_id.into()),
+            in_predicate("message_id", message_ids),
+        ]);
         let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
         let mut scanner = self
             .handle
             .scan(
                 Table::Parts,
                 ScanOpts::with_predicate_and_projection(
-                    &in_predicate("message_id", message_ids),
+                    &predicate,
                     &[
+                        "session_id",
                         "message_id",
                         "id",
                         "ordinal",
                         "type",
-                        "options",
                         "variant_data",
+                        "options",
                     ],
                 ),
             )
@@ -1139,11 +1184,11 @@ impl Store {
                 file_payloads.insert(row, payload);
             }
         }
-        let mut parts_by_message = BTreeMap::<String, Vec<Part>>::new();
+        let mut parts_by_message = BTreeMap::<(String, String), Vec<Part>>::new();
         for row in 0..batch.num_rows() {
             let part = part_from_batch(&batch, row, file_payloads.remove(&row))?;
             parts_by_message
-                .entry(part.message_id.clone())
+                .entry((part.session_id.clone(), part.message_id.clone()))
                 .or_default()
                 .push(part);
         }
@@ -1520,13 +1565,9 @@ impl IngestValidator {
             )];
         }
         if !self.seen_message_ids.insert(message.id().to_owned()) {
-            // Per invariant 17, substrate FirstSeen would silently drop a
-            // same-PK row at the storage layer; we still trap here so the
-            // duplicate stays visible in `dropped_events` instead of being
-            // absorbed into the substrate's `skipped` counter. Adapters
-            // are expected to dedupe upstream (see claude-code's per-file
-            // `seen_uuids`); a hit here means an unrecognized replay
-            // pattern worth investigating.
+            // Keep same-substream duplicate ids visible in `dropped_events`;
+            // adapters are expected to dedupe upstream (see claude-code's
+            // per-file `seen_uuids`), so a hit here is worth investigating.
             let msg = format!("duplicate message id {} in session substream", message.id());
             return vec![error_outcome(
                 index,
@@ -1549,6 +1590,7 @@ impl IngestValidator {
 
     fn push_part(&mut self, index: usize, part: Part) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
+            Value::String(part.session_id.clone()),
             Value::String(part.message_id.clone()),
             Value::String(part.id.clone()),
         ]);
@@ -1562,6 +1604,22 @@ impl IngestValidator {
                 DROP_REASON_PART_BEFORE_MESSAGE,
             )];
         };
+        if part.session_id != current.message.session_id() {
+            let msg = format!(
+                "part {} references session {}, expected {}",
+                part.id,
+                part.session_id,
+                current.message.session_id()
+            );
+            return vec![error_outcome(
+                index,
+                "part",
+                pk,
+                &msg,
+                Some("session_id"),
+                DROP_REASON_PART_MESSAGE_MISMATCH,
+            )];
+        }
         if part.message_id != current.message.id() {
             let msg = format!(
                 "part {} references message {}, expected {}",
@@ -1580,9 +1638,6 @@ impl IngestValidator {
         }
         let part_key = (part.message_id.clone(), part.id.clone());
         if !self.seen_part_keys.insert(part_key) {
-            // Same visibility rationale as `push_message`: substrate FirstSeen
-            // would absorb this silently; trapping here keeps it in
-            // `dropped_events` for operator-visible signal.
             let msg = format!(
                 "duplicate part id {} for message {} in session substream",
                 part.id, part.message_id
@@ -1691,6 +1746,7 @@ fn success_outcomes_for_substream(
         outcomes.push(success_outcome(buffered.index, "message", pk, status));
         for part in &buffered.parts {
             let part_pk = Value::Array(vec![
+                Value::String(part.part.session_id.clone()),
                 Value::String(part.part.message_id.clone()),
                 Value::String(part.part.id.clone()),
             ]);
@@ -1897,13 +1953,20 @@ const EMBEDDING_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("role", BuiltinIndexType::Bitmap, "embeddings_role_bitmap"),
 ];
 
-/// Scalar index on `parts`: `message_id` is the hot-path lookup key for
+/// Scalar indexes on `parts`: `(session_id, message_id)` is the hot-path lookup key for
 /// `parts_for_messages` (hydration on every `get` and grouped search).
-const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[(
-    "message_id",
-    BuiltinIndexType::BTree,
-    "parts_message_id_btree",
-)];
+const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
+    (
+        "session_id",
+        BuiltinIndexType::BTree,
+        "parts_session_id_btree",
+    ),
+    (
+        "message_id",
+        BuiltinIndexType::BTree,
+        "parts_message_id_btree",
+    ),
+];
 
 /// Scalar index on `sessions`: `id` is filtered by `find_session` on every
 /// `get` and every grouped search.
@@ -2008,28 +2071,29 @@ pub(crate) fn message_schema() -> Arc<Schema> {
 
 pub(crate) fn part_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        primary_field("session_id", DataType::Utf8, false),
         primary_field("message_id", DataType::Utf8, false),
         primary_field("id", DataType::Utf8, false),
         Field::new("ordinal", DataType::Int32, false),
         Field::new("type", DataType::Utf8, false),
-        Field::new("options", DataType::Utf8, false),
         Field::new("variant_data", DataType::Utf8, false),
         blob_field("data", true),
+        Field::new("options", DataType::Utf8, false),
     ]))
 }
 
 pub(crate) fn embedding_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        primary_field("session_id", DataType::Utf8, false),
         primary_field("message_id", DataType::Utf8, false),
         primary_field("model_id", DataType::Utf8, false),
         // Part of the PK: `max_embed_tokens` is the tokenizer truncation point,
         // so it changes which prefix of a long message is embedded and thus the
         // vector itself. Folding it into the key means a cap change re-embeds
         // the affected (over-cap) tail under a distinct row instead of silently
-        // leaving a stale vector under `(message_id, model_id)`. See design 3.2.4.
+        // leaving a stale vector under `(session_id, message_id, model_id)`.
         primary_field("max_embed_tokens", DataType::Int32, false),
         Field::new("vector", embedding_vector_type(), false),
-        Field::new("session_id", DataType::Utf8, false),
         Field::new("source_agent", DataType::Utf8, false),
         Field::new("project", DataType::Utf8, false),
         Field::new("role", DataType::Utf8, false),
@@ -2122,6 +2186,11 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
         vec![
             Arc::new(StringArray::from(
                 rows.iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
                     .map(|row| row.message_id.as_str())
                     .collect::<Vec<_>>(),
             )),
@@ -2136,11 +2205,6 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
                     .collect::<Vec<_>>(),
             )),
             Arc::new(vectors),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.session_id.as_str())
-                    .collect::<Vec<_>>(),
-            )),
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|row| row.source_agent.as_str())
@@ -2386,11 +2450,12 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
     // (spec.md#bounded-values); only the StringArray columns are budgeted.
     for ((part, variant), encoded) in parts.iter().zip(&variant_data).zip(&options) {
         let columns = [
+            part.session_id.len(),
             part.message_id.len(),
             part.id.len(),
             part.kind.type_name().len(),
-            encoded.len(),
             variant.len(),
+            encoded.len(),
         ];
         for bytes in columns {
             guard_cell("parts", &part.id, bytes)?;
@@ -2434,6 +2499,12 @@ fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> R
             Arc::new(StringArray::from(
                 parts
                     .iter()
+                    .map(|part| part.session_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                parts
+                    .iter()
                     .map(|part| part.message_id.as_str())
                     .collect::<Vec<_>>(),
             )),
@@ -2453,12 +2524,12 @@ fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> R
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                options.iter().map(String::as_str).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
                 variant_data.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
             blobs.finish()?,
+            Arc::new(StringArray::from(
+                options.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
         ],
     )
     .context("failed to build parts batch")
@@ -2548,6 +2619,7 @@ pub(crate) fn part_from_batch(
     let type_name = string(batch, "type", row)?.context("part type is null")?;
     let variant_data = string(batch, "variant_data", row)?.context("variant_data is null")?;
     Ok(Part {
+        session_id: string(batch, "session_id", row)?.context("part session_id is null")?,
         message_id: string(batch, "message_id", row)?.context("part message_id is null")?,
         id: string(batch, "id", row)?.context("part id is null")?,
         ordinal: int32(batch, "ordinal", row)?,
@@ -2760,6 +2832,7 @@ mod tests {
         let store = Store::open_local(temp.path()).await?;
         let session = synthetic_session("ordering");
         let orphan_part = Part {
+            session_id: session.id.clone(),
             id: "orphan-part".to_owned(),
             message_id: "missing-message".to_owned(),
             ordinal: 0,
@@ -2775,6 +2848,7 @@ mod tests {
             options: ProviderOptions::new(),
         };
         let valid_part = Part {
+            session_id: session.id.clone(),
             id: "valid-part".to_owned(),
             message_id: valid_message.id().to_owned(),
             ordinal: 0,
@@ -2880,6 +2954,7 @@ mod tests {
             options: ProviderOptions::new(),
         };
         let part = Part {
+            session_id: session.id.clone(),
             id: "part-1".to_owned(),
             message_id: message.id().to_owned(),
             ordinal: 0,
@@ -3161,7 +3236,9 @@ mod tests {
             )
             .await?;
         assert!(
-            hits.iter().any(|(id, _)| id == &planted.message_id),
+            hits.iter()
+                .any(|(key, _)| key.session_id == planted.session_id
+                    && key.message_id == planted.message_id),
             "planted vector should be retrievable via the index",
         );
         Ok(())
@@ -3172,7 +3249,7 @@ mod tests {
         // Regression guard: `max_embed_tokens` is part of the embeddings PK, so one
         // message can have several rows (one per cap). Vector search must scan only
         // the identity that produced the query vector - never mix caps, never return
-        // a message_id twice (RRF would double-count it).
+        // a message key twice (RRF would double-count it).
         let (_temp, store, model) = vector_test_setup().await?;
 
         // Same message, two caps, deliberately opposite vectors so the result
@@ -3192,7 +3269,7 @@ mod tests {
             vector: far,
             ..base.clone()
         };
-        // Distinct PKs (same message_id, different cap), so both rows persist.
+        // Distinct PKs (same session/message, different cap), so both rows persist.
         store.upsert_embeddings(&[row_1024, row_4096]).await?;
 
         // Scoped to cap 1024: the message appears exactly once - not once per cap -
@@ -3211,7 +3288,8 @@ mod tests {
             1,
             "the message must appear exactly once, not once per cap: {hits_1024:?}",
         );
-        assert_eq!(hits_1024[0].0, base.message_id);
+        assert_eq!(hits_1024[0].0.session_id, base.session_id);
+        assert_eq!(hits_1024[0].0.message_id, base.message_id);
         assert!(
             hits_1024[0].1 < 0.01,
             "cap-1024 scan must rank the cap-1024 vector, got distance {}",
@@ -3231,7 +3309,8 @@ mod tests {
             )
             .await?;
         assert_eq!(hits_4096.len(), 1);
-        assert_eq!(hits_4096[0].0, base.message_id);
+        assert_eq!(hits_4096[0].0.session_id, base.session_id);
+        assert_eq!(hits_4096[0].0.message_id, base.message_id);
         assert!(
             hits_4096[0].1 > 1.0,
             "cap-4096 scan must rank the cap-4096 vector, got distance {}",

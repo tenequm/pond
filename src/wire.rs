@@ -148,6 +148,7 @@ impl Role {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Part {
+    pub session_id: String,
     pub id: String,
     pub message_id: String,
     pub ordinal: i32,
@@ -460,7 +461,7 @@ pub struct IngestResult {
     /// `"session"` | `"message"` | `"part"`, matching `IngestEvent::kind`.
     pub kind: String,
     /// Echoed primary key: scalar for session, `[session_id, message_id]` for
-    /// message, `[message_id, part_id]` for part. Lets clients reconcile
+    /// message, `[session_id, message_id, part_id]` for part. Lets clients reconcile
     /// against their own state on retry.
     pub pk: Value,
     pub status: IngestStatus,

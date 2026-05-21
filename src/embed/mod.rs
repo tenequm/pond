@@ -61,7 +61,7 @@ pub const DEFAULT_BATCH_TOKEN_SQ_BUDGET: usize = 24_000_000;
 /// sorts within a bounded window instead - large enough to be a representative
 /// length sample, small enough to stay in the streaming memory profile (a
 /// window is on the order of a few Lance scan pages). Unlike `encode`, pond
-/// needs no un-sort: embeddings are keyed by `(message_id, model_id)`, so the
+/// needs no un-sort: embeddings are keyed by `(session_id, message_id, model_id)`, so the
 /// order they are produced in does not matter.
 pub const DEFAULT_LENGTH_WINDOW: usize = 4096;
 
@@ -299,15 +299,15 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
     }
 
     /// Embed every message with `search_text` that does not yet have an
-    /// embedding row for this model. Idempotent: the PK is `(message_id,
-    /// model_id)`, so a re-run over an already-embedded corpus is a no-op.
+    /// embedding row for this model. Idempotent: the PK is `(session_id,
+    /// message_id, model_id)`, so a re-run over an already-embedded corpus is a no-op.
     ///
     /// Messages are pulled from a streaming scan, so peak memory is one stream
     /// page plus the staged batch - not the whole corpus.
     pub async fn run(&self) -> Result<EmbedSummary> {
         let embedded = self
             .store
-            .embedded_message_ids(&self.model_id, self.max_embed_tokens as i32)
+            .embedded_message_keys(&self.model_id, self.max_embed_tokens as i32)
             .await?;
         let mut summary = EmbedSummary::default();
 
@@ -321,7 +321,10 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         tokio::pin!(stream);
         'pull: while let Some(pending) = stream.next().await {
             let mut pending = pending?;
-            if embedded.contains(&pending.message_id) {
+            if embedded.contains(&crate::sessions::MessageKey {
+                session_id: pending.session_id.clone(),
+                message_id: pending.message_id.clone(),
+            }) {
                 continue;
             }
             summary.messages += 1;
@@ -379,7 +382,7 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         // Ascending by estimated token length: consecutive messages are
         // similar-length, so each batch carved off below pads to barely above
         // its own members' lengths. pond needs no un-sort (unlike `encode`) -
-        // embedding rows are keyed by `(message_id, model_id)`.
+        // embedding rows are keyed by `(session_id, message_id, model_id)`.
         window.sort_unstable_by_key(|message| message.tokens);
 
         let mut staged: Vec<StagedMessage> = Vec::with_capacity(self.batch_size);

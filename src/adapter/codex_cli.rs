@@ -545,6 +545,7 @@ fn message_events(
         // item bytes) and explicit (not a synthesised "unknown" or "").
         let text = extract_str(item, "text").or_else(|| Some(extract_compact_repr(item)));
         parts.push(Part {
+            session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -615,6 +616,7 @@ fn tool_call_events(
         None => Value::Null,
     };
     let part = Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
@@ -645,6 +647,7 @@ fn custom_tool_call_events(
     row: &Value,
 ) -> Vec<IngestEvent> {
     let part = Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
@@ -675,6 +678,7 @@ fn custom_tool_result_events(
     row: &Value,
 ) -> Vec<IngestEvent> {
     let part = Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
@@ -716,6 +720,7 @@ fn tool_result_events(
         .cloned();
     let result = payload.get("output").cloned().unwrap_or(Value::Null);
     let part = Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
@@ -765,6 +770,7 @@ fn reasoning_events(
             }
         });
     let part = Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,

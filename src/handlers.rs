@@ -1027,7 +1027,7 @@ mod search_handler {
     use crate::{
         Clock, SystemClock,
         embed::{EmbedBackend, qwen3_query_instruction},
-        sessions::{MessageMeta, Store},
+        sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
             ErrorEnvelope, Group, Hit, ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest,
@@ -1142,17 +1142,18 @@ mod search_handler {
                 let lists = [
                     RankedList {
                         retriever: RetrieverKind::Vector,
-                        ids: vector_raw.into_iter().map(|(id, _)| id).collect(),
+                        keys: vector_raw.into_iter().map(|(key, _)| key).collect(),
                     },
                     RankedList {
                         retriever: RetrieverKind::Fts,
-                        ids: fts.into_iter().map(|(id, _)| id).collect(),
+                        keys: fts.into_iter().map(|(key, _)| key).collect(),
                     },
                 ];
                 rrf_merge(&lists, plan.rrf_k)
                     .into_iter()
                     .map(|hit| Candidate {
-                        message_id: hit.message_id,
+                        session_id: hit.key.session_id,
+                        message_id: hit.key.message_id,
                         base_score: hit.score,
                         matched_via: hit.matched_via,
                     })
@@ -1167,23 +1168,28 @@ mod search_handler {
         // Hydrate hit metadata (timestamp, role, project, preview source) from the
         // canonical `messages` table - the denormalized columns on `embeddings`
         // exist for filter pushdown, not result hydration.
-        let ids = candidates
+        let keys = candidates
             .iter()
-            .map(|candidate| candidate.message_id.clone())
+            .map(|candidate| MessageKey {
+                session_id: candidate.session_id.clone(),
+                message_id: candidate.message_id.clone(),
+            })
             .collect::<Vec<_>>();
         let metas = store
-            .message_metas_by_ids(&ids)
+            .message_metas_by_keys(&keys)
             .await
             .map_err(map_storage)?;
         let meta_index = metas
             .iter()
-            .map(|meta| (meta.message_id.as_str(), meta))
+            .map(|meta| ((meta.session_id.as_str(), meta.message_id.as_str()), meta))
             .collect::<std::collections::HashMap<_, _>>();
 
         let now = clock.now();
         let mut scored = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let Some(meta) = meta_index.get(candidate.message_id.as_str()) else {
+            let Some(meta) =
+                meta_index.get(&(candidate.session_id.as_str(), candidate.message_id.as_str()))
+            else {
                 continue;
             };
             let recency_boost = if plan.boost_recent {
@@ -1208,6 +1214,7 @@ mod search_handler {
                 .score
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.meta.session_id.cmp(&right.meta.session_id))
                 .then_with(|| left.meta.message_id.cmp(&right.meta.message_id))
         });
 
@@ -1315,32 +1322,32 @@ mod search_handler {
         }
     }
 
-    /// A retriever-ranked list of `message_id`s, best-first.
+    /// A retriever-ranked list of message primary keys, best-first.
     pub struct RankedList {
         pub retriever: RetrieverKind,
-        pub ids: Vec<String>,
+        pub keys: Vec<MessageKey>,
     }
 
     /// One merged RRF result.
     #[derive(Debug, Clone, PartialEq)]
     pub struct RrfHit {
-        pub message_id: String,
+        pub key: MessageKey,
         pub score: f64,
         pub matched_via: Vec<String>,
     }
 
     /// Reciprocal Rank Fusion: `sum(1 / (k + rank))` across the retrievers that
-    /// ranked each id (rank is 1-based). Returns hits sorted by score descending,
-    /// ties broken by `message_id` for determinism (spec.md#search).
+    /// ranked each key (rank is 1-based). Returns hits sorted by score descending,
+    /// ties broken by `(session_id, message_id)` for determinism (spec.md#search).
     pub fn rrf_merge(lists: &[RankedList], k: u32) -> Vec<RrfHit> {
         let k = f64::from(k.max(1));
-        let mut merged: std::collections::HashMap<String, (f64, Vec<String>)> =
+        let mut merged: std::collections::HashMap<MessageKey, (f64, Vec<String>)> =
             std::collections::HashMap::new();
         for list in lists {
-            for (rank, id) in list.ids.iter().enumerate() {
+            for (rank, key) in list.keys.iter().enumerate() {
                 let contribution = 1.0 / (k + (rank as f64 + 1.0));
                 let entry = merged
-                    .entry(id.clone())
+                    .entry(key.clone())
                     .or_insert_with(|| (0.0, Vec::new()));
                 entry.0 += contribution;
                 entry.1.push(list.retriever.as_wire().to_owned());
@@ -1348,8 +1355,8 @@ mod search_handler {
         }
         let mut hits = merged
             .into_iter()
-            .map(|(message_id, (score, matched_via))| RrfHit {
-                message_id,
+            .map(|(key, (score, matched_via))| RrfHit {
+                key,
                 score,
                 matched_via,
             })
@@ -1359,7 +1366,7 @@ mod search_handler {
                 .score
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.message_id.cmp(&right.message_id))
+                .then_with(|| left.key.cmp(&right.key))
         });
         hits
     }
@@ -1383,6 +1390,7 @@ mod search_handler {
     }
 
     struct Candidate {
+        session_id: String,
         message_id: String,
         base_score: f64,
         matched_via: Vec<String>,
@@ -1416,11 +1424,12 @@ mod search_handler {
 
     /// Unbounded BM25 scores to a `[0, 1]` base score by dividing by the max in the
     /// result set.
-    fn normalize_fts(hits: Vec<(String, f32)>) -> Vec<Candidate> {
+    fn normalize_fts(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
         let max = hits.iter().map(|(_, score)| *score).fold(0.0_f32, f32::max);
         hits.into_iter()
-            .map(|(message_id, score)| Candidate {
-                message_id,
+            .map(|(key, score)| Candidate {
+                session_id: key.session_id,
+                message_id: key.message_id,
                 base_score: if max > 0.0 {
                     f64::from(score / max)
                 } else {
@@ -1622,16 +1631,23 @@ mod tests {
         }
     }
 
+    fn key(id: &str) -> crate::sessions::MessageKey {
+        crate::sessions::MessageKey {
+            session_id: "session".to_owned(),
+            message_id: id.to_owned(),
+        }
+    }
+
     #[test]
     fn rrf_merge_fuses_retrievers_and_reports_provenance() {
         let lists = [
             RankedList {
                 retriever: RetrieverKind::Vector,
-                ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                keys: vec![key("a"), key("b"), key("c")],
             },
             RankedList {
                 retriever: RetrieverKind::Fts,
-                ids: vec!["b".to_owned(), "a".to_owned(), "d".to_owned()],
+                keys: vec![key("b"), key("a"), key("d")],
             },
         ];
         let merged = rrf_merge(&lists, 60);
@@ -1639,14 +1655,14 @@ mod tests {
         // "a" (ranks 1,2) and "b" (ranks 2,1) have equal fused scores; the tie
         // breaks on message_id, so "a" sorts first. Both beat the single-retriever
         // "c" and "d".
-        assert_eq!(merged[0].message_id, "a");
-        assert_eq!(merged[1].message_id, "b");
+        assert_eq!(merged[0].key.message_id, "a");
+        assert_eq!(merged[1].key.message_id, "b");
         assert_eq!(merged[0].matched_via, vec!["vector", "fts"]);
         assert!(merged[0].score > merged[2].score);
 
-        let c = merged.iter().find(|hit| hit.message_id == "c").unwrap();
+        let c = merged.iter().find(|hit| hit.key.message_id == "c").unwrap();
         assert_eq!(c.matched_via, vec!["vector"]);
-        let d = merged.iter().find(|hit| hit.message_id == "d").unwrap();
+        let d = merged.iter().find(|hit| hit.key.message_id == "d").unwrap();
         assert_eq!(d.matched_via, vec!["fts"]);
     }
 

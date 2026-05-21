@@ -142,6 +142,8 @@ Every table is created with the current stable Lance file format, constant-time 
 
 **`unenforced-pk`** {#unenforced-pk} - Every table MUST declare its primary-key columns as an unenforced primary key. Why: it lets merge-insert default to the right key with no per-call wiring, and it is a precondition for the forward-compatibility seams below.
 
+**`session-scoped-pk`** {#session-scoped-pk} - Every table below `sessions` MUST lead its primary key with `session_id`. Why: a source's message and part ids are unique only within their originating session - lineage operations (spawn, `/compact`, resume, fork) copy a parent's history into a new session and replay its ids unchanged. A key that omits `session_id` is not unique and collides on every replayed id; `unenforced-pk` means the substrate will not catch the collision. Leading with `session_id` also satisfies `shardable-pk-pos1` for these tables.
+
 All of a consumer's datasets share one Lance cache and one object-store client. Why: one pool, rather than one per table, avoids multiplying connections and credential refreshes on object-store backends.
 
 ### 3.5 Concurrency
@@ -219,7 +221,7 @@ model Session {
 }
 ```
 
-Branching exists only between sessions: a session itself is a linear log of messages with no per-message parent pointers. `parent_session_id` records that a session was spawned or forked from another - a sub-agent, a fork; `parent_message_id` additionally records the cut-point in the parent, for a fork-with-cut-point. A plain spawn (a sub-agent) populates only `parent_session_id`. `parent_session_id` is a soft reference: pond does not require the parent to be present at ingest, since independent adapter runs land in any order.
+Branching exists only between sessions: a session itself is a linear log of messages with no per-message parent pointers. `parent_session_id` records that a session was spawned or forked from another - a sub-agent, a fork; `parent_message_id` additionally records the cut-point in the parent, for a fork-with-cut-point. A plain spawn (a sub-agent) populates only `parent_session_id`. `parent_session_id` is a soft reference: pond does not require the parent to be present at ingest, since independent adapter runs land in any order. Because a message id is unique only within its session, `parent_message_id` identifies the cut-point only together with `parent_session_id`; it is never resolved on its own.
 
 **`parent-pointer-coherence`** {#parent-pointer-coherence} - A `parent_message_id` MUST NOT be present without a `parent_session_id`. Why: a cut-point with no parent session to cut from is incoherent; the validator rejects such a session.
 
@@ -260,6 +262,7 @@ enum Provenance { conversational, injected }
 
 model BasePart {
   id: PartID;
+  session_id: SessionID;           // back-reference to the containing session
   message_id: MessageID;           // back-reference to the containing message
   provenance: Provenance;          // conversation vs harness-injected (Section 4.8)
   options: ProviderOptions;
@@ -308,7 +311,7 @@ union Part {
 }
 ```
 
-Seven variants. `id`, `message_id`, and `provenance` on `BasePart` are pond-additive: the model stores Parts as addressable rows with back-references, not as array members. `provenance` records whether a Part is conversation or harness-injected scaffolding (`part-provenance`, Section 4.8); it is orthogonal to the Part's `type` and to the containing message's `role`. FilePart payloads use the storage layer's blob mechanism (Section 5).
+Seven variants. `id`, `session_id`, `message_id`, and `provenance` on `BasePart` are pond-additive: the model stores Parts as addressable rows with back-references, not as array members. `provenance` records whether a Part is conversation or harness-injected scaffolding (`part-provenance`, Section 4.8); it is orthogonal to the Part's `type` and to the containing message's `role`. FilePart payloads use the storage layer's blob mechanism (Section 5).
 
 ### 4.8 Honesty of the model
 
@@ -359,7 +362,7 @@ The sessions consumer registers four Lance tables: `sessions`, `messages`, `part
 
 | Column | Notes |
 |---|---|
-| `message_id`, `id` | composite primary key; clustered on `message_id` |
+| `session_id`, `message_id`, `id` | composite primary key; clustered on `(session_id, message_id)` |
 | `ordinal` | position within the message's content |
 | `type` | the Part discriminator; scalar-indexed |
 | `variant_data` | JSON text; the variant-specific fields |
@@ -370,13 +373,13 @@ The sessions consumer registers four Lance tables: `sessions`, `messages`, `part
 
 | Column | Notes |
 |---|---|
-| `message_id`, `model_id`, `max_embed_tokens` | composite primary key |
+| `session_id`, `message_id`, `model_id`, `max_embed_tokens` | composite primary key |
 | `vector` | the embedding; vector-indexed |
-| `session_id`, `source_agent`, `project`, `role`, `timestamp` | denormalized; filter-pushdown surface |
+| `source_agent`, `project`, `role`, `timestamp` | denormalized; filter-pushdown surface |
 
 ### 5.2 Composite keys
 
-`messages` and `parts` use composite primary keys so a source's own ids can be preserved verbatim without requiring them to be globally unique - a message id need only be unique within its session. Clustering keeps a session's messages, and a message's parts, contiguous on disk for sequential reads.
+`messages`, `parts`, and `embeddings` use composite primary keys that lead with `session_id` (`session-scoped-pk`). A source's own message and part ids are preserved verbatim without requiring global uniqueness: such an id is unique only within its session, and lineage operations - sub-agent spawn, `/compact`, resume, and fork - copy a parent session's history into a new session and replay its message and part ids unchanged. The leading `session_id` keeps each session's copy distinct; a key omitting it collides on every replayed id. Clustering on `(session_id, ...)` keeps a session's messages, parts, and embeddings contiguous on disk for sequential reads.
 
 ### 5.3 Denormalization
 

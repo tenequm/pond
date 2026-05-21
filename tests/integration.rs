@@ -21,6 +21,8 @@ mod remote_backend;
 mod restore;
 #[path = "integration/search.rs"]
 mod search;
+#[path = "integration/session_scoped_pk.rs"]
+mod session_scoped_pk;
 #[path = "integration/store_concurrency.rs"]
 mod store_concurrency;
 #[path = "integration/transport_http.rs"]

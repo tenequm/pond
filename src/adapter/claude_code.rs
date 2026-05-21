@@ -654,7 +654,7 @@ fn message_events(
     let mut parts = Vec::new();
     let message = match (role, content) {
         ("user", Value::String(_)) => {
-            parts.push(text_part(uuid, 0, extract_self_str(content)));
+            parts.push(text_part(session_id, uuid, 0, extract_self_str(content)));
             Message::User {
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
@@ -665,7 +665,14 @@ fn message_events(
         ("user", Value::Array(items)) if items.iter().all(is_tool_result) => {
             let source_tool_result = row.get("toolUseResult").cloned();
             parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
-                tool_result_part(uuid, ordinal, item, source_tool_result.as_ref(), state)
+                tool_result_part(
+                    session_id,
+                    uuid,
+                    ordinal,
+                    item,
+                    source_tool_result.as_ref(),
+                    state,
+                )
             }));
             Message::Tool {
                 id: uuid.to_owned(),
@@ -679,7 +686,7 @@ fn message_events(
                 items
                     .iter()
                     .enumerate()
-                    .map(|(ordinal, item)| user_part(uuid, ordinal, item, state)),
+                    .map(|(ordinal, item)| user_part(session_id, uuid, ordinal, item, state)),
             );
             Message::User {
                 id: uuid.to_owned(),
@@ -693,7 +700,7 @@ fn message_events(
                 items
                     .iter()
                     .enumerate()
-                    .map(|(ordinal, item)| assistant_part(uuid, ordinal, item)),
+                    .map(|(ordinal, item)| assistant_part(session_id, uuid, ordinal, item)),
             );
             Message::Assistant {
                 id: uuid.to_owned(),
@@ -731,8 +738,14 @@ fn message_events(
     Ok(events)
 }
 
-fn text_part(message_id: &str, ordinal: usize, text: Option<Extracted<String>>) -> Part {
+fn text_part(
+    session_id: &str,
+    message_id: &str,
+    ordinal: usize,
+    text: Option<Extracted<String>>,
+) -> Part {
     Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -741,22 +754,36 @@ fn text_part(message_id: &str, ordinal: usize, text: Option<Extracted<String>>) 
     }
 }
 
-fn user_part(message_id: &str, ordinal: usize, value: &Value, state: &FileState) -> Part {
+fn user_part(
+    session_id: &str,
+    message_id: &str,
+    ordinal: usize,
+    value: &Value,
+    state: &FileState,
+) -> Part {
     match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(message_id, ordinal, extract_str(value, "text")),
-        Some("image") | Some("file") => file_part(message_id, ordinal, value),
-        Some("tool_result") => tool_result_part(message_id, ordinal, value, None, state),
+        Some("text") => text_part(session_id, message_id, ordinal, extract_str(value, "text")),
+        Some("image") | Some("file") => file_part(session_id, message_id, ordinal, value),
+        Some("tool_result") => {
+            tool_result_part(session_id, message_id, ordinal, value, None, state)
+        }
         // Unknown user part shapes: preserve the raw JSON in the Text slot
         // rather than dropping. This is not a synthesized value - it's a
         // lossless encoding of structured data the schema doesn't model.
-        _ => text_part(message_id, ordinal, Some(extract_compact_repr(value))),
+        _ => text_part(
+            session_id,
+            message_id,
+            ordinal,
+            Some(extract_compact_repr(value)),
+        ),
     }
 }
 
-fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
+fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
     match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(message_id, ordinal, extract_str(value, "text")),
+        Some("text") => text_part(session_id, message_id, ordinal, extract_str(value, "text")),
         Some("thinking") => Part {
+            session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -766,6 +793,7 @@ fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
             },
         },
         Some("tool_use") => Part {
+            session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -778,6 +806,7 @@ fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
             },
         },
         Some("server_tool_use") => Part {
+            session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -789,14 +818,20 @@ fn assistant_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
                 provider_executed: true,
             },
         },
-        Some("image") | Some("file") => file_part(message_id, ordinal, value),
+        Some("image") | Some("file") => file_part(session_id, message_id, ordinal, value),
         // Same rationale as `user_part`'s fallback: lossless encoding of
         // an unrecognised structured shape, not synthesised data.
-        _ => text_part(message_id, ordinal, Some(extract_compact_repr(value))),
+        _ => text_part(
+            session_id,
+            message_id,
+            ordinal,
+            Some(extract_compact_repr(value)),
+        ),
     }
 }
 
 fn tool_result_part(
+    session_id: &str,
     message_id: &str,
     ordinal: usize,
     value: &Value,
@@ -819,6 +854,7 @@ fn tool_result_part(
         .or_else(|| source_tool_result.cloned())
         .unwrap_or(Value::Null);
     Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
@@ -835,7 +871,7 @@ fn tool_result_part(
     }
 }
 
-fn file_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
+fn file_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
     let media_type = value
         .get("media_type")
         .or_else(|| value.get("mime_type"))
@@ -862,6 +898,7 @@ fn file_part(message_id: &str, ordinal: usize, value: &Value) -> Part {
     };
 
     Part {
+        session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
