@@ -83,8 +83,6 @@ them, and do not "simplify away" their rules:
 - Unit tests live in `#[cfg(test)] mod tests` next to the code. Integration suites
   are modules under `tests/integration/` wired into `tests/integration.rs` via
   `#[path]`. Do not add loose `tests/*.rs` files.
-- One conventional commit per work item (`feat(...)`, `fix(...)`). New commits, never
-  `--amend`. Do not skip hooks.
 
 ---
 
@@ -387,18 +385,18 @@ After all four code items land:
 
 ---
 
-# Sequencing and commits
+# Execution
 
-Implement in this order; one conventional commit per item:
+One continuous chunk, reviewed once when complete - not a staged rollout. The five
+changes (D1, D4, D2/D3, D5) have no interdependencies; edit in whatever order is
+convenient (file-by-file is least context-reloading - `wire.rs`, `substrate.rs`,
+`main.rs`, `handlers.rs`, and `sessions.rs` are each touched by two or more items).
 
-1. `fix(status): bare table names, namespace-driven size accounting` (D1)
-2. `feat(model): Part.provenance, classified at the adapter seam` (D4)
-3. `refactor(substrate): index upkeep on the write path, drop maintenance bundle` (D2/D3)
-4. `feat(search): hit payload carries text and a match snippet` (D5)
-
-D1 and D4 both change on-disk layout/schema; D2/D3 changes indexing. Do all the code,
-then one rebuild + verification pass at the end (a mid-stream rebuild is wasted work).
-Each commit should build and pass `cargo test` on its own.
+Intermediate states need not compile. D4's mandatory no-`Default` `provenance` field
+(spec 6.4) turns every unconverted `Part { .. }` site into a compile error the moment
+its types land - that is the worklist, not a hazard. Drive the whole chunk to green
+once, at the end, then run the rebuild + verification pass above. When it is all
+green, stop for review.
 
 # Out of scope
 
