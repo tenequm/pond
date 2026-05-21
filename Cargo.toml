@@ -30,6 +30,10 @@ lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+# Streaming JSON pull-parser for the adapter seam's oversized-line slow path:
+# a record over `RECORD_CAP` is cap-parsed leaf-by-leaf so peak memory stays
+# bounded instead of materializing a multi-GiB value (see src/adapter/jsonl.rs).
+struson = "0.7"
 thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1.18"

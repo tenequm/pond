@@ -1,11 +1,11 @@
 # Lance v7 reference
 
 Capability reference for **Lance** - the open columnar lakehouse format for multimodal AI -
-regrounded against the `lance-format/lance` repository at git tag **`v7.0.0-beta.16`**
-(commit `98e2b8a`).
+regrounded against the `lance-format/lance` repository at git tag **`v7.1.0-beta.1`**
+(commit `cffa8cb5`).
 
 Citations are `path:line` relative to the repo root. Build a permalink as
-`https://github.com/lance-format/lance/blob/v7.0.0-beta.16/<path>`. Line numbers drift
+`https://github.com/lance-format/lance/blob/v7.1.0-beta.1/<path>`. Line numbers drift
 between tags; treat them as approximate. The authoritative in-repo sources are the format
 spec under `docs/src/format/`, the user guide under `docs/src/guide/`, the protobuf schemas
 under `protos/`, and the Rust workspace under `rust/`.
@@ -60,8 +60,8 @@ code. The format itself is the product - there is no server.
 
 ## 2. The crate workspace
 
-23 crate directories under `rust/`. `[workspace.package]` (`Cargo.toml:30-52`): `version =
-"7.0.0-beta.16"`, `edition = "2024"`, `rust-version = "1.91.0"`, `license = "Apache-2.0"`,
+23 crate directories under `rust/`. `[workspace.package]` (`Cargo.toml:32-53`): `version =
+"7.1.0-beta.1"`, `edition = "2024"`, `rust-version = "1.91.0"`, `license = "Apache-2.0"`,
 `resolver = "3"`. `exclude = ["python", "java/lance-jni"]`.
 
 | Crate dir | Published name | Purpose |
@@ -96,9 +96,15 @@ the workspace as path dependencies rather than explicit members.
 
 **Bindings.** Python: package `pylance` (`python/pyproject.toml`), built with maturin, imported
 as `lance`; the Rust extension crate is `pylance` (`[lib] name = "lance"`); supports Python
-3.9-3.14; runtime deps `pyarrow>=14`, `numpy>=1.22`, `lance-namespace>=0.7.5,<0.8`. Java: an
+3.9-3.14; runtime deps `pyarrow>=14`, `numpy>=1.22`, `lance-namespace>=0.7.7,<0.8`. Java: an
 SDK under `java/` (Maven `org.lance`), bridged to Rust by the `lance-jni` crate
 (`java/lance-jni/`, excluded from the Rust workspace).
+
+**Building.** Five workspace crates carry a protobuf build script - `lance-encoding`,
+`lance-file`, `lance-index`, `lance-table`, `lance-datafusion` - so a `protoc` compiler must
+be reachable to build them. The `lance` crate's `protoc` feature vendors one (`protobuf-src`)
+and cascades it to the first four, but **not** to `lance-datafusion`, which still needs a
+system `protoc` (`Cargo.toml:140-146`, `rust/lance-datafusion/Cargo.toml`).
 
 ---
 
@@ -608,7 +614,9 @@ Index design: loaded on demand (a dataset opens without loading any index), load
 progressively, immutable once written. An index is composed of **segments**, each with a
 UUID, each covering a disjoint subset of fragments recorded in a `fragment_bitmap`. **Segments
 need not cover all fragments** - an index can lag; engines split queries into indexed and
-unindexed subplans and merge results. Index content lives at `_indices/{UUID}`.
+unindexed subplans and merge results. When a column has **no index at all**, both vector
+search and full-text search transparently fall back to a flat scan rather than erroring
+(`rust/lance/src/dataset/scanner.rs:3419,3697`). Index content lives at `_indices/{UUID}`.
 `IndexMetadata` carries `uuid`, `name`, `fields`, `fragment_bitmap`, `index_details` (a typed
 `Any`), `version`.
 
@@ -647,6 +655,23 @@ On-disk layout (format V3): each vector index is two Lance files - an **index fi
 (`auxiliary.idx`, quantized vector storage). HNSW construction defaults: `max_level` 7, `m`
 20, `ef_construction` 150. The PQ codebook and the RaBitQ rotation matrix are stored as
 tensors in the auxiliary file's global buffer.
+
+**Typed index details.** A vector index records a typed `VectorIndexDetails` message in the
+manifest's `index_details` field (`protos/index.proto:188-241`; moved out of `table.proto`
+in `v7.1.0-beta.1`): `metric_type`, `target_partition_size` (0 = unset), an optional
+`HnswParameters` (`max_connections` = M, `construction_ef`, `max_level`), a `compression`
+oneof (`ProductQuantization` / `ScalarQuantization` / `RabitQuantization` with a `FAST` or
+`MATRIX` rotation / `FlatCompression`), and a free-form `runtime_hints` string map. Hint
+keys use reverse-DNS namespacing (e.g. `lance.ivf.max_iters`) and unrecognized keys must be
+silently ignored by all runtimes.
+
+**Build prerequisites.** A vector index cannot be built on an empty table -
+`build_empty_vector_index` returns `not_supported` ("Creating empty vector indices with
+train=False is not yet implemented", `rust/lance/src/index/vector.rs:1437`). PQ training
+needs at least `2^num_bits` rows for its codebook centroids, so a default 8-bit PQ index
+hard-errors below **256 rows** ("Not enough rows to train PQ. Requires {n} rows but only {m}
+available", `rust/lance-index/src/vector/pq/builder.rs:177`); IVF k-means separately needs at
+least `num_partitions` rows. Build vector indexes lazily, once the table holds data.
 
 ### 11.2 Scalar indexes
 
@@ -712,6 +737,13 @@ strategies handle changed row addresses: do nothing (segment stops covering thos
 rewrite segments with remapped addresses, or use a **fragment reuse index** (remap in memory
 at read time). Stable row IDs avoid remapping entirely at the cost of a lookup.
 
+The caller-facing API for folding new data in is `optimize_indices(&OptimizeOptions)`
+(`rust/lance/src/index/api.rs:297`). `OptimizeOptions` (`rust/lance-index/src/optimize.rs:65`)
+has three constructors: `append()` adds a new delta segment over the new fragments;
+`merge(N)` folds the delta updates plus the latest N segments into one; `retrain()` rebuilds
+the whole index from current data (v3 vector indices only). This is incremental maintenance -
+distinct from dropping and recreating an index from scratch.
+
 ---
 
 ## 12. Distributed write and indexing
@@ -749,6 +781,14 @@ The object store is chosen by URI scheme (`docs/src/guide/object_store.md`): `s3
 Config comes from environment variables or the `storage_options` map passed to
 `lance.dataset` / `lance.write_dataset`.
 
+`shared-memory://` is opt-in and distinct from `memory://`: `memory://` mints a fresh
+in-memory store per call, while `shared-memory://<authority>` resolves - across object-store
+registries, threads, and unrelated components in the same process - to one process-global
+`InMemory` backend keyed by the URL authority. The pool is never evicted and grows for the
+process lifetime; it is meant for tests and harnesses that coordinate a writer and an
+independent reader. Pick distinct authorities for isolation
+(`rust/lance-io/src/object_store/providers/shared_memory.rs:16`).
+
 General options: `allow_http` (default false), `connect_timeout` (5s), `request_timeout`
 (30s), `client_max_retries` (3), `download_retry_count` (3), `proxy_url`, `user_agent`.
 
@@ -781,8 +821,9 @@ Disable globally with `LANCE_USE_VERSION_HINT=0`.
 
 ## 14. What changed in v7
 
-The v7 tag line is `v7.0.0-beta.1` through `v7.0.0-beta.16` (no rc/final yet). The crates pin
-`7.0.0-beta.16`. Source: the `v7.0.0-beta.1..v7.0.0-beta.16` commit range plus the v6->v7
+The v7 tag line ran `v7.0.0-beta.1` through `v7.0.0-beta.17`, then `v7.0.0-rc.1`, then the
+v7.1 line opened at `v7.1.0-beta.1` - no `v7.0.0` final git tag was cut. The crates pin
+`7.1.0-beta.1`. Source: the `v7.0.0-beta.1..v7.1.0-beta.1` commit range plus the v6->v7
 boundary commits.
 
 **The v6 -> v7 breaking change.** `feat!: make dataset object store access base-aware`
@@ -814,6 +855,30 @@ delete transactions exposed (#6781); the `Clone` transaction (shallow / deep).
 **Spec restructuring** - the lakehouse spec was formally split into separate catalog /
 namespace / table / index specifications (PR #6750x), reflected in `docs/src/format/`.
 
+### The v7.1.0-beta.1 delta
+
+The 19 commits in `v7.0.0-beta.16..v7.1.0-beta.1` are mostly bug fixes and internal
+performance work (serializable BTree/Bitmap/LabelList index caches, deterministic HNSW
+graph builds, roaring range-iterator speedups). The user-facing additions:
+
+- **Materialized-view namespace API** (PR #6891) - `create_materialized_view` and
+  `refresh_materialized_view` on the `LanceNamespace` trait. A materialized view is a
+  query / UDTF / chunker backed by a stored spec, with an optional initial refresh. The
+  `RestNamespace` implements both (`POST /v1/materialized_view/{id}/create` and
+  `/refresh`); `DirectoryNamespace` and the default trait return `not_supported`.
+- **Typed vector index details** (PR #6099) - the `VectorIndexDetails` and
+  `HnswParameters` messages moved into `protos/index.proto` (section 11.1).
+- **Multi-base `write_fragments`** (PR #6855) - multi-base storage config is now reachable
+  from the Python and Java `write_fragments` API, not just Rust.
+- **Granular tracing targets** (PR #6853) - `pylance` emits trace events under a
+  `lance::events::` prefix so they filter separately from log records; new
+  `lance::dataset_events` and `lance::object_store::throttle` targets. Example:
+  `LANCE_LOG="warn,lance::events::object_store::throttle=info"`
+  (`docs/src/guide/performance.md`).
+- **MemWAL** - a sharding evaluator (PR #6854), L0 flushed-generation dataset caching
+  (PR #6816), and exact primary-key dedup fixes for LSM point lookup and vector search
+  (PR #6881).
+
 Note: there is **no Tantivy-FTS-removal commit in the v7 range**. Lance FTS at this tag is
 already its own native inverted-index implementation; the tokenizer vendoring (#6512)
 predates `v7.0.0-beta.1`. Do not attribute a Tantivy removal to v7.
@@ -822,7 +887,7 @@ predates `v7.0.0-beta.1`. Do not attribute a Tantivy removal to v7.
 
 ## 15. Capability matrix
 
-What Lance can and cannot do at `v7.0.0-beta.16`.
+What Lance can and cannot do at `v7.1.0-beta.1`.
 
 **Storage and format**
 
@@ -882,7 +947,7 @@ dashboard.
 
 ## 16. Source map
 
-Where to look in `lance-format/lance` at `v7.0.0-beta.16`.
+Where to look in `lance-format/lance` at `v7.1.0-beta.1`.
 
 | Topic | Path |
 |-------|------|

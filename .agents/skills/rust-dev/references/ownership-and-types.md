@@ -32,7 +32,7 @@ m.push_str("!");
 let d = b.clone();
 ```
 
-`Copy` types (integers, bools, char, fixed-size tuples of `Copy`, `&T`) are copied implicitly on assignment instead of moved. They are cheap bitwise duplications. `String`, `Vec<T>`, `Box<T>`, etc., are not `Copy`; they move.
+`Copy` types (integers, floats, bools, `char`, `&T`, and tuples and arrays whose elements are all `Copy`) are copied implicitly on assignment instead of moved. They are cheap bitwise duplications. `String`, `Vec<T>`, `Box<T>`, etc., are not `Copy`; they move.
 
 ## Borrowing Rules in Practice
 

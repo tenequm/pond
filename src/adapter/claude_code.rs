@@ -12,10 +12,8 @@ use std::{
 };
 
 use anyhow::Context as _;
-use async_stream::stream;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
     sessions::IngestEvent,
@@ -23,11 +21,15 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    collect_jsonl_files, compact_json, config_path, empty_options,
-    extract::{Extracted, Source, extract_compact_repr, extract_self_str, extract_str},
-    extracted_text, jsonl_bytes, part_id, raw_record,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
+    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
+    empty_options,
+    extract::{
+        Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
+    },
+    extracted_text,
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl_bytes, part_id, raw_record,
 };
 
 /// Per-file streaming state that persists across rows of one JSONL file.
@@ -51,7 +53,7 @@ use super::{
 ///    old `"unknown"` sentinel - faithful to the source rather than
 ///    inventing a value.
 #[derive(Debug, Default)]
-struct FileState {
+pub(crate) struct FileState {
     seen_uuids: HashSet<String>,
     tool_call_names: HashMap<String, Extracted<String>>,
 }
@@ -305,146 +307,51 @@ impl ClaudeCodeAdapter {
 
 impl Adapter for ClaudeCodeAdapter {
     fn discover(&self) -> DiscoverFuture<'_> {
-        let root = self.root.clone();
-        Box::pin(async move {
-            // Count files only - do not pre-parse headers. Headers are read
-            // once at stream time, where any decode failure is the canonical
-            // skip path. Pre-reading here would error out twice for the same
-            // bad file (once in discover, once in events) and would charge
-            // every healthy file two opens instead of one.
-            let paths = collect_jsonl_files(&root)
-                .await
-                .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
-            Ok(paths.len())
-        })
+        jsonl_tree_discover(self)
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
-        let root = self.root.clone();
-        Box::pin(stream! {
-            let paths = match collect_jsonl_files(&root).await {
-                Ok(paths) => paths,
-                Err(io) => {
-                    yield Err(AdapterError::io(NAME, io.path, io.source));
-                    return;
-                }
-            };
-            for path in paths {
-                let path_display = path.display().to_string();
-
-                if let Some((id, mtime)) = peek_id_and_mtime(&path).await
-                    && let Some(ingested_at) = oracle.last_ingested_at(&id)
-                    && mtime <= ingested_at
-                {
-                    yield Ok(AdapterYield::Skipped {
-                        session_id: id,
-                        project: None,
-                        reason: SkipReason::Fresh,
-                    });
-                    continue;
-                }
-
-                let session_event = match session_from_file(&path, &path_display).await {
-                    Ok(session) => session,
-                    Err(error) => {
-                        yield Err(error);
-                        continue;
-                    }
-                };
-                let session_id = session_event.id.clone();
-                let default_timestamp = session_event.created_at;
-                yield Ok(AdapterYield::Event(IngestEvent::Session(session_event)));
-
-                let file = match tokio::fs::File::open(&path).await {
-                    Ok(file) => file,
-                    Err(source) => {
-                        yield Err(AdapterError::io(NAME, path_display, source));
-                        continue;
-                    }
-                };
-
-                let mut lines = BufReader::new(file).lines();
-                let mut line_number = 0usize;
-                let mut state = FileState::default();
-                loop {
-                    let next = lines.next_line().await;
-                    let line = match next {
-                        Ok(Some(line)) => line,
-                        Ok(None) => break,
-                        Err(source) => {
-                            yield Err(AdapterError::io(NAME, path_display.clone(), source));
-                            break;
-                        }
-                    };
-                    line_number += 1;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let value = match serde_json::from_str::<Value>(&line) {
-                        Ok(value) => value,
-                        Err(source) => {
-                            yield Err(AdapterError::parse(
-                                NAME,
-                                path_display.clone(),
-                                line_number,
-                                source,
-                            ));
-                            continue;
-                        }
-                    };
-                    if let Some(uuid) = value.get("uuid").and_then(Value::as_str)
-                        && !state.seen_uuids.insert(uuid.to_owned())
-                    {
-                        tracing::debug!(
-                            target: "pond::adapter::claude_code",
-                            uuid,
-                            file = %path_display,
-                            line = line_number,
-                            "skip replay row (duplicate uuid in file)",
-                        );
-                        continue;
-                    }
-                    capture_tool_call_names(&value, &mut state.tool_call_names);
-                    match events_from_row(
-                        &session_id,
-                        line_number,
-                        &value,
-                        default_timestamp,
-                        &state,
-                    ) {
-                        Ok(events) => {
-                            for event in events {
-                                yield Ok(AdapterYield::Event(event));
-                            }
-                        }
-                        Err(message) => {
-                            yield Err(AdapterError::schema(
-                                NAME,
-                                format!("{path_display}:{line_number}"),
-                                message,
-                            ));
-                            continue;
-                        }
-                    }
-                }
-            }
-        })
+        jsonl_tree_events(self, oracle)
     }
 }
 
-async fn peek_id_and_mtime(path: &Path) -> Option<(String, DateTime<Utc>)> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let mtime = DateTime::<Utc>::from(metadata.modified().ok()?);
-    if let Some(descriptor) = subagent_descriptor(path).await {
-        let id = format!("{}/agent-{}", descriptor.parent_uuid, descriptor.agent_hash);
-        return Some((id, mtime));
+impl JsonlTree for ClaudeCodeAdapter {
+    type State = FileState;
+
+    fn name(&self) -> &'static str {
+        NAME
     }
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let line = lines.next_line().await.ok()??;
-    let row: Value = serde_json::from_str(&line).ok()?;
-    let id = row.get("sessionId")?.as_str()?.to_owned();
-    Some((id, mtime))
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String> {
+        if let Some((parent_uuid, agent_hash)) = subagent_ids(path) {
+            return Some(format!("{parent_uuid}/agent-{agent_hash}"));
+        }
+        let row: Value = serde_json::from_str(first_line).ok()?;
+        row.get("sessionId")?.as_str().map(ToOwned::to_owned)
+    }
+
+    fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
+        session_from_rows(path, rows)
+    }
+
+    fn events_from_row(
+        &self,
+        session: &Session,
+        row: &BoundedRow,
+        state: &mut Self::State,
+    ) -> Result<Vec<IngestEvent>, String> {
+        if let Some(uuid) = row.value.get("uuid").and_then(Value::as_str)
+            && !state.seen_uuids.insert(uuid.to_owned())
+        {
+            return Ok(Vec::new());
+        }
+        capture_tool_call_names(&row.value, &mut state.tool_call_names);
+        events_from_row(&session.id, row.line, &row.value, session.created_at, state)
+    }
 }
 
 /// Walk one raw row's `message.content[]` array (if any) and stash every
@@ -471,75 +378,45 @@ fn capture_tool_call_names(row: &Value, map: &mut HashMap<String, Extracted<Stri
     }
 }
 
-async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, AdapterError> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?;
-    let mut lines = BufReader::new(file).lines();
-    let mut first = None::<(usize, Value)>;
+fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
+    let path_display = path.display().to_string();
     let mut created_at = None;
     let mut project: Option<Extracted<String>> = None;
     let mut version = None;
-    let mut line_number = 0usize;
-
-    loop {
-        let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?
-        else {
-            break;
-        };
-        line_number += 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row = serde_json::from_str::<Value>(&line).map_err(|source| {
-            AdapterError::parse(NAME, path_display.to_owned(), line_number, source)
-        })?;
-
-        if first.is_none() {
-            first = Some((line_number, row.clone()));
-        }
+    for row in rows {
         if created_at.is_none() {
-            created_at = parse_timestamp(&row).ok();
+            created_at = parse_timestamp(&row.value).ok();
         }
         if project.is_none() {
-            project = extract_str(&row, "cwd");
+            project = extract_str(&row.value, "cwd");
         }
         if version.is_none() {
             version = row
+                .value
                 .get("version")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
         }
     }
 
-    let Some((first_line, first)) = first else {
-        return Err(AdapterError::schema(
-            NAME,
-            path_display.to_owned(),
-            "empty jsonl session",
-        ));
-    };
-
+    let first = rows
+        .first()
+        .ok_or_else(|| AdapterError::schema(NAME, path_display.clone(), "empty jsonl session"))?;
+    let at_first = format!("{path_display}:{}", first.line);
     let raw_session_id = first
+        .value
         .get("sessionId")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             AdapterError::schema(
                 NAME,
-                format!("{path_display}:{first_line}"),
-                format!("line {first_line} missing sessionId"),
+                at_first.clone(),
+                format!("line {} missing sessionId", first.line),
             )
         })?
         .to_owned();
     let created_at = created_at.ok_or_else(|| {
-        AdapterError::schema(
-            NAME,
-            format!("{path_display}:{first_line}"),
-            "session has no parseable timestamp",
-        )
+        AdapterError::schema(NAME, at_first, "session has no parseable timestamp")
     })?;
 
     // Subagent detection. Claude Code stores each subagent's transcript at
@@ -549,7 +426,7 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
     // the validator's "project is immutable" rule rejects it under the
     // pre-2026-05-16 layering). The fix is to derive a child id and link
     // back via `parent_session_id`. See spec.md#datasets.
-    let subagent = subagent_descriptor(path).await;
+    let subagent = subagent_descriptor(path);
     let project_dir = source_project_dir(path, subagent.is_some());
     let (session_id, parent_session_id, source_agent, subagent_options) = match subagent {
         Some(SubagentDescriptor {
@@ -587,14 +464,14 @@ async fn session_from_file(path: &Path, path_display: &str) -> Result<Session, A
                 .ok_or_else(|| {
                     AdapterError::schema(
                         NAME,
-                        path_display.to_owned(),
+                        path_display.clone(),
                         "no `cwd` field in any row and source path is not UTF-8",
                     )
                 })?;
             extract_self_str(&Value::String(decoded)).ok_or_else(|| {
                 AdapterError::schema(
                     NAME,
-                    path_display.to_owned(),
+                    path_display.clone(),
                     "internal: Value::String produced None from Source::as_str",
                 )
             })?
@@ -650,12 +527,10 @@ struct SubagentDescriptor {
     meta: Option<Value>,
 }
 
-/// Recognise the on-disk subagent layout:
+/// Parent uuid and agent hash from the subagent on-disk layout
 ///   `.../-<encoded-cwd>/<parent_uuid>/subagents/agent-<hash>.jsonl`
-/// and read the sibling `agent-<hash>.meta.json` for `agentType` and
-/// `description`. Returns `None` for any path that does NOT match the
-/// subagent shape (the common case: top-level session files).
-async fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
+/// `None` for any path not matching that shape (the common case).
+fn subagent_ids(path: &Path) -> Option<(String, String)> {
     let file_name = path.file_name()?.to_str()?;
     let agent_hash = file_name
         .strip_prefix("agent-")?
@@ -665,11 +540,16 @@ async fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
     if subagents_dir.file_name()?.to_str()? != "subagents" {
         return None;
     }
-    let parent_dir = subagents_dir.parent()?;
-    let parent_uuid = parent_dir.file_name()?.to_str()?.to_owned();
+    let parent_uuid = subagents_dir.parent()?.file_name()?.to_str()?.to_owned();
+    Some((parent_uuid, agent_hash))
+}
 
-    let meta_path = subagents_dir.join(format!("agent-{agent_hash}.meta.json"));
-    let (agent_type, meta) = match tokio::fs::read(&meta_path).await {
+/// [`subagent_ids`] plus the sibling `agent-<hash>.meta.json` - `agentType` for
+/// the `source_agent` label, the whole file for lossless sidecar restore.
+fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
+    let (parent_uuid, agent_hash) = subagent_ids(path)?;
+    let meta_path = path.parent()?.join(format!("agent-{agent_hash}.meta.json"));
+    let (agent_type, meta) = match std::fs::read(&meta_path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => (
                 value
@@ -1007,7 +887,7 @@ fn row_options(row: &Value, line: usize) -> ProviderOptions {
         "git_branch": row.get("gitBranch"),
         "request_id": row.get("requestId"),
         "raw_type": row.get("type"),
-        "raw_record": row,
+        "raw_record": extract_raw_record(row),
     });
     options.insert("source".to_owned(), source);
     options

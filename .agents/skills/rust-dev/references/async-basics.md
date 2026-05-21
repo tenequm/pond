@@ -144,12 +144,14 @@ Async runtimes assume tasks yield quickly. CPU-bound work (parsing big files, en
 let result = tokio::task::spawn_blocking(|| expensive_computation()).await?;
 ```
 
-**`tokio::task::block_in_place`** when you cannot spawn (e.g., inside a closure that needs to return synchronously):
+**`tokio::task::block_in_place`** runs a blocking section inside the current async task without starving sibling tasks. It works only on the multi-threaded runtime - it **panics** on a `current_thread` runtime - and it suspends any other code running concurrently in the same task (e.g. under `join!`). Prefer `spawn_blocking`; reach for `block_in_place` only when the blocking work genuinely cannot move into its own task:
 ```rust
 tokio::task::block_in_place(|| do_blocking_thing());
 ```
 
 Never call `std::thread::sleep` in async code. Use `tokio::time::sleep`. Never call blocking I/O (`std::fs::read`, `std::net::TcpStream`) on a runtime thread. Use `tokio::fs`, `tokio::net`, or wrap with `spawn_blocking`.
+
+One caveat on `tokio::fs`: it is not true async I/O. Most operating systems have no async file API, so tokio runs ordinary blocking `std::fs` operations on the `spawn_blocking` pool behind the scenes. That keeps the runtime thread unblocked, but every call carries `spawn_blocking` overhead - for many small reads it can be far slower than plain blocking I/O. Batch file work: read a whole file in one call, or do a sequence of filesystem operations inside a single `spawn_blocking`, rather than issuing hundreds of separate `tokio::fs` calls.
 
 ## Concurrency: `select!`, `join!`, `try_join!`
 
@@ -226,7 +228,7 @@ tx.send("hi".into()).await?;
 
 ## Async in Traits
 
-Native async functions in traits stabilized in Rust 1.75. They work for object-safety-irrelevant cases:
+Native async functions in traits stabilized in Rust 1.75. They work for cases that do not need `dyn Trait`:
 
 ```rust
 trait Greeter {

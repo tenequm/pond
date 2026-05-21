@@ -17,10 +17,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use async_stream::stream;
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
     sessions::IngestEvent,
@@ -28,11 +26,13 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    collect_jsonl_files, compact_json, config_path, empty_options,
-    extract::{Extracted, extract_compact_repr, extract_self_str, extract_str},
-    extracted_text, jsonl_bytes, part_id, raw_record,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
+    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
+    empty_options,
+    extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
+    extracted_text,
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl_bytes, part_id, raw_record,
 };
 
 const NAME: &str = "codex-cli";
@@ -237,114 +237,51 @@ impl CodexCliAdapter {
 
 impl Adapter for CodexCliAdapter {
     fn discover(&self) -> DiscoverFuture<'_> {
-        let root = self.root.clone();
-        Box::pin(async move {
-            // Header-free count: see the matching note on ClaudeCodeAdapter.
-            let paths = collect_jsonl_files(&root)
-                .await
-                .map_err(|io| AdapterError::io(NAME, io.path, io.source))?;
-            Ok(paths.len())
-        })
+        jsonl_tree_discover(self)
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
-        let root = self.root.clone();
-        Box::pin(stream! {
-            let paths = match collect_jsonl_files(&root).await {
-                Ok(paths) => paths,
-                Err(io) => {
-                    yield Err(AdapterError::io(NAME, io.path, io.source));
-                    return;
-                }
-            };
-            for path in paths {
-                let path_display = path.display().to_string();
+        jsonl_tree_events(self, oracle)
+    }
+}
 
-                if let Some((id, mtime)) = peek_id_and_mtime(&path).await
-                    && let Some(ingested_at) = oracle.last_ingested_at(&id)
-                    && mtime <= ingested_at
-                {
-                    yield Ok(AdapterYield::Skipped {
-                        session_id: id,
-                        project: None,
-                        reason: SkipReason::Fresh,
-                    });
-                    continue;
-                }
+impl JsonlTree for CodexCliAdapter {
+    type State = HashMap<String, Extracted<String>>;
 
-                let meta = match session_meta(&path, &path_display).await {
-                    Ok(meta) => meta,
-                    Err(error) => {
-                        yield Err(error);
-                        continue;
-                    }
-                };
-                let session_id = meta.id.clone();
-                let default_timestamp = meta.created_at;
-                yield Ok(AdapterYield::Event(IngestEvent::Session(meta)));
+    fn name(&self) -> &'static str {
+        NAME
+    }
 
-                let file = match tokio::fs::File::open(&path).await {
-                    Ok(file) => file,
-                    Err(source) => {
-                        yield Err(AdapterError::io(NAME, path_display.clone(), source));
-                        continue;
-                    }
-                };
+    fn root(&self) -> &Path {
+        &self.root
+    }
 
-                let mut lines = BufReader::new(file).lines();
-                let mut line_number = 0usize;
-                let mut tool_call_names: HashMap<String, Extracted<String>> = HashMap::new();
-                loop {
-                    let next = lines.next_line().await;
-                    let line = match next {
-                        Ok(Some(line)) => line,
-                        Ok(None) => break,
-                        Err(source) => {
-                            yield Err(AdapterError::io(NAME, path_display.clone(), source));
-                            break;
-                        }
-                    };
-                    line_number += 1;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let row = match serde_json::from_str::<Value>(&line) {
-                        Ok(value) => value,
-                        Err(source) => {
-                            yield Err(AdapterError::parse(
-                                NAME,
-                                path_display.clone(),
-                                line_number,
-                                source,
-                            ));
-                            continue;
-                        }
-                    };
-                    capture_tool_call_name(&row, &mut tool_call_names);
-                    match events_from_row(
-                        &session_id,
-                        line_number,
-                        &row,
-                        default_timestamp,
-                        &tool_call_names,
-                    ) {
-                        Ok(events) => {
-                            for event in events {
-                                yield Ok(AdapterYield::Event(event));
-                            }
-                        }
-                        Err(message) => {
-                            yield Err(AdapterError::schema(
-                                NAME,
-                                format!("{path_display}:{line_number}"),
-                                message,
-                            ));
-                            continue;
-                        }
-                    }
-                }
-            }
-        })
+    fn peek_session_id(&self, _path: &Path, first_line: &str) -> Option<String> {
+        let row: Value = serde_json::from_str(first_line).ok()?;
+        if row.get("type").and_then(Value::as_str) == Some("session_meta") {
+            row.get("payload")?
+                .get("id")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        } else if is_legacy_session_row(&row) {
+            row.get("id")?.as_str().map(ToOwned::to_owned)
+        } else {
+            None
+        }
+    }
+
+    fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
+        session_from_rows(path, rows)
+    }
+
+    fn events_from_row(
+        &self,
+        session: &Session,
+        row: &BoundedRow,
+        state: &mut Self::State,
+    ) -> Result<Vec<IngestEvent>, String> {
+        capture_tool_call_name(&row.value, state);
+        events_from_row(&session.id, row.line, &row.value, session.created_at, state)
     }
 }
 
@@ -356,51 +293,24 @@ fn is_legacy_session_row(row: &Value) -> bool {
     row.get("type").is_none() && row.get("id").is_some()
 }
 
-async fn peek_id_and_mtime(path: &Path) -> Option<(String, DateTime<Utc>)> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let mtime = DateTime::<Utc>::from(metadata.modified().ok()?);
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let line = lines.next_line().await.ok()??;
-    let row: Value = serde_json::from_str(&line).ok()?;
-    // Recognizing the legacy first row lets legacy files freshness-skip like
-    // any other once ingested, instead of re-parsing (and re-failing) every
-    // sync.
-    let id = if row.get("type").and_then(Value::as_str) == Some("session_meta") {
-        row.get("payload")?.get("id")?.as_str()?.to_owned()
-    } else if is_legacy_session_row(&row) {
-        row.get("id")?.as_str()?.to_owned()
-    } else {
-        return None;
-    };
-    Some((id, mtime))
-}
-
-async fn session_meta(path: &Path, path_display: &str) -> Result<Session, AdapterError> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?;
-    let mut lines = BufReader::new(file).lines();
-    let first = lines
-        .next_line()
-        .await
-        .map_err(|source| AdapterError::io(NAME, path_display.to_owned(), source))?
-        .ok_or_else(|| {
-            AdapterError::schema(NAME, path_display.to_owned(), "empty jsonl session")
-        })?;
-    let row = serde_json::from_str::<Value>(&first)
-        .map_err(|source| AdapterError::parse(NAME, path_display.to_owned(), 1, source))?;
-    // The current rollout wraps session metadata in a `session_meta`
-    // envelope; a legacy rollout (spec.md#adapters) has none - the first row
-    // is a bare metadata object. Either way, read fields from `payload`.
+fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
+    let path_display = path.display().to_string();
+    let first = rows
+        .first()
+        .ok_or_else(|| AdapterError::schema(NAME, path_display.clone(), "empty jsonl session"))?;
+    let row = &first.value;
+    let at_first = format!("{path_display}:{}", first.line);
+    // The current rollout wraps session metadata in a `session_meta` envelope;
+    // a legacy rollout (spec.md#adapters) has none - the first row is a bare
+    // metadata object. Either way, read fields from `payload`.
     let payload = if row.get("type").and_then(Value::as_str) == Some("session_meta") {
         row.get("payload").cloned().unwrap_or(Value::Null)
-    } else if is_legacy_session_row(&row) {
+    } else if is_legacy_session_row(row) {
         row.clone()
     } else {
         return Err(AdapterError::schema(
             NAME,
-            format!("{path_display}:1"),
+            at_first,
             "first row must be session_meta",
         ));
     };
@@ -408,11 +318,7 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            AdapterError::schema(
-                NAME,
-                format!("{path_display}:1"),
-                "session_meta missing payload.id",
-            )
+            AdapterError::schema(NAME, at_first.clone(), "session_meta missing payload.id")
         })?
         .to_owned();
     let created_at = payload
@@ -427,11 +333,7 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
                 .map(|dt| dt.with_timezone(&Utc))
         })
         .ok_or_else(|| {
-            AdapterError::schema(
-                NAME,
-                format!("{path_display}:1"),
-                "session_meta has no parseable timestamp",
-            )
+            AdapterError::schema(NAME, at_first, "session_meta has no parseable timestamp")
         })?;
     let project = match extract_str(&payload, "cwd") {
         Some(value) => value,
@@ -439,12 +341,12 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
             let path_str = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(path_display)
+                .unwrap_or(path_display.as_str())
                 .to_owned();
             extract_self_str(&Value::String(path_str)).ok_or_else(|| {
                 AdapterError::schema(
                     NAME,
-                    path_display.to_owned(),
+                    path_display.clone(),
                     "internal: Value::String produced None from Source::as_str",
                 )
             })?
@@ -462,7 +364,7 @@ async fn session_meta(path: &Path, path_display: &str) -> Result<Session, Adapte
             "base_instructions": payload.get("base_instructions"),
             "instructions": payload.get("instructions"),
             "source": payload.get("source"),
-            "raw_record": row,
+            "raw_record": extract_raw_record(row),
         }),
     );
 
@@ -563,7 +465,10 @@ fn events_from_row(
 
 fn row_options(row: &Value) -> ProviderOptions {
     let mut options = ProviderOptions::new();
-    options.insert("source".to_owned(), json!({ "raw_record": row }));
+    options.insert(
+        "source".to_owned(),
+        json!({ "raw_record": extract_raw_record(row) }),
+    );
     options
 }
 
@@ -778,7 +683,7 @@ fn custom_tool_result_events(
             call_id: extract_str(payload, "call_id"),
             name: extract_str(payload, "name"),
             is_failure: false,
-            result: cap_tool_output(payload.get("output").cloned().unwrap_or(Value::Null)),
+            result: payload.get("output").cloned().unwrap_or(Value::Null),
         },
     };
     vec![
@@ -790,42 +695,6 @@ fn custom_tool_result_events(
         }),
         IngestEvent::Part(part),
     ]
-}
-
-/// Stopgap guard against pathological codex-cli `function_call_output.output`
-/// values - a 0.121.0 sandbox-denial path was observed dumping ~4GB of
-/// captured stdout into a single JSON string field, which then overflows the
-/// i32 offset accumulator in `parts.variant_data` (StringArray). Cap at 10MB
-/// and replace with a sentinel that preserves the head bytes plus the
-/// original size. See `plan.md` Stage 6 for the proper storage-seam fix.
-const MAX_TOOL_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
-const TOOL_OUTPUT_HEAD_BYTES: usize = 2048;
-
-fn cap_tool_output(value: Value) -> Value {
-    if let Value::String(s) = &value
-        && s.len() > MAX_TOOL_OUTPUT_BYTES
-    {
-        let original = s.len();
-        let head_end = s
-            .char_indices()
-            .take_while(|(i, _)| *i <= TOOL_OUTPUT_HEAD_BYTES)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        let head = &s[..head_end];
-        tracing::warn!(
-            adapter = NAME,
-            original_bytes = original,
-            cap_bytes = MAX_TOOL_OUTPUT_BYTES,
-            "function_call_output.output exceeded cap; truncated to sentinel"
-        );
-        return json!({
-            "__pond_truncated": true,
-            "original_bytes": original,
-            "head": head,
-        });
-    }
-    value
 }
 
 fn tool_result_events(
@@ -845,7 +714,7 @@ fn tool_result_events(
         .as_ref()
         .and_then(|id| tool_call_names.get(id.as_str()))
         .cloned();
-    let result = cap_tool_output(payload.get("output").cloned().unwrap_or(Value::Null));
+    let result = payload.get("output").cloned().unwrap_or(Value::Null);
     let part = Part {
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),

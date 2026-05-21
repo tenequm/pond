@@ -236,11 +236,8 @@ impl Store {
         if sessions.is_empty() {
             return Ok(Vec::new());
         }
-        let batch = sessions_batch(sessions)?;
-        let inserted = self
-            .handle
-            .merge_insert(Table::Sessions, batch, sessions.len())
-            .await?;
+        let batches = sessions_batches(sessions)?;
+        let inserted = merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
         Ok(statuses_from_inserted(sessions.len(), inserted))
     }
 
@@ -412,35 +409,16 @@ impl Store {
             })
             .collect();
 
-        let sessions_batch = sessions_batch(&sessions_owned)?;
-        let messages_batch = messages_batch(&message_rows)?;
-        let parts_batch = parts_batch(&part_rows)?;
+        let session_batches = sessions_batches(&sessions_owned)?;
+        let message_batches = messages_batches(&message_rows)?;
+        let part_batches = parts_batches(&part_rows)?;
 
         let sessions_count = sessions_owned.len();
-        let messages_count = message_rows.len();
-        let parts_count = part_rows.len();
 
         let (sessions_inserted, messages_inserted, parts_inserted) = tokio::try_join!(
-            self.handle
-                .merge_insert(Table::Sessions, sessions_batch, sessions_count),
-            async {
-                if messages_count == 0 {
-                    Ok::<u64, anyhow::Error>(0)
-                } else {
-                    self.handle
-                        .merge_insert(Table::Messages, messages_batch, messages_count)
-                        .await
-                }
-            },
-            async {
-                if parts_count == 0 {
-                    Ok::<u64, anyhow::Error>(0)
-                } else {
-                    self.handle
-                        .merge_insert(Table::Parts, parts_batch, parts_count)
-                        .await
-                }
-            },
+            merge_insert_chunks(&self.handle, Table::Sessions, session_batches),
+            merge_insert_chunks(&self.handle, Table::Messages, message_batches),
+            merge_insert_chunks(&self.handle, Table::Parts, part_batches),
         )?;
 
         // Per-session success outcomes: each substream's own status row plus
@@ -494,11 +472,8 @@ impl Store {
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
-        let batch = messages_batch(&rows)?;
-        let inserted = self
-            .handle
-            .merge_insert(Table::Messages, batch, messages.len())
-            .await?;
+        let batches = messages_batches(&rows)?;
+        let inserted = merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
         Ok(statuses_from_inserted(messages.len(), inserted))
     }
 
@@ -506,11 +481,8 @@ impl Store {
         if parts.is_empty() {
             return Ok(Vec::new());
         }
-        let batch = parts_batch(parts)?;
-        let inserted = self
-            .handle
-            .merge_insert(Table::Parts, batch, parts.len())
-            .await?;
+        let batches = parts_batches(parts)?;
+        let inserted = merge_insert_chunks(&self.handle, Table::Parts, batches).await?;
         Ok(statuses_from_inserted(parts.len(), inserted))
     }
 
@@ -1229,6 +1201,9 @@ pub struct IngestSummary {
     /// conflicts, transient IO that didn't recover). Hard zero on healthy
     /// runs.
     pub storage_errors: usize,
+    /// Oversized values truncated to a bounded sentinel at the seam
+    /// (spec.md#bounded-values); the rest of each such record is intact.
+    pub truncated_values: usize,
     /// Histogram of stable reason keys for the combined `dropped_events +
     /// dropped_sessions` populations. Keys are `&'static str` (see the
     /// `DROP_REASON_*` constants) so consumers can match by identity.
@@ -2192,7 +2167,84 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
     .context("failed to build embeddings batch")
 }
 
-pub(crate) fn sessions_batch(sessions: &[Session]) -> Result<RecordBatch> {
+/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
+/// is split before the running total of its text columns reaches this, and a
+/// single cell at or above it is rejected rather than left to panic inside
+/// `StringArray::from` (spec.md#bounded-values).
+const COLUMN_BYTE_BUDGET: usize = 1 << 30;
+
+/// Contiguous row ranges whose summed text-column byte cost each stays within
+/// `COLUMN_BYTE_BUDGET`. Budgeting the all-column total bounds every individual
+/// column too, since no single column's total can exceed it. `cells[i]` is row
+/// `i`'s byte cost summed across every text column.
+fn chunk_ranges(cells: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut running = 0usize;
+    for (index, &row) in cells.iter().enumerate() {
+        if running + row > COLUMN_BYTE_BUDGET && index > start {
+            chunks.push(start..index);
+            start = index;
+            running = 0;
+        }
+        running += row;
+    }
+    if start < cells.len() {
+        chunks.push(start..cells.len());
+    }
+    chunks
+}
+
+fn guard_cell(table: &str, pk: &str, bytes: usize) -> Result<()> {
+    if bytes >= COLUMN_BYTE_BUDGET {
+        anyhow::bail!(
+            "{table} row {pk}: a {bytes}-byte text cell meets the per-cell ceiling and would \
+             overflow Arrow's i32 offset buffer"
+        );
+    }
+    Ok(())
+}
+
+async fn merge_insert_chunks(
+    handle: &Handle,
+    table: Table,
+    batches: Vec<RecordBatch>,
+) -> Result<u64> {
+    let mut inserted = 0u64;
+    for batch in batches {
+        let rows = batch.num_rows();
+        inserted += handle.merge_insert(table, batch, rows).await?;
+    }
+    Ok(inserted)
+}
+
+pub(crate) fn sessions_batches(sessions: &[Session]) -> Result<Vec<RecordBatch>> {
+    let options = sessions
+        .iter()
+        .map(|session| json_string(&session.options))
+        .collect::<Result<Vec<_>>>()?;
+    let mut cells = Vec::with_capacity(sessions.len());
+    for (session, encoded) in sessions.iter().zip(&options) {
+        let columns = [
+            session.id.len(),
+            session.parent_session_id.as_deref().map_or(0, str::len),
+            session.parent_message_id.as_deref().map_or(0, str::len),
+            session.source_agent.len(),
+            session.project.as_str().len(),
+            encoded.len(),
+        ];
+        for bytes in columns {
+            guard_cell("sessions", &session.id, bytes)?;
+        }
+        cells.push(columns.iter().sum());
+    }
+    chunk_ranges(&cells)
+        .into_iter()
+        .map(|range| sessions_chunk(&sessions[range.clone()], &options[range]))
+        .collect()
+}
+
+fn sessions_chunk(sessions: &[Session], options: &[String]) -> Result<RecordBatch> {
     let schema = session_schema();
     RecordBatch::try_new(
         schema.clone(),
@@ -2237,17 +2289,42 @@ pub(crate) fn sessions_batch(sessions: &[Session]) -> Result<RecordBatch> {
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                sessions
-                    .iter()
-                    .map(|session| json_string(&session.options))
-                    .collect::<Result<Vec<_>>>()?,
+                options.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
         ],
     )
     .context("failed to build session batch")
 }
 
-pub(crate) fn messages_batch(rows: &[MessageBatchRow<'_>]) -> Result<RecordBatch> {
+pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<RecordBatch>> {
+    let options = rows
+        .iter()
+        .map(|row| json_string(row.message.options()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut cells = Vec::with_capacity(rows.len());
+    for (row, encoded) in rows.iter().zip(&options) {
+        let columns = [
+            row.message.session_id().len(),
+            row.message.id().len(),
+            row.message.role().as_str().len(),
+            row.source_agent.len(),
+            row.project.len(),
+            row.message.system_content().map_or(0, str::len),
+            row.search_text.map_or(0, str::len),
+            encoded.len(),
+        ];
+        for bytes in columns {
+            guard_cell("messages", row.message.id(), bytes)?;
+        }
+        cells.push(columns.iter().sum());
+    }
+    chunk_ranges(&cells)
+        .into_iter()
+        .map(|range| messages_chunk(&rows[range.clone()], &options[range]))
+        .collect()
+}
+
+fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[String]) -> Result<RecordBatch> {
     let schema = message_schema();
     RecordBatch::try_new(
         schema.clone(),
@@ -2288,21 +2365,54 @@ pub(crate) fn messages_batch(rows: &[MessageBatchRow<'_>]) -> Result<RecordBatch
                 rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| json_string(row.message.options()))
-                    .collect::<Result<Vec<_>>>()?,
+                options.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
         ],
     )
     .context("failed to build message batch")
 }
 
-pub(crate) fn parts_batch(parts: &[Part]) -> Result<RecordBatch> {
+pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
+    let variant_data = parts
+        .iter()
+        .map(|part| part_variant_json(&part.kind))
+        .collect::<Result<Vec<_>>>()?;
+    let options = parts
+        .iter()
+        .map(|part| json_string(&part.options))
+        .collect::<Result<Vec<_>>>()?;
+    let mut cells = Vec::with_capacity(parts.len());
+    // The blob column is a BinaryArray, exempt from the text-column bound
+    // (spec.md#bounded-values); only the StringArray columns are budgeted.
+    for ((part, variant), encoded) in parts.iter().zip(&variant_data).zip(&options) {
+        let columns = [
+            part.message_id.len(),
+            part.id.len(),
+            part.kind.type_name().len(),
+            encoded.len(),
+            variant.len(),
+        ];
+        for bytes in columns {
+            guard_cell("parts", &part.id, bytes)?;
+        }
+        cells.push(columns.iter().sum());
+    }
+    chunk_ranges(&cells)
+        .into_iter()
+        .map(|range| {
+            parts_chunk(
+                &parts[range.clone()],
+                &variant_data[range.clone()],
+                &options[range],
+            )
+        })
+        .collect()
+}
+
+fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> Result<RecordBatch> {
     let schema = part_schema();
-    let mut variant_data = Vec::with_capacity(parts.len());
     let mut blobs = BlobArrayBuilder::new(parts.len());
     for part in parts {
-        variant_data.push(part_variant_json(&part.kind)?);
         match &part.kind {
             PartKind::File { data, .. } => match data {
                 FileData::String(value) => blobs.push_bytes(value.as_bytes())?,
@@ -2343,12 +2453,11 @@ pub(crate) fn parts_batch(parts: &[Part]) -> Result<RecordBatch> {
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                parts
-                    .iter()
-                    .map(|part| json_string(&part.options))
-                    .collect::<Result<Vec<_>>>()?,
+                options.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(variant_data)),
+            Arc::new(StringArray::from(
+                variant_data.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
             blobs.finish()?,
         ],
     )
@@ -2621,6 +2730,24 @@ mod tests {
             project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
+    }
+
+    #[test]
+    fn chunk_ranges_splits_on_byte_budget() {
+        assert!(chunk_ranges(&[]).is_empty());
+        assert_eq!(chunk_ranges(&[10, 10, 10]), vec![0..3]);
+
+        let two_thirds = COLUMN_BYTE_BUDGET * 2 / 3;
+        assert_eq!(
+            chunk_ranges(&[two_thirds, two_thirds, two_thirds]),
+            vec![0..1, 1..2, 2..3],
+        );
+
+        // An oversized single row gets its own chunk, never an infinite loop.
+        assert_eq!(
+            chunk_ranges(&[10, COLUMN_BYTE_BUDGET + 1, 10]),
+            vec![0..1, 1..2, 2..3],
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
 ---
 name: rust-dev
-description: Practical day-1 guide to building applications in Rust well. Covers the mental model (ownership, errors as values, traits-not-interfaces), day-1 decisions (String vs &str, Box vs Rc vs Arc, dyn vs impl Trait, anyhow vs thiserror), idioms to internalize early, anti-patterns to avoid, and a tight crate shortlist (tokio, serde, anyhow, clap, reqwest, tracing, axum, sqlx). Use when starting a new Rust project, learning Rust coming from Python/JS/Go/Java/C++, deciding on types and lifetimes, choosing crates, structuring modules, configuring Cargo.toml/clippy/rustfmt, or whenever the user mentions Rust, cargo, ownership, borrow checker, lifetimes, traits, async Rust, or "writing this in Rust".
+description: Practical day-1 guide to building applications in Rust well. Covers the mental model (ownership, errors as values, traits-not-interfaces), day-1 decisions (String vs &str, Box vs Rc vs Arc, dyn vs impl Trait, anyhow vs thiserror), idioms to internalize early, anti-patterns to avoid, and a tight crate shortlist (tokio, serde, anyhow, clap, reqwest, tracing, axum, sqlx). Use when starting a new Rust project, learning Rust coming from Python/JS/Go/Java/C++, deciding on types and lifetimes, choosing crates, structuring modules, configuring Cargo.toml/clippy/rustfmt, writing tests, benchmarking, profiling, or speeding up builds, or whenever the user mentions Rust, cargo, ownership, borrow checker, lifetimes, traits, async Rust, testing, or "writing this in Rust".
 metadata:
-  version: "0.2.0"
-  upstream: "rust@1.95.0, axum@0.8.8, reqwest@0.13.3, sqlx@0.8.6, jiff@0.2.24"
+  version: "0.3.0"
+  upstream: "rust@1.95.0, axum@0.8.9, reqwest@0.13.3, sqlx@0.9.0, jiff@0.2.24"
 ---
 
 # Rust Development - Day 1
@@ -42,7 +42,10 @@ cargo fmt       # format
 # 5. Manage dependencies without editing Cargo.toml by hand
 cargo add tokio --features full
 cargo remove tokio
+cargo update                 # recompute Cargo.lock within existing semver ranges
 ```
+
+`cargo update` only moves within the version ranges already in `Cargo.toml`. Crossing a major version (`1.x` to `2.0`) needs a `Cargo.toml` edit or `cargo add <crate>@2`.
 
 **rust-analyzer is mandatory.** It is the language server every editor uses (VS Code, Zed, Neovim, Helix, RustRover uses its own engine but is comparable). In VS Code, install the `rust-analyzer` extension and set `rust-analyzer.check.command` to `"clippy"` so you get lint feedback on save.
 
@@ -77,8 +80,8 @@ There is no `try`/`catch`. Functions that can fail return `Result<T, E>`. Functi
 
 ```rust
 fn read_config() -> Result<Config, anyhow::Error> {
-    let bytes = std::fs::read("config.toml")?;   // ? = early-return on Err
-    let config = toml::from_slice(&bytes)?;
+    let text = std::fs::read_to_string("config.toml")?;  // ? = early-return on Err
+    let config = toml::from_str(&text)?;
     Ok(config)
 }
 ```
@@ -151,6 +154,8 @@ let active_emails: Vec<String> = users
 
 **`match` exhaustiveness.** Add a new variant to an enum and every `match` that does not handle it becomes a compile error. Use this. It is one of the most powerful refactoring tools in any language.
 
+**Let the compiler drive refactors.** The same trick works on structs: add a mandatory field with no `Default` and every existing constructor becomes a compile error - a free, exhaustive worklist of every site to update.
+
 **`if let` and `let else`** for the common single-arm match.
 ```rust
 if let Some(name) = user.name { println!("hi {name}"); }
@@ -165,7 +170,7 @@ let Some(name) = user.name else { return Err(anyhow!("no name")); };
 
 **Derive macros.** `#[derive(Debug, Clone, PartialEq)]` gets you 80% of the boilerplate for free. Add `#[derive(Serialize, Deserialize)]` for JSON.
 
-**Recent sugar (Rust 1.95+).** Two stabilized features worth knowing: `cfg_select!` is a compile-time `match` over `cfg` predicates (replaces most uses of the `cfg-if` crate), and let-chains now work inside `match` arm guards (`match x { Some(v) if let Ok(n) = v.parse::<i32>() => ... }`).
+**Recent sugar (Rust 1.95+).** Two stabilized features worth knowing: `cfg_select!` is a compile-time `match` over `cfg` predicates (replaces most uses of the `cfg-if` crate), and `if let` guards now work on `match` arms (`match x { Some(v) if let Ok(n) = v.parse::<i32>() => ... }`).
 
 ## Coming From X, Here Is What Bites You
 
@@ -225,9 +230,9 @@ See `references/crate-shortlist.md` for one minimal example each.
 These are the mistakes that show up in every newcomer's code review. Avoid them.
 
 1. **Storing `&str` (or any reference) in a struct.** Causes lifetime annotations to cascade through every caller. Use `String` until you have a profiler-backed reason not to.
-2. **`Rc<RefCell<T>>` everywhere to simulate Python/JS object semantics.** It works but is a code smell, and breaks the moment you need threading. Default to `Arc<Mutex<T>>` instead so you do not refactor.
+2. **Reaching for `Rc<RefCell<T>>` (or `Arc<Mutex<T>>`) to simulate Python/JS object graphs.** First ask whether you need shared mutable state at all - usually plain ownership, or passing data through a channel, is cleaner. When you genuinely do, prefer `Arc<Mutex<T>>` over `Rc<RefCell<T>>` so adding threads later is not a refactor.
 3. **`Box<dyn Error>` in library public APIs.** Forces callers to downcast. Define a typed error enum with `thiserror`. `Box<dyn Error>` is acceptable inside a binary, never in a published library.
-4. **`.unwrap()` and `.expect()` outside prototypes and tests.** Use `?` and propagate. Reserve `unwrap` for truly impossible cases and add a comment explaining why it cannot fail.
+4. **`.unwrap()` and `.expect()` outside prototypes and tests.** Use `?` and propagate - for an `Option`, `.ok_or_else(|| anyhow!(...))?` does the conversion. When a value genuinely cannot be absent, prefer `.expect("why it cannot fail")` over `.unwrap()`: the message is the comment that documents the invariant.
 5. **Brute-force `.clone()` until it compiles.** Sometimes cloning is right, but if you are scattering `.clone()` to silence the borrow checker, the design is wrong. Step back and ask the 3 questions about who owns what.
 6. **Trying to inherit via `Deref`**. `Deref` is for smart-pointer-like wrappers, not for OOP-style "extends". Use composition.
 7. **Reaching for `unsafe`.** App developers should essentially never need it. `unsafe` does not turn off the borrow checker; it lets you do five specific things (deref raw pointers, call unsafe functions, access mutable statics, implement unsafe traits, access union fields) with the contract that you have manually verified the invariants.
@@ -274,13 +279,11 @@ unreachable_pub = "warn"
 all = { level = "deny", priority = -1 }
 # Idiomatic helpers
 # Note: uninlined_format_args moved to clippy::pedantic (allow-by-default)
-# in mid-2026, so an explicit warn keeps the nudge active.
+# in Rust 1.89.0 (mid-2025), so an explicit warn keeps the nudge active.
 uninlined_format_args         = "warn"
 semicolon_if_nothing_returned = "warn"
 implicit_clone                = "warn"
 # Smells in non-prototype code
-unwrap_used  = "warn"
-expect_used  = "warn"
 dbg_macro   = "warn"
 todo        = "warn"
 print_stdout = "warn"   # use `tracing::info!` instead in real apps
@@ -294,6 +297,8 @@ edition       = "2024"
 ```
 
 That is enough. rustfmt's defaults are good. Some teams add `use_small_heuristics = "Max"` to keep more code on single lines. Fancy options like `imports_granularity` and `group_imports` are still nightly-only as of May 2026.
+
+Run `cargo fmt` before you start editing (or commit any pre-existing drift on its own) so formatting noise stays out of your diff, and make `cargo fmt --check` its own CI step.
 
 ## rust-toolchain.toml (optional but recommended)
 
@@ -310,9 +315,9 @@ profile    = "minimal"
 
 ```
 /target
-**/*.rs.bk
-Cargo.lock      # for libraries only; commit Cargo.lock for binaries
 ```
+
+Commit `Cargo.lock`. Since 2023 it is the recommended default for every crate type, libraries included (`cargo new` tracks it); a library may still choose to ignore it.
 
 ## Project Structure
 
@@ -357,3 +362,6 @@ Detailed material lives in `references/`. Read each when you hit the topic.
 - **traits-and-generics.md** - traits as bounds, `dyn` vs `impl Trait` vs generics, common derives, `From`/`Into`/`Display`/`Debug`, blanket impls, the orphan rule
 - **async-basics.md** - `tokio`, `#[tokio::main]`, `.await`, `Send`/`Sync`, common pitfalls (blocking in async, `MutexGuard` across `.await`)
 - **crate-shortlist.md** - minimal usage example for each of the 8 crates above
+- **testing.md** - what to test and what to skip, pragmatic test organization, keeping the suite fast, the minimal high-value tool kit
+- **dev-environment.md** - the fast build loop, build caching (sccache, rust-cache), platform-aware linker guidance, file watchers
+- **performance.md** - profiling before optimizing, benchmarking with criterion/divan, the real runtime wins

@@ -344,7 +344,8 @@ async fn main() -> anyhow::Result<()> {
                 let summary = sync_with_progress(&store, &name, config, &oracle).await?;
                 output(&format!(
                     "{} inserted={} matched={} dropped_events={} \
-                     dropped_sessions={} skipped_files={} skipped_fresh={} storage_errors={}",
+                     dropped_sessions={} skipped_files={} skipped_fresh={} \
+                     storage_errors={} truncated_values={}",
                     pond::output::paint(&format!("sync {name}:"), pond::output::dim()),
                     summary.inserted,
                     summary.matched,
@@ -353,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
                     summary.skipped_files,
                     summary.skipped_fresh,
                     summary.storage_errors,
+                    summary.truncated_values,
                 ))?;
                 // Top-N drop reasons follow the summary line. Empty when
                 // nothing dropped, which is the common case. The bucket

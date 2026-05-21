@@ -178,6 +178,7 @@ mod ingest_handler {
         F: FnMut(SyncEvent),
     {
         let mut summary = IngestSummary::default();
+        let truncations_before = crate::adapter::extract::truncated_values_count();
         // Discovery is best-effort: a failure (no read perm, bad config)
         // still lets the bar run as a rolling counter. We surface the count
         // upfront when we can; otherwise the bar uses `set_length(0)`.
@@ -361,6 +362,9 @@ mod ingest_handler {
         summary.add_outcomes(&final_outcomes);
         drain_pending_dones(&mut pending_dones, &final_outcomes, &mut on_event);
 
+        summary.truncated_values = crate::adapter::extract::truncated_values_count()
+            .saturating_sub(truncations_before) as usize;
+
         let total = run_started.elapsed();
         let other = total
             .saturating_sub(decode_total)
@@ -379,6 +383,7 @@ mod ingest_handler {
             dropped_sessions = summary.dropped_sessions as u64,
             skipped_files = summary.skipped_files as u64,
             skipped_fresh = summary.skipped_fresh as u64,
+            truncated_values = summary.truncated_values as u64,
             "ingest_adapter complete"
         );
         Ok(summary)

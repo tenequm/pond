@@ -184,6 +184,8 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+**0.13 notes** (if you find a 0.12 tutorial): `rustls` is now the default TLS backend (was `native-tls`), and the `rustls-tls` feature is renamed to `rustls`; `query` and `form` are now opt-in crate features. The `json` example above is unaffected.
+
 For tiny sync tools where you do not want a tokio dep, `ureq` is the lightweight alternative.
 
 ## `tracing` and `tracing-subscriber`
@@ -260,14 +262,14 @@ async fn main() -> anyhow::Result<()> {
 
 Path params, query params, JSON body, state, middleware all extract via the `FromRequest`/`FromRequestParts` traits. The axum docs are excellent.
 
-**0.8 breaking changes** (if you find a 0.7 tutorial): path captures use `/{id}` and `/{*rest}` instead of `/:id` and `/*rest`; `Option<T>` extractors require the new `OptionalFromRequestParts` trait; `Host` extractor moved to `axum-extra`; WebSocket `Message` uses `Bytes`/`Utf8Bytes` instead of `Vec<u8>`/`String`. MSRV is 1.78.
+**0.8 breaking changes** (if you find a 0.7 tutorial): path captures use `/{id}` and `/{*rest}` instead of `/:id` and `/*rest`; `Option<T>` extractors require the new `OptionalFromRequestParts` trait; `Host` extractor moved to `axum-extra`; WebSocket `Message` uses `Bytes`/`Utf8Bytes` instead of `Vec<u8>`/`String`. MSRV is 1.80 (raised in 0.8.9).
 
 ## `sqlx`
 
 Async SQL with compile-time-checked queries. Postgres, MySQL, SQLite.
 
 ```toml
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
 ```
 
 ```rust
@@ -296,6 +298,8 @@ For multi-crate workspaces, run `cargo sqlx prepare --workspace` to produce a si
 
 Migrations: `sqlx migrate add init`, write SQL, `sqlx migrate run`.
 
+**0.9 notes** (0.9.0 released 2026-05-06): the repository moved to the `transact-rs` GitHub org, and MSRV is now 1.94. The runtime `query()`/`query_as()` functions now take `impl SqlSafeStr` - wrap a dynamically built query string in `AssertSqlSafe(...)`. The `query_as!` macro shown above is unaffected (it takes a string literal). Older 0.8 tutorials otherwise still apply.
+
 ## `chrono` (and `jiff`)
 
 Dates and times. As of Jan 2026 the chrono maintainer announced soft-deprecation and recommends `jiff` (BurntSushi) for new code. Reality in May 2026:
@@ -320,7 +324,7 @@ let parsed: DateTime<Utc> = "2026-04-29T12:00:00Z".parse()?;
 let in_an_hour = now + chrono::Duration::hours(1);
 
 // jiff (equivalent)
-use jiff::Timestamp;
+use jiff::{Timestamp, ToSpan};
 
 let now: Timestamp = Timestamp::now();
 let parsed: Timestamp = "2026-04-29T12:00:00Z".parse()?;

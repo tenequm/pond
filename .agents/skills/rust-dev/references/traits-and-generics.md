@@ -64,12 +64,12 @@ for a in &animals {
 
 If your collection is homogeneous (all the same type), use a generic. If it is heterogeneous, you need `dyn`.
 
-### Object safety
+### Dyn compatibility (object safety)
 
-Not every trait can be used as `dyn Trait`. The compiler will tell you when you violate object safety. Common reasons:
-- The trait has methods returning `Self` (e.g., `Clone`).
-- The trait has generic methods (`fn f<T>(&self, x: T)`).
-- The trait has methods without a `&self`/`&mut self`/`self` receiver.
+Not every trait can be used as `dyn Trait`. A trait must be *dyn compatible* - the rule was called *object safety* before Rust 1.83, and the compiler's `E0038` error and current docs now say "dyn compatible." Common reasons a trait is not dyn compatible:
+- A method returns `Self` (e.g., `Clone`).
+- A method is generic (`fn f<T>(&self, x: T)`).
+- A method has no `&self`/`&mut self`/`self` receiver.
 
 If you hit this, either redesign the trait or use a generic instead.
 

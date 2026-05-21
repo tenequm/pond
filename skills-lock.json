@@ -5,13 +5,13 @@
       "source": "tenequm/skills",
       "sourceType": "github",
       "skillPath": "skills/lance-format/SKILL.md",
-      "computedHash": "ca0ed0a58790249300d12f78fa63166e37991d3dad941ba9067a5b7bbda60f13"
+      "computedHash": "b098131651c0437cdc0abd531a8661d23c59b0af051435b11e76fc37e0f563cf"
     },
     "rust-dev": {
       "source": "tenequm/skills",
       "sourceType": "github",
       "skillPath": "skills/rust-dev/SKILL.md",
-      "computedHash": "f7b6ae73e4c5142fa609790e2a69603d775255a3c799aa8ce86e7cebea30aa03"
+      "computedHash": "870371f5dfc9d165d70255cbc2244adf43cea8d37996d8608d2ebe556ef9e21a"
     }
   }
 }

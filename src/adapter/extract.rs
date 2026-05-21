@@ -19,6 +19,8 @@
 //!
 //! See spec.md#no-synthesis, spec.md#schema-honesty, and spec.md#lossless-projection for the underlying principles.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::Value;
 
 /// A value that was pulled from real source data. The wrapper is opaque to
@@ -80,6 +82,74 @@ impl<T> std::ops::Deref for Extracted<T> {
 /// "no synthesized values" invariant compile-enforced.
 fn wrap<T>(value: T) -> Extracted<T> {
     Extracted(value)
+}
+
+// Arrow `Utf8` columns address with an `i32` offset buffer: no stored text
+// value may approach `i32::MAX`. The seam caps every extracted value at
+// `LEAF_CAP`, truncating an oversized leaf to a head-preserving marker
+// (spec.md#bounded-values).
+pub(crate) const LEAF_CAP: usize = 10 * 1024 * 1024;
+
+static TRUNCATED_VALUES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn truncated_values_count() -> u64 {
+    TRUNCATED_VALUES.load(Ordering::Relaxed)
+}
+
+fn record_truncation(original_bytes: usize) {
+    TRUNCATED_VALUES.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        original_bytes,
+        cap_bytes = LEAF_CAP,
+        "value exceeded the seam leaf cap; truncated to a marked sentinel"
+    );
+}
+
+fn truncation_marker(original_bytes: usize) -> String {
+    format!("<pond:truncated {original_bytes} bytes>")
+}
+
+/// Truncate an over-cap value to its head-preserving sentinel: a UTF-8 prefix
+/// of `head` plus the `<pond:truncated N bytes>` marker, the whole staying
+/// within `LEAF_CAP`. `original` is the value's true byte length, which may
+/// exceed `head.len()` when the caller streamed and discarded the tail. The
+/// sole definition of the truncation shape (spec.md#bounded-values). Caller
+/// guarantees `head.len() > LEAF_CAP`.
+pub(crate) fn truncate_to_marker(head: &[u8], original: usize) -> String {
+    let marker = truncation_marker(original);
+    let mut end = LEAF_CAP.saturating_sub(marker.len());
+    while end > 0 && head[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+    let mut capped = String::from_utf8_lossy(&head[..end]).into_owned();
+    capped.push_str(&marker);
+    record_truncation(original);
+    capped
+}
+
+pub(crate) fn bound_str(s: &mut String) -> bool {
+    if s.len() <= LEAF_CAP {
+        return false;
+    }
+    *s = truncate_to_marker(s.as_bytes(), s.len());
+    true
+}
+
+pub(crate) fn bound_value(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            bound_str(s);
+        }
+        Value::Array(items) => items.iter_mut().for_each(bound_value),
+        Value::Object(map) => map.values_mut().for_each(bound_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+pub fn extract_raw_record(row: &Value) -> Value {
+    let mut bounded = row.clone();
+    bound_value(&mut bounded);
+    bounded
 }
 
 // ----- serde integration -----
@@ -170,7 +240,11 @@ pub trait Source {
 
 /// Extract a `String` field. `None` when the source did not carry it.
 pub fn extract_str(source: &dyn Source, key: &str) -> Option<Extracted<String>> {
-    source.str_field(key).map(|s| wrap(s.to_owned()))
+    source.str_field(key).map(|s| {
+        let mut owned = s.to_owned();
+        bound_str(&mut owned);
+        wrap(owned)
+    })
 }
 
 /// Extract a `bool` field. `None` when the source did not carry it.
@@ -182,7 +256,10 @@ pub fn extract_bool(source: &dyn Source, key: &str) -> Option<Extracted<bool>> {
 /// carry it. Used for fields like `params` / `result` where pond stores
 /// the raw JSON value alongside the canonical schema slots.
 pub fn extract_value(source: &dyn Source, key: &str) -> Option<Extracted<Value>> {
-    source.value_field(key).cloned().map(wrap)
+    source.value_field(key).cloned().map(|mut value| {
+        bound_value(&mut value);
+        wrap(value)
+    })
 }
 
 /// The source itself, viewed as a primitive string. `None` when the
@@ -190,7 +267,11 @@ pub fn extract_value(source: &dyn Source, key: &str) -> Option<Extracted<Value>>
 /// the "row" the adapter holds is the string (e.g. claude-code's
 /// `("user", Value::String(text))` content shape).
 pub fn extract_self_str(source: &dyn Source) -> Option<Extracted<String>> {
-    source.as_str().map(|s| wrap(s.to_owned()))
+    source.as_str().map(|s| {
+        let mut owned = s.to_owned();
+        bound_str(&mut owned);
+        wrap(owned)
+    })
 }
 
 /// Lossless compact-string encoding of the whole source. Always succeeds
@@ -200,7 +281,9 @@ pub fn extract_self_str(source: &dyn Source) -> Option<Extracted<String>> {
 /// NOT synthesis: the encoded string is a faithful representation of
 /// data the source actually carried.
 pub fn extract_compact_repr(source: &dyn Source) -> Extracted<String> {
-    wrap(source.compact_repr())
+    let mut repr = source.compact_repr();
+    bound_str(&mut repr);
+    wrap(repr)
 }
 
 // ----- impl Source for serde_json::Value -----
@@ -298,5 +381,37 @@ mod tests {
         assert_eq!(nested.str_field("role"), Some("user"));
         assert_eq!(nested.str_field("content"), Some("hi"));
         assert!(row.nested("missing").is_none());
+    }
+
+    #[test]
+    fn bound_value_caps_every_position_and_spares_good_leaves() {
+        let oversize = "x".repeat(LEAF_CAP + 100);
+        let mut value = json!({
+            "first": oversize,
+            "good_a": "ok",
+            "middle": oversize,
+            "good_b": "ok",
+            "nested": {"deep": oversize, "kept": "ok"},
+            "list": ["ok", oversize, "ok"],
+            "last": oversize,
+        });
+        bound_value(&mut value);
+
+        let marker = format!("{} bytes>", LEAF_CAP + 100);
+        let capped = |v: &Value| {
+            let text = v.as_str().expect("string leaf");
+            text.len() <= LEAF_CAP && text.ends_with(&marker)
+        };
+        let intact = |v: &Value| v.as_str() == Some("ok");
+        for path in [&value["first"], &value["middle"], &value["last"]] {
+            assert!(capped(path));
+        }
+        assert!(capped(&value["nested"]["deep"]));
+        assert!(capped(&value["list"][1]));
+        assert!(intact(&value["good_a"]));
+        assert!(intact(&value["good_b"]));
+        assert!(intact(&value["nested"]["kept"]));
+        assert!(intact(&value["list"][0]));
+        assert!(intact(&value["list"][2]));
     }
 }
