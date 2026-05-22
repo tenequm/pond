@@ -3,9 +3,7 @@ use std::{path::PathBuf, sync::Mutex};
 use anyhow::{Result, anyhow};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 
-use crate::config::EmbeddingModel;
-
-use super::EmbedBackend;
+use super::{EmbedBackend, MODEL_ID};
 
 /// The e5-small backend: `intfloat/multilingual-e5-small` via `fastembed`'s
 /// ONNX Runtime path, running on CPU.
@@ -14,55 +12,38 @@ pub struct E5SmallEmbedder {
     /// is shared as `Arc<dyn EmbedBackend>`, so the `Mutex` supplies the
     /// interior mutability the trait's `&self` method needs.
     inner: Mutex<TextEmbedding>,
-    dim: usize,
-    model_id: String,
-    max_embed_tokens: i32,
 }
 
 impl E5SmallEmbedder {
     /// Load `intfloat/multilingual-e5-small` from HuggingFace (cached after the
     /// first download) and build a CPU ONNX Runtime session.
-    pub fn load(model: &EmbeddingModel) -> Result<Self> {
-        // `max_embed_tokens` is the tokenizer `max_length`: input past it is
-        // truncated before inference - one message, one vector, bounded cost.
-        let mut options = InitOptions::new(FastEmbedModel::MultilingualE5Small)
-            .with_max_length(model.max_embed_tokens);
+    pub fn load() -> Result<Self> {
+        // 512 is e5-small's training context; the tokenizer truncates input
+        // past it before inference - one message, one vector, bounded cost.
+        let mut options =
+            InitOptions::new(FastEmbedModel::MultilingualE5Small).with_max_length(512);
         if let Some(cache_dir) = hf_hub_cache_dir() {
             options = options.with_cache_dir(cache_dir);
         }
         let inner = TextEmbedding::try_new(options)
-            .map_err(|error| anyhow!("failed to load embedding model {}: {error}", model.id))?;
-        tracing::info!(model = %model.id, "loaded embedding model");
+            .map_err(|error| anyhow!("failed to load embedding model {MODEL_ID}: {error}"))?;
+        tracing::info!(model = %MODEL_ID, "loaded embedding model");
         Ok(Self {
             inner: Mutex::new(inner),
-            dim: model.dim as usize,
-            model_id: model.id.clone(),
-            max_embed_tokens: model.max_embed_tokens as i32,
         })
     }
 }
 
 impl EmbedBackend for E5SmallEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        // `EmbedWorker` already batches `texts` within a cost budget, so `None`
-        // runs the whole pond-batch in one ORT call rather than re-chunking it.
+        // `EmbedWorker` already batches `texts` to a small fixed size, so this
+        // whole pond-batch runs in one ORT call (`None` re-chunks only past
+        // fastembed's 256 default, which a worker batch never reaches).
         self.inner
             .lock()
             .map_err(|error| anyhow!("e5 embedder mutex poisoned: {error}"))?
             .embed(texts, None)
             .map_err(|error| anyhow!("embedding inference failed: {error}"))
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        self.max_embed_tokens
     }
 }
 

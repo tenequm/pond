@@ -9,10 +9,9 @@
 use chrono::Utc;
 use pond::{
     PROTOCOL_VERSION,
-    config::Config,
     embed::{EmbedBackend, EmbedWorker},
     handlers::{IngestEvent, pond_ingest},
-    sessions::Store,
+    sessions::{EMBEDDING_DIM, Store},
     transport::{AppState, mcp::PondMcp},
     wire::{GetResponse, GetResult, IngestEnvelope, IngestRequest, SearchResponse},
     wire::{Message, Part, PartKind, Provenance, Session},
@@ -38,9 +37,7 @@ fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
 }
 
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
-struct FakeBackend {
-    dim: usize,
-}
+struct FakeBackend;
 
 impl EmbedBackend for FakeBackend {
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -48,7 +45,7 @@ impl EmbedBackend for FakeBackend {
             .iter()
             .map(|text| {
                 let bytes = text.as_bytes();
-                (0..self.dim)
+                (0..EMBEDDING_DIM)
                     .map(|i| {
                         let byte = bytes.get(i % bytes.len().max(1)).copied().unwrap_or(0);
                         f32::from(byte) / 255.0
@@ -56,18 +53,6 @@ impl EmbedBackend for FakeBackend {
                     .collect()
             })
             .collect())
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        "intfloat/multilingual-e5-small"
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        512
     }
 }
 
@@ -141,12 +126,9 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
     );
     store.ensure_indices(false).await?;
 
-    let model = Config::builtin().embeddings.default_model("local")?;
-    let backend = FakeBackend {
-        dim: model.dim as usize,
-    };
-    EmbedWorker::new(&store, &backend, &model)?.run().await?;
-    store.ensure_embedding_indices(&model).await?;
+    let backend = FakeBackend;
+    EmbedWorker::new(&store, &backend).run().await?;
+    store.ensure_embedding_indices().await?;
 
     Ok(AppState {
         store: Arc::new(store),

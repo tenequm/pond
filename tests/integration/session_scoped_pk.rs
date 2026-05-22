@@ -8,7 +8,7 @@ use lance::Dataset;
 use lance::deps::arrow_array::{Array, Int32Array, StringArray};
 use pond::{
     handlers::ingest_events,
-    sessions::{EMBEDDING_DIM, EmbeddingRow, IngestEvent, Store},
+    sessions::{IngestEvent, Store},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -81,17 +81,10 @@ async fn replayed_part_ids_are_distinct_per_session() -> anyhow::Result<()> {
         ],
     )
     .await?;
-    store
-        .upsert_embeddings(&[
-            embedding_row(&parent.id, "replayed-message", 0.1),
-            embedding_row(&fork.id, "replayed-message", 0.2),
-        ])
-        .await?;
 
-    let (_, messages, parts, embeddings) = store.row_counts().await?;
+    let (_, messages, parts) = store.row_counts().await?;
     assert_eq!(messages, 2, "both replayed messages persist");
     assert_eq!(parts, 2, "both replayed parts persist");
-    assert_eq!(embeddings, 2, "both replayed embeddings persist");
     assert_no_duplicate_pks(temp.path()).await?;
 
     let stored = store
@@ -111,29 +104,9 @@ async fn replayed_part_ids_are_distinct_per_session() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn embedding_row(session_id: &str, message_id: &str, value: f32) -> EmbeddingRow {
-    EmbeddingRow {
-        session_id: session_id.to_owned(),
-        message_id: message_id.to_owned(),
-        model_id: "test-model".to_owned(),
-        max_embed_tokens: 1024,
-        vector: vec![value; EMBEDDING_DIM],
-        source_agent: "claude-code".to_owned(),
-        project: "/tmp/pk-test".to_owned(),
-        role: "assistant".to_owned(),
-        timestamp: Utc::now(),
-    }
-}
-
 async fn assert_no_duplicate_pks(root: &Path) -> anyhow::Result<()> {
     assert_unique(root, "messages", &["session_id", "id"]).await?;
     assert_unique(root, "parts", &["session_id", "message_id", "id"]).await?;
-    assert_unique(
-        root,
-        "embeddings",
-        &["session_id", "message_id", "model_id", "max_embed_tokens"],
-    )
-    .await?;
     Ok(())
 }
 

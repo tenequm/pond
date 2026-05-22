@@ -878,7 +878,7 @@ mod tests {
         );
         assert_eq!(summary.skipped_files, 0, "no whole-file skips expected");
 
-        let (sessions, messages, parts, _) = store.row_counts().await?;
+        let (sessions, messages, parts) = store.row_counts().await?;
         assert!(sessions > 0, "at least one codex-cli session");
         assert!(messages > 0, "at least one codex-cli message");
         assert!(parts > 0, "at least one codex-cli Part");

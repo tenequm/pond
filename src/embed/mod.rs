@@ -1,100 +1,42 @@
-//! The embedding stage of `pond ingest`: the e5-small ONNX backend and the
-//! batch-oriented worker that populates the `embeddings` dataset. One message
-//! produces one vector - there is no chunking.
+//! The embedding stage: the e5-small ONNX backend and the batch-oriented
+//! worker that fills `messages.vector` / `messages.embedding_model`
+//! (spec.md#search). One message produces one vector - there is no chunking.
 //!
-//! Batching is load-bearing (plan.md Stage 2): the worker accumulates messages
-//! and calls the model once per batch, never once per message. The same rule
-//! applies to the Lance write path - embedding rows are written in batches,
-//! never one `merge_insert` per message.
+//! The worker accumulates messages and calls the model once per fixed-size
+//! batch, never once per message, and writes each batch's vectors to
+//! `messages` in one column-update commit.
 
 use anyhow::{Result, anyhow};
 use lance::index::vector::VectorIndexParams;
 use lance_linalg::distance::MetricType;
 use tokio_stream::StreamExt;
 
-use crate::{
-    config::{Distance, EmbeddingModel},
-    sessions::{EmbeddingRow, PendingMessage, Store},
-};
+use crate::sessions::{EMBEDDING_DIM, EmbeddedMessage, PendingMessage, Store};
 
 pub mod e5_small;
 pub use e5_small::E5SmallEmbedder;
 
-/// Default ceiling on the number of messages in one model-inference + write
-/// batch. The cost budget below is the other, usually-binding, limiter.
+/// The one embedding model pond ships a loader for (spec.md#search).
+/// `config.embeddings.model` is validated against this; `pond embed` stamps it
+/// into `messages.embedding_model` with every vector.
+pub const MODEL_ID: &str = "intfloat/multilingual-e5-small";
+
+/// Messages per model-inference + write batch. A small fixed batch keeps the
+/// padded attention transient bounded without length-sorting machinery: e5
+/// truncates at 512 tokens, so even a worst-case batch stays modest.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
-/// Default per-batch attention-cost budget, in `token^2` units.
-///
-/// A padded batch's dominant transient is the `[batch, heads, seq, seq]`
-/// attention scores tensor; `seq` is the *longest* member of the batch because
-/// the tokenizer pads the batch to its longest sequence. So the tensor scales
-/// with `batch_count * max_seq_len^2` - and a fixed *count* batch of length-
-/// heterogeneous messages is a memory trap: one long message padded together
-/// with 31 short ones allocates tens of GB and wedges the process. Budgeting
-/// `count * max_seq_len^2` instead makes a long message fall into its own small
-/// batch rather than dragging short ones up to its length.
-///
-/// Sized so the padded attention-scores transient stays well-bounded. That
-/// transient is `[batch, heads, seq, seq]`; capping `count * max_seq_len^2` at
-/// 24M holds it to `24M * heads * 4 bytes` at fp32 - ~1.1 GB even for a 12-head
-/// encoder like e5-small, and proportionally less for narrower ones. A single
-/// message at the default `max_embed_tokens` (512) costs `512^2` ~= 262K, so
-/// the count ceiling is the usual limiter and this budget is the safety net
-/// that catches a long message before it drags a whole count-sized batch up to
-/// its length.
-///
-/// [`crate::config::EmbeddingsConfig::validate`] rejects any configured
-/// `max_embed_tokens` whose single-message cost (`max_embed_tokens^2`) exceeds
-/// this budget - cost-aware batching cannot split a single message, so a
-/// message must always fit one batch on its own.
-pub const DEFAULT_BATCH_TOKEN_SQ_BUDGET: usize = 24_000_000;
-
-/// Default number of pending messages buffered and length-sorted before
-/// batching.
-///
-/// fastembed pads every batch to its longest member, so a batch mixing a long
-/// message with short ones embeds the short ones at the long one's length -
-/// pure wasted compute. The fix is the standard one (see `sentence-transformers`
-/// `SentenceTransformer.encode`): sort by length so each batch holds
-/// similar-length inputs. `encode` sorts *all* inputs because it holds them in
-/// memory; pond streams (peak memory is a window, not the whole corpus), so it
-/// sorts within a bounded window instead - large enough to be a representative
-/// length sample, small enough to stay in the streaming memory profile (a
-/// window is on the order of a few Lance scan pages). Unlike `encode`, pond
-/// needs no un-sort: embeddings are keyed by `(session_id, message_id, model_id)`, so the
-/// order they are produced in does not matter.
-pub const DEFAULT_LENGTH_WINDOW: usize = 4096;
-
-/// Default cap on the *bytes* buffered in one length-sort window - the other
-/// drain trigger besides [`DEFAULT_LENGTH_WINDOW`]'s message count. `search_text`
-/// is buffered untruncated (truncation happens inside the model call), so
-/// without a byte cap a window landing on a run of very large messages could
-/// spike host RSS far above the streaming memory profile. 64 MiB bounds it
-/// regardless of the corpus's message-size distribution.
-pub const DEFAULT_WINDOW_BYTE_BUDGET: usize = 64 * 1024 * 1024;
-
-/// Bytes-per-token ratio for the *sort* length estimate. Typical for code and
-/// prose (~3-4 bytes/token); this is only a relative ordering proxy, not a
-/// safety bound - see [`cost_upper_bound`] for the bound the budget enforces.
-const BYTES_PER_TOKEN_ESTIMATE: usize = 3;
-
-pub fn index_params(model: &EmbeddingModel, num_rows: usize) -> VectorIndexParams {
+/// IVF_PQ parameters for the `messages.vector` index, sized to the row count.
+/// Cosine metric: e5 vectors are L2-normalized. `num_sub_vectors = dim / 8`
+/// gives 8-float PQ subspaces (`EMBEDDING_DIM` is divisible by 8).
+pub fn index_params(num_rows: usize) -> VectorIndexParams {
     VectorIndexParams::ivf_pq(
         ivf_num_partitions(num_rows),
         8,
-        model.num_sub_vectors,
-        metric_type(model.distance),
+        EMBEDDING_DIM / 8,
+        MetricType::Cosine,
         15,
     )
-}
-
-pub fn metric_type(distance: Distance) -> MetricType {
-    match distance {
-        Distance::Cosine => MetricType::Cosine,
-        Distance::L2 => MetricType::L2,
-        Distance::Dot => MetricType::Dot,
-    }
 }
 
 fn ivf_num_partitions(num_rows: usize) -> usize {
@@ -105,29 +47,6 @@ fn ivf_num_partitions(num_rows: usize) -> usize {
     )]
     let sqrt = (num_rows as f64).sqrt().round() as usize;
     sqrt.clamp(32, 4096)
-}
-
-/// A message's relative length, the key the length-sort window is ordered on.
-/// Bytes over the typical bytes-per-token ratio: a cheap monotonic proxy that
-/// groups similar-length messages so each batch pads to barely above its own
-/// members. Clamped to `max_embed_tokens` since the tokenizer truncates there
-/// (past that point messages are all the same effective length). This is *not*
-/// a safety bound: it can under-count token-dense input, so it is never used
-/// for the cost budget (that is [`cost_upper_bound`]'s job).
-fn estimate_tokens(text: &str, max_embed_tokens: usize) -> usize {
-    text.len()
-        .div_ceil(BYTES_PER_TOKEN_ESTIMATE)
-        .clamp(1, max_embed_tokens)
-}
-
-/// A *conservative upper bound* on a message's post-truncation token count, for
-/// the attention-cost budget. Byte-level BPE emits at least one byte per token,
-/// so byte length is always >= the real token count; clamped to
-/// `max_embed_tokens` because the tokenizer truncates there. Unlike
-/// [`estimate_tokens`] this can never *under*-count, so a batch kept within
-/// `count * bound^2` is a true memory bound, not a heuristic one.
-fn cost_upper_bound(text: &str, max_embed_tokens: usize) -> usize {
-    text.len().clamp(1, max_embed_tokens)
 }
 
 /// Prefix a search query for e5-small. e5 is an asymmetric retriever: its model
@@ -142,31 +61,21 @@ pub fn e5_passage(text: &str) -> String {
     format!("passage: {text}")
 }
 
-/// A pluggable embedding backend. The real backend is [`E5SmallEmbedder`];
-/// tests substitute an instrumented fake to assert batching behavior.
+/// The embedding seam (spec.md#search): text in, vectors out. The real backend
+/// is [`E5SmallEmbedder`]; tests substitute an instrumented fake to assert
+/// batching behavior. v1 has one model ([`MODEL_ID`]), so the seam needs no
+/// dimension or model-id accessor - the vector width is checked at the write
+/// boundary and the model id is the [`MODEL_ID`] constant.
 pub trait EmbedBackend: Send + Sync {
-    /// Embed a batch of texts. The returned vectors are L2-normalized and have
-    /// length [`dim`](Self::dim).
+    /// Embed a batch of texts. The returned vectors are L2-normalized and
+    /// `EMBEDDING_DIM` long, one per input.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-
-    /// Output vector dimension.
-    fn dim(&self) -> usize;
-
-    /// The registry id of the model this backend embeds with - the `model_id`
-    /// PK component on the `embeddings` table. Vector search scopes its scan to
-    /// `(model_id, max_embed_tokens)` so it never mixes in vectors from another
-    /// model or another cap (which are distinct rows under the same key).
-    fn model_id(&self) -> &str;
-
-    /// The `max_embed_tokens` cap this backend embeds under - the other
-    /// `embeddings` PK identity component (see [`model_id`](Self::model_id)).
-    fn max_embed_tokens(&self) -> i32;
 }
 
 /// Outcome of an [`EmbedWorker::run`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedSummary {
-    /// Messages that had pending (un-embedded) `search_text`; one vector each.
+    /// Messages embedded; one vector each.
     pub messages: usize,
     /// Model-inference + write batches issued.
     pub batches: usize,
@@ -186,34 +95,13 @@ pub struct BatchProgress {
 
 type ProgressFn = Box<dyn Fn(BatchProgress) + Send + Sync>;
 
-/// Populates the `embeddings` dataset for one registry model. Reads
-/// `messages.search_text` directly (no second concatenation path), batches
-/// messages through the backend one vector each, and writes embedding rows in
-/// batches.
+/// Fills `messages.vector` / `messages.embedding_model` for the backlog of
+/// un-embedded messages. Reads `messages.search_text` directly, batches it
+/// through the backend one vector each, and writes each batch back to
+/// `messages` by primary key.
 pub struct EmbedWorker<'a, B: EmbedBackend> {
     store: &'a Store,
     backend: &'a B,
-    model_id: String,
-    /// Token cap applied per message before estimating its batch cost; mirrors
-    /// the fastembed tokenizer's truncation point.
-    max_embed_tokens: usize,
-    /// Hard ceiling on messages per batch.
-    batch_size: usize,
-    /// Co-batching threshold on `batch_count * max_seq_len^2`: a message is
-    /// flushed into its own batch rather than added to a staged batch that
-    /// would exceed this. Not an absolute ceiling - a single message that on
-    /// its own exceeds the budget is still embedded (cost-aware batching cannot
-    /// split one message). [`crate::config::EmbeddingsConfig::validate`] keeps
-    /// the production path safe by rejecting any `max_embed_tokens` whose
-    /// single-message cost exceeds [`DEFAULT_BATCH_TOKEN_SQ_BUDGET`].
-    cost_budget: usize,
-    /// Pending messages buffered and length-sorted before batching, so each
-    /// batch holds similar-length messages and padding waste stays low.
-    window_size: usize,
-    /// Byte cap on one buffered window before a forced drain - the memory guard
-    /// pairing with `window_size`'s count guard, since the window holds
-    /// untruncated `search_text`.
-    window_byte_budget: usize,
     /// Optional cap on total messages embedded in one `run` - `None` in
     /// production (embed everything), set by the benchmark harness to a fixed
     /// count so a run is a stable, comparable workload.
@@ -224,29 +112,16 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
 }
 
 impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
-    /// Build a worker for `model`. The backend's [`dim`](EmbedBackend::dim) must
-    /// match the model's declared `dim`.
-    pub fn new(store: &'a Store, backend: &'a B, model: &EmbeddingModel) -> Result<Self> {
-        if backend.dim() != model.dim as usize {
-            return Err(anyhow!(
-                "backend dim {} does not match model {} dim {}",
-                backend.dim(),
-                model.id,
-                model.dim,
-            ));
-        }
-        Ok(Self {
+    /// Build a worker over `store`'s un-embedded backlog. A backend whose
+    /// vectors are the wrong width is rejected at the write boundary
+    /// (`embedding_update_batch`), so there is nothing to validate here.
+    pub fn new(store: &'a Store, backend: &'a B) -> Self {
+        Self {
             store,
             backend,
-            model_id: model.id.clone(),
-            max_embed_tokens: model.max_embed_tokens,
-            batch_size: DEFAULT_BATCH_SIZE,
-            cost_budget: DEFAULT_BATCH_TOKEN_SQ_BUDGET,
-            window_size: DEFAULT_LENGTH_WINDOW,
-            window_byte_budget: DEFAULT_WINDOW_BYTE_BUDGET,
             limit: None,
             progress: None,
-        })
+        }
     }
 
     /// Register a per-batch progress callback. Called once after each
@@ -260,38 +135,6 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         self
     }
 
-    /// Override the message-count ceiling per batch (default
-    /// [`DEFAULT_BATCH_SIZE`]). The cost budget is usually the binding limiter.
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size.max(1);
-        self
-    }
-
-    /// Override the per-batch attention-cost co-batching threshold (default
-    /// [`DEFAULT_BATCH_TOKEN_SQ_BUDGET`]). Tests use a small value to exercise
-    /// the cost-driven split without large inputs. Note this is a co-batching
-    /// threshold, not an absolute ceiling: a single message whose own cost
-    /// exceeds the budget is still embedded alone (see the `cost_budget` field).
-    pub fn with_cost_budget(mut self, cost_budget: usize) -> Self {
-        self.cost_budget = cost_budget.max(1);
-        self
-    }
-
-    /// Override the length-sort window (default [`DEFAULT_LENGTH_WINDOW`]).
-    /// Bigger windows give better length-locality at higher buffered memory.
-    pub fn with_window_size(mut self, window_size: usize) -> Self {
-        self.window_size = window_size.max(1);
-        self
-    }
-
-    /// Override the per-window byte budget (default
-    /// [`DEFAULT_WINDOW_BYTE_BUDGET`]). The window drains on whichever of the
-    /// count cap or this byte cap is hit first.
-    pub fn with_window_byte_budget(mut self, window_byte_budget: usize) -> Self {
-        self.window_byte_budget = window_byte_budget.max(1);
-        self
-    }
-
     /// Cap the run at `limit` messages (default: no cap). The benchmark harness
     /// uses this to embed a fixed, comparable slice of a corpus.
     pub fn with_limit(mut self, limit: usize) -> Self {
@@ -299,69 +142,34 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         self
     }
 
-    /// Embed every message with `search_text` that does not yet have an
-    /// embedding row for this model. Idempotent: the PK is `(session_id,
-    /// message_id, model_id)`, so a re-run over an already-embedded corpus is a no-op.
+    /// Embed every message whose `vector` is still null. Idempotent: a re-run
+    /// over an already-embedded corpus finds an empty backlog and is a no-op.
     ///
     /// Messages are pulled from a streaming scan, so peak memory is one stream
     /// page plus the staged batch - not the whole corpus.
     pub async fn run(&self) -> Result<EmbedSummary> {
-        let embedded = self
-            .store
-            .embedded_message_keys(&self.model_id, self.max_embed_tokens as i32)
-            .await?;
         let mut summary = EmbedSummary::default();
+        let mut batch: Vec<PendingMessage> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut pulled = 0usize;
 
-        // Buffer pending messages into a window; once it is full, length-sort
-        // and batch it (see `drain_window`). Sorting within the window keeps
-        // each batch's messages similar-length, so fastembed's pad-to-longest
-        // does not blow short messages up to a long one's length.
-        let mut window: Vec<StagedMessage> = Vec::with_capacity(self.window_size);
-        let mut window_bytes = 0usize;
-        let stream = self.store.pending_messages_stream();
+        let stream = self.store.pending_embedding_messages();
         tokio::pin!(stream);
-        'pull: while let Some(pending) = stream.next().await {
-            let mut pending = pending?;
-            if embedded.contains(&crate::sessions::MessageKey {
-                session_id: pending.session_id.clone(),
-                message_id: pending.message_id.clone(),
-            }) {
-                continue;
+        while let Some(pending) = stream.next().await {
+            // Stop pulling once the message cap is reached; the staged batch is
+            // still flushed below, so exactly `limit` messages are embedded.
+            if self.limit.is_some_and(|limit| pulled >= limit) {
+                break;
             }
-            summary.messages += 1;
-            // Move `search_text` out and apply e5's `passage: ` prefix now, at
-            // staging time, so the length-sort and cost budget below size the
-            // real embed input. The embedding row never carries the text.
-            let text = e5_passage(&std::mem::take(&mut pending.search_text));
-            window_bytes += text.len();
-            let tokens = estimate_tokens(&text, self.max_embed_tokens);
-            let cost_tokens = cost_upper_bound(&text, self.max_embed_tokens);
-            window.push(StagedMessage {
-                message: pending,
-                text,
-                tokens,
-                cost_tokens,
-            });
-
-            // Drain on whichever fills first: the count cap bounds the sort
-            // cost, the byte cap bounds host RSS (the window holds
-            // untruncated `search_text`, so a run of large messages could
-            // otherwise spike memory before any model call).
-            if window.len() >= self.window_size || window_bytes >= self.window_byte_budget {
-                self.drain_window(&mut window, &mut summary).await?;
-                window_bytes = 0;
-            }
-
-            // Stop pulling once the message cap is reached; the window is
-            // still drained below, so exactly `limit` messages are embedded.
-            if self.limit.is_some_and(|limit| summary.messages >= limit) {
-                break 'pull;
+            batch.push(pending?);
+            pulled += 1;
+            if batch.len() >= DEFAULT_BATCH_SIZE {
+                self.flush(&mut batch, &mut summary).await?;
             }
         }
-        self.drain_window(&mut window, &mut summary).await?;
+        self.flush(&mut batch, &mut summary).await?;
 
         tracing::info!(
-            model = %self.model_id,
+            model = MODEL_ID,
             messages = summary.messages,
             batches = summary.batches,
             "embed worker finished",
@@ -369,96 +177,44 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         Ok(summary)
     }
 
-    /// Length-sort a window of pending messages, then carve it into batches by
-    /// the count ceiling and the attention-cost budget. Sorting first - the
-    /// `sentence-transformers` `encode` technique - keeps each batch
-    /// length-homogeneous, so the model embeds little padding. Empties `window`.
-    async fn drain_window(
-        &self,
-        window: &mut Vec<StagedMessage>,
-        summary: &mut EmbedSummary,
-    ) -> Result<()> {
-        if window.is_empty() {
-            return Ok(());
-        }
-        // Ascending by estimated token length: consecutive messages are
-        // similar-length, so each batch carved off below pads to barely above
-        // its own members' lengths. pond needs no un-sort (unlike `encode`) -
-        // embedding rows are keyed by `(session_id, message_id, model_id)`.
-        window.sort_unstable_by_key(|message| message.tokens);
-
-        let mut staged: Vec<StagedMessage> = Vec::with_capacity(self.batch_size);
-        // Running max of the *conservative* per-message bound across the staged
-        // batch. The cost budget is enforced on this, never on the sort estimate
-        // - `cost_tokens` cannot under-count, so the batch is a true memory bound.
-        let mut staged_max_cost = 0usize;
-        for message in window.drain(..) {
-            // Flush the staged batch first if adding this message would overflow
-            // the count ceiling or the cost budget. A single message always
-            // gets staged (the check is skipped when `staged` is empty), so an
-            // oversized message simply becomes its own batch.
-            if !staged.is_empty() {
-                let projected_max = staged_max_cost.max(message.cost_tokens);
-                let projected_cost = (staged.len() + 1)
-                    .saturating_mul(projected_max)
-                    .saturating_mul(projected_max);
-                if staged.len() >= self.batch_size || projected_cost > self.cost_budget {
-                    self.flush(&mut staged, summary).await?;
-                    staged_max_cost = 0;
-                }
-            }
-            staged_max_cost = staged_max_cost.max(message.cost_tokens);
-            staged.push(message);
-        }
-        self.flush(&mut staged, summary).await?;
-        Ok(())
-    }
-
-    /// Embed the staged messages in one model call and write the resulting rows
-    /// in one Lance batch. Empties `staged`.
+    /// Embed the staged messages in one model call and write the resulting
+    /// vectors back to `messages` in one column-update commit. Empties `batch`.
     async fn flush(
         &self,
-        staged: &mut Vec<StagedMessage>,
+        batch: &mut Vec<PendingMessage>,
         summary: &mut EmbedSummary,
     ) -> Result<()> {
-        if staged.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
-        // Move the staged messages out so their text can be handed to the
-        // backend without cloning; `staged` is left empty for the next batch.
-        let messages = std::mem::take(staged);
-        let mut texts = Vec::with_capacity(messages.len());
-        let mut metas = Vec::with_capacity(messages.len());
-        for staged in messages {
-            texts.push(staged.text);
-            metas.push(staged.message);
-        }
+        let pending = std::mem::take(batch);
+        // Apply e5's `passage: ` document prefix at the model boundary; the
+        // stored `search_text` keeps its uncapped, unprefixed form for FTS.
+        let texts = pending
+            .iter()
+            .map(|message| e5_passage(&message.search_text))
+            .collect::<Vec<_>>();
         let vectors = self.backend.embed(&texts)?;
-        if vectors.len() != metas.len() {
+        if vectors.len() != pending.len() {
             return Err(anyhow!(
                 "backend returned {} vectors for {} messages",
                 vectors.len(),
-                metas.len()
+                pending.len(),
             ));
         }
 
-        let mut rows = Vec::with_capacity(metas.len());
-        for (message, vector) in metas.into_iter().zip(vectors) {
-            rows.push(EmbeddingRow {
-                message_id: message.message_id,
-                model_id: self.model_id.clone(),
-                max_embed_tokens: self.max_embed_tokens as i32,
-                vector,
+        let rows = pending
+            .into_iter()
+            .zip(vectors)
+            .map(|(message, vector)| EmbeddedMessage {
                 session_id: message.session_id,
-                source_agent: message.source_agent,
-                project: message.project,
-                role: message.role,
-                timestamp: message.timestamp,
-            });
-        }
-
+                id: message.id,
+                vector,
+            })
+            .collect::<Vec<_>>();
         let batch_messages = rows.len();
-        self.store.upsert_embeddings(&rows).await?;
+        self.store.write_embeddings(&rows).await?;
+        summary.messages += batch_messages;
         summary.batches += 1;
         if let Some(progress) = &self.progress {
             progress(BatchProgress {
@@ -471,20 +227,8 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
     }
 }
 
-struct StagedMessage {
-    message: PendingMessage,
-    text: String,
-    /// Relative length estimate - the key the window is sorted on.
-    tokens: usize,
-    /// Conservative upper bound on token count - what the cost budget is
-    /// enforced against, so the budget can never be under-counted past.
-    cost_tokens: usize,
-}
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
     use super::*;
 
     #[test]
@@ -497,12 +241,5 @@ mod tests {
             e5_passage("retry uses exponential backoff"),
             "passage: retry uses exponential backoff",
         );
-    }
-
-    #[test]
-    fn metric_type_maps_each_registry_distance() {
-        assert_eq!(metric_type(Distance::Cosine), MetricType::Cosine);
-        assert_eq!(metric_type(Distance::L2), MetricType::L2);
-        assert_eq!(metric_type(Distance::Dot), MetricType::Dot);
     }
 }

@@ -10,7 +10,7 @@ use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::deps::arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, TimestampMicrosecondArray, UInt64Array,
+    StringArray, TimestampMicrosecondArray, UInt64Array, new_null_array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance_file::version::LanceFileVersion;
@@ -21,8 +21,7 @@ use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    config::{self, EmbeddingModel},
-    embed,
+    config, embed,
     substrate::{
         Handle, Predicate, ScalarValue, ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
@@ -35,17 +34,23 @@ pub struct Store {
     handle: Handle,
 }
 
-/// A message awaiting embedding: its `search_text` plus the columns the
-/// `embeddings` rows denormalize (spec.md#datasets).
+/// A message awaiting embedding: its primary key plus the `search_text` to
+/// embed. The vector lives on the same `messages` row, so no denormalized
+/// filter columns are needed (spec.md#embeddings-are-derived).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
-    pub message_id: String,
     pub session_id: String,
-    pub source_agent: String,
-    pub project: String,
-    pub role: String,
-    pub timestamp: DateTime<Utc>,
+    pub id: String,
     pub search_text: String,
+}
+
+/// One embedded message: a primary key and the vector to store. `pond embed`
+/// writes a batch of these into `messages.vector` keyed on `(session_id, id)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedMessage {
+    pub session_id: String,
+    pub id: String,
+    pub vector: Vec<f32>,
 }
 
 /// Message metadata used to hydrate search hits after retriever ranking.
@@ -97,7 +102,6 @@ pub struct RowTotals {
     pub sessions: u64,
     pub messages: u64,
     pub parts: u64,
-    pub embeddings: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -542,7 +546,7 @@ impl Store {
         Ok(Some((session, session_messages[start..end].to_vec())))
     }
 
-    pub async fn row_counts(&self) -> Result<(usize, usize, usize, usize)> {
+    pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
         self.handle.row_counts().await
     }
 
@@ -577,13 +581,11 @@ impl Store {
             }
         }
 
-        let (totals_sessions, totals_messages, totals_parts, totals_embeddings) =
-            self.handle.row_counts().await?;
+        let (totals_sessions, totals_messages, totals_parts) = self.handle.row_counts().await?;
         let totals = RowTotals {
             sessions: totals_sessions as u64,
             messages: totals_messages as u64,
             parts: totals_parts as u64,
-            embeddings: totals_embeddings as u64,
         };
 
         let mut by_adapter: BTreeMap<String, Vec<ProjectStats>> = BTreeMap::new();
@@ -620,67 +622,30 @@ impl Store {
         })
     }
 
-    /// Merge-insert embedding rows keyed on `(session_id, message_id, model_id,
-    /// max_embed_tokens)`. Re-running over already-embedded messages is a no-op
-    /// for matched rows.
-    pub async fn upsert_embeddings(&self, rows: &[EmbeddingRow]) -> Result<Vec<UpsertStatus>> {
+    /// Write a batch of embeddings into `messages`: set `vector` and
+    /// `embedding_model` on each row by `(session_id, id)`
+    /// (spec.md#embeddings-are-derived). The column update goes through the
+    /// write seam and lands as a new manifest version (`append-only`).
+    pub async fn write_embeddings(&self, rows: &[EmbeddedMessage]) -> Result<()> {
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let batch = embeddings_batch(rows)?;
-        let inserted = self
-            .handle
-            .merge_insert(Table::Embeddings, batch, rows.len())
+        let batch = embedding_update_batch(rows)?;
+        self.handle
+            .merge_update(Table::Messages, batch, rows.len())
             .await?;
-        Ok(statuses_from_inserted(rows.len(), inserted))
+        Ok(())
     }
 
-    /// The set of `(session_id, message_id)` pairs that already have
-    /// `embeddings` rows for this `(model_id, max_embed_tokens)` identity.
-    pub async fn embedded_message_keys(
-        &self,
-        model_id: &str,
-        max_embed_tokens: i32,
-    ) -> Result<HashSet<MessageKey>> {
-        let identity = embedding_identity_predicate(model_id, max_embed_tokens, None);
-        let scanner = self
-            .handle
-            .scan(
-                Table::Embeddings,
-                ScanOpts::with_predicate_and_projection(&identity, &["session_id", "message_id"]),
-            )
-            .await?;
-        let mut stream = scanner.try_into_stream().await?;
-        let mut set = HashSet::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            for row in 0..batch.num_rows() {
-                let session_id =
-                    string(&batch, "session_id", row)?.context("session_id is null")?;
-                let message_id =
-                    string(&batch, "message_id", row)?.context("message_id is null")?;
-                set.insert(MessageKey {
-                    session_id,
-                    message_id,
-                });
-            }
-        }
-        Ok(set)
-    }
-
-    /// Stream every message awaiting embedding as a domain [`PendingMessage`].
-    pub fn pending_messages_stream(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
+    /// Stream the backlog of un-embedded messages - those with indexed text
+    /// but a still-null `vector` (spec.md#search) - as [`PendingMessage`]s.
+    pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
-            let filter = Predicate::IsNotNull("search_text");
-            let projection: &[&str] = &[
-                "id",
-                "session_id",
-                "source_agent",
-                "project",
-                "role",
-                "timestamp",
-                "search_text",
-            ];
+            let filter = Predicate::And(vec![
+                Predicate::IsNull("vector"),
+                Predicate::IsNotNull("search_text"),
+            ]);
+            let projection: &[&str] = &["session_id", "id", "search_text"];
             let scanner = self
                 .handle
                 .scan(
@@ -695,8 +660,13 @@ impl Store {
             while let Some(batch) = batches.next().await {
                 let batch = batch?;
                 for row in 0..batch.num_rows() {
-                    let pending = pending_message_from_batch(&batch, row)?;
-                    yield pending;
+                    yield PendingMessage {
+                        session_id: string(&batch, "session_id", row)?
+                            .context("session_id is null")?,
+                        id: string(&batch, "id", row)?.context("message id is null")?,
+                        search_text: string(&batch, "search_text", row)?
+                            .context("search_text is null")?,
+                    };
                 }
             }
         }
@@ -733,15 +703,15 @@ impl Store {
         Ok(hits)
     }
 
-    /// Whether the `embeddings` table holds any row for this `(model_id,
-    /// max_embed_tokens)` identity.
-    pub async fn has_embeddings(&self, model_id: &str, max_embed_tokens: i32) -> Result<bool> {
-        let identity = embedding_identity_predicate(model_id, max_embed_tokens, None);
+    /// Whether any `messages` row carries a vector for the configured model
+    /// (spec.md#search) - the signal that flips search from FTS-only to hybrid.
+    pub async fn has_embeddings(&self) -> Result<bool> {
+        let scope = Predicate::Eq("embedding_model", embed::MODEL_ID.into());
         let mut scanner = self
             .handle
             .scan(
-                Table::Embeddings,
-                ScanOpts::with_predicate_and_projection(&identity, &["session_id"]),
+                Table::Messages,
+                ScanOpts::with_predicate_and_projection(&scope, &["id"]),
             )
             .await?;
         scanner.limit(Some(1), None)?;
@@ -749,53 +719,53 @@ impl Store {
         Ok(batch.num_rows() > 0)
     }
 
-    /// Vector kNN retriever over `embeddings.vector`.
+    /// Vector kNN retriever over `messages.vector`, scoped to the configured
+    /// model and prefiltered by the caller's scalar predicate
+    /// (spec.md#prefilter-pushdown). `embedding_model` is set only on embedded
+    /// rows, so the scope also excludes un-embedded messages from the scan.
     pub async fn vector_search(
         &self,
         query: &[f32],
         limit: usize,
         filter: &Predicate,
-        model_id: &str,
-        max_embed_tokens: i32,
     ) -> Result<Vec<(MessageKey, f32)>> {
-        let identity = embedding_identity_predicate(model_id, max_embed_tokens, Some(filter));
-        let mut scanner = self
-            .handle
-            .scanner(Table::Embeddings, Some(&identity))
-            .await?;
+        let scope = Predicate::And(vec![
+            Predicate::Eq("embedding_model", embed::MODEL_ID.into()),
+            filter.clone(),
+        ]);
+        let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         // Mirror the explicit-projection contract from `fts_search`: opt out
         // of `_distance` autoprojection and list it ourselves since the loop
         // below reads it.
         scanner.disable_scoring_autoprojection();
-        scanner.project(&["session_id", "message_id", "_distance"])?;
+        scanner.project(&["session_id", "id", "_distance"])?;
         let batch = scanner.try_into_batch().await?;
         let mut hits = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let key = MessageKey {
                 session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
-                message_id: string(&batch, "message_id", row)?.context("message_id is null")?,
+                message_id: string(&batch, "id", row)?.context("message id is null")?,
             };
             hits.push((key, float32(&batch, "_distance", row)?));
         }
         Ok(hits)
     }
 
-    /// The DataFusion plan string for a filtered hybrid scan.
+    /// The DataFusion plan string for a filtered vector scan - the
+    /// `prefilter-pushdown` regression guard reads it.
     pub async fn explain_vector_plan(
         &self,
         query: &[f32],
         limit: usize,
         filter: &Predicate,
-        model_id: &str,
-        max_embed_tokens: i32,
     ) -> Result<String> {
-        let identity = embedding_identity_predicate(model_id, max_embed_tokens, Some(filter));
-        let mut scanner = self
-            .handle
-            .scanner(Table::Embeddings, Some(&identity))
-            .await?;
+        let scope = Predicate::And(vec![
+            Predicate::Eq("embedding_model", embed::MODEL_ID.into()),
+            filter.clone(),
+        ]);
+        let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
         scanner
@@ -890,9 +860,10 @@ impl Store {
     }
 
     /// Create the FTS index on `messages` plus scalar indexes on content tables.
-    /// `force = true` rebuilds the FTS index even when it already exists - the
-    /// `pond sync --reindex` recovery path. Returns whether `messages` held rows
-    /// to index; `false` means the FTS branch was a no-op (empty corpus).
+    /// `force = true` rebuilds every index from scratch even when it already
+    /// exists - the `pond sync --reindex` recovery path and the post-`pond
+    /// embed` rebuild (spec.md#index-upkeep). Returns whether `messages` held
+    /// rows to index; `false` means the FTS branch was a no-op (empty corpus).
     pub async fn ensure_indices(&self, force: bool) -> Result<bool> {
         let has_messages = self.handle.count_rows(Table::Messages).await? > 0;
         if has_messages {
@@ -920,21 +891,21 @@ impl Store {
                 .await?;
             for (column, kind, name) in MESSAGE_SCALAR_INDICES {
                 self.handle
-                    .ensure_scalar_index(Table::Messages, column, kind, name)
+                    .ensure_scalar_index(Table::Messages, column, kind, name, force)
                     .await?;
             }
         }
         if self.handle.count_rows(Table::Parts).await? > 0 {
             for (column, kind, name) in PARTS_SCALAR_INDICES {
                 self.handle
-                    .ensure_scalar_index(Table::Parts, column, kind, name)
+                    .ensure_scalar_index(Table::Parts, column, kind, name, force)
                     .await?;
             }
         }
         if self.handle.count_rows(Table::Sessions).await? > 0 {
             for (column, kind, name) in SESSIONS_SCALAR_INDICES {
                 self.handle
-                    .ensure_scalar_index(Table::Sessions, column, kind, name)
+                    .ensure_scalar_index(Table::Sessions, column, kind, name, force)
                     .await?;
             }
         }
@@ -963,45 +934,41 @@ impl Store {
             .await
     }
 
-    /// Create scalar indexes on `embeddings`, and IVF_PQ once the table crosses
-    /// [`VECTOR_INDEX_ACTIVATION_ROWS`].
-    pub async fn ensure_embedding_indices(&self, model: &EmbeddingModel) -> Result<()> {
-        self.ensure_embedding_indices_with_threshold(model, VECTOR_INDEX_ACTIVATION_ROWS)
+    /// Build the IVF_PQ index on `messages.vector` once enough messages are
+    /// embedded (spec.md#search). Below the activation threshold vector search
+    /// runs a brute-force flat scan, so no index is needed - and IVF_PQ cannot
+    /// train on too few vectors anyway. The scalar indexes the vector
+    /// retriever's filters need are built by `ensure_indices`.
+    pub async fn ensure_embedding_indices(&self) -> Result<()> {
+        self.ensure_embedding_indices_with_threshold(VECTOR_INDEX_ACTIVATION_ROWS)
             .await
     }
 
     pub async fn ensure_embedding_indices_with_threshold(
         &self,
-        model: &EmbeddingModel,
         vector_index_threshold: usize,
     ) -> Result<()> {
-        let rows = self.handle.count_rows(Table::Embeddings).await?;
-        if rows == 0 {
+        // The threshold gates on embedded rows, not total rows: the IVF_PQ
+        // trainer sees only non-null vectors, so a large but mostly-unembedded
+        // `messages` table must still wait until enough vectors exist.
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let embedded = dataset
+            .count_rows(Some(Predicate::IsNotNull("vector").to_lance()))
+            .await?;
+        if embedded < vector_index_threshold {
             return Ok(());
         }
-        for (column, kind, name) in EMBEDDING_SCALAR_INDICES {
-            self.handle
-                .ensure_scalar_index(Table::Embeddings, column, kind, name)
-                .await?;
-        }
-        if rows >= vector_index_threshold {
-            let params = embed::index_params(model, rows);
-            self.handle
-                .ensure_index(
-                    Table::Embeddings,
-                    "vector",
-                    "embeddings_vector_ivfpq",
-                    IndexType::Vector,
-                    &params,
-                    false,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn embedding_index_names(&self) -> Result<Vec<String>> {
-        self.handle.embedding_index_names().await
+        let params = embed::index_params(embedded);
+        self.handle
+            .ensure_index(
+                Table::Messages,
+                "vector",
+                MESSAGES_VECTOR_INDEX,
+                IndexType::Vector,
+                &params,
+                false,
+            )
+            .await
     }
 
     /// On-disk byte totals per dataset, sized through Lance's object store
@@ -1749,8 +1716,8 @@ fn success_outcome(
 enum IngestError {
     /// spec.md#protocol: `Session.source_agent` and `Session.project` are
     /// immutable post-first-write because the denormalized copies on
-    /// `messages` and `embeddings` were stamped from the prior Session at
-    /// first ingest. A re-write that changes either would silently desync.
+    /// `messages` were stamped from the prior Session at first ingest.
+    /// A re-write that changes either would silently desync.
     ImmutableField {
         field: &'static str,
         session_id: String,
@@ -1898,37 +1865,6 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ("role", BuiltinIndexType::Bitmap, "messages_role_bitmap"),
 ];
 
-/// Scalar indexes on `embeddings` (spec.md#datasets): the same filter set,
-/// denormalized so vector kNN pushes predicates down without a cross-table join.
-const EMBEDDING_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
-    (
-        "message_id",
-        BuiltinIndexType::BTree,
-        "embeddings_message_id_btree",
-    ),
-    (
-        "session_id",
-        BuiltinIndexType::BTree,
-        "embeddings_session_id_btree",
-    ),
-    (
-        "project",
-        BuiltinIndexType::BTree,
-        "embeddings_project_btree",
-    ),
-    (
-        "timestamp",
-        BuiltinIndexType::BTree,
-        "embeddings_timestamp_btree",
-    ),
-    (
-        "source_agent",
-        BuiltinIndexType::Bitmap,
-        "embeddings_source_agent_bitmap",
-    ),
-    ("role", BuiltinIndexType::Bitmap, "embeddings_role_bitmap"),
-];
-
 /// Scalar indexes on `parts`: `(session_id, message_id)` is the hot-path lookup key for
 /// `parts_for_messages` (hydration on every `get` and grouped search).
 const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
@@ -1948,21 +1884,6 @@ const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
 /// `get` and every grouped search.
 const SESSIONS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] =
     &[("id", BuiltinIndexType::BTree, "sessions_id_btree")];
-
-fn embedding_identity_predicate(
-    model_id: &str,
-    max_embed_tokens: i32,
-    extra: Option<&Predicate>,
-) -> Predicate {
-    let mut predicates = vec![
-        Predicate::Eq("model_id", model_id.into()),
-        Predicate::Eq("max_embed_tokens", max_embed_tokens.into()),
-    ];
-    if let Some(extra) = extra {
-        predicates.push(extra.clone());
-    }
-    Predicate::And(predicates)
-}
 
 fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
     Predicate::In(
@@ -1990,14 +1911,17 @@ fn statuses_from_inserted(total: usize, inserted_rows: u64) -> Vec<UpsertStatus>
 pub(crate) const SESSIONS: &str = "sessions";
 pub(crate) const MESSAGES: &str = "messages";
 pub(crate) const PARTS: &str = "parts";
-pub(crate) const EMBEDDINGS: &str = "embeddings";
 
 /// FTS index name on `messages.search_text`. Stable so the unindexed-backlog
 /// query (spec.md#index-upkeep) and index creation name the same index.
 pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
-/// Fixed embedding vector dimension for the configured default model (spec.md#search).
-/// A future model with a different dim activates a second `embeddings` table.
+/// IVF_PQ index name on `messages.vector` (spec.md#search). Stable so the
+/// activation check and index creation name the same index.
+pub(crate) const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
+
+/// Width of the `messages.vector` embedding column (spec.md#search) - the
+/// configured model's output dimension.
 pub const EMBEDDING_DIM: usize = 384;
 
 /// Initial-`CREATE` write params for the namespace-mediated path. The
@@ -2048,6 +1972,10 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("project", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
+        // The message's derived embedding (spec.md#embeddings-are-derived):
+        // both null until `pond embed` fills them, set together thereafter.
+        Field::new("vector", embedding_vector_type(), true),
+        Field::new("embedding_model", DataType::Utf8, true),
         Field::new("options", DataType::Utf8, false),
     ]))
 }
@@ -2065,29 +1993,6 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         Field::new("variant_data", DataType::Utf8, false),
         blob_field("data", true),
         Field::new("options", DataType::Utf8, false),
-    ]))
-}
-
-pub(crate) fn embedding_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        primary_field("session_id", DataType::Utf8, false),
-        primary_field("message_id", DataType::Utf8, false),
-        primary_field("model_id", DataType::Utf8, false),
-        // Part of the PK: `max_embed_tokens` is the tokenizer truncation point,
-        // so it changes which prefix of a long message is embedded and thus the
-        // vector itself. Folding it into the key means a cap change re-embeds
-        // the affected (over-cap) tail under a distinct row instead of silently
-        // leaving a stale vector under `(session_id, message_id, model_id)`.
-        primary_field("max_embed_tokens", DataType::Int32, false),
-        Field::new("vector", embedding_vector_type(), false),
-        Field::new("source_agent", DataType::Utf8, false),
-        Field::new("project", DataType::Utf8, false),
-        Field::new("role", DataType::Utf8, false),
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
     ]))
 }
 
@@ -2121,24 +2026,6 @@ pub(crate) struct MessageBatchRow<'a> {
     pub search_text: Option<&'a str>,
 }
 
-/// One row of the `embeddings` dataset: a (message, model) vector with the
-/// filter columns denormalized from `messages` (spec.md#datasets). One message
-/// produces exactly one vector.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EmbeddingRow {
-    pub message_id: String,
-    pub model_id: String,
-    /// Tokenizer truncation point this vector was embedded under - a PK
-    /// component, since it determines which prefix of the message was embedded.
-    pub max_embed_tokens: i32,
-    pub vector: Vec<f32>,
-    pub session_id: String,
-    pub source_agent: String,
-    pub project: String,
-    pub role: String,
-    pub timestamp: DateTime<Utc>,
-}
-
 fn embedding_vector_type() -> DataType {
     DataType::FixedSizeList(
         Arc::new(Field::new("item", DataType::Float32, true)),
@@ -2146,14 +2033,27 @@ fn embedding_vector_type() -> DataType {
     )
 }
 
-pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
-    let schema = embedding_schema();
+/// The partial-schema source for the embedding column update: the `messages`
+/// primary key plus the two columns `pond embed` fills. The field definitions
+/// match `message_schema` exactly so Lance accepts it as a subset upsert.
+fn embedding_update_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        primary_field("session_id", DataType::Utf8, false),
+        primary_field("id", DataType::Utf8, false),
+        Field::new("vector", embedding_vector_type(), true),
+        Field::new("embedding_model", DataType::Utf8, true),
+    ]))
+}
+
+/// Build the merge-update source batch for [`Store::write_embeddings`]: one row
+/// per embedded message carrying `(session_id, id, vector, embedding_model)`.
+pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordBatch> {
     let mut flat = Vec::with_capacity(rows.len() * EMBEDDING_DIM);
     for row in rows {
         if row.vector.len() != EMBEDDING_DIM {
             anyhow::bail!(
                 "embedding for message {} has dim {}, expected {EMBEDDING_DIM}",
-                row.message_id,
+                row.id,
                 row.vector.len(),
             );
         }
@@ -2168,7 +2068,7 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
     .context("failed to build embedding vector column")?;
 
     RecordBatch::try_new(
-        schema,
+        embedding_update_schema(),
         vec![
             Arc::new(StringArray::from(
                 rows.iter()
@@ -2176,45 +2076,13 @@ pub(crate) fn embeddings_batch(rows: &[EmbeddingRow]) -> Result<RecordBatch> {
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.message_id.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.model_id.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int32Array::from(
-                rows.iter()
-                    .map(|row| row.max_embed_tokens)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             )),
             Arc::new(vectors),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.source_agent.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.project.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.role.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(
-                TimestampMicrosecondArray::from(
-                    rows.iter()
-                        .map(|row| micros(row.timestamp))
-                        .collect::<Vec<_>>(),
-                )
-                .with_timezone("UTC"),
-            ),
+            Arc::new(StringArray::from(vec![embed::MODEL_ID; rows.len()])),
         ],
     )
-    .context("failed to build embeddings batch")
+    .context("failed to build embedding update batch")
 }
 
 /// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
@@ -2414,6 +2282,11 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[String]) -> Result<Re
             Arc::new(StringArray::from(
                 rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
             )),
+            // `vector` / `embedding_model` are written null at ingest; every
+            // message starts un-embedded and `pond embed` fills them later
+            // (spec.md#embeddings-are-derived).
+            new_null_array(&embedding_vector_type(), rows.len()),
+            new_null_array(&DataType::Utf8, rows.len()),
             Arc::new(StringArray::from(
                 options.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
@@ -2585,23 +2458,6 @@ pub(crate) fn message_from_batch(batch: &RecordBatch, row: usize) -> Result<Mess
         }),
         other => anyhow::bail!("unknown message role {other}"),
     }
-}
-
-/// Decode one `messages` row (projected by `Store::pending_messages_stream`)
-/// into a `PendingMessage` for the embed worker.
-pub(crate) fn pending_message_from_batch(
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<PendingMessage> {
-    Ok(PendingMessage {
-        message_id: string(batch, "id", row)?.context("message id is null")?,
-        session_id: string(batch, "session_id", row)?.context("session_id is null")?,
-        source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
-        project: string(batch, "project", row)?.context("project is null")?,
-        role: string(batch, "role", row)?.context("role is null")?,
-        timestamp: datetime(batch, "timestamp", row)?,
-        search_text: string(batch, "search_text", row)?.context("search_text is null")?,
-    })
 }
 
 pub(crate) fn part_from_batch(
@@ -2791,7 +2647,7 @@ mod tests {
         handlers::ingest_events,
         wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
     };
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2936,7 +2792,7 @@ mod tests {
             .await?;
         validator.finish(&store).await?;
 
-        let (sessions, messages, parts, _) = store.row_counts().await?;
+        let (sessions, messages, parts) = store.row_counts().await?;
         assert_eq!(sessions, 1, "session committed despite the orphan part");
         assert_eq!(messages, 1, "valid message committed");
         assert_eq!(parts, 1, "valid part committed; the orphan was dropped");
@@ -2987,7 +2843,7 @@ mod tests {
         );
 
         validator.finish(&store).await?;
-        let (sessions, messages, _, _) = store.row_counts().await?;
+        let (sessions, messages, _) = store.row_counts().await?;
         assert_eq!(sessions, 1, "session committed");
         assert_eq!(messages, 1, "only the first message committed");
 
@@ -3044,8 +2900,8 @@ mod tests {
     // -- ingest_immutable: Session-level immutable field checks ---------------
     //
     // `Session.source_agent` and `Session.project` are immutable
-    // post-first-write because messages/embeddings denormalize them at
-    // first ingest; a silent overwrite would desync the denormalized
+    // post-first-write because `messages` denormalizes them at first
+    // ingest; a silent overwrite would desync the denormalized
     // copies. pond core's `IngestValidator` probes the existing session
     // before the merge_insert and emits a per-row `validation_failed`
     // outcome with the typed field name when either changes. Other Session
@@ -3159,76 +3015,106 @@ mod tests {
 
     // -- vector search and index activation --------------------------------
 
-    /// Open a fresh local-FS store and resolve the built-in default embedding
-    /// model. The three vector tests below share this prelude.
-    async fn vector_test_setup() -> anyhow::Result<(TempDir, Store, EmbeddingModel)> {
-        let temp = TempDir::new()?;
+    /// Ingest `count` synthetic messages spread across a handful of sessions
+    /// and projects, each with conversational `search_text`. Returns the store
+    /// and the message keys in `msg-{i}` order; every `vector` starts null.
+    async fn store_with_messages(
+        temp: &TempDir,
+        count: usize,
+    ) -> anyhow::Result<(Store, Vec<MessageKey>)> {
         let store = Store::open_local(temp.path()).await?;
-        let model = crate::config::Config::builtin()
-            .embeddings
-            .default_model("local")?;
-        Ok((temp, store, model))
+        let sessions = 8.min(count.max(1));
+        let mut events = Vec::new();
+        for s in 0..sessions {
+            events.push(IngestEvent::Session(Session {
+                id: format!("session-{s}"),
+                parent_session_id: None,
+                parent_message_id: None,
+                source_agent: "claude-code".to_owned(),
+                created_at: Utc::now(),
+                project: Extracted::from_test_value(format!("/proj/{}", s % 4)),
+                options: ProviderOptions::new(),
+            }));
+            for i in (s..count).step_by(sessions) {
+                let message_id = format!("msg-{i}");
+                events.push(IngestEvent::Message(Message::User {
+                    id: message_id.clone(),
+                    session_id: format!("session-{s}"),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }));
+                events.push(IngestEvent::Part(Part {
+                    session_id: format!("session-{s}"),
+                    id: format!("{message_id}-part"),
+                    message_id,
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value(format!("synthetic message {i}"))),
+                    },
+                }));
+            }
+        }
+        ingest_events(&store, events).await?;
+        let keys = (0..count)
+            .map(|i| MessageKey {
+                session_id: format!("session-{}", i % sessions),
+                message_id: format!("msg-{i}"),
+            })
+            .collect();
+        Ok((store, keys))
     }
 
-    /// Build `count` synthetic embedding rows with deterministic pseudo-random
-    /// vectors of the production dimension, spread across a handful of sessions.
-    fn synthetic_rows(count: usize, model_id: &str) -> Vec<EmbeddingRow> {
-        let now = Utc::now();
-        (0..count)
-            .map(|i| {
-                let mut vector = Vec::with_capacity(EMBEDDING_DIM);
-                let mut state = (i as u64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add(1);
-                for _ in 0..EMBEDDING_DIM {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    #[allow(clippy::cast_precision_loss)]
-                    let unit = (state >> 33) as f32 / (1u64 << 31) as f32;
-                    vector.push(unit - 1.0);
-                }
-                EmbeddingRow {
-                    message_id: format!("msg-{i}"),
-                    model_id: model_id.to_owned(),
-                    max_embed_tokens: 512,
-                    vector,
-                    session_id: format!("session-{}", i % 8),
-                    source_agent: "claude-code".to_owned(),
-                    project: format!("/proj/{}", i % 4),
-                    role: if i % 2 == 0 { "user" } else { "assistant" }.to_owned(),
-                    timestamp: now - Duration::seconds(i as i64),
-                }
+    /// A deterministic pseudo-random vector of the production dimension.
+    fn synthetic_vector(seed: usize) -> Vec<f32> {
+        let mut state = (seed as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(1);
+        (0..EMBEDDING_DIM)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                #[allow(clippy::cast_precision_loss)]
+                let unit = (state >> 33) as f32 / (1u64 << 31) as f32;
+                unit - 1.0
+            })
+            .collect()
+    }
+
+    /// One [`EmbeddedMessage`] per key, vectors seeded by slice position.
+    fn embedded(keys: &[MessageKey]) -> Vec<EmbeddedMessage> {
+        keys.iter()
+            .enumerate()
+            .map(|(seed, key)| EmbeddedMessage {
+                session_id: key.session_id.clone(),
+                id: key.message_id.clone(),
+                vector: synthetic_vector(seed),
             })
             .collect()
     }
 
     #[tokio::test]
     async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
-        let (_temp, store, model) = vector_test_setup().await?;
-
-        // 4 synthetic rows: `synthetic_rows` cycles `session-{i % 8}`, so 4 is the
-        // smallest count where `session-3` (the filter value below) is a real
-        // partition. Scalar-index pushdown is volume-independent - the planner emits
-        // a `ScalarIndexQuery` for an indexed equality whenever the index exists, so
-        // a larger corpus produces the identical plan.
-        store
-            .upsert_embeddings(&synthetic_rows(4, &model.id))
-            .await?;
-        store.ensure_embedding_indices(&model).await?;
+        let temp = TempDir::new()?;
+        // 4 messages cycle session-0..session-3, so `session-3` is a real
+        // partition. Scalar-index pushdown is volume-independent - the planner
+        // emits a `ScalarIndexQuery` for an indexed equality whenever the index
+        // exists, so a larger corpus produces the identical plan.
+        let (store, keys) = store_with_messages(&temp, 4).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+        // The column update rewrote fragments; refold the scalar indexes the
+        // vector retriever's filters push into, as `pond embed` does.
+        store.index_upkeep().await?;
 
         let query = vec![0.01_f32; EMBEDDING_DIM];
         let plan = store
-            .explain_vector_plan(
-                &query,
-                10,
-                &crate::substrate::Predicate::Eq("session_id", "session-3".into()),
-                &model.id,
-                model.max_embed_tokens as i32,
-            )
+            .explain_vector_plan(&query, 10, &Predicate::Eq("session_id", "session-3".into()))
             .await?;
 
-        // The load-bearing assertion (spec.md#search): the predicate is served by a
-        // scalar-index node, not a postfilter `FilterExec`. (A `FilterExec` for the
-        // KNN-internal `_distance IS NOT NULL` is expected and unrelated.)
+        // The load-bearing assertion (spec.md#prefilter-pushdown): the predicate
+        // is served by a scalar-index node, not a postfilter `FilterExec`. (A
+        // `FilterExec` for the KNN-internal `_distance IS NOT NULL` is expected
+        // and unrelated.)
         assert!(
             plan.contains("ScalarIndexQuery"),
             "expected a ScalarIndexQuery node in the plan:\n{plan}",
@@ -3245,131 +3131,76 @@ mod tests {
 
     #[tokio::test]
     async fn vector_index_activates_past_the_row_threshold() -> anyhow::Result<()> {
-        let (_temp, store, model) = vector_test_setup().await?;
-
-        // 256 rows is the hard floor: the IVF_PQ index uses `num_bits = 8`, so its
-        // PQ trainer needs one row per code centroid (2^8 = 256) - fewer fails with
-        // "Not enough rows to train PQ". The thresholds below straddle that count by
-        // exactly one, so the test exercises the `row_count >= threshold` boundary.
-        let rows = synthetic_rows(256, &model.id);
-        let planted = rows[0].clone();
-        store.upsert_embeddings(&rows).await?;
+        let temp = TempDir::new()?;
+        // 256 embedded rows is the hard floor: IVF_PQ uses `num_bits = 8`, so the
+        // PQ trainer needs one vector per code centroid (2^8 = 256) - fewer fails
+        // with "Not enough rows to train PQ". The thresholds below straddle that
+        // count by exactly one, so the test exercises the `>= threshold` boundary.
+        let (store, keys) = store_with_messages(&temp, 256).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
 
         // Just below threshold (256 < 257): no vector index yet.
-        store
-            .ensure_embedding_indices_with_threshold(&model, 257)
-            .await?;
+        store.ensure_embedding_indices_with_threshold(257).await?;
         assert!(
             !store
-                .embedding_index_names()
+                .handle
+                .messages_index_names()
                 .await?
                 .iter()
-                .any(|name| name == "embeddings_vector_ivfpq"),
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
             "vector index must not build below the activation threshold",
         );
 
         // At the threshold (256 >= 256): the IVF_PQ index builds.
-        store
-            .ensure_embedding_indices_with_threshold(&model, 256)
-            .await?;
-        let indices = store.embedding_index_names().await?;
+        store.ensure_embedding_indices_with_threshold(256).await?;
         assert!(
-            indices.iter().any(|name| name == "embeddings_vector_ivfpq"),
-            "IVF_PQ index should build past the activation threshold: {indices:?}",
+            store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "IVF_PQ index should build past the activation threshold",
         );
 
         // A query whose vector is a planted row returns that row.
         let hits = store
-            .vector_search(
-                &planted.vector,
-                10,
-                &crate::substrate::Predicate::And(Vec::new()),
-                &model.id,
-                model.max_embed_tokens as i32,
-            )
+            .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()))
             .await?;
         assert!(
-            hits.iter()
-                .any(|(key, _)| key.session_id == planted.session_id
-                    && key.message_id == planted.message_id),
+            hits.iter().any(|(key, _)| key == &keys[0]),
             "planted vector should be retrievable via the index",
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn vector_search_is_scoped_to_one_embedding_identity() -> anyhow::Result<()> {
-        // Regression guard: `max_embed_tokens` is part of the embeddings PK, so one
-        // message can have several rows (one per cap). Vector search must scan only
-        // the identity that produced the query vector - never mix caps, never return
-        // a message key twice (RRF would double-count it).
-        let (_temp, store, model) = vector_test_setup().await?;
-
-        // Same message, two caps, deliberately opposite vectors so the result
-        // distance tells us which row the scan actually ranked.
-        let near = vec![0.1_f32; EMBEDDING_DIM];
-        let far = vec![-0.1_f32; EMBEDDING_DIM];
-        let base = synthetic_rows(1, &model.id)
-            .pop()
-            .expect("one synthetic row");
-        let row_1024 = EmbeddingRow {
-            max_embed_tokens: 1024,
-            vector: near.clone(),
-            ..base.clone()
-        };
-        let row_4096 = EmbeddingRow {
-            max_embed_tokens: 4096,
-            vector: far,
-            ..base.clone()
-        };
-        // Distinct PKs (same session/message, different cap), so both rows persist.
-        store.upsert_embeddings(&[row_1024, row_4096]).await?;
-
-        // Scoped to cap 1024: the message appears exactly once - not once per cap -
-        // ranked against the cap-1024 (near) vector, so distance ~0.
-        let hits_1024 = store
-            .vector_search(
-                &near,
-                10,
-                &crate::substrate::Predicate::And(Vec::new()),
-                &model.id,
-                1024,
-            )
-            .await?;
-        assert_eq!(
-            hits_1024.len(),
-            1,
-            "the message must appear exactly once, not once per cap: {hits_1024:?}",
-        );
-        assert_eq!(hits_1024[0].0.session_id, base.session_id);
-        assert_eq!(hits_1024[0].0.message_id, base.message_id);
+    async fn vector_index_builds_over_a_column_with_null_vectors() -> anyhow::Result<()> {
+        // `messages.vector` is null for every un-embedded row; the IVF_PQ index
+        // must train over the embedded rows and skip the nulls, not error.
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 300).await?;
+        // Embed 256 of 300 - the remaining 44 keep a null `vector`.
+        store.write_embeddings(&embedded(&keys[..256])).await?;
+        store.ensure_embedding_indices_with_threshold(256).await?;
         assert!(
-            hits_1024[0].1 < 0.01,
-            "cap-1024 scan must rank the cap-1024 vector, got distance {}",
-            hits_1024[0].1,
+            store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "IVF_PQ must build over a column that still holds null vectors",
         );
 
-        // Scoped to cap 4096: same single message, but ranked against the opposite
-        // (far) vector - so the same query is now distant. Proves the scan switched
-        // rows on the cap, rather than just deduplicating.
-        let hits_4096 = store
-            .vector_search(
-                &near,
-                10,
-                &crate::substrate::Predicate::And(Vec::new()),
-                &model.id,
-                4096,
-            )
+        // The embedded rows stay retrievable; the null rows simply never rank.
+        let hits = store
+            .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()))
             .await?;
-        assert_eq!(hits_4096.len(), 1);
-        assert_eq!(hits_4096[0].0.session_id, base.session_id);
-        assert_eq!(hits_4096[0].0.message_id, base.message_id);
         assert!(
-            hits_4096[0].1 > 1.0,
-            "cap-4096 scan must rank the cap-4096 vector, got distance {}",
-            hits_4096[0].1,
+            hits.iter().any(|(key, _)| key == &keys[0]),
+            "an embedded row is retrievable despite null vectors in the column",
         );
-
         Ok(())
     }
 }

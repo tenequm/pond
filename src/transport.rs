@@ -501,7 +501,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                     request.uri,
                 )])),
                 "stats://pond" => {
-                    let (sessions, messages, parts, embeddings) =
+                    let (sessions, messages, parts) =
                         self.state.store.row_counts().await.map_err(|error| {
                             ErrorData::internal_error(format!("stats unavailable: {error}"), None)
                         })?;
@@ -509,7 +509,6 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                         "sessions": sessions,
                         "messages": messages,
                         "parts": parts,
-                        "embeddings": embeddings,
                     });
                     Ok(ReadResourceResult::new(vec![ResourceContents::text(
                         stats.to_string(),

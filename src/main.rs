@@ -102,19 +102,14 @@ enum Command {
         #[arg(long)]
         reindex: bool,
     },
-    /// Embed the un-embedded message backlog under the registered model.
-    /// Idempotent: the PK is `(message_id, model_id, max_embed_tokens)`, so a
-    /// re-run picks up where the last one left off.
+    /// Embed the backlog of un-embedded messages (spec.md#search). Idempotent:
+    /// the backlog is every message with a null `vector`, so a re-run picks up
+    /// exactly where the last one stopped.
     Embed {
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Registry model id to embed with; defaults to the registry default.
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value = "local")]
-        namespace: String,
         /// Optional cap on messages embedded this run (mostly for benchmarks).
         #[arg(long)]
         limit: Option<usize>,
@@ -129,10 +124,6 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value = "local")]
-        namespace: String,
     },
     /// Run the stdio MCP server only. stdout is reserved for JSON-RPC frames;
     /// all diagnostics go to stderr.
@@ -141,10 +132,6 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value = "local")]
-        namespace: String,
     },
     /// Inspect configuration.
     Config {
@@ -165,10 +152,6 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Registry model id used for the hybrid retriever; defaults to the
-        /// registry default. FTS-only mode ignores this.
-        #[arg(long)]
-        model: Option<String>,
         #[arg(long, default_value = "local")]
         namespace: String,
         #[arg(long, default_value_t = 10)]
@@ -391,11 +374,11 @@ async fn main() -> anyhow::Result<()> {
             }
             // Index create + incremental fold runs on the write path inside
             // every ingest batch (spec.md#index-upkeep). `--reindex` adds an
-            // explicit full FTS rebuild on top - the recovery path for a
-            // missing index or a changed tokenizer config.
+            // explicit full rebuild of every index on top - the recovery path
+            // for a missing index or a changed tokenizer config.
             if reindex {
                 let msg = if store.ensure_indices(true).await? {
-                    "reindex: FTS index rebuilt"
+                    "reindex: indexes rebuilt"
                 } else {
                     "reindex: no messages to index"
                 };
@@ -415,15 +398,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Embed {
             data_dir,
             config,
-            model,
-            namespace,
             limit,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
-            let embedder = E5SmallEmbedder::load(&model)?;
+            let embedder = E5SmallEmbedder::load()?;
             // `indicatif` auto-detects tty and degrades to log-line output in
             // CI / non-tty contexts, so this is safe to always wire.
             let bar = ProgressBar::new_spinner();
@@ -433,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
             );
             bar.enable_steady_tick(Duration::from_millis(120));
             let bar_for_callback = bar.clone();
-            let mut worker = EmbedWorker::new(&store, &embedder, &model)?.with_progress(
+            let mut worker = EmbedWorker::new(&store, &embedder).with_progress(
                 move |progress: BatchProgress| {
                     bar_for_callback.set_message(format!(
                         "batches={} messages={} (+{} this batch)",
@@ -445,15 +425,19 @@ async fn main() -> anyhow::Result<()> {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            store.ensure_embedding_indices(&model).await?;
+            // The column update moves rows into new fragments; Lance's
+            // incremental index fold mishandles that, so rebuild the indexes
+            // from scratch here instead of leaving a stale state for the next
+            // `pond sync` to fold (spec.md#index-upkeep).
+            store.ensure_indices(true).await?;
+            store.ensure_embedding_indices().await?;
             bar.finish_with_message(format!(
                 "done: batches={} messages={}",
                 summary.batches, summary.messages
             ));
             output(&format!(
-                "{} model={} batches={} messages={}",
+                "{} batches={} messages={}",
                 pond::output::paint("embed:", pond::output::dim()),
-                model.id,
                 summary.batches,
                 summary.messages,
             ))?;
@@ -463,43 +447,25 @@ async fn main() -> anyhow::Result<()> {
             port,
             data_dir,
             config,
-            model,
-            namespace,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
-                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
-            } else {
-                None
-            };
+            let embedder = load_embedder(&config)?;
             let state = AppState { store, embedder };
             transport::http::serve(state, host, port).await?;
         }
-        Command::Mcp {
-            data_dir,
-            config,
-            model,
-            namespace,
-        } => {
+        Command::Mcp { data_dir, config } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
-                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
-            } else {
-                None
-            };
+            let embedder = load_embedder(&config)?;
             transport::mcp::serve_stdio(AppState { store, embedder }).await?;
         }
         Command::Search {
             query,
             data_dir,
             config,
-            model,
             namespace,
             limit,
             rrf_k,
@@ -516,13 +482,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let resolved_model = config::resolve_model(&loaded, model.as_deref(), &namespace)?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            let embedder: Option<Arc<dyn EmbedBackend>> = if loaded.embeddings.enabled {
-                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
-            } else {
-                None
-            };
+            let embedder = load_embedder(&loaded)?;
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -731,6 +692,17 @@ fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// Load the embedding backend when `[embeddings] enabled = true`, else `None`.
+/// `pond serve` / `mcp` / `search` all gate the model load on this; `pond
+/// embed` loads the backend unconditionally.
+fn load_embedder(config: &Config) -> anyhow::Result<Option<Arc<dyn EmbedBackend>>> {
+    Ok(if config.embeddings.enabled {
+        Some(Arc::new(E5SmallEmbedder::load()?))
+    } else {
+        None
+    })
 }
 
 /// Resolve the data dir from the CLI/env argument, falling back to the XDG
@@ -1031,12 +1003,11 @@ fn render_status(stats: &CorpusStats, sizes: &TableSizes, unindexed: usize) -> a
     output(&format!("{}  {}", paint("data-dir", dim()), stats.data_url))?;
 
     let mut table = new_table();
-    let total = sizes.sessions + sizes.messages + sizes.parts + sizes.embeddings + sizes.other;
+    let total = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
     for (label, bytes) in [
         ("sessions", sizes.sessions),
         ("messages", sizes.messages),
         ("parts", sizes.parts),
-        ("embeddings", sizes.embeddings),
         ("other", sizes.other),
     ] {
         table.add_row(vec![
@@ -1056,16 +1027,14 @@ fn render_status(stats: &CorpusStats, sizes: &TableSizes, unindexed: usize) -> a
         sessions,
         messages,
         parts,
-        embeddings,
     } = stats.totals;
     output("")?;
     output(&format!(
-        "{}  {} sessions  {} messages  {} parts  {} embeddings",
+        "{}  {} sessions  {} messages  {} parts",
         paint("totals", dim()),
         paint(&format_thousands(sessions), bold()),
         paint(&format_thousands(messages), bold()),
         paint(&format_thousands(parts), bold()),
-        paint(&format_thousands(embeddings), bold()),
     ))?;
     if unindexed == 0 {
         output(&format!("{}  complete", paint("fts index", dim())))?;
