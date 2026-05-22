@@ -197,11 +197,10 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         Ok(summary)
     }
 
-    /// Length-sort the staged window, then hand it to the model in
-    /// [`DEFAULT_BATCH_SIZE`] chunks. The tokenizer pads every batch to its
-    /// longest member, so sorting first - clustering similar-length messages - makes
-    /// each batch pad near its own longest rather than the window's, which is
-    /// what cuts the padding waste. Empties `window`.
+    /// One `merge_update` per window, not per 32-row batch: `merge_update`
+    /// is a full-table merge join, so cost lands in commits, not rows. The
+    /// length-sort clusters similar lengths because the tokenizer pads each
+    /// batch to its longest member. Empties `window`.
     async fn drain_window(
         &self,
         window: &mut Vec<PendingMessage>,
@@ -212,25 +211,29 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         }
         window.sort_unstable_by_key(|message| message.search_text.len());
         let mut batch: Vec<PendingMessage> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut accumulator: Vec<EmbeddedMessage> = Vec::with_capacity(window.len());
         for message in window.drain(..) {
             batch.push(message);
             if batch.len() >= DEFAULT_BATCH_SIZE {
-                self.flush(&mut batch, summary).await?;
+                accumulator.extend(self.embed_batch(&mut batch, summary).await?);
             }
         }
-        self.flush(&mut batch, summary).await?;
+        accumulator.extend(self.embed_batch(&mut batch, summary).await?);
+        if !accumulator.is_empty() {
+            self.store.write_embeddings(&accumulator).await?;
+        }
         Ok(())
     }
 
-    /// Embed the staged messages in one model call and write the resulting
-    /// vectors back to `messages` in one column-update commit. Empties `batch`.
-    async fn flush(
+    /// Run one model batch; return the rows. Store write is batched in
+    /// [`drain_window`](Self::drain_window), one `merge_update` per window.
+    async fn embed_batch(
         &self,
         batch: &mut Vec<PendingMessage>,
         summary: &mut EmbedSummary,
-    ) -> Result<()> {
+    ) -> Result<Vec<EmbeddedMessage>> {
         if batch.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let pending = std::mem::take(batch);
         // Apply e5's `passage: ` document prefix at the model boundary; the
@@ -247,7 +250,6 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
                 pending.len(),
             ));
         }
-
         let rows = pending
             .into_iter()
             .zip(vectors)
@@ -258,7 +260,6 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             })
             .collect::<Vec<_>>();
         let batch_messages = rows.len();
-        self.store.write_embeddings(&rows).await?;
         summary.messages += batch_messages;
         summary.batches += 1;
         if let Some(progress) = &self.progress {
@@ -268,7 +269,7 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
                 total_batches: summary.batches,
             });
         }
-        Ok(())
+        Ok(rows)
     }
 }
 
