@@ -98,7 +98,9 @@ pub(crate) fn truncated_values_count() -> u64 {
 
 fn record_truncation(original_bytes: usize) {
     TRUNCATED_VALUES.fetch_add(1, Ordering::Relaxed);
-    tracing::warn!(
+    // Per-occurrence detail at debug; the operator-facing signal is the
+    // `truncated_values` count in the sync summary, always visible.
+    tracing::debug!(
         original_bytes,
         cap_bytes = LEAF_CAP,
         "value exceeded the seam leaf cap; truncated to a marked sentinel"
