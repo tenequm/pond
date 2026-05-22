@@ -197,8 +197,9 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         Ok(summary)
     }
 
-    /// One `merge_update` per window, not per 32-row batch: `merge_update`
-    /// is a full-table merge join, so cost lands in commits, not rows. The
+    /// One `merge_update` per window, not per 32-row batch: each
+    /// `merge_update` streams the target column once, so amortizing it over
+    /// a window-sized batch beats issuing it per model batch. The
     /// length-sort clusters similar lengths because the tokenizer pads each
     /// batch to its longest member. Empties `window`.
     async fn drain_window(

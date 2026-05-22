@@ -955,17 +955,26 @@ impl Store {
         &self,
         vector_index_threshold: usize,
     ) -> Result<()> {
-        // The threshold gates on embedded rows, not total rows: the IVF_PQ
-        // trainer sees only non-null vectors, so a large but mostly-unembedded
-        // `messages` table must still wait until enough vectors exist.
+        // The threshold gates on current-model rows, not total rows: the IVF_PQ
+        // trainer sees only the embeddings it will index, so a large but
+        // mostly-unembedded `messages` table must still wait until enough
+        // vectors at the current model exist. Counting on `embedding_model`
+        // hits the bitmap index added in this PR; counting on `vector`
+        // (FixedSizeList, no scalar index) would force a full column scan.
         let dataset = self.handle.dataset(Table::Messages).await?;
         let embedded = dataset
-            .count_rows(Some(Predicate::IsNotNull("vector").to_lance()))
+            .count_rows(Some(
+                Predicate::Eq("embedding_model", embed::MODEL_ID.into()).to_lance(),
+            ))
             .await?;
         if embedded < vector_index_threshold {
             return Ok(());
         }
         let params = embed::index_params(embedded);
+        // `replace = true`: vectors arrive via `merge_update` column writes,
+        // which rewrite existing fragments. Lance's incremental index fold
+        // can't follow that safely, so each `pond embed` rebuilds the index
+        // from scratch (paired with the scalar-index rebuild in `pond embed`).
         self.handle
             .ensure_index(
                 Table::Messages,
@@ -973,7 +982,7 @@ impl Store {
                 MESSAGES_VECTOR_INDEX,
                 IndexType::Vector,
                 &params,
-                false,
+                true,
             )
             .await
     }
