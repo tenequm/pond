@@ -20,4 +20,5 @@ Thumbs.db
 tmp/
 .claude/*local.json
 .claude
+.agents/skills/
 /benches/corpus/

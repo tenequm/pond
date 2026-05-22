@@ -18,7 +18,7 @@ A unified storage and retrieval layer for sessions produced by any agentic clien
 
 ## Status
 
-Pre-v1. The Rust crate builds clean and the v1 surface is in place: eight CLI verbs, HTTP+JSON and MCP transports, hybrid search (BM25 + vector + RRF) over four Lance datasets, Qwen3 embeddings via fastembed-rs, and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. A background maintenance loop runs `cleanup_old_versions` + `optimize_indices` on a configurable interval. Schemas, wire shapes, and config keys are subject to breaking change until v1.
+Pre-v1. The Rust crate builds clean and the v1 surface is in place: eight CLI verbs, HTTP+JSON and MCP transports, hybrid search (BM25 + vector + RRF) over three Lance datasets, e5-base embeddings via `candle-transformers` (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. A background maintenance loop runs `cleanup_old_versions` + `optimize_indices` on a configurable interval. Schemas, wire shapes, and config keys are subject to breaking change until v1.
 
 Repository layout:
 
@@ -51,11 +51,11 @@ Key choices:
 - `lance-format/lance` crates direct as the only storage and search engine. No `lancedb` wrapper, no SQL, no additional database.
 - `object_store` (via Lance) for storage substrate: S3 / GCS / Azure / local filesystem.
 - Canonical session types owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This is the moat. Response-side metadata is projected into per-Message Lance columns, not stored as Parts.
-- Four Lance datasets: `sessions`, `messages`, `parts`, `embeddings`. Hot filter columns are denormalized onto search rows for single-stage filter pushdown (`messages` and `embeddings` carry `source_agent` / `project` / `role` / `timestamp` for prefilter on hybrid search).
+- Three Lance datasets: `sessions`, `messages`, `parts`. `messages` carries both the embedding vector (`vector` + `embedding_model`) and the hot filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown on hybrid search.
 - One adapter trait, `SourceAdapter`, with a deterministic event-ordering contract. Everything else (storage, indexing, OCC, time-travel, namespaces, manifest versioning, blob storage) is Lance direct - no extra "seam" abstractions.
 - Append-only writes. Replay (cross-provider re-projection) is deferred to section 4.
 - v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond status`, `pond sync`, `pond embed`, `pond serve`, `pond mcp`, `pond config`, `pond export`.
-- Default embeddings: Qwen3-Embedding-0.6B via fastembed-rs (local, candle backend behind the `qwen3` feature, fixed 1024-dim, 32K context, Apache 2.0). Embedding registry is config-driven.
+- Default embeddings: `intfloat/multilingual-e5-base` (XLM-RoBERTa, 768-dim, 512-token context, MIT) on `candle-transformers` - Metal GPU on macOS automatically, CUDA via the opt-in `cuda` feature, CPU otherwise.
 - Multi-tenancy via opaque namespace strings; bucket prefix per namespace; separate buckets when KMS isolation matters.
 - Encryption is operational (bucket SSE + filesystem encryption), not application-level.
 
