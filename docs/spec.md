@@ -182,7 +182,7 @@ The canonical model is the interlingua: what every adapter parses into and seria
 
 ### 4.1 Shape
 
-The model has three nested types - a Session contains Messages, a Message contains Parts - plus Embedding, a derived type with no canonical counterpart (it is storage only; Sections 5 and 8). It is deliberately LLM-conversation-shaped: it models the conversational layer of an agent session - roles, turns, tool calls, reasoning - below any particular harness. Harness-specific behavior (compaction, retries, step accounting, editor context) is absorbed into the `options` bag, not added as canonical fields. This LLM-conversation shape is also why a flat social-content corpus is a separate consumer rather than a coerced session (Section 9).
+The model has three nested types - a Session contains Messages, a Message contains Parts. A message's embedding vector is derived storage with no canonical counterpart, not a separate type (Sections 5 and 8). It is deliberately LLM-conversation-shaped: it models the conversational layer of an agent session - roles, turns, tool calls, reasoning - below any particular harness. Harness-specific behavior (compaction, retries, step accounting, editor context) is absorbed into the `options` bag, not added as canonical fields. This LLM-conversation shape is also why a flat social-content corpus is a separate consumer rather than a coerced session (Section 9).
 
 ### 4.2 Canonical is the source of truth
 
@@ -331,11 +331,11 @@ Four rules keep the stored canonical form trustworthy and complete. They are enf
 
 ## 5. Session datasets {#datasets}
 
-This section is how the canonical model of Section 4 persists on the substrate of Section 3. It is the sessions consumer's storage schema - the first consumer's tables, indexes, and derived embedding store. A future consumer registers its own tables the same way.
+This section is how the canonical model of Section 4 persists on the substrate of Section 3. It is the sessions consumer's storage schema - the first consumer's tables and indexes. A future consumer registers its own tables the same way.
 
-### 5.1 Four datasets
+### 5.1 Three datasets
 
-The sessions consumer registers four Lance tables: `sessions`, `messages`, `parts`, and `embeddings`. Each is a direct serialization of its canonical type - no projections, no promotions. Typed scalars are typed columns; the open-ended `options` bag and Part variant payloads are stored as JSON text; FilePart binary uses Lance blob storage.
+The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type - no projections, no promotions - except that `messages` additionally carries a message's derived embedding (5.5). Typed scalars are typed columns; the open-ended `options` bag and Part variant payloads are stored as JSON text; FilePart binary uses Lance blob storage.
 
 `sessions` - one row per Session:
 
@@ -358,6 +358,8 @@ The sessions consumer registers four Lance tables: `sessions`, `messages`, `part
 | `source_agent`, `project` | denormalized; filter-pushdown surface |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
+| `vector` | the embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
+| `embedding_model` | the model that produced `vector`; nullable - set with `vector` |
 | `options` | JSON text |
 
 `parts` - one row per Part:
@@ -371,21 +373,13 @@ The sessions consumer registers four Lance tables: `sessions`, `messages`, `part
 | `data` | Lance blob; FilePart payload only |
 | `options` | JSON text |
 
-`embeddings` - one row per message per embedding model:
-
-| Column | Notes |
-|---|---|
-| `session_id`, `message_id`, `model_id`, `max_embed_tokens` | composite primary key |
-| `vector` | the embedding; vector-indexed |
-| `source_agent`, `project`, `role`, `timestamp` | denormalized; filter-pushdown surface |
-
 ### 5.2 Composite keys
 
-`messages`, `parts`, and `embeddings` use composite primary keys that lead with `session_id` (`session-scoped-pk`). A source's own message and part ids are preserved verbatim without requiring global uniqueness: such an id is unique only within its session, and lineage operations - sub-agent spawn, `/compact`, resume, and fork - copy a parent session's history into a new session and replay its message and part ids unchanged. The leading `session_id` keeps each session's copy distinct; a key omitting it collides on every replayed id. Clustering on `(session_id, ...)` keeps a session's messages, parts, and embeddings contiguous on disk for sequential reads.
+`messages` and `parts` use composite primary keys that lead with `session_id` (`session-scoped-pk`). A source's own message and part ids are preserved verbatim without requiring global uniqueness: such an id is unique only within its session, and lineage operations - sub-agent spawn, `/compact`, resume, and fork - copy a parent session's history into a new session and replay its message and part ids unchanged. The leading `session_id` keeps each session's copy distinct; a key omitting it collides on every replayed id. Clustering on `(session_id, ...)` keeps a session's messages and parts contiguous on disk for sequential reads.
 
 ### 5.3 Denormalization
 
-`messages` and `embeddings` carry columns copied from a parent table. A denormalized column is populated by pond core at ingest, is immutable thereafter, and exists solely as a filter-pushdown surface; the parent table remains authoritative for any read outside search. Why denormalize: a vector or full-text query filters and ranks in one pass over one table, and Lance has no relational join planner in pond's crate set - the filter columns must be on the table being searched.
+`messages` carries `source_agent` and `project` copied from its `sessions` parent. A denormalized column is populated by pond core at ingest, is immutable thereafter, and exists solely as a filter-pushdown surface; `sessions` remains authoritative for any read outside search. Why denormalize: a vector or full-text query filters and ranks in one pass over `messages`, and Lance has no relational join planner in pond's crate set - the filter columns must be on the table being searched.
 
 ### 5.4 Durability
 
@@ -393,7 +387,11 @@ The sessions consumer registers four Lance tables: `sessions`, `messages`, `part
 
 ### 5.5 Embeddings are derived
 
-An `embeddings` row has no canonical-type counterpart - it is produced by pond, not supplied by a source. Its key includes `model_id` and `max_embed_tokens` so vectors from different models, or under a different truncation cap, coexist as distinct rows rather than overwriting one another. Section 8 covers how they are produced and queried.
+A message's embedding has no canonical-type counterpart - it is produced by pond, not supplied by a source. It is two nullable columns on `messages`: `vector`, the embedding, and `embedding_model`, the model that produced it. Both stay null until `pond embed` fills them (Section 8); a message ingested with embedding disabled simply keeps them null.
+
+**`embed-from-canonical`** {#embed-from-canonical} - A message's embedding MUST be derived from its stored `search_text`, never from the source record. Why: `search_text` is durable (`durable-copy`) and the source is not - deriving from canonical is what lets pond re-embed under a new or changed model at any later time with no source present, making a model change a re-derivation, not a migration. `embedding_model` records which model `vector` holds, so a re-embed touches only the messages a model change left stale.
+
+Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`append-only`). A same-dimension model change replaces the `vector` column's values; a different dimension cannot reuse a fixed-width column, so the re-embed instead adds a second vector column, backfills it from `search_text`, drops the old `vector`, and renames the new column to `vector` - all on `messages`, never a new table. The prior vectors stay queryable until the replacement is complete, and Lance's manifest history retains them afterward, so a regressed model swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
 
 ---
 
@@ -520,7 +518,7 @@ Two resources, `schema://pond` and `stats://pond`, expose the search-field docum
 
 ### 7.6 Ingest events
 
-A `pond_ingest` event is one canonical object - a Session, a Message, or a Part - tagged with its kind. Within a session's substream the order is fixed (`event-ordering`, Section 6). `Session.source_agent` and `Session.project` are immutable after first write: a re-submitted session with a differing value for either is rejected for that row, since both are denormalized across the other tables.
+A `pond_ingest` event is one canonical object - a Session, a Message, or a Part - tagged with its kind. Within a session's substream the order is fixed (`event-ordering`, Section 6). `Session.source_agent` and `Session.project` are immutable after first write: a re-submitted session with a differing value for either is rejected for that row, since both are denormalized onto `messages`.
 
 ### 7.7 MCP surface
 
@@ -549,7 +547,7 @@ The wire protocol versions through `protocol_version` and additive-only schema c
 
 Search returns messages. It is hybrid - a vector retriever and a keyword retriever, fused - and runs at message granularity. This section also specifies the embedding seam, a generic capability the session datasets consume rather than a part of them.
 
-- **Hybrid retrieval.** A search runs two retrievers over the same corpus: a BM25 full-text retriever over each message's indexed text, and a vector retriever over message embeddings. Their ranked results are fused by reciprocal-rank fusion. Both retrievers operate at message granularity and agree on row identity, so fusion needs no per-chunk deduplication. When embeddings are absent the search runs full-text only; the mode is decided by the server from embedding availability, not requested on the wire, and each hit reports which retrievers matched it.
+- **Hybrid retrieval.** A search runs two retrievers over the same corpus: a BM25 full-text retriever over each message's indexed text, and a vector retriever over the message embeddings produced by the configured model. Their ranked results are fused by reciprocal-rank fusion. Both retrievers operate at message granularity and agree on row identity, so fusion needs no per-chunk deduplication. When no message is embedded under the configured model the search runs full-text only; the mode is decided by the server from embedding availability, not requested on the wire, and each hit reports which retrievers matched it.
 
   **`prefilter-pushdown`** {#prefilter-pushdown} - Every vector and full-text query MUST push its scalar filters into the table's scalar indexes before the retriever ranks, never as an in-memory post-filter. Why: a post-filter ranks first and filters second, so it silently returns fewer than the requested number of results and ignores the scalar indexes entirely - correctness depends on the filter running first.
 
@@ -559,9 +557,9 @@ Search returns messages. It is hybrid - a vector retriever and a keyword retriev
 
 - **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. A recency boost is applied additively by default. Results may be grouped to one summary per session. Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
 - **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
-- **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The set of usable models is a configuration registry: each entry declares a model's identity and vector parameters. The registry is generic; no specific model is enshrined in this document or in the engine - the default is a configuration value.
-- **The embedding worker.** Embeddings are derived, not source data, and are produced after ingest by a worker that walks the backlog of un-embedded messages and writes one vector per message. The worker is the session datasets' use of the embedding seam; a future consumer that wants vectors brings its own worker over its own table, reusing the same seam. v1 runs the worker only on the explicit `pond embed` verb - it is not automatic.
-- **Opt-in.** Embedding is opt-in by configuration. With it off, `pond serve`, `pond mcp`, and `pond search` run full-text only and never load a model. With it on and at least one vector present, search is hybrid.
+- **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The engine ships a fixed set of models it has loaders for; configuration selects one and supplies its vector parameters. No model is mandatory and none is named in this document - the choice and its default are configuration.
+- **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it, and only by the explicit `pond embed` verb - v1 has no automatic trigger. `pond embed` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.
+- **Opt-in.** Embedding is opt-in by configuration. With it off, `pond serve`, `pond mcp`, and `pond search` run full-text only and never load a model. With it on and at least one message embedded under the configured model, search is hybrid.
 - **Index lifecycle.** The indexed-text and vector columns exist from table creation; turning embeddings on or off never needs a schema migration. An index is created on the first write batch that yields enough data and is then folded forward incrementally (Section 3.7). The full-text index has no training step. The vector index needs training data, so it cannot be built on an empty table and trains poorly at small scale - below an activation threshold vector search runs a brute-force flat scan, which is fast at small and medium scale. Retrieval is correct against rows appended since the last fold: the engine flat-scans that not-yet-folded tail and merges it with the indexed results. When the tail is large enough to affect latency, search still returns correct results and surfaces a warning that the index is behind. The index-upkeep step (Section 3.7) folds the tail in after each write batch.
 
 ---
