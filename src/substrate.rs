@@ -15,7 +15,9 @@ use lance::session::Session;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
+};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::DescribeTableRequest;
@@ -26,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 use url::Url;
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 10_000;
 
@@ -64,13 +67,18 @@ pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
     })
 }
 
+/// On-disk byte totals for the four session datasets, plus everything else
+/// under the data-dir root. Sized by listing through Lance's object-store
+/// layer (spec.md#storage-via-lance) so `file://` and `s3://` behave alike.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MaintenanceReport {
-    pub versions_removed: u64,
-    pub bytes_reclaimed: u64,
-    pub tables_optimized: usize,
-    pub tables_failed: usize,
+pub struct TableSizes {
+    pub sessions: u64,
+    pub messages: u64,
+    pub parts: u64,
+    pub embeddings: u64,
+    pub other: u64,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarValue {
     String(String),
@@ -187,7 +195,6 @@ pub struct Handle {
     /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
     /// future hosted pond swaps to "rest" without touching read/write paths
     /// (spec.md#catalog-seam).
-    #[allow(dead_code)]
     nm: Arc<dyn LanceNamespace>,
     /// Namespace identifier this handle binds to. v1 is always `root()`; the
     /// typed seam matches `resolve_namespace`'s return so multi-namespace
@@ -538,41 +545,33 @@ impl Handle {
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().map(|index| index.name.clone()).collect())
     }
-    pub async fn maintenance(&self, retention: chrono::Duration) -> MaintenanceReport {
-        let mut report = MaintenanceReport::default();
-        for table in [
-            Table::Sessions,
-            Table::Messages,
-            Table::Parts,
-            Table::Embeddings,
-        ] {
-            match self.maintain_table(table, retention).await {
-                Ok((versions_removed, bytes_reclaimed)) => {
-                    report.versions_removed += versions_removed;
-                    report.bytes_reclaimed += bytes_reclaimed;
-                    report.tables_optimized += 1;
-                }
-                Err(error) => {
-                    report.tables_failed += 1;
-                    tracing::warn!(table = table.label(), %error, "maintenance pass failed for table");
-                }
-            }
-        }
-        report
-    }
-    async fn maintain_table(
+
+    /// Count rows in `table` not yet covered by index `index_name`
+    /// (spec.md#index-upkeep). Manifest-only, no index I/O; a missing index
+    /// reports the whole table.
+    pub(crate) async fn unindexed_row_count(
         &self,
         table: Table,
-        retention: chrono::Duration,
-    ) -> Result<(u64, u64)> {
+        index_name: &str,
+    ) -> Result<usize> {
+        use lance::index::DatasetIndexInternalExt;
+        let dataset = self.dataset(table).await?;
+        let fragments = dataset
+            .unindexed_fragments(index_name)
+            .await
+            .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
+        Ok(fragments
+            .iter()
+            .map(|fragment| fragment.num_rows().unwrap_or(0))
+            .sum())
+    }
+    /// Fold newly-appended rows into `table`'s indexes incrementally
+    /// (spec.md#index-upkeep). Never a from-scratch rebuild; idempotent and
+    /// concurrency-safe, so it is safe to run on every write batch.
+    pub(crate) async fn optimize_indices(&self, table: Table) -> Result<()> {
         let started = Instant::now();
         let mut guard = self.cached(table).lock().await;
         let mut dataset = guard.latest().await?;
-        let stats = dataset
-            .cleanup_old_versions(retention, None, None)
-            .await
-            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
-        let (versions_removed, bytes_reclaimed) = (stats.old_versions, stats.bytes_removed);
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -580,12 +579,103 @@ impl Handle {
         guard.replace(dataset);
         tracing::info!(
             table = table.label(),
-            versions_removed,
-            bytes_reclaimed,
             duration_ms = started.elapsed().as_millis(),
-            "maintenance pass complete for table",
+            "index fold complete for table",
         );
-        Ok((versions_removed, bytes_reclaimed))
+        Ok(())
+    }
+
+    /// Resolve each table's stored location through the namespace catalog
+    /// (spec.md#catalog-seam) - no hardcoded `.lance` suffix.
+    async fn table_location(&self, table_name: &str) -> Result<String> {
+        let request = DescribeTableRequest {
+            id: Some(self.nm_ident.as_table_id(table_name)),
+            ..Default::default()
+        };
+        let response = self
+            .nm
+            .describe_table(request)
+            .await
+            .with_context(|| format!("failed to describe table {table_name}"))?;
+        response
+            .location
+            .with_context(|| format!("namespace returned no location for table {table_name}"))
+    }
+
+    /// On-disk byte totals for the four datasets plus the data-dir remainder.
+    /// Every byte is sized by listing through Lance's object store
+    /// (spec.md#storage-via-lance), identical for `file://` and `s3://`.
+    pub async fn table_sizes(&self) -> Result<TableSizes> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
+                Arc::new(StorageOptionsAccessor::with_static_options(
+                    self.storage_options.clone(),
+                ))
+            }),
+            ..Default::default()
+        };
+
+        let sessions = self
+            .listed_size(
+                &registry,
+                &params,
+                &self.table_location(sessions::SESSIONS).await?,
+            )
+            .await?;
+        let messages = self
+            .listed_size(
+                &registry,
+                &params,
+                &self.table_location(sessions::MESSAGES).await?,
+            )
+            .await?;
+        let parts = self
+            .listed_size(
+                &registry,
+                &params,
+                &self.table_location(sessions::PARTS).await?,
+            )
+            .await?;
+        let embeddings = self
+            .listed_size(
+                &registry,
+                &params,
+                &self.table_location(sessions::EMBEDDINGS).await?,
+            )
+            .await?;
+        // `other` is whatever sits under the data-dir root but not in the four
+        // tables (config.toml, stray index temp files): root total minus them.
+        let root_total = self
+            .listed_size(&registry, &params, self.location.as_str())
+            .await?;
+        let other = root_total.saturating_sub(sessions + messages + parts + embeddings);
+        Ok(TableSizes {
+            sessions,
+            messages,
+            parts,
+            embeddings,
+            other,
+        })
+    }
+
+    /// Sum `ObjectMeta.size` for every object recursively under `uri`.
+    async fn listed_size(
+        &self,
+        registry: &Arc<ObjectStoreRegistry>,
+        params: &ObjectStoreParams,
+        uri: &str,
+    ) -> Result<u64> {
+        let (store, base) = ObjectStore::from_uri_and_params(registry.clone(), uri, params)
+            .await
+            .with_context(|| format!("failed to open object store for {uri}"))?;
+        let mut listing = store.list(Some(base));
+        let mut total = 0u64;
+        while let Some(meta) = listing.next().await {
+            let meta = meta.with_context(|| format!("listing {uri} failed"))?;
+            total += meta.size;
+        }
+        Ok(total)
     }
     fn cached(&self, table: Table) -> &Mutex<CachedDataset> {
         match table {

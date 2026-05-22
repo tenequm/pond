@@ -329,3 +329,74 @@ async fn group_by_conversation_collapses_to_one_summary_per_session() -> anyhow:
 
     Ok(())
 }
+
+/// spec.md#part-provenance: a harness `<task-notification>` message must be
+/// absent from search results yet still returned in full by `pond_get`.
+#[tokio::test(flavor = "multi_thread")]
+async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -> anyhow::Result<()>
+{
+    let corpus = TempDir::new()?;
+    let project_dir = corpus.path().join("-tmp-pond-provenance");
+    std::fs::create_dir_all(&project_dir)?;
+    let session_uuid = "77777777-7777-7777-7777-777777777777";
+    let marker = "zzqqx-unique-notification-marker";
+    let prompt = serde_json::json!({
+        "type": "user",
+        "uuid": "u-prompt",
+        "sessionId": session_uuid,
+        "cwd": "/tmp/pond-provenance",
+        "timestamp": "2026-05-16T00:00:00.000Z",
+        "message": {"role": "user", "content": "ordinary conversational prompt"},
+    });
+    let notification = serde_json::json!({
+        "type": "user",
+        "uuid": "u-notify",
+        "sessionId": session_uuid,
+        "cwd": "/tmp/pond-provenance",
+        "timestamp": "2026-05-16T00:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": format!("<task-notification>{marker}</task-notification>"),
+        },
+    });
+    std::fs::write(
+        project_dir.join(format!("{session_uuid}.jsonl")),
+        format!("{prompt}\n{notification}\n"),
+    )?;
+
+    let store_temp = TempDir::new()?;
+    let store = Store::open_local(store_temp.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(corpus.path());
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    // The marker lives only inside the injected message - search must not
+    // return it.
+    let request = SearchRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        query: marker.to_owned(),
+        rrf_k: 60,
+        filters: SearchFilters::default(),
+        boost_recent: true,
+        group_by_conversation: false,
+        limit: 50,
+    };
+    let hits = hits_of(pond_search(&store, None, request).await);
+    assert!(
+        hits.iter().all(|hit| hit.message_id != "u-notify"),
+        "an injected task-notification must never surface as a search hit"
+    );
+
+    // But `pond_get` still returns the whole message and its part.
+    let GetEnvelope::Success(response) = pond_get(&store, get_request(session_uuid)).await else {
+        panic!("pond_get must succeed");
+    };
+    let GetResult::Session { messages, .. } = response.result else {
+        panic!("session get returns a session result");
+    };
+    assert!(
+        messages.iter().any(|m| m.id() == "u-notify"),
+        "the injected message is preserved and returned by pond_get"
+    );
+    Ok(())
+}

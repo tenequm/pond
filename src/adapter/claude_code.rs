@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::{
     sessions::IngestEvent,
-    wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
+    wire::{FileData, Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
@@ -653,8 +653,18 @@ fn message_events(
     let content = message_value.get("content").unwrap_or(&Value::Null);
     let mut parts = Vec::new();
     let message = match (role, content) {
-        ("user", Value::String(_)) => {
-            parts.push(text_part(session_id, uuid, 0, extract_self_str(content)));
+        ("user", Value::String(text)) => {
+            // spec.md#part-provenance: a user-slot turn is conversation only
+            // when it is a genuine human prompt; harness-injected wrappers and
+            // `isMeta` rows are scaffolding.
+            let provenance = user_text_provenance(row, text);
+            parts.push(text_part(
+                session_id,
+                uuid,
+                0,
+                extract_self_str(content),
+                provenance,
+            ));
             Message::User {
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
@@ -682,12 +692,12 @@ fn message_events(
             }
         }
         ("user", Value::Array(items)) => {
-            parts.extend(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, item)| user_part(session_id, uuid, ordinal, item, state)),
-            );
+            // Classify the whole user message once: v1 claude-code never mixes
+            // provenance within a single message (spec.md#part-provenance).
+            let provenance = user_array_provenance(row, items);
+            parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
+                user_part(session_id, uuid, ordinal, item, state, provenance)
+            }));
             Message::User {
                 id: uuid.to_owned(),
                 session_id: session_id.to_owned(),
@@ -743,12 +753,14 @@ fn text_part(
     message_id: &str,
     ordinal: usize,
     text: Option<Extracted<String>>,
+    provenance: Provenance,
 ) -> Part {
     Part {
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        provenance,
         options: empty_options(),
         kind: PartKind::Text { text },
     }
@@ -760,10 +772,19 @@ fn user_part(
     ordinal: usize,
     value: &Value,
     state: &FileState,
+    provenance: Provenance,
 ) -> Part {
     match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(session_id, message_id, ordinal, extract_str(value, "text")),
-        Some("image") | Some("file") => file_part(session_id, message_id, ordinal, value),
+        Some("text") => text_part(
+            session_id,
+            message_id,
+            ordinal,
+            extract_str(value, "text"),
+            provenance,
+        ),
+        Some("image") | Some("file") => {
+            file_part(session_id, message_id, ordinal, value, provenance)
+        }
         Some("tool_result") => {
             tool_result_part(session_id, message_id, ordinal, value, None, state)
         }
@@ -775,18 +796,29 @@ fn user_part(
             message_id,
             ordinal,
             Some(extract_compact_repr(value)),
+            provenance,
         ),
     }
 }
 
 fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
+    // spec.md#part-provenance: assistant content - text, reasoning, tool calls -
+    // is model-authored, hence conversational. `tool_result` parts never appear
+    // on an assistant message.
     match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(session_id, message_id, ordinal, extract_str(value, "text")),
+        Some("text") => text_part(
+            session_id,
+            message_id,
+            ordinal,
+            extract_str(value, "text"),
+            Provenance::Conversational,
+        ),
         Some("thinking") => Part {
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            provenance: Provenance::Conversational,
             options: signature_options(value),
             kind: PartKind::Reasoning {
                 text: extract_str(value, "thinking"),
@@ -797,6 +829,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
                 call_id: extract_str(value, "id"),
@@ -810,6 +843,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
                 call_id: extract_str(value, "id"),
@@ -818,7 +852,13 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
                 provider_executed: true,
             },
         },
-        Some("image") | Some("file") => file_part(session_id, message_id, ordinal, value),
+        Some("image") | Some("file") => file_part(
+            session_id,
+            message_id,
+            ordinal,
+            value,
+            Provenance::Conversational,
+        ),
         // Same rationale as `user_part`'s fallback: lossless encoding of
         // an unrecognised structured shape, not synthesised data.
         _ => text_part(
@@ -826,6 +866,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             message_id,
             ordinal,
             Some(extract_compact_repr(value)),
+            Provenance::Conversational,
         ),
     }
 }
@@ -858,6 +899,9 @@ fn tool_result_part(
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        // spec.md#part-provenance: tool output is runtime-produced, not
+        // conversation.
+        provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
             call_id,
@@ -871,7 +915,13 @@ fn tool_result_part(
     }
 }
 
-fn file_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
+fn file_part(
+    session_id: &str,
+    message_id: &str,
+    ordinal: usize,
+    value: &Value,
+    provenance: Provenance,
+) -> Part {
     let media_type = value
         .get("media_type")
         .or_else(|| value.get("mime_type"))
@@ -902,6 +952,7 @@ fn file_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) 
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        provenance,
         options: empty_options(),
         kind: PartKind::File {
             media_type,
@@ -967,6 +1018,57 @@ fn parse_timestamp(value: &Value) -> anyhow::Result<DateTime<Utc>> {
 
 fn is_tool_result(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("tool_result")
+}
+
+/// True when the row carries `isMeta: true` - claude-code's marker for an
+/// expanded skill or command body injected into a user slot.
+fn is_meta_row(row: &Value) -> bool {
+    row.get("isMeta").and_then(Value::as_bool) == Some(true)
+}
+
+/// Harness-injected wrappers claude-code places inside a user-slot turn
+/// (spec.md#part-provenance): task notifications, slash-command echoes,
+/// local-command caveats, interrupt notices.
+fn is_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<task-notification>")
+        || trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<command-args>")
+        || trimmed.starts_with("<local-command-caveat>")
+        || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("[Request interrupted by user")
+}
+
+/// Provenance of a string-content user message: `injected` for an `isMeta`
+/// row or a harness wrapper, `conversational` for a genuine human prompt.
+fn user_text_provenance(row: &Value, text: &str) -> Provenance {
+    if is_meta_row(row) || is_injected_user_text(text) {
+        Provenance::Injected
+    } else {
+        Provenance::Conversational
+    }
+}
+
+/// Provenance of an array-content user message. `isMeta` flags the whole row;
+/// otherwise a leading text item carrying a harness wrapper marks it injected.
+/// v1 claude-code never interleaves both within one message.
+fn user_array_provenance(row: &Value, items: &[Value]) -> Provenance {
+    if is_meta_row(row) {
+        return Provenance::Injected;
+    }
+    let wrapped = items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("text")
+            && item
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_injected_user_text)
+    });
+    if wrapped {
+        Provenance::Injected
+    } else {
+        Provenance::Conversational
+    }
 }
 
 #[cfg(test)]
@@ -1273,6 +1375,93 @@ mod tests {
             }
         }
         assert!(saw_call && saw_result, "both parts must be present");
+        Ok(())
+    }
+
+    /// spec.md#part-provenance: a genuine human prompt classifies
+    /// `conversational`; a harness `<task-notification>` user-slot turn and an
+    /// `isMeta` row classify `injected`.
+    #[test]
+    fn user_text_provenance_separates_prompts_from_harness_injection() {
+        let prompt = json!({"type": "user", "uuid": "u1"});
+        assert_eq!(
+            user_text_provenance(&prompt, "please refactor the parser"),
+            Provenance::Conversational,
+        );
+
+        let notification = json!({"type": "user", "uuid": "u2"});
+        assert_eq!(
+            user_text_provenance(
+                &notification,
+                "<task-notification>background task done</task-notification>",
+            ),
+            Provenance::Injected,
+        );
+
+        let meta = json!({"type": "user", "uuid": "u3", "isMeta": true});
+        assert_eq!(
+            user_text_provenance(&meta, "expanded skill body"),
+            Provenance::Injected,
+        );
+    }
+
+    /// Ingest a session carrying a `<task-notification>` user message and a
+    /// genuine prompt; the notification's part must be `injected` and the
+    /// prompt's `conversational` (spec.md#part-provenance).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_notification_message_yields_injected_parts() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let session_uuid = "66666666-6666-6666-6666-666666666666";
+        let prompt = serde_json::json!({
+            "type": "user",
+            "uuid": "u-prompt",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "message": {"role": "user", "content": "genuine human prompt"},
+        });
+        let notification = serde_json::json!({
+            "type": "user",
+            "uuid": "u-notify",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:01.000Z",
+            "message": {
+                "role": "user",
+                "content": "<task-notification>a background task finished</task-notification>",
+            },
+        });
+        std::fs::write(
+            project_dir.join(format!("{session_uuid}.jsonl")),
+            format!("{prompt}\n{notification}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        let session = store
+            .get_session(session_uuid)
+            .await?
+            .expect("session ingests");
+        let mut saw_prompt = false;
+        let mut saw_notification = false;
+        for stored in &session.messages {
+            for part in &stored.parts {
+                if stored.message.id() == "u-prompt" {
+                    assert_eq!(part.provenance, crate::wire::Provenance::Conversational);
+                    saw_prompt = true;
+                }
+                if stored.message.id() == "u-notify" {
+                    assert_eq!(part.provenance, crate::wire::Provenance::Injected);
+                    saw_notification = true;
+                }
+            }
+        }
+        assert!(saw_prompt && saw_notification, "both messages present");
         Ok(())
     }
 

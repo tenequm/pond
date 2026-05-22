@@ -16,10 +16,11 @@ use comfy_table::{
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
-    config::{self, Config, DEFAULT_CONFIG_TOML, MaintenanceConfig},
+    config::{self, Config, DEFAULT_CONFIG_TOML},
     embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
-    sessions::{AdapterStats, CorpusStats, RowTotals, StorageSizes, Store},
+    sessions::{AdapterStats, CorpusStats, RowTotals, Store},
+    substrate::TableSizes,
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
@@ -316,8 +317,8 @@ async fn main() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let stats = store.corpus_stats(include_subagents).await?;
-            let sizes = storage_sizes_for(&data_dir).await?;
-            render_status(&stats, sizes.as_ref())?;
+            let sizes = store.table_sizes().await?;
+            render_status(&stats, &sizes)?;
         }
         Command::Sync {
             adapter,
@@ -382,19 +383,9 @@ async fn main() -> anyhow::Result<()> {
                     ))?;
                 }
             }
-            store.ensure_indices().await?;
-            let retention = chrono::Duration::days(
-                i64::try_from(loaded.maintenance.retention_days).unwrap_or(i64::MAX),
-            );
-            let report = store.maintenance(retention).await;
-            output(&format!(
-                "{} versions_removed={} bytes_reclaimed={} tables_optimized={} tables_failed={}",
-                pond::output::paint("maintenance:", pond::output::dim()),
-                report.versions_removed,
-                report.bytes_reclaimed,
-                report.tables_optimized,
-                report.tables_failed,
-            ))?;
+            // Index create + incremental fold runs on the write path inside
+            // every ingest batch (spec.md#index-upkeep); `pond sync` no longer
+            // triggers it as a separate step.
         }
         Command::Embed {
             data_dir,
@@ -459,9 +450,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            if config.maintenance.enabled {
-                spawn_maintenance(Arc::clone(&store), &config.maintenance);
-            }
             let state = AppState { store, embedder };
             transport::http::serve(state, host, port).await?;
         }
@@ -480,8 +468,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            // `pond mcp` writes only JSON-RPC frames to stdout; the maintenance
-            // task is `pond serve`-only, so it is not spawned here.
             transport::mcp::serve_stdio(AppState { store, embedder }).await?;
         }
         Command::Search {
@@ -696,32 +682,6 @@ async fn restore_session(
         }
     }
     Ok((sessions.len(), file_count))
-}
-
-/// Spawn the background maintenance task: `cleanup_old_versions` +
-/// `optimize_indices` every `interval_secs` (spec.md#substrate). The first tick
-/// fires immediately, so it is consumed up front - `pond serve` does not run
-/// maintenance at boot. Failures are logged at warn and retried next interval;
-/// they never crash the server.
-fn spawn_maintenance(store: Arc<Store>, config: &MaintenanceConfig) {
-    let interval = Duration::from_secs(config.interval_secs);
-    let retention =
-        chrono::Duration::days(i64::try_from(config.retention_days).unwrap_or(i64::MAX));
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let report = store.maintenance(retention).await;
-            tracing::info!(
-                versions_removed = report.versions_removed,
-                bytes_reclaimed = report.bytes_reclaimed,
-                tables_optimized = report.tables_optimized,
-                tables_failed = report.tables_failed,
-                "background maintenance pass complete",
-            );
-        }
-    });
 }
 
 fn init_tracing() {
@@ -1035,61 +995,37 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Walk the data dir when it's local; for remote data dirs return `None` and
-/// note in `pond status` that sizes are unavailable until the S3 backend
-/// lands (see plan.md S3 backend stage). The remote `LIST` plumbing is wired
-/// alongside the rest of the S3 work, where it can be tested end-to-end.
-async fn storage_sizes_for(data_dir: &Url) -> anyhow::Result<Option<StorageSizes>> {
-    if let Some(path) = config::local_path(data_dir) {
-        let sizes = tokio::task::spawn_blocking(move || StorageSizes::from_local_dir(&path))
-            .await
-            .context("storage size walk panicked")??;
-        Ok(Some(sizes))
-    } else {
-        Ok(None)
-    }
-}
-
 /// Render `pond status` as: a header + storage breakdown table on top, a
 /// totals line, and one section per adapter in registry order with a project
 /// table. Tables width-adapt via comfy-table; on non-TTY stdout (piped to a
 /// file or test) coloring strips automatically via `pond::output::paint`.
-fn render_status(stats: &CorpusStats, sizes: Option<&StorageSizes>) -> anyhow::Result<()> {
+fn render_status(stats: &CorpusStats, sizes: &TableSizes) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&paint("pond status", bold()))?;
     output(&format!("{}  {}", paint("data-dir", dim()), stats.data_url))?;
 
-    match sizes {
-        Some(sizes) => {
-            let mut table = new_table();
-            for (label, bytes) in [
-                ("sessions", sizes.sessions),
-                ("messages", sizes.messages),
-                ("parts", sizes.parts),
-                ("embeddings", sizes.embeddings),
-                ("other", sizes.other),
-            ] {
-                table.add_row(vec![
-                    Cell::new(format!("  {label}")),
-                    Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
-                ]);
-            }
-            table.add_row(vec![
-                Cell::new("  total").add_attribute(Attribute::Bold),
-                Cell::new(format_bytes(sizes.total()))
-                    .set_alignment(CellAlignment::Right)
-                    .add_attribute(Attribute::Bold),
-            ]);
-            output(&table.to_string())?;
-        }
-        None => {
-            output(&paint(
-                "  (size on disk unavailable for remote backends; wired with S3 stage)",
-                dim(),
-            ))?;
-        }
+    let mut table = new_table();
+    let total = sizes.sessions + sizes.messages + sizes.parts + sizes.embeddings + sizes.other;
+    for (label, bytes) in [
+        ("sessions", sizes.sessions),
+        ("messages", sizes.messages),
+        ("parts", sizes.parts),
+        ("embeddings", sizes.embeddings),
+        ("other", sizes.other),
+    ] {
+        table.add_row(vec![
+            Cell::new(format!("  {label}")),
+            Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
+        ]);
     }
+    table.add_row(vec![
+        Cell::new("  total").add_attribute(Attribute::Bold),
+        Cell::new(format_bytes(total))
+            .set_alignment(CellAlignment::Right)
+            .add_attribute(Attribute::Bold),
+    ]);
+    output(&table.to_string())?;
 
     let RowTotals {
         sessions,
@@ -1307,7 +1243,7 @@ fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
         paint(&hit.project, dim()),
         paint(&hit.message_id, dim()),
     ))?;
-    render_preview(&hit.preview)?;
+    render_hit_text(&hit.text, hit.snippet.as_deref())?;
     Ok(())
 }
 
@@ -1334,18 +1270,23 @@ fn render_group(rank: usize, group: &Group) -> anyhow::Result<()> {
         paint(&group.source_agent, dim()),
         paint(&group.session_id, dim()),
     ))?;
-    render_preview(&group.preview)?;
+    render_hit_text(&group.text, group.snippet.as_deref())?;
     Ok(())
 }
 
-fn render_preview(preview: &str) -> anyhow::Result<()> {
+/// Render a hit's `text` payload, then a `snippet` block when one is present
+/// (the text was truncated). Empty text renders nothing.
+fn render_hit_text(text: &str, snippet: Option<&str>) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
-    if preview.is_empty() {
-        return Ok(());
-    }
     let prefix = paint(">", dim());
-    for line in preview.lines() {
+    for line in text.lines() {
         output(&format!("    {prefix} {line}"))?;
+    }
+    if let Some(snippet) = snippet {
+        output(&format!("    {}", paint("snippet:", dim())))?;
+        for line in snippet.lines() {
+            output(&format!("    {prefix} {line}"))?;
+        }
     }
     Ok(())
 }
@@ -1430,7 +1371,7 @@ fn render_message(rank: usize, message: &Message, parts: &[&Part]) -> anyhow::Re
         paint(message.id(), dim()),
     ))?;
     if let Some(content) = message.system_content() {
-        render_preview(content)?;
+        render_hit_text(content, None)?;
         return Ok(());
     }
     for part in parts {

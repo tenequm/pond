@@ -365,6 +365,13 @@ mod ingest_handler {
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
             .saturating_sub(truncations_before) as usize;
 
+        // spec.md#index-upkeep: fold the appended rows into the indexes on the
+        // write path. Soft-fail - a failed fold is logged and retried by the
+        // next write batch, never an error that aborts a committed ingest.
+        if let Err(error) = store.index_upkeep().await {
+            tracing::warn!(%error, "index upkeep failed after sync; will retry on next batch");
+        }
+
         let total = run_started.elapsed();
         let other = total
             .saturating_sub(decode_total)
@@ -514,6 +521,13 @@ mod ingest_handler {
         let mut tail = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
+        // spec.md#index-upkeep: fold the newly-appended rows into the indexes
+        // on the write path, for every ingest route (CLI sync, HTTP, MCP). A
+        // failed fold is soft - logged and retried by the next write batch -
+        // never an error that aborts the committed write.
+        if let Err(error) = store.index_upkeep().await {
+            tracing::warn!(%error, "index upkeep failed after ingest; will retry on next batch");
+        }
         Ok(outcomes)
     }
 
@@ -1063,11 +1077,19 @@ mod search_handler {
 
     /// Server-enforced cap on `limit` (spec.md#search).
     const LIMIT_CAP: usize = 200;
-    /// Preview length in code points (spec.md#search).
-    const PREVIEW_CHARS: usize = 500;
+    /// Hit-payload size bounds in code points (spec.md#search): a message's
+    /// indexed text is returned in full at or below `HIT_TEXT_FULL`; above it,
+    /// the text is truncated to `HIT_TEXT_FULL` and a match-windowed snippet of
+    /// up to `HIT_SNIPPET_CHARS` is added.
+    const HIT_TEXT_FULL: usize = 2000;
+    const HIT_SNIPPET_CHARS: usize = 400;
     /// Recency-boost constants (spec.md#search).
     const RECENCY_MAX_BOOST: f64 = 0.2;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
+    /// Unindexed-row count above which `pond_search` logs that the FTS index is
+    /// behind (spec.md#index-upkeep). Search results stay correct regardless -
+    /// the engine flat-scans the not-yet-folded tail.
+    const INDEX_BACKLOG_WARN: usize = 10_000;
 
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
     /// `embedder` is `Some` AND the store holds at least one embedding row for the
@@ -1100,6 +1122,22 @@ mod search_handler {
         // loaded AND embeddings exist for its identity. Anything else degrades to
         // FTS-only - a vector retriever over zero rows would just be wasted work.
         plan.mode = resolve_effective_mode(store, embedder).await?;
+
+        // spec.md#index-upkeep: results stay correct against the not-yet-folded
+        // tail (the engine flat-scans it), but a large backlog hurts latency -
+        // surface it so an operator knows the index fold is behind.
+        match store.unindexed_message_backlog().await {
+            Ok(backlog) if backlog > INDEX_BACKLOG_WARN => {
+                tracing::warn!(
+                    backlog,
+                    "messages FTS index is behind; search is correct but slower until the fold catches up"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not measure FTS index backlog");
+            }
+        }
         let candidates = match plan.mode {
             SearchMode::Fts => {
                 let hits = store
@@ -1219,7 +1257,7 @@ mod search_handler {
         });
 
         if plan.group_by_conversation {
-            let groups = build_groups(store, &scored, plan.limit).await?;
+            let groups = build_groups(store, &scored, plan.limit, &plan.query).await?;
             let total = groups.len();
             Ok(SearchResponse {
                 result: SearchResultBody::Groups { groups },
@@ -1230,7 +1268,7 @@ mod search_handler {
             let hits = scored
                 .into_iter()
                 .take(plan.limit)
-                .map(ScoredHit::into_hit)
+                .map(|hit| hit.into_hit(&plan.query))
                 .collect::<Vec<_>>();
             let total = hits.len();
             Ok(SearchResponse {
@@ -1379,14 +1417,48 @@ mod search_handler {
         RECENCY_MAX_BOOST * (-age_seconds / RECENCY_DECAY_SECONDS).exp()
     }
 
-    /// First [`PREVIEW_CHARS`] code points of `text`, with `"..."` appended when
-    /// truncated (spec.md#search).
-    pub fn make_preview(text: &str) -> String {
-        let mut preview = text.chars().take(PREVIEW_CHARS).collect::<String>();
-        if text.chars().nth(PREVIEW_CHARS).is_some() {
-            preview.push_str("...");
+    /// Build a hit's `(text, snippet)` payload (spec.md#search): the matched
+    /// message's indexed text in full when small, or a bounded prefix plus a
+    /// query-windowed snippet when it exceeds [`HIT_TEXT_FULL`].
+    pub fn hit_payload(text: &str, query: &str) -> (String, Option<String>) {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= HIT_TEXT_FULL {
+            return (text.to_owned(), None);
         }
-        preview
+        let truncated = chars[..HIT_TEXT_FULL].iter().collect::<String>();
+        (truncated, Some(query_snippet(text, query)))
+    }
+
+    /// A snippet windowed around the first query term found in `text`, capped
+    /// at [`HIT_SNIPPET_CHARS`] code points. Falls back to the text head when
+    /// no term matches.
+    fn query_snippet(text: &str, query: &str) -> String {
+        let lower_text = text.to_lowercase();
+        let hit = query
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .filter_map(|term| lower_text.find(&term.to_lowercase()))
+            .min();
+        let chars: Vec<char> = text.chars().collect();
+        // `find` returned a byte offset into the lowercased copy; index that
+        // copy, not `text` - lowercasing can change byte length, so the offset
+        // is not necessarily a valid char boundary in the original.
+        let center = hit
+            .map(|byte| lower_text[..byte].chars().count())
+            .unwrap_or(0);
+        let half = HIT_SNIPPET_CHARS / 2;
+        let start = center.saturating_sub(half);
+        let end = (start + HIT_SNIPPET_CHARS).min(chars.len());
+        let start = end.saturating_sub(HIT_SNIPPET_CHARS);
+        let mut snippet = String::new();
+        if start > 0 {
+            snippet.push_str("...");
+        }
+        snippet.extend(&chars[start..end]);
+        if end < chars.len() {
+            snippet.push_str("...");
+        }
+        snippet
     }
 
     struct Candidate {
@@ -1405,7 +1477,8 @@ mod search_handler {
     }
 
     impl ScoredHit {
-        fn into_hit(self) -> Hit {
+        fn into_hit(self, query: &str) -> Hit {
+            let (text, snippet) = hit_payload(&self.meta.search_text, query);
             Hit {
                 session_id: self.meta.session_id,
                 message_id: self.meta.message_id,
@@ -1413,7 +1486,8 @@ mod search_handler {
                 timestamp: self.meta.timestamp,
                 project: self.meta.project,
                 source_agent: self.meta.source_agent,
-                preview: make_preview(&self.meta.search_text),
+                text,
+                snippet,
                 score: self.score,
                 base_score: self.base_score,
                 recency_boost: self.recency_boost,
@@ -1464,6 +1538,7 @@ mod search_handler {
         store: &Store,
         scored: &[ScoredHit],
         limit: usize,
+        query: &str,
     ) -> Result<Vec<Group>, ErrorEnvelope> {
         use std::collections::BTreeMap;
 
@@ -1474,20 +1549,25 @@ mod search_handler {
             source_agent: String,
             first_timestamp: DateTime<Utc>,
             last_timestamp: DateTime<Utc>,
-            preview: String,
+            text: String,
+            snippet: Option<String>,
             best_score: f64,
         }
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
         for hit in scored {
             let entry = groups
                 .entry(hit.meta.session_id.clone())
-                .or_insert_with(|| Acc {
-                    project: hit.meta.project.clone(),
-                    source_agent: hit.meta.source_agent.clone(),
-                    first_timestamp: hit.meta.timestamp,
-                    last_timestamp: hit.meta.timestamp,
-                    preview: make_preview(&hit.meta.search_text),
-                    best_score: hit.score,
+                .or_insert_with(|| {
+                    let (text, snippet) = hit_payload(&hit.meta.search_text, query);
+                    Acc {
+                        project: hit.meta.project.clone(),
+                        source_agent: hit.meta.source_agent.clone(),
+                        first_timestamp: hit.meta.timestamp,
+                        last_timestamp: hit.meta.timestamp,
+                        text,
+                        snippet,
+                        best_score: hit.score,
+                    }
                 });
             entry.first_timestamp = entry.first_timestamp.min(hit.meta.timestamp);
             entry.last_timestamp = entry.last_timestamp.max(hit.meta.timestamp);
@@ -1509,7 +1589,8 @@ mod search_handler {
                 source_agent: acc.source_agent,
                 first_timestamp: acc.first_timestamp,
                 last_timestamp: acc.last_timestamp,
-                preview: acc.preview,
+                text: acc.text,
+                snippet: acc.snippet,
                 best_score: acc.best_score,
             })
             .collect::<Vec<_>>();
@@ -1606,7 +1687,7 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, make_preview,
+    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, hit_payload,
     plan_search, pond_search, recency_boost, rrf_merge,
 };
 
@@ -1681,14 +1762,44 @@ mod tests {
     }
 
     #[test]
-    fn make_preview_truncates_at_code_point_boundary() {
-        let short = "a short preview";
-        assert_eq!(make_preview(short), short);
+    fn hit_payload_returns_short_text_in_full_with_no_snippet() {
+        let short = "a short message body";
+        let (text, snippet) = hit_payload(short, "message");
+        assert_eq!(text, short);
+        assert!(snippet.is_none(), "small text needs no snippet");
+    }
 
-        let long = "x".repeat(800);
-        let preview = make_preview(&long);
-        assert!(preview.ends_with("..."));
-        assert_eq!(preview.chars().count(), 503);
+    #[test]
+    fn hit_payload_truncates_long_text_and_windows_the_snippet() {
+        // 2400 chars: a filler head, the query term mid-body, a filler tail.
+        let body = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(394));
+        let (text, snippet) = hit_payload(&body, "needle");
+        assert_eq!(text.chars().count(), 2000, "text truncates to the bound");
+        let snippet = snippet.expect("long text carries a snippet");
+        assert!(
+            snippet.contains("NEEDLE"),
+            "snippet windows on the query term: {snippet}"
+        );
+        assert!(snippet.chars().count() <= 400 + 6, "snippet is bounded");
+    }
+
+    #[test]
+    fn hit_payload_snippet_survives_case_folding_that_changes_byte_length() {
+        // `to_lowercase` of 'İ' is two code points, so the lowercased copy has
+        // a different byte layout than the original. A query offset taken from
+        // that copy must never be sliced into the original text.
+        let body = format!("İÉÉÉ{}", "a".repeat(2100));
+        let (text, snippet) = hit_payload(&body, "ééé");
+        assert_eq!(
+            text.chars().count(),
+            2000,
+            "long text truncates to the bound"
+        );
+        let snippet = snippet.expect("long text carries a snippet");
+        assert!(
+            snippet.contains("ÉÉÉ"),
+            "snippet windows on the matched term: {snippet}"
+        );
     }
 
     #[tokio::test]

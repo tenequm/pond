@@ -15,7 +15,7 @@ use pond::{
     config::parse_data_dir,
     handlers::ingest_events,
     sessions::{IngestEvent, OutcomeStatus, Store},
-    wire::{Message, Part, PartKind, ProviderOptions, Session},
+    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use url::Url;
@@ -58,6 +58,7 @@ async fn store_open_against_memory_uri_round_trips_a_session() -> anyhow::Result
         id: "msg-1:0001".to_owned(),
         message_id: message.id().to_owned(),
         ordinal: 0,
+        provenance: Provenance::Conversational,
         options: ProviderOptions::new(),
         kind: PartKind::Text {
             text: s("hello from a remote-backed pond"),

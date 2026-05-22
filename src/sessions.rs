@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -25,8 +24,7 @@ use crate::{
     config::{self, EmbeddingModel},
     embed,
     substrate::{
-        Handle, MaintenanceReport, Predicate, ScalarValue, ScanOpts, Table,
-        VECTOR_INDEX_ACTIVATION_ROWS,
+        Handle, Predicate, ScalarValue, ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
@@ -126,77 +124,6 @@ pub struct ProjectStats {
 struct GroupAccumulator {
     messages: u64,
     session_ids: HashSet<String>,
-}
-
-/// Disk usage for a local data dir, attributed to a top-level table dir.
-/// Returned only when the data dir is on the local filesystem; remote
-/// backends populate via [`CorpusStats::query_remote_sizes`] instead.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StorageSizes {
-    pub sessions: u64,
-    pub messages: u64,
-    pub parts: u64,
-    pub embeddings: u64,
-    pub other: u64,
-}
-
-impl StorageSizes {
-    pub fn total(&self) -> u64 {
-        self.sessions + self.messages + self.parts + self.embeddings + self.other
-    }
-
-    /// Walk `root` (a local directory) recursively and attribute file sizes
-    /// to the table they belong to by the top-level child directory name.
-    /// Anything outside the four known dirs (config.toml, index temp files,
-    /// ...) is counted under `other`.
-    pub fn from_local_dir(root: &std::path::Path) -> Result<Self> {
-        let mut sizes = StorageSizes::default();
-        if !root.exists() {
-            return Ok(sizes);
-        }
-        let mut stack: Vec<(PathBuf, Option<&'static str>)> = Vec::new();
-        for entry in
-            std::fs::read_dir(root).with_context(|| format!("read data dir {}", root.display()))?
-        {
-            let entry = entry?;
-            let name = entry.file_name();
-            // Lance writes each table as `<name>.lance/`; strip the suffix
-            // before matching so the four known tables are attributed
-            // correctly. Anything else (config.toml, index temp files, ...)
-            // falls through to `other`.
-            let stem = name.to_str().map(|s| s.strip_suffix(".lance").unwrap_or(s));
-            let attribute = match stem {
-                Some("sessions") => Some("sessions"),
-                Some("messages") => Some("messages"),
-                Some("parts") => Some("parts"),
-                Some("embeddings") => Some("embeddings"),
-                _ => None,
-            };
-            stack.push((entry.path(), attribute));
-        }
-        while let Some((path, attribute)) = stack.pop() {
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("stat {}", path.display()))?;
-            if metadata.is_dir() {
-                for entry in
-                    std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))?
-                {
-                    let entry = entry?;
-                    stack.push((entry.path(), attribute));
-                }
-            } else if metadata.is_file() {
-                let bytes = metadata.len();
-                match attribute {
-                    Some("sessions") => sizes.sessions += bytes,
-                    Some("messages") => sizes.messages += bytes,
-                    Some("parts") => sizes.parts += bytes,
-                    Some("embeddings") => sizes.embeddings += bytes,
-                    _ => sizes.other += bytes,
-                }
-            }
-        }
-        Ok(sizes)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -969,7 +896,7 @@ impl Store {
                 .ensure_index(
                     Table::Messages,
                     "search_text",
-                    "messages_search_text_fts",
+                    MESSAGES_FTS_INDEX,
                     IndexType::Inverted,
                     &InvertedIndexParams::default(),
                 )
@@ -995,6 +922,28 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Write-path index upkeep (spec.md#index-upkeep): create indexes that do
+    /// not yet exist, then fold the newly-appended rows into each table's
+    /// indexes incrementally. Runs at the tail of every ingest path.
+    pub async fn index_upkeep(&self) -> Result<()> {
+        self.ensure_indices().await?;
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            if self.handle.count_rows(table).await? > 0 {
+                self.handle.optimize_indices(table).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rows appended to `messages` since the FTS index was last folded
+    /// (spec.md#index-upkeep). A missing index reports the whole table; the
+    /// query is manifest-only - no index I/O.
+    pub async fn unindexed_message_backlog(&self) -> Result<usize> {
+        self.handle
+            .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
+            .await
     }
 
     /// Create scalar indexes on `embeddings`, and IVF_PQ once the table crosses
@@ -1037,8 +986,10 @@ impl Store {
         self.handle.embedding_index_names().await
     }
 
-    pub async fn maintenance(&self, retention: chrono::Duration) -> MaintenanceReport {
-        self.handle.maintenance(retention).await
+    /// On-disk byte totals per dataset, sized through Lance's object store
+    /// (spec.md#storage-via-lance) so `pond status` works on any backend.
+    pub async fn table_sizes(&self) -> Result<TableSizes> {
+        self.handle.table_sizes().await
     }
 
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
@@ -1147,6 +1098,7 @@ impl Store {
                         "id",
                         "ordinal",
                         "type",
+                        "provenance",
                         "variant_data",
                         "options",
                     ],
@@ -1834,8 +1786,14 @@ fn ensure_immutable_match(
 }
 
 pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
+    use crate::wire::Provenance;
     let mut chunks: Vec<String> = Vec::new();
     for part in parts {
+        // spec.md#search: only conversational parts contribute to the indexed
+        // text; harness-injected scaffolding is excluded from search.
+        if part.provenance != Provenance::Conversational {
+            continue;
+        }
         match (message.role(), &part.kind) {
             (Role::User | Role::Assistant, PartKind::Text { text }) => {
                 if let Some(text) = text {
@@ -2008,10 +1966,17 @@ fn statuses_from_inserted(total: usize, inserted_rows: u64) -> Vec<UpsertStatus>
     statuses
 }
 
-pub(crate) const SESSIONS: &str = "sessions.lance";
-pub(crate) const MESSAGES: &str = "messages.lance";
-pub(crate) const PARTS: &str = "parts.lance";
-pub(crate) const EMBEDDINGS: &str = "embeddings.lance";
+// Bare logical table names: the lance-namespace Directory impl owns the
+// `.lance` directory suffix (spec.md#catalog-seam). No consumer reconstructs
+// a `.lance` path.
+pub(crate) const SESSIONS: &str = "sessions";
+pub(crate) const MESSAGES: &str = "messages";
+pub(crate) const PARTS: &str = "parts";
+pub(crate) const EMBEDDINGS: &str = "embeddings";
+
+/// FTS index name on `messages.search_text`. Stable so the unindexed-backlog
+/// query (spec.md#index-upkeep) and index creation name the same index.
+pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// Fixed embedding vector dimension for the configured default model (spec.md#search).
 /// A future model with a different dim activates a second `embeddings` table.
@@ -2076,6 +2041,9 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         primary_field("id", DataType::Utf8, false),
         Field::new("ordinal", DataType::Int32, false),
         Field::new("type", DataType::Utf8, false),
+        // spec.md#part-provenance: conversation vs harness-injected; search
+        // reads this column to exclude injected scaffolding.
+        Field::new("provenance", DataType::Utf8, false),
         Field::new("variant_data", DataType::Utf8, false),
         blob_field("data", true),
         Field::new("options", DataType::Utf8, false),
@@ -2454,6 +2422,7 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
             part.message_id.len(),
             part.id.len(),
             part.kind.type_name().len(),
+            part.provenance.as_str().len(),
             variant.len(),
             encoded.len(),
         ];
@@ -2521,6 +2490,12 @@ fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> R
                 parts
                     .iter()
                     .map(|part| part.kind.type_name())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                parts
+                    .iter()
+                    .map(|part| part.provenance.as_str())
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -2618,14 +2593,24 @@ pub(crate) fn part_from_batch(
 ) -> Result<Part> {
     let type_name = string(batch, "type", row)?.context("part type is null")?;
     let variant_data = string(batch, "variant_data", row)?.context("variant_data is null")?;
+    let provenance = string(batch, "provenance", row)?.context("part provenance is null")?;
     Ok(Part {
         session_id: string(batch, "session_id", row)?.context("part session_id is null")?,
         message_id: string(batch, "message_id", row)?.context("part message_id is null")?,
         id: string(batch, "id", row)?.context("part id is null")?,
         ordinal: int32(batch, "ordinal", row)?,
+        provenance: provenance_from_str(&provenance)?,
         options: json_parse(&string(batch, "options", row)?.context("part options is null")?)?,
         kind: part_kind_from_json(&type_name, &variant_data, file_data)?,
     })
+}
+
+fn provenance_from_str(value: &str) -> Result<crate::wire::Provenance> {
+    match value {
+        "conversational" => Ok(crate::wire::Provenance::Conversational),
+        "injected" => Ok(crate::wire::Provenance::Injected),
+        other => anyhow::bail!("unknown part provenance {other}"),
+    }
 }
 
 fn file_data_from_blob(variant_data: &str, bytes: &[u8]) -> Result<FileData> {
@@ -2805,6 +2790,53 @@ mod tests {
     }
 
     #[test]
+    fn search_text_excludes_injected_parts() {
+        use crate::wire::Provenance;
+        let message = Message::User {
+            id: "m1".to_owned(),
+            session_id: "s1".to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let text_part = |id: &str, text: &str, provenance: Provenance| Part {
+            session_id: "s1".to_owned(),
+            id: id.to_owned(),
+            message_id: "m1".to_owned(),
+            ordinal: 0,
+            provenance,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value(text.to_owned())),
+            },
+        };
+
+        // A conversational part contributes; an injected one is excluded
+        // (spec.md#search).
+        let conversational = search_text(
+            &message,
+            &[text_part(
+                "p1",
+                "real human prompt",
+                Provenance::Conversational,
+            )],
+        );
+        assert_eq!(conversational.as_deref(), Some("real human prompt"));
+
+        let injected = search_text(
+            &message,
+            &[text_part(
+                "p2",
+                "<task-notification>...</task-notification>",
+                Provenance::Injected,
+            )],
+        );
+        assert!(
+            injected.is_none(),
+            "a message whose only part is injected has null search_text"
+        );
+    }
+
+    #[test]
     fn chunk_ranges_splits_on_byte_budget() {
         assert!(chunk_ranges(&[]).is_empty());
         assert_eq!(chunk_ranges(&[10, 10, 10]), vec![0..3]);
@@ -2836,6 +2868,7 @@ mod tests {
             id: "orphan-part".to_owned(),
             message_id: "missing-message".to_owned(),
             ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
             options: ProviderOptions::new(),
             kind: PartKind::Text {
                 text: Some(Extracted::from_test_value("orphan".to_owned())),
@@ -2852,6 +2885,7 @@ mod tests {
             id: "valid-part".to_owned(),
             message_id: valid_message.id().to_owned(),
             ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
             options: ProviderOptions::new(),
             kind: PartKind::Text {
                 text: Some(Extracted::from_test_value("kept".to_owned())),
@@ -2958,6 +2992,7 @@ mod tests {
             id: "part-1".to_owned(),
             message_id: message.id().to_owned(),
             ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
             options: ProviderOptions::new(),
             kind: PartKind::File {
                 media_type: "text/plain".to_owned(),

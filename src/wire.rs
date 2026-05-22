@@ -146,12 +146,35 @@ impl Role {
     }
 }
 
+/// Whether a Part's content is conversation or harness-injected scaffolding
+/// (spec.md#part-provenance). No `Default` and no `#[serde(default)]` on the
+/// `Part.provenance` field below: constructing a Part without classifying it
+/// MUST be a compile error (spec.md#provenance-required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    Conversational,
+    Injected,
+}
+
+impl Provenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversational => "conversational",
+            Self::Injected => "injected",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Part {
     pub session_id: String,
     pub id: String,
     pub message_id: String,
     pub ordinal: i32,
+    /// Conversation vs harness-injected (spec.md#part-provenance). Mandatory,
+    /// no serde default - search reads it to exclude injected scaffolding.
+    pub provenance: Provenance,
     #[serde(default)]
     pub options: ProviderOptions,
     #[serde(flatten)]
@@ -405,7 +428,12 @@ pub struct Hit {
     pub timestamp: DateTime<Utc>,
     pub project: String,
     pub source_agent: String,
-    pub preview: String,
+    /// The matched message's indexed text: full when small, truncated to a
+    /// bounded prefix when large (spec.md#search).
+    pub text: String,
+    /// A query-windowed snippet, present only when `text` was truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
     pub score: f64,
     pub base_score: f64,
     pub recency_boost: f64,
@@ -420,7 +448,10 @@ pub struct Group {
     pub first_timestamp: DateTime<Utc>,
     pub last_timestamp: DateTime<Utc>,
     pub message_count: usize,
-    pub preview: String,
+    /// Best-scoring hit's indexed text, same `(text, snippet)` shape as `Hit`.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
     pub best_score: f64,
 }
 

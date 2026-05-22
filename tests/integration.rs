@@ -9,10 +9,10 @@
 mod claude_code_ingest;
 #[path = "integration/embed.rs"]
 mod embed;
+#[path = "integration/index_upkeep.rs"]
+mod index_upkeep;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
-#[path = "integration/maintenance.rs"]
-mod maintenance;
 #[path = "integration/recovery.rs"]
 mod recovery;
 #[path = "integration/remote_backend.rs"]

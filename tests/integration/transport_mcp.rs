@@ -15,7 +15,7 @@ use pond::{
     sessions::Store,
     transport::{AppState, mcp::PondMcp},
     wire::{GetResponse, GetResult, IngestEnvelope, IngestRequest, SearchResponse},
-    wire::{Message, Part, PartKind, Session},
+    wire::{Message, Part, PartKind, Provenance, Session},
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -103,6 +103,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         id: "mcp-test-part-reasoning".to_owned(),
         message_id: MESSAGE_ID.to_owned(),
         ordinal: 0,
+        provenance: Provenance::Conversational,
         options: Default::default(),
         kind: PartKind::Reasoning {
             text: s(REASONING_TEXT),
@@ -113,6 +114,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         id: "mcp-test-part-text".to_owned(),
         message_id: MESSAGE_ID.to_owned(),
         ordinal: 1,
+        provenance: Provenance::Conversational,
         options: Default::default(),
         kind: PartKind::Text {
             text: s("the answer is forty-two"),

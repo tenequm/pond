@@ -16,7 +16,7 @@ use pond::{
     handlers::{IngestEvent, ingest_adapter, pond_ingest},
     sessions::Store,
     wire::{IngestEnvelope, IngestRequest},
-    wire::{Message, Part, PartKind, Session},
+    wire::{Message, Part, PartKind, Provenance, Session},
 };
 use tempfile::TempDir;
 
@@ -159,6 +159,7 @@ fn text_message_events(session_id: &str, message_id: &str, text: &str) -> Vec<In
             id: format!("{message_id}-part"),
             message_id: message_id.to_owned(),
             ordinal: 0,
+            provenance: Provenance::Conversational,
             options: Default::default(),
             kind: PartKind::Text { text: s(text) },
         }),

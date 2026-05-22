@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::{
     sessions::IngestEvent,
-    wire::{Message, Part, PartKind, ProviderOptions, Session},
+    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
@@ -537,6 +537,11 @@ fn message_events(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // spec.md#part-provenance: a `developer` record is a harness instruction
+    // block; a `user`-slot record whose body is `<environment_context>` or an
+    // `# AGENTS.md instructions` blob is injected context, not a genuine
+    // prompt. Everything else in a message record is conversation.
+    let provenance = message_provenance(role, &content);
     let mut parts = Vec::with_capacity(content.len());
     for (ordinal, item) in content.iter().enumerate() {
         // Faithful encoding of one content item: prefer the raw `text`
@@ -549,6 +554,7 @@ fn message_events(
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
             ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            provenance,
             options: empty_options(),
             kind: PartKind::Text { text },
         });
@@ -599,6 +605,36 @@ fn message_events(
     Ok(events)
 }
 
+/// Provenance of a codex `message` record (spec.md#part-provenance). A
+/// `developer` record is a harness instruction block; a `user`-slot record
+/// whose only content is `<environment_context>` or `# AGENTS.md instructions`
+/// is injected context rather than a typed prompt. v1 codex never interleaves
+/// authored and injected content within one record.
+fn message_provenance(role: &str, content: &[Value]) -> Provenance {
+    if role == "developer" || role == "system" {
+        return Provenance::Injected;
+    }
+    if role == "user" {
+        let injected = content.iter().any(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_injected_user_text)
+        });
+        if injected {
+            return Provenance::Injected;
+        }
+    }
+    Provenance::Conversational
+}
+
+/// Harness-injected user-slot content codex emits as a non-prompt record.
+fn is_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<user_instructions>")
+        || trimmed.starts_with("# AGENTS.md")
+}
+
 fn tool_call_events(
     session_id: &str,
     message_id: &str,
@@ -620,6 +656,8 @@ fn tool_call_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        // spec.md#part-provenance: the model authored the tool call.
+        provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::ToolCall {
             call_id,
@@ -651,6 +689,8 @@ fn custom_tool_call_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        // spec.md#part-provenance: the model authored the tool call.
+        provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::ToolCall {
             call_id: extract_str(payload, "call_id"),
@@ -682,6 +722,8 @@ fn custom_tool_result_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        // spec.md#part-provenance: tool output is runtime-produced.
+        provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
             call_id: extract_str(payload, "call_id"),
@@ -724,6 +766,8 @@ fn tool_result_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        // spec.md#part-provenance: tool output is runtime-produced.
+        provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
             call_id,
@@ -774,6 +818,8 @@ fn reasoning_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        // spec.md#part-provenance: model-authored reasoning.
+        provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::Reasoning { text: summary },
     };
@@ -861,6 +907,34 @@ mod tests {
             "codex-cli corpus must contain at least one Text Part",
         );
         Ok(())
+    }
+
+    /// spec.md#part-provenance: a `developer` record and a `user`-slot record
+    /// whose body is `<environment_context>` are harness-injected; a genuine
+    /// user prompt and an assistant message are conversation.
+    #[test]
+    fn message_provenance_separates_prompts_from_harness_records() {
+        let prompt = vec![json!({"type": "input_text", "text": "refactor this"})];
+        assert_eq!(
+            message_provenance("user", &prompt),
+            Provenance::Conversational,
+        );
+        assert_eq!(
+            message_provenance("assistant", &[]),
+            Provenance::Conversational,
+        );
+
+        let developer = vec![json!({"type": "input_text", "text": "you are an agent"})];
+        assert_eq!(
+            message_provenance("developer", &developer),
+            Provenance::Injected,
+        );
+
+        let env = vec![json!({
+            "type": "input_text",
+            "text": "<environment_context>cwd=/tmp</environment_context>",
+        })];
+        assert_eq!(message_provenance("user", &env), Provenance::Injected);
     }
 
     #[test]

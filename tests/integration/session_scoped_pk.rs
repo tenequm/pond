@@ -9,7 +9,7 @@ use lance::deps::arrow_array::{Array, Int32Array, StringArray};
 use pond::{
     handlers::ingest_events,
     sessions::{EMBEDDING_DIM, EmbeddingRow, IngestEvent, Store},
-    wire::{Message, Part, PartKind, ProviderOptions, Session},
+    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
@@ -46,6 +46,7 @@ fn replayed_part(session_id: &str, message_id: &str, text: &str) -> Part {
         id: format!("{message_id}:0000"),
         message_id: message_id.to_owned(),
         ordinal: 0,
+        provenance: Provenance::Conversational,
         options: ProviderOptions::new(),
         kind: PartKind::Text { text: s(text) },
     }
@@ -137,8 +138,11 @@ async fn assert_no_duplicate_pks(root: &Path) -> anyhow::Result<()> {
 }
 
 async fn assert_unique(root: &Path, table: &str, columns: &[&str]) -> anyhow::Result<()> {
+    // The lance-namespace Directory impl owns the `.lance` directory suffix
+    // (spec.md#catalog-seam); pond's table-name constants are bare logical
+    // names, so the on-disk dir is a single-suffix `<table>.lance`.
     let uri = root
-        .join(format!("{table}.lance.lance"))
+        .join(format!("{table}.lance"))
         .to_string_lossy()
         .into_owned();
     let dataset = Dataset::open(&uri).await?;

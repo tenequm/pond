@@ -143,15 +143,6 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]
 # max_embed_tokens = 2048
 
-# Background maintenance: `cleanup_old_versions` + `optimize_indices`, run by
-# `pond serve` on an interval and at the end of every `pond sync` (sync runs
-# regardless of `enabled`).
-#
-# [maintenance]
-# enabled = true          # run the background task under `pond serve`
-# interval_secs = 21600   # background pass interval (default 6h)
-# retention_days = 30     # cleanup_old_versions window (default 30 days)
-
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
 # an `s3://` / `gs://` / `az://` URI that needs auth or a non-default region.
@@ -179,8 +170,6 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
-    #[serde(default)]
-    pub maintenance: MaintenanceConfig,
     /// `[sources.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
     /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
@@ -199,35 +188,6 @@ pub struct Config {
     /// here override any matching environment variables.
     #[serde(default)]
     pub storage: BTreeMap<String, String>,
-}
-
-/// The `[maintenance]` section: background `cleanup_old_versions` +
-/// `optimize_indices` settings (spec.md#substrate). Durations are plain integers
-/// rather than humanized strings - one fewer parser, and `config.toml` stays
-/// trivially round-trippable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenanceConfig {
-    /// Whether `pond serve` spawns the background maintenance task. Sync's
-    /// tail-call to maintenance runs regardless of this flag.
-    #[serde(default = "default_maintenance_enabled")]
-    pub enabled: bool,
-    /// Background pass interval in seconds (default 6h).
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
-    /// `cleanup_old_versions` retention window in days (default 30).
-    #[serde(default = "default_retention_days")]
-    pub retention_days: u64,
-}
-
-impl Default for MaintenanceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_maintenance_enabled(),
-            interval_secs: default_interval_secs(),
-            retention_days: default_retention_days(),
-        }
-    }
 }
 
 /// `[embeddings]`: master switch, model registry, per-namespace overrides.
@@ -351,33 +311,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_maintenance_enabled() -> bool {
-    true
-}
-
-fn default_interval_secs() -> u64 {
-    21_600
-}
-
-fn default_retention_days() -> u64 {
-    30
-}
-
-impl MaintenanceConfig {
-    /// Reject a config that would spawn a maintenance task that cannot run:
-    /// a zero interval would busy-loop, a zero retention would be a no-op
-    /// cleanup. Only enforced when the background task is enabled.
-    pub fn validate(&self) -> Result<()> {
-        if self.enabled && self.interval_secs == 0 {
-            bail!("[maintenance] interval_secs must be greater than 0 when enabled");
-        }
-        if self.enabled && self.retention_days == 0 {
-            bail!("[maintenance] retention_days must be greater than 0 when enabled");
-        }
-        Ok(())
-    }
-}
-
 impl EmbeddingModel {
     /// Constructor for the configured default embedding model (spec.md#search).
     pub fn qwen3_default() -> Self {
@@ -421,7 +354,6 @@ impl Config {
         };
         config.embeddings.apply_builtin_defaults();
         config.embeddings.validate()?;
-        config.maintenance.validate()?;
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
