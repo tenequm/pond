@@ -892,13 +892,24 @@ impl Store {
     /// Create the FTS index on `messages` plus scalar indexes on content tables.
     pub async fn ensure_indices(&self) -> Result<()> {
         if self.handle.count_rows(Table::Messages).await? > 0 {
+            // Multilingual FTS: `ngram` is language-agnostic and inflection-
+            // tolerant; a whole-word tokenizer is neither. `stem` and
+            // `remove_stop_words` are per-language - they would corrupt or
+            // under-index non-English sessions - so both stay off, which also
+            // makes the index fully language-neutral.
+            let fts_params = InvertedIndexParams::default()
+                .base_tokenizer("ngram".to_owned())
+                .ngram_min_length(3)
+                .ngram_max_length(3)
+                .stem(false)
+                .remove_stop_words(false);
             self.handle
                 .ensure_index(
                     Table::Messages,
                     "search_text",
                     MESSAGES_FTS_INDEX,
                     IndexType::Inverted,
-                    &InvertedIndexParams::default(),
+                    &fts_params,
                 )
                 .await?;
             for (column, kind, name) in MESSAGE_SCALAR_INDICES {
