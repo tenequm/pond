@@ -1,4 +1,4 @@
-//! The embedding stage of `pond ingest`: the Qwen3 candle backend and the
+//! The embedding stage of `pond ingest`: the e5-small ONNX backend and the
 //! batch-oriented worker that populates the `embeddings` dataset. One message
 //! produces one vector - there is no chunking.
 //!
@@ -17,8 +17,8 @@ use crate::{
     sessions::{EmbeddingRow, PendingMessage, Store},
 };
 
-pub mod qwen3;
-pub use qwen3::Qwen3Embedder;
+pub mod e5_small;
+pub use e5_small::E5SmallEmbedder;
 
 /// Default ceiling on the number of messages in one model-inference + write
 /// batch. The cost budget below is the other, usually-binding, limiter.
@@ -35,13 +35,14 @@ pub const DEFAULT_BATCH_SIZE: usize = 32;
 /// `count * max_seq_len^2` instead makes a long message fall into its own small
 /// batch rather than dragging short ones up to its length.
 ///
-/// Sized so the bf16 attention tensor stays well under ~1.5 GB even for a
-/// 32-head model: `budget * heads * 2 bytes` = `24M * 32 * 2` ~= 1.5 GB; for
-/// the 16-head Qwen3-0.6B default it is ~0.77 GB. A single message capped at
-/// the default `max_embed_tokens` (1024) costs `1024^2` ~= 1.05M, so ~22 such
-/// messages still fit one batch; the count ceiling is the usual limiter and
-/// this budget is the safety net that catches a long message before it drags
-/// a whole count-sized batch up to its length.
+/// Sized so the padded attention-scores transient stays well-bounded. That
+/// transient is `[batch, heads, seq, seq]`; capping `count * max_seq_len^2` at
+/// 24M holds it to `24M * heads * 4 bytes` at fp32 - ~1.1 GB even for a 12-head
+/// encoder like e5-small, and proportionally less for narrower ones. A single
+/// message at the default `max_embed_tokens` (512) costs `512^2` ~= 262K, so
+/// the count ceiling is the usual limiter and this budget is the safety net
+/// that catches a long message before it drags a whole count-sized batch up to
+/// its length.
 ///
 /// [`crate::config::EmbeddingsConfig::validate`] rejects any configured
 /// `max_embed_tokens` whose single-message cost (`max_embed_tokens^2`) exceeds
@@ -129,19 +130,19 @@ fn cost_upper_bound(text: &str, max_embed_tokens: usize) -> usize {
     text.len().clamp(1, max_embed_tokens)
 }
 
-/// The retrieval task description baked into the Qwen3 query instruction.
-const QUERY_INSTRUCTION_TASK: &str =
-    "Given a search query, retrieve relevant messages from prior conversations";
-
-/// Format a search query with the Qwen3-Embedding instruction prefix. The model
-/// card prescribes `Instruct: {task}\nQuery: {query}` for the query side; the
-/// document side (chunks embedded by the worker) gets no prefix, so queries and
-/// documents are deliberately embedded asymmetrically.
-pub fn qwen3_query_instruction(query: &str) -> String {
-    format!("Instruct: {QUERY_INSTRUCTION_TASK}\nQuery: {query}")
+/// Prefix a search query for e5-small. e5 is an asymmetric retriever: its model
+/// card prescribes `query: ` on the search side, `passage: ` on documents.
+pub fn e5_query(query: &str) -> String {
+    format!("query: {query}")
 }
 
-/// A pluggable embedding backend. The real backend is [`Qwen3Embedder`];
+/// Prefix a document (one message's `search_text`) for e5-small - the
+/// `passage: ` half of the pair documented on [`e5_query`].
+pub fn e5_passage(text: &str) -> String {
+    format!("passage: {text}")
+}
+
+/// A pluggable embedding backend. The real backend is [`E5SmallEmbedder`];
 /// tests substitute an instrumented fake to assert batching behavior.
 pub trait EmbedBackend: Send + Sync {
     /// Embed a batch of texts. The returned vectors are L2-normalized and have
@@ -328,9 +329,10 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
                 continue;
             }
             summary.messages += 1;
-            // Move `search_text` out of the message: it is handed to the
-            // backend, and the embedding row never carries it.
-            let text = std::mem::take(&mut pending.search_text);
+            // Move `search_text` out and apply e5's `passage: ` prefix now, at
+            // staging time, so the length-sort and cost budget below size the
+            // real embed input. The embedding row never carries the text.
+            let text = e5_passage(&std::mem::take(&mut pending.search_text));
             window_bytes += text.len();
             let tokens = estimate_tokens(&text, self.max_embed_tokens);
             let cost_tokens = cost_upper_bound(&text, self.max_embed_tokens);
@@ -486,12 +488,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen3_query_instruction_wraps_the_query_in_the_model_card_prefix() {
-        let prompt = qwen3_query_instruction("how does retry backoff work");
-        // Model-card format: `Instruct: {task}\nQuery: {query}` - the query sits on
-        // its own line after the instruction and is never mutated, only prefixed.
-        assert!(prompt.starts_with("Instruct: "));
-        assert!(prompt.ends_with("\nQuery: how does retry backoff work"));
+    fn e5_prefixes_apply_the_asymmetric_retrieval_pair() {
+        assert_eq!(
+            e5_query("how does retry backoff work"),
+            "query: how does retry backoff work",
+        );
+        assert_eq!(
+            e5_passage("retry uses exponential backoff"),
+            "passage: retry uses exponential backoff",
+        );
     }
 
     #[test]

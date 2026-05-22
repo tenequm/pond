@@ -1996,7 +1996,7 @@ pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// Fixed embedding vector dimension for the configured default model (spec.md#search).
 /// A future model with a different dim activates a second `embeddings` table.
-pub const EMBEDDING_DIM: usize = 1024;
+pub const EMBEDDING_DIM: usize = 384;
 
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
@@ -3187,7 +3187,7 @@ mod tests {
                 EmbeddingRow {
                     message_id: format!("msg-{i}"),
                     model_id: model_id.to_owned(),
-                    max_embed_tokens: 1024,
+                    max_embed_tokens: 512,
                     vector,
                     session_id: format!("session-{}", i % 8),
                     source_agent: "claude-code".to_owned(),

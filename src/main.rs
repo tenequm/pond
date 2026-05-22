@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML},
-    embed::{BatchProgress, EmbedBackend, EmbedWorker, Qwen3Embedder},
+    embed::{BatchProgress, E5SmallEmbedder, EmbedBackend, EmbedWorker},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{AdapterStats, CorpusStats, RowTotals, Store},
     substrate::TableSizes,
@@ -422,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(config_path(config, &data_dir))?;
             let model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
-            let embedder = Qwen3Embedder::load(&model)?;
+            let embedder = E5SmallEmbedder::load(&model)?;
             // `indicatif` auto-detects tty and degrades to log-line output in
             // CI / non-tty contexts, so this is safe to always wire.
             let bar = ProgressBar::new_spinner();
@@ -470,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
-                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
             } else {
                 None
             };
@@ -488,7 +488,7 @@ async fn main() -> anyhow::Result<()> {
             let resolved_model = config::resolve_model(&config, model.as_deref(), &namespace)?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
             let embedder: Option<Arc<dyn EmbedBackend>> = if config.embeddings.enabled {
-                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
             } else {
                 None
             };
@@ -518,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
             let resolved_model = config::resolve_model(&loaded, model.as_deref(), &namespace)?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let embedder: Option<Arc<dyn EmbedBackend>> = if loaded.embeddings.enabled {
-                Some(Arc::new(Qwen3Embedder::load(&resolved_model)?))
+                Some(Arc::new(E5SmallEmbedder::load(&resolved_model)?))
             } else {
                 None
             };

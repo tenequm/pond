@@ -9,12 +9,14 @@ anstyle = "1"
 anyhow = "1.0.102"
 async-stream = "0.3.6"
 axum = "0.8.9"
-candle-core = "0.10.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
-cudarc = { version = "0.19.7", default-features = false, features = ["fallback-latest"], optional = true }
 dialoguer = { version = "0.12", default-features = false }
+# `ort-download-binaries` fetches a prebuilt ONNX Runtime at build time and
+# links it, so the pond binary is self-contained - no system `libonnxruntime`.
+# The rustls variant matches `hf-hub-rustls-tls`, keeping the build off OpenSSL.
+fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 fastrand = "2"
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
@@ -44,15 +46,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 
-# `ort` is a non-optional dependency of fastembed 5.13.4; `ort-load-dynamic`
-# keeps it from static-linking ONNX Runtime (or downloading the binary). pond's
-# Qwen3 path is pure candle and never dlopens onnxruntime, so this is free.
-[target.'cfg(target_os = "macos")'.dependencies]
-fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "ort-load-dynamic", "metal"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-fastembed = { version = "5.13.4", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "ort-load-dynamic"] }
-
 [dev-dependencies]
 # Also a regular dependency; declared here so integration tests can name
 # `MetricType` when asserting the distance-metric mapping.
@@ -81,15 +74,6 @@ harness = false
 name = "ingest_bench"
 harness = false
 
-[features]
-# Opt-in NVIDIA GPU embeddings for non-macOS builds: forwards to fastembed's
-# `cuda` feature (-> `candle-core/cuda`). Off by default because `candle-core/cuda`
-# needs the CUDA toolkit (`nvcc`) at build time - the default non-macOS build is
-# plain CPU candle and CI never enables this. Build on a CUDA host with
-# `cargo build --features cuda`; candle's `cuda_if_available` then selects the GPU
-# automatically (it returns CPU when this feature is not compiled in).
-cuda = ["fastembed/cuda", "dep:cudarc"]
-
 # `line-tables-only` keeps file/line info for panic and `RUST_BACKTRACE`
 # backtraces but drops the richer per-variable debuginfo only a step-debugger
 # uses. Less debuginfo for rustc to emit means faster codegen on every rebuild.
@@ -97,7 +81,7 @@ cuda = ["fastembed/cuda", "dep:cudarc"]
 debug = "line-tables-only"
 
 # Build dependencies optimized even in dev/test builds. The hot code lives in
-# the dependency graph (lance, candle, arrow); leaving it unoptimized makes
+# the dependency graph (lance, arrow, ONNX Runtime); leaving it unoptimized makes
 # `cargo test` and the embed worker crawl. pond's own crate stays unoptimized
 # and incremental, so the edit -> check -> test loop stays fast. One-time cost:
 # the dep graph is rebuilt once under this setting, then cached.

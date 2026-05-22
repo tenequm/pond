@@ -1040,7 +1040,7 @@ mod search_handler {
 
     use crate::{
         Clock, SystemClock,
-        embed::{EmbedBackend, qwen3_query_instruction},
+        embed::{EmbedBackend, e5_query},
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
@@ -1515,10 +1515,8 @@ mod search_handler {
     }
 
     fn embed_query(embedder: &dyn EmbedBackend, query: &str) -> Result<Vec<f32>, ErrorEnvelope> {
-        // The query side gets the Qwen3 instruction prefix; documents are embedded
-        // bare by the worker (model-card convention).
-        let prompt = qwen3_query_instruction(query);
-        // Model inference is synchronous and CPU/GPU-bound; `block_in_place` keeps
+        let prompt = e5_query(query);
+        // Model inference is synchronous and CPU-bound; `block_in_place` keeps
         // it from stalling other tasks on the async worker thread. (Requires a
         // multi-threaded runtime - see `pond_search`.)
         let vectors =
