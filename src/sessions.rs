@@ -637,12 +637,19 @@ impl Store {
         Ok(())
     }
 
-    /// Stream the backlog of un-embedded messages - those with indexed text
-    /// but a still-null `vector` (spec.md#search) - as [`PendingMessage`]s.
+    /// Stream the backlog of messages needing embedding: rows with `search_text`
+    /// set whose `vector` is null or whose `embedding_model` is not the
+    /// configured model (spec.md#embeddings-are-derived).
     pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
+            // `vector IS NULL` catches never-embedded rows; the `embedding_model`
+            // mismatch catches rows embedded under a prior model so a model swap
+            // re-embeds them (spec.md#embeddings-are-derived).
             let filter = Predicate::And(vec![
-                Predicate::IsNull("vector"),
+                Predicate::Or(vec![
+                    Predicate::IsNull("vector"),
+                    Predicate::Ne("embedding_model", embed::MODEL_ID.into()),
+                ]),
                 Predicate::IsNotNull("search_text"),
             ]);
             let projection: &[&str] = &["session_id", "id", "search_text"];
@@ -1863,6 +1870,11 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         "messages_source_agent_bitmap",
     ),
     ("role", BuiltinIndexType::Bitmap, "messages_role_bitmap"),
+    (
+        "embedding_model",
+        BuiltinIndexType::Bitmap,
+        "messages_embedding_model_bitmap",
+    ),
 ];
 
 /// Scalar indexes on `parts`: `(session_id, message_id)` is the hot-path lookup key for
@@ -1921,8 +1933,8 @@ pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 pub(crate) const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 
 /// Width of the `messages.vector` embedding column (spec.md#search) - the
-/// configured model's output dimension.
-pub const EMBEDDING_DIM: usize = 384;
+/// configured model's output dimension (`intfloat/multilingual-e5-base`).
+pub const EMBEDDING_DIM: usize = 768;
 
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.

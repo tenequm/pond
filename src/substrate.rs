@@ -106,6 +106,7 @@ impl From<i32> for ScalarValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     Eq(&'static str, ScalarValue),
+    Ne(&'static str, ScalarValue),
     IsNull(&'static str),
     IsNotNull(&'static str),
     In(&'static str, Vec<ScalarValue>),
@@ -118,11 +119,13 @@ pub enum Predicate {
     Gte(&'static str, ScalarValue),
     Lte(&'static str, ScalarValue),
     And(Vec<Predicate>),
+    Or(Vec<Predicate>),
 }
 impl Predicate {
     pub fn to_lance(&self) -> String {
         match self {
             Self::Eq(column, value) => format!("{column} = {}", value.to_lance()),
+            Self::Ne(column, value) => format!("{column} <> {}", value.to_lance()),
             Self::IsNull(column) => format!("{column} IS NULL"),
             Self::IsNotNull(column) => format!("{column} IS NOT NULL"),
             Self::In(column, values) => {
@@ -147,6 +150,21 @@ impl Predicate {
                 .filter(|predicate| !predicate.is_empty())
                 .collect::<Vec<_>>()
                 .join(" AND "),
+            Self::Or(predicates) => {
+                // Wrap in parens so the disjunction composes safely as a child
+                // of an outer `And` (SQL `OR` binds looser than `AND`).
+                let body = predicates
+                    .iter()
+                    .map(Self::to_lance)
+                    .filter(|predicate| !predicate.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!("({body})")
+                }
+            }
         }
     }
 }
@@ -435,9 +453,9 @@ impl Handle {
         .await
     }
 
-    /// Shared merge-insert path for [`Self::merge_insert`] and
-    /// [`Self::merge_update`]. Returns the number of rows affected (inserted
-    /// or updated, whichever the behaviors produce).
+    /// Shared merge path for [`Self::merge_insert`] and [`Self::merge_update`].
+    /// Returns the number of rows affected (inserted or updated, whichever the
+    /// behaviors produce).
     async fn merge(
         &self,
         table: Table,

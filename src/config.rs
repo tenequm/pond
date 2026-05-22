@@ -125,7 +125,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # [embeddings]
 # enabled = false
-# model = \"intfloat/multilingual-e5-small\"
+# model = \"intfloat/multilingual-e5-base\"
 
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is

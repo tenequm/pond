@@ -1,4 +1,4 @@
-//! The embedding stage: the e5-small ONNX backend and the batch-oriented
+//! The embedding stage: the e5 candle/Metal backend and the batch-oriented
 //! worker that fills `messages.vector` / `messages.embedding_model`
 //! (spec.md#search). One message produces one vector - there is no chunking.
 //!
@@ -13,18 +13,25 @@ use tokio_stream::StreamExt;
 
 use crate::sessions::{EMBEDDING_DIM, EmbeddedMessage, PendingMessage, Store};
 
-pub mod e5_small;
-pub use e5_small::E5SmallEmbedder;
+pub mod e5;
+pub use e5::E5Embedder;
 
 /// The one embedding model pond ships a loader for (spec.md#search).
 /// `config.embeddings.model` is validated against this; `pond embed` stamps it
 /// into `messages.embedding_model` with every vector.
-pub const MODEL_ID: &str = "intfloat/multilingual-e5-small";
+pub const MODEL_ID: &str = "intfloat/multilingual-e5-base";
 
-/// Messages per model-inference + write batch. A small fixed batch keeps the
-/// padded attention transient bounded without length-sorting machinery: e5
-/// truncates at 512 tokens, so even a worst-case batch stays modest.
+/// Messages per model-inference + write batch. e5 truncates at 512 tokens, so
+/// a 32-row batch's padded attention transient stays bounded.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
+
+/// Messages buffered and length-sorted before being cut into model batches.
+/// The tokenizer pads every batch to its longest member, so a batch mixing a short
+/// and a long message embeds the short one at the long one's length. Sorting a
+/// window first clusters similar-length messages, so each batch pads near its
+/// own longest, not the corpus worst case. Bounded so peak memory stays one
+/// window, not the whole backlog. See [`EmbedWorker::with_sort_window`].
+pub const DEFAULT_SORT_WINDOW: usize = 2048;
 
 /// IVF_PQ parameters for the `messages.vector` index, sized to the row count.
 /// Cosine metric: e5 vectors are L2-normalized. `num_sub_vectors = dim / 8`
@@ -49,20 +56,20 @@ fn ivf_num_partitions(num_rows: usize) -> usize {
     sqrt.clamp(32, 4096)
 }
 
-/// Prefix a search query for e5-small. e5 is an asymmetric retriever: its model
+/// Prefix a search query for e5. e5 is an asymmetric retriever: its model
 /// card prescribes `query: ` on the search side, `passage: ` on documents.
 pub fn e5_query(query: &str) -> String {
     format!("query: {query}")
 }
 
-/// Prefix a document (one message's `search_text`) for e5-small - the
+/// Prefix a document (one message's `search_text`) for e5 - the
 /// `passage: ` half of the pair documented on [`e5_query`].
 pub fn e5_passage(text: &str) -> String {
     format!("passage: {text}")
 }
 
 /// The embedding seam (spec.md#search): text in, vectors out. The real backend
-/// is [`E5SmallEmbedder`]; tests substitute an instrumented fake to assert
+/// is [`E5Embedder`]; tests substitute an instrumented fake to assert
 /// batching behavior. v1 has one model ([`MODEL_ID`]), so the seam needs no
 /// dimension or model-id accessor - the vector width is checked at the write
 /// boundary and the model id is the [`MODEL_ID`] constant.
@@ -106,6 +113,10 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
     /// production (embed everything), set by the benchmark harness to a fixed
     /// count so a run is a stable, comparable workload.
     limit: Option<usize>,
+    /// Messages buffered and length-sorted per `drain_window` pass
+    /// ([`DEFAULT_SORT_WINDOW`]); the benchmark sweeps it through
+    /// [`EmbedWorker::with_sort_window`].
+    sort_window: usize,
     /// Optional per-batch progress callback. Called once per `flush()` with
     /// the running totals; `pond embed` wires this to an `indicatif` bar.
     progress: Option<ProgressFn>,
@@ -120,8 +131,17 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             store,
             backend,
             limit: None,
+            sort_window: DEFAULT_SORT_WINDOW,
             progress: None,
         }
+    }
+
+    /// Override the length-sort window (default [`DEFAULT_SORT_WINDOW`]). The
+    /// benchmark harness sweeps this to size the padding-waste vs. throughput
+    /// trade-off; a window of [`DEFAULT_BATCH_SIZE`] disables sorting.
+    pub fn with_sort_window(mut self, window: usize) -> Self {
+        self.sort_window = window.max(DEFAULT_BATCH_SIZE);
+        self
     }
 
     /// Register a per-batch progress callback. Called once after each
@@ -149,24 +169,24 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
     /// page plus the staged batch - not the whole corpus.
     pub async fn run(&self) -> Result<EmbedSummary> {
         let mut summary = EmbedSummary::default();
-        let mut batch: Vec<PendingMessage> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut window: Vec<PendingMessage> = Vec::with_capacity(self.sort_window);
         let mut pulled = 0usize;
 
         let stream = self.store.pending_embedding_messages();
         tokio::pin!(stream);
         while let Some(pending) = stream.next().await {
-            // Stop pulling once the message cap is reached; the staged batch is
-            // still flushed below, so exactly `limit` messages are embedded.
+            // Stop pulling once the message cap is reached; the staged window
+            // is still drained below, so exactly `limit` messages are embedded.
             if self.limit.is_some_and(|limit| pulled >= limit) {
                 break;
             }
-            batch.push(pending?);
+            window.push(pending?);
             pulled += 1;
-            if batch.len() >= DEFAULT_BATCH_SIZE {
-                self.flush(&mut batch, &mut summary).await?;
+            if window.len() >= self.sort_window {
+                self.drain_window(&mut window, &mut summary).await?;
             }
         }
-        self.flush(&mut batch, &mut summary).await?;
+        self.drain_window(&mut window, &mut summary).await?;
 
         tracing::info!(
             model = MODEL_ID,
@@ -175,6 +195,31 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             "embed worker finished",
         );
         Ok(summary)
+    }
+
+    /// Length-sort the staged window, then hand it to the model in
+    /// [`DEFAULT_BATCH_SIZE`] chunks. The tokenizer pads every batch to its
+    /// longest member, so sorting first - clustering similar-length messages - makes
+    /// each batch pad near its own longest rather than the window's, which is
+    /// what cuts the padding waste. Empties `window`.
+    async fn drain_window(
+        &self,
+        window: &mut Vec<PendingMessage>,
+        summary: &mut EmbedSummary,
+    ) -> Result<()> {
+        if window.is_empty() {
+            return Ok(());
+        }
+        window.sort_unstable_by_key(|message| message.search_text.len());
+        let mut batch: Vec<PendingMessage> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        for message in window.drain(..) {
+            batch.push(message);
+            if batch.len() >= DEFAULT_BATCH_SIZE {
+                self.flush(&mut batch, summary).await?;
+            }
+        }
+        self.flush(&mut batch, summary).await?;
+        Ok(())
     }
 
     /// Embed the staged messages in one model call and write the resulting
