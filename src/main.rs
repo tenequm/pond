@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML},
-    embed::{BatchProgress, E5SmallEmbedder, EmbedBackend, EmbedWorker},
+    embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{AdapterStats, CorpusStats, RowTotals, Store},
     substrate::TableSizes,
@@ -403,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
-            let embedder = E5SmallEmbedder::load()?;
+            let embedder = E5Embedder::load()?;
             // `indicatif` auto-detects tty and degrades to log-line output in
             // CI / non-tty contexts, so this is safe to always wire.
             let bar = ProgressBar::new_spinner();
@@ -436,10 +436,11 @@ async fn main() -> anyhow::Result<()> {
                 summary.batches, summary.messages
             ));
             output(&format!(
-                "{} batches={} messages={}",
+                "{} batches={} messages={} device={}",
                 pond::output::paint("embed:", pond::output::dim()),
                 summary.batches,
                 summary.messages,
+                embedder.device(),
             ))?;
         }
         Command::Serve {
@@ -699,7 +700,7 @@ fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
 /// embed` loads the backend unconditionally.
 fn load_embedder(config: &Config) -> anyhow::Result<Option<Arc<dyn EmbedBackend>>> {
     Ok(if config.embeddings.enabled {
-        Some(Arc::new(E5SmallEmbedder::load()?))
+        Some(Arc::new(E5Embedder::load()?))
     } else {
         None
     })

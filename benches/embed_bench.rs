@@ -7,17 +7,20 @@
 //! - **peak memory** - a background thread samples process RSS; the report is
 //!   the max. Run the same workload over corpora of different sizes: if peak
 //!   RSS tracks the *limit* and not the *data*, memory is capped.
-//! - **throughput** - messages/sec and a per-batch elapsed breakdown.
-//! - **padding waste** - fastembed pads every batch to its longest member, so a
-//!   batch mixing short and long messages embeds the short ones at the long
-//!   one's length. `padding_waste` is the fraction of embedded token-bytes that
-//!   were padding, not content.
+//! - **throughput** - end-to-end messages/sec, split into pure e5 (candle)
+//!   inference vs. the merge-update store write, plus a per-batch breakdown.
+//!   The report also prints the device the model ran on (`metal` / `cpu`).
+//! - **padding waste** - the tokenizer pads every batch to its longest member,
+//!   so a batch mixing short and long messages embeds the short ones at the
+//!   long one's length. `padding_waste` is the fraction of embedded
+//!   token-bytes that were padding, not content.
 //!
 //! It links the `pond` library and uses only public API - changing the worker
 //! breaks this at `cargo check --benches`, so it cannot rot silently.
 //!
 //! Run (the `bench` profile is release-optimized):
 //!   cargo bench --bench embed_bench -- --limit 200
+//!   cargo bench --bench embed_bench -- --window 32   (length-sort disabled)
 
 use std::{
     path::{Path, PathBuf},
@@ -34,7 +37,7 @@ use anyhow::Result;
 use clap::Parser;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    embed::{E5SmallEmbedder, EmbedBackend, EmbedWorker},
+    embed::{DEFAULT_SORT_WINDOW, E5Embedder, EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
     sessions::Store,
 };
@@ -58,6 +61,10 @@ struct Args {
     /// RSS sampling interval in milliseconds.
     #[arg(long, default_value_t = 150)]
     rss_interval_ms: u64,
+    /// Length-sort window: messages buffered and sorted by length before model
+    /// batching. Omitted uses the worker default; `32` disables sorting.
+    #[arg(long)]
+    window: Option<usize>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -98,7 +105,7 @@ struct BatchStat {
 /// Wraps the real embedder, recording the shape and wall time of every
 /// `embed()` call - one call is one worker batch.
 struct InstrumentedBackend<'a> {
-    inner: &'a E5SmallEmbedder,
+    inner: &'a dyn EmbedBackend,
     calls: Mutex<Vec<BatchStat>>,
 }
 
@@ -236,16 +243,17 @@ async fn main() -> Result<()> {
     let (sessions, messages, parts) = store.row_counts().await?;
 
     // Start RSS sampling *before* model load: weight loading is a real
-    // transient (the ONNX model file is read and the ORT session built), and
-    // the report covers "the whole run, model load included", so the sampler
-    // must be live for it. No warmup beyond that: `pond embed` runs once and
-    // pays the cold start once, so the honest number includes it - the
+    // transient (the safetensors are mmap'd and the candle model is built on
+    // the GPU), and the report covers "the whole run, model load included", so
+    // the sampler must be live for it. No warmup beyond that: `pond embed` runs
+    // once and pays the cold start once, so the honest number includes it - the
     // per-batch table shows the cold-to-steady curve directly.
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
 
     let load_start = Instant::now();
-    let embedder = E5SmallEmbedder::load()?;
+    let embedder = E5Embedder::load()?;
     let load_elapsed = load_start.elapsed();
+    let device = embedder.device();
 
     let backend = InstrumentedBackend {
         inner: &embedder,
@@ -254,6 +262,9 @@ async fn main() -> Result<()> {
     let mut worker = EmbedWorker::new(&store, &backend);
     if args.limit > 0 {
         worker = worker.with_limit(args.limit);
+    }
+    if let Some(window) = args.window {
+        worker = worker.with_sort_window(window);
     }
     let embed_start = Instant::now();
     let summary = worker.run().await?;
@@ -265,6 +276,7 @@ async fn main() -> Result<()> {
     report(&Report {
         args: &args,
         corpus: &corpus,
+        device,
         sessions,
         messages,
         parts,
@@ -282,6 +294,7 @@ async fn main() -> Result<()> {
 struct Report<'a> {
     args: &'a Args,
     corpus: &'a Path,
+    device: &'a str,
     sessions: usize,
     messages: usize,
     parts: usize,
@@ -304,9 +317,22 @@ fn report(r: &Report<'_>) {
     };
     let peak_rss_mb = r.peak_rss_kb as f64 / 1024.0;
 
-    // Padding waste: fastembed pads each batch to its longest member, so the
-    // model embeds `count * max_bytes` token-bytes while only `sum_bytes` were
-    // real content. The gap is wasted compute.
+    // `embed_elapsed` wraps two costs per batch: the model call and the
+    // merge-update write of `messages.vector`. Split it - summed per-batch
+    // model time vs. the remainder (store writes) - so the report says which
+    // side is the bottleneck, not just a conflated end-to-end rate.
+    let model_ms: u128 = r.stats.iter().map(|s| s.elapsed_ms).sum();
+    let model_s = model_ms as f64 / 1000.0;
+    let write_s = (embed_s - model_s).max(0.0);
+    let model_msg_per_s = if model_s > 0.0 {
+        r.embedded as f64 / model_s
+    } else {
+        0.0
+    };
+
+    // Padding waste: the tokenizer pads each batch to its longest member, so
+    // the model embeds `count * max_bytes` token-bytes while only `sum_bytes`
+    // were real content. The gap is wasted compute.
     let padded: usize = r.stats.iter().map(|s| s.count * s.max_bytes).sum();
     let real: usize = r.stats.iter().map(|s| s.sum_bytes).sum();
     let waste_pct = if padded > 0 {
@@ -342,13 +368,16 @@ fn report(r: &Report<'_>) {
     };
 
     println!("=== pond embed bench ===");
+    let window = r.args.window.unwrap_or(DEFAULT_SORT_WINDOW);
     println!(
-        "config        limit={}",
+        "config        device={}  limit={}  sort-window={}",
+        r.device,
         if r.args.limit > 0 {
             r.args.limit.to_string()
         } else {
             "none".to_owned()
         },
+        window,
     );
     println!(
         "corpus        {}  sessions={} messages={} parts={}  (ingest {:.1}s)",
@@ -364,7 +393,9 @@ fn report(r: &Report<'_>) {
         "messages      {} embedded in {} batches",
         r.embedded, r.batches
     );
-    println!("wall          {embed_s:.1}s  ->  {msg_per_s:.2} msg/s");
+    println!("model         {model_s:.1}s  ->  {model_msg_per_s:.1} msg/s   (e5 inference only)");
+    println!("store write   {write_s:.1}s              (merge-update of messages.vector)");
+    println!("wall          {embed_s:.1}s  ->  {msg_per_s:.2} msg/s   (end-to-end)");
     println!("peak RSS      {peak_rss_mb:.0} MB   (over the whole run, model load included)");
     println!(
         "batch ms      p50={}  p90={}  max={}",
@@ -390,13 +421,18 @@ fn report(r: &Report<'_>) {
 
     // One-line machine-readable summary so two runs diff cleanly.
     let json = serde_json::json!({
+        "device": r.device,
         "limit": r.args.limit,
+        "sort_window": window,
         "messages": r.embedded,
         "batches": r.batches,
         "ingest_s": r.ingest_elapsed.as_secs_f64(),
         "model_load_s": r.load_elapsed.as_secs_f64(),
         "embed_wall_s": embed_s,
         "msg_per_s": msg_per_s,
+        "model_s": model_s,
+        "model_msg_per_s": model_msg_per_s,
+        "store_write_s": write_s,
         "peak_rss_mb": peak_rss_mb,
         "padding_waste_pct": waste_pct,
         "batch_ms_p50": pct(0.5),

@@ -13,11 +13,16 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
 dialoguer = { version = "0.12", default-features = false }
-# `ort-download-binaries` fetches a prebuilt ONNX Runtime at build time and
-# links it, so the pond binary is self-contained - no system `libonnxruntime`.
-# The rustls variant matches `hf-hub-rustls-tls`, keeping the build off OpenSSL.
-fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# Embedding stack for `intfloat/multilingual-e5-base` (XLM-RoBERTa) - see
+# `src/embed/e5.rs`. These declare the CPU baseline; the GPU backend is added
+# per target - Metal automatically on macOS via the `[target.*]` block below,
+# CUDA via the opt-in `cuda` feature. `hf-hub` fetches the weights,
+# `tokenizers` does the SentencePiece tokenization.
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
 fastrand = "2"
+hf-hub = "0.4"
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
 # Vendored protoc (protobuf-src) so builds need no system protoc. `lance`'s `protoc`
@@ -37,6 +42,7 @@ serde_json = "1.0.149"
 # bounded instead of materializing a multi-GiB value (see src/adapter/jsonl.rs).
 struson = "0.7"
 thiserror = "2.0.18"
+tokenizers = "0.21"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1.18"
 toml = "1.1"
@@ -45,6 +51,22 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
+
+# macOS always ships Metal as a system framework, so the embedding model gets
+# its GPU backend automatically here - a plain `cargo build` works on macOS
+# (Metal) and Linux (candle CPU) alike, with no feature flags. Linux + NVIDIA
+# opts into the GPU with `--features cuda` (see `[features]`).
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10", features = ["metal"] }
+candle-nn = { version = "0.10", features = ["metal"] }
+candle-transformers = { version = "0.10", features = ["metal"] }
+
+[features]
+# Opt-in NVIDIA GPU path: `cargo build --features cuda` on a Linux host with
+# the CUDA toolkit installed. macOS needs no feature - Metal is wired in via
+# the `[target.'cfg(target_os = "macos")']` block above. `select_device` in
+# `src/embed/e5.rs` picks the live backend at runtime.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
 # Also a regular dependency; declared here so integration tests can name
@@ -81,7 +103,7 @@ harness = false
 debug = "line-tables-only"
 
 # Build dependencies optimized even in dev/test builds. The hot code lives in
-# the dependency graph (lance, arrow, ONNX Runtime); leaving it unoptimized makes
+# the dependency graph (lance, arrow, candle); leaving it unoptimized makes
 # `cargo test` and the embed worker crawl. pond's own crate stays unoptimized
 # and incremental, so the edit -> check -> test loop stays fast. One-time cost:
 # the dep graph is rebuilt once under this setting, then cached.
