@@ -46,11 +46,11 @@ impl EmbedBackend for FakeBackend {
     }
 
     fn model_id(&self) -> &str {
-        "Qwen/Qwen3-Embedding-0.6B"
+        "intfloat/multilingual-e5-small"
     }
 
     fn max_embed_tokens(&self) -> i32 {
-        1024
+        512
     }
 }
 

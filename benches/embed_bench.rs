@@ -38,7 +38,7 @@ use pond::{
     config::Config,
     embed::{
         DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_SQ_BUDGET, DEFAULT_LENGTH_WINDOW,
-        DEFAULT_WINDOW_BYTE_BUDGET, EmbedBackend, EmbedWorker, Qwen3Embedder,
+        DEFAULT_WINDOW_BYTE_BUDGET, E5SmallEmbedder, EmbedBackend, EmbedWorker,
     },
     handlers::ingest_adapter,
     sessions::Store,
@@ -127,7 +127,7 @@ struct BatchStat {
 /// Wraps the real embedder, recording the shape and wall time of every
 /// `embed()` call - one call is one worker batch.
 struct InstrumentedBackend<'a> {
-    inner: &'a Qwen3Embedder,
+    inner: &'a E5SmallEmbedder,
     calls: Mutex<Vec<BatchStat>>,
 }
 
@@ -292,17 +292,16 @@ async fn main() -> Result<()> {
     let (sessions, messages, parts, _) = store.row_counts().await?;
 
     // Start RSS sampling *before* model load: weight loading is a real
-    // transient (the safetensors are mapped and the bf16 tensors built on the
-    // device), and the report covers "the whole run, model load included", so
-    // the sampler must be live for it. No warmup beyond that: `pond ingest`
-    // runs once and pays the cold start once, so the honest number includes it
-    // - the per-batch table shows the cold-to-steady curve directly.
+    // transient (the ONNX model file is read and the ORT session built), and
+    // the report covers "the whole run, model load included", so the sampler
+    // must be live for it. No warmup beyond that: `pond ingest` runs once and
+    // pays the cold start once, so the honest number includes it - the
+    // per-batch table shows the cold-to-steady curve directly.
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
 
     let load_start = Instant::now();
-    let embedder = Qwen3Embedder::load(&model)?;
+    let embedder = E5SmallEmbedder::load(&model)?;
     let load_elapsed = load_start.elapsed();
-    let device = embedder.device();
 
     let backend = InstrumentedBackend {
         inner: &embedder,
@@ -327,7 +326,6 @@ async fn main() -> Result<()> {
         args: &args,
         corpus: &corpus,
         model_id: &model.id,
-        device,
         sessions,
         messages,
         parts,
@@ -346,7 +344,6 @@ struct Report<'a> {
     args: &'a Args,
     corpus: &'a Path,
     model_id: &'a str,
-    device: &'a str,
     sessions: usize,
     messages: usize,
     parts: usize,
@@ -370,7 +367,7 @@ fn report(r: &Report<'_>) {
     let peak_rss_mb = r.peak_rss_kb as f64 / 1024.0;
 
     // Padding waste: fastembed pads each batch to its longest member, so the
-    // GPU embeds `count * max_bytes` token-bytes while only `sum_bytes` were
+    // model embeds `count * max_bytes` token-bytes while only `sum_bytes` were
     // real content. The gap is wasted compute.
     let padded: usize = r.stats.iter().map(|s| s.count * s.max_bytes).sum();
     let real: usize = r.stats.iter().map(|s| s.sum_bytes).sum();
@@ -407,7 +404,7 @@ fn report(r: &Report<'_>) {
     };
 
     println!("=== pond embed bench ===");
-    println!("config        model={}  device={}", r.model_id, r.device);
+    println!("config        model={}", r.model_id);
     println!(
         "              max_embed_tokens={}  batch_size={}  cost_budget={}",
         r.args
@@ -467,7 +464,6 @@ fn report(r: &Report<'_>) {
     // One-line machine-readable summary so two runs diff cleanly.
     let json = serde_json::json!({
         "model": r.model_id,
-        "device": r.device,
         "max_embed_tokens": r.args.max_embed_tokens,
         "batch_size": r.args.batch_size,
         "cost_budget": r.args.cost_budget,

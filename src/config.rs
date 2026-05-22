@@ -131,17 +131,17 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Register or tune an embedding model.
 #
 # [[embeddings.models]]
-# id = \"Qwen/Qwen3-Embedding-0.6B\"
-# dim = 1024
-# max_embed_tokens = 1024
-# num_sub_vectors = 64
+# id = \"intfloat/multilingual-e5-small\"
+# dim = 384
+# max_embed_tokens = 512
+# num_sub_vectors = 32
 # distance = \"cosine\"
 # normalize = true
 # default = true
 #
 # Per-namespace tunable overrides (immutable fields cannot be overridden):
-# [embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]
-# max_embed_tokens = 2048
+# [embeddings.overrides.local.\"intfloat/multilingual-e5-small\"]
+# max_embed_tokens = 256
 
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
@@ -211,8 +211,8 @@ pub struct EmbeddingsConfig {
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingModel {
     /// Registry id and the `model_id` PK component on the `embeddings` table.
-    /// Doubles as the HuggingFace repo passed to the loader - see `load_repo`,
-    /// which strips any `@revision` suffix used for cache invalidation.
+    /// `load_repo` strips any trailing `@revision` suffix from it for the
+    /// known-model check.
     pub id: String,
     /// Output vector dimension. Must match the known model's actual dim.
     pub dim: u32,
@@ -257,12 +257,12 @@ struct KnownModel {
     distance: Distance,
 }
 
-/// v1 ships a single loader path: the Qwen3 candle backend via
-/// `Qwen3TextEmbedding::from_hf`. Adding a model pond already knows how to load
-/// is config-only; a new loader still requires code (spec.md#datasets).
+/// v1 ships a single loader path: the e5-small ONNX backend via fastembed's
+/// `TextEmbedding`. Adding a model pond already knows how to load is
+/// config-only; a new loader still requires code (spec.md#datasets).
 const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
-    code: "Qwen/Qwen3-Embedding-0.6B",
-    dim: 1024,
+    code: "intfloat/multilingual-e5-small",
+    dim: 384,
     distance: Distance::Cosine,
 }];
 
@@ -313,24 +313,27 @@ fn default_true() -> bool {
 
 impl EmbeddingModel {
     /// Constructor for the configured default embedding model (spec.md#search).
-    pub fn qwen3_default() -> Self {
+    pub fn e5_small_default() -> Self {
         Self {
-            id: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
-            dim: 1024,
-            // ~98% of the measured corpus is under 1024 tokens (plan.md Stage
-            // 2); the tail is truncated for the vector but kept whole in
-            // BM25/FTS and `pond_get`. 1024 also keeps the per-message embed
-            // cost tiny - see `DEFAULT_BATCH_TOKEN_SQ_BUDGET`.
-            max_embed_tokens: 1024,
-            num_sub_vectors: 64,
+            id: "intfloat/multilingual-e5-small".to_owned(),
+            dim: 384,
+            // 512 is e5-small's training context; the tail past it is
+            // truncated for the vector but kept whole in BM25/FTS and
+            // `pond_get`. It also keeps the per-message embed cost tiny -
+            // see `DEFAULT_BATCH_TOKEN_SQ_BUDGET`.
+            max_embed_tokens: 512,
+            // 384-dim PQ: 32 sub-vectors -> 12-float subspaces, the textbook
+            // range. `num_sub_vectors` must divide `dim` (384 % 32 == 0).
+            num_sub_vectors: 32,
             distance: Distance::Cosine,
             normalize: true,
             default: true,
         }
     }
 
-    /// The HuggingFace repo id to load: `id` with any `@revision` suffix stripped.
-    /// `id` itself stays the logical identity (registry key + `model_id` PK).
+    /// `id` with any trailing `@revision` suffix stripped - the form checked
+    /// against the known-model set. `id` itself stays the logical identity
+    /// (registry key + `model_id` PK).
     pub fn load_repo(&self) -> &str {
         self.id
             .split_once('@')
@@ -535,7 +538,7 @@ pub fn resolve_model(
 }
 
 fn builtin_models() -> Vec<EmbeddingModel> {
-    vec![EmbeddingModel::qwen3_default()]
+    vec![EmbeddingModel::e5_small_default()]
 }
 
 /// Validate one `max_embed_tokens` value. Beyond a non-zero check, it must be
@@ -572,7 +575,7 @@ mod tests {
         let config = EmbeddingsConfig {
             models: vec![EmbeddingModel {
                 id: "bogus/model".to_owned(),
-                ..EmbeddingModel::qwen3_default()
+                ..EmbeddingModel::e5_small_default()
             }],
             ..EmbeddingsConfig::default()
         };
@@ -584,7 +587,7 @@ mod tests {
         let config = EmbeddingsConfig {
             models: vec![EmbeddingModel {
                 dim: 512,
-                ..EmbeddingModel::qwen3_default()
+                ..EmbeddingModel::e5_small_default()
             }],
             ..EmbeddingsConfig::default()
         };
@@ -596,7 +599,7 @@ mod tests {
         let no_default = EmbeddingsConfig {
             models: vec![EmbeddingModel {
                 default: false,
-                ..EmbeddingModel::qwen3_default()
+                ..EmbeddingModel::e5_small_default()
             }],
             ..EmbeddingsConfig::default()
         };
@@ -606,11 +609,11 @@ mod tests {
             models: vec![
                 EmbeddingModel {
                     id: "a".to_owned(),
-                    ..EmbeddingModel::qwen3_default()
+                    ..EmbeddingModel::e5_small_default()
                 },
                 EmbeddingModel {
                     id: "b".to_owned(),
-                    ..EmbeddingModel::qwen3_default()
+                    ..EmbeddingModel::e5_small_default()
                 },
             ],
             ..EmbeddingsConfig::default()
@@ -620,11 +623,11 @@ mod tests {
 
     #[test]
     fn registry_rejects_oversized_max_embed_tokens() {
-        // The built-in 1024 is well within the per-batch cost budget.
+        // The built-in 512 is well within the per-batch cost budget.
         let ok = EmbeddingsConfig {
             models: vec![EmbeddingModel {
-                max_embed_tokens: 1024,
-                ..EmbeddingModel::qwen3_default()
+                max_embed_tokens: 512,
+                ..EmbeddingModel::e5_small_default()
             }],
             ..EmbeddingsConfig::default()
         };
@@ -636,7 +639,7 @@ mod tests {
         let oversized = EmbeddingsConfig {
             models: vec![EmbeddingModel {
                 max_embed_tokens: 8192,
-                ..EmbeddingModel::qwen3_default()
+                ..EmbeddingModel::e5_small_default()
             }],
             ..EmbeddingsConfig::default()
         };
@@ -649,7 +652,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[embeddings.overrides.local.\"Qwen/Qwen3-Embedding-0.6B\"]\nmax_embed_tokens = 2048\n",
+            "[embeddings.overrides.local.\"intfloat/multilingual-e5-small\"]\nmax_embed_tokens = 256\n",
         )
         .unwrap();
 
@@ -660,7 +663,7 @@ mod tests {
                 .default_model("local")
                 .unwrap()
                 .max_embed_tokens,
-            2048,
+            256,
         );
         // The override is scoped to its namespace; others keep the built-in value.
         assert_eq!(
@@ -669,7 +672,7 @@ mod tests {
                 .default_model("other")
                 .unwrap()
                 .max_embed_tokens,
-            1024,
+            512,
         );
     }
 
@@ -690,7 +693,7 @@ mod tests {
         config.embeddings.validate().unwrap();
         assert_eq!(
             config.embeddings.default_model("local").unwrap().id,
-            "Qwen/Qwen3-Embedding-0.6B",
+            "intfloat/multilingual-e5-small",
         );
     }
 

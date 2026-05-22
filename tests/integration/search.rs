@@ -52,11 +52,11 @@ impl EmbedBackend for FakeBackend {
     // The fake stands in for the builtin model: `searchable_corpus` embeds the
     // fixtures with it, so vector search must scope to this identity to see them.
     fn model_id(&self) -> &str {
-        "Qwen/Qwen3-Embedding-0.6B"
+        "intfloat/multilingual-e5-small"
     }
 
     fn max_embed_tokens(&self) -> i32 {
-        1024
+        512
     }
 }
 

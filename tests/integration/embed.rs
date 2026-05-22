@@ -48,6 +48,7 @@ struct Call {
 struct FakeBackend {
     dim: usize,
     calls: Mutex<Vec<Call>>,
+    texts: Mutex<Vec<String>>,
 }
 
 impl FakeBackend {
@@ -55,11 +56,16 @@ impl FakeBackend {
         Self {
             dim,
             calls: Mutex::new(Vec::new()),
+            texts: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn texts(&self) -> Vec<String> {
+        self.texts.lock().unwrap().clone()
     }
 }
 
@@ -71,6 +77,7 @@ impl EmbedBackend for FakeBackend {
             min_bytes: lengths.clone().min().unwrap_or(0),
             max_bytes: lengths.max().unwrap_or(0),
         });
+        self.texts.lock().unwrap().extend(texts.iter().cloned());
         Ok(vec![vec![0.1; self.dim]; texts.len()])
     }
 
@@ -79,11 +86,11 @@ impl EmbedBackend for FakeBackend {
     }
 
     fn model_id(&self) -> &str {
-        "Qwen/Qwen3-Embedding-0.6B"
+        "intfloat/multilingual-e5-small"
     }
 
     fn max_embed_tokens(&self) -> i32 {
-        1024
+        512
     }
 }
 
@@ -141,6 +148,27 @@ async fn embed_worker_batches_inference_and_writes() -> anyhow::Result<()> {
     assert_eq!(again.messages, 0);
     assert!(backend.calls().is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn embed_worker_prefixes_documents_with_the_e5_passage_marker() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(FIXTURES);
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    let model = Config::builtin().embeddings.default_model("local")?;
+    let backend = FakeBackend::new(model.dim as usize);
+    let summary = EmbedWorker::new(&store, &backend, &model)?.run().await?;
+    assert!(summary.messages > 0, "fixtures should yield messages to embed");
+
+    let texts = backend.texts();
+    assert_eq!(texts.len(), summary.messages, "every message embedded once");
+    assert!(
+        texts.iter().all(|text| text.starts_with("passage: ")),
+        "the worker must prefix documents with e5's `passage: ` marker",
+    );
     Ok(())
 }
 
