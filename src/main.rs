@@ -394,11 +394,12 @@ async fn main() -> anyhow::Result<()> {
             // explicit full FTS rebuild on top - the recovery path for a
             // missing index or a changed tokenizer config.
             if reindex {
-                store.ensure_indices(true).await?;
-                output(&pond::output::paint(
-                    "reindex: FTS index rebuilt",
-                    pond::output::dim(),
-                ))?;
+                let msg = if store.ensure_indices(true).await? {
+                    "reindex: FTS index rebuilt"
+                } else {
+                    "reindex: no messages to index"
+                };
+                output(&pond::output::paint(msg, pond::output::dim()))?;
             }
             let unindexed = store.unindexed_message_backlog().await?;
             if unindexed > 0 {

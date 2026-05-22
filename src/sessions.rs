@@ -891,9 +891,11 @@ impl Store {
 
     /// Create the FTS index on `messages` plus scalar indexes on content tables.
     /// `force = true` rebuilds the FTS index even when it already exists - the
-    /// `pond sync --reindex` recovery path.
-    pub async fn ensure_indices(&self, force: bool) -> Result<()> {
-        if self.handle.count_rows(Table::Messages).await? > 0 {
+    /// `pond sync --reindex` recovery path. Returns whether `messages` held rows
+    /// to index; `false` means the FTS branch was a no-op (empty corpus).
+    pub async fn ensure_indices(&self, force: bool) -> Result<bool> {
+        let has_messages = self.handle.count_rows(Table::Messages).await? > 0;
+        if has_messages {
             // Multilingual FTS (spec.md#language-neutral-index): a character
             // `ngram` tokenizer is language-neutral and bridges inflection
             // with no per-language stemmer. The 3-5 gram range is the
@@ -936,7 +938,7 @@ impl Store {
                     .await?;
             }
         }
-        Ok(())
+        Ok(has_messages)
     }
 
     /// Write-path index upkeep (spec.md#index-upkeep): create indexes that do
