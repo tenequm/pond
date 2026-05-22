@@ -97,6 +97,10 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
+        /// Force a full FTS index rebuild after the sync - the recovery path
+        /// for a missing or incomplete index, or after a tokenizer change.
+        #[arg(long)]
+        reindex: bool,
     },
     /// Embed the un-embedded message backlog under the registered model.
     /// Idempotent: the PK is `(message_id, model_id, max_embed_tokens)`, so a
@@ -318,13 +322,15 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
-            render_status(&stats, &sizes)?;
+            let unindexed = store.unindexed_message_backlog().await?;
+            render_status(&stats, &sizes, unindexed)?;
         }
         Command::Sync {
             adapter,
             source_dir,
             data_dir,
             config,
+            reindex,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
@@ -384,8 +390,26 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             // Index create + incremental fold runs on the write path inside
-            // every ingest batch (spec.md#index-upkeep); `pond sync` no longer
-            // triggers it as a separate step.
+            // every ingest batch (spec.md#index-upkeep). `--reindex` adds an
+            // explicit full FTS rebuild on top - the recovery path for a
+            // missing index or a changed tokenizer config.
+            if reindex {
+                store.ensure_indices(true).await?;
+                output(&pond::output::paint(
+                    "reindex: FTS index rebuilt",
+                    pond::output::dim(),
+                ))?;
+            }
+            let unindexed = store.unindexed_message_backlog().await?;
+            if unindexed > 0 {
+                output(&pond::output::paint(
+                    &format!(
+                        "warning: FTS index incomplete ({unindexed} messages \
+                         unindexed) - run `pond sync --reindex` to rebuild"
+                    ),
+                    pond::output::yellow(),
+                ))?;
+            }
         }
         Command::Embed {
             data_dir,
@@ -999,8 +1023,8 @@ fn format_bytes(bytes: u64) -> String {
 /// totals line, and one section per adapter in registry order with a project
 /// table. Tables width-adapt via comfy-table; on non-TTY stdout (piped to a
 /// file or test) coloring strips automatically via `pond::output::paint`.
-fn render_status(stats: &CorpusStats, sizes: &TableSizes) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
+fn render_status(stats: &CorpusStats, sizes: &TableSizes, unindexed: usize) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint, yellow};
 
     output(&paint("pond status", bold()))?;
     output(&format!("{}  {}", paint("data-dir", dim()), stats.data_url))?;
@@ -1042,6 +1066,14 @@ fn render_status(stats: &CorpusStats, sizes: &TableSizes) -> anyhow::Result<()> 
         paint(&format_thousands(parts), bold()),
         paint(&format_thousands(embeddings), bold()),
     ))?;
+    if unindexed == 0 {
+        output(&format!("{}  complete", paint("fts index", dim())))?;
+    } else {
+        output(&paint(
+            &format!("fts index  {unindexed} messages unindexed - run `pond sync --reindex`"),
+            yellow(),
+        ))?;
+    }
     if !stats.include_subagents {
         output(&paint(
             "  note: totals above include sub-agent sessions; the rollup below shows main-agent only. Pass `--include-subagents` for the per-agent breakdown.",

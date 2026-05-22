@@ -890,17 +890,20 @@ impl Store {
     }
 
     /// Create the FTS index on `messages` plus scalar indexes on content tables.
-    pub async fn ensure_indices(&self) -> Result<()> {
+    /// `force = true` rebuilds the FTS index even when it already exists - the
+    /// `pond sync --reindex` recovery path.
+    pub async fn ensure_indices(&self, force: bool) -> Result<()> {
         if self.handle.count_rows(Table::Messages).await? > 0 {
-            // Multilingual FTS: `ngram` is language-agnostic and inflection-
-            // tolerant; a whole-word tokenizer is neither. `stem` and
-            // `remove_stop_words` are per-language - they would corrupt or
-            // under-index non-English sessions - so both stay off, which also
-            // makes the index fully language-neutral.
+            // Multilingual FTS (spec.md#language-neutral-index): a character
+            // `ngram` tokenizer is language-neutral and bridges inflection
+            // with no per-language stemmer. The 3-5 gram range is the
+            // retrieval-quality optimum - 4-5-grams discriminate, `min=3`
+            // keeps 3-char tokens (FTS, OCC) searchable. `stem` and
+            // `remove_stop_words` are per-language and stay off.
             let fts_params = InvertedIndexParams::default()
                 .base_tokenizer("ngram".to_owned())
                 .ngram_min_length(3)
-                .ngram_max_length(3)
+                .ngram_max_length(5)
                 .stem(false)
                 .remove_stop_words(false);
             self.handle
@@ -910,6 +913,7 @@ impl Store {
                     MESSAGES_FTS_INDEX,
                     IndexType::Inverted,
                     &fts_params,
+                    force,
                 )
                 .await?;
             for (column, kind, name) in MESSAGE_SCALAR_INDICES {
@@ -939,7 +943,7 @@ impl Store {
     /// not yet exist, then fold the newly-appended rows into each table's
     /// indexes incrementally. Runs at the tail of every ingest path.
     pub async fn index_upkeep(&self) -> Result<()> {
-        self.ensure_indices().await?;
+        self.ensure_indices(false).await?;
         for table in [Table::Sessions, Table::Messages, Table::Parts] {
             if self.handle.count_rows(table).await? > 0 {
                 self.handle.optimize_indices(table).await?;
@@ -987,6 +991,7 @@ impl Store {
                     "embeddings_vector_ivfpq",
                     IndexType::Vector,
                     &params,
+                    false,
                 )
                 .await?;
         }

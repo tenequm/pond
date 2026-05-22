@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
         |_| {},
     )
     .await?;
-    store.ensure_indices().await?;
+    store.ensure_indices(false).await?;
     let ingest_elapsed = ingest_start.elapsed();
     let (sessions, messages, parts, _) = store.row_counts().await?;
 

@@ -139,7 +139,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         matches!(envelope, IngestEnvelope::Success(_)),
         "synthetic ingest should succeed: {envelope:?}",
     );
-    store.ensure_indices().await?;
+    store.ensure_indices(false).await?;
 
     let model = Config::builtin().embeddings.default_model("local")?;
     let backend = FakeBackend {

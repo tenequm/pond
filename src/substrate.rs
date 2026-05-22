@@ -515,9 +515,12 @@ impl Handle {
             _ => IndexType::BTree,
         };
         let params = ScalarIndexParams::for_builtin(kind.clone());
-        self.ensure_index(table, column, name, index_type, &params)
+        self.ensure_index(table, column, name, index_type, &params, false)
             .await
     }
+    /// Create `name` on `table`.`column`. With `replace = false` the build is
+    /// skipped when an index of that name already exists; `replace = true`
+    /// forces a full rebuild - the `pond sync --reindex` recovery path.
     pub(crate) async fn ensure_index(
         &self,
         table: Table,
@@ -525,16 +528,25 @@ impl Handle {
         name: &str,
         index_type: IndexType,
         params: &dyn lance::index::IndexParams,
+        replace: bool,
     ) -> Result<()> {
         let mut guard = self.cached(table).lock().await;
         let mut dataset = guard.latest().await?;
-        let existing = dataset.load_indices().await?;
-        if existing.iter().any(|index| index.name == name) {
-            return Ok(());
+        if !replace {
+            let existing = dataset.load_indices().await?;
+            if existing.iter().any(|index| index.name == name) {
+                return Ok(());
+            }
         }
-        tracing::info!(index = name, column, "creating Lance index");
+        tracing::info!(index = name, column, replace, "creating Lance index");
         dataset
-            .create_index(&[column], index_type, Some(name.to_owned()), params, false)
+            .create_index(
+                &[column],
+                index_type,
+                Some(name.to_owned()),
+                params,
+                replace,
+            )
             .await
             .with_context(|| format!("failed to create index {name}"))?;
         guard.replace(dataset);
