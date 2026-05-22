@@ -1,9 +1,8 @@
-//! Configuration loading: the embedding-model registry and the background
-//! maintenance settings.
+//! Configuration loading: the `[embeddings]`, `[sources]`, and `[storage]`
+//! blocks.
 //!
-//! Built-in defaults are shipped in the binary so a pond instance with no
-//! `config.toml` still works; user config adds or overrides entries by `id`.
-//! `pond config --print-schema` emits [`DEFAULT_CONFIG_TOML`], the
+//! pond ships built-in defaults, so an instance with no `config.toml` still
+//! works. `pond config --print-schema` emits [`DEFAULT_CONFIG_TOML`], the
 //! fully-annotated example.
 
 use std::{
@@ -16,8 +15,6 @@ use lance_io::object_store::uri_to_url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
-
-use crate::embed::DEFAULT_BATCH_TOKEN_SQ_BUDGET;
 
 /// Parse a CLI / env `--data-dir` argument into a `Url`. Delegates to Lance's
 /// own `uri_to_url`, which handles every form pond cares about:
@@ -121,27 +118,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [sources.codex-cli]
 # path = \"~/.codex/sessions\"
 
-# Embeddings master switch. Default `false`: search runs FTS-only and the
-# model never loads. Set `true` to enable hybrid search. `pond embed` always
-# runs regardless, so vectors can be pre-populated before flipping the switch.
+# Embeddings. Default `enabled = false`: search runs FTS-only and no model is
+# loaded. Set `true` for hybrid search. `pond embed` runs regardless, so
+# vectors can be pre-populated before flipping the switch. `model` selects the
+# embedding model; the engine ships one loader.
 #
 # [embeddings]
 # enabled = false
-#
-# Register or tune an embedding model.
-#
-# [[embeddings.models]]
-# id = \"intfloat/multilingual-e5-small\"
-# dim = 384
-# max_embed_tokens = 512
-# num_sub_vectors = 32
-# distance = \"cosine\"
-# normalize = true
-# default = true
-#
-# Per-namespace tunable overrides (immutable fields cannot be overridden):
-# [embeddings.overrides.local.\"intfloat/multilingual-e5-small\"]
-# max_embed_tokens = 256
+# model = \"intfloat/multilingual-e5-small\"
 
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
@@ -190,81 +174,32 @@ pub struct Config {
     pub storage: BTreeMap<String, String>,
 }
 
-/// `[embeddings]`: master switch, model registry, per-namespace overrides.
-/// With `enabled = false` (the default), the search path never loads the
-/// model; `pond embed` runs regardless.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// `[embeddings]`: the master switch and the model selector. With
+/// `enabled = false` (the default) the search path never loads a model;
+/// `pond embed` runs regardless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// `[[embeddings.models]]` entries. User entries merge over built-ins by `id`.
-    #[serde(default)]
-    pub models: Vec<EmbeddingModel>,
-    /// `[embeddings.overrides.<namespace>.<model_id>]` tunable overrides.
-    #[serde(default)]
-    pub overrides: BTreeMap<String, BTreeMap<String, EmbeddingOverride>>,
+    /// The embedding model id (spec.md#search): configuration selects the
+    /// model, the engine supplies the loader. v1 ships exactly one loader.
+    #[serde(default = "default_model")]
+    pub model: String,
 }
 
-/// One `[[embeddings.models]]` registry entry (spec.md#datasets).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddingModel {
-    /// Registry id and the `model_id` PK component on the `embeddings` table.
-    /// `load_repo` strips any trailing `@revision` suffix from it for the
-    /// known-model check.
-    pub id: String,
-    /// Output vector dimension. Must match the known model's actual dim.
-    pub dim: u32,
-    /// Token cap on the text embedded per message. One message produces one
-    /// vector; the model's own ceiling is far higher, but a longer input still
-    /// collapses into a single vector, so this caps embed cost for the rare
-    /// giant message. Enforced as the tokenizer `max_length` at model load -
-    /// the full `search_text` still goes to the BM25 index uncapped.
-    pub max_embed_tokens: usize,
-    /// IVF_PQ `num_sub_vectors` for this model's vector index.
-    pub num_sub_vectors: usize,
-    #[serde(default = "default_distance")]
-    pub distance: Distance,
-    #[serde(default = "default_true")]
-    pub normalize: bool,
-    #[serde(default)]
-    pub default: bool,
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_model(),
+        }
+    }
 }
 
-/// Per-namespace tunable overrides. Immutable fields (`dim`, `distance`,
-/// `normalize`) cannot be overridden - they would invalidate stored vectors
-/// (spec.md#datasets).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddingOverride {
-    pub max_embed_tokens: Option<usize>,
-    pub num_sub_vectors: Option<usize>,
+fn default_model() -> String {
+    crate::embed::MODEL_ID.to_owned()
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Distance {
-    Cosine,
-    L2,
-    Dot,
-}
-
-/// A model pond knows how to load: the validation set for a model's load repo.
-struct KnownModel {
-    code: &'static str,
-    dim: u32,
-    distance: Distance,
-}
-
-/// v1 ships a single loader path: the e5-small ONNX backend via fastembed's
-/// `TextEmbedding`. Adding a model pond already knows how to load is
-/// config-only; a new loader still requires code (spec.md#datasets).
-const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
-    code: "intfloat/multilingual-e5-small",
-    dim: 384,
-    distance: Distance::Cosine,
-}];
 
 /// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
 /// wins (and may carry an `s3://` / `gs://` / `az://` URI); otherwise the
@@ -303,51 +238,12 @@ pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBu
     PathBuf::from(".pond.toml")
 }
 
-fn default_distance() -> Distance {
-    Distance::Cosine
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl EmbeddingModel {
-    /// Constructor for the configured default embedding model (spec.md#search).
-    pub fn e5_small_default() -> Self {
-        Self {
-            id: "intfloat/multilingual-e5-small".to_owned(),
-            dim: 384,
-            // 512 is e5-small's training context; the tail past it is
-            // truncated for the vector but kept whole in BM25/FTS and
-            // `pond_get`. It also keeps the per-message embed cost tiny -
-            // see `DEFAULT_BATCH_TOKEN_SQ_BUDGET`.
-            max_embed_tokens: 512,
-            // 384-dim PQ: 32 sub-vectors -> 12-float subspaces, the textbook
-            // range. `num_sub_vectors` must divide `dim` (384 % 32 == 0).
-            num_sub_vectors: 32,
-            distance: Distance::Cosine,
-            normalize: true,
-            default: true,
-        }
-    }
-
-    /// `id` with any trailing `@revision` suffix stripped - the form checked
-    /// against the known-model set. `id` itself stays the logical identity
-    /// (registry key + `model_id` PK).
-    pub fn load_repo(&self) -> &str {
-        self.id
-            .split_once('@')
-            .map_or(self.id.as_str(), |(repo, _)| repo)
-    }
-}
-
 impl Config {
-    /// Load `config.toml` from `path` if it exists, merge user `[[embeddings.models]]`
-    /// over the built-in defaults by `id`, expand `~` in source paths, and
-    /// validate the resolved registry. A missing file yields the built-in defaults.
+    /// Load `config.toml` from `path` if it exists and validate it. A missing
+    /// file yields the built-in defaults.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut config = if path.exists() {
+        let config = if path.exists() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read config {}", path.display()))?;
             toml::from_str::<Self>(&text)
@@ -355,19 +251,11 @@ impl Config {
         } else {
             Self::default()
         };
-        config.embeddings.apply_builtin_defaults();
         config.embeddings.validate()?;
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
         Ok(config)
-    }
-
-    /// The built-in defaults with no `config.toml` on disk.
-    pub fn builtin() -> Self {
-        let mut config = Self::default();
-        config.embeddings.apply_builtin_defaults();
-        config
     }
 
     /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. With
@@ -413,153 +301,19 @@ pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
 }
 
 impl EmbeddingsConfig {
-    /// Insert built-in registry entries that the user config did not override by `id`.
-    fn apply_builtin_defaults(&mut self) {
-        for builtin in builtin_models() {
-            if !self.models.iter().any(|model| model.id == builtin.id) {
-                self.models.push(builtin);
-            }
-        }
-    }
-
-    /// Validate the resolved registry against pond's known-model set: unknown
-    /// load repo, dim mismatch, unsupported distance, or not exactly one
-    /// `default = true` entry all fail startup with a clear error (spec.md#datasets).
+    /// The configured model must be one the engine has a loader for
+    /// (spec.md#search). v1 ships exactly one.
     pub fn validate(&self) -> Result<()> {
-        if self.models.is_empty() {
-            bail!("embeddings registry is empty");
+        if self.model != crate::embed::MODEL_ID {
+            bail!(
+                "embeddings.model {:?} is not a model pond can load; the engine \
+                 ships one loader: {:?}",
+                self.model,
+                crate::embed::MODEL_ID,
+            );
         }
-        for model in &self.models {
-            let known = KNOWN_MODELS
-                .iter()
-                .find(|known| known.code == model.load_repo())
-                .with_context(|| {
-                    format!(
-                        "embedding model {:?} uses unknown load repo {:?}; known repos: {}",
-                        model.id,
-                        model.load_repo(),
-                        KNOWN_MODELS
-                            .iter()
-                            .map(|known| known.code)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )
-                })?;
-            if model.dim != known.dim {
-                bail!(
-                    "embedding model {:?} declares dim {} but {} is {}",
-                    model.id,
-                    model.dim,
-                    known.code,
-                    known.dim,
-                );
-            }
-            if model.distance != known.distance {
-                bail!(
-                    "embedding model {:?} declares distance {:?} but {} requires {:?}",
-                    model.id,
-                    model.distance,
-                    known.code,
-                    known.distance,
-                );
-            }
-            check_max_embed_tokens(model.max_embed_tokens, &model.id)?;
-        }
-        // Namespace overrides can raise `max_embed_tokens` after the base
-        // registry is validated, so they must clear the same ceiling.
-        for (namespace, models) in &self.overrides {
-            for (model_id, over) in models {
-                if let Some(value) = over.max_embed_tokens {
-                    check_max_embed_tokens(
-                        value,
-                        &format!("{model_id} (override for namespace {namespace:?})"),
-                    )?;
-                }
-            }
-        }
-        match self.models.iter().filter(|model| model.default).count() {
-            1 => Ok(()),
-            0 => bail!("embeddings registry has no `default = true` model"),
-            n => bail!(
-                "embeddings registry has {n} `default = true` models; exactly one is required"
-            ),
-        }
+        Ok(())
     }
-
-    /// The single `default = true` entry, with any matching namespace override
-    /// applied. Assumes [`validate`](Self::validate) has passed.
-    pub fn default_model(&self, namespace: &str) -> Result<EmbeddingModel> {
-        let base = self
-            .models
-            .iter()
-            .find(|model| model.default)
-            .context("embeddings registry has no default model")?
-            .clone();
-        Ok(self.with_overrides(base, namespace))
-    }
-
-    /// Look up a model by `id`, with any matching namespace override applied.
-    pub fn model(&self, id: &str, namespace: &str) -> Result<EmbeddingModel> {
-        let base = self
-            .models
-            .iter()
-            .find(|model| model.id == id)
-            .with_context(|| format!("embedding model {id:?} not found in registry"))?
-            .clone();
-        Ok(self.with_overrides(base, namespace))
-    }
-
-    fn with_overrides(&self, mut model: EmbeddingModel, namespace: &str) -> EmbeddingModel {
-        if let Some(over) = self
-            .overrides
-            .get(namespace)
-            .and_then(|models| models.get(&model.id))
-        {
-            if let Some(value) = over.max_embed_tokens {
-                model.max_embed_tokens = value;
-            }
-            if let Some(value) = over.num_sub_vectors {
-                model.num_sub_vectors = value;
-            }
-        }
-        model
-    }
-}
-
-pub fn resolve_model(
-    config: &Config,
-    model: Option<&str>,
-    namespace: &str,
-) -> anyhow::Result<EmbeddingModel> {
-    match model {
-        Some(id) => config.embeddings.model(id, namespace),
-        None => config.embeddings.default_model(namespace),
-    }
-}
-
-fn builtin_models() -> Vec<EmbeddingModel> {
-    vec![EmbeddingModel::e5_small_default()]
-}
-
-/// Validate one `max_embed_tokens` value. Beyond a non-zero check, it must be
-/// small enough that a single message's attention cost (`max_embed_tokens^2`)
-/// fits one embedding batch's budget: cost-aware batching keeps a long message
-/// out of an oversized batch, but it cannot split a single message, so a
-/// message that does not fit a batch on its own would risk an out-of-memory
-/// inference pass. `label` identifies the offending registry entry or override.
-fn check_max_embed_tokens(value: usize, label: &str) -> Result<()> {
-    if value == 0 {
-        bail!("embedding model {label:?} max_embed_tokens must be greater than 0");
-    }
-    let cost = value.saturating_mul(value);
-    if cost > DEFAULT_BATCH_TOKEN_SQ_BUDGET {
-        bail!(
-            "embedding model {label:?} max_embed_tokens {value} is too large: a single \
-             message would cost {cost} token^2, over the {DEFAULT_BATCH_TOKEN_SQ_BUDGET} \
-             per-batch budget - a message must fit one embedding batch on its own"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -571,130 +325,32 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn registry_rejects_unknown_model() {
+    fn validate_rejects_an_unknown_model() {
         let config = EmbeddingsConfig {
-            models: vec![EmbeddingModel {
-                id: "bogus/model".to_owned(),
-                ..EmbeddingModel::e5_small_default()
-            }],
-            ..EmbeddingsConfig::default()
+            enabled: true,
+            model: "bogus/model".to_owned(),
         };
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn registry_rejects_dim_mismatch() {
-        let config = EmbeddingsConfig {
-            models: vec![EmbeddingModel {
-                dim: 512,
-                ..EmbeddingModel::e5_small_default()
-            }],
-            ..EmbeddingsConfig::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn registry_rejects_missing_and_duplicate_defaults() {
-        let no_default = EmbeddingsConfig {
-            models: vec![EmbeddingModel {
-                default: false,
-                ..EmbeddingModel::e5_small_default()
-            }],
-            ..EmbeddingsConfig::default()
-        };
-        assert!(no_default.validate().is_err());
-
-        let two_defaults = EmbeddingsConfig {
-            models: vec![
-                EmbeddingModel {
-                    id: "a".to_owned(),
-                    ..EmbeddingModel::e5_small_default()
-                },
-                EmbeddingModel {
-                    id: "b".to_owned(),
-                    ..EmbeddingModel::e5_small_default()
-                },
-            ],
-            ..EmbeddingsConfig::default()
-        };
-        assert!(two_defaults.validate().is_err());
-    }
-
-    #[test]
-    fn registry_rejects_oversized_max_embed_tokens() {
-        // The built-in 512 is well within the per-batch cost budget.
-        let ok = EmbeddingsConfig {
-            models: vec![EmbeddingModel {
-                max_embed_tokens: 512,
-                ..EmbeddingModel::e5_small_default()
-            }],
-            ..EmbeddingsConfig::default()
-        };
-        assert!(ok.validate().is_ok());
-
-        // A value whose single-message cost (`max_embed_tokens^2`) exceeds the
-        // batch budget is rejected: cost-aware batching cannot split one message,
-        // so a message that does not fit a batch alone would risk an OOM pass.
-        let oversized = EmbeddingsConfig {
-            models: vec![EmbeddingModel {
-                max_embed_tokens: 8192,
-                ..EmbeddingModel::e5_small_default()
-            }],
-            ..EmbeddingsConfig::default()
-        };
-        assert!(oversized.validate().is_err());
-    }
-
-    #[test]
-    fn config_load_merges_namespace_overrides() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[embeddings.overrides.local.\"intfloat/multilingual-e5-small\"]\nmax_embed_tokens = 256\n",
-        )
-        .unwrap();
-
-        let config = Config::load(&path).unwrap();
-        assert_eq!(
-            config
-                .embeddings
-                .default_model("local")
-                .unwrap()
-                .max_embed_tokens,
-            256,
-        );
-        // The override is scoped to its namespace; others keep the built-in value.
-        assert_eq!(
-            config
-                .embeddings
-                .default_model("other")
-                .unwrap()
-                .max_embed_tokens,
-            512,
-        );
+        assert!(EmbeddingsConfig::default().validate().is_ok());
     }
 
     #[test]
     fn config_load_missing_file_falls_back_to_builtin() {
         let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
-        assert_eq!(config.embeddings.models.len(), 1);
+        assert_eq!(config.embeddings, EmbeddingsConfig::default());
     }
 
     #[test]
-    fn default_config_toml_loads_to_the_builtin_registry() {
+    fn default_config_toml_loads_to_the_builtin_defaults() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
-        // The shipped template is all comments, so it must load and validate as the
-        // built-in registry - a malformed template fails right here.
+        // The shipped template is all comments, so it must load and validate as
+        // the built-in defaults - a malformed template fails right here.
         let config = Config::load(&path).unwrap();
-        config.embeddings.validate().unwrap();
-        assert_eq!(
-            config.embeddings.default_model("local").unwrap().id,
-            "intfloat/multilingual-e5-small",
-        );
+        assert_eq!(config.embeddings, EmbeddingsConfig::default());
+        assert!(!config.embeddings.enabled);
+        assert_eq!(config.embeddings.model, crate::embed::MODEL_ID);
     }
 
     #[test]

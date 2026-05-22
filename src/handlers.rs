@@ -1092,10 +1092,9 @@ mod search_handler {
     const INDEX_BACKLOG_WARN: usize = 10_000;
 
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
-    /// `embedder` is `Some` AND the store holds at least one embedding row for the
-    /// embedder's `(model_id, max_embed_tokens)` identity, FTS-only otherwise. The
-    /// response has no top-level mode field; per-hit `matched_via` reports the
-    /// retrievers that ranked each row.
+    /// `embedder` is `Some` AND at least one message is embedded under the
+    /// configured model, FTS-only otherwise. The response has no top-level mode
+    /// field; per-hit `matched_via` reports the retrievers that ranked each row.
     ///
     /// Must run on a multi-threaded Tokio runtime: hybrid mode embeds the query via
     /// `block_in_place`, which panics on a `current_thread` runtime.
@@ -1119,8 +1118,9 @@ mod search_handler {
         let mut plan = plan_search(request, SearchMode::Fts)?;
 
         // The mode is server-determined: hybrid only when both the embedder is
-        // loaded AND embeddings exist for its identity. Anything else degrades to
-        // FTS-only - a vector retriever over zero rows would just be wasted work.
+        // loaded AND messages are embedded under the configured model. Anything
+        // else degrades to FTS-only - a vector retriever over zero rows would
+        // just be wasted work.
         plan.mode = resolve_effective_mode(store, embedder).await?;
 
         // spec.md#index-upkeep: results stay correct against the not-yet-folded
@@ -1166,13 +1166,7 @@ mod search_handler {
                 };
                 let vector_fut = async {
                     store
-                        .vector_search(
-                            &vector,
-                            plan.vector_pool,
-                            &plan.filter,
-                            embedder.model_id(),
-                            embedder.max_embed_tokens(),
-                        )
+                        .vector_search(&vector, plan.vector_pool, &plan.filter)
                         .await
                         .map_err(map_storage)
                 };
@@ -1203,9 +1197,8 @@ mod search_handler {
             return Ok(empty_response(plan.group_by_conversation));
         }
 
-        // Hydrate hit metadata (timestamp, role, project, preview source) from the
-        // canonical `messages` table - the denormalized columns on `embeddings`
-        // exist for filter pushdown, not result hydration.
+        // Hydrate hit metadata (timestamp, role, project, preview source) from
+        // the `messages` table - the retrievers return only message keys.
         let keys = candidates
             .iter()
             .map(|candidate| MessageKey {
@@ -1280,19 +1273,16 @@ mod search_handler {
     }
 
     /// Pick the retrieval mode based on the embedder state. Hybrid requires both a
-    /// loaded embedder and at least one embedding row for its identity; otherwise
-    /// FTS-only.
+    /// loaded embedder and at least one message embedded under the configured
+    /// model; otherwise FTS-only.
     async fn resolve_effective_mode(
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
     ) -> Result<SearchMode, ErrorEnvelope> {
         match embedder {
             None => Ok(SearchMode::Fts),
-            Some(backend) => {
-                let has = store
-                    .has_embeddings(backend.model_id(), backend.max_embed_tokens())
-                    .await
-                    .map_err(map_storage)?;
+            Some(_) => {
+                let has = store.has_embeddings().await.map_err(map_storage)?;
                 Ok(if has {
                     SearchMode::Hybrid
                 } else {
@@ -1604,9 +1594,8 @@ mod search_handler {
     }
 
     /// Build the shared scalar filter predicate pushed into both retrievers.
-    /// Column names are identical on `messages` and `embeddings`
-    /// (spec.md#datasets / spec.md#datasets) so one
-    /// predicate serves both.
+    /// Both the FTS and vector retrievers scan `messages` (spec.md#datasets),
+    /// so one predicate serves both.
     pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
         let mut clauses = Vec::new();
 

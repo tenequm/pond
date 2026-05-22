@@ -1,24 +1,23 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
-//! Embedding stress-test harness: a parameterized, repeatable run of the real
-//! [`EmbedWorker`] over a corpus, instrumented for the three questions that
-//! matter when sizing the embedding path:
+//! Embedding stress-test harness: a repeatable run of the real [`EmbedWorker`]
+//! over a corpus, instrumented for the three questions that matter when sizing
+//! the embedding path:
 //!
 //! - **peak memory** - a background thread samples process RSS; the report is
-//!   the max. Run the same params over corpora of different sizes: if peak RSS
-//!   tracks the *params* and not the *data*, memory is capped.
+//!   the max. Run the same workload over corpora of different sizes: if peak
+//!   RSS tracks the *limit* and not the *data*, memory is capped.
 //! - **throughput** - messages/sec and a per-batch elapsed breakdown.
-//! - **why it is slow** - the padding-waste figure. fastembed pads every batch
-//!   to its longest member, so a batch mixing short and long messages embeds
-//!   the short ones at the long one's length. `padding_waste` is the fraction
-//!   of embedded token-bytes that were padding, not content.
+//! - **padding waste** - fastembed pads every batch to its longest member, so a
+//!   batch mixing short and long messages embeds the short ones at the long
+//!   one's length. `padding_waste` is the fraction of embedded token-bytes that
+//!   were padding, not content.
 //!
 //! It links the `pond` library and uses only public API - changing the worker
 //! breaks this at `cargo check --benches`, so it cannot rot silently.
 //!
 //! Run (the `bench` profile is release-optimized):
-//!   cargo bench --bench embed_bench -- --batch-size 16 --cost-budget 8000000
-//!   cargo bench --bench embed_bench -- --max-embed-tokens 4096   # stress a big cap
+//!   cargo bench --bench embed_bench -- --limit 200
 
 use std::{
     path::{Path, PathBuf},
@@ -35,11 +34,7 @@ use anyhow::Result;
 use clap::Parser;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    config::Config,
-    embed::{
-        DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_SQ_BUDGET, DEFAULT_LENGTH_WINDOW,
-        DEFAULT_WINDOW_BYTE_BUDGET, E5SmallEmbedder, EmbedBackend, EmbedWorker,
-    },
+    embed::{E5SmallEmbedder, EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
     sessions::Store,
 };
@@ -60,30 +55,6 @@ struct Args {
     /// the whole corpus).
     #[arg(long, default_value_t = 50)]
     limit: usize,
-    /// Config file for the model registry. Omitted: the built-in registry.
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Registry model id. Omitted: the registry default.
-    #[arg(long)]
-    model: Option<String>,
-    /// Override the model's `max_embed_tokens`. Bypasses config validation, so
-    /// a deliberately dangerous cap can be stress-tested here.
-    #[arg(long)]
-    max_embed_tokens: Option<usize>,
-    /// Worker batch-count ceiling.
-    #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
-    batch_size: usize,
-    /// Worker per-batch cost budget (`count * max_seq_len^2`).
-    #[arg(long, default_value_t = DEFAULT_BATCH_TOKEN_SQ_BUDGET)]
-    cost_budget: usize,
-    /// Pending messages buffered and length-sorted before batching - bigger
-    /// windows give better length-locality (less padding) at more buffered RAM.
-    #[arg(long, default_value_t = DEFAULT_LENGTH_WINDOW)]
-    window_size: usize,
-    /// Byte cap on one buffered window - the window drains on whichever of this
-    /// or `--window-size` is hit first. Bounds host RSS for large-message runs.
-    #[arg(long, default_value_t = DEFAULT_WINDOW_BYTE_BUDGET)]
-    window_byte_budget: usize,
     /// RSS sampling interval in milliseconds.
     #[arg(long, default_value_t = 150)]
     rss_interval_ms: u64,
@@ -167,18 +138,6 @@ impl EmbedBackend for InstrumentedBackend<'_> {
 
         Ok(vectors)
     }
-
-    fn dim(&self) -> usize {
-        self.inner.dim()
-    }
-
-    fn model_id(&self) -> &str {
-        self.inner.model_id()
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        self.inner.max_embed_tokens()
-    }
 }
 
 /// A background RSS sampler. `peak` holds the max RSS in KB seen so far; the
@@ -259,21 +218,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Resolve the model, applying the optional cap override directly on the
-    // struct - this deliberately bypasses `Config` validation so a dangerous
-    // `max_embed_tokens` can be measured rather than rejected.
-    let config = match &args.config {
-        Some(path) => Config::load(path)?,
-        None => Config::builtin(),
-    };
-    let mut model = match &args.model {
-        Some(id) => config.embeddings.model(id, "local")?,
-        None => config.embeddings.default_model("local")?,
-    };
-    if let Some(cap) = args.max_embed_tokens {
-        model.max_embed_tokens = cap;
-    }
-
     // Ingest sessions/messages/parts only - no model, fast. Not under
     // measurement, so the RSS sampler is not running yet.
     let corpus = args.corpus();
@@ -289,29 +233,25 @@ async fn main() -> Result<()> {
     .await?;
     store.ensure_indices(false).await?;
     let ingest_elapsed = ingest_start.elapsed();
-    let (sessions, messages, parts, _) = store.row_counts().await?;
+    let (sessions, messages, parts) = store.row_counts().await?;
 
     // Start RSS sampling *before* model load: weight loading is a real
     // transient (the ONNX model file is read and the ORT session built), and
     // the report covers "the whole run, model load included", so the sampler
-    // must be live for it. No warmup beyond that: `pond ingest` runs once and
+    // must be live for it. No warmup beyond that: `pond embed` runs once and
     // pays the cold start once, so the honest number includes it - the
     // per-batch table shows the cold-to-steady curve directly.
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
 
     let load_start = Instant::now();
-    let embedder = E5SmallEmbedder::load(&model)?;
+    let embedder = E5SmallEmbedder::load()?;
     let load_elapsed = load_start.elapsed();
 
     let backend = InstrumentedBackend {
         inner: &embedder,
         calls: Mutex::new(Vec::new()),
     };
-    let mut worker = EmbedWorker::new(&store, &backend, &model)?
-        .with_batch_size(args.batch_size)
-        .with_cost_budget(args.cost_budget)
-        .with_window_size(args.window_size)
-        .with_window_byte_budget(args.window_byte_budget);
+    let mut worker = EmbedWorker::new(&store, &backend);
     if args.limit > 0 {
         worker = worker.with_limit(args.limit);
     }
@@ -325,7 +265,6 @@ async fn main() -> Result<()> {
     report(&Report {
         args: &args,
         corpus: &corpus,
-        model_id: &model.id,
         sessions,
         messages,
         parts,
@@ -343,7 +282,6 @@ async fn main() -> Result<()> {
 struct Report<'a> {
     args: &'a Args,
     corpus: &'a Path,
-    model_id: &'a str,
     sessions: usize,
     messages: usize,
     parts: usize,
@@ -404,19 +342,8 @@ fn report(r: &Report<'_>) {
     };
 
     println!("=== pond embed bench ===");
-    println!("config        model={}", r.model_id);
     println!(
-        "              max_embed_tokens={}  batch_size={}  cost_budget={}",
-        r.args
-            .max_embed_tokens
-            .map_or_else(|| "registry".to_owned(), |c| c.to_string()),
-        r.args.batch_size,
-        r.args.cost_budget,
-    );
-    println!(
-        "              window={}  window_byte_budget={}  limit={}",
-        r.args.window_size,
-        human_bytes(r.args.window_byte_budget),
+        "config        limit={}",
         if r.args.limit > 0 {
             r.args.limit.to_string()
         } else {
@@ -463,12 +390,6 @@ fn report(r: &Report<'_>) {
 
     // One-line machine-readable summary so two runs diff cleanly.
     let json = serde_json::json!({
-        "model": r.model_id,
-        "max_embed_tokens": r.args.max_embed_tokens,
-        "batch_size": r.args.batch_size,
-        "cost_budget": r.args.cost_budget,
-        "window_size": r.args.window_size,
-        "window_byte_budget": r.args.window_byte_budget,
         "limit": r.args.limit,
         "messages": r.embedded,
         "batches": r.batches,

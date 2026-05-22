@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WriteMode};
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
@@ -30,7 +30,11 @@ use std::{
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use url::Url;
-pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 10_000;
+/// Embedded-row count at which pond builds the IVF_PQ vector index on
+/// `messages.vector` (spec.md#search). Below it, vector search runs a
+/// brute-force flat scan - exact and fast at small and medium scale, and
+/// IVF_PQ cannot train well on fewer vectors anyway.
+pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
 /// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
 /// against an OCC commit-conflict failure (spec.md#protocol). The wire layer
@@ -67,7 +71,7 @@ pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
     })
 }
 
-/// On-disk byte totals for the four session datasets, plus everything else
+/// On-disk byte totals for the three session datasets, plus everything else
 /// under the data-dir root. Sized by listing through Lance's object-store
 /// layer (spec.md#storage-via-lance) so `file://` and `s3://` behave alike.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,7 +79,6 @@ pub struct TableSizes {
     pub sessions: u64,
     pub messages: u64,
     pub parts: u64,
-    pub embeddings: u64,
     pub other: u64,
 }
 
@@ -103,6 +106,7 @@ impl From<i32> for ScalarValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     Eq(&'static str, ScalarValue),
+    IsNull(&'static str),
     IsNotNull(&'static str),
     In(&'static str, Vec<ScalarValue>),
     LikeContains(&'static str, String),
@@ -119,6 +123,7 @@ impl Predicate {
     pub fn to_lance(&self) -> String {
         match self {
             Self::Eq(column, value) => format!("{column} = {}", value.to_lance()),
+            Self::IsNull(column) => format!("{column} IS NULL"),
             Self::IsNotNull(column) => format!("{column} IS NOT NULL"),
             Self::In(column, values) => {
                 let values = values
@@ -183,12 +188,12 @@ impl ScalarValue {
 pub struct Handle {
     datasets: DatasetSet,
     retry: RetryPolicy,
-    /// One `lance::Session` shared across all four datasets. Carries the
+    /// One `lance::Session` shared across all three datasets. Carries the
     /// metadata + index caches and the `ObjectStoreRegistry` (which holds
     /// the underlying object_store / S3 client). Sharing the session means
-    /// one cache pool covers all four tables and one S3 client serves all
-    /// four datasets - load-bearing on object-store backends where a
-    /// per-dataset client would mean 4x the connection pools and 4x the
+    /// one cache pool covers all three tables and one S3 client serves all
+    /// three datasets - load-bearing on object-store backends where a
+    /// per-dataset client would mean 3x the connection pools and 3x the
     /// credential refreshes (lance/src/dataset/builder.rs:509-517).
     #[allow(dead_code)]
     session: Arc<Session>,
@@ -228,7 +233,6 @@ pub enum Table {
     Sessions,
     Messages,
     Parts,
-    Embeddings,
 }
 impl Table {
     fn label(self) -> &'static str {
@@ -236,7 +240,6 @@ impl Table {
             Self::Sessions => "sessions",
             Self::Messages => "messages",
             Self::Parts => "parts",
-            Self::Embeddings => "embeddings",
         }
     }
 }
@@ -245,7 +248,6 @@ struct DatasetSet {
     sessions: Mutex<CachedDataset>,
     messages: Mutex<CachedDataset>,
     parts: Mutex<CachedDataset>,
-    embeddings: Mutex<CachedDataset>,
 }
 #[derive(Debug)]
 struct CachedDataset {
@@ -286,9 +288,9 @@ impl Handle {
                 .await
                 .with_context(|| format!("failed to create data dir {}", path.display()))?;
         }
-        // One Session shared across all four datasets so metadata/index
+        // One Session shared across all three datasets so metadata/index
         // caches and the object_store registry (and thus any S3 client) are
-        // pooled rather than duplicated four times. `Session::default()`
+        // pooled rather than duplicated three times. `Session::default()`
         // ships sensible cache capacities (lance/src/dataset.rs:149,153)
         // and a default ObjectStoreRegistry that knows file/s3/gs/az.
         let session = Arc::new(Session::default());
@@ -363,19 +365,6 @@ impl Handle {
                     last_refresh: Instant::now(),
                     refresh_after,
                 }),
-                embeddings: Mutex::new(CachedDataset {
-                    dataset: open_or_create_via_ns(
-                        &nm,
-                        &nm_ident,
-                        sessions::EMBEDDINGS,
-                        sessions::embedding_schema(),
-                        &session,
-                        &storage_options,
-                    )
-                    .await?,
-                    last_refresh: Instant::now(),
-                    refresh_after,
-                }),
             },
             retry: RetryPolicy::default(),
             session,
@@ -397,59 +386,104 @@ impl Handle {
         &self.storage_options
     }
 
-    pub async fn row_counts(&self) -> Result<(usize, usize, usize, usize)> {
+    pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
         Ok((
             self.count_rows(Table::Sessions).await?,
             self.count_rows(Table::Messages).await?,
             self.count_rows(Table::Parts).await?,
-            self.count_rows(Table::Embeddings).await?,
         ))
     }
+
+    /// Insert-only merge: append new rows, never overwrite a matched PK
+    /// (`WhenMatched::DoNothing`). pond is durable storage, not a
+    /// source-derived cache; sync fills gaps. Returns rows inserted.
     pub(crate) async fn merge_insert(
         &self,
         table: Table,
         batch: RecordBatch,
         row_count: usize,
     ) -> Result<u64> {
+        self.merge(
+            table,
+            batch,
+            row_count,
+            "merge_insert",
+            WhenMatched::DoNothing,
+            WhenNotMatched::InsertAll,
+        )
+        .await
+    }
+
+    /// Update-only merge: a partial-schema source sets its columns on every
+    /// matched PK (`WhenMatched::UpdateAll`) and unmatched source rows are
+    /// dropped, never inserted. `pond embed` uses this to fill `vector` and
+    /// `embedding_model` on existing `messages` rows. Returns rows updated.
+    pub(crate) async fn merge_update(
+        &self,
+        table: Table,
+        batch: RecordBatch,
+        row_count: usize,
+    ) -> Result<u64> {
+        self.merge(
+            table,
+            batch,
+            row_count,
+            "merge_update",
+            WhenMatched::UpdateAll,
+            WhenNotMatched::DoNothing,
+        )
+        .await
+    }
+
+    /// Shared merge-insert path for [`Self::merge_insert`] and
+    /// [`Self::merge_update`]. Returns the number of rows affected (inserted
+    /// or updated, whichever the behaviors produce).
+    async fn merge(
+        &self,
+        table: Table,
+        batch: RecordBatch,
+        row_count: usize,
+        op: &'static str,
+        when_matched: WhenMatched,
+        when_not_matched: WhenNotMatched,
+    ) -> Result<u64> {
         if row_count == 0 {
             return Ok(0);
         }
-        let label = table.label();
         let started = Instant::now();
-        // Insert-only: pond is durable storage, not a source-derived
-        // cache. Sync fills gaps; matched rows are never overwritten.
-        // Field-level migrations are a separate, deferred operation.
-        let when_matched = WhenMatched::DoNothing;
         let result = self
-            .retry_lance(label, || async {
+            .retry_lance(table.label(), || async {
                 let mut cached = self.cached(table).lock().await;
                 let existing = cached.latest().await?;
                 let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
                 let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
                 builder.when_matched(when_matched.clone());
-                // pond's ingest contract is idempotent at the PK: callers may
-                // present the same row more than once in a single batch and
-                // the substrate keeps the first occurrence. Lance's default
-                // is to fail; FirstSeen aligns it with the contract.
+                builder.when_not_matched(when_not_matched.clone());
+                // pond presents each PK at most once per batch; FirstSeen keeps
+                // the first occurrence rather than failing (Lance's default).
                 builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
                 let (dataset, stats) = builder
                     .try_build()?
                     .execute_reader(Box::new(reader))
                     .await?;
                 cached.replace(dataset.as_ref().clone());
-                Ok((stats.num_inserted_rows, stats.num_skipped_duplicates))
+                Ok((
+                    stats.num_inserted_rows + stats.num_updated_rows,
+                    stats.num_skipped_duplicates,
+                ))
             })
             .await;
         let skipped = result.as_ref().map(|(_, s)| *s).unwrap_or(0);
         tracing::info!(
             target: "pond::perf",
-            table = %label,
+            op,
+            table = %table.label(),
             rows = row_count,
             elapsed_ms = started.elapsed().as_millis() as u64,
             skipped,
-            "merge_insert"
+            "merge",
         );
-        result.map(|(inserted, _)| inserted)
+        result.map(|(affected, _)| affected)
     }
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
         let mut cached = self.cached(table).lock().await;
@@ -509,13 +543,14 @@ impl Handle {
         column: &str,
         kind: &BuiltinIndexType,
         name: &str,
+        replace: bool,
     ) -> Result<()> {
         let index_type = match kind {
             BuiltinIndexType::Bitmap => IndexType::Bitmap,
             _ => IndexType::BTree,
         };
         let params = ScalarIndexParams::for_builtin(kind.clone());
-        self.ensure_index(table, column, name, index_type, &params, false)
+        self.ensure_index(table, column, name, index_type, &params, replace)
             .await
     }
     /// Create `name` on `table`.`column`. With `replace = false` the build is
@@ -552,8 +587,10 @@ impl Handle {
         guard.replace(dataset);
         Ok(())
     }
-    pub async fn embedding_index_names(&self) -> Result<Vec<String>> {
-        let dataset = self.dataset(Table::Embeddings).await?;
+    /// Names of every index on `messages` - the vector-index tests read this.
+    #[cfg(test)]
+    pub(crate) async fn messages_index_names(&self) -> Result<Vec<String>> {
+        let dataset = self.dataset(Table::Messages).await?;
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().map(|index| index.name.clone()).collect())
     }
@@ -614,7 +651,7 @@ impl Handle {
             .with_context(|| format!("namespace returned no location for table {table_name}"))
     }
 
-    /// On-disk byte totals for the four datasets plus the data-dir remainder.
+    /// On-disk byte totals for the three datasets plus the data-dir remainder.
     /// Every byte is sized by listing through Lance's object store
     /// (spec.md#storage-via-lance), identical for `file://` and `s3://`.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
@@ -649,24 +686,16 @@ impl Handle {
                 &self.table_location(sessions::PARTS).await?,
             )
             .await?;
-        let embeddings = self
-            .listed_size(
-                &registry,
-                &params,
-                &self.table_location(sessions::EMBEDDINGS).await?,
-            )
-            .await?;
-        // `other` is whatever sits under the data-dir root but not in the four
+        // `other` is whatever sits under the data-dir root but not in the three
         // tables (config.toml, stray index temp files): root total minus them.
         let root_total = self
             .listed_size(&registry, &params, self.location.as_str())
             .await?;
-        let other = root_total.saturating_sub(sessions + messages + parts + embeddings);
+        let other = root_total.saturating_sub(sessions + messages + parts);
         Ok(TableSizes {
             sessions,
             messages,
             parts,
-            embeddings,
             other,
         })
     }
@@ -694,7 +723,6 @@ impl Handle {
             Table::Sessions => &self.datasets.sessions,
             Table::Messages => &self.datasets.messages,
             Table::Parts => &self.datasets.parts,
-            Table::Embeddings => &self.datasets.embeddings,
         }
     }
     async fn retry_lance<T, Fut, Op>(&self, label: &str, mut operation: Op) -> Result<T>
@@ -868,7 +896,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Round-trip: opening a fresh data dir through `lance-namespace`
-    /// produces all four tables, and `Handle::scan` returns an empty batch
+    /// produces all three tables, and `Handle::scan` returns an empty batch
     /// for each (no spurious schema mismatch, no namespace error).
     #[tokio::test]
     async fn store_opens_via_namespace_and_scan_works() -> Result<()> {
@@ -878,11 +906,10 @@ mod tests {
         let handle = Handle::open(&url).await?;
         // Each table has its own PK column; project the canonical one so the
         // scan is exercised end-to-end (catalog -> dataset -> scanner -> batch).
-        let cases: [(Table, &[&str]); 4] = [
+        let cases: [(Table, &[&str]); 3] = [
             (Table::Sessions, &["id"]),
             (Table::Messages, &["id"]),
             (Table::Parts, &["id"]),
-            (Table::Embeddings, &["message_id"]),
         ];
         for (table, projection) in cases {
             let scanner = handle

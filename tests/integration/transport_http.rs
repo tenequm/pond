@@ -15,10 +15,9 @@ use axum::{
 use pond::{
     PROTOCOL_VERSION,
     adapter::ClaudeCodeAdapter,
-    config::Config,
     embed::{EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
-    sessions::Store,
+    sessions::{EMBEDDING_DIM, Store},
     transport::{AppState, http},
     wire::{ErrorCode, GetEnvelope, SearchEnvelope},
 };
@@ -29,34 +28,17 @@ use tower::ServiceExt;
 const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
-struct FakeBackend {
-    dim: usize,
-}
+struct FakeBackend;
 
 impl EmbedBackend for FakeBackend {
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .map(|text| fake_vector(text, self.dim))
-            .collect())
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        "intfloat/multilingual-e5-small"
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        512
+        Ok(texts.iter().map(|text| fake_vector(text)).collect())
     }
 }
 
-fn fake_vector(text: &str, dim: usize) -> Vec<f32> {
+fn fake_vector(text: &str) -> Vec<f32> {
     let bytes = text.as_bytes();
-    (0..dim)
+    (0..EMBEDDING_DIM)
         .map(|i| {
             let byte = bytes.get(i % bytes.len().max(1)).copied().unwrap_or(0);
             f32::from(byte) / 255.0
@@ -78,12 +60,9 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     .await?;
     store.ensure_indices(false).await?;
 
-    let model = Config::builtin().embeddings.default_model("local")?;
-    let backend = FakeBackend {
-        dim: model.dim as usize,
-    };
-    EmbedWorker::new(&store, &backend, &model)?.run().await?;
-    store.ensure_embedding_indices(&model).await?;
+    let backend = FakeBackend;
+    EmbedWorker::new(&store, &backend).run().await?;
+    store.ensure_embedding_indices().await?;
 
     let store = Arc::new(store);
     let state = AppState {

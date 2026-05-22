@@ -8,12 +8,11 @@
 
 use pond::{
     adapter::ClaudeCodeAdapter,
-    config::Config,
     embed::{EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
     handlers::pond_get,
     handlers::pond_search,
-    sessions::Store,
+    sessions::{EMBEDDING_DIM, Store},
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, Hit, ProjectFilter, SearchEnvelope, SearchFilters,
@@ -27,45 +26,20 @@ const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 /// An instrumented embedding backend: deterministic, content-dependent vectors,
 /// no model weights. Enough for the vector retriever to produce a stable,
 /// non-degenerate ranking and for the query side to embed.
-struct FakeBackend {
-    dim: usize,
-}
-
-impl FakeBackend {
-    fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
+struct FakeBackend;
 
 impl EmbedBackend for FakeBackend {
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .map(|text| pseudo_vector(text, self.dim))
-            .collect())
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    // The fake stands in for the builtin model: `searchable_corpus` embeds the
-    // fixtures with it, so vector search must scope to this identity to see them.
-    fn model_id(&self) -> &str {
-        "intfloat/multilingual-e5-small"
-    }
-
-    fn max_embed_tokens(&self) -> i32 {
-        512
+        Ok(texts.iter().map(|text| pseudo_vector(text)).collect())
     }
 }
 
 /// A deterministic pseudo-random vector seeded by the text's FNV-1a hash.
-fn pseudo_vector(text: &str, dim: usize) -> Vec<f32> {
+fn pseudo_vector(text: &str) -> Vec<f32> {
     let mut state = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
-    (0..dim)
+    (0..EMBEDDING_DIM)
         .map(|_| {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -86,10 +60,9 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     store.ensure_indices(false).await?;
 
-    let model = Config::builtin().embeddings.default_model("local")?;
-    let backend = FakeBackend::new(model.dim as usize);
-    EmbedWorker::new(&store, &backend, &model)?.run().await?;
-    store.ensure_embedding_indices(&model).await?;
+    let backend = FakeBackend;
+    EmbedWorker::new(&store, &backend).run().await?;
+    store.ensure_embedding_indices().await?;
     Ok((store, backend))
 }
 
