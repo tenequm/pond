@@ -1,0 +1,40 @@
+id	lang	stratum	query	ground_truth
+EN-NL-1	en	natural-language	how does OCC retry work when two writers conflict	prefix:94a50f23,d652b464
+EN-NL-2	en	natural-language	why are conflict errors surfaced as storage_unavailable instead of a typed conflict	prefix:94a50f23
+EN-NL-3	en	natural-language	why so many sessions marked as fresh on each sync rerun	prefix:9f0b8dcc,48cb87ea
+EN-NL-4	en	natural-language	could the adapter bug have been prevented by the seam contract	prefix:c110f401
+EN-NL-5	en	natural-language	why did we remove pond::Error	prefix:26ac628c
+EN-CON-1	en	conceptual	adapter seam correctness preventing synthesized values	prefix:94a50f23,0ad17ca6
+EN-CON-2	en	conceptual	native restore versus foreign restore fidelity	prefix:c110f401,9f0b8dcc
+EN-CON-3	en	conceptual	lossless round-trip test for restore	prefix:9f0b8dcc,26ac628c
+EN-CON-4	en	conceptual	embedding model selection for local session search	prefix:bc9f0e43
+EN-CON-5	en	conceptual	hybrid search combining FTS and vector ranking	prefix:94a50f23,dbddbe2e
+EN-CON-6	en	conceptual	multi-writer cron sync to a shared S3 bucket	prefix:d652b464
+EN-SYM-1	en	symbol-lookup	Extracted<T> Source primitive adapter	prefix:94a50f23
+EN-SYM-2	en	symbol-lookup	merge_insert SourceDedupeBehavior FirstSeen	prefix:94a50f23
+EN-SYM-3	en	symbol-lookup	shared-memory authority unique per test	prefix:d652b464
+EN-SYM-4	en	symbol-lookup	raw_record replay native serialize	prefix:9f0b8dcc
+EN-ERR-1	en	error-message	codex-cli schema error first row must be session_meta	prefix:9f0b8dcc
+EN-ERR-2	en	error-message	hook_success attachment stdout dropped on ingest	prefix:c110f401
+EN-ERR-3	en	error-message	duplicate rows same message id twice in search results	prefix:94a50f23
+EN-BK-1	en	bare-keyword	Lance manifest	prefix:d652b464
+EN-BK-2	en	bare-keyword	cargo nextest test binaries	prefix:4ad806f9
+EN-BK-3	en	bare-keyword	pond search vs kb relevance comparison	prefix:94a50f23,4ad806f9
+UK-NL-1	uk	natural-language	хто переміг у конфлікті США та Ірану	anchor:обидві сторони
+UK-NL-2	uk	natural-language	чи можеш змінити свою модель на опус посеред розмови	anchor:визначається при запуску
+UK-NL-3	uk	natural-language	чи вмієш ти перезапустити себе самостійно	anchor:немає такого механізму
+UK-NL-4	uk	natural-language	скільки часу контейнер лишається активним без повідомлень	anchor:тримається живим
+UK-NL-5	uk	natural-language	де зберігаються факти які ти про мене знаєш	anchor:Головне сховище
+UK-NL-6	uk	natural-language	що ти вмієш робити та які маєш можливості	anchor:Що я вмію
+UK-CON-1	uk	conceptual	механізм примусового завершення роботи контейнера	anchor:файл-сентинель
+UK-CON-2	uk	conceptual	управління таймаутом бездіяльності сесії	anchor:тримається живим
+UK-CON-3	uk	conceptual	сховище довготривалої памʼяті агента між сесіями	anchor:Головне сховище
+UK-CON-4	uk	conceptual	чому офіційні дипломатичні формулювання неоднозначні	anchor:розмите формулюв
+UK-CON-5	uk	conceptual	як зробити щоб модель автоматично запускалась на опусі	anchor:прописано в
+UK-CON-6	uk	conceptual	нейтральний підсумок міжнародного протистояння	anchor:перемир
+UK-BK-1	uk	bare-keyword	Ормузька протока	anchor:Ормуз
+UK-BK-2	uk	bare-keyword	іранський план десять пунктів	anchor:10 пунктів
+UK-BK-3	uk	bare-keyword	тариф нафта	anchor:тариф на нафту
+UK-BK-4	uk	bare-keyword	таймаут контейнера	anchor:тримається живим
+UK-BK-5	uk	bare-keyword	перемикання моделі опус	anchor:перемкнути
+UK-BK-6	uk	bare-keyword	пам'ять агента	anchor:Головне сховище

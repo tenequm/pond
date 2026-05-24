@@ -514,7 +514,12 @@ pub enum IngestStatus {
 }
 
 fn default_rrf_k() -> u32 {
-    60
+    // k=60 (Cormack/Clarke/Buettcher 2009) flattens the rank curve too aggressively
+    // for short-message corpora: rank 1 (1/61=0.0164) only narrowly beats rank 10
+    // (1/70=0.0143), so a handful of mediocre dual-arm matches outscore one strong
+    // single-arm match. k=10 keeps RRF's monotone-in-rank property but rewards the
+    // top of each retriever's list (rank 1 = 1/11 = 0.091 vs rank 10 = 1/20 = 0.05).
+    10
 }
 
 fn default_limit() -> usize {

@@ -1055,10 +1055,13 @@ mod search_handler {
     /// Internal-only branching enum for the retrieval mode. The wire layer doesn't
     /// expose this - per-hit `matched_via` already tells clients which retrievers
     /// ranked a row, and the request never asks for a specific mode.
+    // TEMP EXPERIMENT (embeddings-benchmark): `Vector` variant added so the harness
+    // can force vector-only retrieval via `POND_SEARCH_MODE=vector`. Revert before merge.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Hybrid,
         Fts,
+        Vector,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1084,8 +1087,87 @@ mod search_handler {
     const HIT_TEXT_FULL: usize = 2000;
     const HIT_SNIPPET_CHARS: usize = 400;
     /// Recency-boost constants (spec.md#search).
-    const RECENCY_MAX_BOOST: f64 = 0.2;
+    // Additive recency boost (spec.md#search). The cap is calibrated to act as
+    // a tiebreaker, not a primary signal: with RRF k=10 the fused base score
+    // tops out near 0.18 (dual-arm rank 1), so a 0.2-class boost would let a
+    // fresh-but-irrelevant hit outscore a perfectly-relevant old one. 0.05
+    // keeps recency at roughly 25% of a dual-arm rank-1 base, still material
+    // enough to break ties among comparably-scored hits but not enough to flip
+    // a strong relevance signal.
+    const RECENCY_MAX_BOOST: f64 = 0.05;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
+
+    // Asymmetric per-arm RRF k (Bruch, Gai, Ingber 2022 - "off-diagonal" finding,
+    // arXiv 2210.11934). For pond's keyword-heavy corpus FTS is the higher-
+    // precision arm, so we sharpen its rank curve (smaller k) and flatten the
+    // vector arm's (larger k). The wire-level `rrf_k` is treated as a global
+    // scaling parameter; we derive `k_fts = rrf_k / 2` and `k_vec = rrf_k * 2`
+    // from it so a caller raising or lowering `rrf_k` still slides both arms
+    // along the same axis. Sweep at `bench/embeddings/simulate_fusion.py`
+    // identified a wide plateau at k_fts in [5,8], k_vec in [15,20]; the
+    // (5, 20) centroid is the default.
+    fn rrf_k_for(arm: RetrieverKind, base: u32) -> u32 {
+        match arm {
+            RetrieverKind::Fts => (base / 2).max(1),
+            RetrieverKind::Vector => base.saturating_mul(2).max(1),
+        }
+    }
+
+    /// Per-query fusion config. The default (Latin-dominant queries) uses the
+    /// asymmetric `k_fts = rrf_k/2, k_vec = rrf_k*2` ratio that wins the
+    /// EN benchmark. When the query is non-Latin-dominant (cross-lingual:
+    /// Ukrainian/Russian/etc. query against a mostly-English corpus), the FTS
+    /// ngram tokenizer can no longer reach the answer; the vector arm becomes
+    /// the load-bearing signal, so we collapse to balanced k and double the
+    /// vector weight (`w_vec = 2`). See `docs/researches/uk-cross-lingual-
+    /// benchmark.md`.
+    struct FusionConfig {
+        k_fts: u32,
+        k_vec: u32,
+        w_fts: f64,
+        w_vec: f64,
+    }
+
+    fn fusion_config_for(query: &str, base_rrf_k: u32) -> FusionConfig {
+        if is_non_latin_dominant(query) {
+            FusionConfig {
+                k_fts: base_rrf_k,
+                k_vec: base_rrf_k,
+                w_fts: 1.0,
+                w_vec: 2.0,
+            }
+        } else {
+            FusionConfig {
+                k_fts: rrf_k_for(RetrieverKind::Fts, base_rrf_k),
+                k_vec: rrf_k_for(RetrieverKind::Vector, base_rrf_k),
+                w_fts: 1.0,
+                w_vec: 1.0,
+            }
+        }
+    }
+
+    /// Returns true when more than ~30% of the query's alphabetic characters
+    /// are non-Latin (Cyrillic, CJK, Greek, Arabic, etc.). A short heuristic
+    /// keyed off Unicode general-category rather than locale guessing: the
+    /// FTS arm's character-ngram tokenizer cannot bridge such queries to the
+    /// pond corpus's predominantly-English search_text, so the fusion needs
+    /// to lean on the vector arm.
+    fn is_non_latin_dominant(query: &str) -> bool {
+        let mut latin = 0usize;
+        let mut non_latin = 0usize;
+        for ch in query.chars() {
+            if ch.is_alphabetic() {
+                if ch.is_ascii() {
+                    latin += 1;
+                } else {
+                    non_latin += 1;
+                }
+            }
+        }
+        let total = latin + non_latin;
+        total > 0 && (non_latin * 10) >= (total * 3)
+    }
+
     /// Unindexed-row count above which `pond_search` logs that the FTS index is
     /// behind (spec.md#index-upkeep). Search results stay correct regardless -
     /// the engine flat-scans the not-yet-folded tail.
@@ -1171,17 +1253,29 @@ mod search_handler {
                         .map_err(map_storage)
                 };
                 let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
+                // Query-language-aware fusion config: Latin queries use the
+                // EN-tuned asymmetric k; non-Latin (cross-lingual) queries
+                // collapse to balanced k with vector-heavy weighting because
+                // the FTS arm cannot bridge across languages.
+                let cfg = fusion_config_for(&plan.query, plan.rrf_k);
+                // FTS first: when both arms picked different messages from the
+                // same session_root, RRF will keep FTS's representative (better
+                // for hit display since BM25 highlights the lexical match).
                 let lists = [
-                    RankedList {
-                        retriever: RetrieverKind::Vector,
-                        keys: vector_raw.into_iter().map(|(key, _)| key).collect(),
-                    },
                     RankedList {
                         retriever: RetrieverKind::Fts,
                         keys: fts.into_iter().map(|(key, _)| key).collect(),
+                        k: cfg.k_fts,
+                        weight: cfg.w_fts,
+                    },
+                    RankedList {
+                        retriever: RetrieverKind::Vector,
+                        keys: vector_raw.into_iter().map(|(key, _)| key).collect(),
+                        k: cfg.k_vec,
+                        weight: cfg.w_vec,
                     },
                 ];
-                rrf_merge(&lists, plan.rrf_k)
+                rrf_merge(&lists)
                     .into_iter()
                     .map(|hit| Candidate {
                         session_id: hit.key.session_id,
@@ -1190,6 +1284,21 @@ mod search_handler {
                         matched_via: hit.matched_via,
                     })
                     .collect()
+            }
+            // TEMP EXPERIMENT (embeddings-benchmark): vector-only retrieval for
+            // the FTS-vs-Vector-vs-Hybrid ablation. Revert before merge.
+            SearchMode::Vector => {
+                let Some(embedder) = embedder else {
+                    return Err(map_error(crate::Error::internal(
+                        "vector mode resolved without an embedder",
+                    )));
+                };
+                let vector = embed_query(embedder, &plan.query)?;
+                let vector_raw = store
+                    .vector_search(&vector, plan.vector_pool, &plan.filter)
+                    .await
+                    .map_err(map_storage)?;
+                normalize_vector(vector_raw)
             }
         };
 
@@ -1279,6 +1388,27 @@ mod search_handler {
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
     ) -> Result<SearchMode, ErrorEnvelope> {
+        // TEMP EXPERIMENT (embeddings-benchmark): `POND_SEARCH_MODE` overrides the
+        // server-decided mode so the harness can run the same query under
+        // {fts,vector,hybrid} against the same corpus. Revert before merge.
+        if let Ok(forced) = std::env::var("POND_SEARCH_MODE") {
+            let mode = match forced.as_str() {
+                "fts" => SearchMode::Fts,
+                "vector" => SearchMode::Vector,
+                "hybrid" => SearchMode::Hybrid,
+                other => {
+                    return Err(map_error(crate::Error::internal(format!(
+                        "POND_SEARCH_MODE must be one of fts|vector|hybrid, got `{other}`"
+                    ))));
+                }
+            };
+            if matches!(mode, SearchMode::Vector | SearchMode::Hybrid) && embedder.is_none() {
+                return Err(map_error(crate::Error::internal(format!(
+                    "POND_SEARCH_MODE=`{forced}` requires an embedder, but none is loaded"
+                ))));
+            }
+            return Ok(mode);
+        }
         match embedder {
             None => Ok(SearchMode::Fts),
             Some(_) => {
@@ -1350,10 +1480,23 @@ mod search_handler {
         }
     }
 
-    /// A retriever-ranked list of message primary keys, best-first.
+    /// A retriever-ranked list of message primary keys, best-first. `k` is the
+    /// RRF constant for THIS arm's contribution - asymmetric per-arm k lets
+    /// pond reward the more reliable arm's top ranks more sharply. For pond's
+    /// keyword-heavy corpus FTS is the higher-precision arm, so the call site
+    /// pairs `k_fts` ~5 (sharper) with `k_vec` ~20 (flatter); see RRF_K_FTS,
+    /// RRF_K_VECTOR. The asymmetric-k pattern is the "off-diagonal" finding of
+    /// Bruch, Gai, Ingber 2022 (arXiv 2210.11934).
     pub struct RankedList {
         pub retriever: RetrieverKind,
         pub keys: Vec<MessageKey>,
+        pub k: u32,
+        /// Linear multiplier on this arm's contributions, defaults to 1.0.
+        /// Used by the query-language router to up-weight the vector arm when
+        /// the query is non-Latin-dominant (cross-lingual): the FTS arm's
+        /// ngram tokenizer cannot bridge a Ukrainian query to an English
+        /// answer, so vector becomes the load-bearing arm.
+        pub weight: f64,
     }
 
     /// One merged RRF result.
@@ -1364,26 +1507,62 @@ mod search_handler {
         pub matched_via: Vec<String>,
     }
 
-    /// Reciprocal Rank Fusion: `sum(1 / (k + rank))` across the retrievers that
-    /// ranked each key (rank is 1-based). Returns hits sorted by score descending,
-    /// ties broken by `(session_id, message_id)` for determinism (spec.md#search).
-    pub fn rrf_merge(lists: &[RankedList], k: u32) -> Vec<RrfHit> {
-        let k = f64::from(k.max(1));
-        let mut merged: std::collections::HashMap<MessageKey, (f64, Vec<String>)> =
+    /// Conversation root for grouping and per-arm dedup. The Claude Code adapter
+    /// stores sub-agent sessions under ids of the form `<parent-uuid>/agent-<id>`;
+    /// stripping at the first `/` yields the user-facing conversation root. Other
+    /// adapters (codex, etc.) use ids without `/` and pass through unchanged.
+    fn session_root(session_id: &str) -> &str {
+        match session_id.find('/') {
+            Some(idx) => &session_id[..idx],
+            None => session_id,
+        }
+    }
+
+    /// Reciprocal Rank Fusion keyed on the conversation root: each retriever
+    /// contributes at most one ballot per session_root (the highest-ranked
+    /// message it returned for that root), and ballots are summed across
+    /// retrievers as `sum(1 / (k + rank))`. The representative message_id is
+    /// the first one each arm picked for the root; when both arms picked
+    /// different messages from the same root, the first arm in the `lists`
+    /// argument wins the representative (callers should list FTS first when
+    /// FTS-side provenance is preferred for the displayed hit). Ties break on
+    /// the representative key for determinism (spec.md#search).
+    ///
+    /// Why session-root keying instead of `(session_id, message_id)`: a long
+    /// session whose best FTS message and best vector message differ would
+    /// otherwise appear as two separate fused hits, neither getting the
+    /// cross-arm validation bonus. Keying on the root credits cross-arm
+    /// agreement at the conversation level - which is what the user sees.
+    pub fn rrf_merge(lists: &[RankedList]) -> Vec<RrfHit> {
+        let mut merged: std::collections::HashMap<String, (f64, Vec<String>, MessageKey)> =
             std::collections::HashMap::new();
         for list in lists {
-            for (rank, key) in list.keys.iter().enumerate() {
-                let contribution = 1.0 / (k + (rank as f64 + 1.0));
+            let k = f64::from(list.k.max(1));
+            let mut seen_in_arm: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // The rank that drives the RRF contribution is the position in the
+            // DEDUPED arm list, not the raw scanner output. Without this, an
+            // arm that returns several messages from one long session at its
+            // top inflates the ranks of every subsequent session by the size
+            // of the duplicate run, suppressing real cross-arm agreement.
+            let mut dedup_rank: usize = 0;
+            for key in &list.keys {
+                let root = session_root(&key.session_id).to_owned();
+                if !seen_in_arm.insert(root.clone()) {
+                    continue;
+                }
+                dedup_rank += 1;
+                let contribution = list.weight / (k + dedup_rank as f64);
                 let entry = merged
-                    .entry(key.clone())
-                    .or_insert_with(|| (0.0, Vec::new()));
+                    .entry(root)
+                    .or_insert_with(|| (0.0, Vec::new(), key.clone()));
                 entry.0 += contribution;
                 entry.1.push(list.retriever.as_wire().to_owned());
             }
         }
         let mut hits = merged
-            .into_iter()
-            .map(|(key, (score, matched_via))| RrfHit {
+            .into_values()
+            .map(|(score, matched_via, key)| RrfHit {
                 key,
                 score,
                 matched_via,
@@ -1399,8 +1578,8 @@ mod search_handler {
         hits
     }
 
-    /// Additive exponential-decay recency boost (spec.md#search): caps at `+0.2` at
-    /// `age = 0`, decays to near-zero past a few weeks.
+    /// Additive exponential-decay recency boost (spec.md#search): caps at
+    /// [`RECENCY_MAX_BOOST`] at `age = 0`, decays to near-zero past a few weeks.
     pub fn recency_boost(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
         #[allow(clippy::cast_precision_loss)]
         let age_seconds = (now - timestamp).num_seconds().max(0) as f64;
@@ -1504,6 +1683,23 @@ mod search_handler {
             .collect()
     }
 
+    // TEMP EXPERIMENT (embeddings-benchmark): rank-based normalization for vector-only
+    // mode. The raw `_distance` is cosine distance from Lance; converting to a
+    // monotone-in-rank `[0, 1]` score keeps the Hit payload comparable to FTS and
+    // Hybrid (where `base_score` is also monotone in rank). Revert before merge.
+    fn normalize_vector(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
+        let n = hits.len() as f64;
+        hits.into_iter()
+            .enumerate()
+            .map(|(idx, (key, _))| Candidate {
+                session_id: key.session_id,
+                message_id: key.message_id,
+                base_score: if n > 0.0 { 1.0 - (idx as f64 / n) } else { 0.0 },
+                matched_via: vec![RetrieverKind::Vector.as_wire().to_owned()],
+            })
+            .collect()
+    }
+
     fn embed_query(embedder: &dyn EmbedBackend, query: &str) -> Result<Vec<f32>, ErrorEnvelope> {
         let prompt = e5_query(query);
         // Model inference is synchronous and CPU-bound; `block_in_place` keeps
@@ -1541,22 +1737,24 @@ mod search_handler {
             snippet: Option<String>,
             best_score: f64,
         }
+        // Key by conversation root: a Claude Code sub-agent session under
+        // `<parent>/agent-<id>` collapses into its parent, so one user-facing
+        // conversation never occupies two slots in the grouped output.
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
         for hit in scored {
-            let entry = groups
-                .entry(hit.meta.session_id.clone())
-                .or_insert_with(|| {
-                    let (text, snippet) = hit_payload(&hit.meta.search_text, query);
-                    Acc {
-                        project: hit.meta.project.clone(),
-                        source_agent: hit.meta.source_agent.clone(),
-                        first_timestamp: hit.meta.timestamp,
-                        last_timestamp: hit.meta.timestamp,
-                        text,
-                        snippet,
-                        best_score: hit.score,
-                    }
-                });
+            let root = session_root(&hit.meta.session_id).to_owned();
+            let entry = groups.entry(root).or_insert_with(|| {
+                let (text, snippet) = hit_payload(&hit.meta.search_text, query);
+                Acc {
+                    project: hit.meta.project.clone(),
+                    source_agent: hit.meta.source_agent.clone(),
+                    first_timestamp: hit.meta.timestamp,
+                    last_timestamp: hit.meta.timestamp,
+                    text,
+                    snippet,
+                    best_score: hit.score,
+                }
+            });
             entry.first_timestamp = entry.first_timestamp.min(hit.meta.timestamp);
             entry.last_timestamp = entry.last_timestamp.max(hit.meta.timestamp);
             entry.best_score = entry.best_score.max(hit.score);
@@ -1671,6 +1869,142 @@ mod search_handler {
             request_id: new_request_id(),
         }
     }
+
+    #[cfg(test)]
+    mod fusion_helpers_tests {
+        use super::*;
+
+        #[test]
+        fn session_root_strips_agent_suffix_for_claude_code_subagents() {
+            assert_eq!(
+                session_root("94a50f23-1234-5678-9abc-def012345678"),
+                "94a50f23-1234-5678-9abc-def012345678",
+            );
+            assert_eq!(
+                session_root("94a50f23-1234-5678-9abc-def012345678/agent-abc123"),
+                "94a50f23-1234-5678-9abc-def012345678",
+            );
+            // Multiple slashes: still cut at the first one (defensive).
+            assert_eq!(session_root("root/a/b"), "root");
+        }
+
+        #[test]
+        fn rrf_merge_dedupes_intra_arm_by_session_root_and_credits_cross_arm() {
+            let mk = |sid: &str, mid: &str| crate::sessions::MessageKey {
+                session_id: sid.to_owned(),
+                message_id: mid.to_owned(),
+            };
+            // FTS: session-A msg-1 (rank 1), session-A msg-2 (rank 2, same root,
+            // dropped by intra-arm dedup), session-B msg-3 (rank 3 -> effective 2),
+            // session-A/agent-x msg-4 (rank 4, same root as A, dropped).
+            // Vector: session-B msg-7 (rank 1, different message than FTS's pick
+            // for B), session-A msg-9 (rank 2).
+            let fts = RankedList {
+                retriever: RetrieverKind::Fts,
+                keys: vec![
+                    mk("session-A", "msg-1"),
+                    mk("session-A", "msg-2"),
+                    mk("session-B", "msg-3"),
+                    mk("session-A/agent-x", "msg-4"),
+                ],
+                k: 10,
+                weight: 1.0,
+            };
+            let vec_arm = RankedList {
+                retriever: RetrieverKind::Vector,
+                keys: vec![mk("session-B", "msg-7"), mk("session-A", "msg-9")],
+                k: 10,
+                weight: 1.0,
+            };
+            let merged = rrf_merge(&[fts, vec_arm]);
+            // Output: one row per session_root, sorted by fused score.
+            assert_eq!(merged.len(), 2);
+            // session-A: FTS rank 1 (1/11) + Vector rank 2 (1/12) = 0.174
+            // session-B: FTS rank 2 (1/12) + Vector rank 1 (1/11) = 0.174
+            // Equal fused scores; tie breaks on the representative key, where
+            // session-A's `msg-1` sorts before session-B's `msg-3`.
+            assert_eq!(merged[0].key.session_id, "session-A");
+            assert_eq!(merged[0].key.message_id, "msg-1");
+            assert_eq!(merged[0].matched_via, vec!["fts", "vector"]);
+            assert_eq!(merged[1].key.session_id, "session-B");
+            // FTS was listed first, so FTS's pick (msg-3) wins the representative
+            // over Vector's pick (msg-7) for session-B.
+            assert_eq!(merged[1].key.message_id, "msg-3");
+            assert_eq!(merged[1].matched_via, vec!["fts", "vector"]);
+        }
+
+        #[test]
+        fn fusion_config_routes_by_query_language() {
+            // Latin-dominant queries get the EN-tuned asymmetric setup.
+            let en = fusion_config_for("how does OCC retry work", 10);
+            assert_eq!(en.k_fts, 5);
+            assert_eq!(en.k_vec, 20);
+            assert!((en.w_fts - 1.0).abs() < 1e-9);
+            assert!((en.w_vec - 1.0).abs() < 1e-9);
+            // Non-Latin-dominant queries (Ukrainian/Cyrillic) collapse to
+            // balanced k with double vector weight.
+            let uk = fusion_config_for("як працює OCC retry коли два писці", 10);
+            assert_eq!(uk.k_fts, 10);
+            assert_eq!(uk.k_vec, 10);
+            assert!((uk.w_vec - 2.0).abs() < 1e-9);
+            // Mixed queries with isolated identifiers stay Latin-dominant.
+            let mixed = fusion_config_for("Extracted<T> Source primitive адаптер", 10);
+            assert_eq!(mixed.k_fts, 5);
+            assert_eq!(mixed.k_vec, 20);
+        }
+
+        #[test]
+        fn is_non_latin_dominant_threshold_is_thirty_percent() {
+            assert!(!is_non_latin_dominant("how does OCC retry work"));
+            assert!(is_non_latin_dominant("як працює OCC retry"));
+            // Threshold ~30%: a query with a single Cyrillic word among
+            // mostly-English text stays Latin-dominant unless the Cyrillic
+            // fraction crosses 30% of alphabetic characters.
+            assert!(is_non_latin_dominant("test тест"));
+            assert!(!is_non_latin_dominant("how does this work then тест"));
+        }
+
+        #[test]
+        fn asymmetric_k_sharpens_fts_and_flattens_vector() {
+            let mk = |sid: &str, mid: &str| crate::sessions::MessageKey {
+                session_id: sid.to_owned(),
+                message_id: mid.to_owned(),
+            };
+            // Scenario: a single-arm FTS rank-1 hit (target) versus a dual-arm
+            // hit whose FTS rank is mediocre but vector rank is high.
+            //   target: FTS rank 1, NOT in vector.
+            //   noise:  FTS rank 3, vector rank 1.
+            // Under equal k=10, target = 1/11 = 0.091; noise = 1/13 + 1/11 = 0.168.
+            //   noise wins.
+            // Under asymmetric k_fts=5, k_vec=20:
+            //   target = 1/6 = 0.167; noise = 1/8 + 1/21 = 0.173. Tight.
+            // The asymmetric setup is calibrated for the broader plateau on
+            // pond's benchmark, not this single-query toy.
+            let fts = RankedList {
+                retriever: RetrieverKind::Fts,
+                keys: vec![mk("target", "t1"), mk("filler", "f1"), mk("noise", "n1")],
+                k: 5,
+                weight: 1.0,
+            };
+            let vec_arm = RankedList {
+                retriever: RetrieverKind::Vector,
+                keys: vec![mk("noise", "n2")],
+                k: 20,
+                weight: 1.0,
+            };
+            let merged = rrf_merge(&[fts, vec_arm]);
+            // Verify per-arm k applied as documented.
+            let target = merged
+                .iter()
+                .find(|h| h.key.session_id == "target")
+                .unwrap();
+            let noise = merged.iter().find(|h| h.key.session_id == "noise").unwrap();
+            let expected_target = 1.0 / (5.0 + 1.0);
+            let expected_noise = 1.0 / (5.0 + 3.0) + 1.0 / (20.0 + 1.0);
+            assert!((target.score - expected_target).abs() < 1e-9);
+            assert!((noise.score - expected_noise).abs() < 1e-9);
+        }
+    }
 }
 
 pub use search_handler::{
@@ -1699,53 +2033,74 @@ mod tests {
         }
     }
 
-    fn key(id: &str) -> crate::sessions::MessageKey {
+    fn key(session: &str, id: &str) -> crate::sessions::MessageKey {
         crate::sessions::MessageKey {
-            session_id: "session".to_owned(),
+            session_id: session.to_owned(),
             message_id: id.to_owned(),
         }
     }
 
     #[test]
     fn rrf_merge_fuses_retrievers_and_reports_provenance() {
+        // Each session contributes at most one ballot per arm; cross-arm
+        // agreement is credited per session_root, not per message_id.
         let lists = [
             RankedList {
                 retriever: RetrieverKind::Vector,
-                keys: vec![key("a"), key("b"), key("c")],
+                keys: vec![
+                    key("session-a", "a"),
+                    key("session-b", "b"),
+                    key("session-c", "c"),
+                ],
+                k: 60,
+                weight: 1.0,
             },
             RankedList {
                 retriever: RetrieverKind::Fts,
-                keys: vec![key("b"), key("a"), key("d")],
+                keys: vec![
+                    key("session-b", "b"),
+                    key("session-a", "a"),
+                    key("session-d", "d"),
+                ],
+                k: 60,
+                weight: 1.0,
             },
         ];
-        let merged = rrf_merge(&lists, 60);
+        let merged = rrf_merge(&lists);
 
-        // "a" (ranks 1,2) and "b" (ranks 2,1) have equal fused scores; the tie
-        // breaks on message_id, so "a" sorts first. Both beat the single-retriever
-        // "c" and "d".
-        assert_eq!(merged[0].key.message_id, "a");
-        assert_eq!(merged[1].key.message_id, "b");
+        // session-a (vector rank 1, FTS rank 2) and session-b (vector rank 2,
+        // FTS rank 1) have equal fused scores; tie breaks on (session_id,
+        // message_id) of the representative, so session-a sorts first. Both
+        // beat the single-retriever session-c and session-d.
+        assert_eq!(merged[0].key.session_id, "session-a");
+        assert_eq!(merged[1].key.session_id, "session-b");
         assert_eq!(merged[0].matched_via, vec!["vector", "fts"]);
         assert!(merged[0].score > merged[2].score);
 
-        let c = merged.iter().find(|hit| hit.key.message_id == "c").unwrap();
+        let c = merged
+            .iter()
+            .find(|hit| hit.key.session_id == "session-c")
+            .unwrap();
         assert_eq!(c.matched_via, vec!["vector"]);
-        let d = merged.iter().find(|hit| hit.key.message_id == "d").unwrap();
+        let d = merged
+            .iter()
+            .find(|hit| hit.key.session_id == "session-d")
+            .unwrap();
         assert_eq!(d.matched_via, vec!["fts"]);
     }
 
     #[test]
     fn recency_boost_matches_the_kb_formula() {
         let now = Utc::now();
-        // Caps at +0.2 at age zero.
-        assert!((recency_boost(now, now) - 0.2).abs() < 1e-6);
+        // Caps at +0.05 at age zero (tiebreaker-scale boost; see RECENCY_MAX_BOOST).
+        assert!((recency_boost(now, now) - 0.05).abs() < 1e-6);
         // One half-life (7 days) decays by exactly 1/e.
         let week = recency_boost(now - Duration::days(7), now);
-        assert!((week - 0.2 / std::f64::consts::E).abs() < 1e-3);
+        assert!((week - 0.05 / std::f64::consts::E).abs() < 1e-3);
         // A year out is effectively zero.
         assert!(recency_boost(now - Duration::days(365), now) < 1e-3);
         // Future timestamps clamp to the cap rather than exceeding it.
-        assert!((recency_boost(now + Duration::days(1), now) - 0.2).abs() < 1e-6);
+        assert!((recency_boost(now + Duration::days(1), now) - 0.05).abs() < 1e-6);
     }
 
     #[test]
