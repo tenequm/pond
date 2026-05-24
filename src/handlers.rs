@@ -1055,12 +1055,15 @@ mod search_handler {
     /// Internal-only branching enum for the retrieval mode. The wire layer doesn't
     /// expose this - per-hit `matched_via` already tells clients which retrievers
     /// ranked a row, and the request never asks for a specific mode.
-    // TEMP EXPERIMENT (embeddings-benchmark): `Vector` variant added so the harness
-    // can force vector-only retrieval via `POND_SEARCH_MODE=vector`. Revert before merge.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Hybrid,
         Fts,
+        // Vector-only retrieval, used by the `bench/embeddings/` ablation harness
+        // to compare FTS vs Vector vs Hybrid against one corpus. Gated behind the
+        // `bench-overrides` Cargo feature so production builds cannot select it
+        // (the variant simply does not exist without the feature).
+        #[cfg(feature = "bench-overrides")]
         Vector,
     }
 
@@ -1285,8 +1288,9 @@ mod search_handler {
                     })
                     .collect()
             }
-            // TEMP EXPERIMENT (embeddings-benchmark): vector-only retrieval for
-            // the FTS-vs-Vector-vs-Hybrid ablation. Revert before merge.
+            // Vector-only branch reachable only via `POND_SEARCH_MODE=vector`,
+            // itself gated by the `bench-overrides` feature.
+            #[cfg(feature = "bench-overrides")]
             SearchMode::Vector => {
                 let Some(embedder) = embedder else {
                     return Err(map_error(crate::Error::internal(
@@ -1388,9 +1392,10 @@ mod search_handler {
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
     ) -> Result<SearchMode, ErrorEnvelope> {
-        // TEMP EXPERIMENT (embeddings-benchmark): `POND_SEARCH_MODE` overrides the
-        // server-decided mode so the harness can run the same query under
-        // {fts,vector,hybrid} against the same corpus. Revert before merge.
+        // Operator-only mode override consumed by `bench/embeddings/`. Compiled
+        // out unless the `bench-overrides` feature is set, so a stray
+        // `POND_SEARCH_MODE` in a release-build process environment is ignored.
+        #[cfg(feature = "bench-overrides")]
         if let Ok(forced) = std::env::var("POND_SEARCH_MODE") {
             let mode = match forced.as_str() {
                 "fts" => SearchMode::Fts,
@@ -1683,10 +1688,11 @@ mod search_handler {
             .collect()
     }
 
-    // TEMP EXPERIMENT (embeddings-benchmark): rank-based normalization for vector-only
-    // mode. The raw `_distance` is cosine distance from Lance; converting to a
-    // monotone-in-rank `[0, 1]` score keeps the Hit payload comparable to FTS and
-    // Hybrid (where `base_score` is also monotone in rank). Revert before merge.
+    // Rank-based normalization for the vector-only branch (gated by the
+    // `bench-overrides` feature). The raw `_distance` is Lance cosine distance;
+    // converting to a monotone-in-rank `[0, 1]` score keeps the Hit payload
+    // comparable to FTS and Hybrid (where `base_score` is also monotone in rank).
+    #[cfg(feature = "bench-overrides")]
     fn normalize_vector(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
         let n = hits.len() as f64;
         hits.into_iter()
@@ -1872,6 +1878,8 @@ mod search_handler {
 
     #[cfg(test)]
     mod fusion_helpers_tests {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+
         use super::*;
 
         #[test]

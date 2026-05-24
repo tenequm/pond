@@ -18,6 +18,16 @@ The EN query set lives outside this directory at `docs/researches/embeddings-ben
 
 `fixtures/` and `results/` are NOT checked in: every JSON envelope captures full message text from the operator's local pond corpus, which contains API keys, wallet addresses, and private project paths that appeared in indexed conversations. Always regenerate locally rather than sharing these directories.
 
+## Build
+
+The harness needs the `bench-overrides` Cargo feature on for `POND_SEARCH_MODE` to switch retrieval modes. Without it the binary ignores the variable (the variant is compiled out):
+
+```
+cargo build --release --features bench-overrides
+```
+
+Plain `cargo build --release` is fine for everything else (scoring, simulating, anchor verification), but the per-mode capture step needs the feature.
+
 ## Workflow for a new benchmark
 
 1. Write queries in the TSV format `id\tlang\tstratum\tquery\tground_truth`.

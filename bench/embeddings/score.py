@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TEMP EXPERIMENT (embeddings-benchmark): score one mode's results against ground truth.
+"""Score one retrieval mode's results against ground truth.
 
 Reads a TSV of queries (id\tlang\tstratum\tquery\tground_truth) plus a directory
 of pond search JSON envelopes (one file per query, named `<id>.json`). For each

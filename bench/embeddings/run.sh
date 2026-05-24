@@ -43,7 +43,8 @@ bin="$repo_root/target/release/pond"
 cfg="$repo_root/bench/embeddings/config.toml"
 
 if [[ ! -x "$bin" ]]; then
-    echo "pond binary not found or not executable: $bin (run cargo build --release first)" >&2
+    echo "pond binary not found or not executable: $bin" >&2
+    echo "build it with: cargo build --release --features bench-overrides" >&2
     exit 69
 fi
 
