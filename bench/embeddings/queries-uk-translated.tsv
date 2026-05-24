@@ -1,0 +1,22 @@
+id	lang	stratum	query	ground_truth
+UK-X-NL-1	uk	natural-language	як працює OCC retry коли два писці конфліктують	prefix:94a50f23,d652b464
+UK-X-NL-2	uk	natural-language	чому помилки конфлікту повертаються як storage_unavailable	prefix:94a50f23
+UK-X-NL-3	uk	natural-language	чому так багато сесій помічено як fresh при кожному syncу	prefix:9f0b8dcc,48cb87ea
+UK-X-NL-4	uk	natural-language	чи можна було б запобігти баг адаптера через контракт seam	prefix:c110f401
+UK-X-NL-5	uk	natural-language	чому ми видалили pond::Error	prefix:26ac628c
+UK-X-CON-1	uk	conceptual	коректність адаптерного seam запобігання синтезованим значенням	prefix:94a50f23,0ad17ca6
+UK-X-CON-2	uk	conceptual	нативний restore проти foreign restore точність	prefix:c110f401,9f0b8dcc
+UK-X-CON-3	uk	conceptual	тест lossless round-trip для restore	prefix:9f0b8dcc,26ac628c
+UK-X-CON-4	uk	conceptual	вибір моделі ембеддингу для локального пошуку сесій	prefix:bc9f0e43
+UK-X-CON-5	uk	conceptual	гібридний пошук комбінує FTS і векторне ранжування	prefix:94a50f23,dbddbe2e
+UK-X-CON-6	uk	conceptual	multi-writer cron sync в спільний S3 бакет	prefix:d652b464
+UK-X-SYM-1	uk	symbol-lookup	Extracted<T> Source primitive адаптер	prefix:94a50f23
+UK-X-SYM-2	uk	symbol-lookup	merge_insert SourceDedupeBehavior FirstSeen	prefix:94a50f23
+UK-X-SYM-3	uk	symbol-lookup	shared-memory authority унікальна для кожного тесту	prefix:d652b464
+UK-X-SYM-4	uk	symbol-lookup	raw_record replay native serialize	prefix:9f0b8dcc
+UK-X-ERR-1	uk	error-message	codex-cli schema error перший row має бути session_meta	prefix:9f0b8dcc
+UK-X-ERR-2	uk	error-message	hook_success attachment stdout відкидається при ingest	prefix:c110f401
+UK-X-ERR-3	uk	error-message	дублікати рядків однакове message id двічі в результатах пошуку	prefix:94a50f23
+UK-X-BK-1	uk	bare-keyword	Lance маніфест	prefix:d652b464
+UK-X-BK-2	uk	bare-keyword	cargo nextest test binaries	prefix:4ad806f9
+UK-X-BK-3	uk	bare-keyword	pond search vs kb relevance порівняння	prefix:94a50f23,4ad806f9

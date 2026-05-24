@@ -19,7 +19,7 @@ use pond::{
     config::{self, Config, DEFAULT_CONFIG_TOML},
     embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
-    sessions::{AdapterStats, CorpusStats, RowTotals, Store},
+    sessions::{AdapterStats, CorpusStats, EmbeddingProgress, RowTotals, Store},
     substrate::TableSizes,
     transport::{self, AppState},
     wire::{
@@ -157,8 +157,8 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
         /// Reciprocal-rank-fusion constant. Lower values emphasize top
-        /// retriever ranks; the server default (60) is sane for most queries.
-        #[arg(long, default_value_t = 60)]
+        /// retriever ranks; the server default is the same.
+        #[arg(long, default_value_t = 10)]
         rrf_k: u32,
         /// Disable the recency boost. The server defaults to enabled (matches
         /// the MCP/HTTP surface).
@@ -306,7 +306,8 @@ async fn main() -> anyhow::Result<()> {
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
             let unindexed = store.unindexed_message_backlog().await?;
-            render_status(&stats, &sizes, unindexed)?;
+            let embedding = store.embedding_progress().await?;
+            render_status(&stats, &sizes, unindexed, embedding)?;
         }
         Command::Sync {
             adapter,
@@ -403,40 +404,51 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
+            let progress = store.embedding_progress().await?;
+            let backlog = progress.total.saturating_sub(progress.embedded);
+            let bar_total = match limit {
+                Some(cap) => backlog.min(cap),
+                None => backlog,
+            };
+            output(&format!(
+                "{} backlog={} already_embedded={} eligible_total={} model={}",
+                pond::output::paint("embed:", pond::output::dim()),
+                format_thousands(bar_total as u64),
+                format_thousands(progress.embedded as u64),
+                format_thousands(progress.total as u64),
+                progress.model,
+            ))?;
             let embedder = E5Embedder::load()?;
             // `indicatif` auto-detects tty and degrades to log-line output in
             // CI / non-tty contexts, so this is safe to always wire.
-            let bar = ProgressBar::new_spinner();
+            let bar = ProgressBar::new(bar_total as u64);
             bar.set_style(
-                ProgressStyle::with_template("{spinner:.green} embed: {msg} ({elapsed_precise})")
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                ProgressStyle::with_template(
+                    "{spinner:.green} embed [{elapsed_precise}] [{bar:24}] {pos}/{len} ({percent}%) {per_sec} eta {eta}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("##-"),
             );
             bar.enable_steady_tick(Duration::from_millis(120));
             let bar_for_callback = bar.clone();
             let mut worker = EmbedWorker::new(&store, &embedder).with_progress(
                 move |progress: BatchProgress| {
-                    bar_for_callback.set_message(format!(
-                        "batches={} messages={} (+{} this batch)",
-                        progress.total_batches, progress.total_messages, progress.batch_messages,
-                    ));
+                    bar_for_callback.set_position(progress.total_messages as u64);
                 },
             );
             if let Some(limit) = limit {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
+            bar.finish_and_clear();
             // The column update moves rows into new fragments; Lance's
             // incremental index fold mishandles that, so rebuild the indexes
             // from scratch here instead of leaving a stale state for the next
             // `pond sync` to fold (spec.md#index-upkeep).
             store.ensure_indices(true).await?;
             store.ensure_embedding_indices().await?;
-            bar.finish_with_message(format!(
-                "done: batches={} messages={}",
-                summary.batches, summary.messages
-            ));
             output(&format!(
-                "{} batches={} messages={} device={}",
+                "{} done: batches={} messages={} device={}",
                 pond::output::paint("embed:", pond::output::dim()),
                 summary.batches,
                 summary.messages,
@@ -997,7 +1009,12 @@ fn format_bytes(bytes: u64) -> String {
 /// totals line, and one section per adapter in registry order with a project
 /// table. Tables width-adapt via comfy-table; on non-TTY stdout (piped to a
 /// file or test) coloring strips automatically via `pond::output::paint`.
-fn render_status(stats: &CorpusStats, sizes: &TableSizes, unindexed: usize) -> anyhow::Result<()> {
+fn render_status(
+    stats: &CorpusStats,
+    sizes: &TableSizes,
+    unindexed: usize,
+    embedding: EmbeddingProgress,
+) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint, yellow};
 
     output(&paint("pond status", bold()))?;
@@ -1042,6 +1059,33 @@ fn render_status(stats: &CorpusStats, sizes: &TableSizes, unindexed: usize) -> a
     } else {
         output(&paint(
             &format!("fts index  {unindexed} messages unindexed - run `pond sync --reindex`"),
+            yellow(),
+        ))?;
+    }
+    let pending = embedding.total.saturating_sub(embedding.embedded);
+    if embedding.total == 0 {
+        output(&format!(
+            "{}  no embeddable messages (model={})",
+            paint("embeddings", dim()),
+            embedding.model,
+        ))?;
+    } else if pending == 0 {
+        output(&format!(
+            "{}  {}/{} messages  model={}",
+            paint("embeddings", dim()),
+            paint(&format_thousands(embedding.embedded as u64), bold()),
+            paint(&format_thousands(embedding.total as u64), bold()),
+            embedding.model,
+        ))?;
+    } else {
+        output(&paint(
+            &format!(
+                "embeddings  {}/{} messages  model={} - run `pond embed` to fill the {} backlog",
+                format_thousands(embedding.embedded as u64),
+                format_thousands(embedding.total as u64),
+                embedding.model,
+                format_thousands(pending as u64),
+            ),
             yellow(),
         ))?;
     }

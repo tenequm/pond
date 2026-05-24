@@ -104,6 +104,18 @@ pub struct RowTotals {
     pub parts: u64,
 }
 
+/// Embedding coverage for `pond status` / `pond embed`. `total` is the count of
+/// `messages` rows that carry `search_text` (i.e. are eligible to embed); rows
+/// without `search_text` produce no vector. `embedded` is the subset of those
+/// already carrying a vector under the current [`embed::MODEL_ID`]. The pending
+/// backlog is `total - embedded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingProgress {
+    pub embedded: usize,
+    pub total: usize,
+    pub model: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct AdapterStats {
     /// Either the main-agent name (`claude-code`) when sub-agents are filtered
@@ -707,6 +719,21 @@ impl Store {
             };
             hits.push((key, float32(&batch, "_score", row)?));
         }
+        // Stable secondary sort: Lance returns tied-BM25-score hits in fragment
+        // order, which varies between runs and across calls with different pool
+        // sizes (the hybrid arm's `pool=100` and FTS-only's `limit=20` produce
+        // different orderings at the same tied score). Without an explicit
+        // tiebreak the downstream RRF dedup-rank for a tied target session can
+        // flip session-to-session, making fusion outcomes nondeterministic.
+        // Sort by `score desc`, then `(session_id, message_id)` asc.
+        hits.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.session_id.cmp(&right.0.session_id))
+                .then_with(|| left.0.message_id.cmp(&right.0.message_id))
+        });
         Ok(hits)
     }
 
@@ -757,6 +784,18 @@ impl Store {
             };
             hits.push((key, float32(&batch, "_distance", row)?));
         }
+        // Stable secondary sort: same reasoning as `fts_search` - IVF_PQ can
+        // emit hits with effectively identical `_distance` in fragment-dependent
+        // order, which makes RRF dedup-ranks nondeterministic for tied
+        // neighbors. Sort by distance asc (smaller = more similar), then by
+        // `(session_id, message_id)` asc.
+        hits.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.session_id.cmp(&right.0.session_id))
+                .then_with(|| left.0.message_id.cmp(&right.0.message_id))
+        });
         Ok(hits)
     }
 
@@ -939,6 +978,28 @@ impl Store {
         self.handle
             .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
             .await
+    }
+
+    /// Embedding coverage: how many `messages` rows already carry a vector
+    /// under the current model, and how many are still eligible. Drives the
+    /// `pond status` embeddings line and the `pond embed` progress bar's known
+    /// total. The `embedding_model` bitmap index makes the `embedded` count an
+    /// index-only lookup; `total` filters on the `search_text` null bitmap.
+    pub async fn embedding_progress(&self) -> Result<EmbeddingProgress> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let embedded = dataset
+            .count_rows(Some(
+                Predicate::Eq("embedding_model", embed::MODEL_ID.into()).to_lance(),
+            ))
+            .await?;
+        let total = dataset
+            .count_rows(Some(Predicate::IsNotNull("search_text").to_lance()))
+            .await?;
+        Ok(EmbeddingProgress {
+            embedded,
+            total,
+            model: embed::MODEL_ID,
+        })
     }
 
     /// Build the IVF_PQ index on `messages.vector` once enough messages are
@@ -3222,6 +3283,28 @@ mod tests {
             hits.iter().any(|(key, _)| key == &keys[0]),
             "an embedded row is retrievable despite null vectors in the column",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedding_progress_counts_embedded_and_eligible_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 10).await?;
+
+        let before = store.embedding_progress().await?;
+        assert_eq!(before.embedded, 0);
+        assert_eq!(before.total, 10);
+        assert_eq!(before.model, crate::embed::MODEL_ID);
+
+        store.write_embeddings(&embedded(&keys[..4])).await?;
+        let partial = store.embedding_progress().await?;
+        assert_eq!(partial.embedded, 4);
+        assert_eq!(partial.total, 10);
+
+        store.write_embeddings(&embedded(&keys[4..])).await?;
+        let full = store.embedding_progress().await?;
+        assert_eq!(full.embedded, 10);
+        assert_eq!(full.total, 10);
         Ok(())
     }
 }
