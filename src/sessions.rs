@@ -1054,6 +1054,53 @@ impl Store {
         self.handle.table_sizes().await
     }
 
+    /// Histogram of Unicode script classes in `messages.search_text`, computed
+    /// from a sample of up to `max_messages` non-null rows. Returned classes
+    /// are sorted descending by character count. Lets `pond status` tell an
+    /// agent whether the corpus is monolingual or mixed - the agent then knows
+    /// whether bilingual querying is worth attempting (cross-lingual recall is
+    /// a caller-layer concern; pond does not translate internally).
+    pub async fn text_script_histogram(&self, max_messages: usize) -> Result<Vec<(String, usize)>> {
+        use std::collections::HashMap;
+        let filter = Predicate::IsNotNull("search_text");
+        let projection: &[&str] = &["search_text"];
+        let scanner = self
+            .handle
+            .scan(
+                Table::Messages,
+                ScanOpts::with_predicate_and_projection(&filter, projection),
+            )
+            .await?;
+        let mut batches = scanner
+            .try_into_stream()
+            .await
+            .context("failed to open messages stream for script histogram")?;
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut sampled = 0usize;
+        'outer: while let Some(batch) = batches.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                if sampled >= max_messages {
+                    break 'outer;
+                }
+                if let Some(text) = string(&batch, "search_text", row)? {
+                    for ch in text.chars() {
+                        if let Some(class) = classify_script(ch) {
+                            *counts.entry(class).or_default() += 1;
+                        }
+                    }
+                    sampled += 1;
+                }
+            }
+        }
+        let mut histogram: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(name, count)| (name.to_owned(), count))
+            .collect();
+        histogram.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        Ok(histogram)
+    }
+
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
         let batch = self
             .handle
@@ -2604,6 +2651,33 @@ fn uint64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .with_context(|| format!("column {name} is not UInt64"))
+}
+
+/// Map a character to its Unicode script class name, or `None` for
+/// non-alphabetic characters (digits, punctuation, whitespace). Used by
+/// `Store::text_script_histogram` to surface corpus language mix in
+/// `pond status`. The ranges cover the scripts most likely to appear in
+/// agent-session transcripts; everything else collapses to `"Other"` so the
+/// histogram stays bounded.
+fn classify_script(ch: char) -> Option<&'static str> {
+    if !ch.is_alphabetic() {
+        return None;
+    }
+    let code = ch as u32;
+    match code {
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some("Latin"),
+        0x0370..=0x03FF => Some("Greek"),
+        0x0400..=0x052F => Some("Cyrillic"),
+        0x0590..=0x05FF => Some("Hebrew"),
+        0x0600..=0x06FF | 0x0750..=0x077F => Some("Arabic"),
+        0x0900..=0x097F => Some("Devanagari"),
+        0x0E00..=0x0E7F => Some("Thai"),
+        0x3040..=0x309F => Some("Hiragana"),
+        0x30A0..=0x30FF => Some("Katakana"),
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF => Some("Han"),
+        0xAC00..=0xD7AF | 0x1100..=0x11FF => Some("Hangul"),
+        _ => Some("Other"),
+    }
 }
 
 pub(crate) fn string(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>> {

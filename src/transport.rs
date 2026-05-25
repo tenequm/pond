@@ -9,14 +9,16 @@
 
 use std::sync::Arc;
 
-use crate::{embed::EmbedBackend, sessions::Store};
+use crate::{embed::LazyEmbedder, sessions::Store};
 
-/// Shared state handed to both transports. `embedder` is `None` when
-/// `[embeddings] enabled = false` (the default); search runs FTS-only.
+/// Shared state handed to both transports. `embedder` holds a lazy handle:
+/// the model isn't loaded until the first hybrid search asks for it, so
+/// `pond mcp` idles at ~50 MB resident and only pays the ~600 MB load cost on
+/// the first query that needs it (spec.md#search opt-in).
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    pub embedder: Option<Arc<dyn EmbedBackend>>,
+    pub embedder: Arc<LazyEmbedder>,
 }
 
 pub mod http {
@@ -120,7 +122,18 @@ pub mod http {
         Json(mut request): Json<SearchRequest>,
     ) -> (StatusCode, Json<SearchEnvelope>) {
         request.namespace.get_or_insert_with(default_namespace);
-        let envelope = pond_search(&state.store, state.embedder.as_deref(), request).await;
+        let embedder = match state.embedder.get().await {
+            Ok(handle) => handle,
+            Err(load_error) => {
+                let envelope = SearchEnvelope::Error(crate::wire::error(
+                    crate::wire::ErrorCode::Internal,
+                    format!("embedder load failed: {load_error}"),
+                    serde_json::json!({}),
+                ));
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(envelope));
+            }
+        };
+        let envelope = pond_search(&state.store, embedder.as_deref(), request).await;
         let status = match &envelope {
             SearchEnvelope::Success(_) => StatusCode::OK,
             SearchEnvelope::Error(error) => status_for(&error.error.code),
@@ -384,7 +397,11 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                            when embeddings are disabled or absent for this store; the response \
                            carries no top-level mode field - each hit's `matched_via` array \
                            reports which retriever(s) ranked it. Keep `query` semantic; use \
-                           the `project` / `conversation_id` filters for scope."
+                           the `project` / `conversation_id` filters for scope. \
+                           For multilingual corpora: if you suspect the indexed text may be in a \
+                           different language than your query, run two searches - one in the \
+                           query's language, one translated to the corpus's likely language - and \
+                           union the results by `session_id`. pond does not translate internally."
         )]
         async fn pond_search(
             &self,
@@ -394,7 +411,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
                 query: params.query,
-                rrf_k: 60,
+                rrf_k: crate::wire::default_rrf_k(),
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.conversation_id,
@@ -407,8 +424,12 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 boost_recent: params.boost_recent.unwrap_or(true),
                 group_by_conversation: params.group_by_conversation.unwrap_or(false),
                 limit: params.limit.unwrap_or(10),
+                mode_override: None,
             };
-            match run_search(&self.state.store, self.state.embedder.as_deref(), request).await {
+            let embedder = self.state.embedder.get().await.map_err(|error| {
+                ErrorData::internal_error(format!("embedder load failed: {error}"), None)
+            })?;
+            match run_search(&self.state.store, embedder.as_deref(), request).await {
                 SearchEnvelope::Success(response) => json_result(&response),
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }

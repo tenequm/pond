@@ -1052,18 +1052,15 @@ mod search_handler {
 
     use super::{map_error, map_storage};
 
-    /// Internal-only branching enum for the retrieval mode. The wire layer doesn't
-    /// expose this - per-hit `matched_via` already tells clients which retrievers
-    /// ranked a row, and the request never asks for a specific mode.
+    /// Internal branching enum for the retrieval mode. Production callers
+    /// never pick: the server decides hybrid-vs-FTS from embedder availability
+    /// (per-hit `matched_via` tells clients which retrievers ranked a row).
+    /// `Vector` exists for operator tooling - selected via `pond search --mode`
+    /// or the `mode_override` wire field consumed by `bench/embeddings/`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Hybrid,
         Fts,
-        // Vector-only retrieval, used by the `bench/embeddings/` ablation harness
-        // to compare FTS vs Vector vs Hybrid against one corpus. Gated behind the
-        // `bench-overrides` Cargo feature so production builds cannot select it
-        // (the variant simply does not exist without the feature).
-        #[cfg(feature = "bench-overrides")]
         Vector,
     }
 
@@ -1100,75 +1097,20 @@ mod search_handler {
     const RECENCY_MAX_BOOST: f64 = 0.05;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
 
-    // Asymmetric per-arm RRF k (Bruch, Gai, Ingber 2022 - "off-diagonal" finding,
-    // arXiv 2210.11934). For pond's keyword-heavy corpus FTS is the higher-
-    // precision arm, so we sharpen its rank curve (smaller k) and flatten the
-    // vector arm's (larger k). The wire-level `rrf_k` is treated as a global
-    // scaling parameter; we derive `k_fts = rrf_k / 2` and `k_vec = rrf_k * 2`
-    // from it so a caller raising or lowering `rrf_k` still slides both arms
-    // along the same axis. Sweep at `bench/embeddings/simulate_fusion.py`
-    // identified a wide plateau at k_fts in [5,8], k_vec in [15,20]; the
-    // (5, 20) centroid is the default.
+    // Asymmetric per-arm RRF k (Bruch, Gai, Ingber 2022 "off-diagonal",
+    // arXiv 2210.11934). FTS is the higher-precision arm on pond's
+    // keyword-heavy corpus, so its rank curve is sharper (smaller k); vector
+    // is flatter (larger k). The wire `rrf_k` is a global scaling knob;
+    // `k_fts = rrf_k / 2` and `k_vec = rrf_k * 2` slide both arms along the
+    // same axis. Sweep at `bench/embeddings/simulate_fusion.py` identified a
+    // wide plateau at k_fts in [5,8] and k_vec in [15,20]; (5, 20) is the
+    // centroid. No per-query routing: cross-lingual queries are an agent-
+    // layer concern (see the `pond_search` MCP description).
     fn rrf_k_for(arm: RetrieverKind, base: u32) -> u32 {
         match arm {
             RetrieverKind::Fts => (base / 2).max(1),
             RetrieverKind::Vector => base.saturating_mul(2).max(1),
         }
-    }
-
-    /// Per-query fusion config. The default (Latin-dominant queries) uses the
-    /// asymmetric `k_fts = rrf_k/2, k_vec = rrf_k*2` ratio that wins the
-    /// EN benchmark. When the query is non-Latin-dominant (cross-lingual:
-    /// Ukrainian/Russian/etc. query against a mostly-English corpus), the FTS
-    /// ngram tokenizer can no longer reach the answer; the vector arm becomes
-    /// the load-bearing signal, so we collapse to balanced k and double the
-    /// vector weight (`w_vec = 2`). See `docs/researches/uk-cross-lingual-
-    /// benchmark.md`.
-    struct FusionConfig {
-        k_fts: u32,
-        k_vec: u32,
-        w_fts: f64,
-        w_vec: f64,
-    }
-
-    fn fusion_config_for(query: &str, base_rrf_k: u32) -> FusionConfig {
-        if is_non_latin_dominant(query) {
-            FusionConfig {
-                k_fts: base_rrf_k,
-                k_vec: base_rrf_k,
-                w_fts: 1.0,
-                w_vec: 2.0,
-            }
-        } else {
-            FusionConfig {
-                k_fts: rrf_k_for(RetrieverKind::Fts, base_rrf_k),
-                k_vec: rrf_k_for(RetrieverKind::Vector, base_rrf_k),
-                w_fts: 1.0,
-                w_vec: 1.0,
-            }
-        }
-    }
-
-    /// Returns true when more than ~30% of the query's alphabetic characters
-    /// are non-Latin (Cyrillic, CJK, Greek, Arabic, etc.). A short heuristic
-    /// keyed off Unicode general-category rather than locale guessing: the
-    /// FTS arm's character-ngram tokenizer cannot bridge such queries to the
-    /// pond corpus's predominantly-English search_text, so the fusion needs
-    /// to lean on the vector arm.
-    fn is_non_latin_dominant(query: &str) -> bool {
-        let mut latin = 0usize;
-        let mut non_latin = 0usize;
-        for ch in query.chars() {
-            if ch.is_alphabetic() {
-                if ch.is_ascii() {
-                    latin += 1;
-                } else {
-                    non_latin += 1;
-                }
-            }
-        }
-        let total = latin + non_latin;
-        total > 0 && (non_latin * 10) >= (total * 3)
     }
 
     /// Unindexed-row count above which `pond_search` logs that the FTS index is
@@ -1200,13 +1142,14 @@ mod search_handler {
         request: SearchRequest,
         clock: &dyn Clock,
     ) -> Result<SearchResponse, ErrorEnvelope> {
+        let override_mode = request.mode_override.map(wire_mode_to_internal);
         let mut plan = plan_search(request, SearchMode::Fts)?;
 
-        // The mode is server-determined: hybrid only when both the embedder is
-        // loaded AND messages are embedded under the configured model. Anything
-        // else degrades to FTS-only - a vector retriever over zero rows would
-        // just be wasted work.
-        plan.mode = resolve_effective_mode(store, embedder).await?;
+        // The mode is server-determined unless the caller passed an explicit
+        // override (operator tooling). Hybrid requires both a loaded embedder
+        // AND at least one message embedded under the configured model;
+        // anything else degrades to FTS-only.
+        plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
 
         // spec.md#index-upkeep: results stay correct against the not-yet-folded
         // tail (the engine flat-scans it), but a large backlog hurts latency -
@@ -1256,11 +1199,11 @@ mod search_handler {
                         .map_err(map_storage)
                 };
                 let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
-                // Query-language-aware fusion config: Latin queries use the
-                // EN-tuned asymmetric k; non-Latin (cross-lingual) queries
-                // collapse to balanced k with vector-heavy weighting because
-                // the FTS arm cannot bridge across languages.
-                let cfg = fusion_config_for(&plan.query, plan.rrf_k);
+                // Asymmetric per-arm k; same constants for every query. Cross-
+                // lingual recall is handled at the agent layer via dual-language
+                // probing, not by routing inside pond.
+                let k_fts = rrf_k_for(RetrieverKind::Fts, plan.rrf_k);
+                let k_vec = rrf_k_for(RetrieverKind::Vector, plan.rrf_k);
                 // FTS first: when both arms picked different messages from the
                 // same session_root, RRF will keep FTS's representative (better
                 // for hit display since BM25 highlights the lexical match).
@@ -1268,14 +1211,12 @@ mod search_handler {
                     RankedList {
                         retriever: RetrieverKind::Fts,
                         keys: fts.into_iter().map(|(key, _)| key).collect(),
-                        k: cfg.k_fts,
-                        weight: cfg.w_fts,
+                        k: k_fts,
                     },
                     RankedList {
                         retriever: RetrieverKind::Vector,
                         keys: vector_raw.into_iter().map(|(key, _)| key).collect(),
-                        k: cfg.k_vec,
-                        weight: cfg.w_vec,
+                        k: k_vec,
                     },
                 ];
                 rrf_merge(&lists)
@@ -1288,13 +1229,14 @@ mod search_handler {
                     })
                     .collect()
             }
-            // Vector-only branch reachable only via `POND_SEARCH_MODE=vector`,
-            // itself gated by the `bench-overrides` feature.
-            #[cfg(feature = "bench-overrides")]
+            // Vector-only branch: reachable only when the caller explicitly
+            // sets `mode_override = Vector` (operator tooling, benchmark
+            // harness). Production agents leave `mode_override = None` and
+            // get the server-decided hybrid/fts path above.
             SearchMode::Vector => {
                 let Some(embedder) = embedder else {
                     return Err(map_error(crate::Error::internal(
-                        "vector mode resolved without an embedder",
+                        "vector mode requested but no embedder is loaded",
                     )));
                 };
                 let vector = embed_query(embedder, &plan.query)?;
@@ -1385,32 +1327,21 @@ mod search_handler {
         }
     }
 
-    /// Pick the retrieval mode based on the embedder state. Hybrid requires both a
-    /// loaded embedder and at least one message embedded under the configured
-    /// model; otherwise FTS-only.
+    /// Pick the retrieval mode. An explicit caller override (operator tooling
+    /// via the wire `mode_override` field / `pond search --mode`) wins; in its
+    /// absence the server decides: hybrid when both a loaded embedder AND at
+    /// least one message embedded under the configured model exist, FTS-only
+    /// otherwise (spec.md#search opt-in).
     async fn resolve_effective_mode(
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
+        override_mode: Option<SearchMode>,
     ) -> Result<SearchMode, ErrorEnvelope> {
-        // Operator-only mode override consumed by `bench/embeddings/`. Compiled
-        // out unless the `bench-overrides` feature is set, so a stray
-        // `POND_SEARCH_MODE` in a release-build process environment is ignored.
-        #[cfg(feature = "bench-overrides")]
-        if let Ok(forced) = std::env::var("POND_SEARCH_MODE") {
-            let mode = match forced.as_str() {
-                "fts" => SearchMode::Fts,
-                "vector" => SearchMode::Vector,
-                "hybrid" => SearchMode::Hybrid,
-                other => {
-                    return Err(map_error(crate::Error::internal(format!(
-                        "POND_SEARCH_MODE must be one of fts|vector|hybrid, got `{other}`"
-                    ))));
-                }
-            };
+        if let Some(mode) = override_mode {
             if matches!(mode, SearchMode::Vector | SearchMode::Hybrid) && embedder.is_none() {
-                return Err(map_error(crate::Error::internal(format!(
-                    "POND_SEARCH_MODE=`{forced}` requires an embedder, but none is loaded"
-                ))));
+                return Err(map_error(crate::Error::internal(
+                    "the requested mode requires embeddings to be enabled in config",
+                )));
             }
             return Ok(mode);
         }
@@ -1489,19 +1420,23 @@ mod search_handler {
     /// RRF constant for THIS arm's contribution - asymmetric per-arm k lets
     /// pond reward the more reliable arm's top ranks more sharply. For pond's
     /// keyword-heavy corpus FTS is the higher-precision arm, so the call site
-    /// pairs `k_fts` ~5 (sharper) with `k_vec` ~20 (flatter); see RRF_K_FTS,
-    /// RRF_K_VECTOR. The asymmetric-k pattern is the "off-diagonal" finding of
-    /// Bruch, Gai, Ingber 2022 (arXiv 2210.11934).
+    /// pairs `k_fts` ~5 (sharper) with `k_vec` ~20 (flatter). The asymmetric-k
+    /// pattern is the "off-diagonal" finding of Bruch, Gai, Ingber 2022
+    /// (arXiv 2210.11934).
     pub struct RankedList {
         pub retriever: RetrieverKind,
         pub keys: Vec<MessageKey>,
         pub k: u32,
-        /// Linear multiplier on this arm's contributions, defaults to 1.0.
-        /// Used by the query-language router to up-weight the vector arm when
-        /// the query is non-Latin-dominant (cross-lingual): the FTS arm's
-        /// ngram tokenizer cannot bridge a Ukrainian query to an English
-        /// answer, so vector becomes the load-bearing arm.
-        pub weight: f64,
+    }
+
+    /// Wire-to-internal mode mapping. Kept here so the wire type stays free of
+    /// handler-internal concerns and the conversion is one obvious place.
+    fn wire_mode_to_internal(wire: crate::wire::SearchModeWire) -> SearchMode {
+        match wire {
+            crate::wire::SearchModeWire::Fts => SearchMode::Fts,
+            crate::wire::SearchModeWire::Vector => SearchMode::Vector,
+            crate::wire::SearchModeWire::Hybrid => SearchMode::Hybrid,
+        }
     }
 
     /// One merged RRF result.
@@ -1557,7 +1492,7 @@ mod search_handler {
                     continue;
                 }
                 dedup_rank += 1;
-                let contribution = list.weight / (k + dedup_rank as f64);
+                let contribution = 1.0 / (k + dedup_rank as f64);
                 let entry = merged
                     .entry(root)
                     .or_insert_with(|| (0.0, Vec::new(), key.clone()));
@@ -1688,11 +1623,10 @@ mod search_handler {
             .collect()
     }
 
-    // Rank-based normalization for the vector-only branch (gated by the
-    // `bench-overrides` feature). The raw `_distance` is Lance cosine distance;
+    // Rank-based normalization for the vector-only branch (selected by
+    // operator override). The raw `_distance` is Lance cosine distance;
     // converting to a monotone-in-rank `[0, 1]` score keeps the Hit payload
     // comparable to FTS and Hybrid (where `base_score` is also monotone in rank).
-    #[cfg(feature = "bench-overrides")]
     fn normalize_vector(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
         let n = hits.len() as f64;
         hits.into_iter()
@@ -1916,13 +1850,11 @@ mod search_handler {
                     mk("session-A/agent-x", "msg-4"),
                 ],
                 k: 10,
-                weight: 1.0,
             };
             let vec_arm = RankedList {
                 retriever: RetrieverKind::Vector,
                 keys: vec![mk("session-B", "msg-7"), mk("session-A", "msg-9")],
                 k: 10,
-                weight: 1.0,
             };
             let merged = rrf_merge(&[fts, vec_arm]);
             // Output: one row per session_root, sorted by fused score.
@@ -1939,37 +1871,6 @@ mod search_handler {
             // over Vector's pick (msg-7) for session-B.
             assert_eq!(merged[1].key.message_id, "msg-3");
             assert_eq!(merged[1].matched_via, vec!["fts", "vector"]);
-        }
-
-        #[test]
-        fn fusion_config_routes_by_query_language() {
-            // Latin-dominant queries get the EN-tuned asymmetric setup.
-            let en = fusion_config_for("how does OCC retry work", 10);
-            assert_eq!(en.k_fts, 5);
-            assert_eq!(en.k_vec, 20);
-            assert!((en.w_fts - 1.0).abs() < 1e-9);
-            assert!((en.w_vec - 1.0).abs() < 1e-9);
-            // Non-Latin-dominant queries (Ukrainian/Cyrillic) collapse to
-            // balanced k with double vector weight.
-            let uk = fusion_config_for("як працює OCC retry коли два писці", 10);
-            assert_eq!(uk.k_fts, 10);
-            assert_eq!(uk.k_vec, 10);
-            assert!((uk.w_vec - 2.0).abs() < 1e-9);
-            // Mixed queries with isolated identifiers stay Latin-dominant.
-            let mixed = fusion_config_for("Extracted<T> Source primitive адаптер", 10);
-            assert_eq!(mixed.k_fts, 5);
-            assert_eq!(mixed.k_vec, 20);
-        }
-
-        #[test]
-        fn is_non_latin_dominant_threshold_is_thirty_percent() {
-            assert!(!is_non_latin_dominant("how does OCC retry work"));
-            assert!(is_non_latin_dominant("як працює OCC retry"));
-            // Threshold ~30%: a query with a single Cyrillic word among
-            // mostly-English text stays Latin-dominant unless the Cyrillic
-            // fraction crosses 30% of alphabetic characters.
-            assert!(is_non_latin_dominant("test тест"));
-            assert!(!is_non_latin_dominant("how does this work then тест"));
         }
 
         #[test]
@@ -1992,13 +1893,11 @@ mod search_handler {
                 retriever: RetrieverKind::Fts,
                 keys: vec![mk("target", "t1"), mk("filler", "f1"), mk("noise", "n1")],
                 k: 5,
-                weight: 1.0,
             };
             let vec_arm = RankedList {
                 retriever: RetrieverKind::Vector,
                 keys: vec![mk("noise", "n2")],
                 k: 20,
-                weight: 1.0,
             };
             let merged = rrf_merge(&[fts, vec_arm]);
             // Verify per-arm k applied as documented.
@@ -2033,7 +1932,8 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
-            rrf_k: 60,
+            mode_override: None,
+            rrf_k: 10,
             filters: SearchFilters::default(),
             boost_recent: true,
             group_by_conversation: false,
@@ -2061,7 +1961,6 @@ mod tests {
                     key("session-c", "c"),
                 ],
                 k: 60,
-                weight: 1.0,
             },
             RankedList {
                 retriever: RetrieverKind::Fts,
@@ -2071,7 +1970,6 @@ mod tests {
                     key("session-d", "d"),
                 ],
                 k: 60,
-                weight: 1.0,
             },
         ];
         let merged = rrf_merge(&lists);

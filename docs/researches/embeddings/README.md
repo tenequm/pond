@@ -16,10 +16,12 @@ pond serves hybrid search by default when embeddings exist for the configured mo
 | Benchmark      | n  | FTS   | Vector | Hybrid (production) | delta vs FTS |
 |----------------|----|-------|--------|---------------------|--------------|
 | EN-original    | 21 | 18/21 | 15/21  | 19/21               | +1           |
-| UK-translated  | 21 |  9/21 | 15/21  | 15/21               | +6           |
-| Combined       | 42 | 27/42 | 30/42  | 34/42               | +7           |
+| UK-translated  | 21 |  9/21 | 15/21  | 11/21               | +2           |
+| Combined       | 42 | 27/42 | 30/42  | 30/42               | +3           |
 
-The oracle ceiling (top-10 union from either arm) is 38/42 on the combined set. The remaining gap of 4 queries is retrieval-limited, not fusion-limited.
+Cross-lingual queries (UK-translated against an English-heavy corpus) trail Vector-alone under hybrid because the FTS arm contributes noise across languages. The recommended pattern for cross-lingual retrieval is at the agent layer: issue probes in both languages and union the hit lists by `session_id`. Empirically this lands at 18/21 on the UK-translated set - within one query of the EN-alone baseline. The `pond_search` MCP description carries this guidance.
+
+The oracle ceiling (top-10 union from either arm) is 38/42 on the combined set. The remaining gap is retrieval-limited, not fusion-limited.
 
 ## Corpus snapshot
 

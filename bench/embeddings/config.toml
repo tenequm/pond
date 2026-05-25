@@ -1,8 +1,0 @@
-# Sandbox config for the embeddings benchmark. Not the user's `~/.config/pond/config.toml`.
-# Embeddings ON so `pond search` loads the embedder when POND_SEARCH_MODE={vector,hybrid}
-# is set. Data dir is supplied explicitly on the command line; this file does not
-# configure sources because the benchmark never runs `pond sync`.
-
-[embeddings]
-enabled = true
-model = "intfloat/multilingual-e5-base"

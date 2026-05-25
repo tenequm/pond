@@ -67,7 +67,7 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     let store = Arc::new(store);
     let state = AppState {
         store: Arc::clone(&store),
-        embedder: Some(Arc::new(backend)),
+        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
     };
     Ok((temp, store, http::router(state)))
 }

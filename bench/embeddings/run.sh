@@ -40,11 +40,10 @@ mkdir -p "$out_dir"
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 bin="$repo_root/target/release/pond"
-cfg="$repo_root/bench/embeddings/config.toml"
 
 if [[ ! -x "$bin" ]]; then
     echo "pond binary not found or not executable: $bin" >&2
-    echo "build it with: cargo build --release --features bench-overrides" >&2
+    echo "build it with: cargo build --release" >&2
     exit 69
 fi
 
@@ -53,7 +52,8 @@ errors=0
 while IFS=$'\t' read -r id lang stratum query ground_truth; do
     [[ -z "${id:-}" || "$id" == "id" ]] && continue
     out_file="$out_dir/$id.json"
-    if POND_SEARCH_MODE="$mode" POND_CONFIG="$cfg" "$bin" search \
+    if "$bin" search \
+        --mode "$mode" \
         --limit "$limit" \
         --format json \
         "$query" > "$out_file" 2> "$out_dir/$id.stderr"; then

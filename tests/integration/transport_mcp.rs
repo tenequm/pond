@@ -132,7 +132,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
 
     Ok(AppState {
         store: Arc::new(store),
-        embedder: Some(Arc::new(backend)),
+        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
     })
 }
 

@@ -6,15 +6,79 @@
 //! batch, never once per message, and writes each batch's vectors to
 //! `messages` in one column-update commit.
 
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use lance::index::vector::VectorIndexParams;
 use lance_linalg::distance::MetricType;
+use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
 use crate::sessions::{EMBEDDING_DIM, EmbeddedMessage, PendingMessage, Store};
 
 pub mod e5;
 pub use e5::E5Embedder;
+
+/// Lazy holder for the embedding backend used by long-running `pond serve` /
+/// `pond mcp`: the model isn't loaded until the first hybrid search asks for
+/// it. Idle `pond mcp` keeps RSS down to ~50 MB; first search triggers the
+/// candle/Metal load (~2-4s) and the loaded handle is cached for the life of
+/// the process. `pond embed` and `pond search` (one-shot CLI) load eagerly
+/// via [`E5Embedder::load`] directly.
+pub struct LazyEmbedder {
+    enabled: bool,
+    cell: OnceCell<Arc<dyn EmbedBackend>>,
+}
+
+impl LazyEmbedder {
+    /// Build a lazy handle. `enabled` mirrors `config.embeddings.enabled`;
+    /// when false, `get` always returns `None` and never loads a model.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            cell: OnceCell::new(),
+        }
+    }
+
+    /// Pre-seed with an already-constructed backend (tests, one-shot eager
+    /// paths). The cell is filled; subsequent `get` calls return this handle.
+    pub fn from_loaded(backend: Arc<dyn EmbedBackend>) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(backend);
+        Self {
+            enabled: true,
+            cell,
+        }
+    }
+
+    /// Cheap, sync: is the embedder configured? `pond search`'s mode-resolution
+    /// uses this to decide hybrid-vs-FTS without paying a model-load cost on
+    /// FTS-only queries.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Load (on first call) or return the cached handle. Returns `None` when
+    /// the config has embeddings disabled. The candle load is synchronous and
+    /// blocking, so it runs on `spawn_blocking`; the async caller sees a clean
+    /// `await` point.
+    pub async fn get(&self) -> Result<Option<Arc<dyn EmbedBackend>>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let handle = self
+            .cell
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(|| {
+                    E5Embedder::load().map(|backend| Arc::new(backend) as Arc<dyn EmbedBackend>)
+                })
+                .await
+                .map_err(|join_error| anyhow!("embedder load panicked: {join_error}"))?
+            })
+            .await?;
+        Ok(Some(handle.clone()))
+    }
+}
 
 /// The one embedding model pond ships a loader for (spec.md#search).
 /// `config.embeddings.model` is validated against this; `pond embed` stamps it

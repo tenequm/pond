@@ -68,13 +68,6 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 # `src/embed/e5.rs` picks the live backend at runtime.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
-# Operator-only retrieval mode override consumed by `bench/embeddings/`. When
-# this feature is on, `pond search` honors `POND_SEARCH_MODE={fts,vector,hybrid}`
-# from the environment so the benchmark harness can run the same query under
-# each retriever against one corpus. Off by default; production builds ignore
-# the variable entirely.
-bench-overrides = []
-
 [dev-dependencies]
 # Also a regular dependency; declared here so integration tests can name
 # `MetricType` when asserting the distance-metric mapping.
