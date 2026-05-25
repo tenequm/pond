@@ -652,6 +652,26 @@ impl Handle {
         Ok(())
     }
 
+    /// Reclaim manifest versions older than `older_than` on `table` along with
+    /// the orphaned data, index, transaction, and deletion files they uniquely
+    /// reference. The current manifest is preserved unconditionally and Lance's
+    /// `delete_unverified=false` floor protects files younger than ~7 days.
+    /// `error_if_tagged_old_versions=false` matches Lance's auto-cleanup hook
+    /// so a tagged old version downgrades the entry to a skip, not an error.
+    pub(crate) async fn cleanup_old_versions(
+        &self,
+        table: Table,
+        older_than: std::time::Duration,
+    ) -> Result<lance::dataset::cleanup::RemovalStats> {
+        let dataset = self.dataset(table).await?;
+        let chrono_older_than = chrono::Duration::from_std(older_than)
+            .with_context(|| format!("cleanup duration out of range: {older_than:?}"))?;
+        dataset
+            .cleanup_old_versions(chrono_older_than, None, Some(false))
+            .await
+            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))
+    }
+
     /// Resolve each table's stored location through the namespace catalog
     /// (spec.md#catalog-seam) - no hardcoded `.lance` suffix.
     async fn table_location(&self, table_name: &str) -> Result<String> {
