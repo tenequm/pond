@@ -17,17 +17,36 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML},
-    embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker},
+    embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{AdapterStats, CorpusStats, EmbeddingProgress, RowTotals, Store},
     substrate::TableSizes,
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
-        Part, PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest,
-        SearchResponse, SearchResultBody,
+        Part, PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire,
+        SearchRequest, SearchResponse, SearchResultBody,
     },
 };
+
+/// CLI surface for `pond search --mode`. Maps 1:1 to `SearchModeWire`; kept
+/// separate so the clap derive lives next to the rest of the CLI types.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSearchMode {
+    Fts,
+    Vector,
+    Hybrid,
+}
+
+impl From<CliSearchMode> for SearchModeWire {
+    fn from(mode: CliSearchMode) -> Self {
+        match mode {
+            CliSearchMode::Fts => SearchModeWire::Fts,
+            CliSearchMode::Vector => SearchModeWire::Vector,
+            CliSearchMode::Hybrid => SearchModeWire::Hybrid,
+        }
+    }
+}
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -160,6 +179,12 @@ enum Command {
         /// retriever ranks; the server default is the same.
         #[arg(long, default_value_t = 10)]
         rrf_k: u32,
+        /// Operator-only retrieval mode override. Production callers should
+        /// omit this and let the server pick (hybrid when embeddings exist,
+        /// FTS-only otherwise); benchmark and ablation harnesses use it to
+        /// force one arm against the same corpus.
+        #[arg(long, value_enum)]
+        mode: Option<CliSearchMode>,
         /// Disable the recency boost. The server defaults to enabled (matches
         /// the MCP/HTTP surface).
         #[arg(long)]
@@ -307,7 +332,10 @@ async fn main() -> anyhow::Result<()> {
             let sizes = store.table_sizes().await?;
             let unindexed = store.unindexed_message_backlog().await?;
             let embedding = store.embedding_progress().await?;
-            render_status(&stats, &sizes, unindexed, embedding)?;
+            // Sample is bounded so this remains O(sample) and `pond status`
+            // stays sub-second on a million-message corpus.
+            let scripts = store.text_script_histogram(2000).await?;
+            render_status(&stats, &sizes, unindexed, embedding, &scripts)?;
         }
         Command::Sync {
             adapter,
@@ -464,7 +492,9 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            let embedder = load_embedder(&config)?;
+            // Lazy: idle `pond serve` keeps RSS ~50 MB; the candle/Metal model
+            // load (~600 MB) only triggers when the first hybrid search asks.
+            let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
             let state = AppState { store, embedder };
             transport::http::serve(state, host, port).await?;
         }
@@ -472,7 +502,10 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
             let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
-            let embedder = load_embedder(&config)?;
+            // Lazy: idle `pond mcp` instances in every Claude Code session
+            // stay light. The model load only happens once per process on the
+            // first `pond_search` tool call that needs hybrid retrieval.
+            let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
             transport::mcp::serve_stdio(AppState { store, embedder }).await?;
         }
         Command::Search {
@@ -482,6 +515,7 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             limit,
             rrf_k,
+            mode,
             no_boost_recent,
             group_by_conversation,
             project,
@@ -496,11 +530,25 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            let embedder = load_embedder(&loaded)?;
+            // One-shot CLI: the embedder load cost has to be paid anyway if
+            // hybrid/vector mode wins, so load eagerly. `LazyEmbedder::get`
+            // would also work but adds an `.await` for zero benefit here.
+            // `--mode hybrid|vector` is an operator override that forces a
+            // load even when `config.embeddings.enabled = false`, so the
+            // benchmark harness can run against any corpus that already has
+            // vectors populated regardless of the user's daily-config switch.
+            let force_embedder =
+                matches!(mode, Some(CliSearchMode::Hybrid | CliSearchMode::Vector));
+            let embedder = if force_embedder || loaded.embeddings.enabled {
+                Some(Arc::new(E5Embedder::load()?) as Arc<dyn EmbedBackend>)
+            } else {
+                None
+            };
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
                 query,
+                mode_override: mode.map(SearchModeWire::from),
                 rrf_k,
                 filters: SearchFilters {
                     project,
@@ -705,17 +753,6 @@ fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
-}
-
-/// Load the embedding backend when `[embeddings] enabled = true`, else `None`.
-/// `pond serve` / `mcp` / `search` all gate the model load on this; `pond
-/// embed` loads the backend unconditionally.
-fn load_embedder(config: &Config) -> anyhow::Result<Option<Arc<dyn EmbedBackend>>> {
-    Ok(if config.embeddings.enabled {
-        Some(Arc::new(E5Embedder::load()?))
-    } else {
-        None
-    })
 }
 
 /// Resolve the data dir from the CLI/env argument, falling back to the XDG
@@ -1014,6 +1051,7 @@ fn render_status(
     sizes: &TableSizes,
     unindexed: usize,
     embedding: EmbeddingProgress,
+    scripts: &[(String, usize)],
 ) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint, yellow};
 
@@ -1088,6 +1126,26 @@ fn render_status(
             ),
             yellow(),
         ))?;
+    }
+    // Surfaces the corpus's language mix so an agent can decide whether
+    // bilingual querying is worth attempting (cross-lingual recall is a
+    // caller-layer concern; pond does not translate internally - see the
+    // `pond_search` MCP description). Sample is bounded; total = sum of
+    // alphabetic characters in the sampled `search_text`.
+    if !scripts.is_empty() {
+        let total: usize = scripts.iter().map(|(_, count)| *count).sum();
+        if total > 0 {
+            let parts = scripts
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(name, count)| {
+                    let pct = (*count as f64 / total as f64) * 100.0;
+                    format!("{name} {pct:.0}%")
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            output(&format!("{}  {parts}", paint("scripts", dim())))?;
+        }
     }
     if !stats.include_subagents {
         output(&paint(

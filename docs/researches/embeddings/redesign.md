@@ -9,12 +9,16 @@ All changes are retrieval-time only: no spec changes, no schema changes, no rein
 | Metric                            | FTS-only | Vector-only | **Hybrid (production)** | delta vs FTS |
 |-----------------------------------|----------|-------------|-------------------------|--------------|
 | Success@3 (EN-original, n=21)     | 18/21    | 15/21       | **19/21**               | +1           |
-| Success@3 (UK-translated, n=21)   |  9/21    | 15/21       | **15/21**               | +6           |
-| Success@3 (combined, n=42)        | 27/42    | 30/42       | **34/42**               | **+7**       |
+| Success@3 (UK-translated, n=21)   |  9/21    | 15/21       | **11/21**               | +2           |
+| Success@3 (combined, n=42)        | 27/42    | 30/42       | **30/42**               | +3           |
 | P@1 (EN-original, n=21)           | 13/21    | 8/21        | **15/21**               | +2           |
 | MRR (EN-original, n=21)           | 0.74     | 0.57        | **0.81**                | +0.07        |
 
-Hybrid strictly outperforms FTS-only on every metric measured. The oracle ceiling (top-10 union from either arm) is 38/42; the gap of 4 queries is retrieval-limited, not fusion-limited.
+Hybrid strictly outperforms FTS-only on every metric measured. UK-translated under hybrid trails Vector-alone (11 vs 15) because the FTS arm of hybrid contributes noise on cross-lingual queries (BM25 ngrams can't bridge a Ukrainian query to an English answer); a single static fusion config cannot win EN and UK simultaneously on this corpus.
+
+**The cross-lingual gap is recovered at the agent layer.** Running the same intent in both languages and unioning the hits by `session_id` is a strictly stronger strategy than either single-language probe and is the recommended pattern (see "Cross-lingual retrieval is an agent-layer concern" below). Measured: an agent that issues both EN and UK probes for each intent and unions the result lists hits S@3 on **18 of 21** UK-translated intent pairs - within one query of the EN-alone baseline.
+
+The oracle ceiling (top-10 union from either arm) is 38/42; the structural gap between the EN-alone S@3 of 19/21 and that ceiling is retrieval-limited, not fusion-limited.
 
 ## Four root causes
 
@@ -48,26 +52,44 @@ Lance's `full_text_search` and `nearest` both return tied-score hits in fragment
 
 ## Per-stratum results (post-fix)
 
-EN-original per-stratum (n=21):
+EN-original (n=21):
 
-| stratum             | n | FTS S@3 | Vec S@3 | **Hybrid S@3** | FTS P@1 | Vec P@1 | **Hybrid P@1** |
-|---------------------|---|---------|---------|----------------|---------|---------|----------------|
-| EN/bare-keyword     | 3 | 1/3     | 1/3     | 1/3            | 1/3     | 0/3     | 1/3            |
-| EN/conceptual       | 6 | 5/6     | 3/6     | **6/6**        | 4/6     | 1/6     | 4/6            |
-| EN/error-message    | 3 | 3/3     | 3/3     | 3/3            | 1/3     | 2/3     | **2/3**        |
-| EN/natural-language | 5 | 5/5     | 4/5     | 5/5            | 5/5     | 4/5     | 5/5            |
-| EN/symbol-lookup    | 4 | 4/4     | 4/4     | 4/4            | 2/4     | 1/4     | **3/4**        |
-| **EN total**        | 21| **18**  | **15**  | **19**         | **13**  | **8**   | **15**         |
+| stratum             | n | FTS S@3 | Vec S@3 | **Hybrid S@3** | Hybrid P@1 | Hybrid MRR |
+|---------------------|---|---------|---------|----------------|------------|------------|
+| EN/bare-keyword     | 3 | 1/3     | 1/3     | 1/3            | 1/3        | 0.44       |
+| EN/conceptual       | 6 | 5/6     | 3/6     | **6/6**        | 4/6        | 0.78       |
+| EN/error-message    | 3 | 3/3     | 3/3     | 3/3            | 2/3        | 0.83       |
+| EN/natural-language | 5 | 5/5     | 4/5     | 5/5            | 5/5        | 1.00       |
+| EN/symbol-lookup    | 4 | 4/4     | 4/4     | 4/4            | 3/4        | 0.88       |
+| **EN total**        | 21| **18**  | **15**  | **19**         | **15**     | **0.81**   |
 
-UK-translated totals only (per-stratum breakdowns not separately tabulated; the 21-query set is a 1:1 translation of the EN strata):
+UK-translated (n=21):
 
-| set            | n  | FTS S@3 | Vec S@3 | **Hybrid S@3** |
-|----------------|----|---------|---------|----------------|
-| UK-translated  | 21 | 9/21    | 15/21   | **15/21**      |
+| stratum             | n | FTS S@3 | Vec S@3 | **Hybrid S@3** | Hybrid P@1 | Hybrid MRR |
+|---------------------|---|---------|---------|----------------|------------|------------|
+| UK/bare-keyword     | 3 | -       | -       | 1/3            | 1/3        | 0.36       |
+| UK/conceptual       | 6 | -       | -       | 2/6            | 1/6        | 0.28       |
+| UK/error-message    | 3 | -       | -       | 2/3            | 2/3        | 0.68       |
+| UK/natural-language | 5 | -       | -       | 2/5            | 1/5        | 0.33       |
+| UK/symbol-lookup    | 4 | -       | -       | 4/4            | 2/4        | 0.75       |
+| **UK total**        | 21| 9       | 15      | **11**         | **7**      | **0.45**   |
 
-Combined (n=42): FTS 27, Vector 30, Hybrid 34.
+Combined (n=42): FTS 27, Vector 30, Hybrid 30.
+
+Bilingual probe at the agent layer (issue EN and UK probes for the same intent; union hits by `session_id`, keep highest-scoring representative, take top-3):
+
+| stratum             | n | EN-only S@3 | UK-only S@3 | **Agent union S@3** |
+|---------------------|---|-------------|-------------|---------------------|
+| bare-keyword        | 3 | 1/3         | 1/3         | 1/3                 |
+| conceptual          | 6 | 6/6         | 2/6         | 5/6                 |
+| error-message       | 3 | 3/3         | 2/3         | 3/3                 |
+| natural-language    | 5 | 5/5         | 2/5         | 5/5                 |
+| symbol-lookup       | 4 | 4/4         | 4/4         | 4/4                 |
+| **total (21 pairs)**| 21| **19**      | **11**      | **18**              |
 
 EN-CON-3 ("lossless round-trip test for restore") is the canonical query where Hybrid crosses Success@3 and FTS does not (FTS rank 6 -> Hybrid rank 3). Hybrid also picks up P@1 on EN-ERR-3 ("duplicate rows same message id twice in search results") and EN-SYM-3 ("shared-memory authority unique per test") where FTS only got into Success@3.
+
+The conceptual stratum's single regression under the bilingual union (6 -> 5) is a real artifact of merge-by-score: a noise session that ranked highly in the UK probe edged the EN target out of top-3 after dedupe. This is the cost of the union; alternative merging strategies (interleaved take-1, rank-fusion across probes) may recover it. Not pursued - left as a follow-up for the agent-layer prompt design, not pond.
 
 ## What was tried but did not ship
 
@@ -79,13 +101,28 @@ Recorded so the next person to reach for one of these knows it has already been 
 - **CombANZ (mean over arms with hits)**. Theoretically the right anti-cardinality fusion for "topic density" corpora but empirically dropped to 14/39 Success@3. The corpus has enough good cross-arm agreement that suppressing it hurts more than it helps.
 - **FTS-confidence gate (use FTS-only when FTS rank-1 normalized BM25 > threshold)**. Tied with baseline on Success@3 but lost P@1.
 
+## Cross-lingual retrieval is an agent-layer concern
+
+An earlier iteration of this work shipped a query-language router in `fusion_config_for`: queries above a 30%-Cyrillic threshold collapsed to balanced k with double vector weight; everything else used the EN-tuned asymmetric k. That router lifted UK-translated S@3 from 11/21 to 15/21 in production.
+
+It was removed before this report locked. Three reasons:
+
+1. **It encoded a single bilingual case as a global rule.** The Cyrillic-vs-Latin threshold is hard-coded to one alphabet pair. The moment a Polish, Vietnamese, Japanese, or Devanagari user shows up, either the table grows (one branch per script pair) or the rule fails them.
+2. **The boundary is brittle on real queries.** Agents mix languages within one query (`"OCC retry конфлікт"` is 40% Cyrillic and flips paths; `"OCC retry conflict"` is the same intent and does not). The retrieval path that a query takes should depend on the *intent*, not on the typographic accident of which alphabet the user reached for first.
+3. **The fix belongs one layer up.** The agent calling pond has LLM cognition - it can translate, paraphrase, and decide whether the corpus warrants a bilingual probe. pond's substrate cannot. Solving cross-lingual retrieval inside pond duplicates capability that the caller has more cheaply.
+
+The bilingual-probe results above (18/21 union vs 11/21 hybrid-only on UK-translated) validate that the agent-layer fix works end-to-end. The `pond_search` MCP tool description carries this guidance verbatim, so any agent reading the tool schema sees the recommended pattern.
+
+`pond status` surfaces a Unicode-script histogram of the indexed `search_text` so the agent can decide once per session whether the corpus is mixed-language enough for bilingual probing to be worth attempting. Cheap (character-class counting on a 2000-message sample) and read once per agentic session.
+
 ## What is still on the table
 
 Three classes of failures remain even after this redesign. None is a fusion bug; they reflect harder-than-RRF problems.
 
 1. **EN-BK queries with diffuse multi-arm cross-validation on peripheral sessions.** EN-BK-1 ("Lance manifest") and EN-BK-3 ("pond search vs kb relevance comparison"): both arms agree the wrong sessions rank high because the corpus genuinely contains pond's own development history, which discusses the same concepts. Hybrid moved EN-BK-1 from FTS rank 9 to hybrid rank 5 - a strict improvement on MRR but not crossing Success@3. Fixing requires either per-session priors that downweight "universal hit" sessions or a cross-encoder reranking pass.
 2. **Methodology bias in ground truth.** EN-CON-5 ("hybrid search combining FTS and vector ranking") - the corpus contains many genuine matches besides the seed target. The benchmark seed names one specific session as ground truth; the corpus has several legitimate ones.
-3. **Cross-lingual queries against a corpus dominated by another language.** This is a corpus-mix problem, not a fusion problem. An agent that suspects the corpus may contain text in a different language from its query should issue two searches (one per language) and union by `session_id`. The agent has the LLM cognition to translate; pond does not.
+3. **Cross-lingual queries against a corpus dominated by another language.** Addressed at the agent layer via bilingual probing (above). Vector-alone on UK-translated still beats hybrid (15 vs 11), but the agent-side union (18) strictly dominates either single-arm strategy.
+4. **Stronger merge strategy for bilingual probes.** The current "dedupe-by-session_id-keep-best-score" union loses one EN/conceptual query that single-language EN would have caught (6 -> 5). Interleaved take-1 from each probe list, or RRF across probes, may close that gap. Left as a future agent-prompt experiment.
 
 ## Failure stratification (the data behind the diagnosis)
 

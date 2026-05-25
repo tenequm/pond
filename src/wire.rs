@@ -371,10 +371,13 @@ pub struct SearchRequest {
     #[serde(default)]
     pub namespace: Option<String>,
     pub query: String,
-    // No request-level `search_mode`: the server decides between hybrid and
-    // FTS-only based on the embedder + embeddings-coverage state. The response
-    // carries no top-level mode field either - per-hit `matched_via` reports
-    // which retriever(s) ranked each row.
+    // Server normally decides between hybrid and FTS-only from the embedder +
+    // embeddings-coverage state (spec.md#search); `mode_override` is the
+    // operator-tooling escape hatch consumed by `pond search --mode` and the
+    // `bench/embeddings/` harness. Production callers (MCP, HTTP agents)
+    // should leave it `None` and let the server pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_override: Option<SearchModeWire>,
     #[serde(default = "default_rrf_k")]
     pub rrf_k: u32,
     #[serde(default)]
@@ -385,6 +388,19 @@ pub struct SearchRequest {
     pub group_by_conversation: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
+}
+
+/// Wire-level retrieval mode override (spec.md#search). Not normally set on
+/// the wire - the server decides hybrid vs FTS-only from embedding
+/// availability. The variant exists so operator tooling (`pond search --mode`,
+/// the embeddings-benchmark harness) can force one arm without an env-var
+/// backdoor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchModeWire {
+    Fts,
+    Vector,
+    Hybrid,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -513,12 +529,14 @@ pub enum IngestStatus {
     Error,
 }
 
-fn default_rrf_k() -> u32 {
-    // k=60 (Cormack/Clarke/Buettcher 2009) flattens the rank curve too aggressively
-    // for short-message corpora: rank 1 (1/61=0.0164) only narrowly beats rank 10
-    // (1/70=0.0143), so a handful of mediocre dual-arm matches outscore one strong
-    // single-arm match. k=10 keeps RRF's monotone-in-rank property but rewards the
-    // top of each retriever's list (rank 1 = 1/11 = 0.091 vs rank 10 = 1/20 = 0.05).
+/// Default RRF `k`. k=60 (Cormack/Clarke/Buettcher 2009) flattens the rank
+/// curve too aggressively for short-message corpora: rank 1 (1/61=0.0164)
+/// only narrowly beats rank 10 (1/70=0.0143), so a handful of mediocre
+/// dual-arm matches outscore one strong single-arm match. k=10 keeps RRF's
+/// monotone-in-rank property but rewards the top of each retriever's list
+/// (rank 1 = 1/11 = 0.091 vs rank 10 = 1/20 = 0.05). `pub` so the MCP
+/// transport can read it instead of hardcoding a separate stale default.
+pub fn default_rrf_k() -> u32 {
     10
 }
 

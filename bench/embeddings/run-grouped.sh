@@ -4,10 +4,10 @@ mode=$1; queries=$2; out_dir=$3
 mkdir -p "$out_dir"
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 bin="$repo_root/target/release/pond"
-cfg="$repo_root/bench/embeddings/config.toml"
 while IFS=$'\t' read -r id lang stratum query gt; do
     [[ -z "${id:-}" || "$id" == "id" ]] && continue
-    POND_SEARCH_MODE="$mode" POND_CONFIG="$cfg" "$bin" search \
+    "$bin" search \
+        --mode "$mode" \
         --group-by-conversation \
         --limit 20 \
         --format json \

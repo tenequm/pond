@@ -4,7 +4,7 @@ Search-quality regression harness for pond's hybrid (FTS + Vector + RRF) retriev
 
 ## Files
 
-- `config.toml` - sandbox config; turns embeddings on so `pond search` loads the embedder when `POND_SEARCH_MODE` is set
+- `queries-en.tsv` - 21 English seed queries
 - `queries-uk-translated.tsv` - 21 EN queries translated to Ukrainian against EN session targets; the cross-lingual benchmark
 - `run.sh <mode> <queries.tsv> <out_dir> [limit]` - executes a single retrieval mode against a query set, dumping one wire envelope per query
 - `run-grouped.sh` - same as `run.sh` but with `--group-by-conversation`
@@ -14,19 +14,11 @@ Search-quality regression harness for pond's hybrid (FTS + Vector + RRF) retriev
 - `fixtures/` (gitignored) - operator-local arm outputs captured at production pool sizes; regenerate with `run.sh` before using `simulate_fusion.py`
 - `results/` (gitignored) - operator-local benchmark runs; regenerate with `run.sh`
 
-The EN query set is `queries-en.tsv` in this directory.
-
 `fixtures/` and `results/` are NOT checked in: every JSON envelope captures full message text from the operator's local pond corpus, which contains API keys, wallet addresses, and private project paths that appeared in indexed conversations. Always regenerate locally rather than sharing these directories.
 
 ## Build
 
-The harness needs the `bench-overrides` Cargo feature on for `POND_SEARCH_MODE` to switch retrieval modes. Without it the binary ignores the variable (the variant is compiled out):
-
-```
-cargo build --release --features bench-overrides
-```
-
-Plain `cargo build --release` is fine for everything else (scoring, simulating, anchor verification), but the per-mode capture step needs the feature.
+Plain `cargo build --release` is sufficient. The harness scripts pass `--mode <fts|vector|hybrid>` to `pond search`; embeddings must be enabled in your local pond config for vector/hybrid runs to succeed.
 
 ## Workflow for a new benchmark
 
@@ -71,14 +63,18 @@ Why this is not a pond flag:
 - Semantic expansion requires an LLM call; pond's embedder is a sentence transformer (e5-base), not a generative model. Wiring an LLM into `pond search` would couple substrate to a generative dependency the spec deliberately omits.
 - Pool depth (`pool=100`, `vector_pool=200`) is already tuned to surface near-misses; making it configurable would invite "just bump it" without addressing the actual gap (which is embedding quality, not pool size).
 
-## Stratum performance (Phase 14)
+## Stratum performance (current)
 
-| Stratum         | n  | Hybrid S@3 |
-|-----------------|----|------------|
-| natural-language | 10 | 9/10       |
-| conceptual       | 12 | 10/12      |
-| symbol-lookup    | 8  | 8/8        |
-| error-message    | 6  | 5/6        |
-| bare-keyword     | 6  | 2/6        |
+EN-original (n=21), hybrid mode:
 
-Bare-keyword is the only stratum below 80%. Confidence-gating, weight tuning, and convex combination have all been simulated against pool-sized fixtures (see `docs/researches/embeddings/redesign.md`); none recover bare-keyword without regressing another stratum. The ceiling at 34/42 combined is structural to the corpus + e5-base embeddings.
+| Stratum          | n | Hybrid S@3 |
+|------------------|---|------------|
+| natural-language | 5 | 5/5        |
+| symbol-lookup    | 4 | 4/4        |
+| error-message    | 3 | 3/3        |
+| conceptual       | 6 | 6/6        |
+| bare-keyword     | 3 | 1/3        |
+
+UK-translated (n=21), hybrid mode: 11/21. The agent-layer bilingual-probe pattern (issue both EN and UK probes, union by `session_id`) lifts this to 18/21 - see `docs/researches/embeddings/redesign.md`.
+
+Bare-keyword is the only stratum below 80%. Confidence-gating, weight tuning, and convex combination have all been simulated against pool-sized fixtures (see `docs/researches/embeddings/redesign.md`); none recover bare-keyword without regressing another stratum. The combined ceiling is structural to the corpus + e5-base embeddings.
