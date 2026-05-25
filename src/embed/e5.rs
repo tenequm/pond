@@ -41,7 +41,13 @@ impl E5Embedder {
         // API - pond forbids `unsafe`, so this is the entry point rather than
         // `VarBuilder::from_mmaped_safetensors`.
         let tensors = candle_core::safetensors::load(fetch("model.safetensors")?, &device)?;
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        // Cast weights to F16 to halve resident model RSS in `pond mcp` and
+        // shrink per-query activations. Final mean-pool casts back to F32.
+        let tensors = tensors
+            .into_iter()
+            .map(|(name, tensor)| Ok((name, tensor.to_dtype(DType::F16)?)))
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F16, &device);
         let model = XLMRobertaModel::new(&config, vb)
             .map_err(|error| anyhow!("load {MODEL_ID} weights: {error}"))?;
 
@@ -93,15 +99,20 @@ impl EmbedBackend for E5Embedder {
         let input_ids = Tensor::stack(&ids, 0)?;
         let attention_mask = Tensor::stack(&masks, 0)?;
         let token_type_ids = input_ids.zeros_like()?;
-        // XLM-RoBERTa last hidden state: [batch, seq, hidden].
-        let hidden = self.model.forward(
-            &input_ids,
-            &attention_mask,
-            &token_type_ids,
-            None,
-            None,
-            None,
-        )?;
+        // XLM-RoBERTa last hidden state: [batch, seq, hidden]. F16 weights ->
+        // F16 hidden; cast to F32 for the pool so the output vector keeps
+        // sentence-transformers' expected precision.
+        let hidden = self
+            .model
+            .forward(
+                &input_ids,
+                &attention_mask,
+                &token_type_ids,
+                None,
+                None,
+                None,
+            )?
+            .to_dtype(DType::F32)?;
         // Masked mean-pool, then L2-normalize - the sentence-transformers
         // pooling e5 was trained with (padding tokens excluded by the mask).
         let mask = attention_mask.to_dtype(DType::F32)?.unsqueeze(2)?;
