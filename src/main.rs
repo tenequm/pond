@@ -331,11 +331,19 @@ async fn main() -> anyhow::Result<()> {
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
             let unindexed = store.unindexed_message_backlog().await?;
+            let vector_unindexed = store.unindexed_vector_backlog().await?;
             let embedding = store.embedding_progress().await?;
             // Sample is bounded so this remains O(sample) and `pond status`
             // stays sub-second on a million-message corpus.
             let scripts = store.text_script_histogram(2000).await?;
-            render_status(&stats, &sizes, unindexed, embedding, &scripts)?;
+            render_status(
+                &stats,
+                &sizes,
+                unindexed,
+                vector_unindexed,
+                embedding,
+                &scripts,
+            )?;
         }
         Command::Sync {
             adapter,
@@ -458,29 +466,58 @@ async fn main() -> anyhow::Result<()> {
                 .progress_chars("##-"),
             );
             bar.enable_steady_tick(Duration::from_millis(120));
+            // First Ctrl-C: cooperative drain (worker exits after the next
+            // window write, indices still rebuild). Second Ctrl-C: terminate
+            // hard with the SIGINT exit code so the user can always escape.
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "\ninterrupted; flushing window and finishing indices (Ctrl-C again to abort)..."
+                    );
+                    let _ = tokio::signal::ctrl_c().await;
+                    std::process::exit(130);
+                });
+            }
             let bar_for_callback = bar.clone();
-            let mut worker = EmbedWorker::new(&store, &embedder).with_progress(
-                move |progress: BatchProgress| {
+            let mut worker = EmbedWorker::new(&store, &embedder)
+                .with_cancel(cancel)
+                .with_progress(move |progress: BatchProgress| {
                     bar_for_callback.set_position(progress.total_messages as u64);
-                },
-            );
+                });
             if let Some(limit) = limit {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            bar.finish_and_clear();
             // The column update moves rows into new fragments; Lance's
             // incremental index fold mishandles that, so rebuild the indexes
             // from scratch here instead of leaving a stale state for the next
-            // `pond sync` to fold (spec.md#index-upkeep).
+            // `pond sync` to fold (spec.md#index-upkeep). The reused bar
+            // switches to a spinner so the user sees the rebuild phase that
+            // would otherwise be silent for minutes.
+            let spinner_style =
+                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner());
+            bar.set_style(spinner_style);
+            bar.set_message("rebuilding scalar and FTS indices...");
             store.ensure_indices(true).await?;
+            let total_vectors = progress.embedded + summary.messages;
+            bar.set_message(format!(
+                "rebuilding vector index ({} vectors, this can take a few minutes)...",
+                format_thousands(total_vectors as u64),
+            ));
             store.ensure_embedding_indices().await?;
+            bar.finish_and_clear();
             output(&format!(
-                "{} done: batches={} messages={} device={}",
+                "{} done: batches={} messages={} device={}{}",
                 pond::output::paint("embed:", pond::output::dim()),
                 summary.batches,
                 summary.messages,
                 embedder.device(),
+                if summary.cancelled { " (interrupted)" } else { "" },
             ))?;
         }
         Command::Serve {
@@ -1050,6 +1087,7 @@ fn render_status(
     stats: &CorpusStats,
     sizes: &TableSizes,
     unindexed: usize,
+    vector_unindexed: usize,
     embedding: EmbeddingProgress,
     scripts: &[(String, usize)],
 ) -> anyhow::Result<()> {
@@ -1097,6 +1135,33 @@ fn render_status(
     } else {
         output(&paint(
             &format!("fts index  {unindexed} messages unindexed - run `pond sync --reindex`"),
+            yellow(),
+        ))?;
+    }
+    // Below the activation threshold no IVF_PQ is built (brute-force vector
+    // scan is exact at that size); above it, `vector_unindexed` is the count
+    // of rows in fragments rewritten since the index was last rebuilt, so a
+    // non-zero value means vector search misses those rows.
+    if embedding.embedded < pond::substrate::VECTOR_INDEX_ACTIVATION_ROWS {
+        output(&format!(
+            "{}  {} vectors  not indexable yet (activates at {})",
+            paint("vector index", dim()),
+            paint(&format_thousands(embedding.embedded as u64), bold()),
+            format_thousands(pond::substrate::VECTOR_INDEX_ACTIVATION_ROWS as u64),
+        ))?;
+    } else if vector_unindexed == 0 {
+        output(&format!(
+            "{}  complete ({} vectors)",
+            paint("vector index", dim()),
+            paint(&format_thousands(embedding.embedded as u64), bold()),
+        ))?;
+    } else {
+        output(&paint(
+            &format!(
+                "vector index  {} vectors  {} unindexed - run `pond embed` to rebuild",
+                format_thousands(embedding.embedded as u64),
+                format_thousands(vector_unindexed as u64),
+            ),
             yellow(),
         ))?;
     }

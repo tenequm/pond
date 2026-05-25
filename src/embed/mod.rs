@@ -7,6 +7,7 @@
 //! `messages` in one column-update commit.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use lance::index::vector::VectorIndexParams;
@@ -150,6 +151,10 @@ pub struct EmbedSummary {
     pub messages: usize,
     /// Model-inference + write batches issued.
     pub batches: usize,
+    /// Set when the run exited via the cancel flag instead of stream end -
+    /// the caller uses this to print an interrupted notice and decide whether
+    /// to still rebuild downstream indices.
+    pub cancelled: bool,
 }
 
 /// Per-batch stats handed to a progress callback. Lets `pond embed` drive an
@@ -184,6 +189,9 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
     /// Optional per-batch progress callback. Called once per `flush()` with
     /// the running totals; `pond embed` wires this to an `indicatif` bar.
     progress: Option<ProgressFn>,
+    /// Set externally (Ctrl-C handler in `pond embed`): the pull loop drains
+    /// the in-memory window before exiting so partial work is committed.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
@@ -197,7 +205,24 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             limit: None,
             sort_window: DEFAULT_SORT_WINDOW,
             progress: None,
+            cancel: None,
         }
+    }
+
+    /// Honour `flag` as a cooperative cancellation signal. The pull loop checks
+    /// it before each new stream message; once set, the worker drains the
+    /// current window (committing the embedded slice) and returns with
+    /// `EmbedSummary { cancelled: true, .. }`. `pond embed` wires this to a
+    /// Ctrl-C handler so an interrupted run doesn't lose its in-memory window.
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Override the length-sort window (default [`DEFAULT_SORT_WINDOW`]). The
@@ -239,9 +264,10 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         let stream = self.store.pending_embedding_messages();
         tokio::pin!(stream);
         while let Some(pending) = stream.next().await {
-            // Stop pulling once the message cap is reached; the staged window
-            // is still drained below, so exactly `limit` messages are embedded.
-            if self.limit.is_some_and(|limit| pulled >= limit) {
+            // Stop pulling once the message cap is reached or cancellation
+            // fires; the staged window is still drained below, so the
+            // already-embedded slice commits cleanly.
+            if self.limit.is_some_and(|limit| pulled >= limit) || self.cancelled() {
                 break;
             }
             window.push(pending?);
@@ -251,11 +277,13 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
             }
         }
         self.drain_window(&mut window, &mut summary).await?;
+        summary.cancelled = self.cancelled();
 
         tracing::info!(
             model = MODEL_ID,
             messages = summary.messages,
             batches = summary.batches,
+            cancelled = summary.cancelled,
             "embed worker finished",
         );
         Ok(summary)
