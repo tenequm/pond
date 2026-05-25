@@ -991,6 +991,28 @@ impl Store {
             .await
     }
 
+    /// Reclaim manifest versions older than `older_than` across every dataset
+    /// pond owns (sessions, messages, parts), summing the per-table
+    /// [`RemovalStats`]. Lance's `delete_unverified=false` floor still
+    /// protects files younger than ~7 days, so this is safe to run while
+    /// `pond mcp` or `pond serve` is live.
+    pub async fn compact(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<lance::dataset::cleanup::RemovalStats> {
+        let mut total = lance::dataset::cleanup::RemovalStats::default();
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            let stats = self.handle.cleanup_old_versions(table, older_than).await?;
+            total.bytes_removed += stats.bytes_removed;
+            total.old_versions += stats.old_versions;
+            total.data_files_removed += stats.data_files_removed;
+            total.transaction_files_removed += stats.transaction_files_removed;
+            total.index_files_removed += stats.index_files_removed;
+            total.deletion_files_removed += stats.deletion_files_removed;
+        }
+        Ok(total)
+    }
+
     /// Embedding coverage: how many `messages` rows already carry a vector
     /// under the current model, and how many are still eligible. Drives the
     /// `pond status` embeddings line and the `pond embed` progress bar's known

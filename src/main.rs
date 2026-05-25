@@ -133,6 +133,21 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Reclaim disk by removing old manifest versions and the orphaned data
+    /// and index files they uniquely reference. The current manifest is kept
+    /// unconditionally and Lance's `delete_unverified=false` floor protects
+    /// files younger than seven days, so this stays safe while `pond mcp` or
+    /// `pond serve` is live.
+    Compact {
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Reclaim manifest versions older than this duration. Accepts
+        /// humantime durations: `1h`, `12h`, `1d`, `7d`. Default: `1d`.
+        #[arg(long, default_value = "1d", value_parser = humantime::parse_duration)]
+        older_than: std::time::Duration,
+    },
     /// Run the HTTP+JSON server, including the streamable-HTTP MCP `/mcp` route.
     Serve {
         #[arg(long, env = "POND_HOST", default_value = "127.0.0.1")]
@@ -492,18 +507,20 @@ async fn main() -> anyhow::Result<()> {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            // The column update moves rows into new fragments; Lance's
-            // incremental index fold mishandles that, so rebuild the indexes
-            // from scratch here instead of leaving a stale state for the next
-            // `pond sync` to fold (spec.md#index-upkeep). The reused bar
-            // switches to a spinner so the user sees the rebuild phase that
-            // would otherwise be silent for minutes.
+            // Stable row IDs (spec.md#stable-row-ids) carry FTS and scalar
+            // indices across the vector merge_update's fragment rewrite, so
+            // the incremental fold here is a near-no-op rather than the
+            // from-scratch FTS rebuild this used to be (one ~800 MiB shard
+            // set per embed). The reused bar switches to a spinner so the
+            // post-embed phase is no longer silent.
             let spinner_style =
                 ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
                     .unwrap_or_else(|_| ProgressStyle::default_spinner());
             bar.set_style(spinner_style);
-            bar.set_message("rebuilding scalar and FTS indices...");
-            store.ensure_indices(true).await?;
+            bar.set_message("folding FTS and scalar indices...");
+            store.index_upkeep().await?;
+            // IVF_PQ trains against row-address snapshots invalidated by the
+            // fragment rewrite, so this rebuild stays - the one true cost.
             let total_vectors = progress.embedded + summary.messages;
             bar.set_message(format!(
                 "rebuilding vector index ({} vectors, this can take a few minutes)...",
@@ -517,7 +534,44 @@ async fn main() -> anyhow::Result<()> {
                 summary.batches,
                 summary.messages,
                 embedder.device(),
-                if summary.cancelled { " (interrupted)" } else { "" },
+                if summary.cancelled {
+                    " (interrupted)"
+                } else {
+                    ""
+                },
+            ))?;
+        }
+        Command::Compact {
+            data_dir,
+            config,
+            older_than,
+        } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let config = Config::load(config_path(config, &data_dir))?;
+            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
+            let started = std::time::Instant::now();
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+            );
+            bar.enable_steady_tick(Duration::from_millis(120));
+            bar.set_message(format!(
+                "reclaiming manifest versions older than {}...",
+                humantime::format_duration(older_than),
+            ));
+            let stats = store.compact(older_than).await?;
+            bar.finish_and_clear();
+            output(&format!(
+                "{} reclaimed {} from {} old versions in {:.1}s ({} data, {} index, {} txn, {} deletion files)",
+                pond::output::paint("compact:", pond::output::dim()),
+                format_bytes(stats.bytes_removed),
+                format_thousands(stats.old_versions),
+                started.elapsed().as_secs_f64(),
+                format_thousands(stats.data_files_removed),
+                format_thousands(stats.index_files_removed),
+                format_thousands(stats.transaction_files_removed),
+                format_thousands(stats.deletion_files_removed),
             ))?;
         }
         Command::Serve {

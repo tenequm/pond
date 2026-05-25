@@ -6275,6 +6275,7 @@ dependencies = [
  "dialoguer",
  "fastrand",
  "hf-hub",
+ "humantime",
  "indicatif 0.18.4",
  "insta",
  "lance",

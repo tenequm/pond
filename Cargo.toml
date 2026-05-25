@@ -23,6 +23,7 @@ candle-nn = "0.10"
 candle-transformers = "0.10"
 fastrand = "2"
 hf-hub = "0.4"
+humantime = "2"
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
 # Vendored protoc (protobuf-src) so builds need no system protoc. `lance`'s `protoc`
