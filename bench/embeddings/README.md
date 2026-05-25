@@ -14,7 +14,7 @@ Search-quality regression harness for pond's hybrid (FTS + Vector + RRF) retriev
 - `fixtures/` (gitignored) - operator-local arm outputs captured at production pool sizes; regenerate with `run.sh` before using `simulate_fusion.py`
 - `results/` (gitignored) - operator-local benchmark runs; regenerate with `run.sh`
 
-The EN query set lives outside this directory at `docs/researches/embeddings-benchmark-queries.tsv`.
+The EN query set is `queries-en.tsv` in this directory.
 
 `fixtures/` and `results/` are NOT checked in: every JSON envelope captures full message text from the operator's local pond corpus, which contains API keys, wallet addresses, and private project paths that appeared in indexed conversations. Always regenerate locally rather than sharing these directories.
 
@@ -81,4 +81,4 @@ Why this is not a pond flag:
 | error-message    | 6  | 5/6        |
 | bare-keyword     | 6  | 2/6        |
 
-Bare-keyword is the only stratum below 80%. Confidence-gating, weight tuning, and convex combination have all been simulated against pool-sized fixtures (see `docs/researches/hybrid-redesign-report.md`); none recover bare-keyword without regressing another stratum. The ceiling at 34/42 combined is structural to the corpus + e5-base embeddings.
+Bare-keyword is the only stratum below 80%. Confidence-gating, weight tuning, and convex combination have all been simulated against pool-sized fixtures (see `docs/researches/embeddings/redesign.md`); none recover bare-keyword without regressing another stratum. The ceiling at 34/42 combined is structural to the corpus + e5-base embeddings.

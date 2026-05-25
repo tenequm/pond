@@ -33,4 +33,4 @@ tmp/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate
 # stats appear inline in the benchmark report. Regenerate via `pond status`.
-/docs/researches/embeddings-benchmark-snapshot.txt
+/docs/researches/embeddings/snapshot.txt
