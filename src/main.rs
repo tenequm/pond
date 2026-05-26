@@ -330,7 +330,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
+            // Read-only verb: skip the open-time fold-and-create pass so
+            // status never races a concurrent writer's commits.
+            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
             let unindexed = store.unindexed_message_backlog().await?;
@@ -526,12 +528,22 @@ async fn main() -> anyhow::Result<()> {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            // spec.md#fold-on-write: every per-window merge_update inside
-            // the worker landed its column write together with the index
-            // folds; the specific merge that crossed
-            // VECTOR_INDEX_ACTIVATION_ROWS triggered the IVF_PQ creation
-            // (sized to the live vector count) inline. There is no
-            // post-embed upkeep verb - the seam owns the contract.
+            // spec.md#fold-on-write: one fold pass at the embed handler
+            // boundary - the worker drains in windows and folding per
+            // window would multiply embed cost. The threshold-crossing
+            // IVF_PQ creation happens here too via the policy's intent
+            // set inside `flush_indices`.
+            let spinner_style =
+                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner());
+            bar.set_style(spinner_style);
+            bar.set_message("folding indices...");
+            // Embed does merge_update column rewrites - use the rebuild
+            // shape for scalar/FTS to dodge the v7.0.0-beta.16 flat-BTREE
+            // bug. Vector folds incrementally either way.
+            store
+                .flush_indices(pond::substrate::WriteShape::ColumnUpdate)
+                .await?;
             bar.finish_and_clear();
             output(&format!(
                 "{} done: batches={} messages={} device={}{}",
@@ -592,7 +604,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
+            // Read-only verb: skip the open-time fold-and-create pass so
+            // search never races a concurrent writer's commits.
+            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
             // One-shot CLI: the embedder load cost has to be paid anyway if
             // hybrid/vector mode wins, so load eagerly. `LazyEmbedder::get`
             // would also work but adds an `.await` for zero benefit here.
@@ -646,7 +660,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
+            // Read-only verb: skip the open-time fold-and-create pass.
+            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
