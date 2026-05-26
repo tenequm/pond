@@ -109,6 +109,9 @@ mod ingest_handler {
         Ok,
         Partial {
             dropped_events: usize,
+            /// First drop's error message; subsequent drops counted, not
+            /// retained. Full detail at `POND_LOG=pond=debug`.
+            first_drop_reason: Option<String>,
         },
         Skipped {
             reason: String,
@@ -131,6 +134,7 @@ mod ingest_handler {
         /// drops at flush time to compute the final `SyncStatus::Partial`
         /// count.
         dropped_events: usize,
+        first_drop_reason: Option<String>,
         /// The `index` value used when the Session event was pushed to the
         /// validator. After batched flush, `RowOutcome.index` lets us match
         /// per-session outcomes back to the originating session.
@@ -147,6 +151,7 @@ mod ingest_handler {
         session_id: String,
         messages: usize,
         dropped_events: usize,
+        first_drop_reason: Option<String>,
         session_index: usize,
     }
 
@@ -238,7 +243,7 @@ mod ingest_handler {
                     }));
                 }
                 Ok(AdapterYield::Event(event)) => {
-                    // A new Session means the previous one is being closed
+                    // A new Session means the current one is being closed
                     // out by the validator (moved to its `completed` buffer
                     // for batched flush). Stage the PendingDone so we can
                     // emit SessionDone with proper status after flush.
@@ -250,6 +255,7 @@ mod ingest_handler {
                             session_id: prev.session_id,
                             messages: prev.messages,
                             dropped_events: prev.dropped_events,
+                            first_drop_reason: prev.first_drop_reason,
                             session_index: prev.session_index,
                         });
                     }
@@ -261,6 +267,7 @@ mod ingest_handler {
                                 session_id: session.id.clone(),
                                 messages: 0,
                                 dropped_events: 0,
+                                first_drop_reason: None,
                                 session_index: event_index,
                             });
                         }
@@ -288,6 +295,10 @@ mod ingest_handler {
                             && let Some(slot) = in_flight.as_mut()
                         {
                             slot.dropped_events += 1;
+                            if slot.first_drop_reason.is_none() {
+                                slot.first_drop_reason =
+                                    outcome.error.as_ref().map(|err| err.message.clone());
+                            }
                         }
                     }
                     summary.add_outcomes(&push_outcomes);
@@ -309,9 +320,9 @@ mod ingest_handler {
                 Err(error) => {
                     // Per-event drop semantics: the adapter's error is either
                     // a pre-Session header failure (whole file unusable) or a
-                    // mid-session bad-line skip. We never reset the validator
-                    // on these any more - subsequent good lines from the same
-                    // file should still land.
+                    // mid-session bad-line skip. The validator is not reset
+                    // on either case so subsequent good lines from the same
+                    // file still land.
                     tracing::debug!(
                         %error,
                         "adapter event error (per-line drop by design)"
@@ -322,6 +333,9 @@ mod ingest_handler {
                             // to this session; the bar will render the per-
                             // session summary at SessionDone time.
                             slot.dropped_events += 1;
+                            if slot.first_drop_reason.is_none() {
+                                slot.first_drop_reason = Some(error.to_string());
+                            }
                             summary.dropped_events += 1;
                         }
                         None => {
@@ -344,14 +358,13 @@ mod ingest_handler {
             }
         }
 
-        // Close the last in-flight substream (if any) and final-flush all
-        // pending substreams in one batched write.
         if let Some(prev) = in_flight.take() {
             pending_dones.push_back(PendingDone {
                 project: prev.project,
                 session_id: prev.session_id,
                 messages: prev.messages,
                 dropped_events: prev.dropped_events,
+                first_drop_reason: prev.first_drop_reason,
                 session_index: prev.session_index,
             });
         }
@@ -364,16 +377,6 @@ mod ingest_handler {
 
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
             .saturating_sub(truncations_before) as usize;
-
-        // spec.md#fold-on-write: one fold pass for the whole ingest, run
-        // at the outermost public boundary (this handler). Ingest is
-        // pure inserts (`merge_insert`), so the cheap incremental
-        // `Append` shape is safe; per-batch fold would push ingest to
-        // O(N^2) - the regression that moved this call out of
-        // `upsert_session_batch`.
-        store
-            .flush_indices(crate::substrate::WriteShape::Append)
-            .await?;
 
         let total = run_started.elapsed();
         let other = total
@@ -442,6 +445,7 @@ mod ingest_handler {
             } else if done.dropped_events > 0 {
                 SyncStatus::Partial {
                     dropped_events: done.dropped_events,
+                    first_drop_reason: done.first_drop_reason,
                 }
             } else {
                 SyncStatus::Ok
@@ -524,10 +528,6 @@ mod ingest_handler {
         let mut tail = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
-        // spec.md#fold-on-write: one fold at the handler boundary.
-        store
-            .flush_indices(crate::substrate::WriteShape::Append)
-            .await?;
         Ok(outcomes)
     }
 
@@ -1113,14 +1113,6 @@ mod search_handler {
         }
     }
 
-    /// Unindexed-row count above which `pond_search` logs that the FTS index
-    /// trails the data (spec.md#fold-on-write). With the fold-on-write
-    /// contract this is normally zero between commits; a non-zero value
-    /// indicates a partially-recovered crash and is reconciled by the next
-    /// open. Search results stay correct regardless - the engine flat-scans
-    /// the not-yet-folded tail.
-    const INDEX_BACKLOG_WARN: usize = 10_000;
-
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
     /// `embedder` is `Some` AND at least one message is embedded under the
     /// configured model, FTS-only otherwise. The response has no top-level mode
@@ -1132,17 +1124,56 @@ mod search_handler {
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
         request: SearchRequest,
+        search: &crate::config::SearchConfig,
     ) -> SearchEnvelope {
-        match run_search(store, embedder, request, &SystemClock).await {
+        match run_search(store, embedder, request, search, &SystemClock).await {
             Ok(response) => SearchEnvelope::Success(response),
             Err(envelope) => SearchEnvelope::Error(envelope),
         }
+    }
+
+    pub async fn explain_search_plan(
+        store: &Store,
+        embedder: Option<&dyn EmbedBackend>,
+        request: SearchRequest,
+        search: &crate::config::SearchConfig,
+    ) -> Result<String, ErrorEnvelope> {
+        let override_mode = request.mode_override.map(wire_mode_to_internal);
+        let mut plan = plan_search(request, SearchMode::Fts)?;
+        plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
+        let mut out = String::new();
+        if matches!(plan.mode, SearchMode::Fts | SearchMode::Hybrid) {
+            let fts = store
+                .explain_fts_plan(&plan.query, plan.pool, &plan.filter)
+                .await
+                .map_err(map_storage)?;
+            out.push_str("fts:\n");
+            out.push_str(&fts);
+            out.push('\n');
+        }
+        if matches!(plan.mode, SearchMode::Vector | SearchMode::Hybrid) {
+            let Some(embedder) = embedder else {
+                return Err(map_error(crate::Error::internal(
+                    "vector explain resolved without an embedder",
+                )));
+            };
+            let vector = embed_query(embedder, &plan.query)?;
+            let vector_plan = store
+                .explain_vector_plan(&vector, plan.vector_pool, &plan.filter, Some(search))
+                .await
+                .map_err(map_storage)?;
+            out.push_str("vector:\n");
+            out.push_str(&vector_plan);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     async fn run_search(
         store: &Store,
         embedder: Option<&dyn EmbedBackend>,
         request: SearchRequest,
+        search: &crate::config::SearchConfig,
         clock: &dyn Clock,
     ) -> Result<SearchResponse, ErrorEnvelope> {
         let override_mode = request.mode_override.map(wire_mode_to_internal);
@@ -1154,23 +1185,6 @@ mod search_handler {
         // anything else degrades to FTS-only.
         plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
 
-        // spec.md#fold-on-write: results stay correct against the
-        // not-yet-folded tail (the engine flat-scans it), but a large backlog
-        // hurts latency. Under the fold-on-write contract this should be
-        // zero; a non-zero value indicates an interrupted write that
-        // open-time reconciliation will recover on the next open.
-        match store.unindexed_message_backlog().await {
-            Ok(backlog) if backlog > INDEX_BACKLOG_WARN => {
-                tracing::warn!(
-                    backlog,
-                    "messages FTS index trails data; this should self-heal on next open"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, "could not measure FTS index backlog");
-            }
-        }
         let candidates = match plan.mode {
             SearchMode::Fts => {
                 let hits = store
@@ -1199,7 +1213,7 @@ mod search_handler {
                 };
                 let vector_fut = async {
                     store
-                        .vector_search(&vector, plan.vector_pool, &plan.filter)
+                        .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                         .await
                         .map_err(map_storage)
                 };
@@ -1246,7 +1260,7 @@ mod search_handler {
                 };
                 let vector = embed_query(embedder, &plan.query)?;
                 let vector_raw = store
-                    .vector_search(&vector, plan.vector_pool, &plan.filter)
+                    .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                     .await
                     .map_err(map_storage)?;
                 normalize_vector(vector_raw)
@@ -1920,8 +1934,8 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, hit_payload,
-    plan_search, pond_search, recency_boost, rrf_merge,
+    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, explain_search_plan,
+    hit_payload, plan_search, pond_search, recency_boost, rrf_merge,
 };
 
 #[cfg(test)]

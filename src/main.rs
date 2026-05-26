@@ -20,7 +20,7 @@ use pond::{
     embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{AdapterStats, CorpusStats, EmbeddingProgress, RowTotals, Store},
-    substrate::TableSizes,
+    substrate::{IndexStatus, TableSizes},
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
@@ -216,8 +216,20 @@ enum Command {
         /// Server-side score threshold; hits below this are dropped.
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
+        /// Print Lance query plans instead of search results.
+        #[arg(long)]
+        explain: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
+    },
+    /// Inspect and maintain Lance indexes.
+    Index {
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     /// Fetch a session or a single message (with optional thread context),
     /// mirroring the `pond_get` MCP tool. Exactly one of `--session-id` or
@@ -294,6 +306,18 @@ enum ExportCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum IndexCommand {
+    Status,
+    Optimize {
+        #[arg(long)]
+        wait: bool,
+    },
+    Rebuild {
+        intent: Option<String>,
+    },
+}
+
 /// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
 /// regex; `lit:<text>` escapes a literal value that would otherwise be
 /// parsed as a prefix; everything else is a substring match.
@@ -330,25 +354,15 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            // Read-only verb: skip the open-time fold-and-create pass so
-            // status never races a concurrent writer's commits.
-            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
-            let unindexed = store.unindexed_message_backlog().await?;
-            let vector_unindexed = store.unindexed_vector_backlog().await?;
+            let index_status = store.index_status().await?;
             let embedding = store.embedding_progress().await?;
             // Sample is bounded so this remains O(sample) and `pond status`
             // stays sub-second on a million-message corpus.
             let scripts = store.text_script_histogram(2000).await?;
-            render_status(
-                &stats,
-                &sizes,
-                unindexed,
-                vector_unindexed,
-                embedding,
-                &scripts,
-            )?;
+            render_status(&stats, &sizes, &index_status, embedding, &scripts)?;
         }
         Command::Sync {
             adapter,
@@ -413,22 +427,6 @@ async fn main() -> anyhow::Result<()> {
                     ))?;
                 }
             }
-            // spec.md#fold-on-write: every ingest batch lands data with its
-            // index folds in one atomic merge, so by the time the loop above
-            // returns every maintained index covers every appended row. No
-            // explicit post-sync upkeep step. A non-zero backlog here would
-            // indicate an interrupted write; open-time reconciliation
-            // self-heals it on the next open.
-            let unindexed = store.unindexed_message_backlog().await?;
-            if unindexed > 0 {
-                output(&pond::output::paint(
-                    &format!(
-                        "warning: FTS index trails data ({unindexed} unindexed \
-                         messages) - the next `pond` open will reconcile"
-                    ),
-                    pond::output::yellow(),
-                ))?;
-            }
         }
         Command::Embed {
             data_dir,
@@ -443,36 +441,27 @@ async fn main() -> anyhow::Result<()> {
             // Model-swap detection: rows with a vector under a different
             // model id are silent-correctness landmines (IVF_PQ centroids
             // belong to one distance space; mixing two corrupts neighbors).
-            // Require explicit `--force`, then clear those rows and drop the
-            // IVF_PQ before the worker writes the new vectors.
+            // Require explicit `--force`, then drop the IVF_PQ before the
+            // worker writes the new vectors.
             let stale = store.stale_embedding_count().await?;
             if stale > 0 {
                 if !force {
                     bail!(
                         "{stale} message(s) embedded under a different model id; pass \
-                         `--force` to re-embed (the stale vectors will be cleared and \
-                         the IVF_PQ rebuilt under the configured model {:?})",
+                         `--force` to re-embed (the IVF_PQ will be rebuilt under \
+                         the configured model {:?})",
                         pond::embed::model_id(),
                     );
                 }
                 output(&pond::output::paint(
                     &format!(
-                        "embed: --force: clearing {} stale-model row(s) and dropping IVF_PQ",
+                        "embed: --force: re-embedding {} stale-model row(s) after dropping IVF_PQ",
                         format_thousands(stale as u64),
                     ),
                     pond::output::yellow(),
                 ))?;
-                // Enumerate stale keys (streamed), then clear in one
-                // merge_update which fold-on-write-prunes the rewritten
-                // fragments from any existing IVF_PQ coverage. Then drop
-                // the IVF_PQ outright so the next merge re-bootstraps it.
-                use tokio_stream::StreamExt;
-                let mut stream = Box::pin(store.stale_embedding_keys());
-                let mut stale_keys = Vec::with_capacity(stale);
-                while let Some(key) = stream.next().await {
-                    stale_keys.push(key?);
-                }
-                store.clear_embeddings(&stale_keys).await?;
+                // Drop the IVF_PQ outright before the merge; centroids belong
+                // to the prior distance space.
                 store.drop_vector_index().await?;
             }
 
@@ -511,9 +500,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "\ninterrupted; flushing window and finishing indices (Ctrl-C again to abort)..."
-                    );
+                    eprintln!("\ninterrupted; flushing window (Ctrl-C again to abort)...");
                     let _ = tokio::signal::ctrl_c().await;
                     std::process::exit(130);
                 });
@@ -524,26 +511,13 @@ async fn main() -> anyhow::Result<()> {
                 .with_progress(move |progress: BatchProgress| {
                     bar_for_callback.set_position(progress.total_messages as u64);
                 });
+            if force {
+                worker = worker.include_stale();
+            }
             if let Some(limit) = limit {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            // spec.md#fold-on-write: one fold pass at the embed handler
-            // boundary - the worker drains in windows and folding per
-            // window would multiply embed cost. The threshold-crossing
-            // IVF_PQ creation happens here too via the policy's intent
-            // set inside `flush_indices`.
-            let spinner_style =
-                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner());
-            bar.set_style(spinner_style);
-            bar.set_message("folding indices...");
-            // Embed does merge_update column rewrites - use the rebuild
-            // shape for scalar/FTS to dodge the v7.0.0-beta.16 flat-BTREE
-            // bug. Vector folds incrementally either way.
-            store
-                .flush_indices(pond::substrate::WriteShape::ColumnUpdate)
-                .await?;
             bar.finish_and_clear();
             output(&format!(
                 "{} done: batches={} messages={} device={}{}",
@@ -570,7 +544,11 @@ async fn main() -> anyhow::Result<()> {
             // Lazy: idle `pond serve` keeps RSS ~50 MB; the candle/Metal model
             // load (~600 MB) only triggers when the first hybrid search asks.
             let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
-            let state = AppState { store, embedder };
+            let state = AppState {
+                store,
+                embedder,
+                search: config.search.clone(),
+            };
             transport::http::serve(state, host, port).await?;
         }
         Command::Mcp { data_dir, config } => {
@@ -581,7 +559,12 @@ async fn main() -> anyhow::Result<()> {
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
             let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
-            transport::mcp::serve_stdio(AppState { store, embedder }).await?;
+            transport::mcp::serve_stdio(AppState {
+                store,
+                embedder,
+                search: config.search.clone(),
+            })
+            .await?;
         }
         Command::Search {
             query,
@@ -600,13 +583,12 @@ async fn main() -> anyhow::Result<()> {
             to_date,
             role,
             min_score,
+            explain,
             format,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            // Read-only verb: skip the open-time fold-and-create pass so
-            // search never races a concurrent writer's commits.
-            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             // One-shot CLI: the embedder load cost has to be paid anyway if
             // hybrid/vector mode wins, so load eagerly. `LazyEmbedder::get`
             // would also work but adds an `.await` for zero benefit here.
@@ -640,9 +622,44 @@ async fn main() -> anyhow::Result<()> {
                 group_by_conversation,
                 limit,
             };
-            let envelope = handlers::pond_search(&store, embedder.as_deref(), request).await;
+            if explain {
+                let plans =
+                    explain_search(&store, embedder.as_deref(), &request, &loaded.search).await?;
+                output(&plans)?;
+                return Ok(());
+            }
+            let envelope =
+                handlers::pond_search(&store, embedder.as_deref(), request, &loaded.search).await;
             if !render_search_envelope(format, &envelope)? {
                 std::process::exit(1);
+            }
+        }
+        Command::Index {
+            data_dir,
+            config,
+            command,
+        } => {
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            match command {
+                IndexCommand::Status => {
+                    let statuses = store.index_status().await?;
+                    render_index_status(&statuses)?;
+                }
+                IndexCommand::Optimize { wait } => {
+                    store.optimize_indices().await?;
+                    if wait {
+                        wait_for_index_catchup(&store).await?;
+                    }
+                    let statuses = store.index_status().await?;
+                    render_index_status(&statuses)?;
+                }
+                IndexCommand::Rebuild { intent } => {
+                    store.rebuild_indices(intent.as_deref()).await?;
+                    let statuses = store.index_status().await?;
+                    render_index_status(&statuses)?;
+                }
             }
         }
         Command::Get {
@@ -660,8 +677,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            // Read-only verb: skip the open-time fold-and-create pass.
-            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -693,10 +709,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            // Export streams raw data through the canonical model and never
-            // reads an index, so open through the minimal path: no policy,
-            // no open-time creation, no fold work.
-            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
+            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
             match command {
                 None => {
                     let summary = match out {
@@ -826,11 +839,8 @@ fn output(message: &str) -> anyhow::Result<()> {
 }
 
 /// Open the store with an indicatif spinner ticking while
-/// [`Store::open_with_options`] runs. Open is normally instant, but it can be
-/// slow when the substrate's open-time fold-and-create pass has real work to
-/// do (a freshly bulk-loaded data dir, or an interrupted prior write's
-/// trail to reconcile). Surfacing it visibly keeps the CLI honest about
-/// where the latency went.
+/// [`Store::open_with_options`] runs. Open itself is cheap; the spinner only
+/// matters for visual consistency with other long-running commands.
 async fn open_store_with_spinner(
     location: &Url,
     storage: HashMap<String, String>,
@@ -949,10 +959,17 @@ async fn sync_with_progress(
     })?;
     let adapter = factory.open(config)?;
 
-    let bar = ProgressBar::new(0);
+    // `stderr_with_hz(8)` (indicatif 0.18.4) lowers the redraw rate from the
+    // 20Hz default so SIGWINCH-triggered terminal reflows have time to
+    // settle between renders. `{wide_msg}` truncates the (variable-length)
+    // message instead of wrapping past the column count, which would leave
+    // the previous render's tail orphaned in scrollback when the user
+    // resizes mid-run (indicatif#144, #695, microsoft/terminal#6932).
+    let bar =
+        ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
     bar.set_style(
         ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:24}] {pos}/{len} sessions  {msg}",
+            "sync {prefix} [{elapsed_precise}] [{bar:24}] {pos}/{len} sessions  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -986,12 +1003,19 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
-                SyncStatus::Partial { dropped_events } => {
+                SyncStatus::Partial {
+                    dropped_events,
+                    first_drop_reason,
+                } => {
                     drops += *dropped_events as u64;
                     status_label = "partial";
                     dropped_count = *dropped_events;
-                    optional_reason =
-                        Some(format!("dropped {dropped_events} event(s) mid-session"));
+                    optional_reason = Some(match first_drop_reason {
+                        Some(reason) => {
+                            format!("dropped {dropped_events} event(s) mid-session: {reason}")
+                        }
+                        None => format!("dropped {dropped_events} event(s) mid-session"),
+                    });
                 }
                 SyncStatus::Skipped { reason } => {
                     errors += 1;
@@ -1012,13 +1036,13 @@ async fn sync_with_progress(
                 }
             }
             messages += outcome.messages as u64;
-            bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
-            // The bar's `println` only renders when stderr is a TTY; in
-            // piped runs (CI, `pond sync 2>&1 | tee`) operators still need
-            // visibility per session. The same data goes out as a `tracing`
-            // event on `pond::sync` at INFO. Default verbosity is `warn` so
-            // this is silent unless the operator asks via `POND_LOG=info`
-            // (or `POND_LOG=pond::sync=info` for sync-only detail).
+            // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
+            // the bulk are routine successes already counted by the bar's
+            // pos/len/msg counters. `pond::sync` at INFO still carries the
+            // full per-session detail for `POND_LOG=pond::sync=info` runs.
+            if !matches!(outcome.status, SyncStatus::Ok | SyncStatus::Fresh) {
+                bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
+            }
             match optional_reason.as_deref() {
                 None => tracing::info!(
                     target: "pond::sync",
@@ -1144,6 +1168,67 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+async fn explain_search(
+    store: &Store,
+    embedder: Option<&dyn EmbedBackend>,
+    request: &SearchRequest,
+    search: &config::SearchConfig,
+) -> anyhow::Result<String> {
+    handlers::explain_search_plan(store, embedder, request.clone(), search)
+        .await
+        .map_err(|envelope| anyhow::anyhow!("{envelope:?}"))
+}
+
+async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let statuses = store.index_status().await?;
+        if statuses.iter().all(|status| status.unindexed_rows == 0) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for indexes to catch up");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint, yellow};
+    let mut table = new_table();
+    table.set_header(vec![
+        "table",
+        "intent",
+        "exists",
+        "fragments",
+        "unindexed rows",
+    ]);
+    for status in statuses {
+        let unindexed = format_thousands(status.unindexed_rows as u64);
+        let unindexed_cell = if status.unindexed_rows == 0 {
+            Cell::new(unindexed)
+        } else {
+            Cell::new(paint(&unindexed, yellow()))
+        };
+        table.add_row(vec![
+            Cell::new(status.table.as_str()),
+            Cell::new(&status.intent_name),
+            Cell::new(if status.exists { "yes" } else { "no" }),
+            Cell::new(status.fragments_covered.to_string()),
+            unindexed_cell.set_alignment(CellAlignment::Right),
+        ]);
+    }
+    output(&paint("pond index status", bold()))?;
+    output(&table.to_string())?;
+    if statuses.iter().any(|status| status.unindexed_rows > 0) {
+        output(&format!(
+            "{}  run `pond index optimize` to fold trailing fragments",
+            paint("hint", dim()),
+        ))?;
+    }
+    Ok(())
+}
+
 /// Render `pond status` as: a header + storage breakdown table on top, a
 /// totals line, and one section per adapter in registry order with a project
 /// table. Tables width-adapt via comfy-table; on non-TTY stdout (piped to a
@@ -1151,8 +1236,7 @@ fn format_bytes(bytes: u64) -> String {
 fn render_status(
     stats: &CorpusStats,
     sizes: &TableSizes,
-    unindexed: usize,
-    vector_unindexed: usize,
+    index_status: &[IndexStatus],
     embedding: EmbeddingProgress,
     scripts: &[(String, usize)],
 ) -> anyhow::Result<()> {
@@ -1195,46 +1279,6 @@ fn render_status(
         paint(&format_thousands(messages), bold()),
         paint(&format_thousands(parts), bold()),
     ))?;
-    if unindexed == 0 {
-        output(&format!("{}  complete", paint("fts index", dim())))?;
-    } else {
-        // spec.md#fold-on-write: this should be zero between commits. A
-        // non-zero count means the last write was interrupted; the next
-        // `pond` open will reconcile.
-        output(&paint(
-            &format!("fts index  {unindexed} messages unindexed - self-heals on next open"),
-            yellow(),
-        ))?;
-    }
-    // Below the activation threshold no IVF_PQ is built (brute-force vector
-    // scan is exact at that size); above it, `vector_unindexed` is the count
-    // of rows in fragments rewritten since the index was last rebuilt, so a
-    // non-zero value means vector search misses those rows.
-    if embedding.embedded < pond::substrate::VECTOR_INDEX_ACTIVATION_ROWS {
-        output(&format!(
-            "{}  {} vectors  not indexable yet (activates at {})",
-            paint("vector index", dim()),
-            paint(&format_thousands(embedding.embedded as u64), bold()),
-            format_thousands(pond::substrate::VECTOR_INDEX_ACTIVATION_ROWS as u64),
-        ))?;
-    } else if vector_unindexed == 0 {
-        output(&format!(
-            "{}  complete ({} vectors)",
-            paint("vector index", dim()),
-            paint(&format_thousands(embedding.embedded as u64), bold()),
-        ))?;
-    } else {
-        // spec.md#fold-on-write: this should be zero between commits;
-        // open-time reconciliation folds the trail on the next open.
-        output(&paint(
-            &format!(
-                "vector index  {} vectors  {} unindexed - self-heals on next open",
-                format_thousands(embedding.embedded as u64),
-                format_thousands(vector_unindexed as u64),
-            ),
-            yellow(),
-        ))?;
-    }
     let pending = embedding.total.saturating_sub(embedding.embedded);
     if embedding.total == 0 {
         output(&format!(
@@ -1260,6 +1304,32 @@ fn render_status(
                 format_thousands(pending as u64),
             ),
             yellow(),
+        ))?;
+    }
+    output("")?;
+    output(&paint("indexes", dim()))?;
+    for status in index_status {
+        let line = format!(
+            "  {}.{}  exists={}  fragments={}  unindexed={}",
+            status.table.as_str(),
+            status.intent_name,
+            if status.exists { "yes" } else { "no" },
+            status.fragments_covered,
+            format_thousands(status.unindexed_rows as u64),
+        );
+        if status.unindexed_rows == 0 {
+            output(&line)?;
+        } else {
+            output(&paint(&line, yellow()))?;
+        }
+    }
+    if index_status.iter().any(|status| status.unindexed_rows > 0) {
+        output(&format!(
+            "  {}",
+            paint(
+                "run `pond index optimize` to fold trailing fragments",
+                yellow()
+            ),
         ))?;
     }
     // Surfaces the corpus's language mix so an agent can decide whether

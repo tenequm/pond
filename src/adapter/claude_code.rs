@@ -1465,7 +1465,7 @@ mod tests {
         Ok(())
     }
 
-    /// Orphan tool_result with no prior tool_use in the same file: the
+    /// Orphan tool_result with no earlier tool_use in the same file: the
     /// per-file map can't resolve. The adapter must emit `name: None`, NOT
     /// the old `"unknown"` sentinel. Invariant 15 (no synthesized values).
     #[tokio::test(flavor = "multi_thread")]
@@ -1475,7 +1475,7 @@ mod tests {
         std::fs::create_dir_all(&project_dir)?;
         let session_uuid = "55555555-5555-5555-5555-555555555555";
 
-        // tool_result with no prior tool_use (simulates a compaction-pruned call).
+        // tool_result with no earlier tool_use (simulates a compaction-pruned call).
         let row = serde_json::json!({
             "type": "user",
             "uuid": "u-orphan",

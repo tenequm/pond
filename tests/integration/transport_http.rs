@@ -60,14 +60,14 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     .await?;
 
     let backend = FakeBackend;
-    // spec.md#fold-on-write: each merge inside ingest_adapter / EmbedWorker
-    // already folded the touched indices forward.
     EmbedWorker::new(&store, &backend).run().await?;
+    store.optimize_indices().await?;
 
     let store = Arc::new(store);
     let state = AppState {
         store: Arc::clone(&store),
         embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
+        search: pond::config::SearchConfig::default(),
     };
     Ok((temp, store, http::router(state)))
 }

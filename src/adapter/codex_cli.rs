@@ -580,10 +580,7 @@ fn message_events(
             true,
         ),
         // `developer` rows are codex-cli's system-prompt frames; map to System
-        // with `content: None` and let the inner Text Parts carry the
-        // body. The previous join-aggregation hack double-stored data and
-        // can't reconstruct an `Extracted<String>` from synthesised text
-        // under the new adapter seam; dropping it is a simplification.
+        // with `content: None` and let the inner Text Parts carry the body.
         "developer" | "system" => (
             Message::System {
                 id: message_id.to_owned(),
@@ -752,10 +749,9 @@ fn tool_result_events(
     tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Vec<IngestEvent> {
     let call_id = extract_str(payload, "call_id");
-    // Resolve tool name from the prior `function_call` row via the
+    // Resolve tool name from the earlier `function_call` row via the
     // per-file `call_id -> name` map. Misses (e.g. compaction pruned the
-    // originating call) yield `None`, a faithful "unresolved" rather than
-    // the previous `"function"` sentinel.
+    // originating call) yield `None`, a faithful "unresolved" value.
     let name = call_id
         .as_ref()
         .and_then(|id| tool_call_names.get(id.as_str()))

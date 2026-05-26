@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
@@ -39,13 +40,8 @@ use url::Url;
 /// IVF_PQ cannot train well on fewer vectors anyway.
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
-/// Declarative description of one index pond wants kept on a table
-/// (spec.md#fold-on-write). The substrate enforces the contract by walking
-/// the per-table intent set after every merge AND at open: any index that
-/// trigger-implies but doesn't yet exist gets created; any that exists gets
-/// folded forward over the just-written fragments. There is no separate
-/// "make these indices" verb at the pond layer - index state is a pure
-/// function of data state.
+/// Declarative description of one index pond keeps on a table. Created when
+/// its trigger fires; folded forward by `pond index optimize`.
 #[derive(Debug, Clone)]
 pub struct IndexIntent {
     /// Stable on-disk name. Must match across runs so existence checks
@@ -87,8 +83,8 @@ pub enum IndexParamsKind {
     InvertedFtsNgram { min: u32, max: u32 },
     /// `VectorIndexParams::ivf_pq` with cosine metric (e5 vectors are
     /// L2-normalized). `sub_vectors = embedding_dim / 8` and `num_bits = 8`
-    /// are pond's conventions; `max_iters` caps kmeans. Partitions are
-    /// `sqrt(count).clamp(32, 4096)` evaluated at create time.
+    /// are pond's conventions; `max_iters` caps kmeans. Partitions follow
+    /// LanceDB's documented `num_rows // 4096` guidance, floored at one.
     IvfPqCosine {
         sub_vectors: usize,
         num_bits: u8,
@@ -139,13 +135,7 @@ impl IndexParamsKind {
                 let count = dataset
                     .count_rows(Some("vector IS NOT NULL".to_owned()))
                     .await?;
-                #[allow(
-                    clippy::cast_precision_loss,
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss
-                )]
-                let sqrt = (count as f64).sqrt().round() as usize;
-                let partitions = sqrt.clamp(32, 4096);
+                let partitions = count.checked_div(4096).unwrap_or(0).max(1);
                 Ok(Box::new(VectorIndexParams::ivf_pq(
                     partitions,
                     *num_bits,
@@ -158,51 +148,13 @@ impl IndexParamsKind {
     }
 }
 
-/// Per-table index policy registered at [`Handle::open_with_options`]. The
-/// substrate walks the matching slice after every merge on that table and at
-/// open. Empty means "manage no indices" - used by `Handle::open` and by
-/// `pond export`, which doesn't need indices.
-#[derive(Debug, Clone, Default)]
-pub struct IndexPolicy {
-    pub sessions: Vec<IndexIntent>,
-    pub messages: Vec<IndexIntent>,
-    pub parts: Vec<IndexIntent>,
-}
-
-impl IndexPolicy {
-    fn for_table(&self, table: Table) -> &[IndexIntent] {
-        match table {
-            Table::Sessions => &self.sessions,
-            Table::Messages => &self.messages,
-            Table::Parts => &self.parts,
-        }
-    }
-}
-
-/// Shape of the writes that preceded a fold call. Picks the safe and cheap
-/// fold strategy per scalar / FTS index:
-///
-/// - `Append`: pure `merge_insert` (no row supersession). The trail is
-///   freshly-written fragments; `optimize_indices(append)` extends the
-///   existing index incrementally. `combine_old_new` never sees duplicate
-///   stable row IDs, so the v7.0.0-beta.16 flat-BTREE bug does not fire.
-///   This is the cheap path - O(new_rows) per index.
-/// - `ColumnUpdate`: `merge_update` rewrote fragments and Lance pruned
-///   every index's coverage. `optimize_indices` on scalar / FTS in this
-///   state goes through `combine_old_new` with duplicate stable row IDs
-///   (old and new fragments both hold the same IDs), tripping
-///   `RowAddrTreeMap::from_sorted_iter called with non-sorted input` on
-///   the next scan. Pond rebuilds scalar / FTS from scratch via
-///   `create_index(replace = true)` instead - O(total_rows) per index, but
-///   correct.
-///
-/// Vector indices always fold incrementally regardless of shape: IVF_PQ
-/// with stable row IDs supports the column-update case natively
-/// (`IvfIndexBuilder::new_incremental`).
-#[derive(Debug, Clone, Copy)]
-pub enum WriteShape {
-    Append,
-    ColumnUpdate,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStatus {
+    pub table: Table,
+    pub intent_name: String,
+    pub fragments_covered: usize,
+    pub unindexed_rows: usize,
+    pub exists: bool,
 }
 
 /// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
@@ -401,10 +353,6 @@ pub struct Handle {
     /// to display where the bytes live and to decide whether to walk a local
     /// directory or issue a remote `LIST` for sizing.
     location: Url,
-    /// Per-table index policy enforced on every merge AND at open
-    /// (spec.md#fold-on-write). Empty policy = "manage no indices", which is
-    /// what [`Handle::open`] uses and what `pond export` opts into.
-    policy: Arc<IndexPolicy>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -416,18 +364,10 @@ impl std::fmt::Debug for Handle {
             .field("nm_ident", &self.nm_ident)
             .field("storage_options", &self.storage_options)
             .field("location", &self.location)
-            .field("policy_intents", &policy_summary(&self.policy))
             .finish()
     }
 }
 
-fn policy_summary(policy: &IndexPolicy) -> (usize, usize, usize) {
-    (
-        policy.sessions.len(),
-        policy.messages.len(),
-        policy.parts.len(),
-    )
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
     Sessions,
@@ -435,6 +375,10 @@ pub enum Table {
     Parts,
 }
 impl Table {
+    pub fn as_str(self) -> &'static str {
+        self.label()
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Sessions => "sessions",
@@ -469,23 +413,18 @@ impl CachedDataset {
     }
 }
 impl Handle {
-    /// Open without storage options or an index policy. Substrate tests use
-    /// this; sessions-layer callers go through
-    /// [`Handle::open_with_options`] with a populated [`IndexPolicy`].
+    /// Open without storage options.
     pub async fn open(location: &Url) -> Result<Self> {
-        Self::open_with_options(location, HashMap::new(), IndexPolicy::default()).await
+        Self::open_with_options(location, HashMap::new()).await
     }
 
-    /// Open with object-store options handed through to Lance verbatim AND a
-    /// per-table [`IndexPolicy`]. Object-store keys are the `object_store`
-    /// crate's standard config names; pond does not parse them. The policy
-    /// is enforced once at open (fold any pre-existing index trail; create
-    /// any implied-but-missing indices), and again after every merge through
-    /// this handle (spec.md#fold-on-write).
+    /// Open with object-store options handed through to Lance verbatim.
+    /// Object-store keys are the `object_store` crate's standard config
+    /// names; pond does not parse them. Opening datasets never performs index
+    /// work; index lifecycle lives under `Handle::optimize_indices`.
     pub async fn open_with_options(
         location: &Url,
         storage_options: HashMap<String, String>,
-        policy: IndexPolicy,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
             tokio::fs::create_dir_all(&path)
@@ -576,25 +515,7 @@ impl Handle {
             nm_ident,
             storage_options,
             location: location.clone(),
-            policy: Arc::new(policy),
         };
-        // spec.md#fold-on-write: open never returns a handle whose indices
-        // trail the data state. For every table with an intent set, walk it:
-        // fold pre-existing trails forward, create any implied-but-missing
-        // indices. No-op for empty policies (Handle::open / pond export).
-        for table in [Table::Sessions, Table::Messages, Table::Parts] {
-            let intents = handle.policy.for_table(table);
-            if intents.is_empty() {
-                continue;
-            }
-            let mut guard = handle.cached(table).lock().await;
-            let mut dataset = guard.latest().await?;
-            // Conservative: at open we don't know what the last write was,
-            // so assume the worst (`ColumnUpdate`) to take the rebuild path
-            // that's safe under the v7.0.0-beta.16 flat-BTREE bug.
-            fold_and_create(&mut dataset, intents, WriteShape::ColumnUpdate).await?;
-            guard.replace(dataset);
-        }
         Ok(handle)
     }
 
@@ -617,12 +538,9 @@ impl Handle {
         ))
     }
 
-    /// Insert-only merge: append new rows, never overwrite a matched PK
-    /// (`WhenMatched::DoNothing`). pond is durable storage, not a
-    /// source-derived cache; sync fills gaps. The data write and the index
-    /// folds it implies are one atomic operation at the seam
-    /// (spec.md#fold-on-write): a failed fold surfaces as a write failure,
-    /// never as a soft warn. Returns rows inserted.
+    /// Insert-only merge: append new rows, never overwrite a matched PK.
+    /// Returns rows inserted. The fold lives separately under
+    /// `Handle::optimize_indices` (spec.md#index-write-decoupled).
     pub(crate) async fn merge_insert(
         &self,
         table: Table,
@@ -640,11 +558,8 @@ impl Handle {
         .await
     }
 
-    /// Update-only merge: a partial-schema source sets its columns on every
-    /// matched PK (`WhenMatched::UpdateAll`) and unmatched source rows are
-    /// dropped, never inserted. `pond embed` uses this to fill `vector` and
-    /// `embedding_model` on existing `messages` rows. Folds-on-write the same
-    /// way `merge_insert` does (spec.md#fold-on-write). Returns rows updated.
+    /// Update-only merge: `WhenMatched::UpdateAll` on matched PKs; unmatched
+    /// rows dropped. The fold lives separately under `Handle::optimize_indices`.
     pub(crate) async fn merge_update(
         &self,
         table: Table,
@@ -664,12 +579,7 @@ impl Handle {
 
     /// Shared merge path for [`Self::merge_insert`] and [`Self::merge_update`].
     /// Returns the number of rows affected (inserted or updated, whichever the
-    /// behaviors produce). Pure data commit; the index fold is owned by the
-    /// caller via [`Self::fold_and_create_indices`] (spec.md#fold-on-write).
-    /// The sessions layer enforces the contract by calling the fold at the
-    /// end of every public write method (`upsert_*`, `write_embeddings`,
-    /// `clear_embeddings`), so callers of those methods see "one Ok = data +
-    /// indices both durable".
+    /// behaviors produce).
     async fn merge(
         &self,
         table: Table,
@@ -718,33 +628,40 @@ impl Handle {
         result.map(|(affected, _)| affected)
     }
 
-    /// Enforce the [`IndexPolicy`] on `table` given the [`WriteShape`] of
-    /// the writes that preceded it: create any implied-but-missing index,
-    /// then update existing ones. See [`WriteShape`] for the per-shape
-    /// rationale (insert path is incremental and cheap; column-update path
-    /// rebuilds scalar / FTS to dodge the v7.0.0-beta.16 flat-BTREE bug).
-    /// Vector indices always fold incrementally.
-    ///
-    /// Wrapped in `retry_lance` so concurrent writers' `CommitConflict`
-    /// on `create_index` / `optimize_indices` is rebased and retried.
-    pub(crate) async fn fold_and_create_indices(
-        &self,
-        table: Table,
-        shape: WriteShape,
-    ) -> Result<()> {
-        let intents = self.policy.for_table(table);
-        if intents.is_empty() {
-            return Ok(());
-        }
+    /// Run the table-local maintenance cycle for the supplied index intents.
+    /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
+    /// BTree combine bug; Bitmap, FTS, and IVF_PQ fold via append.
+    pub async fn optimize_indices(&self, table: Table, intents: &[IndexIntent]) -> Result<()> {
         self.retry_lance(table.label(), || async {
             let mut guard = self.cached(table).lock().await;
             let mut dataset = guard.latest().await?;
-            fold_and_create(&mut dataset, intents, shape).await?;
+            optimize_table(&mut dataset, intents).await?;
             guard.replace(dataset);
             Ok(())
         })
         .await
     }
+
+    pub async fn rebuild_index(&self, table: Table, intent: &IndexIntent) -> Result<()> {
+        self.retry_lance(table.label(), || async {
+            let mut guard = self.cached(table).lock().await;
+            let mut dataset = guard.latest().await?;
+            rebuild_index(&mut dataset, intent).await?;
+            guard.replace(dataset);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn index_status(
+        &self,
+        table: Table,
+        intents: &[IndexIntent],
+    ) -> Result<Vec<IndexStatus>> {
+        let dataset = self.dataset(table).await?;
+        index_status(table, &dataset, intents).await
+    }
+
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
         let mut cached = self.cached(table).lock().await;
         cached.latest().await
@@ -805,10 +722,8 @@ impl Handle {
         Ok(indices.iter().map(|index| index.name.clone()).collect())
     }
 
-    /// Count rows in `table` not yet covered by index `index_name`
-    /// (spec.md#fold-on-write). Manifest-only, no index I/O; a missing index
-    /// reports the whole table. With the fold-on-write contract this is
-    /// normally zero between commits.
+    /// Count rows in `table` not yet covered by `index_name`. Manifest-only;
+    /// a missing index reports the whole table. Powers `pond index status`.
     pub(crate) async fn unindexed_row_count(
         &self,
         table: Table,
@@ -826,7 +741,7 @@ impl Handle {
     }
 
     /// Drop the named index. Used by the `pond embed --force` model-swap path
-    /// to retire an IVF_PQ whose centroids belong to the previous distance
+    /// to retire an IVF_PQ whose centroids belong to the old distance
     /// space, before the next write re-bootstraps it over the new model's
     /// vectors. Errors when the index does not exist; callers may swallow
     /// that.
@@ -944,11 +859,26 @@ impl Handle {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < self.retry.attempts => {
                     let backoff = self.backoff(attempt);
-                    tracing::warn!(label, attempt, ?backoff, %error, "retrying Lance operation");
+                    // `{:#}` walks anyhow's cause chain inline; `%error` (Display)
+                    // drops everything below the top-level message.
+                    let error_chain = format!("{error:#}");
+                    tracing::warn!(
+                        label,
+                        attempt,
+                        ?backoff,
+                        error = %error_chain,
+                        "retrying Lance operation"
+                    );
                     tokio::time::sleep(backoff).await;
                 }
                 Err(error) => {
-                    tracing::warn!(label, attempt, %error, "Lance operation exhausted retries");
+                    let error_chain = format!("{error:#}");
+                    tracing::warn!(
+                        label,
+                        attempt,
+                        error = %error_chain,
+                        "Lance operation exhausted retries"
+                    );
                     // spec.md#protocol: surface OCC failures as a typed `conflict`
                     // rather than the generic `storage_unavailable` bucket. The
                     // chain root is a `lance::Error` (commit-conflict family) when
@@ -973,29 +903,37 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-/// Enforce the [`IndexPolicy`] on `dataset`: create any intent that
-/// trigger-implies-but-doesn't-yet-exist, then update existing scalar /
-/// FTS indices per the [`WriteShape`] (incremental for inserts, rebuild
-/// for column updates) and fold the vector index incrementally regardless.
-async fn fold_and_create(
-    dataset: &mut Dataset,
-    intents: &[IndexIntent],
-    shape: WriteShape,
-) -> Result<()> {
+async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Result<()> {
     if intents.is_empty() {
         return Ok(());
     }
     let started = Instant::now();
 
+    // Lance does not expose a single `optimize()` entrypoint at this pin, so
+    // pond runs compaction + index update + version cleanup in one retry block.
+    // spec.md#index-write-decoupled mandates FRI on by default, but at
+    // v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
+    // panics in `optimize.rs::commit_compaction` with "defer_index_remap
+    // requires row_addrs but none were provided": `rewrite_files` skips
+    // row_addrs when stable row ids are on, then the FRI builder demands
+    // them. With stable_row_ids the remap step is already a no-op
+    // (`optimize.rs:1490`: `needs_remapping = !uses_stable_row_ids() &&
+    // !defer_index_remap`), so running without FRI is correct - we only
+    // lose the documented concurrency-with-index-build benefit. Flip to
+    // `true` once upstream fixes the conflict.
+    let compaction = CompactionOptions {
+        defer_index_remap: false,
+        ..CompactionOptions::default()
+    };
+    compact_files(dataset, compaction, None).await?;
+
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
         existing.iter().map(|index| index.name.clone()).collect();
 
-    let mut scalar_indices_to_append: Vec<String> = Vec::new();
-    let mut vector_indices_to_fold: Vec<String> = Vec::new();
+    let mut append_indices: Vec<String> = Vec::new();
 
     for intent in intents {
-        let is_vector = matches!(intent.params, IndexParamsKind::IvfPqCosine { .. });
         let exists = existing_names.contains(intent.name);
 
         if !exists {
@@ -1007,7 +945,7 @@ async fn fold_and_create(
             tracing::info!(
                 index = intent.name,
                 column = intent.column,
-                "creating Lance index (fold-on-write trigger fired)",
+                "creating Lance index (trigger fired)",
             );
             dataset
                 .create_index(
@@ -1025,23 +963,15 @@ async fn fold_and_create(
         if dataset.unindexed_fragments(intent.name).await?.is_empty() {
             continue;
         }
-        if is_vector {
-            vector_indices_to_fold.push(intent.name.to_owned());
-            continue;
-        }
-
-        match shape {
-            WriteShape::Append => {
-                scalar_indices_to_append.push(intent.name.to_owned());
-            }
-            WriteShape::ColumnUpdate => {
+        match intent.params {
+            IndexParamsKind::Scalar(BuiltinIndexType::BTree) => {
                 let params = intent.params.build(dataset).await?;
                 let index_type = intent.params.index_type();
                 tracing::debug!(
                     target: "pond::perf",
                     index = intent.name,
                     column = intent.column,
-                    "rebuilding Lance scalar/FTS index (column-update fold)",
+                    "rebuilding Lance BTree index",
                 );
                 dataset
                     .create_index(
@@ -1054,41 +984,111 @@ async fn fold_and_create(
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
             }
+            IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
+            | IndexParamsKind::InvertedFtsNgram { .. }
+            | IndexParamsKind::IvfPqCosine { .. } => {
+                append_indices.push(intent.name.to_owned());
+            }
+            IndexParamsKind::Scalar(_) => {
+                let params = intent.params.build(dataset).await?;
+                dataset
+                    .create_index(
+                        &[intent.column],
+                        intent.params.index_type(),
+                        Some(intent.name.to_owned()),
+                        params.as_ref(),
+                        true,
+                    )
+                    .await
+                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+            }
         }
     }
 
-    if !scalar_indices_to_append.is_empty() {
-        let to_append = scalar_indices_to_append.clone();
+    if !append_indices.is_empty() {
+        let to_append = append_indices.clone();
         dataset
             .optimize_indices(&OptimizeOptions::append().index_names(to_append))
             .await
-            .context("optimize_indices(append) failed during fold-on-write")?;
+            .context("optimize_indices(append) failed during index optimize")?;
         tracing::debug!(
             target: "pond::perf",
-            indices = ?scalar_indices_to_append,
-            "appended trailing fragments into scalar/FTS indices",
+            indices = ?append_indices,
+            "appended trailing fragments into indices",
         );
     }
 
-    if !vector_indices_to_fold.is_empty() {
-        let to_fold = vector_indices_to_fold.clone();
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(1).index_names(to_fold))
-            .await
-            .context("optimize_indices(merge) failed during fold-on-write")?;
-        tracing::debug!(
-            target: "pond::perf",
-            indices = ?vector_indices_to_fold,
-            "folded vector indices incrementally",
-        );
-    }
+    dataset
+        .cleanup_old_versions(chrono::Duration::days(7), None, Some(false))
+        .await
+        .context("cleanup_old_versions failed during index optimize")?;
 
     tracing::debug!(
         target: "pond::perf",
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "fold_and_create complete",
+        "index optimize complete",
     );
     Ok(())
+}
+
+async fn rebuild_index(dataset: &mut Dataset, intent: &IndexIntent) -> Result<()> {
+    if !intent.trigger.should_create(dataset).await? {
+        return Ok(());
+    }
+    let params = intent.params.build(dataset).await?;
+    dataset
+        .create_index(
+            &[intent.column],
+            intent.params.index_type(),
+            Some(intent.name.to_owned()),
+            params.as_ref(),
+            true,
+        )
+        .await
+        .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+    Ok(())
+}
+
+async fn index_status(
+    table: Table,
+    dataset: &Dataset,
+    intents: &[IndexIntent],
+) -> Result<Vec<IndexStatus>> {
+    let existing = dataset.load_indices().await?;
+    let existing_names: std::collections::HashSet<String> =
+        existing.iter().map(|index| index.name.clone()).collect();
+    let total_fragments = dataset.get_fragments().len();
+    let total_rows = dataset.count_rows(None).await?;
+    let mut statuses = Vec::with_capacity(intents.len());
+    for intent in intents {
+        let exists = existing_names.contains(intent.name);
+        if !exists {
+            statuses.push(IndexStatus {
+                table,
+                intent_name: intent.name.to_owned(),
+                fragments_covered: 0,
+                unindexed_rows: total_rows,
+                exists,
+            });
+            continue;
+        }
+        let unindexed = dataset
+            .unindexed_fragments(intent.name)
+            .await
+            .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
+        let unindexed_rows = unindexed
+            .iter()
+            .map(|fragment| fragment.num_rows().unwrap_or(0))
+            .sum();
+        statuses.push(IndexStatus {
+            table,
+            intent_name: intent.name.to_owned(),
+            fragments_covered: total_fragments.saturating_sub(unindexed.len()),
+            unindexed_rows,
+            exists,
+        });
+    }
+    Ok(statuses)
 }
 
 /// Open the table at `table_name` via the namespace; create + initialize on
@@ -1214,13 +1214,12 @@ fn ensure_schema_matches(
             (actual_field.data_type(), expected_field.data_type())
             && actual_dim != expected_dim
         {
-            anyhow::bail!(
-                "table {table_name} column {name:?} has dim {actual_dim} but this pond build is \
-                 configured for dim {expected_dim} - the on-disk vectors were produced under a \
-                 different embedding model. To switch models: `pond export` the data, delete the \
-                 data dir, set the new `[embeddings].model` + `[embeddings].dim`, then re-ingest \
-                 and re-embed.",
-                name = actual_field.name(),
+            tracing::warn!(
+                table = table_name,
+                column = actual_field.name(),
+                actual_dim,
+                expected_dim,
+                "embedding dimension differs from config; open proceeds because model swaps are operator-driven",
             );
         }
     }

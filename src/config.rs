@@ -138,6 +138,13 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384
 
+# Search tuning. Leave unset for Lance defaults; set when tuning IVF_PQ recall
+# against a corpus.
+#
+# [search]
+# nprobes = 16
+# refine_factor = 2
+
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
 # an `s3://` / `gs://` / `az://` URI that needs auth or a non-default region.
@@ -165,6 +172,8 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
     /// `[sources.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
     /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
@@ -183,6 +192,16 @@ pub struct Config {
     /// here override any matching environment variables.
     #[serde(default)]
     pub storage: BTreeMap<String, String>,
+}
+
+/// `[search]`: optional Lance vector-query tuning knobs.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub nprobes: Option<usize>,
+    #[serde(default)]
+    pub refine_factor: Option<u32>,
 }
 
 /// `[embeddings]`: the master switch, model selector, and vector dimension.

@@ -6,11 +6,11 @@ use std::{
 use anyhow::{Context, Result};
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
-use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::deps::arrow_array::{
-    Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, TimestampMicrosecondArray, UInt64Array, new_null_array,
+    Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
+    UInt64Array, new_null_array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance_file::version::LanceFileVersion;
@@ -22,8 +22,8 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     config, embed,
     substrate::{
-        Handle, IndexIntent, IndexParamsKind, IndexPolicy, IndexTrigger, Predicate, ScalarValue,
-        ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS, WriteShape,
+        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, Predicate, ScalarValue,
+        ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
@@ -34,9 +34,26 @@ pub struct Store {
     handle: Handle,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IndexIntents {
+    pub sessions: Vec<IndexIntent>,
+    pub messages: Vec<IndexIntent>,
+    pub parts: Vec<IndexIntent>,
+}
+
+impl IndexIntents {
+    fn all(&self) -> [(Table, &[IndexIntent]); 3] {
+        [
+            (Table::Sessions, &self.sessions),
+            (Table::Messages, &self.messages),
+            (Table::Parts, &self.parts),
+        ]
+    }
+}
+
 /// A message awaiting embedding: its primary key plus the `search_text` to
 /// embed. The vector lives on the same `messages` row, so no denormalized
-/// filter columns are needed (spec.md#embeddings-are-derived).
+/// filter columns are needed (spec.md#embed-from-canonical).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
     pub session_id: String,
@@ -164,38 +181,13 @@ impl Store {
     /// Open with object-store options (S3 creds, region, endpoint, ...)
     /// threaded through Lance verbatim. Keys are the standard `object_store`
     /// config names; pond does not parse them. Empty options is equivalent
-    /// to [`Store::open`]. The substrate enforces pond's full
-    /// [`IndexPolicy`] at open (spec.md#fold-on-write); read-only paths that
-    /// don't touch indices (`pond export`) should use [`Store::open_minimal`]
-    /// to skip the open-time index work.
+    /// to [`Store::open`].
     pub async fn open_with_options(
         location: &Url,
         storage_options: std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        Self::open_with_policy(location, storage_options, pond_index_policy()).await
-    }
-
-    /// Open without pond's index policy: no indices are created, no trail
-    /// is folded. Used by `pond export`, which streams raw data through the
-    /// canonical model and never reads an index.
-    pub async fn open_minimal(
-        location: &Url,
-        storage_options: std::collections::HashMap<String, String>,
-    ) -> Result<Self> {
-        Self::open_with_policy(location, storage_options, IndexPolicy::default()).await
-    }
-
-    /// Open with an explicit [`IndexPolicy`]. Tests pass a custom policy via
-    /// [`pond_index_policy_with_vector_threshold`] to drive IVF_PQ activation
-    /// at a much lower row count than the production
-    /// [`VECTOR_INDEX_ACTIVATION_ROWS`].
-    pub async fn open_with_policy(
-        location: &Url,
-        storage_options: std::collections::HashMap<String, String>,
-        policy: IndexPolicy,
-    ) -> Result<Self> {
         Ok(Self {
-            handle: Handle::open_with_options(location, storage_options, policy).await?,
+            handle: Handle::open_with_options(location, storage_options).await?,
         })
     }
 
@@ -208,36 +200,13 @@ impl Store {
         Self::open_with_options(&url, std::collections::HashMap::new()).await
     }
 
-    /// Test-only convenience matching [`Store::open_local`] but with a custom
-    /// IVF_PQ activation threshold so the unit tests can exercise the index
-    /// activation boundary without writing 100k vectors.
-    #[cfg(test)]
-    pub(crate) async fn open_local_with_vector_threshold(
-        path: impl AsRef<std::path::Path>,
-        threshold: usize,
-    ) -> Result<Self> {
-        let url = config::url_for_path(path)?;
-        Self::open_with_policy(
-            &url,
-            std::collections::HashMap::new(),
-            pond_index_policy_with_vector_threshold(threshold),
-        )
-        .await
-    }
-
     pub async fn upsert_sessions(&self, sessions: &[Session]) -> Result<Vec<UpsertStatus>> {
         if sessions.is_empty() {
             return Ok(Vec::new());
         }
         let batches = sessions_batches(sessions)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
-        // Direct-API path. spec.md#fold-on-write: callers that drive many
-        // upsert_* calls in a loop should defer the fold via
-        // `flush_indices` for O(N) cost; a single isolated call gets a
-        // single fold here.
-        self.handle
-            .fold_and_create_indices(Table::Sessions, WriteShape::Append)
-            .await?;
+        // Per-row outcomes; no fold here (see `pond index optimize`).
         Ok(statuses_from_inserted(sessions.len(), inserted))
     }
 
@@ -262,9 +231,7 @@ impl Store {
     ///      parts) across every valid substream.
     ///   4. Fires the three `merge_insert` calls in parallel via
     ///      `tokio::try_join!`. Cross-table mutex on `CachedDataset` is
-    ///      independent, so these proceed concurrently. Single-commit-per-
-    ///      table replaces the previous one-commit-per-session-per-table
-    ///      pattern (3 commits N times -> 3 commits total).
+    ///      independent, so these proceed concurrently.
     ///   5. Composes per-session [`RowOutcome`]s in original substream order.
     async fn upsert_session_batch(
         &self,
@@ -276,10 +243,9 @@ impl Store {
 
         let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(substreams.len());
 
-        // Step 2 - in-batch dedup. Build an ordered map: first occurrence of
-        // each session_id wins; later occurrences either merge or get
-        // rejected. Iteration order preserves original substream order so
-        // outcomes index correctly.
+        // In-batch dedup. First occurrence of each session_id wins; later
+        // occurrences either merge or get rejected. Iteration order preserves
+        // original substream order so outcomes index correctly.
         let mut merged: Vec<CompletedSubstream> = Vec::with_capacity(substreams.len());
         let mut by_session_id: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(substreams.len());
@@ -348,8 +314,6 @@ impl Store {
             merged.push(substream);
         }
 
-        // Step 1 - immutable check against storage, sequentially per
-        // surviving substream.
         let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
         for substream in merged {
             if let Some(existing) = self.find_session(&substream.session.id).await?
@@ -381,7 +345,6 @@ impl Store {
             return Ok(outcomes);
         }
 
-        // Build the three flat record batches across every valid substream.
         let sessions_owned: Vec<Session> = writeable
             .iter()
             .map(|substream| substream.session.clone())
@@ -420,12 +383,6 @@ impl Store {
             merge_insert_chunks(&self.handle, Table::Messages, message_batches),
             merge_insert_chunks(&self.handle, Table::Parts, part_batches),
         )?;
-        // spec.md#fold-on-write: this is the per-batch substream commit
-        // path - the outer handler (`ingest_adapter` / `ingest_events`)
-        // calls `Store::flush_indices` once at end to fold the full ingest.
-        // Folding per-batch would push ingest cost to O(N^2) on a sync
-        // that flushes every 100 substreams.
-
         // Per-session success outcomes: each substream's own status row plus
         // per-message and per-part rows. The Lance `merge_insert` returns a
         // single batch-level "inserted vs matched" count, not per-row; we
@@ -479,9 +436,6 @@ impl Store {
             .collect::<Vec<_>>();
         let batches = messages_batches(&rows)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
-        self.handle
-            .fold_and_create_indices(Table::Messages, WriteShape::Append)
-            .await?;
         Ok(statuses_from_inserted(messages.len(), inserted))
     }
 
@@ -491,9 +445,6 @@ impl Store {
         }
         let batches = parts_batches(parts)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Parts, batches).await?;
-        self.handle
-            .fold_and_create_indices(Table::Parts, WriteShape::Append)
-            .await?;
         Ok(statuses_from_inserted(parts.len(), inserted))
     }
 
@@ -706,7 +657,7 @@ impl Store {
 
     /// Write a batch of embeddings into `messages`: set `vector` and
     /// `embedding_model` on each row by `(session_id, id)`
-    /// (spec.md#embeddings-are-derived). The column update goes through the
+    /// (spec.md#embed-from-canonical). The column update goes through the
     /// write seam and lands as a new manifest version (`append-only`).
     pub async fn write_embeddings(&self, rows: &[EmbeddedMessage]) -> Result<()> {
         if rows.is_empty() {
@@ -716,21 +667,11 @@ impl Store {
         self.handle
             .merge_update(Table::Messages, batch, rows.len())
             .await?;
-        // spec.md#fold-on-write: the embed worker drains in many windows;
-        // folding per call would slow embed by ~O(windows) full-table
-        // index rebuilds (and per-window optimize_indices(append) on a
-        // stable-row-id-flat-BTREE-after-column-update repeatedly trips
-        // lance v7.0.0-beta.16's combine_old_new bug). The outer
-        // `pond embed` handler calls `Store::flush_indices` once at end.
         Ok(())
     }
 
     /// Stream the backlog of messages needing embedding: rows with `search_text`
-    /// set whose `vector` is null (spec.md#embeddings-are-derived). Model swaps
-    /// are handled explicitly by `pond embed --force`, which clears stale rows
-    /// (setting `vector = NULL` on every row not under the current model) before
-    /// the worker pulls them - so by the time this stream runs, the only rows
-    /// with non-null `vector` are under the active model.
+    /// set whose `vector` is null (spec.md#embed-from-canonical).
     pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
             let filter = Predicate::And(vec![
@@ -749,6 +690,46 @@ impl Store {
                 .try_into_stream()
                 .await
                 .context("failed to open messages stream")?;
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                for row in 0..batch.num_rows() {
+                    yield PendingMessage {
+                        session_id: string(&batch, "session_id", row)?
+                            .context("session_id is null")?,
+                        id: string(&batch, "id", row)?.context("message id is null")?,
+                        search_text: string(&batch, "search_text", row)?
+                            .context("search_text is null")?,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Stream messages that are either never embedded or stale under the
+    /// current model. `pond embed --force` feeds this to the same unconditional
+    /// merge_update as the normal backlog; the filter makes that semantically
+    /// equivalent to the conditional update in spec.md#embed-from-canonical.
+    pub fn pending_or_stale_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
+        try_stream! {
+            let filter = Predicate::And(vec![
+                Predicate::IsNotNull("search_text"),
+                Predicate::Or(vec![
+                    Predicate::IsNull("vector"),
+                    Predicate::Ne("embedding_model", embed::model_id().into()),
+                ]),
+            ]);
+            let projection: &[&str] = &["session_id", "id", "search_text"];
+            let scanner = self
+                .handle
+                .scan(
+                    Table::Messages,
+                    ScanOpts::with_predicate_and_projection(&filter, projection),
+                )
+                .await?;
+            let mut batches = scanner
+                .try_into_stream()
+                .await
+                .context("failed to open pending-or-stale messages stream")?;
             while let Some(batch) = batches.next().await {
                 let batch = batch?;
                 for row in 0..batch.num_rows() {
@@ -840,11 +821,18 @@ impl Store {
         query: &[f32],
         limit: usize,
         filter: &Predicate,
+        search: Option<&config::SearchConfig>,
     ) -> Result<Vec<(MessageKey, f32)>> {
         let scope = embedded_scope(filter);
         let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
+        if let Some(nprobes) = search.and_then(|cfg| cfg.nprobes) {
+            scanner.nprobes(nprobes);
+        }
+        if let Some(refine_factor) = search.and_then(|cfg| cfg.refine_factor) {
+            scanner.refine(refine_factor);
+        }
         // Mirror the explicit-projection contract from `fts_search`: opt out
         // of `_distance` autoprojection and list it ourselves since the loop
         // below reads it.
@@ -881,11 +869,36 @@ impl Store {
         query: &[f32],
         limit: usize,
         filter: &Predicate,
+        search: Option<&config::SearchConfig>,
     ) -> Result<String> {
         let scope = embedded_scope(filter);
         let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
+        if let Some(nprobes) = search.and_then(|cfg| cfg.nprobes) {
+            scanner.nprobes(nprobes);
+        }
+        if let Some(refine_factor) = search.and_then(|cfg| cfg.refine_factor) {
+            scanner.refine(refine_factor);
+        }
+        scanner
+            .explain_plan(true)
+            .await
+            .context("explain_plan failed")
+    }
+
+    pub async fn explain_fts_plan(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &Predicate,
+    ) -> Result<String> {
+        let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
+        scanner.full_text_search(
+            FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
+        )?;
+        scanner.project(&["session_id", "id"])?;
+        scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
         scanner
             .explain_plan(true)
             .await
@@ -977,11 +990,8 @@ impl Store {
         Ok(counts)
     }
 
-    /// Rows appended to `messages` since the FTS index was last folded
-    /// (spec.md#fold-on-write). A missing index reports the whole table; the
-    /// query is manifest-only - no index I/O. With the fold-on-write contract
-    /// this is normally zero between commits; a non-zero value at open time
-    /// is reconciled before [`Store::open_with_options`] returns.
+    /// Rows appended to `messages` since the FTS index was last optimized.
+    /// A missing index reports the whole table; the query is manifest-only.
     pub async fn unindexed_message_backlog(&self) -> Result<usize> {
         self.handle
             .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
@@ -989,7 +999,7 @@ impl Store {
     }
 
     /// Rows added or rewritten in `messages` since the IVF_PQ vector index
-    /// was last folded (spec.md#fold-on-write). Below
+    /// was last optimized. Below
     /// [`VECTOR_INDEX_ACTIVATION_ROWS`] no index exists yet, so the caller
     /// must read [`embedding_progress`](Self::embedding_progress) too and
     /// distinguish "index not built yet" from "index trails data".
@@ -1022,9 +1032,7 @@ impl Store {
 
     /// Count rows whose `embedding_model` is not the currently configured
     /// model AND whose `vector` is still populated - the signal `pond embed`
-    /// uses to detect a model swap and require `--force`. With `--force`,
-    /// these rows are cleared via [`Self::clear_embeddings`] before the
-    /// worker runs.
+    /// uses to detect a model swap and require `--force`.
     pub async fn stale_embedding_count(&self) -> Result<usize> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         dataset
@@ -1039,76 +1047,49 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Stream the `(session_id, id)` keys for stale-model rows. Used by
-    /// `pond embed --force` to enumerate the rows that need clearing before
-    /// the new model writes its vectors.
-    pub fn stale_embedding_keys(&self) -> impl Stream<Item = Result<MessageKey>> + '_ {
-        try_stream! {
-            let filter = Predicate::And(vec![
-                Predicate::IsNotNull("vector"),
-                Predicate::Ne("embedding_model", embed::model_id().into()),
-            ]);
-            let projection: &[&str] = &["session_id", "id"];
-            let scanner = self
-                .handle
-                .scan(
-                    Table::Messages,
-                    ScanOpts::with_predicate_and_projection(&filter, projection),
-                )
-                .await?;
-            let mut batches = scanner
-                .try_into_stream()
-                .await
-                .context("failed to open stale-embedding stream")?;
-            while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                for row in 0..batch.num_rows() {
-                    yield MessageKey {
-                        session_id: string(&batch, "session_id", row)?
-                            .context("session_id is null")?,
-                        message_id: string(&batch, "id", row)?.context("message id is null")?,
-                    };
+    pub async fn optimize_indices(&self) -> Result<()> {
+        let policy = pond_index_intents();
+        for (table, intents) in policy.all() {
+            self.handle.optimize_indices(table, intents).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn optimize_indices_with_vector_threshold(&self, vector_threshold: usize) -> Result<()> {
+        let policy = pond_index_intents_with_vector_threshold(vector_threshold);
+        for (table, intents) in policy.all() {
+            self.handle.optimize_indices(table, intents).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn rebuild_indices(&self, intent_name: Option<&str>) -> Result<()> {
+        let policy = pond_index_intents();
+        let mut matched = false;
+        for (table, intents) in policy.all() {
+            for intent in intents {
+                if intent_name.is_none_or(|name| name == intent.name) {
+                    matched = true;
+                    self.handle.rebuild_index(table, intent).await?;
                 }
             }
         }
-    }
-
-    /// Set `vector = NULL, embedding_model = NULL` on every `messages` row in
-    /// `keys`. Used by the `pond embed --force` model-swap path: the worker
-    /// only picks up rows whose `vector IS NULL`, so clearing the stale ones
-    /// puts them back in the backlog. The merge_update folds-on-write, which
-    /// prunes the rewritten fragments from the IVF_PQ's coverage; the embed
-    /// handler then drops the old IVF_PQ (its centroids belong to the prior
-    /// distance space) before the new vectors arrive.
-    pub async fn clear_embeddings(&self, keys: &[MessageKey]) -> Result<()> {
-        if keys.is_empty() {
-            return Ok(());
+        if let Some(name) = intent_name
+            && !matched
+        {
+            anyhow::bail!("unknown index intent {name:?}");
         }
-        let batch = embedding_clear_batch(keys)?;
-        self.handle
-            .merge_update(Table::Messages, batch, keys.len())
-            .await?;
-        // Same batching shape as `write_embeddings`: outer handler folds
-        // at end via `Store::flush_indices`.
         Ok(())
     }
 
-    /// Fold every maintained index on every table forward, creating any
-    /// implied-but-missing ones (spec.md#fold-on-write). Outer handlers
-    /// (`ingest_adapter`, `ingest_events`, `pond embed`) call this once
-    /// at end so the spec contract holds at the seam without paying
-    /// per-batch fold cost during a long ingest or embed pass.
-    ///
-    /// The [`WriteShape`] picks the right scalar / FTS strategy: pure
-    /// inserts get the cheap incremental `optimize_indices(append)`;
-    /// column updates get the safe rebuild that dodges the
-    /// v7.0.0-beta.16 flat-BTREE bug. Vector folds incrementally either
-    /// way.
-    pub async fn flush_indices(&self, shape: WriteShape) -> Result<()> {
-        for table in [Table::Sessions, Table::Messages, Table::Parts] {
-            self.handle.fold_and_create_indices(table, shape).await?;
+    pub async fn index_status(&self) -> Result<Vec<IndexStatus>> {
+        let policy = pond_index_intents();
+        let mut statuses = Vec::new();
+        for (table, intents) in policy.all() {
+            statuses.extend(self.handle.index_status(table, intents).await?);
         }
-        Ok(())
+        Ok(statuses)
     }
 
     /// Drop the IVF_PQ index on `messages.vector`. Used by `pond embed
@@ -1123,7 +1104,6 @@ impl Store {
             Ok(()) => Ok(()),
             Err(error) => {
                 let msg = error.to_string();
-                // The index simply was not there - fine, nothing to drop.
                 if msg.contains("not found") || msg.contains("does not exist") {
                     Ok(())
                 } else {
@@ -1202,6 +1182,8 @@ impl Store {
         }
     }
 
+    /// Rare standalone message-id lookup; no `messages.id` index, so Lance
+    /// full-scans with the predicate.
     async fn find_message(&self, message_id: &str) -> Result<Option<Message>> {
         let batch = self
             .handle
@@ -1303,11 +1285,11 @@ impl Store {
         let batch = scanner.try_into_batch().await.context("scan failed")?;
         let row_addresses = uint64(&batch, "_rowaddr")?;
         let mut file_payloads = BTreeMap::<usize, FileData>::new();
-        let mut file_rows = Vec::<(usize, u64, String)>::new();
+        let mut file_rows = Vec::<(usize, u64, Vec<u8>)>::new();
         for row in 0..batch.num_rows() {
             if string(&batch, "type", row)?.as_deref() == Some("file") {
                 let variant_data =
-                    string(&batch, "variant_data", row)?.context("variant_data is null")?;
+                    json_column(&batch, "variant_data", row)?.context("variant_data is null")?;
                 file_rows.push((row, row_addresses.value(row), variant_data));
             }
         }
@@ -1318,15 +1300,10 @@ impl Store {
                 .collect::<Vec<_>>();
             let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
             for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
-                let payload = if file_data_kind(&variant_data)? == "url" {
-                    FileData::Url(
-                        blob.uri()
-                            .context("file URL payload has no blob URI")?
-                            .to_owned(),
-                    )
-                } else {
-                    file_data_from_blob(&variant_data, &blob.read().await?)?
-                };
+                // Legacy blob (lance-encoding:blob): payload is bytes; the
+                // url variant stored its URL as UTF-8 bytes, recovered via
+                // `file_data_from_blob`'s `data_kind = "url"` branch.
+                let payload = file_data_from_blob(&variant_data, &blob.read().await?)?;
                 file_payloads.insert(row, payload);
             }
         }
@@ -1377,7 +1354,7 @@ pub struct IngestSummary {
     /// inspect `drop_reasons` for the top contributors.
     pub dropped_events: usize,
     /// Sessions whose Session-level invariants (immutable `source_agent` /
-    /// `project` against a previously-stored row) failed at flush time and
+    /// `project` against the stored row) failed at flush time and
     /// whose substream got rejected wholesale. Always small relative to
     /// `inserted`; if not, there's a real problem to investigate.
     pub dropped_sessions: usize,
@@ -1399,8 +1376,7 @@ pub struct IngestSummary {
     /// dropped_sessions` populations. Keys are `&'static str` (see the
     /// `DROP_REASON_*` constants) so consumers can match by identity.
     /// Empty on a clean run. Used by `pond sync` to print the top reasons
-    /// and by `benches/ingest_bench.rs` to bucket Partial drops (which
-    /// previously carried only a count, no reason).
+    /// and by `benches/ingest_bench.rs` to bucket Partial drops by cause.
     pub drop_reasons: BTreeMap<&'static str, usize>,
 }
 
@@ -1432,12 +1408,11 @@ impl IngestSummary {
                 OutcomeStatus::Inserted => self.inserted += 1,
                 OutcomeStatus::Matched => self.matched += 1,
                 OutcomeStatus::Error => {
-                    // A whole-substream rejection arrives as exactly one
-                    // session-kind Error outcome (see
-                    // `error_outcomes_for_substream`). Per-event drops
-                    // arrive as one Error each on message/part. Keeping the
-                    // populations distinct is the whole point of the new
-                    // `IngestSummary` shape.
+                    // Session-level rejection: exactly one session-kind Error
+                    // outcome (see `error_outcomes_for_substream`). Per-event
+                    // drop: one Error per message/part. The two populations
+                    // are counted separately so the operator can tell a
+                    // structural reject from a row-level skip.
                     if outcome.kind == "session" {
                         self.dropped_sessions += 1;
                     } else {
@@ -1518,11 +1493,10 @@ struct BufferedPart {
 /// batches: sessions, messages, parts). A validation error on a single event
 /// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
 /// continues; only Session-level invariants (immutable source_agent / project
-/// on re-write) drop the whole substream. The N-events-per-rejection cascade
-/// from the prior contract is gone (see spec.md#event-ordering).
+/// on re-write) drop the whole substream (spec.md#event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
-/// `Session` event closes out the previous one), they accumulate in
+/// `Session` event closes out the current one), they accumulate in
 /// `completed` rather than each one calling `merge_insert` immediately.
 /// The caller drains the buffer via [`Self::flush`] / [`Self::finish`],
 /// at which point one batched 3-parallel-merge-insert covers all pending
@@ -1608,7 +1582,7 @@ impl IngestValidator {
         index: usize,
         mut session: Session,
     ) -> Result<Vec<RowOutcome>> {
-        // Close out the previous substream (if any) - move it to the pending
+        // Close out the current substream (if any) - move it to the pending
         // buffer instead of writing immediately. The actual write happens
         // when the caller invokes `flush` / `finish`.
         self.close_current_substream();
@@ -1841,10 +1815,7 @@ fn error_outcome(
 /// Session-level rejection (immutable `source_agent` / `project` violation):
 /// emit exactly one Error outcome on the Session row. The buffered messages
 /// and parts of this substream are *not* surfaced as per-row errors - their
-/// loss is implied by the single session-rejection. Earlier versions
-/// cascaded N error rows per rejected substream; that inflated the operator
-/// view ("12,297 errors") for what is structurally one decision
-/// ("1 session-level rejection"). See spec.md#event-ordering.
+/// loss is implied by the single session-rejection (spec.md#event-ordering).
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -2057,10 +2028,8 @@ pub struct SessionWithMessages {
 /// (a model swap goes through `pond embed --force` which drops the IVF_PQ,
 /// clears stale rows, and re-bootstraps), so `embedding_model` is never a
 /// query-time predicate - the only embedding-state filter is `vector IS NOT
-/// NULL`. The column remains for audit and for `pond embed`'s model-swap
-/// detection.
+/// NULL`. `id` lookups are rare and full-scan.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
-    ("id", BuiltinIndexType::BTree, "messages_id_btree"),
     ("project", BuiltinIndexType::BTree, "messages_project_btree"),
     (
         "session_id",
@@ -2135,8 +2104,8 @@ pub(crate) const SESSIONS: &str = "sessions";
 pub(crate) const MESSAGES: &str = "messages";
 pub(crate) const PARTS: &str = "parts";
 
-/// FTS index name on `messages.search_text`. Stable so the unindexed-backlog
-/// query (spec.md#fold-on-write) and index creation name the same index.
+/// FTS index name on `messages.search_text`. Stable so status and index
+/// creation name the same index.
 pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// IVF_PQ index name on `messages.vector` (spec.md#search). Stable so the
@@ -2158,19 +2127,16 @@ const IVF_PQ_MAX_ITERS: usize = 15;
 const FTS_NGRAM_MIN: u32 = 3;
 const FTS_NGRAM_MAX: u32 = 5;
 
-/// Pond's production index policy (spec.md#fold-on-write). Sessions
-/// registers this with the substrate at every [`Store::open_with_options`].
-/// The substrate then enforces it on every merge and at open: missing
-/// intents that trigger-imply are created, existing indices are folded
-/// forward, accumulated segments are collapsed.
-pub fn pond_index_policy() -> IndexPolicy {
-    pond_index_policy_with_vector_threshold(VECTOR_INDEX_ACTIVATION_ROWS)
+/// Pond's production IndexIntents: the per-table intent set
+/// `Store::open_with_options` registers with the substrate.
+pub fn pond_index_intents() -> IndexIntents {
+    pond_index_intents_with_vector_threshold(VECTOR_INDEX_ACTIVATION_ROWS)
 }
 
-/// Same as [`pond_index_policy`] but with an overridable IVF_PQ activation
+/// Same as [`pond_index_intents`] but with an overridable IVF_PQ activation
 /// threshold. Used by tests that need to exercise the activation boundary
 /// without writing 100k vectors.
-pub(crate) fn pond_index_policy_with_vector_threshold(vector_threshold: usize) -> IndexPolicy {
+pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) -> IndexIntents {
     let mut messages = Vec::with_capacity(MESSAGE_SCALAR_INDICES.len() + 2);
     messages.push(IndexIntent {
         name: MESSAGES_FTS_INDEX,
@@ -2220,7 +2186,7 @@ pub(crate) fn pond_index_policy_with_vector_threshold(vector_threshold: usize) -
             params: IndexParamsKind::Scalar(kind.clone()),
         })
         .collect();
-    IndexPolicy {
+    IndexIntents {
         sessions,
         messages,
         parts,
@@ -2255,17 +2221,16 @@ pub fn init_embedding_dim(dim: usize) {
 
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
-/// `auto_cleanup` window defaults to 90 days; hosted recovery scenarios
-/// (sources deleted, sessions expired, re-ingest impossible) need a long
-/// rollback window and storage cost is negligible for append-only workloads.
+/// `auto_cleanup` is short; long-term recovery is `pond export` snapshots
+/// plus deferred Lance tags (spec.md#durable-copy).
 pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
-        data_storage_version: Some(LanceFileVersion::V2_2),
+        data_storage_version: Some(LanceFileVersion::V2_1),
         enable_v2_manifest_paths: true,
         enable_stable_row_ids: true,
         auto_cleanup: Some(AutoCleanupParams {
             interval: 20,
-            older_than: chrono::TimeDelta::days(90),
+            older_than: chrono::TimeDelta::days(7),
         }),
         ..WriteParams::default()
     }
@@ -2283,7 +2248,7 @@ pub(crate) fn session_schema() -> Arc<Schema> {
             false,
         ),
         Field::new("project", DataType::Utf8, false),
-        Field::new("options", DataType::Utf8, false),
+        json_field("options", false),
     ]))
 }
 
@@ -2301,11 +2266,11 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("project", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
-        // The message's derived embedding (spec.md#embeddings-are-derived):
+        // The message's derived embedding (spec.md#embed-from-canonical):
         // both null until `pond embed` fills them, set together thereafter.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
-        Field::new("options", DataType::Utf8, false),
+        json_field("options", false),
     ]))
 }
 
@@ -2319,9 +2284,9 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         // spec.md#part-provenance: conversation vs harness-injected; search
         // reads this column to exclude injected scaffolding.
         Field::new("provenance", DataType::Utf8, false),
-        Field::new("variant_data", DataType::Utf8, false),
-        blob_field("data", true),
-        Field::new("options", DataType::Utf8, false),
+        json_field("variant_data", false),
+        legacy_blob_field("data", true),
+        json_field("options", false),
     ]))
 }
 
@@ -2355,9 +2320,14 @@ pub(crate) struct MessageBatchRow<'a> {
     pub search_text: Option<&'a str>,
 }
 
+// Lance v7.0.0-beta.16's IVF_PQ build path (`rust/lance/src/index/vector/utils.rs`
+// `infer_vector_element_type_impl`) accepts only Float16/Float32/Float64/UInt8/Int8;
+// `FixedSizeBinary(2)`-backed `lance.bfloat16` is rejected. The format docs list
+// BFloat16 as a future-supported embedding type; until the Rust IVF_PQ build
+// path catches up, store as Float16 (half-precision, also 2 bytes/element).
 fn embedding_vector_type() -> DataType {
     DataType::FixedSizeList(
-        Arc::new(Field::new("item", DataType::Float32, true)),
+        Arc::new(Field::new("item", DataType::Float16, true)),
         embedding_dim() as i32,
     )
 }
@@ -2374,35 +2344,6 @@ fn embedding_update_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Source batch for [`Store::clear_embeddings`]: one row per key carrying
-/// `(session_id, id, NULL, NULL)`. `merge_update` then nulls the `vector`
-/// and `embedding_model` columns on each matched row, putting it back in
-/// the embed worker's backlog (`vector IS NULL`).
-fn embedding_clear_batch(keys: &[MessageKey]) -> Result<RecordBatch> {
-    let session_ids = StringArray::from(
-        keys.iter()
-            .map(|key| key.session_id.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let ids = StringArray::from(
-        keys.iter()
-            .map(|key| key.message_id.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let null_vectors = new_null_array(&embedding_vector_type(), keys.len());
-    let null_models = new_null_array(&DataType::Utf8, keys.len());
-    RecordBatch::try_new(
-        embedding_update_schema(),
-        vec![
-            Arc::new(session_ids),
-            Arc::new(ids),
-            null_vectors,
-            null_models,
-        ],
-    )
-    .context("failed to build embedding-clear batch")
-}
-
 /// Build the merge-update source batch for [`Store::write_embeddings`]: one row
 /// per embedded message carrying `(session_id, id, vector, embedding_model)`.
 pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordBatch> {
@@ -2416,15 +2357,12 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
                 row.vector.len(),
             );
         }
-        flat.extend_from_slice(&row.vector);
+        flat.extend(row.vector.iter().map(|value| half::f16::from_f32(*value)));
     }
-    let vectors = FixedSizeListArray::try_new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        dim as i32,
-        Arc::new(Float32Array::from(flat)),
-        None,
-    )
-    .context("failed to build embedding vector column")?;
+    let values = Float16Array::from(flat);
+    let item_field = Arc::new(Field::new("item", DataType::Float16, true));
+    let vectors = FixedSizeListArray::try_new(item_field, dim as i32, Arc::new(values), None)
+        .context("failed to build embedding vector column")?;
 
     RecordBatch::try_new(
         embedding_update_schema(),
@@ -2498,7 +2436,7 @@ async fn merge_insert_chunks(
 pub(crate) fn sessions_batches(sessions: &[Session]) -> Result<Vec<RecordBatch>> {
     let options = sessions
         .iter()
-        .map(|session| json_string(&session.options))
+        .map(|session| json_bytes(&session.options))
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(sessions.len());
     for (session, encoded) in sessions.iter().zip(&options) {
@@ -2521,7 +2459,7 @@ pub(crate) fn sessions_batches(sessions: &[Session]) -> Result<Vec<RecordBatch>>
         .collect()
 }
 
-fn sessions_chunk(sessions: &[Session], options: &[String]) -> Result<RecordBatch> {
+fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBatch> {
     let schema = session_schema();
     RecordBatch::try_new(
         schema.clone(),
@@ -2565,8 +2503,8 @@ fn sessions_chunk(sessions: &[Session], options: &[String]) -> Result<RecordBatc
                     .map(|session| session.project.as_str())
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(
-                options.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(LargeBinaryArray::from_iter_values(
+                options.iter().map(Vec::as_slice),
             )),
         ],
     )
@@ -2576,7 +2514,7 @@ fn sessions_chunk(sessions: &[Session], options: &[String]) -> Result<RecordBatc
 pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<RecordBatch>> {
     let options = rows
         .iter()
-        .map(|row| json_string(row.message.options()))
+        .map(|row| json_bytes(row.message.options()))
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(rows.len());
     for (row, encoded) in rows.iter().zip(&options) {
@@ -2601,7 +2539,7 @@ pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<Recor
         .collect()
 }
 
-fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[String]) -> Result<RecordBatch> {
+fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<RecordBatch> {
     let schema = message_schema();
     RecordBatch::try_new(
         schema.clone(),
@@ -2643,11 +2581,11 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[String]) -> Result<Re
             )),
             // `vector` / `embedding_model` are written null at ingest; every
             // message starts un-embedded and `pond embed` fills them later
-            // (spec.md#embeddings-are-derived).
+            // (spec.md#embed-from-canonical).
             new_null_array(&embedding_vector_type(), rows.len()),
             new_null_array(&DataType::Utf8, rows.len()),
-            Arc::new(StringArray::from(
-                options.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(LargeBinaryArray::from_iter_values(
+                options.iter().map(Vec::as_slice),
             )),
         ],
     )
@@ -2661,7 +2599,7 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         .collect::<Result<Vec<_>>>()?;
     let options = parts
         .iter()
-        .map(|part| json_string(&part.options))
+        .map(|part| json_bytes(&part.options))
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(parts.len());
     // The blob column is a BinaryArray, exempt from the text-column bound
@@ -2693,24 +2631,32 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         .collect()
 }
 
-fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> Result<RecordBatch> {
+fn parts_chunk(
+    parts: &[Part],
+    variant_data: &[Vec<u8>],
+    options: &[Vec<u8>],
+) -> Result<RecordBatch> {
     let schema = part_schema();
-    let mut blobs = BlobArrayBuilder::new(parts.len());
-    for part in parts {
-        match &part.kind {
-            PartKind::File { data, .. } => match data {
-                FileData::String(value) => blobs.push_bytes(value.as_bytes())?,
-                FileData::Bytes(value) => blobs.push_bytes(value)?,
-                FileData::Url(value) => blobs.push_uri(value)?,
-            },
+    // Legacy blob (`legacy_blob_field`) is a plain LargeBinary; the URL
+    // variant is stored as UTF-8 bytes and recovered through `variant_data`'s
+    // `data_kind = "url"` discriminator (see `file_data_from_blob`).
+    let blob_payloads: Vec<Option<&[u8]>> = parts
+        .iter()
+        .map(|part| match &part.kind {
+            PartKind::File { data, .. } => Some(match data {
+                FileData::String(value) => value.as_bytes(),
+                FileData::Bytes(value) => value.as_slice(),
+                FileData::Url(value) => value.as_bytes(),
+            }),
             PartKind::Text { .. }
             | PartKind::Reasoning { .. }
             | PartKind::ToolCall { .. }
             | PartKind::ToolResult { .. }
             | PartKind::ToolApprovalRequest { .. }
-            | PartKind::ToolApprovalResponse { .. } => blobs.push_empty()?,
-        }
-    }
+            | PartKind::ToolApprovalResponse { .. } => None,
+        })
+        .collect();
+    let blob_array = LargeBinaryArray::from_iter(blob_payloads);
 
     RecordBatch::try_new(
         schema.clone(),
@@ -2748,12 +2694,12 @@ fn parts_chunk(parts: &[Part], variant_data: &[String], options: &[String]) -> R
                     .map(|part| part.provenance.as_str())
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(
-                variant_data.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(LargeBinaryArray::from_iter_values(
+                variant_data.iter().map(Vec::as_slice),
             )),
-            blobs.finish()?,
-            Arc::new(StringArray::from(
-                options.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(blob_array),
+            Arc::new(LargeBinaryArray::from_iter_values(
+                options.iter().map(Vec::as_slice),
             )),
         ],
     )
@@ -2770,7 +2716,7 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
         project: crate::adapter::Extracted::from_stored(
             string(batch, "project", row)?.context("project is null")?,
         ),
-        options: json_parse(&string(batch, "options", row)?.context("options is null")?)?,
+        options: json_parse(&json_column(batch, "options", row)?.context("options is null")?)?,
     })
 }
 
@@ -2778,7 +2724,8 @@ pub(crate) fn message_from_batch(batch: &RecordBatch, row: usize) -> Result<Mess
     let id = string(batch, "id", row)?.context("message id is null")?;
     let session_id = string(batch, "session_id", row)?.context("message session_id is null")?;
     let timestamp = datetime(batch, "timestamp", row)?;
-    let options = json_parse(&string(batch, "options", row)?.context("message options is null")?)?;
+    let options =
+        json_parse(&json_column(batch, "options", row)?.context("message options is null")?)?;
 
     match string(batch, "role", row)?
         .context("message role is null")?
@@ -2825,7 +2772,7 @@ pub(crate) fn part_from_batch(
     file_data: Option<FileData>,
 ) -> Result<Part> {
     let type_name = string(batch, "type", row)?.context("part type is null")?;
-    let variant_data = string(batch, "variant_data", row)?.context("variant_data is null")?;
+    let variant_data = json_column(batch, "variant_data", row)?.context("variant_data is null")?;
     let provenance = string(batch, "provenance", row)?.context("part provenance is null")?;
     Ok(Part {
         session_id: string(batch, "session_id", row)?.context("part session_id is null")?,
@@ -2833,7 +2780,7 @@ pub(crate) fn part_from_batch(
         id: string(batch, "id", row)?.context("part id is null")?,
         ordinal: int32(batch, "ordinal", row)?,
         provenance: provenance_from_str(&provenance)?,
-        options: json_parse(&string(batch, "options", row)?.context("part options is null")?)?,
+        options: json_parse(&json_column(batch, "options", row)?.context("part options is null")?)?,
         kind: part_kind_from_json(&type_name, &variant_data, file_data)?,
     })
 }
@@ -2846,7 +2793,7 @@ fn provenance_from_str(value: &str) -> Result<crate::wire::Provenance> {
     }
 }
 
-fn file_data_from_blob(variant_data: &str, bytes: &[u8]) -> Result<FileData> {
+fn file_data_from_blob(variant_data: &[u8], bytes: &[u8]) -> Result<FileData> {
     let kind = file_data_kind(variant_data)?;
     match kind.as_str() {
         "string" => {
@@ -2865,7 +2812,7 @@ fn file_data_from_blob(variant_data: &str, bytes: &[u8]) -> Result<FileData> {
     }
 }
 
-fn file_data_kind(variant_data: &str) -> Result<String> {
+fn file_data_kind(variant_data: &[u8]) -> Result<String> {
     let value = json_parse::<Value>(variant_data)?;
     value
         .get("data_kind")
@@ -2924,6 +2871,39 @@ pub(crate) fn string(batch: &RecordBatch, name: &str, row: usize) -> Result<Opti
     }
 }
 
+fn json_column(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<Vec<u8>>> {
+    // Lance can return a `lance.json` column either as raw JSONB bytes
+    // (LargeBinary) or auto-converted to the Arrow text form (Utf8 /
+    // LargeUtf8), depending on the read path. Handle both.
+    let column = batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?;
+    if let Some(array) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+        return if array.is_null(row) {
+            Ok(None)
+        } else {
+            Ok(Some(
+                lance_arrow::json::decode_json(array.value(row)).into_bytes(),
+            ))
+        };
+    }
+    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        return if array.is_null(row) {
+            Ok(None)
+        } else {
+            Ok(Some(array.value(row).as_bytes().to_vec()))
+        };
+    }
+    if let Some(array) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return if array.is_null(row) {
+            Ok(None)
+        } else {
+            Ok(Some(array.value(row).as_bytes().to_vec()))
+        };
+    }
+    anyhow::bail!("column {name} is not a JSON-compatible array")
+}
+
 fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<i32> {
     let array = batch
         .column_by_name(name)
@@ -2966,19 +2946,49 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
     )
 }
 
+// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`). Blob v2's
+// `Struct<data, uri>` extension requires `data_storage_version >= 2.2`, which
+// is marked unstable in Lance docs (`format/file/versioning.md`) and at
+// v7.0.0-beta.16 trips a `compact_files` bug: the AllBinary blob_handling
+// path leaves the field as a 2-child struct but `BlobV2StructuralEncoder`
+// allocated only one column_info, so the decoder's second `expect_next()`
+// fires `"there were more fields in the schema than provided column
+// indices / infos"`. Legacy blob writes `BlobLayout` pages, which compact
+// handles correctly (covered by Lance's own `test_compact_blob_columns`).
+fn legacy_blob_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::LargeBinary, nullable).with_metadata(
+        [(lance_arrow::BLOB_META_KEY.to_owned(), "true".to_owned())]
+            .into_iter()
+            .collect(),
+    )
+}
+
+fn json_field(name: &str, nullable: bool) -> Field {
+    lance_arrow::json::json_field(name, nullable)
+}
+
 fn micros(timestamp: DateTime<Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
 
-fn json_string<T: Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string(value).context("failed to serialize JSON field")
+fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    // Write JSONB bytes (not plain UTF-8 JSON text) so the on-disk encoding
+    // matches the `lance.json` extension contract. Lance's compact path
+    // (`optimize.rs:908`) reads through `DatasetRecordBatchStream` which
+    // applies `decode_json -> encode_json` on this column; with proper JSONB
+    // on disk that roundtrip is idempotent, with plain UTF-8 it corrupts
+    // (the analogous fix landed for `update.rs` in PR #6741 by switching to
+    // `try_into_dfstream`; compact still goes through the adapter).
+    let text = serde_json::to_string(value).context("failed to serialize JSON field")?;
+    lance_arrow::json::encode_json(&text)
+        .map_err(|err| anyhow::anyhow!("failed to encode JSON field as JSONB: {err}"))
 }
 
-fn json_parse<T: DeserializeOwned>(value: &str) -> Result<T> {
-    serde_json::from_str(value).context("failed to parse JSON field")
+fn json_parse<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
+    serde_json::from_slice(value).context("failed to parse JSON field")
 }
 
-fn part_variant_json(kind: &PartKind) -> Result<String> {
+fn part_variant_json(kind: &PartKind) -> Result<Vec<u8>> {
     if let PartKind::File {
         media_type,
         file_name,
@@ -2990,12 +3000,11 @@ fn part_variant_json(kind: &PartKind) -> Result<String> {
             FileData::Bytes(_) => "bytes",
             FileData::Url(_) => "url",
         };
-        return serde_json::to_string(&serde_json::json!({
+        return json_bytes(&serde_json::json!({
             "media_type": media_type,
             "file_name": file_name,
             "data_kind": data_kind,
-        }))
-        .context("failed to serialize file part variant");
+        }));
     }
     let value = serde_json::to_value(kind)?;
     let mut object = value
@@ -3003,12 +3012,12 @@ fn part_variant_json(kind: &PartKind) -> Result<String> {
         .cloned()
         .context("part variant did not serialize to an object")?;
     object.remove("type");
-    serde_json::to_string(&object).context("failed to serialize part variant")
+    json_bytes(&object)
 }
 
 fn part_kind_from_json(
     type_name: &str,
-    variant_data: &str,
+    variant_data: &[u8],
     file_data: Option<FileData>,
 ) -> Result<PartKind> {
     let mut value = json_parse::<Value>(variant_data)?;
@@ -3236,6 +3245,77 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: compact_files on `parts` with the blob column tripped a
+    /// Lance v7.0.0-beta.16 dispatch bug under `lance.blob.v2`. Two upsert
+    /// batches give compact fragments to merge; every `FileData` variant
+    /// exercises the blob round-trip. All-File batches sidestep a debug-only
+    /// `debug_assert_eq!` in Lance's legacy blob encoder that trips when one
+    /// write batch mixes null + valid rows in the blob column - benign in
+    /// release, irrelevant to this regression's scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn optimize_indices_compacts_parts_with_blob_column() -> anyhow::Result<()> {
+        use crate::wire::{FileData, PartKind, Provenance};
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        let session = synthetic_session("compact-blob");
+        store.upsert_sessions(std::slice::from_ref(&session)).await?;
+
+        let make_part = |idx: usize, kind: PartKind| Part {
+            session_id: session.id.clone(),
+            message_id: format!("msg-{idx}"),
+            id: format!("part-{idx}"),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind,
+        };
+
+        let batch_a = vec![
+            make_part(
+                0,
+                PartKind::File {
+                    media_type: "text/plain".to_owned(),
+                    file_name: Some("a.txt".to_owned()),
+                    data: FileData::Bytes(b"alpha".to_vec()),
+                },
+            ),
+            make_part(
+                1,
+                PartKind::File {
+                    media_type: "text/plain".to_owned(),
+                    file_name: Some("b.txt".to_owned()),
+                    data: FileData::String("beta".to_owned()),
+                },
+            ),
+        ];
+        store.upsert_parts(&batch_a).await?;
+
+        let batch_b = vec![
+            make_part(
+                2,
+                PartKind::File {
+                    media_type: "application/octet-stream".to_owned(),
+                    file_name: None,
+                    data: FileData::Url("https://example.com/file".to_owned()),
+                },
+            ),
+            make_part(
+                3,
+                PartKind::File {
+                    media_type: "image/png".to_owned(),
+                    file_name: Some("c.png".to_owned()),
+                    data: FileData::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
+                },
+            ),
+        ];
+        store.upsert_parts(&batch_b).await?;
+
+        store.optimize_indices().await?;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -3283,7 +3363,6 @@ mod tests {
         Ok(())
     }
 
-    // -- ingest_immutable: Session-level immutable field checks ---------------
     //
     // `Session.source_agent` and `Session.project` are immutable
     // post-first-write because `messages` denormalizes them at first
@@ -3399,8 +3478,6 @@ mod tests {
         Ok(())
     }
 
-    // -- vector search and index activation --------------------------------
-
     /// Ingest `count` synthetic messages spread across a handful of sessions
     /// and projects, each with conversational `search_text`. Returns the store
     /// and the message keys in `msg-{i}` order; every `vector` starts null.
@@ -3411,15 +3488,14 @@ mod tests {
         store_with_messages_at_threshold(temp, count, VECTOR_INDEX_ACTIVATION_ROWS).await
     }
 
-    /// Same as [`store_with_messages`] but opens the store with a custom
-    /// IVF_PQ activation threshold so tests can exercise the activation
-    /// boundary without writing 100k vectors.
+    /// Same as [`store_with_messages`] but tests optimize with a custom
+    /// IVF_PQ activation threshold.
     async fn store_with_messages_at_threshold(
         temp: &TempDir,
         count: usize,
-        vector_threshold: usize,
+        _vector_threshold: usize,
     ) -> anyhow::Result<(Store, Vec<MessageKey>)> {
-        let store = Store::open_local_with_vector_threshold(temp.path(), vector_threshold).await?;
+        let store = Store::open_local(temp.path()).await?;
         let sessions = 8.min(count.max(1));
         let mut events = Vec::new();
         for s in 0..sessions {
@@ -3490,26 +3566,42 @@ mod tests {
             .collect()
     }
 
+    fn embedding_update_batch_with_model(
+        rows: &[EmbeddedMessage],
+        model: &str,
+    ) -> Result<RecordBatch> {
+        let mut batch = embedding_update_batch(rows)?;
+        let columns = batch
+            .columns()
+            .iter()
+            .take(3)
+            .cloned()
+            .chain(std::iter::once(
+                Arc::new(StringArray::from(vec![model; rows.len()])) as _,
+            ))
+            .collect::<Vec<_>>();
+        batch = RecordBatch::try_new(batch.schema(), columns)?;
+        Ok(batch)
+    }
+
     #[tokio::test]
     async fn filtered_vector_scan_pushes_scalar_predicate_into_the_index() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         // 4 messages cycle session-0..session-3, so `session-3` is a real
-        // partition. Scalar-index pushdown is volume-independent - the planner
-        // emits a `ScalarIndexQuery` for an indexed equality whenever the index
-        // exists, so a larger corpus produces the identical plan. With
-        // fold-on-write, the ingest inside `store_with_messages` already
-        // created the session_id BTREE; the column update below re-folds it
-        // inline. No separate upkeep call.
+        // partition. Scalar-index pushdown is volume-independent: the planner
+        // emits `ScalarIndexQuery` whenever the index exists.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
-        // Direct `write_embeddings` usage (outside a handler) - flush
-        // explicitly so the BTREE on session_id covers the rewritten
-        // fragments before the planner asserts ScalarIndexQuery pushdown.
-        store.flush_indices(WriteShape::ColumnUpdate).await?;
+        store.optimize_indices().await?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store
-            .explain_vector_plan(&query, 10, &Predicate::Eq("session_id", "session-3".into()))
+            .explain_vector_plan(
+                &query,
+                10,
+                &Predicate::Eq("session_id", "session-3".into()),
+                None,
+            )
             .await?;
 
         // The load-bearing assertion (spec.md#prefilter-pushdown): the predicate
@@ -3531,18 +3623,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_index_activates_when_threshold_is_crossed_inline() -> anyhow::Result<()> {
-        // spec.md#fold-on-write: at the outermost public boundary, the
-        // IVF_PQ exists once `count(vector IS NOT NULL) >= threshold`.
-        // We emulate the boundary here with explicit `flush_indices` after
-        // each write batch (handlers wrap this automatically).
+    async fn vector_index_activates_when_threshold_is_crossed() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
 
-        // First batch: 255 vectors, one below threshold. The handler-end
-        // fold does not create the IVF_PQ (trigger not met).
+        // First batch: 255 vectors, one below threshold. Optimize does not
+        // create the IVF_PQ because the trigger is not met.
         store.write_embeddings(&embedded(&keys[..255])).await?;
-        store.flush_indices(WriteShape::ColumnUpdate).await?;
+        store.optimize_indices_with_vector_threshold(256).await?;
         assert!(
             !store
                 .handle
@@ -3553,10 +3641,10 @@ mod tests {
             "IVF_PQ must not exist below the activation threshold",
         );
 
-        // Next batch: one more vector. Total reaches 256; the next
-        // flush_indices creates the IVF_PQ.
+        // Next batch: one more vector. Total reaches 256; optimize creates
+        // the IVF_PQ.
         store.write_embeddings(&embedded(&keys[255..256])).await?;
-        store.flush_indices(WriteShape::ColumnUpdate).await?;
+        store.optimize_indices_with_vector_threshold(256).await?;
         assert!(
             store
                 .handle
@@ -3564,18 +3652,72 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "fold-on-write must create the IVF_PQ once the threshold is crossed",
+            "optimize must create the IVF_PQ once the threshold is crossed",
         );
 
         // The remaining 44 rows stay un-embedded; the IVF_PQ trains over the
         // non-null subset and a planted vector is retrievable.
         let hits = store
-            .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()))
+            .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()), None)
             .await?;
         assert!(
             hits.iter().any(|(key, _)| key == &keys[0]),
             "an embedded row is retrievable via the index",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_swap_force_re_embeds_only_stale_rows_and_rebuilds_ivf_pq() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
+        let old_rows = embedded(&keys);
+        let old_batch = embedding_update_batch_with_model(&old_rows, "old-model")?;
+        store
+            .handle
+            .merge_update(Table::Messages, old_batch, old_rows.len())
+            .await?;
+        store.optimize_indices_with_vector_threshold(256).await?;
+        assert!(
+            store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "IVF_PQ must exist before a model swap",
+        );
+        assert_eq!(store.stale_embedding_count().await?, keys.len());
+
+        store.drop_vector_index().await?;
+        let mut pending = Vec::new();
+        let stream = store.pending_or_stale_messages();
+        tokio::pin!(stream);
+        while let Some(row) = stream.next().await {
+            pending.push(row?);
+        }
+        assert_eq!(
+            pending.len(),
+            keys.len(),
+            "force stream should see stale rows"
+        );
+        store.write_embeddings(&embedded(&keys)).await?;
+        assert_eq!(store.stale_embedding_count().await?, 0);
+        store.optimize_indices_with_vector_threshold(256).await?;
+        assert!(
+            store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "optimize must rebuild IVF_PQ after force re-embed",
+        );
+
+        let stream = store.pending_or_stale_messages();
+        tokio::pin!(stream);
+        assert!(stream.next().await.is_none(), "up-to-date rows are skipped");
         Ok(())
     }
 
@@ -3593,8 +3735,7 @@ mod tests {
         let (store, _keys) = store_with_messages(&temp, 4).await?;
 
         // Produce several distinct manifest versions on `sessions` so the
-        // older ones become eligible for cleanup. Each upsert_sessions
-        // commits one merge_insert manifest plus its fold-on-write commit.
+        // older ones become eligible for cleanup.
         for tag in 0..3 {
             let extra = synthetic_session(&format!("extra-{tag}"));
             store.upsert_sessions(&[extra]).await?;
@@ -3624,159 +3765,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fold_on_write_holds_after_ingest_and_embed() -> anyhow::Result<()> {
-        // spec.md#fold-on-write at the outermost public boundary: after
-        // an ingest + embed pair plus one final `flush_indices` (the
-        // pond embed handler does this), the FTS and IVF_PQ backlogs are
-        // both zero and the IVF_PQ exists.
-        let temp = TempDir::new()?;
-        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
-        store.write_embeddings(&embedded(&keys)).await?;
-        store.flush_indices(WriteShape::ColumnUpdate).await?;
-
-        assert_eq!(
-            store.unindexed_message_backlog().await?,
-            0,
-            "FTS index must fully cover messages after fold-on-write",
-        );
-        assert_eq!(
-            store.unindexed_vector_backlog().await?,
-            0,
-            "IVF_PQ must fully cover vectors after fold-on-write",
-        );
-        assert!(
-            store
-                .handle
-                .messages_index_names()
-                .await?
-                .iter()
-                .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "IVF_PQ must exist after embed crosses the activation threshold",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn open_recreates_an_implied_missing_index() -> anyhow::Result<()> {
-        // spec.md#fold-on-write: index state is a pure function of data
-        // state. Drop an index that data implies should exist (bypass the
-        // contract from outside), reopen the store, and the open-time
-        // fold-and-create pass must recreate it before returning a handle.
-        // No recovery verb anywhere - the seam owns the contract.
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let session = synthetic_session("recover");
-        let message = Message::User {
-            id: "m-1".to_owned(),
-            session_id: session.id.clone(),
-            timestamp: Utc::now(),
-            options: ProviderOptions::new(),
-        };
-        let part = Part {
-            session_id: session.id.clone(),
-            id: "m-1:0".to_owned(),
-            message_id: message.id().to_owned(),
-            ordinal: 0,
-            provenance: crate::wire::Provenance::Conversational,
-            options: ProviderOptions::new(),
-            kind: PartKind::Text {
-                text: Some(Extracted::from_test_value("recoverable".to_owned())),
-            },
-        };
-        ingest_events(
-            &store,
-            vec![
-                IngestEvent::Session(session.clone()),
-                IngestEvent::Message(message),
-                IngestEvent::Part(part),
-            ],
-        )
-        .await?;
-        assert!(
-            store
-                .handle
-                .messages_index_names()
-                .await?
-                .iter()
-                .any(|name| name == MESSAGES_FTS_INDEX),
-            "FTS index must exist after ingest (sanity)",
-        );
-
-        // Drop the FTS index outside the contract; reopen.
-        store
-            .handle
-            .drop_index(Table::Messages, MESSAGES_FTS_INDEX)
-            .await?;
-        drop(store);
-        let reopened = Store::open_local(temp.path()).await?;
-        assert!(
-            reopened
-                .handle
-                .messages_index_names()
-                .await?
-                .iter()
-                .any(|name| name == MESSAGES_FTS_INDEX),
-            "open-time fold-and-create must recreate the missing FTS index",
-        );
-        assert_eq!(
-            reopened.unindexed_message_backlog().await?,
-            0,
-            "the recreated FTS index must fully cover existing rows",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn model_swap_force_path_clears_and_rebuilds_ivf_pq() -> anyhow::Result<()> {
-        // The `pond embed --force` model-swap workflow at the substrate
-        // level: drop_vector_index removes the IVF_PQ; clear_embeddings
-        // nulls `vector` + `embedding_model` on the stale rows; the next
-        // write (or open) re-bootstraps the IVF_PQ from scratch under the
-        // current model. (`init_model_id` is process-global and seeded
-        // once, so the test drives the mechanics directly rather than
-        // swapping model ids.)
-        let temp = TempDir::new()?;
-        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
-        store.write_embeddings(&embedded(&keys)).await?;
-        store.flush_indices(WriteShape::ColumnUpdate).await?;
-        assert!(
-            store
-                .handle
-                .messages_index_names()
-                .await?
-                .iter()
-                .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "IVF_PQ must exist after the first embed pass + flush (sanity)",
-        );
-
-        // Drop the IVF_PQ (production-equivalent: `Store::drop_vector_index`),
-        // clear half the rows, then reopen. Open-time fold-and-create sees
-        // an implied-missing IVF_PQ and re-bootstraps it on the now-current
-        // vector population.
-        store.drop_vector_index().await?;
-        store.clear_embeddings(&keys[..150]).await?;
-        // Re-embed the cleared half so the count stays >= threshold.
-        store.write_embeddings(&embedded(&keys[..150])).await?;
-        drop(store);
-        let reopened = Store::open_local_with_vector_threshold(temp.path(), 256).await?;
-        assert!(
-            reopened
-                .handle
-                .messages_index_names()
-                .await?
-                .iter()
-                .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "open-time fold-and-create must rebuild the IVF_PQ after drop",
-        );
-        assert_eq!(
-            reopened.unindexed_vector_backlog().await?,
-            0,
-            "the rebuilt IVF_PQ must fully cover the current vector set",
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn embedding_progress_counts_embedded_and_eligible_rows() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, keys) = store_with_messages(&temp, 10).await?;
@@ -3795,142 +3783,6 @@ mod tests {
         let full = store.embedding_progress().await?;
         assert_eq!(full.embedded, 10);
         assert_eq!(full.total, 10);
-        Ok(())
-    }
-
-    // spec.md#fold-on-write invariants under random write sequences. After
-    // every public write through `Store`, every maintained index on the
-    // touched table must fully cover its data - `unindexed_row_count` is
-    // zero. Open-time reconciliation must hold the same invariant. The
-    // sequence is small (proptest is slow against a TempDir-backed Store)
-    // but the case count is enough to exercise interleavings of
-    // upsert + write_embeddings + open/close.
-    proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig {
-            cases: 8,
-            .. proptest::prelude::ProptestConfig::default()
-        })]
-        #[test]
-        fn fold_on_write_invariants_hold_after_random_writes(
-            ops in proptest::collection::vec(write_op_strategy(), 1..6),
-        ) {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            runtime.block_on(async move {
-                let temp = TempDir::new()?;
-                // Threshold = 256 keeps IVF_PQ inactive at proptest scale
-                // (we never write 256 vectors in 6 ops). Lower would force
-                // the activation path which carries its own dedicated test.
-                let store = Store::open_local_with_vector_threshold(temp.path(), 256).await?;
-                let mut messages_written = 0usize;
-                for op in &ops {
-                    apply_proptest_op(&store, *op, &mut messages_written).await?;
-                    assert_fold_invariants(&store).await?;
-                }
-                // Reopen: open-time fold-and-create must hold the invariant.
-                drop(store);
-                let reopened = Store::open_local_with_vector_threshold(temp.path(), 256).await?;
-                assert_fold_invariants(&reopened).await?;
-                Ok::<_, anyhow::Error>(())
-            }).expect("proptest case");
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum WriteOp {
-        IngestSession { messages: u8 },
-        ClearAllEmbeddings,
-    }
-
-    fn write_op_strategy() -> impl proptest::strategy::Strategy<Value = WriteOp> {
-        use proptest::prelude::*;
-        prop_oneof![
-            (1u8..6).prop_map(|messages| WriteOp::IngestSession { messages }),
-            Just(WriteOp::ClearAllEmbeddings),
-        ]
-    }
-
-    async fn apply_proptest_op(
-        store: &Store,
-        op: WriteOp,
-        messages_written: &mut usize,
-    ) -> Result<()> {
-        use crate::wire::Provenance;
-        match op {
-            WriteOp::IngestSession { messages } => {
-                let session_id = format!("proptest-session-{}", *messages_written);
-                let mut events = vec![IngestEvent::Session(Session {
-                    id: session_id.clone(),
-                    parent_session_id: None,
-                    parent_message_id: None,
-                    source_agent: "claude-code".to_owned(),
-                    created_at: Utc::now(),
-                    project: Extracted::from_test_value("/tmp/proptest".to_owned()),
-                    options: ProviderOptions::new(),
-                })];
-                for index in 0..messages {
-                    let message_id = format!("msg-{}-{index}", *messages_written);
-                    events.push(IngestEvent::Message(Message::User {
-                        id: message_id.clone(),
-                        session_id: session_id.clone(),
-                        timestamp: Utc::now(),
-                        options: ProviderOptions::new(),
-                    }));
-                    events.push(IngestEvent::Part(Part {
-                        session_id: session_id.clone(),
-                        id: format!("{message_id}-part"),
-                        message_id,
-                        ordinal: 0,
-                        provenance: Provenance::Conversational,
-                        options: ProviderOptions::new(),
-                        kind: PartKind::Text {
-                            text: Some(Extracted::from_test_value(format!(
-                                "proptest message {index}"
-                            ))),
-                        },
-                    }));
-                    *messages_written += 1;
-                }
-                ingest_events(store, events).await?;
-            }
-            WriteOp::ClearAllEmbeddings => {
-                // Embed every pending row, then clear them all. Exercises
-                // the merge_update + fold path twice.
-                let keys: Vec<MessageKey> = {
-                    use tokio_stream::StreamExt;
-                    let mut stream = Box::pin(store.pending_embedding_messages());
-                    let mut out = Vec::new();
-                    while let Some(pending) = stream.next().await {
-                        let pending = pending?;
-                        out.push(MessageKey {
-                            session_id: pending.session_id,
-                            message_id: pending.id,
-                        });
-                    }
-                    out
-                };
-                if !keys.is_empty() {
-                    store.write_embeddings(&embedded(&keys)).await?;
-                    store.clear_embeddings(&keys).await?;
-                    store.flush_indices(WriteShape::ColumnUpdate).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn assert_fold_invariants(store: &Store) -> Result<()> {
-        // Every maintained scalar / FTS index on `messages` fully covers
-        // the data (vector index is the only one allowed to trail under
-        // the activation threshold, and our proptest threshold keeps it
-        // unbuilt).
-        assert_eq!(
-            store.unindexed_message_backlog().await?,
-            0,
-            "FTS index must fully cover messages after fold-on-write",
-        );
         Ok(())
     }
 }

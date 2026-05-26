@@ -369,7 +369,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `source_agent`, `project` | denormalized; filter-pushdown surface |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
-| `vector` | BFloat16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
+| `vector` | Float16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
 | `embedding_model` | the model that produced `vector`; nullable - set with `vector` |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
@@ -604,6 +604,8 @@ These are scoped out of v1. None requires a schema migration or a cross-cutting 
    7. Wire-surfaced time-travel queries - expose Lance's version pinning on the wire.
    8. OTel-compatible projection of the canonical model.
    9. `pond tag` verb - create / list / delete Lance tags as the named-snapshot recovery floor.
+   10. BFloat16 embedding storage - swap Float16 for BFloat16 once Lance's IVF_PQ build path accepts the `lance.bfloat16` extension (today it rejects `FixedSizeBinary(2)` at `infer_vector_element_type`). Same 2 bytes per element; wider dynamic range, lower precision than Float16.
+   11. Blob v2 part storage - swap legacy `LargeBinary + lance-encoding:blob=true` for the `lance.blob.v2` Struct extension (and bump `data_storage_version` V2.1 -> V2.2) once Lance's compact path dispatches the BlobLayout fast-path for blob.v2 fields. At v7.0.0-beta.16, `compact_files` reads blob.v2 through the generic struct branch (`rust/lance-encoding/src/decoder.rs:758-791`) and errors with "there were more fields in the schema than provided column indices / infos"; legacy blob writes `BlobLayout` pages which compact handles correctly. Same one-payload-per-row model; blob v2 adds the sidecar-file optimization for large external blobs and a separate `uri` Arrow sub-field (today the URL string is stored as UTF-8 bytes in the `data` column with the variant tag in `variant_data.data_kind`).
 7. **Open questions.** Undecided: what event first activates the multi-tenant router; what use case first activates live-write; which catalog backend the hosted tier uses.
 
 ---
