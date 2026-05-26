@@ -12,7 +12,7 @@ pond stores agentic-client sessions: it ingests them from many client formats in
 6. [Adapters](#adapters) - the bidirectional codec between client formats and canonical.
 7. [Protocol](#protocol) - the wire interface, operations, and CLI verbs.
 8. [Search and embeddings](#search) - hybrid retrieval and the embedding seam.
-9. [Deferred](#deferred) - work scoped out of v1, with activation triggers.
+9. [Deferred](#deferred) - work scoped out of v1.
 10. [References](#references) - external work that informed this design.
 
 ---
@@ -23,7 +23,7 @@ This section states what pond is and the single idea the rest of the document el
 
 ### 1.1 What pond is
 
-pond ingests sessions from agentic clients - Claude Code, Codex, and others on the roadmap - into one canonical form, stores them in Lance, and serves hybrid search (vector and keyword, fused) over them at message granularity. It ships as a single static binary that exposes two transports - an HTTP+JSON API and an MCP server - over one shared set of handlers, and runs in two deployments: a personal pond on a laptop, or a multi-tenant pond against object storage.
+pond ingests sessions from agentic clients - Claude Code, Codex, and others on the roadmap - into one canonical form, stores them in Lance, and serves hybrid search (vector and keyword, fused) over them at message granularity. It ships as a single static binary that exposes two transports - an HTTP+JSON API and an MCP server - over one shared set of handlers, and runs in two deployments (Section 2.2).
 
 ### 1.2 The interchange-hub model
 
@@ -31,7 +31,7 @@ The canonical Session / Message / Part schema is not merely how pond stores data
 
 ### 1.3 "Lossless" means value-complete
 
-Throughout this document, *lossless* means every value round-trips as an equal value - it does not mean the bytes are identical. Restoring a session is a rederivation from canonical, not a byte replay, so incidental encoding (whitespace, JSON key order, equivalent number forms) is not data and is not preserved. Restoring a session with the adapter that produced it is lossless in this value-complete sense; restoring it with any other adapter is best-effort, target-optimized transcoding.
+Throughout this document, *lossless* means every value round-trips as an equal value - it does not mean the bytes are identical. Restoring a session is a rederivation from canonical, not a byte replay, so incidental encoding (whitespace, JSON key order, equivalent number forms) is not data and is not preserved. Restoring a session with the adapter that produced it is lossless in this value-complete sense.
 
 ### 1.4 Preservation over convenience
 
@@ -114,7 +114,7 @@ The storage substrate is the layer that owns how pond uses Lance - opening datas
 
 ### 3.1 Purpose
 
-A consumer - the session datasets in v1, others later (Section 9) - does not use Lance directly. It declares its tables to the substrate and then stores and queries rows through it. The substrate guarantees durable append-only storage, safe concurrent writers, retry around transient faults, and bounded read staleness. It does not interpret rows: column meaning, indexes, and denormalization belong to the consumer (Section 5 for sessions). Specifying the substrate with no reference to sessions is what keeps it reusable.
+A consumer - the session datasets in v1, others later (Section 9) - does not use Lance directly. It declares its tables to the substrate and then stores and queries rows through it. The substrate guarantees durable append-only storage, safe concurrent writers, retry around transient faults, and bounded read staleness. It does not interpret rows: column meaning, indexes, and denormalization belong to the consumer (Section 5 for sessions).
 
 ### 3.2 The three seams
 
@@ -124,9 +124,9 @@ Every interaction with Lance funnels through one of three paths, each a single c
 
 **`read-seam`** {#read-seam} - Every scan and search query MUST be built through the substrate's read path. Why: it is the one place `prefilter-pushdown` (Section 8) is enforced, and the one place a future scanner change lands.
 
-**`write-seam`** {#write-seam} - Every write MUST go through the substrate's merge-insert path. Why: `append-only` and `additive-sync` (Section 6) hold only with a single write chokepoint; a direct write bypasses both.
+**`write-seam`** {#write-seam} - Every write MUST go through the substrate's merge-insert path. Writes through this seam never fold indexes - index lifecycle lives separately under `index-write-decoupled` (Section 3.7). Why: `append-only` and `additive-sync` (Section 6) hold only with a single write chokepoint; a direct write bypasses both.
 
-**`storage-via-lance`** {#storage-via-lance} - Every access to a dataset's stored bytes - open, scan, write, and auxiliary operations such as size accounting - MUST go through Lance's object-store layer. No code reads, lists, or walks dataset files through the operating-system filesystem, and no consumer resolves a dataset to a local path. Why: a filesystem-backed pond and an object-store-backed pond behave identically for every consumer only if there is zero direct-filesystem access to dataset bytes; one direct read against a dataset silently backend-locks that operation and turns object-store support from a configuration change into a code change. This is the invariant the three seams exist to uphold - stated explicitly so an operation that fits none of them, such as status or diagnostics, cannot reach around Lance to the filesystem.
+**`storage-via-lance`** {#storage-via-lance} - Every read, list, or write of dataset bytes MUST go through Lance's object-store layer; no code resolves a dataset to a local path. Why: a `file://` pond and an `s3://` pond behave identically only when no code reaches around Lance; a single direct-FS access silently backend-locks that operation.
 
 ### 3.3 Data integrity
 
@@ -138,7 +138,7 @@ Every interaction with Lance funnels through one of three paths, each a single c
 
 ### 3.4 Dataset parameters
 
-Every table is created with the current stable Lance file format, constant-time latest-manifest lookup, and a manifest-retention window long enough to serve as a recovery floor (Section 5). Two creation settings are rules, because a future table must not skip them:
+Every table is created with the current stable Lance file format, constant-time latest-manifest lookup, and a short manifest-retention window. v1 recovery beyond the window is via `pond export` snapshots; deferred named-snapshot preservation via Lance tags is in Section 9. Two creation settings are rules, because a future table must not skip them:
 
 **`stable-row-ids`** {#stable-row-ids} - Every table MUST enable stable row ids. Why: with them, secondary indexes survive compaction without being rewritten to follow moved rows; without them, every compaction pass rewrites every index.
 
@@ -160,22 +160,24 @@ pond processes are stateless workers. Several may write the same namespace at on
 
 When retry is exhausted on a write, the substrate raises a typed conflict signal carrying the attempt count. The wire layer (Section 7) maps it to the retryable `conflict` error code. The dependency is one-way: the wire layer knows the substrate's conflict signal; the substrate knows nothing of the wire error model.
 
-### 3.7 Atomic data + index commit
+### 3.7 Index lifecycle
 
-**`fold-on-write`** {#fold-on-write} - A write through the `write-seam` MUST present its data write and the index folds it implies as one atomic operation at the seam: the call returns success only when every index covering the written fragments has been folded forward, or it returns a typed error and the caller treats no commit as having succeeded. A failed fold surfaces as a write failure, never as a warning the next batch will retry. Open through the `catalog-seam` reconciles any pre-existing index trail before returning a handle. Why: indices that derive from rows must never be observed inconsistent with those rows for the lifetime of a reader's handle - a "write now, fold later" design admits an invisible inconsistency window that the system then needs a recovery verb to repair.
+**`index-write-decoupled`** {#index-write-decoupled} - Writes commit data without folding indexes. Index maintenance is operator-triggered via `pond index optimize` (Section 7.8). A trailing index is not a correctness problem: Lance reads merge index results with a flat scan over unindexed fragments, so a query before optimize returns complete results, just slower. Why: matching Lance's own design (`table.optimize()` is the canonical periodic-maintenance op) avoids per-write index rebuilds that would otherwise dominate write cost, and the earlier eager-fold contract was strictly stronger than the underlying format requires.
 
-The substrate's storage engine commits data and index updates as two sequential transactions (the lance file format does not expose single-commit composition for this path); the seam closes that gap at the pond layer with two cooperating rules:
+**`index-per-family`** {#index-per-family} - The fold strategy for each `IndexIntent` is determined by its index family, not by the write that preceded it:
 
-- The write call propagates index-fold failure as write failure. No soft warn, no deferred retry verb. When the data commit succeeded and the fold did not, rows are durably on disk; the seam returns a typed error and the caller retries the same write. Retry is safe because data writes through the seam are idempotent on primary key (`additive-sync`, Section 6) and column updates are idempotent on value.
-- Every dataset open through the `catalog-seam` reconciles any pre-existing index trail before returning a handle, by folding every maintained index whose unindexed-fragment set is non-empty. A reader's handle never observes data without folded indices because the reconciliation is part of opening.
+| Family | Fold on `pond index optimize` | Why |
+|---|---|---|
+| BTree (scalar) | `create_index(replace=true)` | Lance v7.0.0-beta.16's `optimize_indices` BTree path tripped `RowAddrTreeMap::from_sorted_iter` on column-update commits; rebuild from scratch avoids the bug. Switch to `optimize_indices(append)` once upstream is fixed. |
+| Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
+| Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
+| IVF_PQ (vector) | `optimize_indices(append)` | Stable-row-id IVF_PQ supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and PQ codebook carry forward. |
 
-A concurrent reader whose handle was opened before a write may, within the `handle-freshness` window, see the data commit before the fold commit; that window is exactly the existing `handle-freshness` contract and is not widened by `fold-on-write`. The contract bans persistent inconsistency, not the window itself.
-
-The fold is incremental - never a from-scratch rebuild. New rows append a delta segment to each index using the existing trained state; the substrate collapses accumulated delta segments back into a bounded count on the write path so search latency does not drift. Index state is a pure function of data state - there is no operator-facing recovery verb, because reconciliation at open is the recovery path. If reconciliation cannot bring an index forward at open, the open fails with a typed error naming the corrupted index file; that is a real storage failure, restored from `pond export` (Section 5.4), not a normal operating mode. Fragment compaction and manifest-version garbage collection are deferred (Section 9): with append-only writes and incremental folds nothing rewrites stored data, so there is almost nothing to reclaim until compaction exists.
+`pond index optimize` skips indexes whose columns no write has touched; this is sound because Lance prunes index coverage only for indexes whose fields overlap a write's modified fields.
 
 ### 3.8 Forward-compatibility seams
 
-Three rules cost almost nothing in v1 and keep horizontal-scale work (Section 9) a substrate swap rather than a rewrite. v1 builds none of that machinery; these rules only ensure the v1 data shape does not foreclose it - and that reasoning is itself the contract, kept here so the rules are not later mistaken for needless ceremony and removed.
+Three rules cost almost nothing in v1 and keep horizontal-scale work (Section 9) a substrate swap rather than a rewrite.
 
 **`shardable-pk-pos1`** {#shardable-pk-pos1} - On a high-volume table, the first primary-key column MUST be an attribute coarse enough to shard on. Why: a sharded writer attaches a shard spec to an existing column; if no first-position column is shardable, enabling sharding later means a primary-key redesign and a migration of every existing row. Choosing a shardable attribute now costs nothing and removes that future migration entirely.
 
@@ -195,7 +197,7 @@ The model has three nested types - a Session contains Messages, a Message contai
 
 ### 4.2 Canonical is the source of truth
 
-The stored canonical form is authoritative - not derived from some other representation, not a cache of one. There is no second, "raw" copy of a session. Why this is a rule and not just a fact: a derived canonical would invite a parallel raw store and a re-derivation step, and the moment those exist the canonical form is no longer the contract. Completeness of the canonical form is instead guaranteed by `lossless-projection` below.
+The stored canonical form is authoritative - not derived from some other representation, not a cache of one. There is no second, "raw" copy of a session. A derived canonical would invite a parallel raw store and a re-derivation step, and the moment those exist the canonical form is no longer the contract. Completeness of the canonical form is instead guaranteed by `lossless-projection` below.
 
 ### 4.3 Conventions
 
@@ -322,7 +324,7 @@ union Part {
 }
 ```
 
-Seven variants. `id`, `session_id`, `message_id`, and `provenance` on `BasePart` are pond-additive: the model stores Parts as addressable rows with back-references, not as array members. `provenance` records whether a Part is conversation or harness-injected scaffolding (`part-provenance`, Section 4.8); it is orthogonal to the Part's `type` and to the containing message's `role`. FilePart payloads use the storage layer's blob mechanism (Section 5).
+`id`, `session_id`, `message_id`, and `provenance` on `BasePart` are pond-additive: the model stores Parts as addressable rows with back-references, not as array members. `provenance` records whether a Part is conversation or harness-injected scaffolding (`part-provenance`, Section 4.8); it is orthogonal to the Part's `type` and to the containing message's `role`. FilePart payloads use the storage layer's blob mechanism (Section 5).
 
 ### 4.8 Honesty of the model
 
@@ -344,7 +346,7 @@ This section is how the canonical model of Section 4 persists on the substrate o
 
 ### 5.1 Three datasets
 
-The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type - no projections, no promotions - except that `messages` additionally carries a message's derived embedding (5.5). Typed scalars are typed columns; the open-ended `options` bag and Part variant payloads are stored as JSON text; FilePart binary uses Lance blob storage.
+The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type - no projections, no promotions - except that `messages` additionally carries a message's derived embedding (5.5).
 
 `sessions` - one row per Session:
 
@@ -355,7 +357,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `source_agent` | scalar-indexed, low cardinality |
 | `created_at` | source-recorded |
 | `project` | scalar-indexed; equality and prefix |
-| `options` | JSON text |
+| `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
 `messages` - one row per Message:
 
@@ -367,9 +369,9 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `source_agent`, `project` | denormalized; filter-pushdown surface |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
-| `vector` | the embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
+| `vector` | BFloat16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
 | `embedding_model` | the model that produced `vector`; nullable - set with `vector` |
-| `options` | JSON text |
+| `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
 `parts` - one row per Part:
 
@@ -378,9 +380,9 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `session_id`, `message_id`, `id` | composite primary key; clustered on `(session_id, message_id)` |
 | `ordinal` | position within the message's content |
 | `type` | the Part discriminator; scalar-indexed |
-| `variant_data` | JSON text; the variant-specific fields |
+| `variant_data` | JSON (Lance `pa.json_()`, stored as JSONB); the variant-specific fields |
 | `data` | Lance blob; FilePart payload only |
-| `options` | JSON text |
+| `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
 ### 5.2 Composite keys
 
@@ -392,15 +394,15 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 
 ### 5.4 Durability
 
-**`durable-copy`** {#durable-copy} - Once a session is stored, it MUST survive the loss of its source - source rotation, deletion, or expiry. pond is the canonical record after ingest; re-ingest is not a recovery path, because a source that has since rotated or been deleted can no longer supply the rows. Why: being the durable record is the value of pond; a design that silently depended on the source still being reachable would not be one. Recovery runs through Lance's manifest history (retained for the substrate's retention window) and through `pond export` snapshots taken ahead of risky operations.
+**`durable-copy`** {#durable-copy} - Once a session is stored, it MUST survive the loss of its source - source rotation, deletion, or expiry. pond is the canonical record after ingest; re-ingest is not a recovery path, because a source that has since rotated or been deleted can no longer supply the rows. Why: being the durable record is the value of pond; a design that silently depended on the source still being reachable would not be one. Recovery runs through `pond export` snapshots taken ahead of risky operations; the manifest-retention window (Section 3.4) is short and not a recovery floor on its own.
 
 ### 5.5 Embeddings are derived
 
 A message's embedding has no canonical-type counterpart - it is produced by pond, not supplied by a source. It is two nullable columns on `messages`: `vector`, the embedding, and `embedding_model`, the model that produced it. Both stay null until `pond embed` fills them (Section 8); a message ingested with embedding disabled simply keeps them null.
 
-**`embed-from-canonical`** {#embed-from-canonical} - A message's embedding MUST be derived from its stored `search_text`, never from the source record. Why: `search_text` is durable (`durable-copy`) and the source is not - deriving from canonical is what lets pond re-embed under a new or changed model at any later time with no source present, making a model change a re-derivation, not a migration. `embedding_model` records which model `vector` holds, so a re-embed touches only the messages a model change left stale.
+**`embed-from-canonical`** {#embed-from-canonical} - A message's embedding MUST be derived from its stored `search_text`, never from the source record. Why: `search_text` is durable (`durable-copy`) and the source is not - deriving from canonical is what lets pond re-embed under a new or changed model at any later time with no source present, making a model change a re-derivation, not a migration.
 
-Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`append-only`). A same-dimension model change replaces the `vector` column's values; a different dimension cannot reuse a fixed-width column, so the re-embed instead adds a second vector column, backfills it from `search_text`, drops the old `vector`, and renames the new column to `vector` - all on `messages`, never a new table. The prior vectors stay queryable until the replacement is complete, and Lance's manifest history retains them afterward, so a regressed model swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
+Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`append-only`). A model swap is a single conditional `merge_update` keyed on `target.embedding_model != source.embedding_model`: stale rows update, up-to-date rows are left alone, and the IVF_PQ is dropped before new vectors arrive (centroids belong to one distance space; the next `pond index optimize` rebuilds it). A same-dimension swap rewrites `vector` in place; a different-dimension swap adds a new column, backfills from `search_text`, drops the old, and renames - all on `messages`, never a new table. Lance's manifest history retains prior vectors, so a regressed swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
 
 ---
 
@@ -519,7 +521,7 @@ Retryability is conveyed by the code; there is no separate field. `conflict` is 
 ### 7.5 Operations
 
 1. **`pond_search`** (`POST /v1/search`) - hybrid search; Section 8 specifies retrieval. Returns ranked message hits, each reporting which retrievers matched it.
-2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context. Toggles control whether reasoning and tool-result Parts are included; by default they are stripped.
+2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context.
 3. **`pond_ingest`** (`POST /v1/ingest`) - accept a batch of canonical events. Always batched, bounded by an event count and a body-size cap. Events are grouped by session and applied per session; partial success across sessions is normal and reported per row.
 4. **`pond_session_events`** (`GET /v1/sessions/{id}/events`, SSE) - stream a session's messages and parts in order. v1 is catch-up only: it scans, emits, and closes. Live-tail activates with live-write (Section 9) on the same endpoint.
 
@@ -537,13 +539,17 @@ The MCP transport exposes only the read operations - `pond_search` and `pond_get
 
 The same handlers back a set of command-line verbs:
 
-- `pond sync` - parse, store, and index from the configured sources.
-- `pond embed` - embed the backlog of un-embedded messages (Section 8).
-- `pond search`, `pond get` - the read operations from the command line.
+- `pond sync` - parse and store data from the configured sources. Pure data write; never folds indexes.
+- `pond embed` - embed the backlog of un-embedded messages (Section 8). Pure data write; never folds indexes. `--force` re-embeds rows whose `embedding_model` differs from the current model via conditional merge.
+- `pond search [--explain]` - hybrid search from the command line. `--explain` returns Lance's `analyze_plan` output instead of results.
+- `pond get` - fetch a session, or one message with context, from the command line.
+- `pond index status` - per-intent index health: covered fragments, unindexed row counts, and whether `pond index optimize` would do work.
+- `pond index optimize [--wait]` - run Lance's `optimize()` per table: compaction, index update, and version cleanup in one atomic transaction. The three are co-located because Lance's `optimize()` commits them atomically; splitting them would lose that atomicity. Fragment Reuse Index (FRI) defers per-fragment row-address remap into index load-time by default, so compaction does not conflict with concurrent index builds. The canonical periodic-maintenance verb. `--wait` blocks until every managed index reports `num_unindexed_rows == 0`.
+- `pond index rebuild [<intent>]` - force-rebuild named index intents from scratch via `create_index(replace=true)`. Escape hatch for tokenizer-config changes or recovery from a corrupted index file.
 - `pond export` - export stored sessions as canonical ingest events, a portable snapshot byte-compatible with `pond_ingest` input, for one named session or the whole pond. Restore is a distinct mode: it serializes one named session, with its lineage (`lineage-complete-restore`, 6.2), into a target client format through that adapter's serializer. Restore is always rooted at a single named session - there is no bulk restore-to-client-format - because a restore targets a session the caller has identified, while whole-pond transfer is already served by the canonical snapshot.
 - `pond serve` - run the HTTP server, including the MCP route.
 - `pond mcp` - run the MCP server over stdio.
-- `pond status` - row counts and dataset statistics.
+- `pond status` - row counts, dataset statistics, embedding coverage, and a summary of `pond index status`.
 - `pond config` - emit an annotated configuration template.
 
 ### 7.9 Versioning
@@ -562,34 +568,43 @@ Search returns messages. It is hybrid - a vector retriever and a keyword retriev
 
 - **Indexed text.** What is searchable is one text field per message, built at ingest by one pond-core function applied uniformly to every message - per-source customization is rejected so the search corpus has one predictable shape. The field concatenates, in order, the text of TextParts and the metadata of FileParts that carry `provenance: conversational` (Section 4.7). It is null for system and tool messages, and for any message left with no conversational text - a bare tool call, or a message whose only content is harness-injected. Reasoning text, tool-call bodies, tool results, approval parts, and harness-injected parts are deliberately not indexed - they are retrievable through `pond_get` but they are plumbing, not the conversation. Excluding injected parts is not per-source customization: the conversational-or-injected decision is made once at the adapter seam (`part-provenance`, Section 6) and recorded as `Part.provenance`, so this function reads a canonical field and stays uniform. A message with null indexed text is absent from search but still returned in full by `pond_get`.
 
-  **`language-neutral-index`** {#language-neutral-index} - The full-text index MUST tokenize every language alike; it MUST NOT apply a transform keyed to a single language - stemming or stop-word removal under one language setting. Why: pond ingests agent sessions in any language, and a monolingual transform silently corrupts or under-indexes every other language - the failure is invisible until someone queries in the affected language. Only language-neutral tokenization keeps full-text search correct across a multilingual corpus. pond therefore indexes with a character-`ngram` tokenizer, 3-5 gram range - n-grams are language-neutral and inflection-bridging, 4-5-grams give term discrimination, and `min=3` keeps 3-character tokens (`FTS`, `OCC`) searchable; a whole-word tokenizer is rejected because bridging inflection would require the per-language stemmer this rule forbids. Reasoning and the controlled experiment: `docs/researches/tokenizer-experiment-report.md`.
+  **`language-neutral-index`** {#language-neutral-index} - The full-text index MUST tokenize every language alike; it MUST NOT apply a transform keyed to a single language. Why: pond ingests sessions in any language; a monolingual transform silently under-indexes every other. Pond indexes with a character-`ngram` tokenizer (3-5 range; rationale and experiment: `docs/researches/tokenizer-experiment-report.md`).
 
 - **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. A recency boost is applied additively by default. Results may be grouped to one summary per session. Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
 - **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
 - **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The engine ships a fixed set of models it has loaders for; configuration selects one and supplies its vector parameters. No model is mandatory and none is named in this document - the choice and its default are configuration.
 - **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it, and only by the explicit `pond embed` verb - v1 has no automatic trigger. `pond embed` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.
 - **Opt-in.** Embedding is opt-in by configuration. With it off, `pond serve`, `pond mcp`, and `pond search` run full-text only and never load a model. With it on and at least one message embedded under the configured model, search is hybrid.
-- **Index lifecycle.** The indexed-text and vector columns exist from table creation; turning embeddings on or off never needs a schema migration. An index is created on the first write batch that yields enough data and is then kept in sync by `fold-on-write` (Section 3.7). The full-text index has no training step. The vector index needs training data, so it cannot be built on an empty table and trains poorly at small scale - below an activation threshold vector search runs a brute-force flat scan, which is fast at small and medium scale. Above the threshold the trained index stays continuously in sync with the data: every write folds the touched fragments forward as part of the same call, and every dataset open reconciles any pre-existing trail before serving reads. There is no stale-index state retrieval works around - the seam owns the contract.
+- **Index lifecycle.** Vector and full-text columns exist from table creation; turning embeddings on or off never needs a schema migration. Index maintenance follows `index-write-decoupled` (Section 3.7). Vector search uses brute-force flat scan below the activation threshold (currently 100,000 non-null vectors); above it the trained IVF_PQ takes over. Partitions = `num_rows // 4096`; `[search].nprobes` and `[search].refine_factor` are operator-tunable for recall.
 
 ---
 
 ## 9. Deferred {#deferred}
 
-These are scoped out of v1. None requires a schema migration or a cross-cutting change when it activates - the v1 design forecloses none of them. Each entry names the work and the trigger that would start it.
+These are scoped out of v1. None requires a schema migration or a cross-cutting change when it activates - the v1 design forecloses none of them.
 
 1. **Future consumers.** The storage substrate (Section 3) is generic; the session datasets are its first consumer, and these are the next. Each is a separate consumer with its own canonical model and its own tables on the same substrate - not an extension of sessions.
-   - **Resources and blobs** - per-namespace knowledge-base files. Trigger: a concrete need for file storage alongside sessions.
-   - **Social and web content archives** - exports from Telegram, Discord, Twitter, Reddit, GitHub. These are flat-message content, not LLM conversations, so they get their own canonical model rather than being coerced into Session/Message/Part. Trigger: a decision to bring an export corpus into pond.
-   - **A file and blob store shaped like the Files API** - upload, reference, download. Trigger: integrator demand.
-   - **A versioned-document store shaped like agent memory stores** - small text documents with an immutable version history. The substrate's manifest versioning aligns naturally with this. Trigger: integrator demand.
+   - **Resources and blobs** - per-namespace knowledge-base files.
+   - **Social and web content archives** - exports from Telegram, Discord, Twitter, Reddit, GitHub. These are flat-message content, not LLM conversations, so they get their own canonical model rather than being coerced into Session/Message/Part.
+   - **A file and blob store shaped like the Files API** - upload, reference, download.
+   - **A versioned-document store shaped like agent memory stores** - small text documents with an immutable version history. The substrate's manifest versioning aligns naturally with this.
 2. **Future source adapters.** A new adapter adds no substrate or schema change - it is a new file and a registry line (Section 6).
    - **A Managed Agents adapter**, including multi-agent sessions: a coordinator and its delegated agent threads map onto linked Sessions through `parent_session_id` and `parent_message_id`. The spawn case already works for v1 sources (Claude Code subagents ingest as linked child Sessions); the Managed Agents adapter is the next step.
    - **Other clients** - OpenCode, Cursor, aider, Gemini CLI, and more.
-3. **Provider-target restore.** Restoring a canonical session into a provider API request shape (Anthropic, OpenAI, Bedrock, Gemini), as opposed to a harness session-log format. Always foreign, and additionally constrained to produce API-valid output. Trigger: integrator demand.
-4. **Live-write.** Ingesting events as a session runs, rather than after it ends. The substrate work this needs - a per-shard write-ahead layer, a scanner that merges in-memory and on-disk generations, a sharded writer - is real implementation work; the forward-compatibility seams of Section 3 are what keep their activation a substrate swap rather than a rewrite. Trigger: a use case needing in-flight search of a running session, or hosted write fan-out beyond optimistic-concurrency tolerance.
-5. **Hosted multi-tenant.** Mapping each tenant to a child Lance namespace, and swapping the directory catalog for a hosted one. The catalog seam and the single namespace-resolution point (Sections 3 and 7) are the seams this rides. Trigger: the first hosted tenant.
-6. **Other.** Remote embedding providers; cross-session attachment deduplication; fragment compaction and manifest-version garbage collection (trigger: observed disk growth, surfaced by `pond status`); a graph-traversal layer over fork lineage; wire-surfaced time-travel queries; an OTel-compatible projection of the canonical model; indexing the contents of file attachments.
-7. **Open questions.** Undecided, each pending a trigger: what event first activates the multi-tenant router; what use case first activates live-write; which catalog backend the hosted tier uses.
+3. **Provider-target restore.** Restoring a canonical session into a provider API request shape (Anthropic, OpenAI, Bedrock, Gemini), as opposed to a harness session-log format. Always foreign, and additionally constrained to produce API-valid output.
+4. **Live-write.** Ingesting events as a session runs, rather than after it ends. The substrate work this needs - a per-shard write-ahead layer, a scanner that merges in-memory and on-disk generations, a sharded writer - is real implementation work; the forward-compatibility seams of Section 3 are what keep their activation a substrate swap rather than a rewrite.
+5. **Hosted multi-tenant.** Mapping each tenant to a child Lance namespace, and swapping the directory catalog for a hosted one. The catalog seam and the single namespace-resolution point (Sections 3 and 7) are the seams this rides.
+6. **Other.**
+   1. Remote embedding providers - pluggable embedding backends behind the existing seam.
+   2. Cross-session attachment deduplication - dedup identical FilePart payloads.
+   3. Indexing file-attachment contents.
+   4. Typed image arrays for image-typed FileParts - `EncodedImage` / `FixedShapeImageTensor` for `image/*` media types.
+   5. JSON-path scalar indices on `options` - index hot paths via pond's index policy and add JSON-path filter predicates.
+   6. Graph-traversal layer over fork lineage - queryable traversal over `parent_session_id` / `parent_message_id`.
+   7. Wire-surfaced time-travel queries - expose Lance's version pinning on the wire.
+   8. OTel-compatible projection of the canonical model.
+   9. `pond tag` verb - create / list / delete Lance tags as the named-snapshot recovery floor.
+7. **Open questions.** Undecided: what event first activates the multi-tenant router; what use case first activates live-write; which catalog backend the hosted tier uses.
 
 ---
 
