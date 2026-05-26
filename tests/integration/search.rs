@@ -62,7 +62,7 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices().await?;
+    store.optimize_indices(None, None).await?.into_result()?;
     Ok((store, backend))
 }
 

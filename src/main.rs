@@ -19,8 +19,11 @@ use pond::{
     config::{self, Config, DEFAULT_CONFIG_TOML},
     embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
-    sessions::{AdapterStats, CorpusStats, EmbeddingProgress, RowTotals, Store},
-    substrate::{IndexStatus, TableSizes},
+    sessions::{
+        AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, OptimizeOutcome, RowTotals,
+        Store,
+    },
+    substrate::{IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes},
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
@@ -312,10 +315,114 @@ enum IndexCommand {
     Optimize {
         #[arg(long)]
         wait: bool,
+        /// Override the manifest-retention window for this run.
+        /// Accepts Ns/Nm/Nh/Nd (default: 1d). Implies aggressive deletion
+        /// (delete_unverified=true): reclaims files Lance's 7-day in-progress
+        /// guard would otherwise protect. Unsafe under concurrent writers;
+        /// see --vacuum for a one-shot full reclaim.
+        #[arg(long, value_parser = parse_retention_arg)]
+        cleanup_older_than: Option<chrono::Duration>,
+        /// Reclaim every orphan immediately. Sugar for
+        /// `--cleanup-older-than 0s`. Same safety caveat applies.
+        #[arg(long, conflicts_with = "cleanup_older_than")]
+        vacuum: bool,
+        /// Skip the confirmation prompt when aggressive cleanup is enabled.
+        /// Required for non-interactive use of --vacuum / --cleanup-older-than.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     Rebuild {
         intent: Option<String>,
     },
+}
+
+/// `clap` value-parser for `--cleanup-older-than`. Accepts `Ns`/`Nm`/`Nh`/`Nd`
+/// (or bare `N` interpreted as seconds). Mirrors LanceDB's docs without taking
+/// a humantime dependency.
+fn parse_retention_arg(input: &str) -> Result<chrono::Duration, String> {
+    let trimmed = input.trim();
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (num, unit) = trimmed.split_at(split_at);
+    let n: i64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {input:?} (expected like `1h`, `30m`, `0s`)"))?;
+    match unit {
+        "s" | "" => Ok(chrono::Duration::seconds(n)),
+        "m" => Ok(chrono::Duration::minutes(n)),
+        "h" => Ok(chrono::Duration::hours(n)),
+        "d" => Ok(chrono::Duration::days(n)),
+        _ => Err(format!(
+            "unknown duration unit {unit:?} in {input:?} (use s/m/h/d)"
+        )),
+    }
+}
+
+fn format_retention(d: chrono::Duration) -> String {
+    let s = d.num_seconds();
+    if s == 0 {
+        return "0s".into();
+    }
+    if s.rem_euclid(86_400) == 0 {
+        return format!("{}d", s / 86_400);
+    }
+    if s.rem_euclid(3_600) == 0 {
+        return format!("{}h", s / 3_600);
+    }
+    if s.rem_euclid(60) == 0 {
+        return format!("{}m", s / 60);
+    }
+    format!("{s}s")
+}
+
+/// Resolve `--cleanup-older-than` / `--vacuum` / `--yes` into a `CleanupConfig`
+/// override (or `None` to use pond's safe default). Any explicit retention flag
+/// implies `delete_unverified=true` to bypass Lance's 7-day in-progress guard;
+/// that bypass is unsafe under concurrent writers, so a confirmation prompt
+/// fires unless `--yes` is set (non-interactive callers must pass `--yes`).
+fn resolve_cleanup_config(
+    cleanup_older_than: Option<chrono::Duration>,
+    vacuum: bool,
+    yes: bool,
+) -> anyhow::Result<Option<CleanupConfig>> {
+    let aggressive = vacuum || cleanup_older_than.is_some();
+    if !aggressive {
+        return Ok(None);
+    }
+    let older_than = if vacuum {
+        chrono::Duration::zero()
+    } else {
+        cleanup_older_than.unwrap_or_else(chrono::Duration::zero)
+    };
+    let cfg = CleanupConfig {
+        older_than,
+        delete_unverified: true,
+    };
+    let warning = format!(
+        "warning: cleanup_older_than={} with delete_unverified=true.\n\
+         warning: this deletes orphan files newer than Lance's 7-day in-progress guard.\n\
+         warning: ensure no other pond writer (serve, sync, embed) is active on this data dir.",
+        format_retention(cfg.older_than),
+    );
+    eprintln!("{}", pond::output::paint(&warning, pond::output::yellow()));
+    if yes {
+        return Ok(Some(cfg));
+    }
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to run aggressive cleanup non-interactively; pass --yes to confirm"
+        );
+    }
+    let proceed = dialoguer::Confirm::new()
+        .with_prompt("Continue?")
+        .default(false)
+        .interact()
+        .context("failed to read confirmation")?;
+    if !proceed {
+        anyhow::bail!("aborted by operator");
+    }
+    Ok(Some(cfg))
 }
 
 /// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
@@ -531,6 +638,20 @@ async fn main() -> anyhow::Result<()> {
                     ""
                 },
             ))?;
+            // Fold the just-written vectors into the search indices so the
+            // operator doesn't have to remember `pond index optimize` after
+            // every embed pass. Skip on cancel: a Ctrl-C user doesn't want
+            // surprise follow-on work.
+            if !summary.cancelled && summary.messages > 0 {
+                output(&pond::output::paint(
+                    "embed: folding new rows into search indices...",
+                    pond::output::dim(),
+                ))?;
+                let (progress, fold_bar) = optimize_progress_bar();
+                let outcome = store.build_indices_only(Some(progress)).await?;
+                fold_bar.finish_and_clear();
+                render_optimize_outcome(&outcome)?;
+            }
         }
         Command::Serve {
             host,
@@ -647,13 +768,37 @@ async fn main() -> anyhow::Result<()> {
                     let statuses = store.index_status().await?;
                     render_index_status(&statuses)?;
                 }
-                IndexCommand::Optimize { wait } => {
-                    store.optimize_indices().await?;
+                IndexCommand::Optimize {
+                    wait,
+                    cleanup_older_than,
+                    vacuum,
+                    yes,
+                } => {
+                    let cleanup = resolve_cleanup_config(cleanup_older_than, vacuum, yes)?;
+                    if let Some(c) = cleanup {
+                        output(&format!(
+                            "{}  cleanup_older_than={}{}",
+                            pond::output::paint("optimize:", pond::output::dim()),
+                            format_retention(c.older_than),
+                            if c.delete_unverified {
+                                " (aggressive)"
+                            } else {
+                                ""
+                            },
+                        ))?;
+                    }
+                    let (progress, bar) = optimize_progress_bar();
+                    let outcome = store.optimize_indices(Some(progress), cleanup).await?;
+                    bar.finish_and_clear();
+                    render_optimize_outcome(&outcome)?;
                     if wait {
                         wait_for_index_catchup(&store).await?;
                     }
                     let statuses = store.index_status().await?;
                     render_index_status(&statuses)?;
+                    if outcome.any_indices_failed() {
+                        std::process::exit(1);
+                    }
                 }
                 IndexCommand::Rebuild { intent } => {
                     store.rebuild_indices(intent.as_deref()).await?;
@@ -1190,6 +1335,105 @@ async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
             anyhow::bail!("timed out waiting for indexes to catch up");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Build the spinner + progress callback pair for `pond index optimize` and
+/// `pond embed`'s index-fold tail. `PhaseStart` updates the spinner so the
+/// operator sees what's running; `PhaseDone` writes a completed line via
+/// `output()` (stdout) so per-phase timing is captured by pipes and scripts
+/// too. The bar's draw target is stderr; when stderr isn't a TTY the bar
+/// silently degrades and only the `output()` lines are visible.
+fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
+    use pond::output::{dim, paint};
+    let bar = ProgressBar::new_spinner();
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    bar.enable_steady_tick(Duration::from_millis(120));
+    let bar_for_callback = bar.clone();
+    let callback: OptimizeProgressFn = Box::new(move |event| match event {
+        OptimizeEvent::PhaseStart {
+            table,
+            phase,
+            detail,
+        } => {
+            let label = match detail {
+                Some(d) => format!("{} {} ({d})", table.as_str(), phase.label()),
+                None => format!("{} {}", table.as_str(), phase.label()),
+            };
+            bar_for_callback.set_message(label);
+        }
+        OptimizeEvent::PhaseDone {
+            table,
+            phase,
+            elapsed_ms,
+        } => {
+            let line = format!(
+                "  {:9}  {:<14}  {} ms",
+                table.as_str(),
+                phase.label(),
+                format_thousands(elapsed_ms),
+            );
+            let _ = output(&paint(&line, dim()));
+        }
+    });
+    (callback, bar)
+}
+
+fn render_optimize_outcome(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint, red, yellow};
+    let mut table = new_table();
+    table.set_header(vec!["table", "indices", "compaction"]);
+    for entry in &outcome.tables {
+        table.add_row(vec![
+            Cell::new(entry.table.as_str()),
+            phase_cell(&entry.indices, "indices"),
+            phase_cell(&entry.compaction, "compaction"),
+        ]);
+    }
+    output(&paint("pond index optimize", bold()))?;
+    output(&table.to_string())?;
+    let mut hinted = false;
+    for entry in &outcome.tables {
+        if matches!(entry.compaction, PhaseOutcome::SkippedConflict) {
+            hinted = true;
+            output(&format!(
+                "{}  compaction on {} deferred: concurrent writer; rerun once it finishes",
+                paint("hint", dim()),
+                entry.table.as_str(),
+            ))?;
+        }
+    }
+    for entry in &outcome.tables {
+        if let PhaseOutcome::Failed(error) = &entry.indices {
+            output(&paint(
+                &format!("error  indices on {}: {error:#}", entry.table.as_str()),
+                red(),
+            ))?;
+            hinted = true;
+        }
+        if let PhaseOutcome::Failed(error) = &entry.compaction {
+            output(&paint(
+                &format!("error  compaction on {}: {error:#}", entry.table.as_str()),
+                yellow(),
+            ))?;
+            hinted = true;
+        }
+    }
+    let _ = hinted;
+    Ok(())
+}
+
+fn phase_cell(outcome: &PhaseOutcome, _phase: &str) -> Cell {
+    use pond::output::{dim, paint, red, yellow};
+    match outcome {
+        PhaseOutcome::Ok => Cell::new("ok"),
+        PhaseOutcome::Noop => Cell::new(paint("-", dim())),
+        PhaseOutcome::NotAttempted => Cell::new(paint("-", dim())),
+        PhaseOutcome::SkippedConflict => Cell::new(paint("skipped (conflict)", yellow())),
+        PhaseOutcome::Failed(_) => Cell::new(paint("failed", red())),
     }
 }
 
