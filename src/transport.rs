@@ -411,7 +411,6 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
                 query: params.query,
-                rrf_k: crate::wire::default_rrf_k(),
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.conversation_id,

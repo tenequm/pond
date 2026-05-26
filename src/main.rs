@@ -181,10 +181,6 @@ enum Command {
         namespace: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Reciprocal-rank-fusion constant. Lower values emphasize top
-        /// retriever ranks; the server default is the same.
-        #[arg(long, default_value_t = 10)]
-        rrf_k: u32,
         /// Operator-only retrieval mode override. Production callers should
         /// omit this and let the server pick (hybrid when embeddings exist,
         /// FTS-only otherwise); benchmark and ablation harnesses use it to
@@ -693,7 +689,6 @@ async fn main() -> anyhow::Result<()> {
             config,
             namespace,
             limit,
-            rrf_k,
             mode,
             no_boost_recent,
             group_by_conversation,
@@ -729,7 +724,6 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 query,
                 mode_override: mode.map(SearchModeWire::from),
-                rrf_k,
                 filters: SearchFilters {
                     project,
                     session_id,
@@ -971,9 +965,14 @@ async fn restore_session(
 }
 
 fn init_tracing() {
+    // Lance's IVF_PQ builder warns once per empty centroid during merge
+    // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
+    // It already handles the case - records a zero-sized partition and continues -
+    // so the warning is benign log noise on every `pond embed` index-append.
+    // POND_LOG / RUST_LOG still override this default.
     let filter = EnvFilter::try_from_env("POND_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+        .unwrap_or_else(|_| EnvFilter::new("warn,lance::index::vector::builder=error"));
 
     fmt().with_env_filter(filter).with_writer(io::stderr).init();
 }

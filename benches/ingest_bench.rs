@@ -111,9 +111,7 @@ async fn main() -> Result<()> {
                         sync_errors += 1;
                         *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
                     }
-                    SyncStatus::Partial {
-                        dropped_events, ..
-                    } => {
+                    SyncStatus::Partial { dropped_events, .. } => {
                         sync_partial += 1;
                         sync_partial_drops += *dropped_events as u64;
                     }

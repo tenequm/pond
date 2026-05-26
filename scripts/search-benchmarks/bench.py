@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Search-quality regression harness for pond's hybrid retrieval.
 
-Wraps `target/release/pond search --format json` and scores the output against
-ground truth. The research artifact (rejected fusion variants, methodology,
-per-stratum numbers) lives in `docs/researches/embeddings/`; this file is the
-operator entrypoint for re-running and adding new query sets.
+Drives `target/release/pond search --format json` end-to-end, scores the
+output against ground truth, and can replay captured arm fixtures through
+arbitrary fusion variants without re-running pond. The research artifact
+(methodology, per-stratum numbers, history of fusion choices) lives in
+`docs/researches/embeddings/`; this file is the operator entrypoint.
 
 # Subcommands
 
@@ -15,6 +16,10 @@ operator entrypoint for re-running and adding new query sets.
     score   - Score a results directory against ground truth; emit a per-
               stratum S@3 / P@1 / MRR table plus a per-query ranks CSV.
     pair    - Paired sign test on two ranks CSVs (Success@3 indicator).
+    sweep   - Replay captured FTS+Vector arm fixtures through a grid of
+              fusion variants (zero pond invocations).
+    variant - Replay one fusion variant; emit a per-query ranks CSV that
+              `pair` can consume.
 
 `bench.py <subcommand> --help` for full flags.
 
@@ -33,6 +38,12 @@ operator entrypoint for re-running and adding new query sets.
     # 4. (optional) paired sign test across two runs / modes
     python3 bench.py pair --csv-a /tmp/fts-en.csv --csv-b /tmp/hybrid-en.csv \\
         --label-a fts --label-b hybrid
+
+    # 5. (research-only) replay arm fixtures through fusion variants
+    python3 bench.py run --mode fts    --queries Q --out fixtures/fts    --limit 100
+    python3 bench.py run --mode vector --queries Q --out fixtures/vector --limit 200
+    python3 bench.py sweep --queries Q \\
+        --fts-fixtures fixtures/fts --vector-fixtures fixtures/vector
 
 # Anchor verification - run before locking a new query set
 
@@ -54,10 +65,8 @@ agreement from them, you only see the top 20 from each arm: for queries
 where a noise session sits at rank 30-50 in one arm, you never see it but
 production does. Any cross-arm gating idea evaluated against truncated
 fixtures will look better than it performs in production. For honest
-per-arm analysis, capture at production pool sizes:
-
-    python3 bench.py run --mode fts    --queries Q --out fixtures/fts    --limit 100
-    python3 bench.py run --mode vector --queries Q --out fixtures/vector --limit 200
+per-arm analysis, capture at production pool sizes (--limit 100 FTS,
+--limit 200 Vector).
 
 # Privacy note
 
@@ -76,19 +85,35 @@ import argparse
 import csv
 import json
 import math
+import os
 import subprocess
 import sys
 import unicodedata
+from collections import defaultdict
 from math import comb
 from pathlib import Path
 from typing import Iterator
 
 K_FOR_SUCCESS = 3
-BIN_PATH = Path(__file__).resolve().parents[2] / "target/release/pond"
+BIN_PATH = Path(
+    os.environ.get("POND_BIN") or Path(__file__).resolve().parents[2] / "target/release/pond"
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
 
 
 def nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
+
+
+def session_root(session_id: str) -> str:
+    """Mirror src/handlers.rs::session_root - strip the first '/' to drop
+    Claude Code's `/agent-XXX` sub-agent suffix."""
+    idx = session_id.find("/")
+    return session_id[:idx] if idx >= 0 else session_id
 
 
 def parse_ground_truth(spec: str) -> tuple[str, list[str]]:
@@ -145,8 +170,8 @@ def run_search(query: str, mode: str, limit: int, grouped: bool = False) -> dict
     cmd = [str(BIN_PATH), "search", "--mode", mode, "--limit", str(limit), "--format", "json"]
     if grouped:
         cmd.append("--group-by-conversation")
-    # `--` so a query starting with `-` (real user prompts often do)
-    # isn't mistaken for a flag by clap.
+    # `--` so a query starting with `-` (real user prompts often do) isn't
+    # mistaken for a flag by clap.
     cmd.extend(["--", query])
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -179,6 +204,11 @@ def normalize_hits(payload: dict) -> list[dict]:
             for h in kb
         ]
     return []
+
+
+# ---------------------------------------------------------------------------
+# run / verify / score / pair
+# ---------------------------------------------------------------------------
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -268,10 +298,15 @@ def cmd_score(args: argparse.Namespace) -> int:
         for r in rows:
             w.writerow({**r, "mode": args.label})
 
+    _print_stratum_table(args.label, rows)
+    return 0
+
+
+def _print_stratum_table(label: str, rows: list[dict]) -> None:
     strata: dict[str, list[dict]] = {}
     for r in rows:
         strata.setdefault(f"{r['lang']}/{r['stratum']}", []).append(r)
-    print(f"# {args.label}\n")
+    print(f"# {label}\n")
     print(
         f"| stratum | n | S@{K_FOR_SUCCESS} | S@{K_FOR_SUCCESS} 95% CI | "
         f"P@1 | P@1 95% CI | MRR |"
@@ -304,7 +339,6 @@ def cmd_score(args: argparse.Namespace) -> int:
             f"{total_p1}/{total_n} = {total_p1 / total_n:.2f} | -- | "
             f"{total_mrr / total_n:.3f} |"
         )
-    return 0
 
 
 def cmd_pair(args: argparse.Namespace) -> int:
@@ -359,6 +393,286 @@ def cmd_pair(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Fixture replay: sweep / variant
+# ---------------------------------------------------------------------------
+
+
+def load_arm(path: Path) -> tuple[list[dict], float | None]:
+    """Load one captured arm envelope. Returns (hits, top_score) where
+    top_score is the first hit's `_score`/`score`/`bm25` field if present
+    (used by the fts-gate variant); None if the arm errored or is empty."""
+    if not path.is_file():
+        return [], None
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return [], None
+    hits = payload.get("hits") or []
+    if not hits:
+        return [], None
+    first = hits[0]
+    top = first.get("_score") or first.get("score") or first.get("bm25")
+    return hits, (float(top) if top is not None else None)
+
+
+def wrrf_merge(arms: list[tuple[list[dict], int, float]]) -> list[dict]:
+    """Weighted RRF: contribution = weight / (k + dedup_rank). weight=1.0
+    reduces to vanilla RRF."""
+    merged: dict[str, dict] = {}
+    for hits, k, weight in arms:
+        k_eff = float(max(k, 1))
+        seen: set[str] = set()
+        dedup_rank = 0
+        for hit in hits:
+            root = session_root(hit.get("session_id") or "")
+            if root in seen:
+                continue
+            seen.add(root)
+            dedup_rank += 1
+            contribution = weight / (k_eff + float(dedup_rank))
+            entry = merged.setdefault(root, {"score": 0.0, "rep": hit})
+            entry["score"] += contribution
+    return _sort_merged(merged)
+
+
+def normscore_merge(
+    arms: list[tuple[list[dict], float, str]],
+    norm: str = "minmax",
+) -> list[dict]:
+    """Score-normalized linear fusion. For each arm: extract raw scores
+    (key=score_key), normalize across the FULL arm pool (norm in
+    {minmax, zscore, none}), dedup by `session_root`, then sum
+    `weight * norm_score` per root. This mirrors production
+    `src/handlers.rs::fuse_arms`."""
+    merged: dict[str, dict] = {}
+    for hits, weight, score_key in arms:
+        if not hits:
+            continue
+        raw = [float(h.get(score_key) or h.get("_score") or h.get("score") or 0.0) for h in hits]
+        if norm == "minmax":
+            lo, hi = min(raw), max(raw)
+            rng = hi - lo if hi > lo else 1.0
+            normed = [(r - lo) / rng for r in raw]
+        elif norm == "zscore":
+            mean = sum(raw) / len(raw)
+            var = sum((r - mean) ** 2 for r in raw) / max(len(raw), 1)
+            sd = math.sqrt(var) if var > 0 else 1.0
+            normed = [(r - mean) / sd for r in raw]
+        else:
+            normed = raw
+        seen: set[str] = set()
+        for h, ns in zip(hits, normed):
+            root = session_root(h.get("session_id") or "")
+            if root in seen:
+                continue
+            seen.add(root)
+            entry = merged.setdefault(root, {"score": 0.0, "rep": h})
+            entry["score"] += weight * ns
+    return _sort_merged(merged)
+
+
+def _sort_merged(merged: dict[str, dict]) -> list[dict]:
+    out = [{**e["rep"], "_fused_score": e["score"]} for e in merged.values()]
+    out.sort(
+        key=lambda h: (
+            -h["_fused_score"],
+            h.get("session_id") or "",
+            h.get("message_id") or "",
+        )
+    )
+    return out
+
+
+def parse_variant(spec: str) -> dict:
+    """Variant grammar:
+      norm:<w_fts>,<w_vec>                    - score-normalized (production)
+      sym:<k>                                 - symmetric RRF
+      asym:<k_fts>,<k_vec>                    - asymmetric RRF (legacy default)
+      wrrf:<k_fts>,<k_vec>,<w_fts>,<w_vec>    - weighted RRF
+      fts-gate:<bm25_thresh>:<k_fts>,<k_vec>  - skip FTS arm if top BM25 < thresh
+      fts-only / vector-only                  - single-arm baselines
+    """
+    if spec == "fts-only":
+        return {"kind": "fts-only", "label": "fts-only"}
+    if spec == "vector-only":
+        return {"kind": "vector-only", "label": "vector-only"}
+    if spec.startswith("norm:"):
+        parts = spec[5:].split(",")
+        if len(parts) != 2:
+            raise ValueError("norm: expects w_fts,w_vec")
+        w_fts, w_vec = float(parts[0]), float(parts[1])
+        return {"kind": "norm", "w_fts": w_fts, "w_vec": w_vec, "label": f"norm:w=({w_fts},{w_vec})"}
+    if spec.startswith("sym:"):
+        k = int(spec[4:])
+        return {"kind": "rrf", "k_fts": k, "k_vec": k, "label": f"sym:k={k}"}
+    if spec.startswith("asym:"):
+        kf, kv = spec[5:].split(",")
+        return {"kind": "rrf", "k_fts": int(kf), "k_vec": int(kv), "label": f"asym:{kf},{kv}"}
+    if spec.startswith("wrrf:"):
+        parts = spec[5:].split(",")
+        if len(parts) != 4:
+            raise ValueError("wrrf: expects k_fts,k_vec,w_fts,w_vec")
+        kf, kv, wf, wv = int(parts[0]), int(parts[1]), float(parts[2]), float(parts[3])
+        return {"kind": "wrrf", "k_fts": kf, "k_vec": kv, "w_fts": wf, "w_vec": wv,
+                "label": f"wrrf:k=({kf},{kv}),w=({wf},{wv})"}
+    if spec.startswith("fts-gate:"):
+        thresh_s, ks = spec[len("fts-gate:"):].split(":")
+        kf, kv = ks.split(",")
+        return {"kind": "fts-gate", "threshold": float(thresh_s),
+                "k_fts": int(kf), "k_vec": int(kv),
+                "label": f"fts-gate:t={thresh_s},k=({kf},{kv})"}
+    raise ValueError(f"unknown variant: {spec!r}")
+
+
+def apply_variant(
+    variant: dict, fts_hits: list[dict], vec_hits: list[dict], fts_top: float | None
+) -> list[dict]:
+    kind = variant["kind"]
+    if kind == "fts-only":
+        return fts_hits
+    if kind == "vector-only":
+        return vec_hits
+    if kind == "norm":
+        # FTS-first to match production representative-tie behavior.
+        return normscore_merge(
+            [(fts_hits, variant["w_fts"], "base_score"), (vec_hits, variant["w_vec"], "base_score")]
+        )
+    if kind == "rrf":
+        return wrrf_merge([(fts_hits, variant["k_fts"], 1.0), (vec_hits, variant["k_vec"], 1.0)])
+    if kind == "wrrf":
+        return wrrf_merge(
+            [
+                (fts_hits, variant["k_fts"], variant["w_fts"]),
+                (vec_hits, variant["k_vec"], variant["w_vec"]),
+            ]
+        )
+    if kind == "fts-gate":
+        if fts_top is not None and fts_top < variant["threshold"]:
+            return vec_hits
+        return wrrf_merge([(fts_hits, variant["k_fts"], 1.0), (vec_hits, variant["k_vec"], 1.0)])
+    raise ValueError(f"unimplemented variant kind: {kind}")
+
+
+def score_variant(
+    variant: dict, queries: list[dict], fts_dir: Path, vec_dir: Path
+) -> dict:
+    per_query: list[dict] = []
+    for row in queries:
+        qid = row["id"]
+        kind, tokens = parse_ground_truth(row["ground_truth"])
+        fts_hits, fts_top = load_arm(fts_dir / f"{qid}.json")
+        vec_hits, _ = load_arm(vec_dir / f"{qid}.json")
+        fused = apply_variant(variant, fts_hits, vec_hits, fts_top)
+        per_query.append({
+            "id": qid,
+            "stratum": row["stratum"],
+            "lang": row["lang"],
+            "rank": find_match_rank(fused, kind, tokens),
+        })
+    n = len(per_query)
+    s3 = sum(1 for r in per_query if 1 <= r["rank"] <= K_FOR_SUCCESS)
+    p1 = sum(1 for r in per_query if r["rank"] == 1)
+    mrr = sum((1.0 / r["rank"]) if r["rank"] >= 1 else 0.0 for r in per_query)
+    by_stratum: dict[str, list[dict]] = defaultdict(list)
+    for r in per_query:
+        by_stratum[f"{r['lang']}/{r['stratum']}"].append(r)
+    return {
+        "label": variant["label"],
+        "n": n,
+        "s3": s3,
+        "p1": p1,
+        "mrr": (mrr / n) if n else 0.0,
+        "by_stratum": dict(by_stratum),
+        "per_query": per_query,
+    }
+
+
+def default_grid() -> list[str]:
+    return [
+        "fts-only",
+        "vector-only",
+        # Production (score-normalized) at the shipped 0.135:1 ratio.
+        "norm:0.135,1.0",
+        # Legacy RRF reference points.
+        "sym:60",
+        "asym:5,20",
+        # Symmetric-k sweep around 0.135 score-norm ratio.
+        "norm:0.05,1.0",
+        "norm:0.10,1.0",
+        "norm:0.20,1.0",
+    ]
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    queries = list(iter_queries(Path(args.queries)))
+    fts_dir = Path(args.fts_fixtures)
+    vec_dir = Path(args.vector_fixtures)
+    grid = args.variant or default_grid()
+    rows = []
+    for spec in grid:
+        try:
+            variant = parse_variant(spec)
+        except ValueError as e:
+            print(f"skip {spec!r}: {e}", file=sys.stderr)
+            continue
+        rows.append(score_variant(variant, queries, fts_dir, vec_dir))
+    print(f"# Fusion sweep ({len(queries)} queries)\n")
+    print(f"| variant | n | S@{K_FOR_SUCCESS} | S@{K_FOR_SUCCESS} 95% CI | P@1 | MRR |")
+    print("|---------|---|-----|----------|-----|-----|")
+    for r in rows:
+        lo, hi = wilson_ci(r["s3"], r["n"])
+        print(
+            f"| {r['label']} | {r['n']} | "
+            f"{r['s3']}/{r['n']} = {r['s3'] / max(r['n'], 1):.2f} | "
+            f"[{lo:.2f},{hi:.2f}] | "
+            f"{r['p1']}/{r['n']} = {r['p1'] / max(r['n'], 1):.2f} | "
+            f"{r['mrr']:.3f} |"
+        )
+    if args.by_stratum:
+        print("\n## Per-stratum S@3\n")
+        strata = sorted({s for r in rows for s in r["by_stratum"]})
+        print("| variant | " + " | ".join(strata) + " |")
+        print("|---------|" + "|".join(["----"] * len(strata)) + "|")
+        for r in rows:
+            cells = []
+            for s in strata:
+                items = r["by_stratum"].get(s, [])
+                n_s = len(items)
+                if n_s == 0:
+                    cells.append("-")
+                    continue
+                s3_s = sum(1 for it in items if 1 <= it["rank"] <= K_FOR_SUCCESS)
+                cells.append(f"{s3_s}/{n_s}")
+            print(f"| {r['label']} | " + " | ".join(cells) + " |")
+    return 0
+
+
+def cmd_variant(args: argparse.Namespace) -> int:
+    queries = list(iter_queries(Path(args.queries)))
+    variant = parse_variant(args.variant)
+    result = score_variant(variant, queries, Path(args.fts_fixtures), Path(args.vector_fixtures))
+    out = Path(args.out)
+    with out.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["id", "stratum", "lang", "mode", "rank", "note"])
+        w.writeheader()
+        for r in result["per_query"]:
+            w.writerow({**r, "mode": result["label"], "note": ""})
+    lo, hi = wilson_ci(result["s3"], result["n"])
+    print(
+        f"{result['label']}: S@3 = {result['s3']}/{result['n']} = "
+        f"{result['s3'] / max(result['n'], 1):.2f} [{lo:.2f},{hi:.2f}]; "
+        f"P@1 = {result['p1']}/{result['n']}; MRR = {result['mrr']:.3f}"
+    )
+    print(f"per-query ranks written to {out} (use `bench.py pair` for sign tests)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -374,9 +688,9 @@ def main() -> int:
     p_run.add_argument("--grouped", action="store_true", help="Pass --group-by-conversation")
     p_run.set_defaults(func=cmd_run)
 
-    p_verify = sub.add_parser("verify", help="Check every query's ground truth is reachable in FTS or Vector")
+    p_verify = sub.add_parser("verify", help="Check every query's ground truth is reachable")
     p_verify.add_argument("--queries", required=True)
-    p_verify.add_argument("--limit", type=int, default=200, help="Top-N to check per arm (default 200)")
+    p_verify.add_argument("--limit", type=int, default=200, help="Top-N per arm (default 200)")
     p_verify.set_defaults(func=cmd_verify)
 
     p_score = sub.add_parser("score", help="Score results against ground truth")
@@ -392,6 +706,24 @@ def main() -> int:
     p_pair.add_argument("--label-a", required=True)
     p_pair.add_argument("--label-b", required=True)
     p_pair.set_defaults(func=cmd_pair)
+
+    p_sweep = sub.add_parser("sweep", help="Score a grid of fusion variants over captured fixtures")
+    p_sweep.add_argument("--queries", required=True)
+    p_sweep.add_argument("--fts-fixtures", required=True)
+    p_sweep.add_argument("--vector-fixtures", required=True)
+    p_sweep.add_argument("--variant", action="append",
+                         help="Variant spec; repeat for multiple. Defaults to a built-in grid.")
+    p_sweep.add_argument("--by-stratum", action="store_true",
+                         help="Also print a per-stratum S@3 table for each variant.")
+    p_sweep.set_defaults(func=cmd_sweep)
+
+    p_variant = sub.add_parser("variant", help="Score one fusion variant; emit per-query ranks CSV")
+    p_variant.add_argument("--variant", required=True)
+    p_variant.add_argument("--queries", required=True)
+    p_variant.add_argument("--fts-fixtures", required=True)
+    p_variant.add_argument("--vector-fixtures", required=True)
+    p_variant.add_argument("--out", required=True)
+    p_variant.set_defaults(func=cmd_variant)
 
     args = parser.parse_args()
     return args.func(args)

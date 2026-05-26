@@ -18,6 +18,7 @@ Thumbs.db
 
 .env*
 tmp/
+.mcp.json
 .claude/*local.json
 .claude
 .agents/skills/
@@ -29,10 +30,11 @@ tmp/
 # paraphrased query set is also derivative - even after paraphrasing the
 # topics and project names leak. Regenerate locally via `bench.py`. Never
 # commit these.
-/bench/embeddings/fixtures/
-/bench/embeddings/results/
-/bench/embeddings/queries-paraphrased*.tsv
-/bench/embeddings/__pycache__/
+/scripts/search-benchmarks/fixtures/
+/scripts/search-benchmarks/results/
+/scripts/search-benchmarks/queries-paraphrased*.tsv
+/scripts/search-benchmarks/queries-real-use*.tsv
+/scripts/search-benchmarks/__pycache__/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate
 # stats appear inline in the benchmark report. Regenerate via `pond status`.
