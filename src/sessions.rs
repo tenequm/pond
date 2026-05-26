@@ -23,7 +23,7 @@ use crate::{
     config, embed,
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexPolicy, IndexTrigger, Predicate, ScalarValue,
-        ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
+        ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS, WriteShape,
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
@@ -231,10 +231,13 @@ impl Store {
         }
         let batches = sessions_batches(sessions)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
-        // spec.md#fold-on-write: append commit -> fold every index on this
-        // table. The append path is not affected by the v7.0.0-beta.16
-        // flat-BTREE bug (which lives in the column-update rebuild path).
-        self.handle.fold_and_create_indices(Table::Sessions).await?;
+        // Direct-API path. spec.md#fold-on-write: callers that drive many
+        // upsert_* calls in a loop should defer the fold via
+        // `flush_indices` for O(N) cost; a single isolated call gets a
+        // single fold here.
+        self.handle
+            .fold_and_create_indices(Table::Sessions, WriteShape::Append)
+            .await?;
         Ok(statuses_from_inserted(sessions.len(), inserted))
     }
 
@@ -417,12 +420,11 @@ impl Store {
             merge_insert_chunks(&self.handle, Table::Messages, message_batches),
             merge_insert_chunks(&self.handle, Table::Parts, part_batches),
         )?;
-        // spec.md#fold-on-write: append commit -> fold every index on each
-        // touched table. Run sequentially so the shared `lance::Session`
-        // index cache stays consistent across the three create_index commits.
-        self.handle.fold_and_create_indices(Table::Sessions).await?;
-        self.handle.fold_and_create_indices(Table::Messages).await?;
-        self.handle.fold_and_create_indices(Table::Parts).await?;
+        // spec.md#fold-on-write: this is the per-batch substream commit
+        // path - the outer handler (`ingest_adapter` / `ingest_events`)
+        // calls `Store::flush_indices` once at end to fold the full ingest.
+        // Folding per-batch would push ingest cost to O(N^2) on a sync
+        // that flushes every 100 substreams.
 
         // Per-session success outcomes: each substream's own status row plus
         // per-message and per-part rows. The Lance `merge_insert` returns a
@@ -477,7 +479,9 @@ impl Store {
             .collect::<Vec<_>>();
         let batches = messages_batches(&rows)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
-        self.handle.fold_and_create_indices(Table::Messages).await?;
+        self.handle
+            .fold_and_create_indices(Table::Messages, WriteShape::Append)
+            .await?;
         Ok(statuses_from_inserted(messages.len(), inserted))
     }
 
@@ -487,7 +491,9 @@ impl Store {
         }
         let batches = parts_batches(parts)?;
         let inserted = merge_insert_chunks(&self.handle, Table::Parts, batches).await?;
-        self.handle.fold_and_create_indices(Table::Parts).await?;
+        self.handle
+            .fold_and_create_indices(Table::Parts, WriteShape::Append)
+            .await?;
         Ok(statuses_from_inserted(parts.len(), inserted))
     }
 
@@ -710,14 +716,12 @@ impl Store {
         self.handle
             .merge_update(Table::Messages, batch, rows.len())
             .await?;
-        // spec.md#fold-on-write: only the vector index covers the columns
-        // this merge_update touched. Scalar / FTS indices on `messages`
-        // index unchanged columns; folding them after a column update
-        // would trip the lance v7.0.0-beta.16 flat-BTREE bug (see
-        // `Handle::fold_and_create_indices`) and would be semantically
-        // unnecessary - reads of those indices stay correct because Lance
-        // flat-scans the spuriously-pruned trail.
-        self.handle.fold_and_create_indices(Table::Messages).await?;
+        // spec.md#fold-on-write: the embed worker drains in many windows;
+        // folding per call would slow embed by ~O(windows) full-table
+        // index rebuilds (and per-window optimize_indices(append) on a
+        // stable-row-id-flat-BTREE-after-column-update repeatedly trips
+        // lance v7.0.0-beta.16's combine_old_new bug). The outer
+        // `pond embed` handler calls `Store::flush_indices` once at end.
         Ok(())
     }
 
@@ -1084,10 +1088,26 @@ impl Store {
         self.handle
             .merge_update(Table::Messages, batch, keys.len())
             .await?;
-        // Same as `write_embeddings`: only the vector index covers the
-        // touched column. Spare the scalar/FTS indices the v7.0.0-beta.16
-        // flat-BTREE bug.
-        self.handle.fold_and_create_indices(Table::Messages).await?;
+        // Same batching shape as `write_embeddings`: outer handler folds
+        // at end via `Store::flush_indices`.
+        Ok(())
+    }
+
+    /// Fold every maintained index on every table forward, creating any
+    /// implied-but-missing ones (spec.md#fold-on-write). Outer handlers
+    /// (`ingest_adapter`, `ingest_events`, `pond embed`) call this once
+    /// at end so the spec contract holds at the seam without paying
+    /// per-batch fold cost during a long ingest or embed pass.
+    ///
+    /// The [`WriteShape`] picks the right scalar / FTS strategy: pure
+    /// inserts get the cheap incremental `optimize_indices(append)`;
+    /// column updates get the safe rebuild that dodges the
+    /// v7.0.0-beta.16 flat-BTREE bug. Vector folds incrementally either
+    /// way.
+    pub async fn flush_indices(&self, shape: WriteShape) -> Result<()> {
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            self.handle.fold_and_create_indices(table, shape).await?;
+        }
         Ok(())
     }
 
@@ -3482,6 +3502,10 @@ mod tests {
         // inline. No separate upkeep call.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
+        // Direct `write_embeddings` usage (outside a handler) - flush
+        // explicitly so the BTREE on session_id covers the rewritten
+        // fragments before the planner asserts ScalarIndexQuery pushdown.
+        store.flush_indices(WriteShape::ColumnUpdate).await?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store
@@ -3508,18 +3532,17 @@ mod tests {
 
     #[tokio::test]
     async fn vector_index_activates_when_threshold_is_crossed_inline() -> anyhow::Result<()> {
-        // spec.md#fold-on-write: the merge_update that pushes
-        // `count(vector IS NOT NULL)` past the activation threshold triggers
-        // IVF_PQ creation inside that same commit. Below the threshold no
-        // index exists; at the threshold it appears. No separate upkeep
-        // call. (Threshold = 256 here, the IVF_PQ trainer's hard floor for
-        // num_bits = 8.)
+        // spec.md#fold-on-write: at the outermost public boundary, the
+        // IVF_PQ exists once `count(vector IS NOT NULL) >= threshold`.
+        // We emulate the boundary here with explicit `flush_indices` after
+        // each write batch (handlers wrap this automatically).
         let temp = TempDir::new()?;
         let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
 
-        // First batch: 255 vectors, one below threshold. The merge_update
-        // commits with fold-on-write but the IVF_PQ trigger doesn't fire.
+        // First batch: 255 vectors, one below threshold. The handler-end
+        // fold does not create the IVF_PQ (trigger not met).
         store.write_embeddings(&embedded(&keys[..255])).await?;
+        store.flush_indices(WriteShape::ColumnUpdate).await?;
         assert!(
             !store
                 .handle
@@ -3530,10 +3553,10 @@ mod tests {
             "IVF_PQ must not exist below the activation threshold",
         );
 
-        // Next batch: one more vector. The total now reaches 256; the
-        // fold-on-write pass inside this merge_update creates the IVF_PQ
-        // before returning.
+        // Next batch: one more vector. Total reaches 256; the next
+        // flush_indices creates the IVF_PQ.
         store.write_embeddings(&embedded(&keys[255..256])).await?;
+        store.flush_indices(WriteShape::ColumnUpdate).await?;
         assert!(
             store
                 .handle
@@ -3541,8 +3564,7 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "fold-on-write must create the IVF_PQ as the threshold-crossing \
-             merge_update commits",
+            "fold-on-write must create the IVF_PQ once the threshold is crossed",
         );
 
         // The remaining 44 rows stay un-embedded; the IVF_PQ trains over the
@@ -3603,14 +3625,14 @@ mod tests {
 
     #[tokio::test]
     async fn fold_on_write_holds_after_ingest_and_embed() -> anyhow::Result<()> {
-        // spec.md#fold-on-write: every write returns with its touched
-        // indices folded forward. No separate upkeep verb anywhere in this
-        // test. After ingest + embed, both the FTS and the IVF_PQ backlog
-        // are zero, and the IVF_PQ exists (the threshold-crossing
-        // merge_update created it inline).
+        // spec.md#fold-on-write at the outermost public boundary: after
+        // an ingest + embed pair plus one final `flush_indices` (the
+        // pond embed handler does this), the FTS and IVF_PQ backlogs are
+        // both zero and the IVF_PQ exists.
         let temp = TempDir::new()?;
         let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
         store.write_embeddings(&embedded(&keys)).await?;
+        store.flush_indices(WriteShape::ColumnUpdate).await?;
 
         assert_eq!(
             store.unindexed_message_backlog().await?,
@@ -3716,6 +3738,7 @@ mod tests {
         let temp = TempDir::new()?;
         let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
         store.write_embeddings(&embedded(&keys)).await?;
+        store.flush_indices(WriteShape::ColumnUpdate).await?;
         assert!(
             store
                 .handle
@@ -3723,7 +3746,7 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "IVF_PQ must exist after the first embed pass (sanity)",
+            "IVF_PQ must exist after the first embed pass + flush (sanity)",
         );
 
         // Drop the IVF_PQ (production-equivalent: `Store::drop_vector_index`),
@@ -3891,6 +3914,7 @@ mod tests {
                 if !keys.is_empty() {
                     store.write_embeddings(&embedded(&keys)).await?;
                     store.clear_embeddings(&keys).await?;
+                    store.flush_indices(WriteShape::ColumnUpdate).await?;
                 }
             }
         }

@@ -365,12 +365,15 @@ mod ingest_handler {
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
             .saturating_sub(truncations_before) as usize;
 
-        // spec.md#fold-on-write: every merge through the substrate folds its
-        // touched indices forward inside the same retry block, so by the time
-        // the per-batch flushes above returned Ok every maintained index on
-        // the three tables already covers the appended rows. No explicit
-        // post-ingest upkeep call is needed - and there is no soft-warn
-        // fallback because the contract forbids the indices-trail-data state.
+        // spec.md#fold-on-write: one fold pass for the whole ingest, run
+        // at the outermost public boundary (this handler). Ingest is
+        // pure inserts (`merge_insert`), so the cheap incremental
+        // `Append` shape is safe; per-batch fold would push ingest to
+        // O(N^2) - the regression that moved this call out of
+        // `upsert_session_batch`.
+        store
+            .flush_indices(crate::substrate::WriteShape::Append)
+            .await?;
 
         let total = run_started.elapsed();
         let other = total
@@ -521,9 +524,10 @@ mod ingest_handler {
         let mut tail = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
-        // spec.md#fold-on-write: each `validator.push` / `validator.finish`
-        // merge above already returned with its touched indices folded
-        // forward; there is no separate upkeep step.
+        // spec.md#fold-on-write: one fold at the handler boundary.
+        store
+            .flush_indices(crate::substrate::WriteShape::Append)
+            .await?;
         Ok(outcomes)
     }
 

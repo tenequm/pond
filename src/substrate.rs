@@ -179,6 +179,32 @@ impl IndexPolicy {
     }
 }
 
+/// Shape of the writes that preceded a fold call. Picks the safe and cheap
+/// fold strategy per scalar / FTS index:
+///
+/// - `Append`: pure `merge_insert` (no row supersession). The trail is
+///   freshly-written fragments; `optimize_indices(append)` extends the
+///   existing index incrementally. `combine_old_new` never sees duplicate
+///   stable row IDs, so the v7.0.0-beta.16 flat-BTREE bug does not fire.
+///   This is the cheap path - O(new_rows) per index.
+/// - `ColumnUpdate`: `merge_update` rewrote fragments and Lance pruned
+///   every index's coverage. `optimize_indices` on scalar / FTS in this
+///   state goes through `combine_old_new` with duplicate stable row IDs
+///   (old and new fragments both hold the same IDs), tripping
+///   `RowAddrTreeMap::from_sorted_iter called with non-sorted input` on
+///   the next scan. Pond rebuilds scalar / FTS from scratch via
+///   `create_index(replace = true)` instead - O(total_rows) per index, but
+///   correct.
+///
+/// Vector indices always fold incrementally regardless of shape: IVF_PQ
+/// with stable row IDs supports the column-update case natively
+/// (`IvfIndexBuilder::new_incremental`).
+#[derive(Debug, Clone, Copy)]
+pub enum WriteShape {
+    Append,
+    ColumnUpdate,
+}
+
 /// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
 /// against an OCC commit-conflict failure (spec.md#protocol). The wire layer
 /// downcasts to this type to classify the outcome as `conflict` rather than
@@ -563,7 +589,10 @@ impl Handle {
             }
             let mut guard = handle.cached(table).lock().await;
             let mut dataset = guard.latest().await?;
-            fold_and_create(&mut dataset, intents).await?;
+            // Conservative: at open we don't know what the last write was,
+            // so assume the worst (`ColumnUpdate`) to take the rebuild path
+            // that's safe under the v7.0.0-beta.16 flat-BTREE bug.
+            fold_and_create(&mut dataset, intents, WriteShape::ColumnUpdate).await?;
             guard.replace(dataset);
         }
         Ok(handle)
@@ -689,33 +718,20 @@ impl Handle {
         result.map(|(affected, _)| affected)
     }
 
-    /// Enforce the [`IndexPolicy`] on `table`: create any
-    /// implied-but-missing index, rebuild scalar / FTS indices that have
-    /// trailing fragments, and fold the vector index incrementally.
-    /// Sessions calls this at the end of every public write method
-    /// (spec.md#fold-on-write); a write's `Ok` return implies the indices
-    /// fully cover the data.
-    ///
-    /// The scalar / FTS rebuild path uses `create_index(replace = true)`
-    /// rather than `optimize_indices`. Lance v7.0.0-beta.16's
-    /// `optimize_indices` walk for scalar / FTS goes through
-    /// `combine_old_new` (`lance/src/index/append.rs:506-589`), which
-    /// under stable row IDs (`spec.md#stable-row-ids`) produces a flat
-    /// BTREE whose `IDS_COL_IDX` column violates the strictly-sorted
-    /// invariant the next scan asserts via
-    /// `RowAddrTreeMap::from_sorted_iter`
-    /// (`lance-core/src/utils/mask.rs:402-424`,
-    /// `lance-index/src/scalar/btree/flat.rs:56`). The rebuild path
-    /// starts fresh, never touches `combine_old_new`, and is cheap because
-    /// pond's scalar / FTS indices are small (`messages` rows are tens of
-    /// MB compressed). Vector indices avoid the bug entirely - the IVF v3
-    /// path (`lance/src/index/vector/builder.rs:803-852`) is incremental
-    /// with stable row IDs, so `optimize_indices(merge(1))` is correct
-    /// and O(rewritten_vectors).
+    /// Enforce the [`IndexPolicy`] on `table` given the [`WriteShape`] of
+    /// the writes that preceded it: create any implied-but-missing index,
+    /// then update existing ones. See [`WriteShape`] for the per-shape
+    /// rationale (insert path is incremental and cheap; column-update path
+    /// rebuilds scalar / FTS to dodge the v7.0.0-beta.16 flat-BTREE bug).
+    /// Vector indices always fold incrementally.
     ///
     /// Wrapped in `retry_lance` so concurrent writers' `CommitConflict`
     /// on `create_index` / `optimize_indices` is rebased and retried.
-    pub(crate) async fn fold_and_create_indices(&self, table: Table) -> Result<()> {
+    pub(crate) async fn fold_and_create_indices(
+        &self,
+        table: Table,
+        shape: WriteShape,
+    ) -> Result<()> {
         let intents = self.policy.for_table(table);
         if intents.is_empty() {
             return Ok(());
@@ -723,7 +739,7 @@ impl Handle {
         self.retry_lance(table.label(), || async {
             let mut guard = self.cached(table).lock().await;
             let mut dataset = guard.latest().await?;
-            fold_and_create(&mut dataset, intents).await?;
+            fold_and_create(&mut dataset, intents, shape).await?;
             guard.replace(dataset);
             Ok(())
         })
@@ -957,28 +973,25 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-/// Enforce the [`IndexPolicy`] on `dataset` in one pass: create any intent
-/// that trigger-implies-but-doesn't-yet-exist, then re-cover the trailing
-/// fragments per index. Scalar / FTS indices are rebuilt from scratch via
-/// `create_index(replace = true)` to dodge lance v7.0.0-beta.16's
-/// `RowAddrTreeMap::from_sorted_iter called with non-sorted input` error
-/// in `combine_old_new` under stable row IDs (see
-/// [`Handle::fold_and_create_indices`] for the bug write-up); vector
-/// indices fold incrementally via `optimize_indices(merge(1))`, since
-/// `IvfIndexBuilder::new_incremental` carries the existing centroids and
-/// PQ codebook forward at O(rewritten_vectors) cost.
-async fn fold_and_create(dataset: &mut Dataset, intents: &[IndexIntent]) -> Result<()> {
+/// Enforce the [`IndexPolicy`] on `dataset`: create any intent that
+/// trigger-implies-but-doesn't-yet-exist, then update existing scalar /
+/// FTS indices per the [`WriteShape`] (incremental for inserts, rebuild
+/// for column updates) and fold the vector index incrementally regardless.
+async fn fold_and_create(
+    dataset: &mut Dataset,
+    intents: &[IndexIntent],
+    shape: WriteShape,
+) -> Result<()> {
     if intents.is_empty() {
         return Ok(());
     }
     let started = Instant::now();
 
-    // Snapshot the existing indices so we can decide create-vs-rebuild
-    // per intent in a single pass.
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
         existing.iter().map(|index| index.name.clone()).collect();
 
+    let mut scalar_indices_to_append: Vec<String> = Vec::new();
     let mut vector_indices_to_fold: Vec<String> = Vec::new();
 
     for intent in intents {
@@ -986,7 +999,6 @@ async fn fold_and_create(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resu
         let exists = existing_names.contains(intent.name);
 
         if !exists {
-            // Brand new index: only create if the data state implies it.
             if !intent.trigger.should_create(dataset).await? {
                 continue;
             }
@@ -1010,10 +1022,6 @@ async fn fold_and_create(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resu
             continue;
         }
 
-        // Index exists. Re-cover trailing fragments. Scalar / FTS go
-        // through `create_index(replace = true)` (rebuild from scratch -
-        // single-segment, no `combine_old_new`, safe). Vector goes
-        // through `optimize_indices(merge(1))` for incremental fold.
         if dataset.unindexed_fragments(intent.name).await?.is_empty() {
             continue;
         }
@@ -1021,24 +1029,45 @@ async fn fold_and_create(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resu
             vector_indices_to_fold.push(intent.name.to_owned());
             continue;
         }
-        let params = intent.params.build(dataset).await?;
-        let index_type = intent.params.index_type();
+
+        match shape {
+            WriteShape::Append => {
+                scalar_indices_to_append.push(intent.name.to_owned());
+            }
+            WriteShape::ColumnUpdate => {
+                let params = intent.params.build(dataset).await?;
+                let index_type = intent.params.index_type();
+                tracing::debug!(
+                    target: "pond::perf",
+                    index = intent.name,
+                    column = intent.column,
+                    "rebuilding Lance scalar/FTS index (column-update fold)",
+                );
+                dataset
+                    .create_index(
+                        &[intent.column],
+                        index_type,
+                        Some(intent.name.to_owned()),
+                        params.as_ref(),
+                        true,
+                    )
+                    .await
+                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+            }
+        }
+    }
+
+    if !scalar_indices_to_append.is_empty() {
+        let to_append = scalar_indices_to_append.clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(to_append))
+            .await
+            .context("optimize_indices(append) failed during fold-on-write")?;
         tracing::debug!(
             target: "pond::perf",
-            index = intent.name,
-            column = intent.column,
-            "rebuilding Lance scalar/FTS index (fold-on-write trail)",
+            indices = ?scalar_indices_to_append,
+            "appended trailing fragments into scalar/FTS indices",
         );
-        dataset
-            .create_index(
-                &[intent.column],
-                index_type,
-                Some(intent.name.to_owned()),
-                params.as_ref(),
-                true,
-            )
-            .await
-            .with_context(|| format!("failed to rebuild index {}", intent.name))?;
     }
 
     if !vector_indices_to_fold.is_empty() {
