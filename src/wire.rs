@@ -15,7 +15,7 @@ pub struct Session {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// Constrained by invariant 19: when set, `parent_session_id`
+    /// spec.md#parent-pointer-coherence: when set, `parent_session_id`
     /// MUST also be set. Spawn-only sources (claude-code subagents,
     /// nanoclaw) leave this `None`; fork-with-cut-point sources
     /// (pi-mono) populate both pointers together.
@@ -214,10 +214,8 @@ pub enum PartKind {
         call_id: Option<Extracted<String>>,
         /// `None` when the source carried no tool name. claude-code
         /// always carries it on `tool_use` rows; codex-cli sometimes
-        /// has placeholder shapes. The seal blocks the previous
-        /// "unknown" / "function" / "server_tool" synthesis patterns
-        /// (spec.md#no-synthesis) - the only way to populate
-        /// this is via `extract_str` against a real source row.
+        /// has placeholder shapes. The seal makes synthesized names
+        /// unconstructable from adapter code (spec.md#no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         params: Value,
@@ -231,9 +229,8 @@ pub enum PartKind {
         /// In claude-code, name lives only on the prior `tool_use` row;
         /// the adapter resolves via a per-file `tool_use_id -> name`
         /// map and surfaces a miss (e.g. compaction pruned the originating
-        /// call) as `None`. The seal prevents the previous "unknown"
-        /// sentinel: a misresolution flows as `None`, never as a
-        /// fabricated string (spec.md#no-synthesis).
+        /// call) as `None`, never as a fabricated string
+        /// (spec.md#no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         is_failure: bool,
@@ -513,7 +510,7 @@ pub struct IngestResult {
     pub pk: Value,
     pub status: IngestStatus,
     /// Set only when `status = "error"`. Carries the same shape as the
-    /// envelope-level error body in 3.6.1.
+    /// envelope-level error body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorBody>,
 }
@@ -523,7 +520,7 @@ pub struct IngestResult {
 pub enum IngestStatus {
     /// New PK; `merge_insert` wrote a fresh row.
     Inserted,
-    /// PK existed; `merge_insert` matched it (no-op per invariant 2).
+    /// PK existed; `merge_insert` matched it (no-op per spec.md#additive-sync).
     Matched,
     /// Per-row failure: validation or storage error. See `error` field.
     Error,

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::{embed::LazyEmbedder, sessions::Store};
+use crate::{config::SearchConfig, embed::LazyEmbedder, sessions::Store};
 
 /// Shared state handed to both transports. `embedder` holds a lazy handle:
 /// the model isn't loaded until the first hybrid search asks for it, so
@@ -19,6 +19,7 @@ use crate::{embed::LazyEmbedder, sessions::Store};
 pub struct AppState {
     pub store: Arc<Store>,
     pub embedder: Arc<LazyEmbedder>,
+    pub search: SearchConfig,
 }
 
 pub mod http {
@@ -133,7 +134,7 @@ pub mod http {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(envelope));
             }
         };
-        let envelope = pond_search(&state.store, embedder.as_deref(), request).await;
+        let envelope = pond_search(&state.store, embedder.as_deref(), request, &state.search).await;
         let status = match &envelope {
             SearchEnvelope::Success(_) => StatusCode::OK,
             SearchEnvelope::Error(error) => status_for(&error.error.code),
@@ -201,8 +202,7 @@ pub mod http {
             return error_response(code, envelope);
         }
 
-        // `since` query param wins over `Last-Event-ID` header (per 3.6.5
-        // "Explicit `since` wins if both set.").
+        // `since` query param wins over `Last-Event-ID` header.
         let since_raw = params.since.clone().or_else(|| {
             headers
                 .get("last-event-id")
@@ -245,7 +245,7 @@ pub mod http {
     }
 
     /// Map a wire error code to an HTTP status. The envelope body still carries
-    /// the full typed error (3.6.1); the status is the coarse signal.
+    /// the full typed error; the status is the coarse signal.
     fn status_for(code: &ErrorCode) -> StatusCode {
         match code {
             ErrorCode::ValidationFailed
@@ -429,7 +429,14 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             let embedder = self.state.embedder.get().await.map_err(|error| {
                 ErrorData::internal_error(format!("embedder load failed: {error}"), None)
             })?;
-            match run_search(&self.state.store, embedder.as_deref(), request).await {
+            match run_search(
+                &self.state.store,
+                embedder.as_deref(),
+                request,
+                &self.state.search,
+            )
+            .await
+            {
                 SearchEnvelope::Success(response) => json_result(&response),
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }

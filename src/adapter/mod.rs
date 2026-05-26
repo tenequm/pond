@@ -339,8 +339,6 @@ pub fn probe_all(env: &Env) -> Vec<(&'static str, Value)> {
         .collect()
 }
 
-// -- shared helpers used by file-tree-based adapters ---------------------------
-
 /// Stable Part-row id: `"{message_id}:{ordinal:04}"`. Both JSONL adapters use
 /// this shape so the cross-adapter id space stays predictable.
 pub(crate) fn part_id(message_id: &str, ordinal: usize) -> String {

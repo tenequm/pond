@@ -10,14 +10,147 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::xlm_roberta::{Config, XLMRobertaModel};
+use tokenizers::Tokenizer;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
-use crate::sessions::{EmbeddedMessage, PendingMessage, Store};
+use crate::sessions::{EmbeddedMessage, PendingMessage, Store, embedding_dim};
 
-pub mod e5;
-pub use e5::E5Embedder;
+/// e5's training context. The tokenizer truncates input past it before
+/// inference - one message, one vector, bounded embed cost.
+const MAX_TOKENS: usize = 512;
+
+/// The e5 backend: XLM-RoBERTa weights on the GPU (Metal on macOS, CUDA on a
+/// `cuda`-feature non-macOS build, CPU otherwise). `forward` is `&self`, so no
+/// interior mutability is needed.
+pub struct E5Embedder {
+    model: XLMRobertaModel,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+impl E5Embedder {
+    /// Load the configured XLM-RoBERTa model from HuggingFace (cached after
+    /// the first download) onto the best available device.
+    pub fn load() -> Result<Self> {
+        let device = select_device();
+        let id = model_id();
+        let api = hf_hub::api::sync::Api::new().context("init HuggingFace hub client")?;
+        let repo = api.model(id.to_owned());
+        let fetch = |file: &str| {
+            repo.get(file)
+                .with_context(|| format!("fetch {file} for {id}"))
+        };
+
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(fetch("config.json")?)?)?;
+        if config.hidden_size != embedding_dim() {
+            return Err(anyhow!(
+                "[embeddings].dim = {} but model {id:?} reports hidden_size = {}; \
+                 set [embeddings].dim to match the model's output width.",
+                embedding_dim(),
+                config.hidden_size,
+            ));
+        }
+        let tensors = candle_core::safetensors::load(fetch("model.safetensors")?, &device)?;
+        let tensors = tensors
+            .into_iter()
+            .map(|(name, tensor)| Ok((name, tensor.to_dtype(DType::F16)?)))
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F16, &device);
+        let model = XLMRobertaModel::new(&config, vb)
+            .map_err(|error| anyhow!("load {id} weights: {error}"))?;
+
+        let mut tokenizer = Tokenizer::from_file(fetch("tokenizer.json")?)
+            .map_err(|error| anyhow!("load e5 tokenizer: {error}"))?;
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            pad_id: config.pad_token_id,
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|error| anyhow!("configure e5 tokenizer: {error}"))?;
+
+        tracing::info!(model = %id, device = device_label(&device), "loaded embedding model");
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
+    }
+
+    /// The device the weights are on - `"metal"`, `"cuda"`, or `"cpu"`.
+    pub fn device(&self) -> &'static str {
+        device_label(&self.device)
+    }
+}
+
+impl EmbedBackend for E5Embedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|error| anyhow!("tokenize embedding batch: {error}"))?;
+        let mut ids = Vec::with_capacity(encodings.len());
+        let mut masks = Vec::with_capacity(encodings.len());
+        for encoding in &encodings {
+            ids.push(Tensor::new(encoding.get_ids(), &self.device)?);
+            masks.push(Tensor::new(encoding.get_attention_mask(), &self.device)?);
+        }
+        let input_ids = Tensor::stack(&ids, 0)?;
+        let attention_mask = Tensor::stack(&masks, 0)?;
+        let token_type_ids = input_ids.zeros_like()?;
+        let hidden = self
+            .model
+            .forward(
+                &input_ids,
+                &attention_mask,
+                &token_type_ids,
+                None,
+                None,
+                None,
+            )?
+            .to_dtype(DType::F32)?;
+        let mask = attention_mask.to_dtype(DType::F32)?.unsqueeze(2)?;
+        let summed = hidden.broadcast_mul(&mask)?.sum(1)?;
+        let counts = mask.sum(1)?;
+        let mean = summed.broadcast_div(&counts)?;
+        let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?;
+        mean.broadcast_div(&norm)?
+            .to_vec2::<f32>()
+            .map_err(|error| anyhow!("read embedding vectors: {error}"))
+    }
+}
+
+fn select_device() -> Device {
+    #[cfg(target_os = "macos")]
+    let device = Device::metal_if_available(0);
+    #[cfg(not(target_os = "macos"))]
+    let device = Device::cuda_if_available(0);
+    device.unwrap_or_else(|error| {
+        tracing::warn!(%error, "GPU device unavailable, falling back to CPU");
+        Device::Cpu
+    })
+}
+
+fn device_label(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "cpu",
+        Device::Cuda(_) => "cuda",
+        Device::Metal(_) => "metal",
+    }
+}
 
 /// Lazy holder for the embedding backend used by long-running `pond serve` /
 /// `pond mcp`: the model isn't loaded until the first hybrid search asks for
@@ -177,6 +310,7 @@ type ProgressFn = Box<dyn Fn(BatchProgress) + Send + Sync>;
 pub struct EmbedWorker<'a, B: EmbedBackend> {
     store: &'a Store,
     backend: &'a B,
+    include_stale: bool,
     /// Optional cap on total messages embedded in one `run` - `None` in
     /// production (embed everything), set by the benchmark harness to a fixed
     /// count so a run is a stable, comparable workload.
@@ -201,6 +335,7 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         Self {
             store,
             backend,
+            include_stale: false,
             limit: None,
             sort_window: DEFAULT_SORT_WINDOW,
             progress: None,
@@ -250,6 +385,11 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         self
     }
 
+    pub fn include_stale(mut self) -> Self {
+        self.include_stale = true;
+        self
+    }
+
     /// Embed every message whose `vector` is still null. Idempotent: a re-run
     /// over an already-embedded corpus finds an empty backlog and is a no-op.
     ///
@@ -260,8 +400,13 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         let mut window: Vec<PendingMessage> = Vec::with_capacity(self.sort_window);
         let mut pulled = 0usize;
 
-        let stream = self.store.pending_embedding_messages();
-        tokio::pin!(stream);
+        let mut stream = if self.include_stale {
+            Box::pin(self.store.pending_or_stale_messages())
+                as std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PendingMessage>> + '_>>
+        } else {
+            Box::pin(self.store.pending_embedding_messages())
+                as std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PendingMessage>> + '_>>
+        };
         while let Some(pending) = stream.next().await {
             // Stop pulling once the message cap is reached or cancellation
             // fires; the staged window is still drained below, so the

@@ -154,7 +154,6 @@ pub fn extract_raw_record(row: &Value) -> Value {
     bounded
 }
 
-// ----- serde integration -----
 //
 // Round-tripping `Extracted<T>` through serde is required because
 // `PartKind::Text { text: Option<Extracted<String>> }` (and friends) are
@@ -177,8 +176,6 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Extracted<T> {
         T::deserialize(deserializer).map(wrap)
     }
 }
-
-// ----- Source trait -----
 
 /// One row of source data, abstracted across transports. Adapter authors
 /// implement this for whatever type carries one event from their source:
@@ -233,7 +230,6 @@ pub trait Source {
     fn compact_repr(&self) -> String;
 }
 
-// ----- extract_* helpers -----
 //
 // These are the ONLY public producers of `Option<Extracted<T>>`. Anything
 // else that needs to put a value into a schema field has to go through
@@ -288,7 +284,6 @@ pub fn extract_compact_repr(source: &dyn Source) -> Extracted<String> {
     wrap(repr)
 }
 
-// ----- impl Source for serde_json::Value -----
 //
 // The default implementation for JSON-flavored adapters. Sits at the
 // seam, not inside a specific adapter, so claude-code, codex-cli, and

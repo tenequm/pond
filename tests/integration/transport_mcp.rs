@@ -125,13 +125,13 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         "synthetic ingest should succeed: {envelope:?}",
     );
     let backend = FakeBackend;
-    // spec.md#fold-on-write: each merge inside ingest / EmbedWorker
-    // already folded the touched indices forward.
     EmbedWorker::new(&store, &backend).run().await?;
+    store.optimize_indices().await?;
 
     Ok(AppState {
         store: Arc::new(store),
         embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
+        search: pond::config::SearchConfig::default(),
     })
 }
 

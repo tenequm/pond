@@ -111,7 +111,9 @@ async fn main() -> Result<()> {
                         sync_errors += 1;
                         *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
                     }
-                    SyncStatus::Partial { dropped_events } => {
+                    SyncStatus::Partial {
+                        dropped_events, ..
+                    } => {
                         sync_partial += 1;
                         sync_partial_drops += *dropped_events as u64;
                     }
@@ -291,7 +293,12 @@ impl<S: Subscriber> Layer<S> for PerfLayer {
         event.record(&mut fields);
         let message = fields.message.as_deref().unwrap_or("");
         match message {
-            "merge_insert" => {
+            // Post-overhaul (2026-05-26) probe shape: one `"merge"` event covers
+            // both insert and update paths; `op` carries the variant.
+            "merge" => {
+                if fields.string("op").as_deref() != Some("merge_insert") {
+                    return;
+                }
                 let table = fields.string("table").unwrap_or_else(|| "?".to_owned());
                 let rows = fields.u64("rows").unwrap_or(0);
                 let ms = fields.u64("elapsed_ms").unwrap_or(0);

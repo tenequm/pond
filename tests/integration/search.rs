@@ -8,6 +8,7 @@
 
 use pond::{
     adapter::ClaudeCodeAdapter,
+    config::SearchConfig,
     embed::{EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
     handlers::pond_get,
@@ -57,15 +58,16 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
 async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
-    // spec.md#fold-on-write: ingest_adapter folds the FTS + scalar indices
-    // inline on each merge, so by the time it returns the indices already
-    // cover every appended row. EmbedWorker likewise folds-on-write per
-    // window. No separate post-ingest / post-embed upkeep call.
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
+    store.optimize_indices().await?;
     Ok((store, backend))
+}
+
+fn search_config() -> SearchConfig {
+    SearchConfig::default()
 }
 
 fn search_request(query: &str) -> SearchRequest {
@@ -158,7 +160,16 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
     let phrase = corpus_phrase(&store).await?;
 
     let hits = body_hits(
-        success_of(pond_search(&store, Some(&backend), search_request(&phrase)).await).result,
+        success_of(
+            pond_search(
+                &store,
+                Some(&backend),
+                search_request(&phrase),
+                &search_config(),
+            )
+            .await,
+        )
+        .result,
     );
     assert!(!hits.is_empty(), "hybrid search must return hits");
     for pair in hits.windows(2) {
@@ -183,8 +194,10 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
     }
 
     // Case 2: embedder is `None` -> FTS-only.
-    let hits =
-        body_hits(success_of(pond_search(&store, None, search_request(&phrase)).await).result);
+    let hits = body_hits(
+        success_of(pond_search(&store, None, search_request(&phrase), &search_config()).await)
+            .result,
+    );
     assert!(!hits.is_empty(), "fts must still return hits");
     for hit in &hits {
         assert_eq!(hit.matched_via, ["fts"]);
@@ -203,7 +216,16 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
     )
     .await?;
     let hits = body_hits(
-        success_of(pond_search(&store2, Some(&backend), search_request(&phrase)).await).result,
+        success_of(
+            pond_search(
+                &store2,
+                Some(&backend),
+                search_request(&phrase),
+                &search_config(),
+            )
+            .await,
+        )
+        .result,
     );
     for hit in &hits {
         assert_eq!(hit.matched_via, ["fts"]);
@@ -220,7 +242,7 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     // role: every hit carries the requested role.
     let mut request = search_request(&phrase);
     request.filters.role = Some("assistant".to_owned());
-    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
     assert!(!hits.is_empty(), "the corpus has assistant messages");
     assert!(hits.iter().all(|hit| hit.role == "assistant"));
 
@@ -233,31 +255,45 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
         .expect("the corpus has at least one session");
     let mut request = search_request(&phrase);
     request.filters.session_id = Some(session_id.clone());
-    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
     assert!(hits.iter().all(|hit| hit.session_id == session_id));
 
     // source_agent: the real agent returns hits; an unknown one returns none.
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("claude-code".to_owned());
-    assert!(!hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
+    assert!(
+        !hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
+    );
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("no-such-agent".to_owned());
-    assert!(hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
+    assert!(
+        hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
+    );
 
     // date window: a far-future lower bound excludes the whole corpus.
     let mut request = search_request(&phrase);
     request.filters.from_date = Some("2099-01-01".to_owned());
-    assert!(hits_of(pond_search(&store, Some(&backend), request).await).is_empty());
+    assert!(
+        hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
+    );
 
     // project (contains): every hit is scoped to the requested project.
-    let project = hits_of(pond_search(&store, Some(&backend), search_request(&phrase)).await)
-        .into_iter()
-        .map(|hit| hit.project)
-        .find(|p| !p.is_empty())
-        .expect("fixture hits carry a project");
+    let project = hits_of(
+        pond_search(
+            &store,
+            Some(&backend),
+            search_request(&phrase),
+            &search_config(),
+        )
+        .await,
+    )
+    .into_iter()
+    .map(|hit| hit.project)
+    .find(|p| !p.is_empty())
+    .expect("fixture hits carry a project");
     let mut request = search_request(&phrase);
     request.filters.project = Some(ProjectFilter::Contains(project.clone()));
-    let hits = hits_of(pond_search(&store, Some(&backend), request).await);
+    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
     assert!(!hits.is_empty());
     assert!(
         hits.iter()
@@ -275,7 +311,8 @@ async fn group_by_conversation_collapses_to_one_summary_per_session() -> anyhow:
 
     let mut request = search_request(&phrase);
     request.group_by_conversation = true;
-    let SearchEnvelope::Success(response) = pond_search(&store, Some(&backend), request).await
+    let SearchEnvelope::Success(response) =
+        pond_search(&store, Some(&backend), request, &search_config()).await
     else {
         panic!("grouped search must succeed");
     };
@@ -357,7 +394,7 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         group_by_conversation: false,
         limit: 50,
     };
-    let hits = hits_of(pond_search(&store, None, request).await);
+    let hits = hits_of(pond_search(&store, None, request, &search_config()).await);
     assert!(
         hits.iter().all(|hit| hit.message_id != "u-notify"),
         "an injected task-notification must never surface as a search hit"
