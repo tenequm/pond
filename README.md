@@ -3,65 +3,98 @@
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
-Your own small-scale data lake.
+Your own small-scale data lake for agentic-client sessions.
 
-A unified storage and retrieval layer for sessions produced by any agentic client (Claude Code, Codex, OpenCode, Cursor, aider, ChatGPT, Gemini CLI, ...). One Rust binary, two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. Lance file format on object storage. No SQL.
+One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
 
 ## Table of Contents
 
-- [Status](#status)
 - [Background](#background)
+- [Install](#install)
+- [Usage](#usage)
 - [Design](#design)
 - [References](#references)
 - [Contributing](#contributing)
 - [License](#license)
 
-## Status
-
-Pre-v1. The Rust crate builds clean and the v1 surface is in place: eight CLI verbs, HTTP+JSON and MCP transports, hybrid search (BM25 + vector + RRF) over three Lance datasets, e5-base embeddings via `candle-transformers` (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. A background maintenance loop runs `cleanup_old_versions` + `optimize_indices` on a configurable interval. Schemas, wire shapes, and config keys are subject to breaking change until v1.
-
-Repository layout:
-
-- `src/` - the pond Rust crate (modules: `adapter/`, `embed/`, `config`, `handlers`, `sessions`, `substrate`, `transport`, `wire`).
-- `docs/spec.md` - the locked-in v1 specification.
-- `docs/references/` - frozen snapshots of the upstream schemas pond's design draws from.
-- `tests/` - integration tests; `tests/fixtures/adapter/` holds real session captures from eight source harnesses, used as SourceAdapter test fixtures.
-- `docs/archive/` - historical design notes and the resolved open-questions log.
-
 ## Background
 
 Every agentic CLI ships its own session format and its own search surface. Switching tools means losing history. Replaying a Claude Code session in another provider's tooling means re-translating the wire shape by hand. Hosted multi-tenant deployments rebuild the same storage layer from scratch.
 
-Pond is one Rust binary that ingests sessions from any source, stores them losslessly in a canonical Part union (modeled on Effect v4's `Prompt`-side types), and serves them via HTTP+JSON or MCP. Storage, hybrid search (BM25 + vector + RRF), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
+Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, hybrid search (BM25 + vector, score-normalized fusion), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
 
-Two day-1 use cases:
+Pre-v1. The crate builds clean and the v1 surface is in place: full CLI, HTTP+JSON and MCP transports, hybrid search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md) for the locked-in specification.
 
-1. **Personal**: replace a per-tool knowledge base. Ingest local Claude Code sessions, hybrid-search them, retrieve them for replay.
-2. **Hosted**: storage and search backend for multi-tenant agent deployments. Each namespace is an opaque-string isolation boundary; the integrator owns identity, access, and routing.
+## Install
 
-See `docs/spec.md` for the full rationale.
+Pond is a single static binary built from source. Linux and macOS are supported; Windows is not in v1 scope.
+
+```sh
+git clone https://github.com/tenequm/pond.git
+cd pond
+cargo install --path .
+```
+
+For CUDA acceleration on Linux:
+
+```sh
+cargo install --path . --features cuda
+```
+
+On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
+
+## Usage
+
+Ingest sessions from local sources, embed them, and search:
+
+```sh
+pond sync
+pond embed
+pond search "how did we wire up the OCC retry loop"
+```
+
+Run a server (HTTP + MCP on the same binary):
+
+```sh
+pond serve            # HTTP+JSON on 127.0.0.1, MCP route mounted alongside
+pond mcp              # MCP over stdio, for direct agent integration
+```
+
+Fetch a single session or message, or export the whole pond as canonical ingest events:
+
+```sh
+pond get --session-id <id>
+pond export > snapshot.jsonl
+```
+
+Index maintenance is operator-triggered (writes never fold indexes; a trailing index returns complete results, just slower):
+
+```sh
+pond index status
+pond index optimize --wait
+pond index rebuild <intent>     # escape hatch for tokenizer-config changes
+```
+
+`pond status` reports row counts, embedding coverage, and index health. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
 ## Design
 
-The specification lives at [`docs/spec.md`](docs/spec.md).
+The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 
-Key choices:
-
-- Rust + tokio, single static binary.
-- `lance-format/lance` crates direct as the only storage and search engine. No `lancedb` wrapper, no SQL, no additional database.
-- `object_store` (via Lance) for storage substrate: S3 / GCS / Azure / local filesystem.
-- Canonical session types owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This is the moat. Response-side metadata is projected into per-Message Lance columns, not stored as Parts.
-- Three Lance datasets: `sessions`, `messages`, `parts`. `messages` carries both the embedding vector (`vector` + `embedding_model`) and the hot filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown on hybrid search.
-- One adapter trait, `SourceAdapter`, with a deterministic event-ordering contract. Everything else (storage, indexing, OCC, time-travel, namespaces, manifest versioning, blob storage) is Lance direct - no extra "seam" abstractions.
-- Append-only writes. Replay (cross-provider re-projection) is deferred to section 4.
-- v1 surface: two transports - HTTP+JSON (`POST /v1/<op>` plus SSE) and MCP (rmcp), wrapping the same handlers. Operations: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. CLI verbs out of band: `pond status`, `pond sync`, `pond embed`, `pond serve`, `pond mcp`, `pond config`, `pond export`.
-- Default embeddings: `intfloat/multilingual-e5-base` (XLM-RoBERTa, 768-dim, 512-token context, MIT) on `candle-transformers` - Metal GPU on macOS automatically, CUDA via the opt-in `cuda` feature, CPU otherwise.
-- Multi-tenancy via opaque namespace strings; bucket prefix per namespace; separate buckets when KMS isolation matters.
-- Encryption is operational (bucket SSE + filesystem encryption), not application-level.
+- **Lance direct, no wrapper.** The `lance-format/lance` crates are the only storage and search engine. No `lancedb`, no SQL, no parallel abstraction. Storage, indexing, OCC, schema evolution, blob columns, versioning, and time-travel are all Lance.
+- **Canonical Session / Message / Part interlingua.** Owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This schema is pond's product; everything else is machinery around it.
+- **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
+- **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `no-synthesis`, `schema-honesty`, and `provenance-required` are structural, not review rules.
+- **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. Operators run `pond index optimize` on their own cadence; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
+- **Score-normalized hybrid fusion.** Per-arm shaping (max-norm BM25 for FTS, rank-norm for vector), min-max to [0, 1], then weighted sum. Session-root-keyed dedup so cross-arm agreement compounds at the conversation level.
+- **Language-neutral full-text.** Character `ngram` tokenizer (3-5), no monolingual stemmer - pond indexes sessions in any language alike.
+- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. MCP also exposes `schema://pond` and `stats://pond` resources.
+- **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
+- **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.
 
 ## References
 
-`docs/references/` holds frozen snapshots of upstream schemas; real session samples live under `tests/fixtures/adapter/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
+`docs/references/` holds frozen snapshots of upstream schemas; real session captures live under `tests/fixtures/adapter/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
 
 | Path | Source | Why kept |
 |------|--------|----------|
@@ -71,20 +104,18 @@ Key choices:
 | `docs/references/pi-mono/` | github.com/badlogic/pi-mono | Leaf-cursor branching and cross-provider conformance test matrix. |
 | `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
 | `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
-| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude-code, claude-app, claude-managed-agents, codex, opencode, openclaw, nanoclaw, pi). Drives adapter design, stress-tests the schema, and serves as SourceAdapter test fixtures. |
-
-To refresh a snapshot, see the maintenance instructions in [`docs/references/README.md`](docs/references/README.md).
+| `docs/references/recursive-language-models-study-2512.24601v3.pdf` | arXiv 2512.24601 | Long context as a queryable environment; recursion as sub-agent spawning - corroborates the linked-Sessions branching model. |
+| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as SourceAdapter test fixtures. |
 
 ## Contributing
 
-Issues and pull requests are welcome. The most useful contributions right now are:
+Issues and pull requests are welcome. The most useful contributions right now:
 
-- Spec feedback on `docs/spec.md`.
+- Spec feedback on [`docs/spec.md`](docs/spec.md).
 - Pointers to additional reference schemas or session samples worth snapshotting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
-- Corrections to the design doc.
 
-For larger changes, please open an issue first to discuss the direction.
+For larger changes, open an issue first to discuss the direction.
 
 ## License
 
