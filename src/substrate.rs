@@ -178,6 +178,85 @@ impl std::fmt::Display for ConflictExhausted {
 
 impl std::error::Error for ConflictExhausted {}
 
+/// Per-phase result for one table's pass through `Handle::optimize_table`.
+/// spec.md#substrate 3.7 (`index-write-decoupled`): the indices phase and the
+/// compaction phase get independent retry budgets and independent commits,
+/// so a hot writer that starves the Rewrite cannot abort the index Update.
+#[derive(Debug)]
+pub enum PhaseOutcome {
+    /// Phase attempted and committed work.
+    Ok,
+    /// Phase attempted; no work was needed.
+    Noop,
+    /// Phase attempted; OCC retry budget exhausted on conflict (the operator
+    /// can rerun later once the hot writer quiesces).
+    SkippedConflict,
+    /// Phase failed with a non-conflict error.
+    Failed(anyhow::Error),
+    /// Phase not requested by the caller (e.g. compaction skipped under
+    /// `Store::build_indices_only`).
+    NotAttempted,
+}
+
+impl PhaseOutcome {
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// What `Handle::optimize_table` did for one table.
+#[derive(Debug)]
+pub struct TableOptimizeOutcome {
+    pub table: Table,
+    pub indices: PhaseOutcome,
+    pub compaction: PhaseOutcome,
+}
+
+/// Boundary event during one `Handle::optimize_table` pass. The CLI binds a
+/// progress callback to render a live spinner; library callers pass `None`.
+#[derive(Debug, Clone)]
+pub enum OptimizeEvent {
+    PhaseStart {
+        table: Table,
+        phase: OptimizePhase,
+        detail: Option<String>,
+    },
+    PhaseDone {
+        table: Table,
+        phase: OptimizePhase,
+        elapsed_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OptimizePhase {
+    Compact,
+    Cleanup,
+    IndexCreate,
+    IndexRebuild,
+    IndexAppend,
+}
+
+impl OptimizePhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Cleanup => "cleanup",
+            Self::IndexCreate => "index-create",
+            Self::IndexRebuild => "index-rebuild",
+            Self::IndexAppend => "index-append",
+        }
+    }
+}
+
+pub type OptimizeProgressFn = Box<dyn Fn(OptimizeEvent) + Send + Sync>;
+
+fn emit(progress: Option<&OptimizeProgressFn>, event: OptimizeEvent) {
+    if let Some(callback) = progress {
+        callback(event);
+    }
+}
+
 /// True when the chain root is one of Lance's commit-conflict variants
 /// (`CommitConflict`, `RetryableCommitConflict`, `TooMuchWriteContention`).
 /// Everything else (timeouts, IAM denials, disk errors) is not a conflict.
@@ -190,6 +269,12 @@ pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
                 | lance::Error::TooMuchWriteContention { .. }
         )
     })
+}
+
+/// True when `retry_lance` exhausted retries against an OCC conflict and
+/// attached `ConflictExhausted` to the chain head.
+fn is_conflict_exhausted(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ConflictExhausted>())
 }
 
 /// On-disk byte totals for the three session datasets, plus everything else
@@ -421,7 +506,7 @@ impl Handle {
     /// Open with object-store options handed through to Lance verbatim.
     /// Object-store keys are the `object_store` crate's standard config
     /// names; pond does not parse them. Opening datasets never performs index
-    /// work; index lifecycle lives under `Handle::optimize_indices`.
+    /// work; index lifecycle lives under `Handle::optimize_table`.
     pub async fn open_with_options(
         location: &Url,
         storage_options: HashMap<String, String>,
@@ -540,7 +625,7 @@ impl Handle {
 
     /// Insert-only merge: append new rows, never overwrite a matched PK.
     /// Returns rows inserted. The fold lives separately under
-    /// `Handle::optimize_indices` (spec.md#index-write-decoupled).
+    /// `Handle::optimize_table` (spec.md#index-write-decoupled).
     pub(crate) async fn merge_insert(
         &self,
         table: Table,
@@ -559,7 +644,7 @@ impl Handle {
     }
 
     /// Update-only merge: `WhenMatched::UpdateAll` on matched PKs; unmatched
-    /// rows dropped. The fold lives separately under `Handle::optimize_indices`.
+    /// rows dropped. The fold lives separately under `Handle::optimize_table`.
     pub(crate) async fn merge_update(
         &self,
         table: Table,
@@ -631,15 +716,91 @@ impl Handle {
     /// Run the table-local maintenance cycle for the supplied index intents.
     /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
     /// BTree combine bug; Bitmap, FTS, and IVF_PQ fold via append.
-    pub async fn optimize_indices(&self, table: Table, intents: &[IndexIntent]) -> Result<()> {
-        self.retry_lance(table.label(), || async {
-            let mut guard = self.cached(table).lock().await;
-            let mut dataset = guard.latest().await?;
-            optimize_table(&mut dataset, intents).await?;
-            guard.replace(dataset);
-            Ok(())
-        })
-        .await
+    ///
+    /// spec.md#substrate 3.7 (`index-write-decoupled`): indices and compaction
+    /// commit independently and use independent retry budgets, so a hot writer
+    /// that starves compaction (Rewrite) does not abort the index build
+    /// (Update) the operator actually asked for.
+    pub async fn optimize_table(
+        &self,
+        table: Table,
+        intents: &[IndexIntent],
+        progress: Option<&OptimizeProgressFn>,
+        cleanup: crate::sessions::CleanupConfig,
+    ) -> TableOptimizeOutcome {
+        let compaction = self
+            .run_optimize_compact_phase(table, progress, cleanup)
+            .await;
+        let indices = self
+            .run_optimize_indices_phase(table, intents, progress)
+            .await;
+        TableOptimizeOutcome {
+            table,
+            indices,
+            compaction,
+        }
+    }
+
+    /// Run only the indices phase for one table. Used by `pond embed`'s tail
+    /// to fold newly written vectors into the indices without paying the
+    /// compaction retry budget while embed itself may still be writing.
+    pub async fn optimize_table_indices_only(
+        &self,
+        table: Table,
+        intents: &[IndexIntent],
+        progress: Option<&OptimizeProgressFn>,
+    ) -> PhaseOutcome {
+        self.run_optimize_indices_phase(table, intents, progress)
+            .await
+    }
+
+    async fn run_optimize_indices_phase(
+        &self,
+        table: Table,
+        intents: &[IndexIntent],
+        progress: Option<&OptimizeProgressFn>,
+    ) -> PhaseOutcome {
+        if intents.is_empty() {
+            return PhaseOutcome::Noop;
+        }
+        let result = self
+            .retry_lance(table.label(), || async {
+                let mut guard = self.cached(table).lock().await;
+                let mut dataset = guard.latest().await?;
+                let did_work =
+                    optimize_table_indices(&mut dataset, intents, table, progress).await?;
+                guard.replace(dataset);
+                Ok::<_, anyhow::Error>(did_work)
+            })
+            .await;
+        match result {
+            Ok(true) => PhaseOutcome::Ok,
+            Ok(false) => PhaseOutcome::Noop,
+            Err(error) if is_conflict_exhausted(&error) => PhaseOutcome::SkippedConflict,
+            Err(error) => PhaseOutcome::Failed(error),
+        }
+    }
+
+    async fn run_optimize_compact_phase(
+        &self,
+        table: Table,
+        progress: Option<&OptimizeProgressFn>,
+        cleanup: crate::sessions::CleanupConfig,
+    ) -> PhaseOutcome {
+        let result = self
+            .retry_lance(table.label(), || async {
+                let mut guard = self.cached(table).lock().await;
+                let mut dataset = guard.latest().await?;
+                optimize_table_compact(&mut dataset, table, progress, cleanup).await?;
+                guard.replace(dataset);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+        match result {
+            Ok(()) => PhaseOutcome::Ok,
+            Err(error) if is_conflict_exhausted(&error) => PhaseOutcome::SkippedConflict,
+            Err(error) => PhaseOutcome::Failed(error),
+        }
     }
 
     pub async fn rebuild_index(&self, table: Table, intent: &IndexIntent) -> Result<()> {
@@ -903,35 +1064,97 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Result<()> {
-    if intents.is_empty() {
-        return Ok(());
-    }
-    let started = Instant::now();
-
-    // Lance does not expose a single `optimize()` entrypoint at this pin, so
-    // pond runs compaction + index update + version cleanup in one retry block.
-    // spec.md#index-write-decoupled mandates FRI on by default, but at
-    // v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
-    // panics in `optimize.rs::commit_compaction` with "defer_index_remap
-    // requires row_addrs but none were provided": `rewrite_files` skips
-    // row_addrs when stable row ids are on, then the FRI builder demands
-    // them. With stable_row_ids the remap step is already a no-op
-    // (`optimize.rs:1490`: `needs_remapping = !uses_stable_row_ids() &&
-    // !defer_index_remap`), so running without FRI is correct - we only
-    // lose the documented concurrency-with-index-build benefit. Flip to
-    // `true` once upstream fixes the conflict.
+/// Compaction phase: `compact_files` + `cleanup_old_versions`, both inside one
+/// retry block. Distinct from the indices phase so a hot writer that loses the
+/// Rewrite race here does not abort index work the operator actually asked for.
+///
+/// spec.md#index-write-decoupled mandates FRI on by default, but at
+/// v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
+/// panics in `optimize.rs::commit_compaction` with "defer_index_remap
+/// requires row_addrs but none were provided": `rewrite_files` skips
+/// row_addrs when stable row ids are on, then the FRI builder demands
+/// them. With stable_row_ids the remap step is already a no-op
+/// (`optimize.rs:1490`: `needs_remapping = !uses_stable_row_ids() &&
+/// !defer_index_remap`), so running without FRI is correct - we only
+/// lose the documented concurrency-with-index-build benefit. Flip to
+/// `true` once upstream fixes the conflict.
+async fn optimize_table_compact(
+    dataset: &mut Dataset,
+    table: Table,
+    progress: Option<&OptimizeProgressFn>,
+    cleanup: crate::sessions::CleanupConfig,
+) -> Result<()> {
     let compaction = CompactionOptions {
         defer_index_remap: false,
         ..CompactionOptions::default()
     };
-    compact_files(dataset, compaction, None).await?;
 
+    emit(
+        progress,
+        OptimizeEvent::PhaseStart {
+            table,
+            phase: OptimizePhase::Compact,
+            detail: None,
+        },
+    );
+    let started = Instant::now();
+    compact_files(dataset, compaction, None).await?;
+    emit(
+        progress,
+        OptimizeEvent::PhaseDone {
+            table,
+            phase: OptimizePhase::Compact,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    );
+
+    emit(
+        progress,
+        OptimizeEvent::PhaseStart {
+            table,
+            phase: OptimizePhase::Cleanup,
+            detail: None,
+        },
+    );
+    let started = Instant::now();
+    // delete_unverified=true is the operator opt-in via `--cleanup-older-than`
+    // / `--vacuum` that bypasses Lance's 7-day in-progress safety guard
+    // (UNVERIFIED_THRESHOLD_DAYS in lance/dataset/cleanup.rs). Required to
+    // reclaim files younger than 7 days; unsafe under concurrent writers.
+    dataset
+        .cleanup_old_versions(
+            cleanup.older_than,
+            Some(cleanup.delete_unverified),
+            Some(false),
+        )
+        .await
+        .context("cleanup_old_versions failed during index optimize")?;
+    emit(
+        progress,
+        OptimizeEvent::PhaseDone {
+            table,
+            phase: OptimizePhase::Cleanup,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    );
+
+    Ok(())
+}
+
+/// Indices phase: per-intent create/rebuild + batched `optimize_indices(append)`
+/// for incremental families. Returns `true` if anything committed.
+async fn optimize_table_indices(
+    dataset: &mut Dataset,
+    intents: &[IndexIntent],
+    table: Table,
+    progress: Option<&OptimizeProgressFn>,
+) -> Result<bool> {
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
         existing.iter().map(|index| index.name.clone()).collect();
 
     let mut append_indices: Vec<String> = Vec::new();
+    let mut did_work = false;
 
     for intent in intents {
         let exists = existing_names.contains(intent.name);
@@ -947,6 +1170,15 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
                 column = intent.column,
                 "creating Lance index (trigger fired)",
             );
+            emit(
+                progress,
+                OptimizeEvent::PhaseStart {
+                    table,
+                    phase: OptimizePhase::IndexCreate,
+                    detail: Some(intent.name.to_owned()),
+                },
+            );
+            let started = Instant::now();
             dataset
                 .create_index(
                     &[intent.column],
@@ -957,6 +1189,15 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
                 )
                 .await
                 .with_context(|| format!("failed to create index {}", intent.name))?;
+            emit(
+                progress,
+                OptimizeEvent::PhaseDone {
+                    table,
+                    phase: OptimizePhase::IndexCreate,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+            did_work = true;
             continue;
         }
 
@@ -973,6 +1214,15 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
                     column = intent.column,
                     "rebuilding Lance BTree index",
                 );
+                emit(
+                    progress,
+                    OptimizeEvent::PhaseStart {
+                        table,
+                        phase: OptimizePhase::IndexRebuild,
+                        detail: Some(intent.name.to_owned()),
+                    },
+                );
+                let started = Instant::now();
                 dataset
                     .create_index(
                         &[intent.column],
@@ -983,6 +1233,15 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
                     )
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+                emit(
+                    progress,
+                    OptimizeEvent::PhaseDone {
+                        table,
+                        phase: OptimizePhase::IndexRebuild,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
+                );
+                did_work = true;
             }
             IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
             | IndexParamsKind::InvertedFtsNgram { .. }
@@ -991,6 +1250,15 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
             }
             IndexParamsKind::Scalar(_) => {
                 let params = intent.params.build(dataset).await?;
+                emit(
+                    progress,
+                    OptimizeEvent::PhaseStart {
+                        table,
+                        phase: OptimizePhase::IndexRebuild,
+                        detail: Some(intent.name.to_owned()),
+                    },
+                );
+                let started = Instant::now();
                 dataset
                     .create_index(
                         &[intent.column],
@@ -1001,34 +1269,51 @@ async fn optimize_table(dataset: &mut Dataset, intents: &[IndexIntent]) -> Resul
                     )
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+                emit(
+                    progress,
+                    OptimizeEvent::PhaseDone {
+                        table,
+                        phase: OptimizePhase::IndexRebuild,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
+                );
+                did_work = true;
             }
         }
     }
 
     if !append_indices.is_empty() {
         let to_append = append_indices.clone();
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::IndexAppend,
+                detail: Some(append_indices.join(", ")),
+            },
+        );
+        let started = Instant::now();
         dataset
             .optimize_indices(&OptimizeOptions::append().index_names(to_append))
             .await
             .context("optimize_indices(append) failed during index optimize")?;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::IndexAppend,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
         tracing::debug!(
             target: "pond::perf",
             indices = ?append_indices,
             "appended trailing fragments into indices",
         );
+        did_work = true;
     }
 
-    dataset
-        .cleanup_old_versions(chrono::Duration::days(7), None, Some(false))
-        .await
-        .context("cleanup_old_versions failed during index optimize")?;
-
-    tracing::debug!(
-        target: "pond::perf",
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "index optimize complete",
-    );
-    Ok(())
+    Ok(did_work)
 }
 
 async fn rebuild_index(dataset: &mut Dataset, intent: &IndexIntent) -> Result<()> {

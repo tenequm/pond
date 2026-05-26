@@ -61,7 +61,7 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices().await?;
+    store.optimize_indices(None, None).await?.into_result()?;
 
     let store = Arc::new(store);
     let state = AppState {

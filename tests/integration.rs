@@ -11,6 +11,8 @@ mod claude_code_ingest;
 mod embed;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
+#[path = "integration/optimize_under_contention.rs"]
+mod optimize_under_contention;
 #[path = "integration/recovery.rs"]
 mod recovery;
 #[path = "integration/remote_backend.rs"]

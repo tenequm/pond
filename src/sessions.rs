@@ -22,8 +22,9 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     config, embed,
     substrate::{
-        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, Predicate, ScalarValue,
-        ScanOpts, Table, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
+        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, OptimizeProgressFn,
+        PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
+        VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{FileData, Message, Part, PartKind, Role, Session},
 };
@@ -92,6 +93,73 @@ pub struct MessageKey {
 pub enum UpsertStatus {
     Inserted,
     Matched,
+}
+
+/// What one `Store::optimize_indices` or `Store::build_indices_only` pass did
+/// across every table. Each [`TableOptimizeOutcome`] reports phase-by-phase
+/// results so the CLI can render compaction-skipped (under writer contention)
+/// distinctly from index-build failure (real problem).
+#[derive(Debug, Default)]
+pub struct OptimizeOutcome {
+    pub tables: Vec<TableOptimizeOutcome>,
+}
+
+impl OptimizeOutcome {
+    /// True if any table's indices phase reported a non-conflict failure.
+    /// `SkippedConflict` is expected under contention and does not count.
+    pub fn any_indices_failed(&self) -> bool {
+        self.tables.iter().any(|t| t.indices.is_failed())
+    }
+
+    /// Treat any `Failed` phase as an error. Tests that don't run under
+    /// contention use this to keep their existing `.await?` style: a real
+    /// failure becomes an `Err`, while `SkippedConflict` is impossible there.
+    pub fn into_result(self) -> Result<Self> {
+        for table in &self.tables {
+            if let PhaseOutcome::Failed(error) = &table.indices {
+                anyhow::bail!(
+                    "indices phase failed on {}: {error:#}",
+                    table.table.as_str()
+                );
+            }
+            if let PhaseOutcome::Failed(error) = &table.compaction {
+                anyhow::bail!(
+                    "compaction phase failed on {}: {error:#}",
+                    table.table.as_str()
+                );
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// Default manifest-retention window for `pond index optimize`'s explicit
+/// cleanup pass. Matches LanceDB's recommended OSS-operator practice
+/// (lancedb docs: performance.mdx, tables/update.mdx). Note: with
+/// `delete_unverified=false` (default), Lance protects files newer than
+/// 7 days regardless of this value (`UNVERIFIED_THRESHOLD_DAYS` in
+/// lance/dataset/cleanup.rs).
+pub fn default_cleanup_older_than() -> chrono::Duration {
+    chrono::Duration::days(1)
+}
+
+/// Cleanup parameters for the compaction phase of `pond index optimize`.
+/// `delete_unverified=true` overrides Lance's 7-day in-progress safety
+/// guard - required to reclaim files younger than 7 days, unsafe under
+/// concurrent writers.
+#[derive(Debug, Clone, Copy)]
+pub struct CleanupConfig {
+    pub older_than: chrono::Duration,
+    pub delete_unverified: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            older_than: default_cleanup_older_than(),
+            delete_unverified: false,
+        }
+    }
 }
 
 /// What `pond status` reports: where the data lives, total rows per table,
@@ -1047,21 +1115,70 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub async fn optimize_indices(&self) -> Result<()> {
+    /// Run the per-table maintenance cycle (compact + indices) across every
+    /// table, never short-circuiting. spec.md#index-write-decoupled: indices
+    /// and compaction commit independently, so a hot writer that starves
+    /// compaction on one table does not abort the index work the operator
+    /// asked for on other tables (or even on the same table).
+    pub async fn optimize_indices(
+        &self,
+        progress: Option<OptimizeProgressFn>,
+        cleanup: Option<CleanupConfig>,
+    ) -> Result<OptimizeOutcome> {
+        let cleanup = cleanup.unwrap_or_default();
         let policy = pond_index_intents();
+        let mut tables = Vec::with_capacity(3);
         for (table, intents) in policy.all() {
-            self.handle.optimize_indices(table, intents).await?;
+            let outcome = self
+                .handle
+                .optimize_table(table, intents, progress.as_ref(), cleanup)
+                .await;
+            tables.push(outcome);
         }
-        Ok(())
+        Ok(OptimizeOutcome { tables })
+    }
+
+    /// Fold trailing fragments into existing indices across every table,
+    /// without running compaction. Used by `pond embed`'s tail so newly
+    /// written vectors land in the FTS / IVF_PQ / btree / bitmap indices
+    /// without paying the compaction retry budget while embed itself may
+    /// still be writing in a sibling process.
+    pub async fn build_indices_only(
+        &self,
+        progress: Option<OptimizeProgressFn>,
+    ) -> Result<OptimizeOutcome> {
+        let policy = pond_index_intents();
+        let mut tables = Vec::with_capacity(3);
+        for (table, intents) in policy.all() {
+            let indices = self
+                .handle
+                .optimize_table_indices_only(table, intents, progress.as_ref())
+                .await;
+            tables.push(TableOptimizeOutcome {
+                table,
+                indices,
+                compaction: PhaseOutcome::NotAttempted,
+            });
+        }
+        Ok(OptimizeOutcome { tables })
     }
 
     #[cfg(test)]
-    async fn optimize_indices_with_vector_threshold(&self, vector_threshold: usize) -> Result<()> {
+    async fn optimize_indices_with_vector_threshold(
+        &self,
+        vector_threshold: usize,
+    ) -> Result<OptimizeOutcome> {
+        let cleanup = CleanupConfig::default();
         let policy = pond_index_intents_with_vector_threshold(vector_threshold);
+        let mut tables = Vec::with_capacity(3);
         for (table, intents) in policy.all() {
-            self.handle.optimize_indices(table, intents).await?;
+            let outcome = self
+                .handle
+                .optimize_table(table, intents, None, cleanup)
+                .await;
+            tables.push(outcome);
         }
-        Ok(())
+        Ok(OptimizeOutcome { tables })
     }
 
     pub async fn rebuild_indices(&self, intent_name: Option<&str>) -> Result<()> {
@@ -2230,7 +2347,7 @@ pub(crate) fn write_params_for_create() -> WriteParams {
         enable_stable_row_ids: true,
         auto_cleanup: Some(AutoCleanupParams {
             interval: 20,
-            older_than: chrono::TimeDelta::days(7),
+            older_than: chrono::TimeDelta::days(1),
         }),
         ..WriteParams::default()
     }
@@ -3259,7 +3376,9 @@ mod tests {
         let store = Store::open_local(temp.path()).await?;
 
         let session = synthetic_session("compact-blob");
-        store.upsert_sessions(std::slice::from_ref(&session)).await?;
+        store
+            .upsert_sessions(std::slice::from_ref(&session))
+            .await?;
 
         let make_part = |idx: usize, kind: PartKind| Part {
             session_id: session.id.clone(),
@@ -3311,7 +3430,7 @@ mod tests {
         ];
         store.upsert_parts(&batch_b).await?;
 
-        store.optimize_indices().await?;
+        store.optimize_indices(None, None).await?.into_result()?;
 
         Ok(())
     }
@@ -3592,7 +3711,7 @@ mod tests {
         // emits `ScalarIndexQuery` whenever the index exists.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
-        store.optimize_indices().await?;
+        store.optimize_indices(None, None).await?.into_result()?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store
@@ -3630,7 +3749,10 @@ mod tests {
         // First batch: 255 vectors, one below threshold. Optimize does not
         // create the IVF_PQ because the trigger is not met.
         store.write_embeddings(&embedded(&keys[..255])).await?;
-        store.optimize_indices_with_vector_threshold(256).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
         assert!(
             !store
                 .handle
@@ -3644,7 +3766,10 @@ mod tests {
         // Next batch: one more vector. Total reaches 256; optimize creates
         // the IVF_PQ.
         store.write_embeddings(&embedded(&keys[255..256])).await?;
-        store.optimize_indices_with_vector_threshold(256).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
         assert!(
             store
                 .handle
@@ -3678,7 +3803,10 @@ mod tests {
             .handle
             .merge_update(Table::Messages, old_batch, old_rows.len())
             .await?;
-        store.optimize_indices_with_vector_threshold(256).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
         assert!(
             store
                 .handle
@@ -3704,7 +3832,10 @@ mod tests {
         );
         store.write_embeddings(&embedded(&keys)).await?;
         assert_eq!(store.stale_embedding_count().await?, 0);
-        store.optimize_indices_with_vector_threshold(256).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
         assert!(
             store
                 .handle
