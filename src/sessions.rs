@@ -1299,6 +1299,44 @@ impl Store {
         }
     }
 
+    /// Fetch the stored vector for one message, for `similar_to`-style
+    /// retrieval. Returns `Ok(None)` when the message exists but is not yet
+    /// embedded, or when no message has that id. Vectors are stored Float16
+    /// (`embedding_vector_type`); the search path takes `&[f32]`, so we
+    /// widen here. Cheap rare op - one predicate scan, no index.
+    pub async fn message_vector_by_id(&self, message_id: &str) -> Result<Option<Vec<f32>>> {
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::Eq("id", message_id.into())),
+                &["vector"],
+            )
+            .await?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>();
+        let Some(list) = column else {
+            return Ok(None);
+        };
+        if list.is_null(0) {
+            return Ok(None);
+        }
+        let values = list.value(0);
+        let halves = values
+            .as_any()
+            .downcast_ref::<Float16Array>()
+            .context("messages.vector inner array is not Float16")?;
+        let widened = (0..halves.len())
+            .map(|i| halves.value(i).to_f32())
+            .collect();
+        Ok(Some(widened))
+    }
+
     /// Rare standalone message-id lookup; no `messages.id` index, so Lance
     /// full-scans with the predicate.
     async fn find_message(&self, message_id: &str) -> Result<Option<Message>> {

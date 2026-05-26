@@ -1040,7 +1040,7 @@ mod search_handler {
 
     use crate::{
         Clock, SystemClock,
-        embed::{EmbedBackend, e5_query},
+        embed::{EmbedBackend, LazyEmbedder, format_query},
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
@@ -1068,12 +1068,17 @@ mod search_handler {
     pub struct SearchPlan {
         pub mode: SearchMode,
         pub query: String,
+        /// When set, vector-only "find similar messages to this stored
+        /// message" mode: the stored vector for `similar_to` is the query;
+        /// `query` and FTS arm are ignored.
+        pub similar_to: Option<String>,
         pub filter: Predicate,
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
         pub boost_recent: bool,
         pub group_by_conversation: bool,
+        pub full: bool,
         pub min_score: f64,
     }
 
@@ -1105,16 +1110,18 @@ mod search_handler {
     const FTS_FUSION_WEIGHT: f64 = 0.135;
     const VECTOR_FUSION_WEIGHT: f64 = 1.0;
 
-    /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
-    /// `embedder` is `Some` AND at least one message is embedded under the
-    /// configured model, FTS-only otherwise. The response has no top-level mode
-    /// field; per-hit `matched_via` reports the retrievers that ranked each row.
+    /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid
+    /// when the store has any vectors, FTS-only otherwise. The embedder is
+    /// `LazyEmbedder`-loaded on the first hybrid/vector call, so FTS-only
+    /// corpora never pay the model load. The response has no top-level mode
+    /// field; per-hit `matched_via` reports the retrievers that ranked each
+    /// row.
     ///
     /// Must run on a multi-threaded Tokio runtime: hybrid mode embeds the query via
     /// `block_in_place`, which panics on a `current_thread` runtime.
     pub async fn pond_search(
         store: &Store,
-        embedder: Option<&dyn EmbedBackend>,
+        embedder: &LazyEmbedder,
         request: SearchRequest,
         search: &crate::config::SearchConfig,
     ) -> SearchEnvelope {
@@ -1126,13 +1133,13 @@ mod search_handler {
 
     pub async fn explain_search_plan(
         store: &Store,
-        embedder: Option<&dyn EmbedBackend>,
+        embedder: &LazyEmbedder,
         request: SearchRequest,
         search: &crate::config::SearchConfig,
     ) -> Result<String, ErrorEnvelope> {
         let override_mode = request.mode_override.map(wire_mode_to_internal);
         let mut plan = plan_search(request, SearchMode::Fts)?;
-        plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
+        plan.mode = resolve_effective_mode(store, override_mode).await?;
         let mut out = String::new();
         if matches!(plan.mode, SearchMode::Fts | SearchMode::Hybrid) {
             let fts = store
@@ -1144,12 +1151,8 @@ mod search_handler {
             out.push('\n');
         }
         if matches!(plan.mode, SearchMode::Vector | SearchMode::Hybrid) {
-            let Some(embedder) = embedder else {
-                return Err(map_error(crate::Error::internal(
-                    "vector explain resolved without an embedder",
-                )));
-            };
-            let vector = embed_query(embedder, &plan.query)?;
+            let backend = load_embedder(embedder).await?;
+            let vector = embed_query(backend.as_ref(), &plan.query)?;
             let vector_plan = store
                 .explain_vector_plan(&vector, plan.vector_pool, &plan.filter, Some(search))
                 .await
@@ -1163,7 +1166,7 @@ mod search_handler {
 
     async fn run_search(
         store: &Store,
-        embedder: Option<&dyn EmbedBackend>,
+        embedder: &LazyEmbedder,
         request: SearchRequest,
         search: &crate::config::SearchConfig,
         clock: &dyn Clock,
@@ -1171,11 +1174,17 @@ mod search_handler {
         let override_mode = request.mode_override.map(wire_mode_to_internal);
         let mut plan = plan_search(request, SearchMode::Fts)?;
 
-        // The mode is server-determined unless the caller passed an explicit
-        // override (operator tooling). Hybrid requires both a loaded embedder
-        // AND at least one message embedded under the configured model;
-        // anything else degrades to FTS-only.
-        plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
+        // `similar_to` pins mode to Vector regardless of override or store
+        // state: we are running kNN over a stored vector, not embedding a
+        // query, so there is no FTS arm and no query-side embedder load.
+        if plan.similar_to.is_some() {
+            plan.mode = SearchMode::Vector;
+        } else {
+            // Mode is server-determined unless the caller passed an explicit
+            // override (operator tooling). `has_embeddings()` is the only
+            // gate: hybrid when the store has any vectors, FTS-only when empty.
+            plan.mode = resolve_effective_mode(store, override_mode).await?;
+        }
 
         let candidates = match plan.mode {
             SearchMode::Fts => {
@@ -1186,15 +1195,8 @@ mod search_handler {
                 normalize_fts(hits)
             }
             SearchMode::Hybrid => {
-                // `resolve_effective_mode` only returns Hybrid when `embedder` is
-                // `Some` and `has_embeddings` returned true; an `Internal` error
-                // here would only fire under a logic bug.
-                let Some(embedder) = embedder else {
-                    return Err(map_error(crate::Error::internal(
-                        "hybrid mode resolved without an embedder",
-                    )));
-                };
-                let vector = embed_query(embedder, &plan.query)?;
+                let backend = load_embedder(embedder).await?;
+                let vector = embed_query(backend.as_ref(), &plan.query)?;
                 // The two retrievers hit disjoint datasets (and disjoint mutexes),
                 // so run them concurrently rather than back-to-back.
                 let fts_fut = async {
@@ -1272,17 +1274,33 @@ mod search_handler {
                     })
                     .collect()
             }
-            // Vector-only branch: reachable only when the caller explicitly
-            // sets `mode_override = Vector` (operator tooling, benchmark
-            // harness). Production agents leave `mode_override = None` and
-            // get the server-decided hybrid/fts path above.
+            // Vector-only branch. Reached two ways:
+            //   - caller pinned `similar_to`: pond fetches the stored vector
+            //     for that message_id and uses it directly as the query (no
+            //     embedder load, no query-side text formatting).
+            //   - caller set `mode_override = Vector` (operator tooling /
+            //     benchmark harness): embed `plan.query` and run kNN.
             SearchMode::Vector => {
-                let Some(embedder) = embedder else {
-                    return Err(map_error(crate::Error::internal(
-                        "vector mode requested but no embedder is loaded",
-                    )));
+                let vector = if let Some(similar_id) = &plan.similar_to {
+                    let stored = store
+                        .message_vector_by_id(similar_id)
+                        .await
+                        .map_err(map_storage)?;
+                    let Some(vector) = stored else {
+                        return Err(map_error(crate::Error::not_found(
+                            "message",
+                            serde_json::json!(similar_id),
+                            format!(
+                                "no embedded message with id {similar_id} (the message may not \
+                                 exist, or it exists but is not yet embedded - run `pond embed`)"
+                            ),
+                        )));
+                    };
+                    vector
+                } else {
+                    let backend = load_embedder(embedder).await?;
+                    embed_query(backend.as_ref(), &plan.query)?
                 };
-                let vector = embed_query(embedder, &plan.query)?;
                 let vector_raw = store
                     .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                     .await
@@ -1348,7 +1366,7 @@ mod search_handler {
         });
 
         if plan.group_by_conversation {
-            let groups = build_groups(store, &scored, plan.limit, &plan.query).await?;
+            let groups = build_groups(store, &scored, plan.limit, &plan.query, plan.full).await?;
             let total = groups.len();
             Ok(SearchResponse {
                 result: SearchResultBody::Groups { groups },
@@ -1359,7 +1377,7 @@ mod search_handler {
             let hits = scored
                 .into_iter()
                 .take(plan.limit)
-                .map(|hit| hit.into_hit(&plan.query))
+                .map(|hit| hit.into_hit(&plan.query, plan.full))
                 .collect::<Vec<_>>();
             let total = hits.len();
             Ok(SearchResponse {
@@ -1372,33 +1390,34 @@ mod search_handler {
 
     /// Pick the retrieval mode. An explicit caller override (operator tooling
     /// via the wire `mode_override` field / `pond search --mode`) wins; in its
-    /// absence the server decides: hybrid when both a loaded embedder AND at
-    /// least one message embedded under the configured model exist, FTS-only
-    /// otherwise (spec.md#search opt-in).
+    /// absence the server runs hybrid when the store has any vectors and
+    /// FTS-only when it doesn't (`has_embeddings()` is the only gate).
     async fn resolve_effective_mode(
         store: &Store,
-        embedder: Option<&dyn EmbedBackend>,
         override_mode: Option<SearchMode>,
     ) -> Result<SearchMode, ErrorEnvelope> {
         if let Some(mode) = override_mode {
-            if matches!(mode, SearchMode::Vector | SearchMode::Hybrid) && embedder.is_none() {
-                return Err(map_error(crate::Error::internal(
-                    "the requested mode requires embeddings to be enabled in config",
-                )));
-            }
             return Ok(mode);
         }
-        match embedder {
-            None => Ok(SearchMode::Fts),
-            Some(_) => {
-                let has = store.has_embeddings().await.map_err(map_storage)?;
-                Ok(if has {
-                    SearchMode::Hybrid
-                } else {
-                    SearchMode::Fts
-                })
-            }
-        }
+        let has = store.has_embeddings().await.map_err(map_storage)?;
+        Ok(if has {
+            SearchMode::Hybrid
+        } else {
+            SearchMode::Fts
+        })
+    }
+
+    /// Materialize the lazy embedder on the first hybrid/vector branch that
+    /// needs it. Wraps the load error in an Internal envelope - candle/Metal
+    /// load failure is a server-side problem, not a caller error.
+    async fn load_embedder(
+        embedder: &LazyEmbedder,
+    ) -> Result<std::sync::Arc<dyn EmbedBackend>, ErrorEnvelope> {
+        embedder.get().await.map_err(|error| {
+            map_error(crate::Error::internal(format!(
+                "embedder load failed: {error}"
+            )))
+        })
     }
 
     pub fn plan_search(
@@ -1410,12 +1429,17 @@ mod search_handler {
         let _ns = super::resolve_namespace(request.namespace.as_deref())?;
 
         let query = request.query.trim().to_owned();
-        if query.is_empty() {
+        let similar_to = request
+            .similar_to
+            .as_ref()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        if similar_to.is_none() && query.is_empty() {
             return Err(map_error(crate::Error::validation_field(
                 "query must be non-empty after trim",
                 "query",
                 Some(serde_json::json!(request.query)),
-                Some("non-empty string after trim".to_owned()),
+                Some("non-empty string after trim, or pass `similar_to`".to_owned()),
             )));
         }
         if request.limit == 0 {
@@ -1434,12 +1458,14 @@ mod search_handler {
         Ok(SearchPlan {
             mode,
             query,
+            similar_to,
             filter,
             pool,
             vector_pool: pool.saturating_mul(2),
             limit,
             boost_recent: request.boost_recent,
             group_by_conversation: request.group_by_conversation,
+            full: request.full,
             min_score: request.filters.min_score,
         })
     }
@@ -1594,27 +1620,66 @@ mod search_handler {
         RECENCY_MAX_BOOST * (-age_seconds / RECENCY_DECAY_SECONDS).exp()
     }
 
-    /// Build a hit's `(text, snippet)` payload (spec.md#search): the matched
-    /// message's indexed text in full when small, or a bounded prefix plus a
-    /// query-windowed snippet when it exceeds [`HIT_TEXT_FULL`].
-    pub fn hit_payload(text: &str, query: &str) -> (String, Option<String>) {
+    /// Minimum query-term length considered "informative" for snippet
+    /// anchoring. Shorter terms ("how", "the", "is", "my", "at") attract the
+    /// `.min()` anchor to offset-near-0 because they occur very early in any
+    /// text, masking the real match site.
+    const ANCHOR_MIN_TERM_CHARS: usize = 4;
+
+    /// Build a hit's `(text, snippet)` payload (spec.md#search).
+    ///
+    /// `full=false` (the default for `pond_search` MCP / HTTP callers): `text`
+    /// is the match-windowed snippet (~`HIT_SNIPPET_CHARS`), `snippet` is
+    /// None. Short messages whose body fits the snippet window return their
+    /// full body as `text` - no inversion to do when there's nothing to trim.
+    ///
+    /// `full=true` (operator tooling, `pond search --full`): `text` is the
+    /// indexed text up to `HIT_TEXT_FULL`; `snippet` holds the match window
+    /// only when the body was truncated.
+    pub fn hit_payload(text: &str, query: &str, full: bool) -> (String, Option<String>) {
         let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= HIT_TEXT_FULL {
+        if full {
+            if chars.len() <= HIT_TEXT_FULL {
+                return (text.to_owned(), None);
+            }
+            let truncated = chars[..HIT_TEXT_FULL].iter().collect::<String>();
+            return (truncated, Some(query_snippet(text, query)));
+        }
+        if chars.len() <= HIT_SNIPPET_CHARS {
             return (text.to_owned(), None);
         }
-        let truncated = chars[..HIT_TEXT_FULL].iter().collect::<String>();
-        (truncated, Some(query_snippet(text, query)))
+        (query_snippet(text, query), None)
     }
 
-    /// A snippet windowed around the first query term found in `text`, capped
-    /// at [`HIT_SNIPPET_CHARS`] code points. Falls back to the text head when
-    /// no term matches.
+    /// A snippet windowed around the first informative query term found in
+    /// `text`, capped at [`HIT_SNIPPET_CHARS`] code points. Falls back to the
+    /// text head when no term matches.
+    ///
+    /// Terms shorter than [`ANCHOR_MIN_TERM_CHARS`] are excluded from anchor
+    /// selection because they pull the window to offset-0 (a snippet audit on
+    /// the live corpus found ~25-30% of conversational queries had their
+    /// anchor degraded by short stop-word-like terms like "how", "the", "my").
+    /// If every term is short, the filter is bypassed.
+    ///
+    /// TODO(snippet-anchor): reassess for vector-only hits (e.g. similar_to,
+    /// paraphrase queries where no literal term matches): the fallback to
+    /// offset-0 is OK but not great. Possible upgrades: ngram match overlap,
+    /// or skip-window-around-most-distinctive-substring. See snippet audit
+    /// in tier-0 findings.
     fn query_snippet(text: &str, query: &str) -> String {
         let lower_text = text.to_lowercase();
-        let hit = query
+        let terms: Vec<String> = query
             .split_whitespace()
             .filter(|term| !term.is_empty())
-            .filter_map(|term| lower_text.find(&term.to_lowercase()))
+            .map(str::to_lowercase)
+            .collect();
+        let any_informative = terms
+            .iter()
+            .any(|term| term.chars().count() >= ANCHOR_MIN_TERM_CHARS);
+        let hit = terms
+            .iter()
+            .filter(|term| !any_informative || term.chars().count() >= ANCHOR_MIN_TERM_CHARS)
+            .filter_map(|term| lower_text.find(term.as_str()))
             .min();
         let chars: Vec<char> = text.chars().collect();
         // `find` returned a byte offset into the lowercased copy; index that
@@ -1654,8 +1719,8 @@ mod search_handler {
     }
 
     impl ScoredHit {
-        fn into_hit(self, query: &str) -> Hit {
-            let (text, snippet) = hit_payload(&self.meta.search_text, query);
+        fn into_hit(self, query: &str, full: bool) -> Hit {
+            let (text, snippet) = hit_payload(&self.meta.search_text, query, full);
             Hit {
                 session_id: self.meta.session_id,
                 message_id: self.meta.message_id,
@@ -1709,7 +1774,7 @@ mod search_handler {
     }
 
     fn embed_query(embedder: &dyn EmbedBackend, query: &str) -> Result<Vec<f32>, ErrorEnvelope> {
-        let prompt = e5_query(query);
+        let prompt = format_query(query);
         // Model inference is synchronous and CPU-bound; `block_in_place` keeps
         // it from stalling other tasks on the async worker thread. (Requires a
         // multi-threaded runtime - see `pond_search`.)
@@ -1731,12 +1796,15 @@ mod search_handler {
         scored: &[ScoredHit],
         limit: usize,
         query: &str,
+        full: bool,
     ) -> Result<Vec<Group>, ErrorEnvelope> {
         use std::collections::BTreeMap;
 
         // `scored` is already sorted by score descending, so the first hit seen for
-        // a session is its best-scoring match.
+        // a session is its best-scoring match - its message_id is the
+        // `best_hit_message_id` callers use to drill in via `pond_get`.
         struct Acc {
+            best_hit_message_id: String,
             project: String,
             source_agent: String,
             first_timestamp: DateTime<Utc>,
@@ -1752,8 +1820,9 @@ mod search_handler {
         for hit in scored {
             let root = session_root(&hit.meta.session_id).to_owned();
             let entry = groups.entry(root).or_insert_with(|| {
-                let (text, snippet) = hit_payload(&hit.meta.search_text, query);
+                let (text, snippet) = hit_payload(&hit.meta.search_text, query, full);
                 Acc {
+                    best_hit_message_id: hit.meta.message_id.clone(),
                     project: hit.meta.project.clone(),
                     source_agent: hit.meta.source_agent.clone(),
                     first_timestamp: hit.meta.timestamp,
@@ -1779,6 +1848,7 @@ mod search_handler {
             .map(|(session_id, acc)| Group {
                 message_count: counts.get(&session_id).copied().unwrap_or_default(),
                 session_id,
+                best_hit_message_id: acc.best_hit_message_id,
                 project: acc.project,
                 source_agent: acc.source_agent,
                 first_timestamp: acc.first_timestamp,
@@ -1995,9 +2065,11 @@ mod tests {
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
             mode_override: None,
+            similar_to: None,
             filters: SearchFilters::default(),
             boost_recent: true,
             group_by_conversation: false,
+            full: true,
             limit: 20,
         }
     }
@@ -2077,7 +2149,7 @@ mod tests {
     #[test]
     fn hit_payload_returns_short_text_in_full_with_no_snippet() {
         let short = "a short message body";
-        let (text, snippet) = hit_payload(short, "message");
+        let (text, snippet) = hit_payload(short, "message", true);
         assert_eq!(text, short);
         assert!(snippet.is_none(), "small text needs no snippet");
     }
@@ -2086,7 +2158,7 @@ mod tests {
     fn hit_payload_truncates_long_text_and_windows_the_snippet() {
         // 2400 chars: a filler head, the query term mid-body, a filler tail.
         let body = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(394));
-        let (text, snippet) = hit_payload(&body, "needle");
+        let (text, snippet) = hit_payload(&body, "needle", true);
         assert_eq!(text.chars().count(), 2000, "text truncates to the bound");
         let snippet = snippet.expect("long text carries a snippet");
         assert!(
@@ -2097,12 +2169,41 @@ mod tests {
     }
 
     #[test]
+    fn hit_payload_default_returns_snippet_only_for_long_text() {
+        // Inversion: with `full=false` the long body is replaced by the
+        // match-windowed snippet and no separate `snippet` field ships.
+        let body = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(394));
+        let (text, snippet) = hit_payload(&body, "needle", false);
+        assert!(
+            text.contains("NEEDLE"),
+            "default text is the match-windowed snippet"
+        );
+        assert!(
+            text.chars().count() <= 400 + 6,
+            "default text is bounded to the snippet size"
+        );
+        assert!(
+            snippet.is_none(),
+            "snippet field is None when text already is one"
+        );
+    }
+
+    #[test]
+    fn hit_payload_default_returns_full_body_for_short_text() {
+        // No inversion to do when the body already fits the snippet window.
+        let short = "a short message body";
+        let (text, snippet) = hit_payload(short, "message", false);
+        assert_eq!(text, short);
+        assert!(snippet.is_none());
+    }
+
+    #[test]
     fn hit_payload_snippet_survives_case_folding_that_changes_byte_length() {
         // `to_lowercase` of 'İ' is two code points, so the lowercased copy has
         // a different byte layout than the original. A query offset taken from
         // that copy must never be sliced into the original text.
         let body = format!("İÉÉÉ{}", "a".repeat(2100));
-        let (text, snippet) = hit_payload(&body, "ééé");
+        let (text, snippet) = hit_payload(&body, "ééé", true);
         assert_eq!(
             text.chars().count(),
             2000,

@@ -123,18 +123,7 @@ pub mod http {
         Json(mut request): Json<SearchRequest>,
     ) -> (StatusCode, Json<SearchEnvelope>) {
         request.namespace.get_or_insert_with(default_namespace);
-        let embedder = match state.embedder.get().await {
-            Ok(handle) => handle,
-            Err(load_error) => {
-                let envelope = SearchEnvelope::Error(crate::wire::error(
-                    crate::wire::ErrorCode::Internal,
-                    format!("embedder load failed: {load_error}"),
-                    serde_json::json!({}),
-                ));
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(envelope));
-            }
-        };
-        let envelope = pond_search(&state.store, embedder.as_deref(), request, &state.search).await;
+        let envelope = pond_search(&state.store, &state.embedder, request, &state.search).await;
         let status = match &envelope {
             SearchEnvelope::Success(_) => StatusCode::OK,
             SearchEnvelope::Error(error) => status_for(&error.error.code),
@@ -292,13 +281,29 @@ pub mod mcp {
         wire::{Part, PartKind},
     };
 
-    /// Static documentation served as the `schema://pond` resource.
+    /// Static documentation served as the `schema://pond` resource. The
+    /// `#[tool(description = ...)]` strings stay tight (agents skim); this
+    /// resource carries the longer-form schema, ranking provenance, and the
+    /// multilingual caveat for callers that load it on demand.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
 (default 10, max 200), project (path substring), conversation_id (exact \
 session match), source_agent, role (user|assistant), from_date / to_date \
-(YYYY-MM-DD), min_score (default 0.0; pond's RRF score is not on kb's 0-1 \
-scale), boost_recent (default true), group_by_conversation (default false).
+(YYYY-MM-DD), boost_recent (default true), group_by_conversation \
+(default true; grouped hits carry `best_hit_message_id` for drill-in via \
+`pond_get`).
+
+pond_search response: each hit carries `score` (RRF fusion, not on a 0-1 \
+scale; comparable within one response, not across queries) and `matched_via` \
+(array of retrievers that ranked the row: \"fts\", \"vector\", or both). \
+Filter on `score` by reading the gradient in the returned hits, not by \
+passing a server-side threshold.
+
+pond_search multilingual: pond's embedder (multilingual-e5-small) is \
+trained for cross-lingual retrieval, so a query in language A can match \
+indexed text in language B via the vector arm. The FTS arm is character- \
+ngram-based and only matches surface tokens, so for cross-lingual queries \
+expect most signal to come from the vector arm.
 
 pond_get: message_id (one message + context_depth messages of thread context \
 each side) OR conversation_id (full session; up_to truncates, max_messages \
@@ -309,9 +314,13 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
     /// contract: `conversation_id` here maps to the wire `session_id` filter.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSearchParams {
-        /// What to search for: concepts and keywords. Keep it semantic - do not
-        /// put project names in the query, use the `project` filter instead.
-        query: String,
+        /// What to search for: concepts and keywords. Keep it semantic - do
+        /// not put project names in the query, use the `project` filter
+        /// instead. Optional only when `similar_to` is set (vector-only mode
+        /// uses the stored vector and ignores the query text); required in
+        /// every other call.
+        #[serde(default)]
+        query: Option<String>,
         /// Max hits to return. Default 10, server-capped at 200.
         #[serde(default)]
         limit: Option<usize>,
@@ -333,14 +342,28 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         /// Only messages on or before this date (YYYY-MM-DD).
         #[serde(default)]
         to_date: Option<String>,
-        /// Minimum hybrid score. Default 0.0 - pond's RRF score is not on kb's
-        /// 0-1 scale, so a 0.5 default would filter everything.
-        #[serde(default)]
-        min_score: Option<f64>,
         /// Boost recent messages in ranking. Default true.
         #[serde(default)]
         boost_recent: Option<bool>,
-        /// Collapse hits to one summary per session. Default false.
+        /// "Find similar messages to this one." When set, pond uses the
+        /// stored vector for `similar_to` as the kNN query and ignores the
+        /// `query` text; vector-only, no embedder load. Compose with
+        /// `pond_search` -> read top hit -> `pond_search(similar_to=<that
+        /// message_id>)` to explore neighbors of any returned hit.
+        #[serde(default)]
+        similar_to: Option<String>,
+        /// When true, each hit's `text` carries the full indexed message
+        /// body (up to a server cap). Default false: `text` is the
+        /// match-windowed snippet (~400 chars) - cheap for scan-and-decide.
+        /// Fetch the full body via `pond_get(message_id)` when needed.
+        #[serde(default)]
+        full: Option<bool>,
+        /// Collapse hits to one summary per session. Default true: most
+        /// searches are "find the conversation about X" and message-level
+        /// duplicates from one session corrupt the corpus picture. Pass
+        /// `false` to get individual message hits (composes with
+        /// `pond_get(message_id, context_depth)`). When grouped, each group
+        /// carries `best_hit_message_id` for drill-in.
         #[serde(default)]
         group_by_conversation: Option<bool>,
     }
@@ -392,16 +415,11 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         }
 
         #[tool(
-            description = "Hybrid search (vector + full-text + RRF) over stored conversation \
-                           history. Returns ranked message hits. Auto-degrades to FTS-only \
-                           when embeddings are disabled or absent for this store; the response \
-                           carries no top-level mode field - each hit's `matched_via` array \
-                           reports which retriever(s) ranked it. Keep `query` semantic; use \
-                           the `project` / `conversation_id` filters for scope. \
-                           For multilingual corpora: if you suspect the indexed text may be in a \
-                           different language than your query, run two searches - one in the \
-                           query's language, one translated to the corpus's likely language - and \
-                           union the results by `session_id`. pond does not translate internally."
+            description = "Hybrid (vector + BM25) search over stored conversation history. \
+                           Returns ranked message hits with `score` and `matched_via` per hit. \
+                           Keep `query` semantic; use `project` / `conversation_id` filters \
+                           for scope. See `schema://pond` for the full schema, ranking \
+                           provenance, and multilingual notes."
         )]
         async fn pond_search(
             &self,
@@ -410,7 +428,7 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
-                query: params.query,
+                query: params.query.unwrap_or_default(),
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.conversation_id,
@@ -418,19 +436,22 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                     from_date: params.from_date,
                     to_date: params.to_date,
                     role: params.role,
-                    min_score: params.min_score.unwrap_or(0.0),
+                    // min_score is intentionally not on the MCP surface; RRF scores
+                    // are not interpretable as absolute confidence, so a server-side
+                    // threshold is a footgun for agent callers. The CLI / HTTP wire
+                    // path still exposes it for the bench harness.
+                    min_score: 0.0,
                 },
                 boost_recent: params.boost_recent.unwrap_or(true),
-                group_by_conversation: params.group_by_conversation.unwrap_or(false),
+                group_by_conversation: params.group_by_conversation.unwrap_or(true),
                 limit: params.limit.unwrap_or(10),
                 mode_override: None,
+                similar_to: params.similar_to,
+                full: params.full.unwrap_or(false),
             };
-            let embedder = self.state.embedder.get().await.map_err(|error| {
-                ErrorData::internal_error(format!("embedder load failed: {error}"), None)
-            })?;
             match run_search(
                 &self.state.store,
-                embedder.as_deref(),
+                &self.state.embedder,
                 request,
                 &self.state.search,
             )
@@ -528,14 +549,54 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                     request.uri,
                 )])),
                 "stats://pond" => {
-                    let (sessions, messages, parts) =
-                        self.state.store.row_counts().await.map_err(|error| {
-                            ErrorData::internal_error(format!("stats unavailable: {error}"), None)
-                        })?;
+                    let store = &self.state.store;
+                    let map_err = |error: anyhow::Error| {
+                        ErrorData::internal_error(format!("stats unavailable: {error}"), None)
+                    };
+                    let (sessions, messages, parts) = store.row_counts().await.map_err(&map_err)?;
+                    let embedding = store.embedding_progress().await.map_err(&map_err)?;
+                    let stale = store.stale_embedding_count().await.map_err(&map_err)?;
+                    let indices = store.index_status().await.map_err(&map_err)?;
+
+                    let embedded_percent = if embedding.total == 0 {
+                        0.0
+                    } else {
+                        #[allow(clippy::cast_precision_loss)]
+                        let pct = (embedding.embedded as f64 / embedding.total as f64) * 100.0;
+                        (pct * 10.0).round() / 10.0
+                    };
+                    let index_rows = indices
+                        .iter()
+                        .map(|status| {
+                            serde_json::json!({
+                                "table": status.table.as_str(),
+                                "intent": status.intent_name,
+                                "exists": status.exists,
+                                "fragments_covered": status.fragments_covered,
+                                "unindexed_rows": status.unindexed_rows,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    // spec.md#search: `search_text` is the conversational text
+                    // (filtered of harness-injected parts at the adapter seam).
+                    // `embedding.total` is the searchable population - that is
+                    // the right denominator for "% embedded", not total messages.
                     let stats = serde_json::json!({
-                        "sessions": sessions,
-                        "messages": messages,
-                        "parts": parts,
+                        "corpus": {
+                            "sessions": sessions,
+                            "messages": messages,
+                            "searchable_messages": embedding.total,
+                            "parts": parts,
+                        },
+                        "embeddings": {
+                            "model": embedding.model,
+                            "embedded": embedding.embedded,
+                            "searchable_total": embedding.total,
+                            "embedded_percent": embedded_percent,
+                            "stale_under_other_model": stale,
+                        },
+                        "indices": index_rows,
                     });
                     Ok(ReadResourceResult::new(vec![ResourceContents::text(
                         stats.to_string(),
@@ -609,21 +670,34 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
     }
 
     /// Map a wire error envelope to a JSON-RPC error. rmcp ships no app-level
-    /// codes, so pond defines its own `-32000`-family set here.
+    /// codes, so pond defines its own `-32000`-family set here. The `data`
+    /// payload carries pond's canonical string code and a `retryable` flag
+    /// (per spec.md#error-model) so MCP callers can branch on retry semantics
+    /// without parsing message strings or knowing the JSON-RPC code mapping.
     fn to_error_data(envelope: &ErrorEnvelope) -> ErrorData {
-        let code = match envelope.error.code {
-            WireErrorCode::ValidationFailed => JsonRpcErrorCode(-32010),
-            WireErrorCode::VersionUnsupported => JsonRpcErrorCode(-32011),
-            WireErrorCode::NotFound => JsonRpcErrorCode(-32012),
-            WireErrorCode::NamespaceUnknown => JsonRpcErrorCode(-32013),
-            WireErrorCode::StorageUnavailable => JsonRpcErrorCode(-32014),
-            WireErrorCode::Conflict => JsonRpcErrorCode(-32015),
-            WireErrorCode::Internal => JsonRpcErrorCode(-32016),
+        let (jsonrpc_code, pond_code, retryable) = match envelope.error.code {
+            WireErrorCode::ValidationFailed => (-32010, "validation_failed", false),
+            WireErrorCode::VersionUnsupported => (-32011, "version_unsupported", false),
+            WireErrorCode::NotFound => (-32012, "not_found", false),
+            WireErrorCode::NamespaceUnknown => (-32013, "namespace_unknown", false),
+            WireErrorCode::StorageUnavailable => (-32014, "storage_unavailable", true),
+            WireErrorCode::Conflict => (-32015, "conflict", true),
+            WireErrorCode::Internal => (-32016, "internal", false),
         };
+        let mut data = match &envelope.error.details {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        data.insert("pond_code".to_owned(), serde_json::json!(pond_code));
+        data.insert("retryable".to_owned(), serde_json::json!(retryable));
+        data.insert(
+            "request_id".to_owned(),
+            serde_json::json!(envelope.request_id),
+        );
         ErrorData::new(
-            code,
+            JsonRpcErrorCode(jsonrpc_code),
             envelope.error.message.clone(),
-            Some(envelope.error.details.clone()),
+            Some(serde_json::Value::Object(data)),
         )
     }
 }

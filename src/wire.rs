@@ -375,12 +375,27 @@ pub struct SearchRequest {
     // should leave it `None` and let the server pick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_override: Option<SearchModeWire>,
+    /// When set, retrieve messages similar to this stored message - pond uses
+    /// the message's stored `vector` directly as the query, runs vector-only
+    /// kNN, and ignores `query` and the FTS arm. The stored vector was
+    /// derived from `search_text` (`spec.md#embed-from-canonical`), so the
+    /// signal is already filtered of harness-injected parts. Filters,
+    /// `boost_recent`, `group_by_conversation`, and `limit` still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar_to: Option<String>,
     #[serde(default)]
     pub filters: SearchFilters,
     #[serde(default = "default_true")]
     pub boost_recent: bool,
     #[serde(default)]
     pub group_by_conversation: bool,
+    /// When true, hit `text` carries the indexed message body (up to a code
+    /// constant); `snippet` holds the match window when the body was
+    /// truncated. When false (the default), `text` is the match-windowed
+    /// snippet only - cheap default for scan-and-decide flows; callers fetch
+    /// the full body via `pond_get(message_id)` when they need it.
+    #[serde(default)]
+    pub full: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -454,6 +469,10 @@ pub struct Hit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub session_id: String,
+    /// Message id of the best-scoring hit in this group. Lets callers drill
+    /// into the exact moment via `pond_get(message_id=...)` without a second
+    /// search; load-bearing now that `group_by_conversation` defaults to true.
+    pub best_hit_message_id: String,
     pub project: String,
     pub source_agent: String,
     pub first_timestamp: DateTime<Utc>,

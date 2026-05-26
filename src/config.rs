@@ -118,11 +118,11 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [sources.codex-cli]
 # path = \"~/.codex/sessions\"
 
-# Embeddings. Default `enabled = false`: search runs FTS-only and no model is
-# loaded. Set `true` for hybrid search. `pond embed` runs regardless, so
-# vectors can be pre-populated before flipping the switch. `model` selects
-# the HuggingFace XLM-RoBERTa model; `dim` declares its output width and is
-# baked into the messages.vector schema on table creation - it must equal the
+# Embeddings. Search runs hybrid (vector + FTS) whenever the store has any
+# vectors, and FTS-only otherwise - the model loads lazily on the first hybrid
+# query, so there's no cost on FTS-only corpora. `model` selects the
+# HuggingFace XLM-RoBERTa model; `dim` declares its output width and is baked
+# into the messages.vector schema on table creation - it must equal the
 # model's hidden_size and be a multiple of 8 (IVF_PQ subspace stride).
 #
 # Common pairings:
@@ -134,7 +134,6 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # schema boundary.
 #
 # [embeddings]
-# enabled = false
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384
 
@@ -204,44 +203,33 @@ pub struct SearchConfig {
     pub refine_factor: Option<u32>,
 }
 
-/// `[embeddings]`: the master switch, model selector, and vector dimension.
-/// With `enabled = false` (the default) the search path never loads a model;
-/// `pond embed` runs regardless. `model` and `dim` are installed into the
-/// process at startup via `embed::init_model_id` / `sessions::init_embedding_dim`,
-/// so swapping models for a one-off experiment is a temporary config file -
-/// no CLI flag and no per-call-site plumbing.
+/// `[embeddings]`: model selector and vector dimension. There is no master
+/// switch - the search path always runs hybrid when vectors exist in the
+/// store and FTS-only when they don't (`has_embeddings()` is the only gate);
+/// the candle/Metal model is `LazyEmbedder`-loaded on the first query that
+/// actually needs it. `model` and `dim` are installed into the process at
+/// startup via `embed::init_model_id` / `sessions::init_embedding_dim`, so
+/// swapping models for a one-off experiment is a temporary config file - no
+/// CLI flag and no per-call-site plumbing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct EmbeddingsConfig {
-    #[serde(default)]
-    pub enabled: bool,
     /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
     /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-base`.
-    #[serde(default = "default_model")]
     pub model: String,
     /// Output dimension of `model`. Must equal the model's `hidden_size` and
     /// be divisible by 8 (the IVF_PQ subspace stride; see `embed::index_params`).
     /// Defaults to 768 (e5-base). Set to 384 for e5-small, 1024 for e5-large.
-    #[serde(default = "default_dim")]
     pub dim: usize,
 }
 
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            model: default_model(),
-            dim: default_dim(),
+            model: crate::embed::DEFAULT_MODEL_ID.to_owned(),
+            dim: crate::sessions::DEFAULT_EMBEDDING_DIM,
         }
     }
-}
-
-fn default_model() -> String {
-    crate::embed::DEFAULT_MODEL_ID.to_owned()
-}
-
-fn default_dim() -> usize {
-    crate::sessions::DEFAULT_EMBEDDING_DIM
 }
 
 /// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
@@ -388,21 +376,18 @@ mod tests {
         // Empty / whitespace-only model id is rejected: HuggingFace fetch
         // would fail far away from the config error.
         let bad_model = EmbeddingsConfig {
-            enabled: true,
             model: "   ".to_owned(),
             dim: 768,
         };
         assert!(bad_model.validate().is_err());
         // Dim must divide 8 (PQ subspace stride in `embed::index_params`).
         let bad_dim = EmbeddingsConfig {
-            enabled: true,
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
         };
         assert!(bad_dim.validate().is_err());
         // Zero is rejected too (would divide-by-zero inside index_params).
         let zero_dim = EmbeddingsConfig {
-            enabled: true,
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,
         };
@@ -424,7 +409,6 @@ mod tests {
         // the built-in defaults - a malformed template fails right here.
         let config = Config::load(&path).unwrap();
         assert_eq!(config.embeddings, EmbeddingsConfig::default());
-        assert!(!config.embeddings.enabled);
         assert_eq!(config.embeddings.model, crate::embed::DEFAULT_MODEL_ID);
         assert_eq!(
             config.embeddings.dim,
