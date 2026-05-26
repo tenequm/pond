@@ -9,7 +9,7 @@
 use pond::{
     adapter::ClaudeCodeAdapter,
     config::SearchConfig,
-    embed::{EmbedBackend, EmbedWorker},
+    embed::{EmbedBackend, EmbedWorker, LazyEmbedder},
     handlers::ingest_adapter,
     handlers::pond_get,
     handlers::pond_search,
@@ -20,6 +20,7 @@ use pond::{
         SearchRequest, SearchResultBody,
     },
 };
+use std::sync::Arc;
 use tempfile::TempDir;
 
 const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
@@ -55,7 +56,7 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
 /// Ingest the claude-code fixtures, build the indices, and embed every message
 /// with the fake backend - the `pond_search` handler then runs end to end
 /// without model weights, exactly as `pond ingest` wires it (main.rs).
-async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
+async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedder)> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
@@ -63,7 +64,8 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
     store.optimize_indices(None, None).await?.into_result()?;
-    Ok((store, backend))
+    let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn EmbedBackend>);
+    Ok((store, embedder))
 }
 
 fn search_config() -> SearchConfig {
@@ -76,9 +78,11 @@ fn search_request(query: &str) -> SearchRequest {
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
         mode_override: None,
+        similar_to: None,
         filters: SearchFilters::default(),
         boost_recent: true,
         group_by_conversation: false,
+        full: true,
         limit: 20,
     }
 }
@@ -146,29 +150,19 @@ async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
     anyhow::bail!("no usable text part in the fixture corpus")
 }
 
-/// The retrieval mode is server-determined: hybrid when the embedder is loaded
-/// AND has embeddings for its identity, FTS otherwise. The wire surface no
-/// longer carries a `search_mode` field; per-hit `matched_via` is the only
-/// retriever-provenance signal. This test exercises all three branches and
-/// asserts the right retrievers ranked the hits.
+/// The retrieval mode is server-determined: hybrid when the store has any
+/// vectors, FTS otherwise. The wire surface no longer carries a `search_mode`
+/// field; per-hit `matched_via` is the only retriever-provenance signal.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<()> {
-    // Case 1: embedder + embeddings -> hybrid (both retrievers contribute).
+async fn search_picks_hybrid_or_fts_based_on_store_state() -> anyhow::Result<()> {
+    // Case 1: store has vectors -> hybrid (both retrievers contribute).
     let temp = TempDir::new()?;
-    let (store, backend) = searchable_corpus(&temp).await?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
     let hits = body_hits(
-        success_of(
-            pond_search(
-                &store,
-                Some(&backend),
-                search_request(&phrase),
-                &search_config(),
-            )
-            .await,
-        )
-        .result,
+        success_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
+            .result,
     );
     assert!(!hits.is_empty(), "hybrid search must return hits");
     for pair in hits.windows(2) {
@@ -192,19 +186,10 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
         );
     }
 
-    // Case 2: embedder is `None` -> FTS-only.
-    let hits = body_hits(
-        success_of(pond_search(&store, None, search_request(&phrase), &search_config()).await)
-            .result,
-    );
-    assert!(!hits.is_empty(), "fts must still return hits");
-    for hit in &hits {
-        assert_eq!(hit.matched_via, ["fts"]);
-    }
-
-    // Case 3: embedder present but the embeddings table has no rows for its
-    // identity -> auto-degrade to FTS. Build a fresh store with messages and
-    // the FTS index but no embed pass.
+    // Case 2: store has no vectors -> auto-degrade to FTS-only. The embedder
+    // is still passed in (production wiring always provides one); the
+    // resolver's `has_embeddings` check short-circuits before the model is
+    // ever loaded.
     let temp2 = TempDir::new()?;
     let store2 = Store::open_local(temp2.path()).await?;
     ingest_adapter(
@@ -218,7 +203,7 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
         success_of(
             pond_search(
                 &store2,
-                Some(&backend),
+                &embedder,
                 search_request(&phrase),
                 &search_config(),
             )
@@ -235,13 +220,13 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let (store, backend) = searchable_corpus(&temp).await?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
     // role: every hit carries the requested role.
     let mut request = search_request(&phrase);
     request.filters.role = Some("assistant".to_owned());
-    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
+    let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(!hits.is_empty(), "the corpus has assistant messages");
     assert!(hits.iter().all(|hit| hit.role == "assistant"));
 
@@ -254,45 +239,32 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
         .expect("the corpus has at least one session");
     let mut request = search_request(&phrase);
     request.filters.session_id = Some(session_id.clone());
-    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
+    let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(hits.iter().all(|hit| hit.session_id == session_id));
 
     // source_agent: the real agent returns hits; an unknown one returns none.
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("claude-code".to_owned());
-    assert!(
-        !hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
-    );
+    assert!(!hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
     let mut request = search_request(&phrase);
     request.filters.source_agent = Some("no-such-agent".to_owned());
-    assert!(
-        hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
-    );
+    assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
 
     // date window: a far-future lower bound excludes the whole corpus.
     let mut request = search_request(&phrase);
     request.filters.from_date = Some("2099-01-01".to_owned());
-    assert!(
-        hits_of(pond_search(&store, Some(&backend), request, &search_config()).await).is_empty()
-    );
+    assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
 
     // project (contains): every hit is scoped to the requested project.
-    let project = hits_of(
-        pond_search(
-            &store,
-            Some(&backend),
-            search_request(&phrase),
-            &search_config(),
-        )
-        .await,
-    )
-    .into_iter()
-    .map(|hit| hit.project)
-    .find(|p| !p.is_empty())
-    .expect("fixture hits carry a project");
+    let project =
+        hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
+            .into_iter()
+            .map(|hit| hit.project)
+            .find(|p| !p.is_empty())
+            .expect("fixture hits carry a project");
     let mut request = search_request(&phrase);
     request.filters.project = Some(ProjectFilter::Contains(project.clone()));
-    let hits = hits_of(pond_search(&store, Some(&backend), request, &search_config()).await);
+    let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(!hits.is_empty());
     assert!(
         hits.iter()
@@ -305,13 +277,13 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
 #[tokio::test(flavor = "multi_thread")]
 async fn group_by_conversation_collapses_to_one_summary_per_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let (store, backend) = searchable_corpus(&temp).await?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
     let mut request = search_request(&phrase);
     request.group_by_conversation = true;
     let SearchEnvelope::Success(response) =
-        pond_search(&store, Some(&backend), request, &search_config()).await
+        pond_search(&store, &embedder, request, &search_config()).await
     else {
         panic!("grouped search must succeed");
     };
@@ -387,12 +359,17 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         namespace: Some("local".to_owned()),
         query: marker.to_owned(),
         mode_override: None,
+        similar_to: None,
         filters: SearchFilters::default(),
         boost_recent: true,
         group_by_conversation: false,
+        full: true,
         limit: 50,
     };
-    let hits = hits_of(pond_search(&store, None, request, &search_config()).await);
+    // FTS-only path: this store has no embeddings, so the resolver
+    // short-circuits to FTS and never queries the LazyEmbedder.
+    let embedder = LazyEmbedder::new();
+    let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(
         hits.iter().all(|hit| hit.message_id != "u-notify"),
         "an injected task-notification must never surface as a search hit"

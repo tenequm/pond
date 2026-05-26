@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML},
-    embed::{BatchProgress, E5Embedder, EmbedBackend, EmbedWorker, LazyEmbedder},
+    embed::{BatchProgress, E5Embedder, EmbedWorker, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
         AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, OptimizeOutcome, RowTotals,
@@ -194,6 +194,12 @@ enum Command {
         /// Collapse to one row per session, keeping the best-scoring message.
         #[arg(long)]
         group_by_conversation: bool,
+        /// Include each hit's full indexed text instead of just the match-
+        /// windowed snippet. Default off - the CLI shows snippets for the
+        /// human reading the table; pass `--full` for one-shot scripts that
+        /// want the body in the same response.
+        #[arg(long)]
+        full: bool,
         /// Substring match by default (`--project pond` -> contains "pond"). Prefix
         /// with `re:` for regex (`--project 're:^/Users/.*/x402'`); `lit:` escapes
         /// a literal value that would otherwise be parsed as a prefix.
@@ -660,7 +666,7 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(open_store_with_spinner(&data_dir, storage_map(&config)).await?);
             // Lazy: idle `pond serve` keeps RSS ~50 MB; the candle/Metal model
             // load (~600 MB) only triggers when the first hybrid search asks.
-            let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
+            let embedder = Arc::new(LazyEmbedder::new());
             let state = AppState {
                 store,
                 embedder,
@@ -675,7 +681,7 @@ async fn main() -> anyhow::Result<()> {
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
-            let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
+            let embedder = Arc::new(LazyEmbedder::new());
             transport::mcp::serve_stdio(AppState {
                 store,
                 embedder,
@@ -692,6 +698,7 @@ async fn main() -> anyhow::Result<()> {
             mode,
             no_boost_recent,
             group_by_conversation,
+            full,
             project,
             session_id,
             source_agent,
@@ -705,25 +712,16 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            // One-shot CLI: the embedder load cost has to be paid anyway if
-            // hybrid/vector mode wins, so load eagerly. `LazyEmbedder::get`
-            // would also work but adds an `.await` for zero benefit here.
-            // `--mode hybrid|vector` is an operator override that forces a
-            // load even when `config.embeddings.enabled = false`, so the
-            // benchmark harness can run against any corpus that already has
-            // vectors populated regardless of the user's daily-config switch.
-            let force_embedder =
-                matches!(mode, Some(CliSearchMode::Hybrid | CliSearchMode::Vector));
-            let embedder = if force_embedder || loaded.embeddings.enabled {
-                Some(Arc::new(E5Embedder::load()?) as Arc<dyn EmbedBackend>)
-            } else {
-                None
-            };
+            // Same `LazyEmbedder` pattern as the daemons: a single one-shot
+            // `pond search "foo"` against an FTS-only corpus never loads the
+            // model. The cost is one extra `.await` on first call.
+            let embedder = LazyEmbedder::new();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
                 query,
                 mode_override: mode.map(SearchModeWire::from),
+                similar_to: None,
                 filters: SearchFilters {
                     project,
                     session_id,
@@ -735,16 +733,15 @@ async fn main() -> anyhow::Result<()> {
                 },
                 boost_recent: !no_boost_recent,
                 group_by_conversation,
+                full,
                 limit,
             };
             if explain {
-                let plans =
-                    explain_search(&store, embedder.as_deref(), &request, &loaded.search).await?;
+                let plans = explain_search(&store, &embedder, &request, &loaded.search).await?;
                 output(&plans)?;
                 return Ok(());
             }
-            let envelope =
-                handlers::pond_search(&store, embedder.as_deref(), request, &loaded.search).await;
+            let envelope = handlers::pond_search(&store, &embedder, request, &loaded.search).await;
             if !render_search_envelope(format, &envelope)? {
                 std::process::exit(1);
             }
@@ -1314,7 +1311,7 @@ fn format_bytes(bytes: u64) -> String {
 
 async fn explain_search(
     store: &Store,
-    embedder: Option<&dyn EmbedBackend>,
+    embedder: &LazyEmbedder,
     request: &SearchRequest,
     search: &config::SearchConfig,
 ) -> anyhow::Result<String> {

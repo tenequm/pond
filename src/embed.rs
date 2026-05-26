@@ -152,53 +152,35 @@ fn device_label(device: &Device) -> &'static str {
     }
 }
 
-/// Lazy holder for the embedding backend used by long-running `pond serve` /
-/// `pond mcp`: the model isn't loaded until the first hybrid search asks for
-/// it. Idle `pond mcp` keeps RSS down to ~50 MB; first search triggers the
-/// candle/Metal load (~2-4s) and the loaded handle is cached for the life of
-/// the process. `pond embed` and `pond search` (one-shot CLI) load eagerly
-/// via [`E5Embedder::load`] directly.
+/// Lazy holder for the embedding backend. The candle/Metal model isn't
+/// loaded until the first hybrid search asks for it - idle `pond mcp` /
+/// `pond serve` keep RSS down to ~50 MB, and FTS-only corpora never pay the
+/// load at all because `pond_search`'s resolver only calls `get` inside the
+/// hybrid/vector branches. First call triggers the load (~2-4s) and the
+/// loaded handle is cached for the life of the process.
+#[derive(Default)]
 pub struct LazyEmbedder {
-    enabled: bool,
     cell: OnceCell<Arc<dyn EmbedBackend>>,
 }
 
 impl LazyEmbedder {
-    /// Build a lazy handle. `enabled` mirrors `config.embeddings.enabled`;
-    /// when false, `get` always returns `None` and never loads a model.
-    pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            cell: OnceCell::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Pre-seed with an already-constructed backend (tests, one-shot eager
-    /// paths). The cell is filled; subsequent `get` calls return this handle.
+    /// Pre-seed with an already-constructed backend. Used by integration
+    /// tests that want to inject a fake `EmbedBackend` without paying the
+    /// real model-load cost.
     pub fn from_loaded(backend: Arc<dyn EmbedBackend>) -> Self {
         let cell = OnceCell::new();
         let _ = cell.set(backend);
-        Self {
-            enabled: true,
-            cell,
-        }
+        Self { cell }
     }
 
-    /// Cheap, sync: is the embedder configured? `pond search`'s mode-resolution
-    /// uses this to decide hybrid-vs-FTS without paying a model-load cost on
-    /// FTS-only queries.
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Load (on first call) or return the cached handle. Returns `None` when
-    /// the config has embeddings disabled. The candle load is synchronous and
-    /// blocking, so it runs on `spawn_blocking`; the async caller sees a clean
-    /// `await` point.
-    pub async fn get(&self) -> Result<Option<Arc<dyn EmbedBackend>>> {
-        if !self.enabled {
-            return Ok(None);
-        }
+    /// Load (on first call) or return the cached handle. The candle load is
+    /// synchronous and blocking, so it runs on `spawn_blocking`; the async
+    /// caller sees a clean `await` point.
+    pub async fn get(&self) -> Result<Arc<dyn EmbedBackend>> {
         let handle = self
             .cell
             .get_or_try_init(|| async {
@@ -209,7 +191,7 @@ impl LazyEmbedder {
                 .map_err(|join_error| anyhow!("embedder load panicked: {join_error}"))?
             })
             .await?;
-        Ok(Some(handle.clone()))
+        Ok(handle.clone())
     }
 }
 
@@ -254,15 +236,18 @@ pub const DEFAULT_BATCH_SIZE: usize = 32;
 /// window, not the whole backlog. See [`EmbedWorker::with_sort_window`].
 pub const DEFAULT_SORT_WINDOW: usize = 2048;
 
-/// Prefix a search query for e5. e5 is an asymmetric retriever: its model
-/// card prescribes `query: ` on the search side, `passage: ` on documents.
-pub fn e5_query(query: &str) -> String {
+/// Format a search query for the embedder. e5 is an asymmetric retriever:
+/// its model card prescribes `query: ` on the search side, `passage: ` on
+/// documents. Used by `pond_search` to prepare the query text before the
+/// candle/Metal embed call.
+pub fn format_query(query: &str) -> String {
     format!("query: {query}")
 }
 
-/// Prefix a document (one message's `search_text`) for e5 - the
-/// `passage: ` half of the pair documented on [`e5_query`].
-pub fn e5_passage(text: &str) -> String {
+/// Format a document (one message's `search_text`) for the embedder - the
+/// `passage: ` half of the pair documented on [`format_query`]. Used by
+/// `EmbedWorker` when batching messages for `pond embed`.
+pub fn format_passage(text: &str) -> String {
     format!("passage: {text}")
 }
 
@@ -477,7 +462,7 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         // stored `search_text` keeps its uncapped, unprefixed form for FTS.
         let texts = pending
             .iter()
-            .map(|message| e5_passage(&message.search_text))
+            .map(|message| format_passage(&message.search_text))
             .collect::<Vec<_>>();
         let vectors = self.backend.embed(&texts)?;
         if vectors.len() != pending.len() {
@@ -517,11 +502,11 @@ mod tests {
     #[test]
     fn e5_prefixes_apply_the_asymmetric_retrieval_pair() {
         assert_eq!(
-            e5_query("how does retry backoff work"),
+            format_query("how does retry backoff work"),
             "query: how does retry backoff work",
         );
         assert_eq!(
-            e5_passage("retry uses exponential backoff"),
+            format_passage("retry uses exponential backoff"),
             "passage: retry uses exponential backoff",
         );
     }

@@ -182,6 +182,72 @@ def run_search(query: str, mode: str, limit: int, grouped: bool = False) -> dict
         return {"hits": [], "error": f"json: {e}"}
 
 
+class KbMcpClient:
+    """Persistent stdio JSON-RPC client for `kb mcp`. Reused across queries to
+    avoid ~0.5s per-query startup cost on 100+ runs."""
+
+    def __init__(self) -> None:
+        self.proc = subprocess.Popen(
+            ["kb", "mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self._req_id = 0
+        self._send({
+            "jsonrpc": "2.0", "method": "initialize", "id": self._next_id(),
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "pond-bench", "version": "0.1"}},
+        })
+        self._recv()  # initialize response
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    def _next_id(self) -> int:
+        self._req_id += 1
+        return self._req_id
+
+    def _send(self, obj: dict) -> None:
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps(obj) + "\n")
+        self.proc.stdin.flush()
+
+    def _recv(self) -> dict | None:
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline()
+        return json.loads(line) if line else None
+
+    def search(self, query: str, limit: int, min_score: float) -> dict:
+        self._send({
+            "jsonrpc": "2.0", "method": "tools/call", "id": self._next_id(),
+            "params": {"name": "kb_search",
+                       "arguments": {"query": query, "limit": limit, "min_score": min_score}},
+        })
+        resp = self._recv()
+        if resp is None:
+            return {"hits": [], "error": "kb mcp closed stdout"}
+        if "error" in resp:
+            return {"hits": [], "error": str(resp["error"])}
+        # Tool response is wrapped in `result.structuredContent`; the kb envelope
+        # sits at `.structuredContent.result` and matches normalize_hits' kb branch.
+        result = (resp.get("result") or {}).get("structuredContent")
+        if not result:
+            return {"hits": [], "error": "no structuredContent"}
+        return result
+
+    def close(self) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        finally:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 def normalize_hits(payload: dict) -> list[dict]:
     """Coerce one of three envelope shapes into [{session_id, message_id, text}]:
     pond `hits` (default), pond `groups` (--group-by-conversation), or kb's
@@ -212,23 +278,41 @@ def normalize_hits(payload: dict) -> list[dict]:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    check_binary()
+    backend = getattr(args, "backend", "pond")
+    if backend == "pond":
+        check_binary()
+        kb_client = None
+    elif backend == "kb-mcp":
+        kb_client = KbMcpClient()
+    else:
+        print(f"unknown backend: {backend}", file=sys.stderr)
+        return 64
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     count = errors = 0
-    for row in iter_queries(Path(args.queries)):
-        qid = row["id"]
-        envelope = run_search(row["query"], args.mode, args.limit, args.grouped)
-        if "error" in envelope:
-            errors += 1
-            (out_dir / f"{qid}.stderr").write_text(envelope["error"])
-            print(f"FAIL {qid} (mode={args.mode}): {envelope['error']}", file=sys.stderr)
-            continue
-        (out_dir / f"{qid}.json").write_text(json.dumps(envelope))
-        count += 1
+    try:
+        for row in iter_queries(Path(args.queries)):
+            qid = row["id"]
+            if backend == "pond":
+                envelope = run_search(row["query"], args.mode, args.limit, args.grouped)
+            else:
+                envelope = kb_client.search(row["query"], args.limit, args.kb_min_score)
+            if "error" in envelope:
+                errors += 1
+                (out_dir / f"{qid}.stderr").write_text(envelope["error"])
+                print(f"FAIL {qid} (backend={backend}): {envelope['error']}", file=sys.stderr)
+                continue
+            (out_dir / f"{qid}.json").write_text(json.dumps(envelope))
+            count += 1
+    finally:
+        if kb_client is not None:
+            kb_client.close()
+
     suffix = " grouped" if args.grouped else ""
+    mode_label = args.mode if backend == "pond" else f"kb-mcp(min_score={args.kb_min_score})"
     print(
-        f"done: ran {count} queries in {args.mode} mode{suffix} "
+        f"done: ran {count} queries in {mode_label} mode{suffix} "
         f"(limit={args.limit}); {errors} errors"
     )
     return 0 if errors == 0 else 1
@@ -682,7 +766,12 @@ def main() -> int:
 
     p_run = sub.add_parser("run", help="Run one retrieval mode against a query set")
     p_run.add_argument("--queries", required=True, help="TSV: id\\tlang\\tstratum\\tquery\\tground_truth")
-    p_run.add_argument("--mode", required=True, choices=["fts", "vector", "hybrid"])
+    p_run.add_argument("--mode", default="hybrid", choices=["fts", "vector", "hybrid"],
+                       help="pond retrieval mode (ignored for backend=kb-mcp)")
+    p_run.add_argument("--backend", default="pond", choices=["pond", "kb-mcp"],
+                       help="Search backend: pond CLI (default) or kb MCP server over stdio")
+    p_run.add_argument("--kb-min-score", type=float, default=0.0,
+                       help="kb_search min_score (default 0.0 for apples-to-apples vs pond default)")
     p_run.add_argument("--out", required=True, help="Output dir for per-query JSON envelopes")
     p_run.add_argument("--limit", type=int, default=20, help="pond search --limit (default 20)")
     p_run.add_argument("--grouped", action="store_true", help="Pass --group-by-conversation")
