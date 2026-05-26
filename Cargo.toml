@@ -13,11 +13,9 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
 dialoguer = { version = "0.12", default-features = false }
-# Embedding stack for `intfloat/multilingual-e5-small` (XLM-RoBERTa) - see
-# `src/embed.rs`. These declare the CPU baseline; the GPU backend is added
-# per target - Metal automatically on macOS via the `[target.*]` block below,
-# CUDA via the opt-in `cuda` feature. `hf-hub` fetches the weights,
-# `tokenizers` does the SentencePiece tokenization.
+# Embedding stack for `intfloat/multilingual-e5-small`. Backend chosen at
+# runtime in `src/embed.rs`: Metal on macOS (via the `[target.*]` block
+# below), CUDA via `--features cuda`, CPU otherwise.
 candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
@@ -25,8 +23,6 @@ fastrand = "2"
 hf-hub = "0.4"
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
-# Vendored protoc (protobuf-src) so builds need no system protoc. `lance`'s `protoc`
-# feature omits lance-datafusion, so it is declared here only to carry the feature.
 lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
 half = { version = "2.1", default-features = false }
 lance-datafusion = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
@@ -40,8 +36,8 @@ rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 # Streaming JSON pull-parser for the adapter seam's oversized-line slow path:
-# a record over `RECORD_CAP` is cap-parsed leaf-by-leaf so peak memory stays
-# bounded instead of materializing a multi-GiB value (see src/adapter/jsonl.rs).
+# records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays
+# bounded (see src/adapter/jsonl.rs).
 struson = "0.7"
 thiserror = "2.0.18"
 tokenizers = "0.21"
@@ -54,72 +50,48 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 
-# macOS always ships Metal as a system framework, so the embedding model gets
-# its GPU backend automatically here - a plain `cargo build` works on macOS
-# (Metal) and Linux (candle CPU) alike, with no feature flags. Linux + NVIDIA
-# opts into the GPU with `--features cuda` (see `[features]`).
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
 candle-nn = { version = "0.10", features = ["metal"] }
 candle-transformers = { version = "0.10", features = ["metal"] }
 
 [features]
-# Opt-in NVIDIA GPU path: `cargo build --features cuda` on a Linux host with
-# the CUDA toolkit installed. macOS needs no feature - Metal is wired in via
-# the `[target.'cfg(target_os = "macos")']` block above. `select_device` in
-# `src/embed.rs` picks the live backend at runtime.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
-# Also a regular dependency; declared here so integration tests can name
-# `MetricType` when asserting the distance-metric mapping.
+# Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
 lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-# `rmcp` is a regular dependency too; the `client` feature is dev-only so the
-# MCP integration test can drive the server with an in-process client. Cargo
-# unifies it into the test build without adding `client` to the shipped binary.
+# Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
 tempfile = "3.25"
-# `oneshot` lets the HTTP integration test drive the axum `Router` directly,
-# with no socket bind and no HTTP client dependency.
+# Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
 
-# `benches/embed_bench.rs` is a parameterized stress-test harness, not a
-# `cargo bench` micro-benchmark - `harness = false` makes it a plain `fn main`
-# binary. Run: `cargo bench --bench embed_bench -- --help`.
+# Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]
 name = "embed_bench"
 harness = false
 
-# `benches/ingest_bench.rs` measures the ingest path: per-stage timing plus a
-# per-table merge_insert breakdown captured via a `pond::perf` tracing layer.
-# Run: `cargo bench --bench ingest_bench -- --source-dir <PATH> [--source-dir <PATH>...]`
 [[bench]]
 name = "ingest_bench"
 harness = false
 
-# `line-tables-only` keeps file/line info for panic and `RUST_BACKTRACE`
-# backtraces but drops the richer per-variable debuginfo only a step-debugger
-# uses. Less debuginfo for rustc to emit means faster codegen on every rebuild.
+# Keeps file/line info for panic backtraces; drops the per-variable debuginfo
+# only a step-debugger uses. Faster codegen on every rebuild.
 [profile.dev]
 debug = "line-tables-only"
 
-# Build dependencies optimized even in dev/test builds. The hot code lives in
-# the dependency graph (lance, arrow, candle); leaving it unoptimized makes
-# `cargo test` and the embed worker crawl. pond's own crate stays unoptimized
-# and incremental, so the edit -> check -> test loop stays fast. One-time cost:
-# the dep graph is rebuilt once under this setting, then cached.
+# Optimize dependency crates even in dev/test - the hot code (lance, arrow,
+# candle) lives there; pond's own crate stays unoptimized for fast rebuilds.
 [profile.dev.package."*"]
 opt-level = 3
 
-# Plain `release` is the iteration profile - no LTO, default codegen-units - so
-# `cargo build --release` and `cargo bench` (which inherits `release`) relink in
-# seconds on a local-crate change. Ship-grade optimization lives in `dist`.
+# Iteration profile: no LTO so local-crate rebuilds relink in seconds.
+# Ship-grade optimization is `dist`.
 [profile.release]
 
-# `dist` is the ship profile: whole-program thin-LTO and a single codegen unit.
-# Used only for release artifacts (`cargo build --profile dist`), never the
-# edit loop - it rebuilds the dependency graph once under its own settings.
+# Ship profile: thin-LTO + single codegen unit. Used only for release artifacts.
 [profile.dist]
 inherits = "release"
 lto = "thin"
