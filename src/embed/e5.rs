@@ -8,7 +8,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::xlm_roberta::{Config, XLMRobertaModel};
 use tokenizers::Tokenizer;
 
-use super::{EmbedBackend, MODEL_ID};
+use super::{EmbedBackend, model_id};
+use crate::sessions::embedding_dim;
 
 /// e5's training context. The tokenizer truncates input past it before
 /// inference - one message, one vector, bounded embed cost.
@@ -24,19 +25,31 @@ pub struct E5Embedder {
 }
 
 impl E5Embedder {
-    /// Load `intfloat/multilingual-e5-base` from HuggingFace (cached after the
-    /// first download) onto the best available device.
+    /// Load the configured XLM-RoBERTa model from HuggingFace (cached after
+    /// the first download) onto the best available device. The model id comes
+    /// from [`model_id`]; the configured `[embeddings].dim` must match the
+    /// model's `hidden_size`, otherwise writes would fail at the schema
+    /// boundary anyway.
     pub fn load() -> Result<Self> {
         let device = select_device();
+        let id = model_id();
         let api = hf_hub::api::sync::Api::new().context("init HuggingFace hub client")?;
-        let repo = api.model(MODEL_ID.to_owned());
+        let repo = api.model(id.to_owned());
         let fetch = |file: &str| {
             repo.get(file)
-                .with_context(|| format!("fetch {file} for {MODEL_ID}"))
+                .with_context(|| format!("fetch {file} for {id}"))
         };
 
         let config: Config =
             serde_json::from_str(&std::fs::read_to_string(fetch("config.json")?)?)?;
+        if config.hidden_size != embedding_dim() {
+            return Err(anyhow!(
+                "[embeddings].dim = {} but model {id:?} reports hidden_size = {}; \
+                 set [embeddings].dim to match the model's output width.",
+                embedding_dim(),
+                config.hidden_size,
+            ));
+        }
         // `candle_core::safetensors::load` encapsulates the mmap behind a safe
         // API - pond forbids `unsafe`, so this is the entry point rather than
         // `VarBuilder::from_mmaped_safetensors`.
@@ -49,7 +62,7 @@ impl E5Embedder {
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
         let vb = VarBuilder::from_tensors(tensors, DType::F16, &device);
         let model = XLMRobertaModel::new(&config, vb)
-            .map_err(|error| anyhow!("load {MODEL_ID} weights: {error}"))?;
+            .map_err(|error| anyhow!("load {id} weights: {error}"))?;
 
         let mut tokenizer = Tokenizer::from_file(fetch("tokenizer.json")?)
             .map_err(|error| anyhow!("load e5 tokenizer: {error}"))?;
@@ -67,7 +80,7 @@ impl E5Embedder {
             }))
             .map_err(|error| anyhow!("configure e5 tokenizer: {error}"))?;
 
-        tracing::info!(model = %MODEL_ID, device = device_label(&device), "loaded embedding model");
+        tracing::info!(model = %id, device = device_label(&device), "loaded embedding model");
         Ok(Self {
             model,
             tokenizer,

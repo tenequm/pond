@@ -1,8 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! Write-path index upkeep (spec.md#index-upkeep): every ingest route builds
-//! and folds the FTS index, and retrieval finds a message by a verbatim
-//! multi-word phrase it contains.
+//! Fold-on-write at the ingest seam (spec.md#fold-on-write): every ingest
+//! route lands data and its index folds in one atomic operation per merge,
+//! so after either `ingest_adapter` or `ingest_events` the FTS index covers
+//! every appended row and a verbatim phrase is retrievable end-to-end.
 
 use chrono::Utc;
 use pond::{

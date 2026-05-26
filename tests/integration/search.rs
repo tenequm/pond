@@ -12,7 +12,7 @@ use pond::{
     handlers::ingest_adapter,
     handlers::pond_get,
     handlers::pond_search,
-    sessions::{EMBEDDING_DIM, Store},
+    sessions::{Store, embedding_dim},
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, Hit, ProjectFilter, SearchEnvelope, SearchFilters,
@@ -39,7 +39,7 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
     let mut state = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
-    (0..EMBEDDING_DIM)
+    (0..embedding_dim())
         .map(|_| {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -57,12 +57,14 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
 async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, FakeBackend)> {
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
+    // spec.md#fold-on-write: ingest_adapter folds the FTS + scalar indices
+    // inline on each merge, so by the time it returns the indices already
+    // cover every appended row. EmbedWorker likewise folds-on-write per
+    // window. No separate post-ingest / post-embed upkeep call.
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
-    store.ensure_indices(false).await?;
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.ensure_embedding_indices().await?;
     Ok((store, backend))
 }
 
@@ -200,7 +202,6 @@ async fn search_picks_hybrid_or_fts_based_on_embedder_state() -> anyhow::Result<
         |_| {},
     )
     .await?;
-    store2.ensure_indices(false).await?;
     let hits = body_hits(
         success_of(pond_search(&store2, Some(&backend), search_request(&phrase)).await).result,
     );

@@ -7,15 +7,14 @@
 //! `messages` in one column-update commit.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
-use lance::index::vector::VectorIndexParams;
-use lance_linalg::distance::MetricType;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
-use crate::sessions::{EMBEDDING_DIM, EmbeddedMessage, PendingMessage, Store};
+use crate::sessions::{EmbeddedMessage, PendingMessage, Store};
 
 pub mod e5;
 pub use e5::E5Embedder;
@@ -81,10 +80,34 @@ impl LazyEmbedder {
     }
 }
 
-/// The one embedding model pond ships a loader for (spec.md#search).
-/// `config.embeddings.model` is validated against this; `pond embed` stamps it
-/// into `messages.embedding_model` with every vector.
-pub const MODEL_ID: &str = "intfloat/multilingual-e5-base";
+/// Default embedding model pond ships a loader for (spec.md#search). Used when
+/// `[embeddings].model` is absent. `pond embed` stamps the runtime model id
+/// (see [`model_id`]) into `messages.embedding_model` with every vector.
+/// e5-small (384-dim) is the default; bench/embeddings/queries-paraphrased.tsv
+/// showed no statistically-significant quality loss vs e5-base while halving
+/// vector storage and ~halving model RSS.
+pub const DEFAULT_MODEL_ID: &str = "intfloat/multilingual-e5-small";
+
+/// Process-wide model id, seeded once at startup from `[embeddings].model` via
+/// [`init_model_id`]. `OnceLock` (not `const`) so a temporary config file can
+/// pick e5-small / e5-large for an experiment without touching every call site.
+/// Uninitialized -> [`DEFAULT_MODEL_ID`], keeping unit tests config-free.
+static MODEL_ID_RUNTIME: OnceLock<String> = OnceLock::new();
+
+/// The active model id. Returns the value installed by [`init_model_id`] or
+/// [`DEFAULT_MODEL_ID`] when nothing has installed one (tests, ad-hoc tooling).
+pub fn model_id() -> &'static str {
+    MODEL_ID_RUNTIME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_MODEL_ID)
+}
+
+/// Seed [`model_id`] from config. First call wins; later calls with a different
+/// id are silently ignored - the process loads its config once.
+pub fn init_model_id(id: String) {
+    MODEL_ID_RUNTIME.get_or_init(|| id);
+}
 
 /// Messages per model-inference + write batch. e5 truncates at 512 tokens, so
 /// a 32-row batch's padded attention transient stays bounded.
@@ -97,29 +120,6 @@ pub const DEFAULT_BATCH_SIZE: usize = 32;
 /// own longest, not the corpus worst case. Bounded so peak memory stays one
 /// window, not the whole backlog. See [`EmbedWorker::with_sort_window`].
 pub const DEFAULT_SORT_WINDOW: usize = 2048;
-
-/// IVF_PQ parameters for the `messages.vector` index, sized to the row count.
-/// Cosine metric: e5 vectors are L2-normalized. `num_sub_vectors = dim / 8`
-/// gives 8-float PQ subspaces (`EMBEDDING_DIM` is divisible by 8).
-pub fn index_params(num_rows: usize) -> VectorIndexParams {
-    VectorIndexParams::ivf_pq(
-        ivf_num_partitions(num_rows),
-        8,
-        EMBEDDING_DIM / 8,
-        MetricType::Cosine,
-        15,
-    )
-}
-
-fn ivf_num_partitions(num_rows: usize) -> usize {
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let sqrt = (num_rows as f64).sqrt().round() as usize;
-    sqrt.clamp(32, 4096)
-}
 
 /// Prefix a search query for e5. e5 is an asymmetric retriever: its model
 /// card prescribes `query: ` on the search side, `passage: ` on documents.
@@ -135,12 +135,11 @@ pub fn e5_passage(text: &str) -> String {
 
 /// The embedding seam (spec.md#search): text in, vectors out. The real backend
 /// is [`E5Embedder`]; tests substitute an instrumented fake to assert
-/// batching behavior. v1 has one model ([`MODEL_ID`]), so the seam needs no
-/// dimension or model-id accessor - the vector width is checked at the write
-/// boundary and the model id is the [`MODEL_ID`] constant.
+/// batching behavior. The vector width is checked at the write boundary and
+/// the model id is whatever [`model_id`] returns at the time of the write.
 pub trait EmbedBackend: Send + Sync {
     /// Embed a batch of texts. The returned vectors are L2-normalized and
-    /// `EMBEDDING_DIM` long, one per input.
+    /// [`embedding_dim`] long, one per input.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
@@ -280,7 +279,7 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
         summary.cancelled = self.cancelled();
 
         tracing::info!(
-            model = MODEL_ID,
+            model = model_id(),
             messages = summary.messages,
             batches = summary.batches,
             cancelled = summary.cancelled,

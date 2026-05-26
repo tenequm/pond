@@ -23,12 +23,15 @@ tmp/
 .agents/skills/
 /benches/corpus/
 
-# Benchmark fixtures/results capture full conversation content from the
-# operator's local corpus (including API keys, wallet addresses, and private
-# project paths embedded in indexed messages). Regenerate locally via
-# `bench/embeddings/run.sh`. Never commit these.
+# Benchmark fixtures/results and any query set derived from the operator's
+# corpus capture full conversation content (including API keys, wallet
+# addresses, and private project paths embedded in indexed messages). The
+# paraphrased query set is also derivative - even after paraphrasing the
+# topics and project names leak. Regenerate locally via `bench.py`. Never
+# commit these.
 /bench/embeddings/fixtures/
 /bench/embeddings/results/
+/bench/embeddings/queries-paraphrased*.tsv
 /bench/embeddings/__pycache__/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate

@@ -12,7 +12,7 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     embed::{DEFAULT_BATCH_SIZE, EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
-    sessions::{EMBEDDING_DIM, Store},
+    sessions::{Store, embedding_dim},
 };
 use tempfile::TempDir;
 
@@ -49,7 +49,7 @@ impl EmbedBackend for FakeBackend {
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.counts.lock().unwrap().push(texts.len());
         self.texts.lock().unwrap().extend(texts.iter().cloned());
-        Ok(vec![vec![0.1; EMBEDDING_DIM]; texts.len()])
+        Ok(vec![vec![0.1; embedding_dim()]; texts.len()])
     }
 }
 

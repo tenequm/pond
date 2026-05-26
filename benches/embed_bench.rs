@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
         |_| {},
     )
     .await?;
-    store.ensure_indices(false).await?;
+    // spec.md#fold-on-write: ingest_adapter already folded FTS + scalars.
     let ingest_elapsed = ingest_start.elapsed();
     let (sessions, messages, parts) = store.row_counts().await?;
 
