@@ -19,6 +19,8 @@ mod recovery;
 mod remote_backend;
 #[path = "integration/restore.rs"]
 mod restore;
+#[path = "integration/s3_backend.rs"]
+mod s3_backend;
 #[path = "integration/search.rs"]
 mod search;
 #[path = "integration/session_scoped_pk.rs"]

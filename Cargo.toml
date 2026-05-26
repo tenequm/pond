@@ -67,6 +67,9 @@ insta = "1.47.2"
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+s3s = "0.13"
+s3s-fs = "0.13"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]
@@ -75,6 +78,10 @@ harness = false
 
 [[bench]]
 name = "ingest_bench"
+harness = false
+
+[[bench]]
+name = "backend_bench"
 harness = false
 
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo
