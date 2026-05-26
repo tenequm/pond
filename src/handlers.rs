@@ -1056,7 +1056,7 @@ mod search_handler {
     /// never pick: the server decides hybrid-vs-FTS from embedder availability
     /// (per-hit `matched_via` tells clients which retrievers ranked a row).
     /// `Vector` exists for operator tooling - selected via `pond search --mode`
-    /// or the `mode_override` wire field consumed by `bench/embeddings/`.
+    /// or the `mode_override` wire field consumed by `scripts/search-benchmarks/`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Hybrid,
@@ -1072,7 +1072,6 @@ mod search_handler {
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
-        pub rrf_k: u32,
         pub boost_recent: bool,
         pub group_by_conversation: bool,
         pub min_score: f64,
@@ -1087,31 +1086,24 @@ mod search_handler {
     const HIT_TEXT_FULL: usize = 2000;
     const HIT_SNIPPET_CHARS: usize = 400;
     /// Recency-boost constants (spec.md#search).
-    // Additive recency boost (spec.md#search). The cap is calibrated to act as
-    // a tiebreaker, not a primary signal: with RRF k=10 the fused base score
-    // tops out near 0.18 (dual-arm rank 1), so a 0.2-class boost would let a
-    // fresh-but-irrelevant hit outscore a perfectly-relevant old one. 0.05
-    // keeps recency at roughly 25% of a dual-arm rank-1 base, still material
-    // enough to break ties among comparably-scored hits but not enough to flip
-    // a strong relevance signal.
+    // Additive recency boost (spec.md#search). Caps at 0.05 so it stays a
+    // tiebreaker rather than a primary signal: the fused base score from
+    // score-normalized hybrid fusion ranges in [0, FTS_FUSION_WEIGHT +
+    // VECTOR_FUSION_WEIGHT] = [0, 1.135], so 0.05 is roughly 4% of the
+    // max-possible base.
     const RECENCY_MAX_BOOST: f64 = 0.05;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
 
-    // Asymmetric per-arm RRF k (Bruch, Gai, Ingber 2022 "off-diagonal",
-    // arXiv 2210.11934). FTS is the higher-precision arm on pond's
-    // keyword-heavy corpus, so its rank curve is sharper (smaller k); vector
-    // is flatter (larger k). The wire `rrf_k` is a global scaling knob;
-    // `k_fts = rrf_k / 2` and `k_vec = rrf_k * 2` slide both arms along the
-    // same axis. Sweep at `bench/embeddings/simulate_fusion.py` identified a
-    // wide plateau at k_fts in [5,8] and k_vec in [15,20]; (5, 20) is the
-    // centroid. No per-query routing: cross-lingual queries are an agent-
-    // layer concern (see the `pond_search` MCP description).
-    fn rrf_k_for(arm: RetrieverKind, base: u32) -> u32 {
-        match arm {
-            RetrieverKind::Fts => (base / 2).max(1),
-            RetrieverKind::Vector => base.saturating_mul(2).max(1),
-        }
-    }
+    // Score-normalized hybrid fusion weights (spec.md#search). Per-arm
+    // base_score is min-max normalized within the arm's pool, then the two
+    // arms are combined as w_fts * norm_fts + w_vec * norm_vec. The 0.135:1
+    // ratio was identified by `scripts/search-benchmarks/simulate_fusion.py` on the
+    // 111-query paraphrase set: a wide plateau at w_fts in [0.09, 0.14]
+    // (S@3 = 0.640-0.649), centroid 0.135. Symmetric across arms — no
+    // per-query routing; cross-lingual queries are an agent-layer concern
+    // (see the `pond_search` MCP description).
+    const FTS_FUSION_WEIGHT: f64 = 0.135;
+    const VECTOR_FUSION_WEIGHT: f64 = 1.0;
 
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
     /// `embedder` is `Some` AND at least one message is embedded under the
@@ -1218,27 +1210,59 @@ mod search_handler {
                         .map_err(map_storage)
                 };
                 let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
-                // Asymmetric per-arm k; same constants for every query. Cross-
-                // lingual recall is handled at the agent layer via dual-language
-                // probing, not by routing inside pond.
-                let k_fts = rrf_k_for(RetrieverKind::Fts, plan.rrf_k);
-                let k_vec = rrf_k_for(RetrieverKind::Vector, plan.rrf_k);
+                // Per-arm score shaping before fusion:
+                //   - FTS: max-normalize raw BM25 (`score / max`) so the
+                //     unbounded BM25 head doesn't dominate fusion when the
+                //     query has one term that hits a rare phrase very hard.
+                //   - Vector: rank-normalize the cosine-distance-ordered
+                //     output (`1 - idx/n`); this is what the bench harness
+                //     `simulate_fusion.py` was tuned against and what the
+                //     vector-only path already emits as `base_score`.
+                // Fusion (`fuse_arms`) min-max normalizes again over the
+                // arm's full pool and weights the two arms by
+                // FTS_FUSION_WEIGHT and VECTOR_FUSION_WEIGHT.
+                let fts_max = fts.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
+                let fts_entries: Vec<(MessageKey, f64)> = fts
+                    .into_iter()
+                    .map(|(key, score)| {
+                        let normed = if fts_max > 0.0 {
+                            f64::from(score / fts_max)
+                        } else {
+                            0.0
+                        };
+                        (key, normed)
+                    })
+                    .collect();
+                let vec_n = vector_raw.len() as f64;
+                let vector_entries: Vec<(MessageKey, f64)> = vector_raw
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (key, _))| {
+                        let normed = if vec_n > 0.0 {
+                            1.0 - (idx as f64 / vec_n)
+                        } else {
+                            0.0
+                        };
+                        (key, normed)
+                    })
+                    .collect();
                 // FTS first: when both arms picked different messages from the
-                // same session_root, RRF will keep FTS's representative (better
-                // for hit display since BM25 highlights the lexical match).
+                // same session_root, the fuser keeps FTS's representative
+                // (better for hit display since BM25 highlights the lexical
+                // match).
                 let lists = [
                     RankedList {
                         retriever: RetrieverKind::Fts,
-                        keys: fts.into_iter().map(|(key, _)| key).collect(),
-                        k: k_fts,
+                        entries: fts_entries,
+                        weight: FTS_FUSION_WEIGHT,
                     },
                     RankedList {
                         retriever: RetrieverKind::Vector,
-                        keys: vector_raw.into_iter().map(|(key, _)| key).collect(),
-                        k: k_vec,
+                        entries: vector_entries,
+                        weight: VECTOR_FUSION_WEIGHT,
                     },
                 ];
-                rrf_merge(&lists)
+                fuse_arms(&lists)
                     .into_iter()
                     .map(|hit| Candidate {
                         session_id: hit.key.session_id,
@@ -1404,7 +1428,8 @@ mod search_handler {
         }
         let limit = request.limit.min(LIMIT_CAP);
         let filter = build_filter(&request.filters)?;
-        // Retriever candidate pool: wider than `limit` so RRF has material to merge.
+        // Retriever candidate pool: wider than `limit` so the fuser has
+        // material to merge.
         let pool = limit.saturating_mul(5).max(50);
         Ok(SearchPlan {
             mode,
@@ -1413,7 +1438,6 @@ mod search_handler {
             pool,
             vector_pool: pool.saturating_mul(2),
             limit,
-            rrf_k: request.rrf_k,
             boost_recent: request.boost_recent,
             group_by_conversation: request.group_by_conversation,
             min_score: request.filters.min_score,
@@ -1435,17 +1459,16 @@ mod search_handler {
         }
     }
 
-    /// A retriever-ranked list of message primary keys, best-first. `k` is the
-    /// RRF constant for THIS arm's contribution - asymmetric per-arm k lets
-    /// pond reward the more reliable arm's top ranks more sharply. For pond's
-    /// keyword-heavy corpus FTS is the higher-precision arm, so the call site
-    /// pairs `k_fts` ~5 (sharper) with `k_vec` ~20 (flatter). The asymmetric-k
-    /// pattern is the "off-diagonal" finding of Bruch, Gai, Ingber 2022
-    /// (arXiv 2210.11934).
+    /// A retriever-ranked arm: scored hits best-first plus the arm's fusion
+    /// weight. `entries` carries each hit's raw `base_score` (BM25 for FTS,
+    /// cosine-similarity for the vector arm); the fuser min-max normalizes
+    /// those within the arm before combining across arms. `weight` is the
+    /// per-arm scalar that controls relative arm influence after
+    /// normalization.
     pub struct RankedList {
         pub retriever: RetrieverKind,
-        pub keys: Vec<MessageKey>,
-        pub k: u32,
+        pub entries: Vec<(MessageKey, f64)>,
+        pub weight: f64,
     }
 
     /// Wire-to-internal mode mapping. Kept here so the wire type stays free of
@@ -1458,9 +1481,9 @@ mod search_handler {
         }
     }
 
-    /// One merged RRF result.
+    /// One merged hybrid-fusion result.
     #[derive(Debug, Clone, PartialEq)]
-    pub struct RrfHit {
+    pub struct FusedHit {
         pub key: MessageKey,
         pub score: f64,
         pub matched_via: Vec<String>,
@@ -1477,41 +1500,67 @@ mod search_handler {
         }
     }
 
-    /// Reciprocal Rank Fusion keyed on the conversation root: each retriever
-    /// contributes at most one ballot per session_root (the highest-ranked
-    /// message it returned for that root), and ballots are summed across
-    /// retrievers as `sum(1 / (k + rank))`. The representative message_id is
-    /// the first one each arm picked for the root; when both arms picked
-    /// different messages from the same root, the first arm in the `lists`
-    /// argument wins the representative (callers should list FTS first when
-    /// FTS-side provenance is preferred for the displayed hit). Ties break on
-    /// the representative key for determinism (spec.md#search).
+    /// Score-normalized hybrid fusion keyed on the conversation root: for
+    /// each arm, the surviving (post intra-arm dedup-by-root) raw `base_score`
+    /// values are min-max normalized to [0, 1] across that arm's pool, then
+    /// summed across arms weighted by `RankedList.weight`. The representative
+    /// message_id is the first one each arm picked for the root; when both
+    /// arms picked different messages from the same root, the first arm in
+    /// the `lists` argument wins the representative (callers should list FTS
+    /// first when FTS-side provenance is preferred for the displayed hit).
+    /// Ties break on the representative key for determinism
+    /// (spec.md#search).
     ///
     /// Why session-root keying instead of `(session_id, message_id)`: a long
     /// session whose best FTS message and best vector message differ would
     /// otherwise appear as two separate fused hits, neither getting the
     /// cross-arm validation bonus. Keying on the root credits cross-arm
     /// agreement at the conversation level - which is what the user sees.
-    pub fn rrf_merge(lists: &[RankedList]) -> Vec<RrfHit> {
+    ///
+    /// Why per-arm score normalization instead of RRF: RRF discards score
+    /// magnitude (rank 1 contributes the same whether the vector cosine is
+    /// 0.85 or 0.55), and on paraphrase queries that magnitude is the load-
+    /// bearing signal. See `scripts/search-benchmarks/simulate_fusion.py` and
+    /// `docs/researches/embeddings/`.
+    pub fn fuse_arms(lists: &[RankedList]) -> Vec<FusedHit> {
         let mut merged: std::collections::HashMap<String, (f64, Vec<String>, MessageKey)> =
             std::collections::HashMap::new();
         for list in lists {
-            let k = f64::from(list.k.max(1));
+            if list.entries.is_empty() {
+                continue;
+            }
+            // Min-max normalize across the FULL arm pool BEFORE dedup. The
+            // benchmark simulator (scripts/search-benchmarks/simulate_fusion.py) and
+            // the production code MUST agree on the normalization basis;
+            // dedupping first would narrow [lo, hi] to only the surviving
+            // session-roots' scores and skew the normalized signal away
+            // from what the benchmark reports. A degenerate arm where every
+            // hit ties on raw score collapses to zero contribution; the
+            // other arm then decides the order.
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for (_, raw) in &list.entries {
+                if *raw < lo {
+                    lo = *raw;
+                }
+                if *raw > hi {
+                    hi = *raw;
+                }
+            }
+            let range = hi - lo;
+            // Intra-arm dedup-by-root keeps the highest-scoring message
+            // each arm returned for a given conversation: without it a long
+            // session whose top-N hits all share a root would crowd out
+            // cross-arm signal from other sessions.
             let mut seen_in_arm: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            // The rank that drives the RRF contribution is the position in the
-            // DEDUPED arm list, not the raw scanner output. Without this, an
-            // arm that returns several messages from one long session at its
-            // top inflates the ranks of every subsequent session by the size
-            // of the duplicate run, suppressing real cross-arm agreement.
-            let mut dedup_rank: usize = 0;
-            for key in &list.keys {
+            for (key, raw) in &list.entries {
                 let root = session_root(&key.session_id).to_owned();
                 if !seen_in_arm.insert(root.clone()) {
                     continue;
                 }
-                dedup_rank += 1;
-                let contribution = 1.0 / (k + dedup_rank as f64);
+                let norm = if range > 0.0 { (raw - lo) / range } else { 0.0 };
+                let contribution = list.weight * norm;
                 let entry = merged
                     .entry(root)
                     .or_insert_with(|| (0.0, Vec::new(), key.clone()));
@@ -1521,7 +1570,7 @@ mod search_handler {
         }
         let mut hits = merged
             .into_values()
-            .map(|(score, matched_via, key)| RrfHit {
+            .map(|(score, matched_via, key)| FusedHit {
                 key,
                 score,
                 matched_via,
@@ -1850,92 +1899,86 @@ mod search_handler {
         }
 
         #[test]
-        fn rrf_merge_dedupes_intra_arm_by_session_root_and_credits_cross_arm() {
+        fn fuse_arms_dedupes_intra_arm_by_session_root_and_credits_cross_arm() {
             let mk = |sid: &str, mid: &str| crate::sessions::MessageKey {
                 session_id: sid.to_owned(),
                 message_id: mid.to_owned(),
             };
-            // FTS: session-A msg-1 (rank 1), session-A msg-2 (rank 2, same root,
-            // dropped by intra-arm dedup), session-B msg-3 (rank 3 -> effective 2),
-            // session-A/agent-x msg-4 (rank 4, same root as A, dropped).
-            // Vector: session-B msg-7 (rank 1, different message than FTS's pick
-            // for B), session-A msg-9 (rank 2).
+            // FTS pool (raw BM25): session-A msg-1 (10.0), session-A msg-2
+            // (9.0, same root, dropped by intra-arm dedup), session-B msg-3
+            // (6.0), session-A/agent-x msg-4 (5.0, same root as A, dropped).
+            // Vector pool (raw cosine): session-B msg-7 (0.9, different
+            // message than FTS's pick for B), session-A msg-9 (0.6).
             let fts = RankedList {
                 retriever: RetrieverKind::Fts,
-                keys: vec![
-                    mk("session-A", "msg-1"),
-                    mk("session-A", "msg-2"),
-                    mk("session-B", "msg-3"),
-                    mk("session-A/agent-x", "msg-4"),
+                entries: vec![
+                    (mk("session-A", "msg-1"), 10.0),
+                    (mk("session-A", "msg-2"), 9.0),
+                    (mk("session-B", "msg-3"), 6.0),
+                    (mk("session-A/agent-x", "msg-4"), 5.0),
                 ],
-                k: 10,
+                weight: 0.135,
             };
             let vec_arm = RankedList {
                 retriever: RetrieverKind::Vector,
-                keys: vec![mk("session-B", "msg-7"), mk("session-A", "msg-9")],
-                k: 10,
+                entries: vec![
+                    (mk("session-B", "msg-7"), 0.9),
+                    (mk("session-A", "msg-9"), 0.6),
+                ],
+                weight: 1.0,
             };
-            let merged = rrf_merge(&[fts, vec_arm]);
-            // Output: one row per session_root, sorted by fused score.
+            let merged = fuse_arms(&[fts, vec_arm]);
+            // Output: one row per session_root after intra-arm dedup.
             assert_eq!(merged.len(), 2);
-            // session-A: FTS rank 1 (1/11) + Vector rank 2 (1/12) = 0.174
-            // session-B: FTS rank 2 (1/12) + Vector rank 1 (1/11) = 0.174
-            // Equal fused scores; tie breaks on the representative key, where
-            // session-A's `msg-1` sorts before session-B's `msg-3`.
-            assert_eq!(merged[0].key.session_id, "session-A");
-            assert_eq!(merged[0].key.message_id, "msg-1");
+            // Per-arm min-max over the FULL pool BEFORE dedup:
+            // FTS pool [10, 9, 6, 5]: range 5. A's first hit (10) -> 1.0;
+            // B's first hit (6) -> 0.2.
+            // Vector pool [0.9, 0.6]: range 0.3. B -> 1.0; A -> 0.0.
+            // session-A: 0.135 * 1.0 + 1.0 * 0.0 = 0.135.
+            // session-B: 0.135 * 0.2 + 1.0 * 1.0 = 1.027. B wins.
+            assert_eq!(merged[0].key.session_id, "session-B");
+            // FTS was listed first, so FTS's pick (msg-3) wins the
+            // representative over Vector's pick (msg-7) for session-B.
+            assert_eq!(merged[0].key.message_id, "msg-3");
             assert_eq!(merged[0].matched_via, vec!["fts", "vector"]);
-            assert_eq!(merged[1].key.session_id, "session-B");
-            // FTS was listed first, so FTS's pick (msg-3) wins the representative
-            // over Vector's pick (msg-7) for session-B.
-            assert_eq!(merged[1].key.message_id, "msg-3");
+            assert_eq!(merged[1].key.session_id, "session-A");
+            assert_eq!(merged[1].key.message_id, "msg-1");
             assert_eq!(merged[1].matched_via, vec!["fts", "vector"]);
         }
 
         #[test]
-        fn asymmetric_k_sharpens_fts_and_flattens_vector() {
+        fn fuse_arms_collapses_degenerate_tied_arm_to_zero_contribution() {
+            // When every surviving hit in an arm shares the same raw score,
+            // min-max normalization has zero range; that arm contributes 0
+            // and the other arm decides the order on its own normalized
+            // signal. This protects fusion from "flat" arms (e.g. an FTS arm
+            // whose BM25 scores all tie at the same low magnitude).
             let mk = |sid: &str, mid: &str| crate::sessions::MessageKey {
                 session_id: sid.to_owned(),
                 message_id: mid.to_owned(),
             };
-            // Scenario: a single-arm FTS rank-1 hit (target) versus a dual-arm
-            // hit whose FTS rank is mediocre but vector rank is high.
-            //   target: FTS rank 1, NOT in vector.
-            //   noise:  FTS rank 3, vector rank 1.
-            // Under equal k=10, target = 1/11 = 0.091; noise = 1/13 + 1/11 = 0.168.
-            //   noise wins.
-            // Under asymmetric k_fts=5, k_vec=20:
-            //   target = 1/6 = 0.167; noise = 1/8 + 1/21 = 0.173. Tight.
-            // The asymmetric setup is calibrated for the broader plateau on
-            // pond's benchmark, not this single-query toy.
             let fts = RankedList {
                 retriever: RetrieverKind::Fts,
-                keys: vec![mk("target", "t1"), mk("filler", "f1"), mk("noise", "n1")],
-                k: 5,
+                entries: vec![(mk("session-A", "a"), 1.0), (mk("session-B", "b"), 1.0)],
+                weight: 0.135,
             };
             let vec_arm = RankedList {
                 retriever: RetrieverKind::Vector,
-                keys: vec![mk("noise", "n2")],
-                k: 20,
+                entries: vec![(mk("session-A", "a"), 0.9), (mk("session-B", "b"), 0.3)],
+                weight: 1.0,
             };
-            let merged = rrf_merge(&[fts, vec_arm]);
-            // Verify per-arm k applied as documented.
-            let target = merged
-                .iter()
-                .find(|h| h.key.session_id == "target")
-                .unwrap();
-            let noise = merged.iter().find(|h| h.key.session_id == "noise").unwrap();
-            let expected_target = 1.0 / (5.0 + 1.0);
-            let expected_noise = 1.0 / (5.0 + 3.0) + 1.0 / (20.0 + 1.0);
-            assert!((target.score - expected_target).abs() < 1e-9);
-            assert!((noise.score - expected_noise).abs() < 1e-9);
+            let merged = fuse_arms(&[fts, vec_arm]);
+            // Vector arm alone decides: A's normalized 1.0 beats B's 0.0.
+            assert_eq!(merged[0].key.session_id, "session-A");
+            assert!((merged[0].score - 1.0).abs() < 1e-9);
+            assert!(merged[1].score.abs() < 1e-9);
         }
     }
 }
 
 pub use search_handler::{
-    RankedList, RetrieverKind, RrfHit, SearchMode, SearchPlan, build_filter, explain_search_plan,
-    hit_payload, plan_search, pond_search, recency_boost, rrf_merge,
+    FusedHit, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter, explain_search_plan,
+    fuse_arms, hit_payload, plan_search, pond_search, recency_boost,
 };
 
 #[cfg(test)]
@@ -1952,7 +1995,6 @@ mod tests {
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
             mode_override: None,
-            rrf_k: 10,
             filters: SearchFilters::default(),
             boost_recent: true,
             group_by_conversation: false,
@@ -1968,39 +2010,43 @@ mod tests {
     }
 
     #[test]
-    fn rrf_merge_fuses_retrievers_and_reports_provenance() {
+    fn fuse_arms_fuses_retrievers_and_reports_provenance() {
         // Each session contributes at most one ballot per arm; cross-arm
         // agreement is credited per session_root, not per message_id.
+        // Vector pool (raw cosine): a=0.9, b=0.7, c=0.5.
+        // FTS pool (raw BM25):     b=10.0, a=8.0, d=4.0.
         let lists = [
             RankedList {
                 retriever: RetrieverKind::Vector,
-                keys: vec![
-                    key("session-a", "a"),
-                    key("session-b", "b"),
-                    key("session-c", "c"),
+                entries: vec![
+                    (key("session-a", "a"), 0.9),
+                    (key("session-b", "b"), 0.7),
+                    (key("session-c", "c"), 0.5),
                 ],
-                k: 60,
+                weight: 1.0,
             },
             RankedList {
                 retriever: RetrieverKind::Fts,
-                keys: vec![
-                    key("session-b", "b"),
-                    key("session-a", "a"),
-                    key("session-d", "d"),
+                entries: vec![
+                    (key("session-b", "b"), 10.0),
+                    (key("session-a", "a"), 8.0),
+                    (key("session-d", "d"), 4.0),
                 ],
-                k: 60,
+                weight: 0.135,
             },
         ];
-        let merged = rrf_merge(&lists);
+        let merged = fuse_arms(&lists);
 
-        // session-a (vector rank 1, FTS rank 2) and session-b (vector rank 2,
-        // FTS rank 1) have equal fused scores; tie breaks on (session_id,
-        // message_id) of the representative, so session-a sorts first. Both
-        // beat the single-retriever session-c and session-d.
+        // Vector normalized: a=1.0, b=0.5, c=0.0.
+        // FTS normalized:    b=1.0, a=2/3, d=0.0.
+        // session-a: 1.0 * 1.0 + 0.135 * 2/3 = 1.090
+        // session-b: 1.0 * 0.5 + 0.135 * 1.0 = 0.635
+        // session-c: 1.0 * 0.0 + 0 = 0
+        // session-d: 0 + 0.135 * 0.0 = 0
         assert_eq!(merged[0].key.session_id, "session-a");
         assert_eq!(merged[1].key.session_id, "session-b");
         assert_eq!(merged[0].matched_via, vec!["vector", "fts"]);
-        assert!(merged[0].score > merged[2].score);
+        assert!(merged[0].score > merged[1].score);
 
         let c = merged
             .iter()
