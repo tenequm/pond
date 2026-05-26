@@ -164,7 +164,8 @@ enum Command {
         #[arg(long)]
         print_schema: bool,
     },
-    /// Hybrid (vector + BM25 + RRF) search over stored messages. Mirrors the
+    /// Hybrid (BM25 + vector, score-normalized fusion) search over stored
+    /// messages. Mirrors the
     /// `pond_search` MCP tool: hybrid mode kicks in automatically when
     /// embeddings exist for the resolved model, FTS-only otherwise. The
     /// pretty default is human-readable; `--format json` emits the wire

@@ -2377,7 +2377,9 @@ pub fn init_embedding_dim(dim: usize) {
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond export` snapshots
-/// plus deferred Lance tags (spec.md#durable-copy).
+/// plus deferred Lance tags (spec.md#durable-copy). `skip_auto_cleanup`
+/// suppresses the per-commit hook so cleanup stays operator-driven via
+/// `pond index optimize` (one LIST per command instead of per write).
 pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_1),
@@ -2387,6 +2389,7 @@ pub(crate) fn write_params_for_create() -> WriteParams {
             interval: 20,
             older_than: chrono::TimeDelta::days(1),
         }),
+        skip_auto_cleanup: true,
         ..WriteParams::default()
     }
 }

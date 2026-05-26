@@ -40,6 +40,28 @@ use url::Url;
 /// IVF_PQ cannot train well on fewer vectors anyway.
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
+/// Default minimum unindexed-fragment count required before a per-intent
+/// append/rebuild step is admitted into `optimize_table_indices`. Lower
+/// values make each commit smaller and more frequent (bad on remote
+/// stores); higher values let fragments accumulate behind the brute-force
+/// fallback. 4 is the floor of the documented 4-8 band.
+pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
+
+static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Seed the process-wide index-lag threshold from `[search].index_lag_threshold`.
+/// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
+pub fn init_index_lag_threshold(value: usize) {
+    INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
+}
+
+pub fn index_lag_threshold() -> usize {
+    INDEX_LAG_THRESHOLD_RUNTIME
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
+}
+
 /// Declarative description of one index pond keeps on a table. Created when
 /// its trigger fires; folded forward by `pond index optimize`.
 #[derive(Debug, Clone)]
@@ -509,12 +531,14 @@ impl Handle {
     /// work; index lifecycle lives under `Handle::optimize_table`.
     pub async fn open_with_options(
         location: &Url,
-        storage_options: HashMap<String, String>,
+        mut storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
             tokio::fs::create_dir_all(&path)
                 .await
                 .with_context(|| format!("failed to create data dir {}", path.display()))?;
+        } else {
+            apply_remote_storage_defaults(&mut storage_options);
         }
         // One Session shared across all three datasets so metadata/index
         // caches and the object_store registry (and thus any S3 client) are
@@ -689,6 +713,10 @@ impl Handle {
                 // pond presents each PK at most once per batch; FirstSeen keeps
                 // the first occurrence rather than failing (Lance's default).
                 builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+                // Cleanup is operator-driven via `pond index optimize`; the
+                // per-commit auto hook would add a LIST per write on remote
+                // backends without changing the steady-state retention.
+                builder.skip_auto_cleanup(true);
                 let (dataset, stats) = builder
                     .try_build()?
                     .execute_reader(Box::new(reader))
@@ -1201,7 +1229,14 @@ async fn optimize_table_indices(
             continue;
         }
 
-        if dataset.unindexed_fragments(intent.name).await?.is_empty() {
+        let unindexed = dataset.unindexed_fragments(intent.name).await?;
+        if unindexed.is_empty() {
+            continue;
+        }
+        // Lag guard: let fragments accumulate behind the brute-force fallback
+        // rather than firing a commit per tiny append. Threshold is operator-
+        // tunable via `[search].index_lag_threshold`.
+        if unindexed.len() < index_lag_threshold() {
             continue;
         }
         match intent.params {
@@ -1510,6 +1545,36 @@ fn ensure_schema_matches(
     }
     Ok(())
 }
+/// Object-store defaults injected for any non-local pond location. Each key
+/// is only set when neither the user-provided key nor its env-var-form alias
+/// is already present, so explicit overrides in `[storage]` always win.
+/// `aws_unsigned_payload` is gated on a custom endpoint (the marker for
+/// S3-compatible stores like Hetzner, MinIO, R2), where the SHA256 payload
+/// signature is wasted work the server does not validate.
+fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
+    fn set_default(options: &mut HashMap<String, String>, aliases: &[&str], value: &str) {
+        if aliases
+            .iter()
+            .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)))
+        {
+            return;
+        }
+        options.insert(aliases[0].to_owned(), value.to_owned());
+    }
+    set_default(options, &["pool_idle_timeout"], "300 seconds");
+    set_default(options, &["connect_timeout"], "10 seconds");
+    let has_custom_endpoint = ["aws_endpoint", "endpoint"]
+        .iter()
+        .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)));
+    if has_custom_endpoint {
+        set_default(
+            options,
+            &["aws_unsigned_payload", "unsigned_payload"],
+            "true",
+        );
+    }
+}
+
 fn quoted_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }

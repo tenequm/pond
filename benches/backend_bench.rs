@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
                 rows.push(run_bench(format!("remote {url}"), &store, &args, open_ms).await?);
             }
             None => {
-                eprintln!("skip remote: pass --s3-url s3://bucket/path to bench an object store")
+                eprintln!("skip remote: pass --s3-url s3://bucket/path to bench an object store");
             }
         }
     }

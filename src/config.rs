@@ -140,9 +140,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Search tuning. Leave unset for Lance defaults; set when tuning IVF_PQ recall
 # against a corpus.
 #
+# `index_lag_threshold` is the minimum unindexed-fragment count before a
+# per-intent append/rebuild runs in `pond index optimize`; the brute-force
+# fallback keeps queries correct while fragments accumulate. Defaults to 4.
+#
 # [search]
 # nprobes = 16
 # refine_factor = 2
+# index_lag_threshold = 4
 
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
@@ -201,6 +206,13 @@ pub struct SearchConfig {
     pub nprobes: Option<usize>,
     #[serde(default)]
     pub refine_factor: Option<u32>,
+    /// Minimum unindexed-fragment count below which `optimize_table_indices`
+    /// skips the per-intent append/rebuild path; the brute-force fallback
+    /// keeps queries correct while fragments accumulate. Default 4 trades a
+    /// little query latency on cold fragments for far fewer remote index
+    /// commits during high-rate ingest.
+    #[serde(default)]
+    pub index_lag_threshold: Option<usize>,
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master
@@ -287,6 +299,9 @@ impl Config {
         };
         config.embeddings.validate()?;
         config.embeddings.install_runtime();
+        if let Some(threshold) = config.search.index_lag_threshold {
+            crate::substrate::init_index_lag_threshold(threshold);
+        }
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
