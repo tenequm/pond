@@ -116,14 +116,12 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Force a full FTS index rebuild after the sync - the recovery path
-        /// for a missing or incomplete index, or after a tokenizer change.
-        #[arg(long)]
-        reindex: bool,
     },
     /// Embed the backlog of un-embedded messages (spec.md#search). Idempotent:
     /// the backlog is every message with a null `vector`, so a re-run picks up
-    /// exactly where the last one stopped.
+    /// exactly where the last one stopped. A model swap (rows embedded under
+    /// a different model id) requires `--force`, which clears those rows and
+    /// drops the IVF_PQ before the new vectors land.
     Embed {
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
@@ -132,21 +130,11 @@ enum Command {
         /// Optional cap on messages embedded this run (mostly for benchmarks).
         #[arg(long)]
         limit: Option<usize>,
-    },
-    /// Reclaim disk by removing old manifest versions and the orphaned data
-    /// and index files they uniquely reference. The current manifest is kept
-    /// unconditionally and Lance's `delete_unverified=false` floor protects
-    /// files younger than seven days, so this stays safe while `pond mcp` or
-    /// `pond serve` is live.
-    Compact {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
-        #[arg(long, env = "POND_CONFIG")]
-        config: Option<PathBuf>,
-        /// Reclaim manifest versions older than this duration. Accepts
-        /// humantime durations: `1h`, `12h`, `1d`, `7d`. Default: `1d`.
-        #[arg(long, default_value = "1d", value_parser = humantime::parse_duration)]
-        older_than: std::time::Duration,
+        /// Allow re-embedding rows whose stored `embedding_model` does not
+        /// match the configured model. Without this flag, such rows abort the
+        /// run with a typed error so a model swap is never silent.
+        #[arg(long)]
+        force: bool,
     },
     /// Run the HTTP+JSON server, including the streamable-HTTP MCP `/mcp` route.
     Serve {
@@ -342,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
             let stats = store.corpus_stats(include_subagents).await?;
             let sizes = store.table_sizes().await?;
             let unindexed = store.unindexed_message_backlog().await?;
@@ -365,12 +353,11 @@ async fn main() -> anyhow::Result<()> {
             source_dir,
             data_dir,
             config,
-            reindex,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
             let loaded = Config::load(&config_file)?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
             let sources =
                 resolve_sync_sources(&loaded, &config_file, adapter.as_deref(), source_dir)?;
             let started = std::time::Instant::now();
@@ -424,24 +411,18 @@ async fn main() -> anyhow::Result<()> {
                     ))?;
                 }
             }
-            // Index create + incremental fold runs on the write path inside
-            // every ingest batch (spec.md#index-upkeep). `--reindex` adds an
-            // explicit full rebuild of every index on top - the recovery path
-            // for a missing index or a changed tokenizer config.
-            if reindex {
-                let msg = if store.ensure_indices(true).await? {
-                    "reindex: indexes rebuilt"
-                } else {
-                    "reindex: no messages to index"
-                };
-                output(&pond::output::paint(msg, pond::output::dim()))?;
-            }
+            // spec.md#fold-on-write: every ingest batch lands data with its
+            // index folds in one atomic merge, so by the time the loop above
+            // returns every maintained index covers every appended row. No
+            // explicit post-sync upkeep step. A non-zero backlog here would
+            // indicate an interrupted write; open-time reconciliation
+            // self-heals it on the next open.
             let unindexed = store.unindexed_message_backlog().await?;
             if unindexed > 0 {
                 output(&pond::output::paint(
                     &format!(
-                        "warning: FTS index incomplete ({unindexed} messages \
-                         unindexed) - run `pond sync --reindex` to rebuild"
+                        "warning: FTS index trails data ({unindexed} unindexed \
+                         messages) - the next `pond` open will reconcile"
                     ),
                     pond::output::yellow(),
                 ))?;
@@ -451,10 +432,48 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             config,
             limit,
+            force,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
+            let store = open_store_with_spinner(&data_dir, storage_map(&config)).await?;
+
+            // Model-swap detection: rows with a vector under a different
+            // model id are silent-correctness landmines (IVF_PQ centroids
+            // belong to one distance space; mixing two corrupts neighbors).
+            // Require explicit `--force`, then clear those rows and drop the
+            // IVF_PQ before the worker writes the new vectors.
+            let stale = store.stale_embedding_count().await?;
+            if stale > 0 {
+                if !force {
+                    bail!(
+                        "{stale} message(s) embedded under a different model id; pass \
+                         `--force` to re-embed (the stale vectors will be cleared and \
+                         the IVF_PQ rebuilt under the configured model {:?})",
+                        pond::embed::model_id(),
+                    );
+                }
+                output(&pond::output::paint(
+                    &format!(
+                        "embed: --force: clearing {} stale-model row(s) and dropping IVF_PQ",
+                        format_thousands(stale as u64),
+                    ),
+                    pond::output::yellow(),
+                ))?;
+                // Enumerate stale keys (streamed), then clear in one
+                // merge_update which fold-on-write-prunes the rewritten
+                // fragments from any existing IVF_PQ coverage. Then drop
+                // the IVF_PQ outright so the next merge re-bootstraps it.
+                use tokio_stream::StreamExt;
+                let mut stream = Box::pin(store.stale_embedding_keys());
+                let mut stale_keys = Vec::with_capacity(stale);
+                while let Some(key) = stream.next().await {
+                    stale_keys.push(key?);
+                }
+                store.clear_embeddings(&stale_keys).await?;
+                store.drop_vector_index().await?;
+            }
+
             let progress = store.embedding_progress().await?;
             let backlog = progress.total.saturating_sub(progress.embedded);
             let bar_total = match limit {
@@ -507,26 +526,12 @@ async fn main() -> anyhow::Result<()> {
                 worker = worker.with_limit(limit);
             }
             let summary = worker.run().await?;
-            // Stable row IDs (spec.md#stable-row-ids) carry FTS and scalar
-            // indices across the vector merge_update's fragment rewrite, so
-            // the incremental fold here is a near-no-op rather than the
-            // from-scratch FTS rebuild this used to be (one ~800 MiB shard
-            // set per embed). The reused bar switches to a spinner so the
-            // post-embed phase is no longer silent.
-            let spinner_style =
-                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner());
-            bar.set_style(spinner_style);
-            bar.set_message("folding FTS and scalar indices...");
-            store.index_upkeep().await?;
-            // IVF_PQ trains against row-address snapshots invalidated by the
-            // fragment rewrite, so this rebuild stays - the one true cost.
-            let total_vectors = progress.embedded + summary.messages;
-            bar.set_message(format!(
-                "rebuilding vector index ({} vectors, this can take a few minutes)...",
-                format_thousands(total_vectors as u64),
-            ));
-            store.ensure_embedding_indices().await?;
+            // spec.md#fold-on-write: every per-window merge_update inside
+            // the worker landed its column write together with the index
+            // folds; the specific merge that crossed
+            // VECTOR_INDEX_ACTIVATION_ROWS triggered the IVF_PQ creation
+            // (sized to the live vector count) inline. There is no
+            // post-embed upkeep verb - the seam owns the contract.
             bar.finish_and_clear();
             output(&format!(
                 "{} done: batches={} messages={} device={}{}",
@@ -541,39 +546,6 @@ async fn main() -> anyhow::Result<()> {
                 },
             ))?;
         }
-        Command::Compact {
-            data_dir,
-            config,
-            older_than,
-        } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&config)).await?;
-            let started = std::time::Instant::now();
-            let bar = ProgressBar::new_spinner();
-            bar.set_style(
-                ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-            );
-            bar.enable_steady_tick(Duration::from_millis(120));
-            bar.set_message(format!(
-                "reclaiming manifest versions older than {}...",
-                humantime::format_duration(older_than),
-            ));
-            let stats = store.compact(older_than).await?;
-            bar.finish_and_clear();
-            output(&format!(
-                "{} reclaimed {} from {} old versions in {:.1}s ({} data, {} index, {} txn, {} deletion files)",
-                pond::output::paint("compact:", pond::output::dim()),
-                format_bytes(stats.bytes_removed),
-                format_thousands(stats.old_versions),
-                started.elapsed().as_secs_f64(),
-                format_thousands(stats.data_files_removed),
-                format_thousands(stats.index_files_removed),
-                format_thousands(stats.transaction_files_removed),
-                format_thousands(stats.deletion_files_removed),
-            ))?;
-        }
         Command::Serve {
             host,
             port,
@@ -582,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(open_store_with_spinner(&data_dir, storage_map(&config)).await?);
             // Lazy: idle `pond serve` keeps RSS ~50 MB; the candle/Metal model
             // load (~600 MB) only triggers when the first hybrid search asks.
             let embedder = Arc::new(LazyEmbedder::new(config.embeddings.enabled));
@@ -592,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Mcp { data_dir, config } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(Store::open_with_options(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(open_store_with_spinner(&data_dir, storage_map(&config)).await?);
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
@@ -620,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
             // One-shot CLI: the embedder load cost has to be paid anyway if
             // hybrid/vector mode wins, so load eagerly. `LazyEmbedder::get`
             // would also work but adds an `.await` for zero benefit here.
@@ -674,7 +646,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -706,7 +678,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            // Export streams raw data through the canonical model and never
+            // reads an index, so open through the minimal path: no policy,
+            // no open-time creation, no fold work.
+            let store = Store::open_minimal(&data_dir, storage_map(&loaded)).await?;
             match command {
                 None => {
                     let summary = match out {
@@ -833,6 +808,27 @@ fn init_tracing() {
 #[allow(clippy::print_stdout)]
 fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
+}
+
+/// Open the store with an indicatif spinner ticking while
+/// [`Store::open_with_options`] runs. Open is normally instant, but it can be
+/// slow when the substrate's open-time fold-and-create pass has real work to
+/// do (a freshly bulk-loaded data dir, or an interrupted prior write's
+/// trail to reconcile). Surfacing it visibly keeps the CLI honest about
+/// where the latency went.
+async fn open_store_with_spinner(
+    location: &Url,
+    storage: HashMap<String, String>,
+) -> anyhow::Result<Store> {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.green} opening pond store... [{elapsed_precise}]")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    let result = Store::open_with_options(location, storage).await;
+    spinner.finish_and_clear();
+    result
 }
 
 /// Materialize `Config.storage` (a sorted `BTreeMap` for round-tripping) into
@@ -1187,8 +1183,11 @@ fn render_status(
     if unindexed == 0 {
         output(&format!("{}  complete", paint("fts index", dim())))?;
     } else {
+        // spec.md#fold-on-write: this should be zero between commits. A
+        // non-zero count means the last write was interrupted; the next
+        // `pond` open will reconcile.
         output(&paint(
-            &format!("fts index  {unindexed} messages unindexed - run `pond sync --reindex`"),
+            &format!("fts index  {unindexed} messages unindexed - self-heals on next open"),
             yellow(),
         ))?;
     }
@@ -1210,9 +1209,11 @@ fn render_status(
             paint(&format_thousands(embedding.embedded as u64), bold()),
         ))?;
     } else {
+        // spec.md#fold-on-write: this should be zero between commits;
+        // open-time reconciliation folds the trail on the next open.
         output(&paint(
             &format!(
-                "vector index  {} vectors  {} unindexed - run `pond embed` to rebuild",
+                "vector index  {} vectors  {} unindexed - self-heals on next open",
                 format_thousands(embedding.embedded as u64),
                 format_thousands(vector_unindexed as u64),
             ),

@@ -365,12 +365,12 @@ mod ingest_handler {
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
             .saturating_sub(truncations_before) as usize;
 
-        // spec.md#index-upkeep: fold the appended rows into the indexes on the
-        // write path. Soft-fail - a failed fold is logged and retried by the
-        // next write batch, never an error that aborts a committed ingest.
-        if let Err(error) = store.index_upkeep().await {
-            tracing::warn!(%error, "index upkeep failed after sync; will retry on next batch");
-        }
+        // spec.md#fold-on-write: every merge through the substrate folds its
+        // touched indices forward inside the same retry block, so by the time
+        // the per-batch flushes above returned Ok every maintained index on
+        // the three tables already covers the appended rows. No explicit
+        // post-ingest upkeep call is needed - and there is no soft-warn
+        // fallback because the contract forbids the indices-trail-data state.
 
         let total = run_started.elapsed();
         let other = total
@@ -521,13 +521,9 @@ mod ingest_handler {
         let mut tail = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
-        // spec.md#index-upkeep: fold the newly-appended rows into the indexes
-        // on the write path, for every ingest route (CLI sync, HTTP, MCP). A
-        // failed fold is soft - logged and retried by the next write batch -
-        // never an error that aborts the committed write.
-        if let Err(error) = store.index_upkeep().await {
-            tracing::warn!(%error, "index upkeep failed after ingest; will retry on next batch");
-        }
+        // spec.md#fold-on-write: each `validator.push` / `validator.finish`
+        // merge above already returned with its touched indices folded
+        // forward; there is no separate upkeep step.
         Ok(outcomes)
     }
 
@@ -1113,9 +1109,12 @@ mod search_handler {
         }
     }
 
-    /// Unindexed-row count above which `pond_search` logs that the FTS index is
-    /// behind (spec.md#index-upkeep). Search results stay correct regardless -
-    /// the engine flat-scans the not-yet-folded tail.
+    /// Unindexed-row count above which `pond_search` logs that the FTS index
+    /// trails the data (spec.md#fold-on-write). With the fold-on-write
+    /// contract this is normally zero between commits; a non-zero value
+    /// indicates a partially-recovered crash and is reconciled by the next
+    /// open. Search results stay correct regardless - the engine flat-scans
+    /// the not-yet-folded tail.
     const INDEX_BACKLOG_WARN: usize = 10_000;
 
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid when
@@ -1151,14 +1150,16 @@ mod search_handler {
         // anything else degrades to FTS-only.
         plan.mode = resolve_effective_mode(store, embedder, override_mode).await?;
 
-        // spec.md#index-upkeep: results stay correct against the not-yet-folded
-        // tail (the engine flat-scans it), but a large backlog hurts latency -
-        // surface it so an operator knows the index fold is behind.
+        // spec.md#fold-on-write: results stay correct against the
+        // not-yet-folded tail (the engine flat-scans it), but a large backlog
+        // hurts latency. Under the fold-on-write contract this should be
+        // zero; a non-zero value indicates an interrupted write that
+        // open-time reconciliation will recover on the next open.
         match store.unindexed_message_backlog().await {
             Ok(backlog) if backlog > INDEX_BACKLOG_WARN => {
                 tracing::warn!(
                     backlog,
-                    "messages FTS index is behind; search is correct but slower until the fold catches up"
+                    "messages FTS index trails data; this should self-heal on next open"
                 );
             }
             Ok(_) => {}

@@ -17,7 +17,7 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     embed::{EmbedBackend, EmbedWorker},
     handlers::ingest_adapter,
-    sessions::{EMBEDDING_DIM, Store},
+    sessions::{Store, embedding_dim},
     transport::{AppState, http},
     wire::{ErrorCode, GetEnvelope, SearchEnvelope},
 };
@@ -38,7 +38,7 @@ impl EmbedBackend for FakeBackend {
 
 fn fake_vector(text: &str) -> Vec<f32> {
     let bytes = text.as_bytes();
-    (0..EMBEDDING_DIM)
+    (0..embedding_dim())
         .map(|i| {
             let byte = bytes.get(i % bytes.len().max(1)).copied().unwrap_or(0);
             f32::from(byte) / 255.0
@@ -58,11 +58,11 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
         |_| {},
     )
     .await?;
-    store.ensure_indices(false).await?;
 
     let backend = FakeBackend;
+    // spec.md#fold-on-write: each merge inside ingest_adapter / EmbedWorker
+    // already folded the touched indices forward.
     EmbedWorker::new(&store, &backend).run().await?;
-    store.ensure_embedding_indices().await?;
 
     let store = Arc::new(store);
     let state = AppState {

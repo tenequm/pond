@@ -13,7 +13,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
 dialoguer = { version = "0.12", default-features = false }
-# Embedding stack for `intfloat/multilingual-e5-base` (XLM-RoBERTa) - see
+# Embedding stack for `intfloat/multilingual-e5-small` (XLM-RoBERTa) - see
 # `src/embed/e5.rs`. These declare the CPU baseline; the GPU backend is added
 # per target - Metal automatically on macOS via the `[target.*]` block below,
 # CUDA via the opt-in `cuda` feature. `hf-hub` fetches the weights,
@@ -23,7 +23,6 @@ candle-nn = "0.10"
 candle-transformers = "0.10"
 fastrand = "2"
 hf-hub = "0.4"
-humantime = "2"
 indicatif = "0.18"
 lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
 # Vendored protoc (protobuf-src) so builds need no system protoc. `lance`'s `protoc`
@@ -78,6 +77,10 @@ lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-be
 # unifies it into the test build without adding `client` to the shipped binary.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
+# Property tests for the `fold-on-write` invariants in `src/sessions.rs#tests`
+# (spec.md#fold-on-write): random sequences of writes plus open/close cycles
+# must always leave every maintained index fully covering data.
+proptest = "1"
 tempfile = "3.25"
 # `oneshot` lets the HTTP integration test drive the axum `Router` directly,
 # with no socket bind and no HTTP client dependency.

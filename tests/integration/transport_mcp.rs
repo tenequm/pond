@@ -11,7 +11,7 @@ use pond::{
     PROTOCOL_VERSION,
     embed::{EmbedBackend, EmbedWorker},
     handlers::{IngestEvent, pond_ingest},
-    sessions::{EMBEDDING_DIM, Store},
+    sessions::{Store, embedding_dim},
     transport::{AppState, mcp::PondMcp},
     wire::{GetResponse, GetResult, IngestEnvelope, IngestRequest, SearchResponse},
     wire::{Message, Part, PartKind, Provenance, Session},
@@ -45,7 +45,7 @@ impl EmbedBackend for FakeBackend {
             .iter()
             .map(|text| {
                 let bytes = text.as_bytes();
-                (0..EMBEDDING_DIM)
+                (0..embedding_dim())
                     .map(|i| {
                         let byte = bytes.get(i % bytes.len().max(1)).copied().unwrap_or(0);
                         f32::from(byte) / 255.0
@@ -124,11 +124,10 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         matches!(envelope, IngestEnvelope::Success(_)),
         "synthetic ingest should succeed: {envelope:?}",
     );
-    store.ensure_indices(false).await?;
-
     let backend = FakeBackend;
+    // spec.md#fold-on-write: each merge inside ingest / EmbedWorker
+    // already folded the touched indices forward.
     EmbedWorker::new(&store, &backend).run().await?;
-    store.ensure_embedding_indices().await?;
 
     Ok(AppState {
         store: Arc::new(store),

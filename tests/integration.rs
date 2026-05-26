@@ -9,8 +9,8 @@
 mod claude_code_ingest;
 #[path = "integration/embed.rs"]
 mod embed;
-#[path = "integration/index_upkeep.rs"]
-mod index_upkeep;
+#[path = "integration/fold_on_write.rs"]
+mod fold_on_write;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
 #[path = "integration/recovery.rs"]

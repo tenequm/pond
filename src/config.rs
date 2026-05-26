@@ -120,12 +120,23 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 
 # Embeddings. Default `enabled = false`: search runs FTS-only and no model is
 # loaded. Set `true` for hybrid search. `pond embed` runs regardless, so
-# vectors can be pre-populated before flipping the switch. `model` selects the
-# embedding model; the engine ships one loader.
+# vectors can be pre-populated before flipping the switch. `model` selects
+# the HuggingFace XLM-RoBERTa model; `dim` declares its output width and is
+# baked into the messages.vector schema on table creation - it must equal the
+# model's hidden_size and be a multiple of 8 (IVF_PQ subspace stride).
+#
+# Common pairings:
+#   model = \"intfloat/multilingual-e5-small\"   dim = 384   (default)
+#   model = \"intfloat/multilingual-e5-base\"    dim = 768
+#   model = \"intfloat/multilingual-e5-large\"   dim = 1024
+#
+# A different-dim model needs a fresh data dir; pond enforces this at the
+# schema boundary.
 #
 # [embeddings]
 # enabled = false
-# model = \"intfloat/multilingual-e5-base\"
+# model = \"intfloat/multilingual-e5-small\"
+# dim = 384
 
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
@@ -174,18 +185,26 @@ pub struct Config {
     pub storage: BTreeMap<String, String>,
 }
 
-/// `[embeddings]`: the master switch and the model selector. With
-/// `enabled = false` (the default) the search path never loads a model;
-/// `pond embed` runs regardless.
+/// `[embeddings]`: the master switch, model selector, and vector dimension.
+/// With `enabled = false` (the default) the search path never loads a model;
+/// `pond embed` runs regardless. `model` and `dim` are installed into the
+/// process at startup via `embed::init_model_id` / `sessions::init_embedding_dim`,
+/// so swapping models for a one-off experiment is a temporary config file -
+/// no CLI flag and no per-call-site plumbing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// The embedding model id (spec.md#search): configuration selects the
-    /// model, the engine supplies the loader. v1 ships exactly one loader.
+    /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
+    /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-base`.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Output dimension of `model`. Must equal the model's `hidden_size` and
+    /// be divisible by 8 (the IVF_PQ subspace stride; see `embed::index_params`).
+    /// Defaults to 768 (e5-base). Set to 384 for e5-small, 1024 for e5-large.
+    #[serde(default = "default_dim")]
+    pub dim: usize,
 }
 
 impl Default for EmbeddingsConfig {
@@ -193,12 +212,17 @@ impl Default for EmbeddingsConfig {
         Self {
             enabled: false,
             model: default_model(),
+            dim: default_dim(),
         }
     }
 }
 
 fn default_model() -> String {
-    crate::embed::MODEL_ID.to_owned()
+    crate::embed::DEFAULT_MODEL_ID.to_owned()
+}
+
+fn default_dim() -> usize {
+    crate::sessions::DEFAULT_EMBEDDING_DIM
 }
 
 /// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
@@ -240,7 +264,10 @@ pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBu
 
 impl Config {
     /// Load `config.toml` from `path` if it exists and validate it. A missing
-    /// file yields the built-in defaults.
+    /// file yields the built-in defaults. On success the resolved embedding
+    /// model id + dim are installed into the process (`OnceLock`-backed; only
+    /// the first call per process sticks), so all downstream code paths see a
+    /// consistent pair without per-handler plumbing.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let config = if path.exists() {
@@ -252,6 +279,7 @@ impl Config {
             Self::default()
         };
         config.embeddings.validate()?;
+        config.embeddings.install_runtime();
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
@@ -301,18 +329,29 @@ pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
 }
 
 impl EmbeddingsConfig {
-    /// The configured model must be one the engine has a loader for
-    /// (spec.md#search). v1 ships exactly one.
+    /// Surface-level validation: model id non-empty and dim divisible by 8.
+    /// The dim/model mismatch is the load-time check inside `E5Embedder::load`,
+    /// which knows the model's `hidden_size`; what we can catch up front is the
+    /// IVF_PQ subspace stride (`dim / 8` in `embed::index_params`).
     pub fn validate(&self) -> Result<()> {
-        if self.model != crate::embed::MODEL_ID {
+        if self.model.trim().is_empty() {
+            bail!("embeddings.model must be a non-empty HuggingFace model id");
+        }
+        if self.dim == 0 || !self.dim.is_multiple_of(8) {
             bail!(
-                "embeddings.model {:?} is not a model pond can load; the engine \
-                 ships one loader: {:?}",
-                self.model,
-                crate::embed::MODEL_ID,
+                "embeddings.dim = {} must be a positive multiple of 8 (IVF_PQ subspace stride)",
+                self.dim,
             );
         }
         Ok(())
+    }
+
+    /// Install model id + dim into the process. Idempotent: only the first
+    /// call sticks (matches `OnceLock` semantics in `embed::init_model_id` and
+    /// `sessions::init_embedding_dim`).
+    pub fn install_runtime(&self) {
+        crate::embed::init_model_id(self.model.clone());
+        crate::sessions::init_embedding_dim(self.dim);
     }
 }
 
@@ -325,13 +364,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn validate_rejects_an_unknown_model() {
-        let config = EmbeddingsConfig {
-            enabled: true,
-            model: "bogus/model".to_owned(),
-        };
-        assert!(config.validate().is_err());
+    fn validate_catches_empty_model_and_bad_dim() {
         assert!(EmbeddingsConfig::default().validate().is_ok());
+        // Empty / whitespace-only model id is rejected: HuggingFace fetch
+        // would fail far away from the config error.
+        let bad_model = EmbeddingsConfig {
+            enabled: true,
+            model: "   ".to_owned(),
+            dim: 768,
+        };
+        assert!(bad_model.validate().is_err());
+        // Dim must divide 8 (PQ subspace stride in `embed::index_params`).
+        let bad_dim = EmbeddingsConfig {
+            enabled: true,
+            model: "intfloat/multilingual-e5-base".to_owned(),
+            dim: 100,
+        };
+        assert!(bad_dim.validate().is_err());
+        // Zero is rejected too (would divide-by-zero inside index_params).
+        let zero_dim = EmbeddingsConfig {
+            enabled: true,
+            model: "intfloat/multilingual-e5-base".to_owned(),
+            dim: 0,
+        };
+        assert!(zero_dim.validate().is_err());
     }
 
     #[test]
@@ -350,7 +406,11 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.embeddings, EmbeddingsConfig::default());
         assert!(!config.embeddings.enabled);
-        assert_eq!(config.embeddings.model, crate::embed::MODEL_ID);
+        assert_eq!(config.embeddings.model, crate::embed::DEFAULT_MODEL_ID);
+        assert_eq!(
+            config.embeddings.dim,
+            crate::sessions::DEFAULT_EMBEDDING_DIM
+        );
     }
 
     #[test]
