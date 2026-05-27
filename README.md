@@ -33,7 +33,7 @@ Linux and macOS are supported; Windows is not in v1 scope.
 
 ```sh
 brew install tenequm/tap/pond                          # Homebrew
-nix profile install github:tenequm/nur-packages#pond  # Nix
+nix profile add github:tenequm/nur-packages#pond      # Nix
 ```
 
 **Build from source:**
