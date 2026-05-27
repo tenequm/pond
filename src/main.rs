@@ -27,9 +27,9 @@ use pond::{
     substrate::{IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes},
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Message,
-        Part, PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire,
-        SearchRequest, SearchResponse, SearchResultBody,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Part,
+        PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
+        SearchResponse, SearchResultBody,
     },
 };
 
@@ -235,12 +235,6 @@ enum Command {
         /// Collapse to one row per session, keeping the best-scoring message.
         #[arg(long)]
         group_by_conversation: bool,
-        /// Include each hit's full indexed text instead of just the match-
-        /// windowed snippet. Default off - the CLI shows snippets for the
-        /// human reading the table; pass `--full` for one-shot scripts that
-        /// want the body in the same response.
-        #[arg(long)]
-        full: bool,
         /// Substring match by default (`--project pond` -> contains "pond"). Prefix
         /// with `re:` for regex (`--project 're:^/Users/.*/x402'`); `lit:` escapes
         /// a literal value that would otherwise be parsed as a prefix.
@@ -281,7 +275,7 @@ enum Command {
     /// Fetch a session or message.
     #[command(group(ArgGroup::new("get_selector")
         .required(true)
-        .args(["session_id", "message_id"])))]
+        .args(["session_id", "message_id", "cursor"])))]
     Get {
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
@@ -310,12 +304,14 @@ enum Command {
         /// Cap on returned messages.
         #[arg(long, default_value_t = 100)]
         max_messages: usize,
-        /// Include reasoning parts in the response (server-side filter).
+        /// Include per-message parts (reasoning, tool calls, tool results,
+        /// files) in the response. Default off: the response carries only
+        /// `messages[].text` to fit the agent-context budget.
         #[arg(long)]
-        include_thinking: bool,
-        /// Include tool-result parts in the response (server-side filter).
-        #[arg(long)]
-        include_tool_results: bool,
+        include_parts: bool,
+        /// Opaque continuation token from a prior response's `next_cursor`.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
     },
@@ -494,7 +490,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             let sizes = store.table_sizes().await?;
             render_status_header(&data_dir, &sizes)?;
             output(&format!(
@@ -524,7 +522,9 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
             let loaded = Config::load(&config_file)?;
-            let store = open_store_with_spinner(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                open_store_with_spinner(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             let stages = SyncStages::resolve(only, &skip)?;
             if import_from.is_some() && !stages.import {
                 bail!(
@@ -558,7 +558,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = open_store_with_spinner(&data_dir, storage_map(&config)).await?;
+            let store =
+                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
+                    .await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
             if !summary.summary.cancelled && summary.summary.messages > 0 {
                 let outcome = run_update_indexes_stage(&store).await?;
@@ -576,7 +578,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(open_store_with_spinner(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(
+                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
+                    .await?,
+            );
             let embedder = Arc::new(LazyEmbedder::new());
             let state = AppState {
                 store,
@@ -597,7 +602,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Mcp { data_dir, config } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(open_store_with_spinner(&data_dir, storage_map(&config)).await?);
+            let store = Arc::new(
+                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
+                    .await?,
+            );
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
@@ -618,7 +626,6 @@ async fn main() -> anyhow::Result<()> {
             mode,
             no_boost_recent,
             group_by_conversation,
-            full,
             project,
             session_id,
             source_agent,
@@ -631,10 +638,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
-            // Same `LazyEmbedder` pattern as the daemons: a single one-shot
-            // `pond search "foo"` against an FTS-only corpus never loads the
-            // model. The cost is one extra `.await` on first call.
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             let embedder = LazyEmbedder::new();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -653,7 +659,6 @@ async fn main() -> anyhow::Result<()> {
                 },
                 boost_recent: !no_boost_recent,
                 group_by_conversation,
-                full,
                 limit,
             };
             if explain {
@@ -673,7 +678,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             match command {
                 IndexCommand::Status => {
                     let statuses = store.index_status().await?;
@@ -727,13 +734,15 @@ async fn main() -> anyhow::Result<()> {
             up_to,
             context_depth,
             max_messages,
-            include_thinking,
-            include_tool_results,
+            include_parts,
+            cursor,
             format,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -742,8 +751,8 @@ async fn main() -> anyhow::Result<()> {
                 up_to,
                 context_depth,
                 max_messages,
-                include_thinking,
-                include_tool_results,
+                include_parts,
+                cursor,
             };
             let envelope = handlers::pond_get(&store, request).await;
             if !render_get_envelope(format, &envelope)? {
@@ -765,7 +774,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             match format {
                 ExportFormat::Pond => {
                     let path = out.unwrap_or_else(|| PathBuf::from("pond-export.pond"));
@@ -812,7 +823,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
-            let store = Store::open_with_options(&data_dir, storage_map(&loaded)).await?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
             let summary = import_pond_archive(&store, &archive).await?;
             output(&format!(
                 "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
@@ -858,6 +871,7 @@ fn output(message: &str) -> anyhow::Result<()> {
 async fn open_store_with_spinner(
     location: &Url,
     storage: HashMap<String, String>,
+    caps: pond::substrate::RuntimeCaps,
 ) -> anyhow::Result<Store> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -865,7 +879,7 @@ async fn open_store_with_spinner(
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    let result = Store::open_with_options(location, storage).await;
+    let result = Store::open_with_options(location, storage, caps).await;
     spinner.finish_and_clear();
     result
 }
@@ -879,6 +893,13 @@ fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// Resolve `[runtime]` into the substrate's typed caps struct. A standalone
+/// helper to keep every call site terse and to make sure no surface forgets
+/// the caps.
+fn runtime_caps(config: &Config) -> pond::substrate::RuntimeCaps {
+    pond::substrate::RuntimeCaps::from_config(&config.runtime)
 }
 
 /// Resolve the data dir from the CLI/env argument, falling back to the XDG
@@ -2103,16 +2124,10 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
 fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
-    let matched = if hit.matched_via.is_empty() {
-        "-".to_owned()
-    } else {
-        hit.matched_via.join("+")
-    };
     output(&format!(
-        "{}  {}  {}",
+        "{}  {}",
         paint(&format!("[{rank}]"), dim()),
         paint(&format!("{:.4}", hit.score), bold()),
-        paint(&matched, dim()),
     ))?;
     output(&format!(
         "    {}  {}  {}  {}",
@@ -2124,7 +2139,7 @@ fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
         paint(&hit.project, dim()),
         paint(&hit.message_id, dim()),
     ))?;
-    render_hit_text(&hit.text, hit.snippet.as_deref())?;
+    render_hit_text(&hit.text)?;
     Ok(())
 }
 
@@ -2135,39 +2150,35 @@ fn render_group(rank: usize, group: &Group) -> anyhow::Result<()> {
         "{}  best={}  {} messages",
         paint(&format!("[{rank}]"), dim()),
         paint(&format!("{:.4}", group.best_score), bold()),
-        paint(&format_thousands(group.message_count as u64), bold()),
+        paint(
+            &format_thousands(group.session_messages_count as u64),
+            bold(),
+        ),
     ))?;
+    let span = match group.last_timestamp {
+        Some(last) => format!(
+            "{} -> {}",
+            group.first_timestamp.format("%Y-%m-%dT%H:%M"),
+            last.format("%Y-%m-%dT%H:%M"),
+        ),
+        None => group.first_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
+    };
     output(&format!(
-        "    {} -> {}  {}  {}  {}",
-        paint(
-            &group.first_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
-            dim(),
-        ),
-        paint(
-            &group.last_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
-            dim(),
-        ),
+        "    {}  {}  {}  {}",
+        paint(&span, dim()),
         paint(&group.project, dim()),
         paint(&group.source_agent, dim()),
         paint(&group.session_id, dim()),
     ))?;
-    render_hit_text(&group.text, group.snippet.as_deref())?;
+    render_hit_text(&group.text)?;
     Ok(())
 }
 
-/// Render a hit's `text` payload, then a `snippet` block when one is present
-/// (the text was truncated). Empty text renders nothing.
-fn render_hit_text(text: &str, snippet: Option<&str>) -> anyhow::Result<()> {
+fn render_hit_text(text: &str) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     let prefix = paint(">", dim());
     for line in text.lines() {
         output(&format!("    {prefix} {line}"))?;
-    }
-    if let Some(snippet) = snippet {
-        output(&format!("    {}", paint("snippet:", dim())))?;
-        for line in snippet.lines() {
-            output(&format!("    {prefix} {line}"))?;
-        }
     }
     Ok(())
 }
@@ -2204,8 +2215,6 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
         ),
     ))?;
 
-    // Group parts by message_id, sorted by ordinal, so each message renders
-    // its parts in order without re-scanning the parts vec per message.
     let mut parts_by_msg: std::collections::HashMap<&str, Vec<&Part>> =
         std::collections::HashMap::new();
     for part in parts {
@@ -2221,39 +2230,54 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
     for (idx, message) in messages.iter().enumerate() {
         output("")?;
         let parts_for_msg = parts_by_msg
-            .get(message.id())
+            .get(message.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         render_message(idx + 1, message, parts_for_msg)?;
     }
 
     output("")?;
-    output(&format!(
-        "{} {} messages, {} parts{}",
+    let mut footer = format!(
+        "{} {} messages",
         paint("(total:", dim()),
         paint(&format_thousands(messages.len() as u64), bold()),
-        paint(&format_thousands(parts.len() as u64), bold()),
-        paint(")", dim()),
-    ))?;
+    );
+    if !parts.is_empty() {
+        footer.push_str(&format!(
+            ", {} parts",
+            paint(&format_thousands(parts.len() as u64), bold()),
+        ));
+    }
+    if response.has_more {
+        footer.push_str(&format!(" {}", paint("[more]", dim())));
+    }
+    footer.push_str(&paint(")", dim()));
+    output(&footer)?;
+    if let Some(cursor) = response.next_cursor.as_deref() {
+        output(&format!("{} {}", paint("next-cursor:", dim()), cursor))?;
+    }
     Ok(())
 }
 
-fn render_message(rank: usize, message: &Message, parts: &[&Part]) -> anyhow::Result<()> {
+fn render_message(
+    rank: usize,
+    message: &pond::wire::GetMessage,
+    parts: &[&Part],
+) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
     output(&format!(
         "{}  {}  {}  {}",
         paint(&format!("[{rank}]"), dim()),
         paint(
-            &message.timestamp().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            &message.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-        paint_role(message.role().as_str()),
-        paint(message.id(), dim()),
+        paint_role(message.role.as_str()),
+        paint(&message.id, dim()),
     ))?;
-    if let Some(content) = message.system_content() {
-        render_hit_text(content, None)?;
-        return Ok(());
+    if !message.text.is_empty() {
+        render_hit_text(&message.text)?;
     }
     for part in parts {
         render_part(part)?;

@@ -162,7 +162,6 @@ fn search_request(query: &str, mode: Option<SearchModeWire>) -> SearchRequest {
         filters: SearchFilters::default(),
         boost_recent: false,
         group_by_conversation: false,
-        full: false,
         limit: 10,
     }
 }
@@ -398,7 +397,12 @@ async fn main() -> Result<()> {
                     );
                 }
                 let t = Instant::now();
-                let store = Store::open_with_options(&url, storage_opts).await?;
+                let store = Store::open_with_options(
+                    &url,
+                    storage_opts,
+                    pond::substrate::RuntimeCaps::default(),
+                )
+                .await?;
                 let open_ms = t.elapsed().as_millis();
                 rows.push(run_bench(format!("remote {url}"), &store, &args, open_ms).await?);
             }

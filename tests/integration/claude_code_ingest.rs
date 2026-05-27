@@ -36,8 +36,8 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 up_to: None,
                 context_depth: 0,
                 max_messages: 1000,
-                include_thinking: true,
-                include_tool_results: true,
+                include_parts: true,
+                cursor: None,
             },
         )
         .await;
@@ -53,7 +53,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
         assert_eq!(session.id, *session_id);
         assert!(!messages.is_empty());
 
-        let target = messages[0].id().to_owned();
+        let target = messages[0].id.clone();
         let envelope = pond_get(
             &store,
             GetRequest {
@@ -64,8 +64,8 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 up_to: None,
                 context_depth: 1,
                 max_messages: 100,
-                include_thinking: false,
-                include_tool_results: false,
+                include_parts: false,
+                cursor: None,
             },
         )
         .await;

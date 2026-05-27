@@ -1,7 +1,6 @@
 //! The HTTP+JSON and stdio-MCP transports: thin adapters over the shared wire
-//! handlers. Both transports dispatch to the exact same handler functions - the
-//! only intentional divergence is the MCP placeholder rendering in
-//! [`mcp::render_placeholders`] (spec.md#protocol).
+//! handlers. Both transports dispatch to the same handler functions - no
+//! per-transport behavior divergence.
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get`, `POST /v1/ingest`, and the
 //! SSE `GET /v1/sessions/{id}/events` stream. MCP exposes only `pond_search` /
@@ -161,25 +160,20 @@ pub mod http {
     }
 
     /// Query string for `GET /v1/sessions/{session_id}/events`
-    /// (spec.md#protocol). `since` resumes after a prior
-    /// event id; the `Last-Event-ID` HTTP header is honored as a fallback when
-    /// the query param is absent (EventSource auto-reconnect path).
+    /// (spec.md#protocol). `since` resumes after a prior event id; the
+    /// `Last-Event-ID` HTTP header is honored as a fallback for EventSource
+    /// auto-reconnect.
     #[derive(Debug, Deserialize)]
     struct SessionEventsQuery {
         #[serde(default)]
         since: Option<String>,
         #[serde(default)]
-        include_thinking: Option<bool>,
-        #[serde(default)]
-        include_tool_results: Option<bool>,
-        #[serde(default)]
         namespace: Option<String>,
     }
 
     /// `GET /v1/sessions/{session_id}/events` SSE handler. Catch-up only in
-    /// v1: scans `messages` (and their `parts`) strictly after `since`,
-    /// emits them in `(timestamp, message_id)` order, then emits an `end`
-    /// event and closes. SSE keepalive every 15s.
+    /// v1: emits canonical message stubs strictly after `since` in
+    /// `(timestamp, message_id)` order, then `end`. SSE keepalive every 15s.
     async fn session_events(
         State(state): State<AppState>,
         Path(session_id): Path<String>,
@@ -191,7 +185,6 @@ pub mod http {
             return error_response(code, envelope);
         }
 
-        // `since` query param wins over `Last-Event-ID` header.
         let since_raw = params.since.clone().or_else(|| {
             headers
                 .get("last-event-id")
@@ -200,18 +193,7 @@ pub mod http {
         });
         let since = parse_since(since_raw.as_deref());
 
-        let include_thinking = params.include_thinking.unwrap_or(false);
-        let include_tool_results = params.include_tool_results.unwrap_or(false);
-
-        match pond_session_events(
-            &state.store,
-            &session_id,
-            since,
-            include_thinking,
-            include_tool_results,
-        )
-        .await
-        {
+        match pond_session_events(&state.store, &session_id, since).await {
             Ok(events) => {
                 let stream = tokio_stream::iter(events.into_iter().map(|sse| {
                     let payload = sse.data.to_string();
@@ -275,40 +257,40 @@ pub mod mcp {
         handlers::pond_get as run_get,
         handlers::pond_search as run_search,
         wire::{
-            ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResult,
-            ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
+            ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter,
+            SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
         },
-        wire::{Part, PartKind},
     };
 
-    /// Static documentation served as the `schema://pond` resource. The
-    /// `#[tool(description = ...)]` strings stay tight (agents skim); this
-    /// resource carries the longer-form schema, ranking provenance, and the
-    /// multilingual caveat for callers that load it on demand.
+    /// Static documentation served as the `schema://pond` resource. Detail
+    /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
 (default 10, max 200), project (path substring), conversation_id (exact \
 session match), source_agent, role (user|assistant), from_date / to_date \
-(YYYY-MM-DD), boost_recent (default true), group_by_conversation \
-(default true; grouped hits carry `best_hit_message_id` for drill-in via \
-`pond_get`).
+(YYYY-MM-DD), boost_recent (default true), group_by_conversation (default \
+true; grouped hits carry `best_hit_message_id` for drill-in via `pond_get`).
 
-pond_search response: each hit carries `score` (RRF fusion, not on a 0-1 \
-scale; comparable within one response, not across queries) and `matched_via` \
-(array of retrievers that ranked the row: \"fts\", \"vector\", or both). \
-Filter on `score` by reading the gradient in the returned hits, not by \
-passing a server-side threshold.
+pond_search response: each hit carries `score` normalized to [0.0, 1.0] \
+(comparable within one response). Grouped hits surface `first_timestamp` and, \
+when matches span more than one timestamp, `last_timestamp`. The hit `text` \
+is a ~600-char window of the indexed message body centered on the query \
+term; fetch the full body via `pond_get(message_id)`.
 
-pond_search multilingual: pond's embedder (multilingual-e5-small) is \
-trained for cross-lingual retrieval, so a query in language A can match \
-indexed text in language B via the vector arm. The FTS arm is character- \
-ngram-based and only matches surface tokens, so for cross-lingual queries \
-expect most signal to come from the vector arm.
+pond_search multilingual: pond's embedder (multilingual-e5-small) is trained \
+for cross-lingual retrieval, so a query in language A can match indexed text \
+in language B via the vector arm. The FTS arm is character-ngram-based and \
+only matches surface tokens, so for cross-lingual queries expect most signal \
+to come from the vector arm.
 
 pond_get: message_id (one message + context_depth messages of thread context \
 each side) OR conversation_id (full session; up_to truncates, max_messages \
-caps at 1000). include_thinking / include_tool_results default false; excluded \
-parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders.";
+caps at 1000). The default response carries `messages[].text` only; pass \
+`include_parts=true` to also receive the per-message parts (reasoning, tool \
+calls, tool results, files). Responses are paginated with a `~10000-token \
+budget; when `has_more` is true the response carries an opaque `next_cursor` \
+- pass it back as `cursor` to fetch the next page (originating session_id / \
+message_id / include_parts are re-supplied automatically).";
 
     /// `pond_search` MCP tool parameters. Field names follow the kb parity
     /// contract: `conversation_id` here maps to the wire `session_id` filter.
@@ -352,12 +334,6 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         /// message_id>)` to explore neighbors of any returned hit.
         #[serde(default)]
         similar_to: Option<String>,
-        /// When true, each hit's `text` carries the full indexed message
-        /// body (up to a server cap). Default false: `text` is the
-        /// match-windowed snippet (~400 chars) - cheap for scan-and-decide.
-        /// Fetch the full body via `pond_get(message_id)` when needed.
-        #[serde(default)]
-        full: Option<bool>,
         /// Collapse hits to one summary per session. Default true: most
         /// searches are "find the conversation about X" and message-level
         /// duplicates from one session corrupt the corpus picture. Pass
@@ -369,7 +345,8 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
     }
 
     /// `pond_get` MCP tool parameters. `conversation_id` maps to the wire
-    /// `session_id`; one of `message_id` / `conversation_id` is required.
+    /// `session_id`; one of `message_id` / `conversation_id` / `cursor`
+    /// is required.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpGetParams {
         /// Retrieve this message plus surrounding thread context.
@@ -385,17 +362,20 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         /// With message_id: messages of thread context to include on each side.
         #[serde(default)]
         context_depth: Option<usize>,
-        /// With conversation_id: cap on returned messages. Default 100, max 1000.
+        /// Cap on returned messages. Default 100, max 1000.
         #[serde(default)]
         max_messages: Option<usize>,
-        /// Include reasoning parts in full. Default false (rendered as a
-        /// `[reasoning: N chars]` placeholder).
+        /// When true, the response also carries each message's parts
+        /// (reasoning, tool calls, tool results, files). Default false: the
+        /// response carries only `messages[].text` to fit the agent-context
+        /// budget; pass true when full parts are needed for restore-style flows.
         #[serde(default)]
-        include_thinking: Option<bool>,
-        /// Include tool-result parts in full. Default false (rendered as a
-        /// `[tool_result: N chars]` placeholder).
+        include_parts: Option<bool>,
+        /// Opaque continuation token from a prior response's `next_cursor`.
+        /// When set, the originating `conversation_id` / `message_id` /
+        /// `include_parts` are re-supplied from the cursor automatically.
         #[serde(default)]
-        include_tool_results: Option<bool>,
+        cursor: Option<String>,
     }
 
     /// The pond MCP server: holds the shared state and the generated tool router.
@@ -416,10 +396,10 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
 
         #[tool(
             description = "Hybrid (vector + BM25) search over stored conversation history. \
-                           Returns ranked message hits with `score` and `matched_via` per hit. \
+                           Returns ranked message hits with `score` normalized to [0, 1]. \
                            Keep `query` semantic; use `project` / `conversation_id` filters \
-                           for scope. See `schema://pond` for the full schema, ranking \
-                           provenance, and multilingual notes."
+                           for scope. See `schema://pond` for the full schema and \
+                           multilingual notes."
         )]
         async fn pond_search(
             &self,
@@ -436,10 +416,10 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                     from_date: params.from_date,
                     to_date: params.to_date,
                     role: params.role,
-                    // min_score is intentionally not on the MCP surface; RRF scores
-                    // are not interpretable as absolute confidence, so a server-side
-                    // threshold is a footgun for agent callers. The CLI / HTTP wire
-                    // path still exposes it for the bench harness.
+                    // min_score is intentionally not on the MCP surface; scores
+                    // are response-relative, so a server-side threshold is a
+                    // footgun for agent callers. CLI / HTTP still exposes it
+                    // for the bench harness.
                     min_score: 0.0,
                 },
                 boost_recent: params.boost_recent.unwrap_or(true),
@@ -447,7 +427,6 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 limit: params.limit.unwrap_or(10),
                 mode_override: None,
                 similar_to: params.similar_to,
-                full: params.full.unwrap_or(false),
             };
             match run_search(
                 &self.state.store,
@@ -465,20 +444,16 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
         #[tool(
             description = "Retrieve stored conversation content. With `message_id`: that \
                            message plus `context_depth` messages of thread context each side. \
-                           With `conversation_id`: the full session. Excluded thinking / \
-                           tool-result parts are rendered as `[reasoning: N chars]` / \
-                           `[tool_result: N chars]` placeholders."
+                           With `conversation_id`: the full session. Default response carries \
+                           `messages[].text` only; pass `include_parts=true` to also receive \
+                           parts (reasoning, tool calls, tool results, files). Responses are \
+                           bounded by a ~10000-token budget - when `has_more` is true, pass \
+                           `next_cursor` back as `cursor` to fetch the next page."
         )]
         async fn pond_get(
             &self,
             Parameters(params): Parameters<McpGetParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let include_thinking = params.include_thinking.unwrap_or(false);
-            let include_tool_results = params.include_tool_results.unwrap_or(false);
-            // Always fetch full content from the shared handler; the MCP
-            // transport renders placeholders for excluded parts
-            // (spec.md#protocol) instead of dropping them - so the
-            // divergence lives here, not in the handler.
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
@@ -487,18 +462,11 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
                 up_to: params.up_to,
                 context_depth: params.context_depth.unwrap_or(0),
                 max_messages: params.max_messages.unwrap_or(100),
-                include_thinking: true,
-                include_tool_results: true,
+                include_parts: params.include_parts.unwrap_or(false),
+                cursor: params.cursor,
             };
             match run_get(&self.state.store, request).await {
-                GetEnvelope::Success(mut response) => {
-                    render_placeholders(
-                        &mut response.result,
-                        include_thinking,
-                        include_tool_results,
-                    );
-                    json_result(&response)
-                }
+                GetEnvelope::Success(response) => json_result(&response),
                 GetEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
         }
@@ -621,44 +589,6 @@ parts are rendered as [reasoning: N chars] / [tool_result: N chars] placeholders
             .context("failed to start stdio MCP server")?;
         service.waiting().await.context("stdio MCP server error")?;
         Ok(())
-    }
-
-    /// Replace excluded `Reasoning` / `ToolResult` parts with a compact text
-    /// placeholder so a calling agent knows retrievable content exists and can
-    /// re-request with the toggle (spec.md#protocol). This is the one
-    /// intentional MCP-vs-HTTP response divergence.
-    fn render_placeholders(
-        result: &mut GetResult,
-        include_thinking: bool,
-        include_tool_results: bool,
-    ) {
-        let parts: &mut Vec<Part> = match result {
-            GetResult::Session { parts, .. } | GetResult::Message { parts, .. } => parts,
-        };
-        for part in parts.iter_mut() {
-            let placeholder = match &part.kind {
-                PartKind::Reasoning { text } if !include_thinking => Some(format!(
-                    "[reasoning: {} chars]",
-                    text.as_deref().map(|t| (**t).chars().count()).unwrap_or(0)
-                )),
-                PartKind::ToolResult { result, .. } if !include_tool_results => Some(format!(
-                    "[tool_result: {} chars]",
-                    result.to_string().chars().count()
-                )),
-                _ => None,
-            };
-            if let Some(text) = placeholder {
-                // Synthesized placeholder is a transport-layer rewrite (the
-                // user-facing redaction for clients that opted out of
-                // reasoning / tool_result content), not adapter output. Use
-                // the storage-internal constructor since the value isn't
-                // coming from a real `Source`. Same channel that
-                // `message_from_batch` uses on read-back.
-                part.kind = PartKind::Text {
-                    text: Some(crate::adapter::Extracted::from_stored(text)),
-                };
-            }
-        }
     }
 
     /// Serialize a wire response into an MCP tool result (one JSON text block).

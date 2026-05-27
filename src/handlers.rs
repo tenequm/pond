@@ -579,14 +579,14 @@ mod session_events_handler {
     //! `pond_session_events` (spec.md#protocol): catch-up SSE stream over a
     //! stored session's messages. v1 scope is read-after-`since`: scan
     //! messages strictly after the resume point in `(timestamp, message_id)`
-    //! order, emit one `message` event per row (with its parts, filtered by
-    //! include_thinking / include_tool_results), then emit `end` and close.
+    //! order, emit a canonical-content stub per row, then `end` and close.
     //! Live-tail activates with live-write (section 4) on the same endpoint
-    //! without a wire change.
+    //! without a wire change. Full-fidelity event replay (parts, metadata)
+    //! is not in scope - agents fetch parts via `pond_get(include_parts=true)`.
 
     use crate::{
         sessions::{MessageWithParts, Store},
-        wire::{ErrorEnvelope, PartKind},
+        wire::ErrorEnvelope,
     };
     use serde_json::{Value, json};
 
@@ -649,8 +649,6 @@ mod session_events_handler {
         store: &Store,
         session_id: &str,
         since: Since,
-        include_thinking: bool,
-        include_tool_results: bool,
     ) -> Result<Vec<SseEvent>, ErrorEnvelope> {
         let stored = store.get_session(session_id).await.map_err(map_storage)?;
         let Some(stored) = stored else {
@@ -661,7 +659,6 @@ mod session_events_handler {
             )));
         };
 
-        // `end:<id>` is idempotent - emit terminator + close, no scan.
         if since == Since::End {
             return Ok(vec![end_event(session_id)]);
         }
@@ -697,36 +694,17 @@ mod session_events_handler {
         };
 
         for message in &messages[start_at..] {
-            events.push(message_event(
-                message,
-                include_thinking,
-                include_tool_results,
-            ));
+            events.push(message_event(message));
         }
         events.push(end_event(session_id));
         Ok(events)
     }
 
-    fn message_event(
-        message: &MessageWithParts,
-        include_thinking: bool,
-        include_tool_results: bool,
-    ) -> SseEvent {
-        let mut parts = message.parts.clone();
-        parts.retain(|part| match &part.kind {
-            PartKind::Reasoning { .. } => include_thinking,
-            PartKind::ToolResult { .. } => include_tool_results,
-            PartKind::ToolApprovalRequest { .. } | PartKind::ToolApprovalResponse { .. } => false,
-            PartKind::Text { .. } | PartKind::File { .. } | PartKind::ToolCall { .. } => true,
-        });
-
+    fn message_event(message: &MessageWithParts) -> SseEvent {
         SseEvent {
             event: "message",
             id: message.message.id().to_owned(),
-            data: json!({
-                "message": message.message,
-                "parts": parts,
-            }),
+            data: json!({ "message": message.message }),
         }
     }
 
@@ -864,13 +842,66 @@ mod restore_handler {
 pub use restore_handler::restore_lineage;
 
 mod get_handler {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde::{Deserialize, Serialize};
+
     use crate::{
-        sessions::{MessageWithParts, SessionWithMessages, Store},
+        sessions::{MessageWindow, PagedScope, PagedSessionView, Store},
         wire::{GetEnvelope, GetRequest, GetResponse, GetResult, validate_protocol},
-        wire::{Message, Part, PartKind},
     };
 
     use super::{map_error, map_storage};
+
+    /// ~10000-token response budget at the `chars/4` estimator.
+    const BUDGET_CHARS: usize = 40_000;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum CursorScope {
+        Session,
+        Message,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Cursor {
+        scope: CursorScope,
+        anchor_id: String,
+        after_message_id: String,
+        #[serde(default)]
+        include_parts: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up_to: Option<String>,
+        #[serde(default)]
+        context_depth: usize,
+    }
+
+    fn encode_cursor(cursor: &Cursor) -> String {
+        // Cursor is plain owned types (String / Option<String> / bool / usize /
+        // enum); serde_json can't fail on it, so an explicit panic message
+        // beats threading an infallible Result up to the response shape.
+        #[allow(clippy::expect_used)]
+        let bytes = serde_json::to_vec(cursor).expect("cursor encodes as JSON");
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn decode_cursor(raw: &str) -> Result<Cursor, crate::wire::ErrorEnvelope> {
+        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| {
+            map_error(crate::Error::validation_field(
+                "cursor is malformed (expected opaque value from a prior response)",
+                "cursor",
+                Some(serde_json::json!(raw)),
+                Some("opaque base64url".to_owned()),
+            ))
+        })?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            map_error(crate::Error::validation_field(
+                "cursor is malformed (decode failed)",
+                "cursor",
+                Some(serde_json::json!(raw)),
+                Some("opaque cursor from a prior response".to_owned()),
+            ))
+        })
+    }
 
     pub async fn pond_get(store: &Store, request: GetRequest) -> GetEnvelope {
         if let Err(error) = validate_protocol(request.protocol_version) {
@@ -880,154 +911,253 @@ mod get_handler {
             return GetEnvelope::Error(envelope);
         }
 
-        let result = match (&request.session_id, &request.message_id, &request.up_to) {
-            (Some(session_id), None, up_to) => {
-                session_scope(store, &request, session_id, up_to.as_deref()).await
-            }
-            (None, Some(message_id), None) => message_scope(store, &request, message_id).await,
-            (None, Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
-                "up_to is valid only with session_id",
-                "up_to",
-                request.up_to.clone().map(serde_json::Value::String),
-                Some("only valid with session_id".to_owned()),
-            ))),
-            (Some(_), Some(_), _) => Err(map_error(crate::Error::validation_field(
-                "session_id and message_id are mutually exclusive",
-                "message_id",
-                request.message_id.clone().map(serde_json::Value::String),
-                Some("omit when session_id is present".to_owned()),
-            ))),
-            (None, None, _) => Err(map_error(crate::Error::validation(
-                "one of session_id or message_id is required",
-            ))),
+        let cursor = match request.cursor.as_deref() {
+            Some(raw) => Some(match decode_cursor(raw) {
+                Ok(cursor) => cursor,
+                Err(envelope) => return GetEnvelope::Error(envelope),
+            }),
+            None => None,
         };
 
-        match result {
-            Ok(result) => GetEnvelope::Success(GetResponse {
+        let outcome = match cursor {
+            Some(cursor) => match cursor.scope {
+                CursorScope::Session => {
+                    session_page(
+                        store,
+                        cursor.anchor_id.clone(),
+                        cursor.up_to.clone(),
+                        Some(cursor.after_message_id.clone()),
+                        request.max_messages,
+                        cursor.include_parts,
+                    )
+                    .await
+                }
+                CursorScope::Message => {
+                    message_page(
+                        store,
+                        cursor.anchor_id.clone(),
+                        cursor.context_depth,
+                        Some(cursor.after_message_id.clone()),
+                        request.max_messages,
+                        cursor.include_parts,
+                    )
+                    .await
+                }
+            },
+            None => match (&request.session_id, &request.message_id, &request.up_to) {
+                (Some(session_id), None, up_to) => {
+                    session_page(
+                        store,
+                        session_id.clone(),
+                        up_to.clone(),
+                        None,
+                        request.max_messages,
+                        request.include_parts,
+                    )
+                    .await
+                }
+                (None, Some(message_id), None) => {
+                    message_page(
+                        store,
+                        message_id.clone(),
+                        request.context_depth,
+                        None,
+                        request.max_messages,
+                        request.include_parts,
+                    )
+                    .await
+                }
+                (None, Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
+                    "up_to is valid only with session_id",
+                    "up_to",
+                    request.up_to.clone().map(serde_json::Value::String),
+                    Some("only valid with session_id".to_owned()),
+                ))),
+                (Some(_), Some(_), _) => Err(map_error(crate::Error::validation_field(
+                    "session_id and message_id are mutually exclusive",
+                    "message_id",
+                    request.message_id.clone().map(serde_json::Value::String),
+                    Some("omit when session_id is present".to_owned()),
+                ))),
+                (None, None, _) => Err(map_error(crate::Error::validation(
+                    "one of session_id, message_id, or cursor is required",
+                ))),
+            },
+        };
+
+        match outcome {
+            Ok((result, has_more, next_cursor)) => GetEnvelope::Success(GetResponse {
                 result,
+                has_more,
+                next_cursor,
                 request_id: crate::wire::new_request_id(),
             }),
             Err(error) => GetEnvelope::Error(error),
         }
     }
 
-    async fn session_scope(
+    async fn session_page(
         store: &Store,
-        request: &GetRequest,
-        session_id: &str,
-        up_to: Option<&str>,
-    ) -> Result<GetResult, crate::wire::ErrorEnvelope> {
-        let Some(mut stored) = store.get_session(session_id).await.map_err(map_storage)? else {
+        session_id: String,
+        up_to: Option<String>,
+        start_after: Option<String>,
+        max_messages: usize,
+        include_parts: bool,
+    ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
+        let scope = PagedScope {
+            up_to: up_to.as_deref(),
+            start_after: start_after.as_deref(),
+            window: None,
+            max_messages,
+            budget_chars: BUDGET_CHARS,
+            include_parts,
+        };
+        let view = store
+            .paged_session_view(&session_id, scope)
+            .await
+            .map_err(map_storage)?;
+        let Some(view) = view else {
             return Err(map_error(crate::Error::not_found(
                 "session",
                 serde_json::json!(session_id),
                 format!("session not found: {session_id}"),
             )));
         };
-
-        if let Some(up_to) = up_to {
-            let Some(index) = stored
-                .messages
-                .iter()
-                .position(|message| message.message.id() == up_to)
-            else {
-                return Err(map_error(crate::Error::not_found(
-                    "message",
-                    serde_json::json!([session_id, up_to]),
-                    format!("up_to message not found in session: {session_id}/{up_to}"),
-                )));
-            };
-            stored.messages.truncate(index + 1);
-        }
-
-        let max_messages = request.max_messages.min(1000);
-        if stored.messages.len() > max_messages {
-            stored.messages = stored.messages[stored.messages.len() - max_messages..].to_vec();
-        }
-        filter_session(
-            &mut stored,
-            request.include_thinking,
-            request.include_tool_results,
+        let (next_cursor, has_more) = build_next_cursor(
+            &view,
+            CursorScope::Session,
+            &session_id,
+            up_to.clone(),
+            0,
+            include_parts,
         );
-        let session = stored.session;
-        let (messages, parts) = into_canonical(stored.messages);
-        Ok(GetResult::Session {
-            session,
-            messages,
-            parts,
-        })
+        Ok((
+            GetResult::Session {
+                session: view.session,
+                messages: view.messages,
+                parts: view.parts,
+            },
+            has_more,
+            next_cursor,
+        ))
     }
 
-    async fn message_scope(
+    async fn message_page(
         store: &Store,
-        request: &GetRequest,
-        message_id: &str,
-    ) -> Result<GetResult, crate::wire::ErrorEnvelope> {
-        let Some((session, mut messages)) = store
-            .get_message_context(message_id, request.context_depth)
+        message_id: String,
+        context_depth: usize,
+        start_after: Option<String>,
+        max_messages: usize,
+        include_parts: bool,
+    ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
+        let session_id = store
+            .session_id_for_message(&message_id)
             .await
             .map_err(map_storage)?
-        else {
+            .ok_or_else(|| {
+                map_error(crate::Error::not_found(
+                    "message",
+                    serde_json::json!(message_id),
+                    format!("message not found: {message_id}"),
+                ))
+            })?;
+        let scope = PagedScope {
+            up_to: None,
+            start_after: start_after.as_deref(),
+            window: Some(MessageWindow {
+                anchor: &message_id,
+                depth: context_depth,
+            }),
+            max_messages,
+            budget_chars: BUDGET_CHARS,
+            include_parts,
+        };
+        let view = store
+            .paged_session_view(&session_id, scope)
+            .await
+            .map_err(map_storage)?;
+        let Some(view) = view else {
             return Err(map_error(crate::Error::not_found(
-                "message",
-                serde_json::json!(message_id),
-                format!("message not found: {message_id}"),
+                "session",
+                serde_json::json!(session_id),
+                format!("session not found: {session_id}"),
             )));
         };
-        filter_messages(
-            &mut messages,
-            request.include_thinking,
-            request.include_tool_results,
+        let (next_cursor, has_more) = build_next_cursor(
+            &view,
+            CursorScope::Message,
+            &message_id,
+            None,
+            context_depth,
+            include_parts,
         );
-        let (messages, parts) = into_canonical(messages);
-        Ok(GetResult::Message {
-            session,
-            messages,
-            parts,
-        })
+        Ok((
+            GetResult::Message {
+                session: view.session,
+                messages: view.messages,
+                parts: view.parts,
+            },
+            has_more,
+            next_cursor,
+        ))
     }
 
-    fn filter_session(
-        session: &mut SessionWithMessages,
-        include_thinking: bool,
-        include_tool_results: bool,
-    ) {
-        filter_messages(
-            &mut session.messages,
-            include_thinking,
-            include_tool_results,
-        );
+    fn build_next_cursor(
+        view: &PagedSessionView,
+        scope: CursorScope,
+        anchor_id: &str,
+        up_to: Option<String>,
+        context_depth: usize,
+        include_parts: bool,
+    ) -> (Option<String>, bool) {
+        match view.next_after.as_deref() {
+            Some(after) => (
+                Some(encode_cursor(&Cursor {
+                    scope,
+                    anchor_id: anchor_id.to_owned(),
+                    after_message_id: after.to_owned(),
+                    include_parts,
+                    up_to,
+                    context_depth,
+                })),
+                view.has_more,
+            ),
+            None => (None, false),
+        }
     }
 
-    fn filter_messages(
-        messages: &mut Vec<MessageWithParts>,
-        include_thinking: bool,
-        include_tool_results: bool,
-    ) {
-        for message in messages.iter_mut() {
-            message.parts.retain(|part| match &part.kind {
-                PartKind::Reasoning { .. } => include_thinking,
-                PartKind::ToolResult { .. } => include_tool_results,
-                PartKind::ToolApprovalRequest { .. } | PartKind::ToolApprovalResponse { .. } => {
-                    false
-                }
-                PartKind::Text { .. } | PartKind::File { .. } | PartKind::ToolCall { .. } => true,
-            });
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+
+        #[test]
+        fn cursor_round_trips_through_base64url_json() {
+            let cursor = Cursor {
+                scope: CursorScope::Session,
+                anchor_id: "s-1".to_owned(),
+                after_message_id: "m-7".to_owned(),
+                include_parts: true,
+                up_to: Some("m-9".to_owned()),
+                context_depth: 0,
+            };
+            let raw = encode_cursor(&cursor);
+            let back = decode_cursor(&raw).unwrap();
+            assert!(matches!(back.scope, CursorScope::Session));
+            assert_eq!(back.anchor_id, "s-1");
+            assert_eq!(back.after_message_id, "m-7");
+            assert!(back.include_parts);
+            assert_eq!(back.up_to.as_deref(), Some("m-9"));
         }
 
-        messages.retain(|message| {
-            message.message.role() != crate::wire::Role::Tool || !message.parts.is_empty()
-        });
-    }
-
-    fn into_canonical(messages: Vec<MessageWithParts>) -> (Vec<Message>, Vec<Part>) {
-        let mut canonical_messages = Vec::with_capacity(messages.len());
-        let mut canonical_parts = Vec::new();
-        for message in messages {
-            canonical_messages.push(message.message);
-            canonical_parts.extend(message.parts);
+        #[test]
+        fn malformed_cursor_returns_validation_failed() {
+            let envelope = decode_cursor("not-base64!!!").unwrap_err();
+            assert_eq!(
+                envelope.error.code,
+                crate::wire::ErrorCode::ValidationFailed
+            );
         }
-        (canonical_messages, canonical_parts)
     }
 }
 
@@ -1078,26 +1208,20 @@ mod search_handler {
         pub limit: usize,
         pub boost_recent: bool,
         pub group_by_conversation: bool,
-        pub full: bool,
         pub min_score: f64,
     }
 
-    /// Server-enforced cap on `limit` (spec.md#search).
     const LIMIT_CAP: usize = 200;
-    /// Hit-payload size bounds in code points (spec.md#search): a message's
-    /// indexed text is returned in full at or below `HIT_TEXT_FULL`; above it,
-    /// the text is truncated to `HIT_TEXT_FULL` and a match-windowed snippet of
-    /// up to `HIT_SNIPPET_CHARS` is added.
-    const HIT_TEXT_FULL: usize = 2000;
-    const HIT_SNIPPET_CHARS: usize = 400;
-    /// Recency-boost constants (spec.md#search).
-    // Additive recency boost (spec.md#search). Caps at 0.05 so it stays a
-    // tiebreaker rather than a primary signal: the fused base score from
-    // score-normalized hybrid fusion ranges in [0, FTS_FUSION_WEIGHT +
-    // VECTOR_FUSION_WEIGHT] = [0, 1.135], so 0.05 is roughly 4% of the
-    // max-possible base.
+    /// Centered query-windowed body returned on every hit (spec.md#search).
+    /// Calibrated for the agent-context budget: ~600 code points fits a typical
+    /// match site without crowding the 10k-token `pond_get` page.
+    const HIT_SNIPPET_CHARS: usize = 600;
+    /// Additive recency boost (spec.md#search). Caps at 0.05 so it stays a
+    /// tiebreaker; with `FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT = 1.135`,
+    /// `SCORE_DENOMINATOR` divides best_score by 1.185 to land in `[0, 1]`.
     const RECENCY_MAX_BOOST: f64 = 0.05;
     const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
+    const SCORE_DENOMINATOR: f64 = FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT + RECENCY_MAX_BOOST;
 
     // Score-normalized hybrid fusion weights (spec.md#search). Per-arm
     // base_score is min-max normalized within the arm's pool, then the two
@@ -1270,7 +1394,6 @@ mod search_handler {
                         session_id: hit.key.session_id,
                         message_id: hit.key.message_id,
                         base_score: hit.score,
-                        matched_via: hit.matched_via,
                     })
                     .collect()
             }
@@ -1339,21 +1462,18 @@ mod search_handler {
             else {
                 continue;
             };
-            let recency_boost = if plan.boost_recent {
+            let recency = if plan.boost_recent {
                 recency_boost(meta.timestamp, now)
             } else {
                 0.0
             };
-            let score = candidate.base_score + recency_boost;
+            let score = candidate.base_score + recency;
             if score < plan.min_score {
                 continue;
             }
             scored.push(ScoredHit {
                 meta: (*meta).clone(),
-                base_score: candidate.base_score,
-                recency_boost,
                 score,
-                matched_via: candidate.matched_via,
             });
         }
         scored.sort_by(|left, right| {
@@ -1366,7 +1486,7 @@ mod search_handler {
         });
 
         if plan.group_by_conversation {
-            let groups = build_groups(store, &scored, plan.limit, &plan.query, plan.full).await?;
+            let groups = build_groups(store, &scored, plan.limit, &plan.query).await?;
             let total = groups.len();
             Ok(SearchResponse {
                 result: SearchResultBody::Groups { groups },
@@ -1377,7 +1497,7 @@ mod search_handler {
             let hits = scored
                 .into_iter()
                 .take(plan.limit)
-                .map(|hit| hit.into_hit(&plan.query, plan.full))
+                .map(|hit| hit.into_hit(&plan.query))
                 .collect::<Vec<_>>();
             let total = hits.len();
             Ok(SearchResponse {
@@ -1465,7 +1585,6 @@ mod search_handler {
             limit,
             boost_recent: request.boost_recent,
             group_by_conversation: request.group_by_conversation,
-            full: request.full,
             min_score: request.filters.min_score,
         })
     }
@@ -1626,29 +1745,16 @@ mod search_handler {
     /// text, masking the real match site.
     const ANCHOR_MIN_TERM_CHARS: usize = 4;
 
-    /// Build a hit's `(text, snippet)` payload (spec.md#search).
-    ///
-    /// `full=false` (the default for `pond_search` MCP / HTTP callers): `text`
-    /// is the match-windowed snippet (~`HIT_SNIPPET_CHARS`), `snippet` is
-    /// None. Short messages whose body fits the snippet window return their
-    /// full body as `text` - no inversion to do when there's nothing to trim.
-    ///
-    /// `full=true` (operator tooling, `pond search --full`): `text` is the
-    /// indexed text up to `HIT_TEXT_FULL`; `snippet` holds the match window
-    /// only when the body was truncated.
-    pub fn hit_payload(text: &str, query: &str, full: bool) -> (String, Option<String>) {
-        let chars: Vec<char> = text.chars().collect();
-        if full {
-            if chars.len() <= HIT_TEXT_FULL {
-                return (text.to_owned(), None);
-            }
-            let truncated = chars[..HIT_TEXT_FULL].iter().collect::<String>();
-            return (truncated, Some(query_snippet(text, query)));
+    /// Build a hit's `text` payload (spec.md#search): the message body when
+    /// it fits within the snippet window, otherwise a query-windowed slice
+    /// centered on the first informative term. Bounded for the agent-context
+    /// budget; callers fetch the full body via `pond_get`.
+    pub fn hit_payload(text: &str, query: &str) -> String {
+        let chars_len = text.chars().count();
+        if chars_len <= HIT_SNIPPET_CHARS {
+            return text.to_owned();
         }
-        if chars.len() <= HIT_SNIPPET_CHARS {
-            return (text.to_owned(), None);
-        }
-        (query_snippet(text, query), None)
+        query_snippet(text, query)
     }
 
     /// A snippet windowed around the first informative query term found in
@@ -1707,20 +1813,16 @@ mod search_handler {
         session_id: String,
         message_id: String,
         base_score: f64,
-        matched_via: Vec<String>,
     }
 
     struct ScoredHit {
         meta: MessageMeta,
-        base_score: f64,
-        recency_boost: f64,
         score: f64,
-        matched_via: Vec<String>,
     }
 
     impl ScoredHit {
-        fn into_hit(self, query: &str, full: bool) -> Hit {
-            let (text, snippet) = hit_payload(&self.meta.search_text, query, full);
+        fn into_hit(self, query: &str) -> Hit {
+            let text = hit_payload(&self.meta.search_text, query);
             Hit {
                 session_id: self.meta.session_id,
                 message_id: self.meta.message_id,
@@ -1729,17 +1831,15 @@ mod search_handler {
                 project: self.meta.project,
                 source_agent: self.meta.source_agent,
                 text,
-                snippet,
-                score: self.score,
-                base_score: self.base_score,
-                recency_boost: self.recency_boost,
-                matched_via: self.matched_via,
+                score: normalize_score(self.score),
             }
         }
     }
 
-    /// Unbounded BM25 scores to a `[0, 1]` base score by dividing by the max in the
-    /// result set.
+    fn normalize_score(score: f64) -> f64 {
+        (score / SCORE_DENOMINATOR).clamp(0.0, 1.0)
+    }
+
     fn normalize_fts(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
         let max = hits.iter().map(|(_, score)| *score).fold(0.0_f32, f32::max);
         hits.into_iter()
@@ -1751,15 +1851,10 @@ mod search_handler {
                 } else {
                     0.0
                 },
-                matched_via: vec![RetrieverKind::Fts.as_wire().to_owned()],
             })
             .collect()
     }
 
-    // Rank-based normalization for the vector-only branch (selected by
-    // operator override). The raw `_distance` is Lance cosine distance;
-    // converting to a monotone-in-rank `[0, 1]` score keeps the Hit payload
-    // comparable to FTS and Hybrid (where `base_score` is also monotone in rank).
     fn normalize_vector(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
         let n = hits.len() as f64;
         hits.into_iter()
@@ -1768,7 +1863,6 @@ mod search_handler {
                 session_id: key.session_id,
                 message_id: key.message_id,
                 base_score: if n > 0.0 { 1.0 - (idx as f64 / n) } else { 0.0 },
-                matched_via: vec![RetrieverKind::Vector.as_wire().to_owned()],
             })
             .collect()
     }
@@ -1796,7 +1890,6 @@ mod search_handler {
         scored: &[ScoredHit],
         limit: usize,
         query: &str,
-        full: bool,
     ) -> Result<Vec<Group>, ErrorEnvelope> {
         use std::collections::BTreeMap;
 
@@ -1810,27 +1903,19 @@ mod search_handler {
             first_timestamp: DateTime<Utc>,
             last_timestamp: DateTime<Utc>,
             text: String,
-            snippet: Option<String>,
             best_score: f64,
         }
-        // Key by conversation root: a Claude Code sub-agent session under
-        // `<parent>/agent-<id>` collapses into its parent, so one user-facing
-        // conversation never occupies two slots in the grouped output.
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
         for hit in scored {
             let root = session_root(&hit.meta.session_id).to_owned();
-            let entry = groups.entry(root).or_insert_with(|| {
-                let (text, snippet) = hit_payload(&hit.meta.search_text, query, full);
-                Acc {
-                    best_hit_message_id: hit.meta.message_id.clone(),
-                    project: hit.meta.project.clone(),
-                    source_agent: hit.meta.source_agent.clone(),
-                    first_timestamp: hit.meta.timestamp,
-                    last_timestamp: hit.meta.timestamp,
-                    text,
-                    snippet,
-                    best_score: hit.score,
-                }
+            let entry = groups.entry(root).or_insert_with(|| Acc {
+                best_hit_message_id: hit.meta.message_id.clone(),
+                project: hit.meta.project.clone(),
+                source_agent: hit.meta.source_agent.clone(),
+                first_timestamp: hit.meta.timestamp,
+                last_timestamp: hit.meta.timestamp,
+                text: hit_payload(&hit.meta.search_text, query),
+                best_score: hit.score,
             });
             entry.first_timestamp = entry.first_timestamp.min(hit.meta.timestamp);
             entry.last_timestamp = entry.last_timestamp.max(hit.meta.timestamp);
@@ -1846,16 +1931,19 @@ mod search_handler {
         let mut result = groups
             .into_iter()
             .map(|(session_id, acc)| Group {
-                message_count: counts.get(&session_id).copied().unwrap_or_default(),
+                session_messages_count: counts.get(&session_id).copied().unwrap_or_default(),
                 session_id,
                 best_hit_message_id: acc.best_hit_message_id,
                 project: acc.project,
                 source_agent: acc.source_agent,
                 first_timestamp: acc.first_timestamp,
-                last_timestamp: acc.last_timestamp,
+                last_timestamp: if acc.last_timestamp > acc.first_timestamp {
+                    Some(acc.last_timestamp)
+                } else {
+                    None
+                },
                 text: acc.text,
-                snippet: acc.snippet,
-                best_score: acc.best_score,
+                best_score: normalize_score(acc.best_score),
             })
             .collect::<Vec<_>>();
         result.sort_by(|left, right| {
@@ -2069,7 +2157,6 @@ mod tests {
             filters: SearchFilters::default(),
             boost_recent: true,
             group_by_conversation: false,
-            full: true,
             limit: 20,
         }
     }
@@ -2147,54 +2234,26 @@ mod tests {
     }
 
     #[test]
-    fn hit_payload_returns_short_text_in_full_with_no_snippet() {
+    fn hit_payload_returns_short_text_in_full() {
         let short = "a short message body";
-        let (text, snippet) = hit_payload(short, "message", true);
-        assert_eq!(text, short);
-        assert!(snippet.is_none(), "small text needs no snippet");
+        let text = hit_payload(short, "message");
+        assert_eq!(text, short, "small text is returned as-is");
     }
 
     #[test]
-    fn hit_payload_truncates_long_text_and_windows_the_snippet() {
-        // 2400 chars: a filler head, the query term mid-body, a filler tail.
+    fn hit_payload_windows_long_text_around_the_query_term() {
+        // ~2400 chars: filler head, query term mid-body, filler tail.
         let body = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(394));
-        let (text, snippet) = hit_payload(&body, "needle", true);
-        assert_eq!(text.chars().count(), 2000, "text truncates to the bound");
-        let snippet = snippet.expect("long text carries a snippet");
-        assert!(
-            snippet.contains("NEEDLE"),
-            "snippet windows on the query term: {snippet}"
-        );
-        assert!(snippet.chars().count() <= 400 + 6, "snippet is bounded");
-    }
-
-    #[test]
-    fn hit_payload_default_returns_snippet_only_for_long_text() {
-        // Inversion: with `full=false` the long body is replaced by the
-        // match-windowed snippet and no separate `snippet` field ships.
-        let body = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(394));
-        let (text, snippet) = hit_payload(&body, "needle", false);
+        let text = hit_payload(&body, "needle");
         assert!(
             text.contains("NEEDLE"),
-            "default text is the match-windowed snippet"
+            "text is the match-windowed snippet: {text}"
         );
+        // `query_snippet` adds up to "..." on each side, so account for the +6.
         assert!(
-            text.chars().count() <= 400 + 6,
-            "default text is bounded to the snippet size"
+            text.chars().count() <= 600 + 6,
+            "snippet is bounded by HIT_SNIPPET_CHARS"
         );
-        assert!(
-            snippet.is_none(),
-            "snippet field is None when text already is one"
-        );
-    }
-
-    #[test]
-    fn hit_payload_default_returns_full_body_for_short_text() {
-        // No inversion to do when the body already fits the snippet window.
-        let short = "a short message body";
-        let (text, snippet) = hit_payload(short, "message", false);
-        assert_eq!(text, short);
-        assert!(snippet.is_none());
     }
 
     #[test]
@@ -2203,16 +2262,10 @@ mod tests {
         // a different byte layout than the original. A query offset taken from
         // that copy must never be sliced into the original text.
         let body = format!("İÉÉÉ{}", "a".repeat(2100));
-        let (text, snippet) = hit_payload(&body, "ééé", true);
-        assert_eq!(
-            text.chars().count(),
-            2000,
-            "long text truncates to the bound"
-        );
-        let snippet = snippet.expect("long text carries a snippet");
+        let text = hit_payload(&body, "ééé");
         assert!(
-            snippet.contains("ÉÉÉ"),
-            "snippet windows on the matched term: {snippet}"
+            text.contains("ÉÉÉ"),
+            "snippet windows on the matched term: {text}"
         );
     }
 
@@ -2320,8 +2373,6 @@ mod tests {
 
     #[test]
     fn plan_search_shapes_request_for_each_planning_input() {
-        // Case 1: large limit + group + filters + min_score. Query gets trimmed,
-        // limit caps at 200, pools size off `limit * k`.
         let mut request = search_request("  vector memory  ");
         request.limit = 500;
         request.group_by_conversation = true;

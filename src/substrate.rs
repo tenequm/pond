@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_stream::StreamExt;
 use url::Url;
 /// Embedded-row count at which pond builds the IVF_PQ vector index on
@@ -431,6 +431,45 @@ impl ScalarValue {
         }
     }
 }
+/// Lance cache caps in bytes. `None` lets the substrate pick the backend-aware
+/// default (local FS gets a tighter cap; object stores stay near Lance's
+/// defaults). Wired through `Store::open_with_options` from `[runtime]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeCaps {
+    pub index_cache_bytes: Option<usize>,
+    pub metadata_cache_bytes: Option<usize>,
+}
+
+impl RuntimeCaps {
+    pub fn from_config(config: &crate::config::RuntimeConfig) -> Self {
+        Self {
+            index_cache_bytes: config.index_cache_bytes,
+            metadata_cache_bytes: config.metadata_cache_bytes,
+        }
+    }
+}
+
+/// Local-FS default: tight enough that a long-lived `pond mcp` lands well
+/// under the 500 MiB target without measurable latency cost vs Lance's 6 GiB
+/// default (see `benches/serve_mem_bench.rs --cap-sweep`).
+const LOCAL_INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const LOCAL_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Object-store defaults: latency to refill is per-page, so keep more in cache.
+const REMOTE_INDEX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const REMOTE_METADATA_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+fn resolve_cache_caps(location: &Url, caps: RuntimeCaps) -> (usize, usize) {
+    let (index_default, metadata_default) = if config::is_local(location) {
+        (LOCAL_INDEX_CACHE_BYTES, LOCAL_METADATA_CACHE_BYTES)
+    } else {
+        (REMOTE_INDEX_CACHE_BYTES, REMOTE_METADATA_CACHE_BYTES)
+    };
+    (
+        caps.index_cache_bytes.unwrap_or(index_default),
+        caps.metadata_cache_bytes.unwrap_or(metadata_default),
+    )
+}
+
 pub struct Handle {
     datasets: DatasetSet,
     retry: RetryPolicy,
@@ -460,6 +499,10 @@ pub struct Handle {
     /// to display where the bytes live and to decide whether to walk a local
     /// directory or issue a remote `LIST` for sizing.
     location: Url,
+    /// Cached `parts.lance` open metadata, used the first time a caller asks
+    /// for parts. Holds the namespace probe shape so the lazy open re-uses the
+    /// same `catalog-seam` path as the eager opens for sessions/messages.
+    parts_refresh_after: Duration,
 }
 
 impl std::fmt::Debug for Handle {
@@ -498,7 +541,13 @@ impl Table {
 struct DatasetSet {
     sessions: Mutex<CachedDataset>,
     messages: Mutex<CachedDataset>,
-    parts: Mutex<CachedDataset>,
+    /// `parts.lance` opens lazily on the first read or write that needs it
+    /// (`pond_get(include_parts=true)`, ingest with Part events, hydration
+    /// during grouped search). MCP processes that only serve trimmed `pond_get`
+    /// and `pond_search` never touch this file, saving its metadata pages and
+    /// file handle at cold-open. The OnceCell makes init single-flight; the
+    /// inner `Mutex<CachedDataset>` then behaves identically to the other two.
+    parts: OnceCell<Mutex<CachedDataset>>,
 }
 #[derive(Debug)]
 struct CachedDataset {
@@ -520,18 +569,21 @@ impl CachedDataset {
     }
 }
 impl Handle {
-    /// Open without storage options.
+    /// Open without storage options or explicit cache caps. Backend-aware
+    /// defaults from `[runtime]` apply.
     pub async fn open(location: &Url) -> Result<Self> {
-        Self::open_with_options(location, HashMap::new()).await
+        Self::open_with_options(location, HashMap::new(), RuntimeCaps::default()).await
     }
 
-    /// Open with object-store options handed through to Lance verbatim.
-    /// Object-store keys are the `object_store` crate's standard config
-    /// names; pond does not parse them. Opening datasets never performs index
-    /// work; index lifecycle lives under `Handle::optimize_table`.
+    /// Open with object-store options handed through to Lance verbatim, plus
+    /// the resolved `[runtime]` cache caps. Object-store keys are the
+    /// `object_store` crate's standard config names; pond does not parse them.
+    /// Opening datasets never performs index work; index lifecycle lives under
+    /// `Handle::optimize_table`. `parts.lance` opens lazily on first use.
     pub async fn open_with_options(
         location: &Url,
         mut storage_options: HashMap<String, String>,
+        caps: RuntimeCaps,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
             tokio::fs::create_dir_all(&path)
@@ -542,10 +594,15 @@ impl Handle {
         }
         // One Session shared across all three datasets so metadata/index
         // caches and the object_store registry (and thus any S3 client) are
-        // pooled rather than duplicated three times. `Session::default()`
-        // ships sensible cache capacities (lance/src/dataset.rs:149,153)
-        // and a default ObjectStoreRegistry that knows file/s3/gs/az.
-        let session = Arc::new(Session::default());
+        // pooled rather than duplicated three times. Caps are sized by the
+        // `[runtime]` block; explicit values from `caps` win, otherwise the
+        // local/remote backend default kicks in.
+        let (index_cache_bytes, metadata_cache_bytes) = resolve_cache_caps(location, caps);
+        let session = Arc::new(Session::new(
+            index_cache_bytes,
+            metadata_cache_bytes,
+            Arc::new(ObjectStoreRegistry::default()),
+        ));
         // Build the lance-namespace catalog seam once (spec.md#catalog-seam).
         // The `root` property is whatever URL the Directory impl understands;
         // `uri_to_url` (lance-io/object_store.rs) accepts both bare paths and
@@ -604,19 +661,7 @@ impl Handle {
                     last_refresh: Instant::now(),
                     refresh_after,
                 }),
-                parts: Mutex::new(CachedDataset {
-                    dataset: open_or_create_via_ns(
-                        &nm,
-                        &nm_ident,
-                        sessions::PARTS,
-                        sessions::part_schema(),
-                        &session,
-                        &storage_options,
-                    )
-                    .await?,
-                    last_refresh: Instant::now(),
-                    refresh_after,
-                }),
+                parts: OnceCell::new(),
             },
             retry: RetryPolicy::default(),
             session,
@@ -624,6 +669,7 @@ impl Handle {
             nm_ident,
             storage_options,
             location: location.clone(),
+            parts_refresh_after: refresh_after,
         };
         Ok(handle)
     }
@@ -704,7 +750,7 @@ impl Handle {
         let started = Instant::now();
         let result = self
             .retry_lance(table.label(), || async {
-                let mut cached = self.cached(table).lock().await;
+                let mut cached = self.cached(table).await?.lock().await;
                 let existing = cached.latest().await?;
                 let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
                 let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
@@ -793,7 +839,7 @@ impl Handle {
         }
         let result = self
             .retry_lance(table.label(), || async {
-                let mut guard = self.cached(table).lock().await;
+                let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
                 let did_work =
                     optimize_table_indices(&mut dataset, intents, table, progress).await?;
@@ -817,7 +863,7 @@ impl Handle {
     ) -> PhaseOutcome {
         let result = self
             .retry_lance(table.label(), || async {
-                let mut guard = self.cached(table).lock().await;
+                let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
                 optimize_table_compact(&mut dataset, table, progress, cleanup).await?;
                 guard.replace(dataset);
@@ -833,7 +879,7 @@ impl Handle {
 
     pub async fn rebuild_index(&self, table: Table, intent: &IndexIntent) -> Result<()> {
         self.retry_lance(table.label(), || async {
-            let mut guard = self.cached(table).lock().await;
+            let mut guard = self.cached(table).await?.lock().await;
             let mut dataset = guard.latest().await?;
             rebuild_index(&mut dataset, intent).await?;
             guard.replace(dataset);
@@ -852,7 +898,7 @@ impl Handle {
     }
 
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
-        let mut cached = self.cached(table).lock().await;
+        let mut cached = self.cached(table).await?.lock().await;
         cached.latest().await
     }
     /// Build a prefiltered `Scanner` for `table`. Composable read entry
@@ -935,7 +981,7 @@ impl Handle {
     /// vectors. Errors when the index does not exist; callers may swallow
     /// that.
     pub(crate) async fn drop_index(&self, table: Table, name: &str) -> Result<()> {
-        let mut guard = self.cached(table).lock().await;
+        let mut guard = self.cached(table).await?.lock().await;
         let mut dataset = guard.latest().await?;
         dataset
             .drop_index(name)
@@ -1029,12 +1075,36 @@ impl Handle {
         }
         Ok(total)
     }
-    fn cached(&self, table: Table) -> &Mutex<CachedDataset> {
+    async fn cached(&self, table: Table) -> Result<&Mutex<CachedDataset>> {
         match table {
-            Table::Sessions => &self.datasets.sessions,
-            Table::Messages => &self.datasets.messages,
-            Table::Parts => &self.datasets.parts,
+            Table::Sessions => Ok(&self.datasets.sessions),
+            Table::Messages => Ok(&self.datasets.messages),
+            Table::Parts => self.parts_cached().await,
         }
+    }
+
+    /// Open `parts.lance` on first use (spec.md#datasets). Single-flight via
+    /// `OnceCell`; once initialized, behaves identically to the other two.
+    async fn parts_cached(&self) -> Result<&Mutex<CachedDataset>> {
+        self.datasets
+            .parts
+            .get_or_try_init(|| async {
+                let dataset = open_or_create_via_ns(
+                    &self.nm,
+                    &self.nm_ident,
+                    sessions::PARTS,
+                    sessions::part_schema(),
+                    &self.session,
+                    &self.storage_options,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(Mutex::new(CachedDataset {
+                    dataset,
+                    last_refresh: Instant::now(),
+                    refresh_after: self.parts_refresh_after,
+                }))
+            })
+            .await
     }
     async fn retry_lance<T, Fut, Op>(&self, label: &str, mut operation: Op) -> Result<T>
     where

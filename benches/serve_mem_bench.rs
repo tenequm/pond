@@ -42,6 +42,7 @@ use pond::{
     embed::{E5Embedder, EmbedBackend, LazyEmbedder},
     handlers::{pond_get, pond_search},
     sessions::Store,
+    substrate::RuntimeCaps,
     wire::{
         GetEnvelope, GetRequest, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
         SearchResponse,
@@ -111,6 +112,12 @@ struct Args {
     /// metal_backend/device.rs:44-57).
     #[arg(long)]
     probe_embedder: bool,
+    /// Sweep the workload across a fixed grid of `(metadata_cache_bytes,
+    /// index_cache_bytes)` pairs, printing peak RSS and p50/p95 hybrid latency
+    /// for each. Used to calibrate the `[runtime]` defaults (`docs/plans/mcp-
+    /// memory-budget.md` Q5).
+    #[arg(long)]
+    cap_sweep: bool,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -205,7 +212,6 @@ fn search_request(query: &str, mode: Option<SearchModeWire>, limit: usize) -> Se
         filters: SearchFilters::default(),
         boost_recent: true,
         group_by_conversation: false,
-        full: false,
         limit,
     }
 }
@@ -219,8 +225,8 @@ fn get_request(message_id: String) -> GetRequest {
         up_to: None,
         context_depth: 0,
         max_messages: 50,
-        include_thinking: false,
-        include_tool_results: false,
+        include_parts: false,
+        cursor: None,
     }
 }
 
@@ -563,6 +569,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    if args.cap_sweep {
+        return run_cap_sweep(&args, &data_dir).await;
+    }
+
     let cfg = SearchConfig::default();
     let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
@@ -782,5 +792,106 @@ async fn main() -> Result<()> {
     if !pass {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Sweep `(metadata, index)` Lance cache caps across a fixed MiB grid and
+/// print peak RSS + p50 / p95 hybrid latency for each. Used to calibrate the
+/// `[runtime]` defaults against a real corpus (`docs/plans/mcp-memory-budget.md`
+/// Q5). The E5 embedder loads once and is reused across grid points so the
+/// model-load spike is not double-counted.
+async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
+    const SWEEP_MIB: &[u64] = &[32, 64, 128, 256, 512, 1024];
+
+    println!("=== pond serve-mem bench: --cap-sweep ===");
+    println!("data_dir         {}", data_dir.display());
+    println!(
+        "queries/phase    {} (warmup={}, limit={})",
+        args.queries, args.warmup, args.limit
+    );
+    println!();
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "meta_MiB", "index_MiB", "peak_MiB", "steady_MiB", "p50_ms", "p95_ms",
+    );
+    println!("{}", "-".repeat(70));
+
+    let cfg = SearchConfig::default();
+    let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
+    let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
+    let embedder = LazyEmbedder::new();
+    let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+
+    for &mib in SWEEP_MIB {
+        let bytes = (mib as usize) * 1024 * 1024;
+        let caps = RuntimeCaps {
+            index_cache_bytes: Some(bytes),
+            metadata_cache_bytes: Some(bytes),
+        };
+
+        let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
+        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+        let url = pond::config::url_for_path(data_dir)?;
+        let store = Store::open_with_options(&url, Default::default(), caps).await?;
+
+        run_search_phase(SearchPhase {
+            name: "warm",
+            store: &store,
+            embedder: &embedder,
+            cfg: &cfg,
+            sampler: &sampler,
+            mode: Some(SearchModeWire::Hybrid),
+            queries: &warmup,
+            limit: args.limit,
+            record_hits: false,
+            hit_sink: &hit_sink,
+        })
+        .await?;
+        let steady = run_search_phase(SearchPhase {
+            name: "steady",
+            store: &store,
+            embedder: &embedder,
+            cfg: &cfg,
+            sampler: &sampler,
+            mode: Some(SearchModeWire::Hybrid),
+            queries: &queries,
+            limit: args.limit,
+            record_hits: false,
+            hit_sink: &hit_sink,
+        })
+        .await?;
+
+        let peak_mib = sampler.peak_kb() as f64 / 1024.0;
+        let steady_mib = steady.rss_end_kb as f64 / 1024.0;
+        sampler.finish();
+        drop(store);
+
+        println!(
+            "{:>10}  {:>10}  {:>10.1}  {:>10.1}  {:>8}  {:>8}",
+            mib,
+            mib,
+            peak_mib,
+            steady_mib,
+            steady.p50(),
+            steady.p95(),
+        );
+        rows.push(serde_json::json!({
+            "metadata_mib": mib,
+            "index_mib": mib,
+            "peak_mib": peak_mib,
+            "steady_mib": steady_mib,
+            "p50_ms": steady.p50(),
+            "p95_ms": steady.p95(),
+        }));
+    }
+
+    let json = serde_json::json!({
+        "mode": "cap_sweep",
+        "data_dir": data_dir.display().to_string(),
+        "rows": rows,
+    });
+    println!();
+    println!("JSON {json}");
     Ok(())
 }

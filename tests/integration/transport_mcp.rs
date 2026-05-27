@@ -174,8 +174,6 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         "search response total should match the body length",
     );
 
-    // pond_get with `conversation_id` maps to the wire `session_id` filter (kb
-    // parity), and excluded reasoning parts render as a placeholder, not raw.
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
@@ -187,33 +185,28 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         )
         .await?;
     let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session { session, parts, .. } = response.result else {
+    let GetResult::Session {
+        session,
+        messages,
+        parts,
+    } = response.result
+    else {
         panic!("expected a session result");
     };
     assert_eq!(session.id, SESSION_ID, "conversation_id -> session_id");
     assert!(
-        parts
-            .iter()
-            .all(|part| !matches!(part.kind, PartKind::Reasoning { .. })),
-        "default include_thinking=false: no raw reasoning parts over MCP",
+        parts.is_empty(),
+        "default include_parts=false: parts elided from response"
     );
-    let placeholder = parts.iter().find_map(|part| match &part.kind {
-        PartKind::Text { text: Some(text) } if text.starts_with("[reasoning:") => {
-            Some(text.as_str())
-        }
-        _ => None,
-    });
-    assert_eq!(
-        placeholder,
-        Some(format!("[reasoning: {} chars]", REASONING_TEXT.chars().count()).as_str()),
-        "excluded reasoning renders as a [reasoning: N chars] placeholder",
+    assert!(
+        !messages.is_empty(),
+        "session has at least one message in the trimmed response"
     );
 
-    // With include_thinking=true the raw reasoning part comes back in full.
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "conversation_id": SESSION_ID, "include_thinking": true })
+                json!({ "conversation_id": SESSION_ID, "include_parts": true })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -229,7 +222,7 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
             &part.kind,
             PartKind::Reasoning { text: Some(text) } if text.as_str() == REASONING_TEXT
         )),
-        "include_thinking=true returns the raw reasoning part",
+        "include_parts=true returns the reasoning part in full"
     );
 
     // A wire error (unknown session) surfaces as a JSON-RPC tool error.

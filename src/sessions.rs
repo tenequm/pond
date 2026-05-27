@@ -28,7 +28,7 @@ use crate::{
         PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, Message, Part, PartKind, Role, Session},
+    wire::{FileData, GetMessage, GetSession, Message, Part, PartKind, Role, Session},
 };
 use url::Url;
 
@@ -276,24 +276,31 @@ impl Store {
 
     /// Open with object-store options (S3 creds, region, endpoint, ...)
     /// threaded through Lance verbatim. Keys are the standard `object_store`
-    /// config names; pond does not parse them. Empty options is equivalent
-    /// to [`Store::open`].
+    /// config names; pond does not parse them. Empty options + default caps
+    /// is equivalent to [`Store::open`]. Cache caps come from the `[runtime]`
+    /// config block via [`crate::substrate::RuntimeCaps`].
     pub async fn open_with_options(
         location: &Url,
         storage_options: std::collections::HashMap<String, String>,
+        caps: crate::substrate::RuntimeCaps,
     ) -> Result<Self> {
         Ok(Self {
-            handle: Handle::open_with_options(location, storage_options).await?,
+            handle: Handle::open_with_options(location, storage_options, caps).await?,
         })
     }
 
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
     /// a `file://...` URL via [`config::url_for_path`] before opening. Routes
     /// through [`Store::open_with_options`] so the production policy is
-    /// applied.
+    /// applied; tests get the backend-aware local-FS defaults.
     pub async fn open_local(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let url = config::url_for_path(path)?;
-        Self::open_with_options(&url, std::collections::HashMap::new()).await
+        Self::open_with_options(
+            &url,
+            std::collections::HashMap::new(),
+            crate::substrate::RuntimeCaps::default(),
+        )
+        .await
     }
 
     /// Export clean, index-free Lance datasets into `dest`.
@@ -798,6 +805,151 @@ impl Store {
         let start = target_pos.saturating_sub(context_depth);
         let end = (target_pos + context_depth + 1).min(session_messages.len());
         Ok(Some((session, session_messages[start..end].to_vec())))
+    }
+
+    /// Pull a page of `(id, role, timestamp, search_text)` for one session,
+    /// applying `up_to` / `start_after` (exclusive) / max_messages / char-budget,
+    /// without touching parts.lance unless `include_parts` is set. The body
+    /// is `messages.search_text` (per spec.md#search, the embed-source projection).
+    pub async fn paged_session_view(
+        &self,
+        session_id: &str,
+        scope: PagedScope<'_>,
+    ) -> Result<Option<PagedSessionView>> {
+        let Some(raw) = self.find_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::Eq("session_id", session_id.into())),
+                &["id", "timestamp", "role", "search_text"],
+            )
+            .await?;
+
+        let mut rows: Vec<MessageRow> = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let id = string(&batch, "id", row)?.context("message id is null")?;
+            let role =
+                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+            let timestamp = datetime(&batch, "timestamp", row)?;
+            let text = string(&batch, "search_text", row)?.unwrap_or_default();
+            rows.push(MessageRow {
+                id,
+                role,
+                timestamp,
+                text,
+            });
+        }
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+
+        if let Some(up_to) = scope.up_to {
+            let Some(idx) = rows.iter().position(|row| row.id == up_to) else {
+                anyhow::bail!("up_to message not found in session: {session_id}/{up_to}");
+            };
+            rows.truncate(idx + 1);
+        }
+
+        if let Some(window) = scope.window.as_ref() {
+            let Some(anchor_pos) = rows.iter().position(|row| row.id == window.anchor) else {
+                anyhow::bail!("anchor message not found in session: {}", window.anchor);
+            };
+            let start = anchor_pos.saturating_sub(window.depth);
+            let end = (anchor_pos + window.depth + 1).min(rows.len());
+            rows = rows[start..end].to_vec();
+        }
+
+        let start_at = match scope.start_after {
+            Some(after) => match rows.iter().position(|row| row.id == after) {
+                Some(idx) => idx + 1,
+                None => 0,
+            },
+            None => 0,
+        };
+        if start_at >= rows.len() {
+            return Ok(Some(PagedSessionView {
+                session: get_session_from(raw),
+                messages: Vec::new(),
+                parts: Vec::new(),
+                has_more: false,
+                next_after: None,
+            }));
+        }
+        let mut sliced = rows[start_at..].to_vec();
+        let max = scope.max_messages.clamp(1, 1000);
+        if sliced.len() > max {
+            sliced.truncate(max);
+        }
+
+        let mut acc = 0usize;
+        let mut emitted = 0usize;
+        for row in &sliced {
+            let next = acc.saturating_add(row.text.chars().count());
+            if emitted > 0 && next > scope.budget_chars {
+                break;
+            }
+            acc = next;
+            emitted += 1;
+        }
+        let has_more = emitted < sliced.len();
+        let next_after = if has_more {
+            Some(sliced[emitted - 1].id.clone())
+        } else {
+            None
+        };
+        sliced.truncate(emitted);
+
+        let parts = if scope.include_parts {
+            let ids: Vec<String> = sliced.iter().map(|row| row.id.clone()).collect();
+            let mut by_message = self.parts_for_messages(session_id, &ids).await?;
+            let mut all = Vec::new();
+            for row in &sliced {
+                let key = (session_id.to_owned(), row.id.clone());
+                if let Some(parts) = by_message.remove(&key) {
+                    all.extend(parts);
+                }
+            }
+            all
+        } else {
+            Vec::new()
+        };
+
+        let messages = sliced
+            .into_iter()
+            .map(|row| GetMessage {
+                id: row.id,
+                role: row.role,
+                timestamp: row.timestamp,
+                text: row.text,
+            })
+            .collect();
+
+        Ok(Some(PagedSessionView {
+            session: get_session_from(raw),
+            messages,
+            parts,
+            has_more,
+            next_after,
+        }))
+    }
+
+    /// Locate the session id for a stored message. Cheap when only the routing
+    /// hint is needed - callers that need the message itself use `find_message`.
+    pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::Eq("id", message_id.into())),
+                &["session_id"],
+            )
+            .await?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        string(&batch, "session_id", 0)
     }
 
     pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
@@ -2328,6 +2480,62 @@ pub struct MessageWithParts {
 pub struct SessionWithMessages {
     pub session: Session,
     pub messages: Vec<MessageWithParts>,
+}
+
+/// Parameters for `Store::paged_session_view`. `start_after` is exclusive
+/// (the cursor's "resume past this message id" semantics). `window` carries
+/// the message-scope `(anchor, context_depth)` slice from `pond_get(message_id=
+/// ..., context_depth=...)`; absent for whole-session reads.
+#[derive(Debug, Clone)]
+pub struct PagedScope<'a> {
+    pub up_to: Option<&'a str>,
+    pub start_after: Option<&'a str>,
+    pub window: Option<MessageWindow<'a>>,
+    pub max_messages: usize,
+    pub budget_chars: usize,
+    pub include_parts: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageWindow<'a> {
+    pub anchor: &'a str,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PagedSessionView {
+    pub session: GetSession,
+    pub messages: Vec<GetMessage>,
+    pub parts: Vec<Part>,
+    pub has_more: bool,
+    pub next_after: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MessageRow {
+    id: String,
+    role: Role,
+    timestamp: DateTime<Utc>,
+    text: String,
+}
+
+fn get_session_from(session: Session) -> GetSession {
+    GetSession {
+        id: session.id,
+        source_agent: session.source_agent,
+        project: (*session.project).clone(),
+        created_at: session.created_at,
+    }
+}
+
+fn role_from_str(value: &str) -> Result<Role> {
+    match value {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        other => anyhow::bail!("unknown message role {other}"),
+    }
 }
 
 /// Scalar indexes on `messages` (spec.md#datasets): BTREE for high-cardinality

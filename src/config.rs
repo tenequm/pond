@@ -12,9 +12,69 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use lance_io::object_store::uri_to_url;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use url::Url;
+
+/// Parse `"128 MiB"`, `"1 GiB"`, `"500 KiB"`, or a bare byte count. Accepts
+/// SI (KB/MB/GB) and binary (KiB/MiB/GiB/TiB) suffixes; treats the bare unit
+/// `"B"` and unsuffixed numbers as raw bytes. Tolerant of whitespace and
+/// case. The result MUST fit in `usize` (Lance's cache APIs take `usize`).
+fn parse_byte_size(raw: &str) -> Result<usize, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("byte-size value is empty".to_owned());
+    }
+    let split = trimmed
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let number: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("byte-size value {raw:?} is not a number"))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!("byte-size value {raw:?} must be non-negative"));
+    }
+    let multiplier: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "kib" => 1_024.0,
+        "m" | "mb" => 1_000_000.0,
+        "mib" => 1_048_576.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "gib" => 1_073_741_824.0,
+        "tib" => 1_099_511_627_776.0,
+        other => {
+            return Err(format!(
+                "byte-size unit {other:?} not recognized (try MiB / GiB)"
+            ));
+        }
+    };
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes > usize::MAX as f64 {
+        return Err(format!("byte-size value {raw:?} overflows usize"));
+    }
+    Ok(bytes as usize)
+}
+
+fn deserialize_byte_size_opt<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Bytes(u64),
+        Text(String),
+    }
+    let repr: Option<Repr> = Option::deserialize(deserializer)?;
+    match repr {
+        None => Ok(None),
+        Some(Repr::Bytes(value)) => usize::try_from(value).map(Some).map_err(de::Error::custom),
+        Some(Repr::Text(value)) => parse_byte_size(&value).map(Some).map_err(de::Error::custom),
+    }
+}
 
 /// Parse a CLI / env `--data-dir` argument into a `Url`. Delegates to Lance's
 /// own `uri_to_url`, which handles every form pond cares about:
@@ -149,6 +209,19 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # refine_factor = 2
 # index_lag_threshold = 4
 
+# Long-running process caps. Both accept either a plain byte count or a
+# humansize-style suffix (\"128 MiB\", \"1 GiB\"). Both are optional - leave
+# unset to let pond pick the backend-aware default:
+#   local FS  : index_cache = 256 MiB, metadata_cache = 128 MiB
+#   remote    : index_cache = 2 GiB,   metadata_cache = 512 MiB
+# Lance's library defaults (6 GiB / 1 GiB) are too generous for a per-session
+# `pond mcp` process; tightening them is what keeps RSS under the 500 MiB target
+# without measurable latency regressions on typical agent-history corpora.
+#
+# [runtime]
+# index_cache_bytes    = \"256 MiB\"
+# metadata_cache_bytes = \"128 MiB\"
+
 # Object-store credentials and tuning, passed verbatim to Lance's
 # `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
 # an `s3://` / `gs://` / `az://` URI that needs auth or a non-default region.
@@ -178,6 +251,8 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// `[sources.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
     /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
@@ -196,6 +271,19 @@ pub struct Config {
     /// here override any matching environment variables.
     #[serde(default)]
     pub storage: BTreeMap<String, String>,
+}
+
+/// `[runtime]`: long-running process caps. Both knobs accept either a plain
+/// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
+/// optional - `None` lets `pond::substrate` pick the backend-aware default
+/// (local FS gets a tight cap; object stores stay near Lance's defaults).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RuntimeConfig {
+    #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
+    pub index_cache_bytes: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
+    pub metadata_cache_bytes: Option<usize>,
 }
 
 /// `[search]`: optional Lance vector-query tuning knobs.

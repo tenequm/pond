@@ -92,7 +92,12 @@ fn make_session(id: usize) -> Session {
 async fn s3s_fs_in_process_round_trips_a_session() -> anyhow::Result<()> {
     let fx = spawn_s3s_fs("pond").await?;
     let url = Url::parse("s3://pond/data")?;
-    let store = Store::open_with_options(&url, storage_options(&fx.endpoint)).await?;
+    let store = Store::open_with_options(
+        &url,
+        storage_options(&fx.endpoint),
+        pond::substrate::RuntimeCaps::default(),
+    )
+    .await?;
 
     store.upsert_sessions(&[make_session(1)]).await?;
     let (sessions, _, _) = store.row_counts().await?;

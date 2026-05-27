@@ -319,29 +319,53 @@ pub struct GetRequest {
     #[serde(default = "default_max_messages")]
     pub max_messages: usize,
     #[serde(default)]
-    pub include_thinking: bool,
+    pub include_parts: bool,
     #[serde(default)]
-    pub include_tool_results: bool,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetResponse {
     #[serde(flatten)]
     pub result: GetResult,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub request_id: String,
+}
+
+/// Trimmed session header (spec.md#protocol): adapter-redundant `options`,
+/// parent pointers (served by `restore_lineage`), and per-message session id
+/// dropped to keep `pond_get` responses lean for agent context windows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetSession {
+    pub id: String,
+    pub source_agent: String,
+    pub project: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetMessage {
+    pub id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GetResult {
     Session {
-        session: Session,
-        messages: Vec<Message>,
+        session: GetSession,
+        messages: Vec<GetMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<Part>,
     },
     Message {
-        session: Session,
-        messages: Vec<Message>,
+        session: GetSession,
+        messages: Vec<GetMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<Part>,
     },
 }
@@ -370,9 +394,8 @@ pub struct SearchRequest {
     pub query: String,
     // Server normally decides between hybrid and FTS-only from the embedder +
     // embeddings-coverage state (spec.md#search); `mode_override` is the
-    // operator-tooling escape hatch consumed by `pond search --mode` and the
-    // `scripts/search-benchmarks/` harness. Production callers (MCP, HTTP agents)
-    // should leave it `None` and let the server pick.
+    // operator-tooling escape hatch consumed by the `scripts/search-benchmarks/`
+    // harness. Production callers (MCP, HTTP agents) should leave it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_override: Option<SearchModeWire>,
     /// When set, retrieve messages similar to this stored message - pond uses
@@ -389,13 +412,6 @@ pub struct SearchRequest {
     pub boost_recent: bool,
     #[serde(default)]
     pub group_by_conversation: bool,
-    /// When true, hit `text` carries the indexed message body (up to a code
-    /// constant); `snippet` holds the match window when the body was
-    /// truncated. When false (the default), `text` is the match-windowed
-    /// snippet only - cheap default for scan-and-decide flows; callers fetch
-    /// the full body via `pond_get(message_id)` when they need it.
-    #[serde(default)]
-    pub full: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -454,16 +470,8 @@ pub struct Hit {
     pub timestamp: DateTime<Utc>,
     pub project: String,
     pub source_agent: String,
-    /// The matched message's indexed text: full when small, truncated to a
-    /// bounded prefix when large (spec.md#search).
     pub text: String,
-    /// A query-windowed snippet, present only when `text` was truncated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snippet: Option<String>,
     pub score: f64,
-    pub base_score: f64,
-    pub recency_boost: f64,
-    pub matched_via: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -475,13 +483,17 @@ pub struct Group {
     pub best_hit_message_id: String,
     pub project: String,
     pub source_agent: String,
+    /// Earliest matched-hit timestamp.
     pub first_timestamp: DateTime<Utc>,
-    pub last_timestamp: DateTime<Utc>,
-    pub message_count: usize,
-    /// Best-scoring hit's indexed text, same `(text, snippet)` shape as `Hit`.
-    pub text: String,
+    /// Latest matched-hit timestamp, emitted only when matches span more than
+    /// one timestamp - agents disambiguate "which version of this conversation"
+    /// by whether the span is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snippet: Option<String>,
+    pub last_timestamp: Option<DateTime<Utc>>,
+    pub session_messages_count: usize,
+    /// Best-scoring hit's 600-char window of indexed text.
+    pub text: String,
+    /// Normalized to `[0.0, 1.0]` across the fusion + recency cap.
     pub best_score: f64,
 }
 
