@@ -3,7 +3,7 @@
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
-Your own small-scale data lake for agentic-client sessions.
+Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. Your history, your search, your sessions - independent of the agent vendor that made them.
 
 One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
 
