@@ -293,7 +293,6 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
     pub error: ErrorBody,
-    pub request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -316,8 +315,8 @@ pub struct GetRequest {
     pub up_to: Option<String>,
     #[serde(default)]
     pub context_depth: usize,
-    #[serde(default = "default_max_messages")]
-    pub max_messages: usize,
+    #[serde(default = "default_get_limit")]
+    pub limit: usize,
     #[serde(default)]
     pub include_parts: bool,
     #[serde(default)]
@@ -331,7 +330,6 @@ pub struct GetResponse {
     pub has_more: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    pub request_id: String,
 }
 
 /// Trimmed session header (spec.md#protocol): adapter-redundant `options`,
@@ -402,18 +400,16 @@ pub struct SearchRequest {
     /// the message's stored `vector` directly as the query, runs vector-only
     /// kNN, and ignores `query` and the FTS arm. The stored vector was
     /// derived from `search_text` (`spec.md#embed-from-canonical`), so the
-    /// signal is already filtered of harness-injected parts. Filters,
-    /// `boost_recent`, `group_by_conversation`, and `limit` still apply.
+    /// signal is already filtered of harness-injected parts. Filters and
+    /// `limit` still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similar_to: Option<String>,
     #[serde(default)]
     pub filters: SearchFilters,
-    #[serde(default = "default_true")]
-    pub boost_recent: bool,
-    #[serde(default)]
-    pub group_by_conversation: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Wire-level retrieval mode override (spec.md#search). Not normally set on
@@ -449,52 +445,39 @@ pub struct SearchFilters {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchResponse {
-    #[serde(flatten)]
-    pub result: SearchResultBody,
-    pub total: usize,
-    pub request_id: String,
+    pub sessions: Vec<SearchSession>,
+    pub matched_total: usize,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SearchResultBody {
-    Hits { hits: Vec<Hit> },
-    Groups { groups: Vec<Group> },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Hit {
+pub struct SearchSession {
     pub session_id: String,
-    pub message_id: String,
-    pub role: String,
-    pub timestamp: DateTime<Utc>,
     pub project: String,
     pub source_agent: String,
+    pub session_messages_count: usize,
+    pub matched_message_count: usize,
+    pub matches: Vec<SearchResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub message_id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
     pub text: String,
     pub score: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Group {
-    pub session_id: String,
-    /// Message id of the best-scoring hit in this group. Lets callers drill
-    /// into the exact moment via `pond_get(message_id=...)` without a second
-    /// search; load-bearing now that `group_by_conversation` defaults to true.
-    pub best_hit_message_id: String,
-    pub project: String,
-    pub source_agent: String,
-    /// Earliest matched-hit timestamp.
-    pub first_timestamp: DateTime<Utc>,
-    /// Latest matched-hit timestamp, emitted only when matches span more than
-    /// one timestamp - agents disambiguate "which version of this conversation"
-    /// by whether the span is set.
+pub struct SearchCursor {
+    pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_timestamp: Option<DateTime<Utc>>,
-    pub session_messages_count: usize,
-    /// Best-scoring hit's 600-char window of indexed text.
-    pub text: String,
-    /// Normalized to `[0.0, 1.0]` across the fusion + recency cap.
-    pub best_score: f64,
+    pub similar_to: Option<String>,
+    pub filters: SearchFilters,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -523,7 +506,6 @@ pub struct IngestResponse {
     pub accepted: usize,
     pub rejected: usize,
     pub results: Vec<IngestResult>,
-    pub request_id: String,
 }
 
 /// One row of `pond_ingest` per-row output (spec.md#protocol).
@@ -559,10 +541,6 @@ fn default_limit() -> usize {
     10
 }
 
-fn default_true() -> bool {
-    true
-}
-
 pub fn new_request_id() -> String {
     format!("req_{}", Uuid::now_v7())
 }
@@ -573,7 +551,7 @@ pub fn default_namespace() -> String {
     DEFAULT_NAMESPACE.to_owned()
 }
 
-fn default_max_messages() -> usize {
+fn default_get_limit() -> usize {
     100
 }
 
@@ -599,7 +577,6 @@ pub fn error(code: ErrorCode, message: impl Into<String>, details: Value) -> Err
             message: message.into(),
             details,
         },
-        request_id: new_request_id(),
     }
 }
 
@@ -677,6 +654,5 @@ mod tests {
         let envelope: ErrorEnvelope = crate::Error::Conflict { attempts: 3 }.into();
         assert_eq!(envelope.error.code, ErrorCode::Conflict);
         assert_eq!(envelope.error.details, json!({ "attempts": 3 }));
-        assert!(!envelope.request_id.is_empty(), "request_id must be set");
     }
 }

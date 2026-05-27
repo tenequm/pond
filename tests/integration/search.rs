@@ -1,7 +1,7 @@
 //! Handler-level integration tests for `pond_search` over a real fixture
-//! corpus with a deterministic fake embedder. Pure-helper tests (RRF math,
-//! recency boost, filter predicate construction, planner shape, distance
-//! metric mapping) and `Store`-level vector-index tests live inline in
+//! corpus with a deterministic fake embedder. Pure-helper tests (fusion math,
+//! filter predicate construction, planner shape, distance metric mapping) and
+//! `Store`-level vector-index tests live inline in
 //! `src/handlers.rs::tests`, `src/embed/mod.rs::tests`, and
 //! `src/sessions.rs::tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -16,8 +16,8 @@ use pond::{
     sessions::{Store, embedding_dim},
     wire::PartKind,
     wire::{
-        GetEnvelope, GetRequest, GetResult, Hit, ProjectFilter, SearchEnvelope, SearchFilters,
-        SearchRequest, SearchResultBody,
+        GetEnvelope, GetRequest, GetResult, ProjectFilter, Role, SearchEnvelope, SearchFilters,
+        SearchRequest,
     },
 };
 use std::sync::Arc;
@@ -84,9 +84,8 @@ fn search_request(query: &str) -> SearchRequest {
         mode_override: None,
         similar_to: None,
         filters: SearchFilters::default(),
-        boost_recent: true,
-        group_by_conversation: false,
         limit: 20,
+        cursor: None,
     }
 }
 
@@ -98,36 +97,39 @@ fn get_request(session_id: &str) -> GetRequest {
         message_id: None,
         up_to: None,
         context_depth: 0,
-        max_messages: 1000,
+        limit: 1000,
         include_parts: true,
         cursor: None,
     }
 }
 
-/// Unwrap a hit-shaped search response, panicking on errors or grouped results.
-fn hits_of(envelope: SearchEnvelope) -> Vec<Hit> {
-    match envelope {
-        SearchEnvelope::Success(response) => match response.result {
-            SearchResultBody::Hits { hits } => hits,
-            SearchResultBody::Groups { .. } => panic!("expected hits, got groups"),
-        },
-        SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
-    }
+struct HitView {
+    session_id: String,
+    message_id: String,
+    role: Role,
+    project: String,
+    score: f64,
 }
 
-/// Unwrap a successful search envelope, panicking on errors.
-fn success_of(envelope: SearchEnvelope) -> pond::wire::SearchResponse {
+/// Unwrap a successful search response and flatten its session matches for assertions.
+fn hits_of(envelope: SearchEnvelope) -> Vec<HitView> {
     match envelope {
-        SearchEnvelope::Success(response) => response,
+        SearchEnvelope::Success(response) => response
+            .sessions
+            .into_iter()
+            .flat_map(|session| {
+                let session_id = session.session_id;
+                let project = session.project;
+                session.matches.into_iter().map(move |hit| HitView {
+                    session_id: session_id.clone(),
+                    message_id: hit.message_id,
+                    role: hit.role,
+                    project: project.clone(),
+                    score: hit.score,
+                })
+            })
+            .collect(),
         SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
-    }
-}
-
-/// Pull the hits body out of a response, panicking on grouped results.
-fn body_hits(body: SearchResultBody) -> Vec<Hit> {
-    match body {
-        SearchResultBody::Hits { hits } => hits,
-        SearchResultBody::Groups { .. } => panic!("expected hits, got groups"),
     }
 }
 
@@ -161,7 +163,7 @@ fn get_request_text_only(session_id: &str) -> GetRequest {
         message_id: None,
         up_to: None,
         context_depth: 0,
-        max_messages: 1000,
+        limit: 1000,
         include_parts: false,
         cursor: None,
     }
@@ -176,10 +178,8 @@ async fn search_picks_hybrid_or_fts_based_on_store_state() -> anyhow::Result<()>
     let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
-    let hits = body_hits(
-        success_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
-            .result,
-    );
+    let hits =
+        hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await);
     assert!(!hits.is_empty(), "hybrid search must return hits");
     for pair in hits.windows(2) {
         assert!(pair[0].score >= pair[1].score, "hits must be score-ordered");
@@ -201,17 +201,14 @@ async fn search_picks_hybrid_or_fts_based_on_store_state() -> anyhow::Result<()>
         |_| {},
     )
     .await?;
-    let hits = body_hits(
-        success_of(
-            pond_search(
-                &store2,
-                &embedder,
-                search_request(&phrase),
-                &search_config(),
-            )
-            .await,
+    let hits = hits_of(
+        pond_search(
+            &store2,
+            &embedder,
+            search_request(&phrase),
+            &search_config(),
         )
-        .result,
+        .await,
     );
     for hit in &hits {
         assert!(
@@ -234,15 +231,15 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     request.filters.role = Some("assistant".to_owned());
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(!hits.is_empty(), "the corpus has assistant messages");
-    assert!(hits.iter().all(|hit| hit.role == "assistant"));
+    assert!(hits.iter().all(|hit| hit.role == Role::Assistant));
 
     // session_id: every hit belongs to the one requested session.
     let session_id = store
         .session_ids()
         .await?
         .into_iter()
-        .next()
-        .expect("the corpus has at least one session");
+        .find(|id| !id.contains('/'))
+        .expect("the corpus has at least one top-level session");
     let mut request = search_request(&phrase);
     request.filters.session_id = Some(session_id.clone());
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
@@ -281,45 +278,38 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn group_by_conversation_collapses_to_one_summary_per_session() -> anyhow::Result<()> {
+async fn search_returns_one_session_row_with_top_matches_per_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
-    let mut request = search_request(&phrase);
-    request.group_by_conversation = true;
     let SearchEnvelope::Success(response) =
-        pond_search(&store, &embedder, request, &search_config()).await
+        pond_search(&store, &embedder, search_request(&phrase), &search_config()).await
     else {
-        panic!("grouped search must succeed");
-    };
-    let SearchResultBody::Groups { groups } = response.result else {
-        panic!("group_by_conversation returns groups, not hits");
+        panic!("search must succeed");
     };
 
-    assert!(!groups.is_empty());
+    assert!(!response.sessions.is_empty());
     // One summary per session: session ids are unique across groups.
-    let unique = groups
+    let unique = response
+        .sessions
         .iter()
-        .map(|group| group.session_id.as_str())
+        .map(|session| session.session_id.as_str())
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         unique.len(),
-        groups.len(),
+        response.sessions.len(),
         "each session appears at most once",
     );
-    for group in &groups {
+    for session in &response.sessions {
         // `session_messages_count` is the whole-session size, not the match count.
-        assert!(group.session_messages_count > 0);
-        assert!(group.best_score > 0.0);
-        if let Some(last) = group.last_timestamp {
-            assert!(
-                group.first_timestamp <= last,
-                "first_timestamp must precede last_timestamp when both are present",
-            );
-        }
+        assert!(session.session_messages_count > 0);
+        assert!(session.matched_message_count > 0);
+        assert!(!session.matches.is_empty());
+        assert!(session.matches.len() <= 3);
+        assert!(session.matches[0].score > 0.0);
     }
-    assert_eq!(response.total, groups.len());
+    assert!(response.matched_total >= response.sessions.len());
 
     Ok(())
 }
@@ -370,9 +360,8 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         mode_override: None,
         similar_to: None,
         filters: SearchFilters::default(),
-        boost_recent: true,
-        group_by_conversation: false,
         limit: 50,
+        cursor: None,
     };
     let embedder = LazyEmbedder::candle();
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
@@ -470,7 +459,7 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
             message_id: None,
             up_to: None,
             context_depth: 0,
-            max_messages: 1000,
+            limit: 1000,
             include_parts: false,
             cursor: None,
         },
@@ -497,7 +486,7 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
             message_id: None,
             up_to: None,
             context_depth: 0,
-            max_messages: 1000,
+            limit: 1000,
             include_parts: false,
             cursor: Some(cursor),
         },

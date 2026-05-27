@@ -164,9 +164,8 @@ fn search_request(query: &str, mode: Option<SearchModeWire>) -> SearchRequest {
         mode_override: mode,
         similar_to: None,
         filters: SearchFilters::default(),
-        boost_recent: false,
-        group_by_conversation: false,
         limit: 10,
+        cursor: None,
     }
 }
 

@@ -1,10 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! stdio-MCP transport (spec.md#protocol, spec.md#protocol,
-//! kb parity contract): the `pond_search` / `pond_get` tools are driven by an
-//! in-process rmcp client over a `duplex` pipe. Asserts the kb-parity field
-//! mapping (`conversation_id` -> `session_id`) and the MCP-only placeholder
-//! rendering for excluded parts (spec.md#protocol).
+//! stdio-MCP transport (spec.md#protocol): the `pond_search` / `pond_get`
+//! tools are driven by an in-process rmcp client over a `duplex` pipe. Asserts
+//! the `tools/list` size-cap annotations, the round-trip response shape, and
+//! the JSON-RPC error mapping for unknown sessions.
 
 use chrono::Utc;
 use pond::{
@@ -17,7 +16,7 @@ use pond::{
     wire::{Message, Part, PartKind, Provenance, Session},
 };
 use rmcp::{
-    ClientHandler, ServiceExt,
+    ClientHandler, ServiceError, ServiceExt,
     model::{CallToolRequestParams, CallToolResult},
 };
 use serde_json::json;
@@ -149,7 +148,7 @@ fn tool_text(result: &CallToolResult) -> &str {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result<()> {
+async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let state = synthetic_state(&temp).await?;
 
@@ -161,6 +160,18 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
     });
     let client = TestClient.serve(client_transport).await?;
 
+    let tools = client.list_all_tools().await?;
+    let meta_chars = |name: &str| -> Option<i64> {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.meta.as_ref())
+            .and_then(|meta| meta.0.get("anthropic/maxResultSizeChars"))
+            .and_then(serde_json::Value::as_i64)
+    };
+    assert_eq!(meta_chars("pond_search"), Some(80_000));
+    assert_eq!(meta_chars("pond_get"), Some(200_000));
+
     // pond_search runs over the MCP transport and returns a success envelope.
     let result = client
         .call_tool(
@@ -169,19 +180,14 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         )
         .await?;
     let search: SearchResponse = serde_json::from_str(tool_text(&result))?;
-    assert_eq!(
-        search.total,
-        match &search.result {
-            pond::wire::SearchResultBody::Hits { hits } => hits.len(),
-            pond::wire::SearchResultBody::Groups { groups } => groups.len(),
-        },
-        "search response total should match the body length",
-    );
+    assert_eq!(search.matched_total, 1);
+    assert_eq!(search.sessions.len(), 1);
+    assert_eq!(search.sessions[0].matches.len(), 1);
 
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "conversation_id": SESSION_ID })
+                json!({ "session_id": SESSION_ID })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -197,7 +203,7 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
     else {
         panic!("expected a session result");
     };
-    assert_eq!(session.id, SESSION_ID, "conversation_id -> session_id");
+    assert_eq!(session.id, SESSION_ID);
     assert!(
         parts.is_empty(),
         "default include_parts=false: parts elided from response"
@@ -210,7 +216,7 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "conversation_id": SESSION_ID, "include_parts": true })
+                json!({ "session_id": SESSION_ID, "include_parts": true })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -233,7 +239,7 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
     let missing = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "conversation_id": "no-such-session" })
+                json!({ "session_id": "no-such-session" })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -244,6 +250,16 @@ async fn mcp_tools_honor_kb_parity_and_placeholder_rendering() -> anyhow::Result
         missing.is_err(),
         "an unknown session should be a tool error"
     );
+    let ServiceError::McpError(error) = missing.unwrap_err() else {
+        panic!("expected MCP tool error");
+    };
+    let data = error
+        .data
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .expect("tool error data is an object");
+    assert_eq!(data.get("pond_code"), Some(&json!("not_found")));
+    assert_eq!(data.get("retryable"), Some(&json!(false)));
 
     client.cancel().await?;
     let _ = server_handle.await;

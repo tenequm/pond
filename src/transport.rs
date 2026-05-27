@@ -33,7 +33,7 @@ pub mod http {
     use axum::{
         Json, Router,
         extract::{DefaultBodyLimit, Path, Query, State},
-        http::StatusCode,
+        http::{HeaderValue, StatusCode},
         response::{
             IntoResponse, Response,
             sse::{Event, KeepAlive, Sse},
@@ -53,7 +53,7 @@ pub mod http {
         },
         wire::{
             ErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, IngestEnvelope, IngestRequest,
-            SearchEnvelope, SearchRequest, default_namespace,
+            SearchEnvelope, SearchRequest, default_namespace, new_request_id,
         },
     };
 
@@ -120,33 +120,30 @@ pub mod http {
     async fn search(
         State(state): State<AppState>,
         Json(mut request): Json<SearchRequest>,
-    ) -> (StatusCode, Json<SearchEnvelope>) {
+    ) -> Response {
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_search(&state.store, &state.embedder, request, &state.search).await;
         let status = match &envelope {
             SearchEnvelope::Success(_) => StatusCode::OK,
             SearchEnvelope::Error(error) => status_for(&error.error.code),
         };
-        (status, Json(envelope))
+        with_request_id((status, Json(envelope)).into_response())
     }
 
-    async fn get(
-        State(state): State<AppState>,
-        Json(mut request): Json<GetRequest>,
-    ) -> (StatusCode, Json<GetEnvelope>) {
+    async fn get(State(state): State<AppState>, Json(mut request): Json<GetRequest>) -> Response {
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_get(&state.store, request).await;
         let status = match &envelope {
             GetEnvelope::Success(_) => StatusCode::OK,
             GetEnvelope::Error(error) => status_for(&error.error.code),
         };
-        (status, Json(envelope))
+        with_request_id((status, Json(envelope)).into_response())
     }
 
     async fn ingest(
         State(state): State<AppState>,
         Json(mut request): Json<IngestRequest>,
-    ) -> (StatusCode, Json<IngestEnvelope>) {
+    ) -> Response {
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_ingest(&state.store, request).await;
         // Per-row errors in `results[]` are not request-level failures, so
@@ -156,7 +153,7 @@ pub mod http {
             IngestEnvelope::Success(_) => StatusCode::OK,
             IngestEnvelope::Error(error) => status_for(&error.error.code),
         };
-        (status, Json(envelope))
+        with_request_id((status, Json(envelope)).into_response())
     }
 
     /// Query string for `GET /v1/sessions/{session_id}/events`
@@ -199,20 +196,29 @@ pub mod http {
                     let payload = sse.data.to_string();
                     Ok::<_, Infallible>(Event::default().event(sse.event).id(sse.id).data(payload))
                 }));
-                Sse::new(stream)
-                    .keep_alive(
-                        KeepAlive::new()
-                            .interval(Duration::from_secs(15))
-                            .text("keepalive"),
-                    )
-                    .into_response()
+                with_request_id(
+                    Sse::new(stream)
+                        .keep_alive(
+                            KeepAlive::new()
+                                .interval(Duration::from_secs(15))
+                                .text("keepalive"),
+                        )
+                        .into_response(),
+                )
             }
             Err(envelope) => error_response(envelope.error.code.clone(), envelope),
         }
     }
 
     fn error_response(code: ErrorCode, envelope: ErrorEnvelope) -> Response {
-        (status_for(&code), Json(envelope)).into_response()
+        with_request_id((status_for(&code), Json(envelope)).into_response())
+    }
+
+    fn with_request_id(mut response: Response) -> Response {
+        if let Ok(value) = HeaderValue::from_str(&new_request_id()) {
+            response.headers_mut().insert("x-pond-request-id", value);
+        }
+        response
     }
 
     /// Map a wire error code to an HTTP status. The envelope body still carries
@@ -241,8 +247,9 @@ pub mod mcp {
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
             AnnotateAble, CallToolResult, Content, ErrorCode as JsonRpcErrorCode,
-            ListResourcesResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
-            ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+            ListResourcesResult, ListToolsResult, Meta, PaginatedRequestParams, RawResource,
+            ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+            ServerInfo,
         },
         schemars,
         service::RequestContext,
@@ -266,16 +273,16 @@ pub mod mcp {
     /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
-(default 10, max 200), project (path substring), conversation_id (exact \
-session match), source_agent, role (user|assistant), from_date / to_date \
-(YYYY-MM-DD), boost_recent (default true), group_by_conversation (default \
-true; grouped hits carry `best_hit_message_id` for drill-in via `pond_get`).
+(default 10, max 200), project (path substring), session_id (exact session \
+match), source_agent, role (user|assistant|system|tool), from_date / to_date \
+(YYYY-MM-DD), cursor (opaque continuation token).
 
-pond_search response: each hit carries `score` normalized to [0.0, 1.0] \
-(comparable within one response). Grouped hits surface `first_timestamp` and, \
-when matches span more than one timestamp, `last_timestamp`. The hit `text` \
-is a ~600-char window of the indexed message body centered on the query \
-term; fetch the full body via `pond_get(message_id)`.
+pond_search response: always grouped by session. `matched_total` is the \
+message count before `limit` and byte-budget truncation. Each session carries \
+up to 3 top-scoring `matches`, sorted score-desc; each match has `score` \
+normalized to [0.0, 1.0] within one response and `text` as a ~600-char indexed \
+body window. When `has_more` is true, pass `next_cursor` back as `cursor`; \
+rank may shift between cursor pages if the corpus changes.
 
 pond_search multilingual: pond's embedder (multilingual-e5-small) is trained \
 for cross-lingual retrieval, so a query in language A can match indexed text \
@@ -284,16 +291,15 @@ only matches surface tokens, so for cross-lingual queries expect most signal \
 to come from the vector arm.
 
 pond_get: message_id (one message + context_depth messages of thread context \
-each side) OR conversation_id (full session; up_to truncates, max_messages \
-caps at 1000). The default response carries `messages[].text` only; pass \
+each side) OR session_id (full session; up_to truncates, limit caps at 1000). \
+The default response carries `messages[].text` only; pass \
 `include_parts=true` to also receive the per-message parts (reasoning, tool \
 calls, tool results, files). Responses are paginated with a `~10000-token \
 budget; when `has_more` is true the response carries an opaque `next_cursor` \
 - pass it back as `cursor` to fetch the next page (originating session_id / \
 message_id / include_parts are re-supplied automatically).";
 
-    /// `pond_search` MCP tool parameters. Field names follow the kb parity
-    /// contract: `conversation_id` here maps to the wire `session_id` filter.
+    /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSearchParams {
         /// What to search for: concepts and keywords. Keep it semantic - do
@@ -311,7 +317,7 @@ message_id / include_parts are re-supplied automatically).";
         project: Option<String>,
         /// Filter to one session (exact match).
         #[serde(default)]
-        conversation_id: Option<String>,
+        session_id: Option<String>,
         /// Filter to one source agent (e.g. "claude-code").
         #[serde(default)]
         source_agent: Option<String>,
@@ -324,9 +330,6 @@ message_id / include_parts are re-supplied automatically).";
         /// Only messages on or before this date (YYYY-MM-DD).
         #[serde(default)]
         to_date: Option<String>,
-        /// Boost recent messages in ranking. Default true.
-        #[serde(default)]
-        boost_recent: Option<bool>,
         /// "Find similar messages to this one." When set, pond uses the
         /// stored vector for `similar_to` as the kNN query and ignores the
         /// `query` text; vector-only, no embedder load. Compose with
@@ -334,19 +337,13 @@ message_id / include_parts are re-supplied automatically).";
         /// message_id>)` to explore neighbors of any returned hit.
         #[serde(default)]
         similar_to: Option<String>,
-        /// Collapse hits to one summary per session. Default true: most
-        /// searches are "find the conversation about X" and message-level
-        /// duplicates from one session corrupt the corpus picture. Pass
-        /// `false` to get individual message hits (composes with
-        /// `pond_get(message_id, context_depth)`). When grouped, each group
-        /// carries `best_hit_message_id` for drill-in.
+        /// Opaque continuation token from a prior response's `next_cursor`.
         #[serde(default)]
-        group_by_conversation: Option<bool>,
+        cursor: Option<String>,
     }
 
-    /// `pond_get` MCP tool parameters. `conversation_id` maps to the wire
-    /// `session_id`; one of `message_id` / `conversation_id` / `cursor`
-    /// is required.
+    /// `pond_get` MCP tool parameters. One of `message_id` / `session_id` /
+    /// `cursor` is required.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpGetParams {
         /// Retrieve this message plus surrounding thread context.
@@ -354,8 +351,8 @@ message_id / include_parts are re-supplied automatically).";
         message_id: Option<String>,
         /// Retrieve this whole session (mutually exclusive with message_id).
         #[serde(default)]
-        conversation_id: Option<String>,
-        /// With conversation_id: truncate the session at and including this
+        session_id: Option<String>,
+        /// With session_id: truncate the session at and including this
         /// message id (restore-to-a-point).
         #[serde(default)]
         up_to: Option<String>,
@@ -364,7 +361,7 @@ message_id / include_parts are re-supplied automatically).";
         context_depth: Option<usize>,
         /// Cap on returned messages. Default 100, max 1000.
         #[serde(default)]
-        max_messages: Option<usize>,
+        limit: Option<usize>,
         /// When true, the response also carries each message's parts
         /// (reasoning, tool calls, tool results, files). Default false: the
         /// response carries only `messages[].text` to fit the agent-context
@@ -372,7 +369,7 @@ message_id / include_parts are re-supplied automatically).";
         #[serde(default)]
         include_parts: Option<bool>,
         /// Opaque continuation token from a prior response's `next_cursor`.
-        /// When set, the originating `conversation_id` / `message_id` /
+        /// When set, the originating `session_id` / `message_id` /
         /// `include_parts` are re-supplied from the cursor automatically.
         #[serde(default)]
         cursor: Option<String>,
@@ -396,10 +393,10 @@ message_id / include_parts are re-supplied automatically).";
 
         #[tool(
             description = "Hybrid (vector + BM25) search over stored conversation history. \
-                           Returns ranked message hits with `score` normalized to [0, 1]. \
-                           Keep `query` semantic; use `project` / `conversation_id` filters \
-                           for scope. See `schema://pond` for the full schema and \
-                           multilingual notes."
+                           Returns sessions with up to 3 top matches each and cursor \
+                           pagination when the response reaches the server byte budget. \
+                           Keep `query` semantic; use `project` / `session_id` filters \
+                           for scope. See `schema://pond` for the full schema."
         )]
         async fn pond_search(
             &self,
@@ -411,7 +408,7 @@ message_id / include_parts are re-supplied automatically).";
                 query: params.query.unwrap_or_default(),
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
-                    session_id: params.conversation_id,
+                    session_id: params.session_id,
                     source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
@@ -422,9 +419,8 @@ message_id / include_parts are re-supplied automatically).";
                     // for the bench harness.
                     min_score: 0.0,
                 },
-                boost_recent: params.boost_recent.unwrap_or(true),
-                group_by_conversation: params.group_by_conversation.unwrap_or(true),
                 limit: params.limit.unwrap_or(10),
+                cursor: params.cursor,
                 mode_override: None,
                 similar_to: params.similar_to,
             };
@@ -444,7 +440,7 @@ message_id / include_parts are re-supplied automatically).";
         #[tool(
             description = "Retrieve stored conversation content. With `message_id`: that \
                            message plus `context_depth` messages of thread context each side. \
-                           With `conversation_id`: the full session. Default response carries \
+                           With `session_id`: the full session. Default response carries \
                            `messages[].text` only; pass `include_parts=true` to also receive \
                            parts (reasoning, tool calls, tool results, files). Responses are \
                            bounded by a ~10000-token budget - when `has_more` is true, pass \
@@ -457,11 +453,11 @@ message_id / include_parts are re-supplied automatically).";
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
-                session_id: params.conversation_id,
+                session_id: params.session_id,
                 message_id: params.message_id,
                 up_to: params.up_to,
                 context_depth: params.context_depth.unwrap_or(0),
-                max_messages: params.max_messages.unwrap_or(100),
+                limit: params.limit.unwrap_or(100),
                 include_parts: params.include_parts.unwrap_or(false),
                 cursor: params.cursor,
             };
@@ -577,6 +573,37 @@ message_id / include_parts are re-supplied automatically).";
                 )),
             }
         }
+
+        async fn list_tools(
+            &self,
+            request: Option<PaginatedRequestParams>,
+            context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let _ = (request, context);
+            let mut result = ListToolsResult {
+                tools: self.tool_router.list_all(),
+                next_cursor: None,
+                meta: None,
+            };
+            annotate_tool_limits(&mut result);
+            Ok(result)
+        }
+    }
+
+    fn annotate_tool_limits(result: &mut ListToolsResult) {
+        for tool in &mut result.tools {
+            let chars = match tool.name.as_ref() {
+                "pond_search" => 80_000,
+                "pond_get" => 200_000,
+                _ => continue,
+            };
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "anthropic/maxResultSizeChars".to_owned(),
+                serde_json::json!(chars),
+            );
+            tool.meta = Some(Meta(meta));
+        }
     }
 
     /// Run the stdio MCP server until the client disconnects. All diagnostics
@@ -620,14 +647,126 @@ message_id / include_parts are re-supplied automatically).";
         };
         data.insert("pond_code".to_owned(), serde_json::json!(pond_code));
         data.insert("retryable".to_owned(), serde_json::json!(retryable));
-        data.insert(
-            "request_id".to_owned(),
-            serde_json::json!(envelope.request_id),
-        );
         ErrorData::new(
             JsonRpcErrorCode(jsonrpc_code),
             envelope.error.message.clone(),
             Some(serde_json::Value::Object(data)),
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+        use std::sync::Arc;
+
+        use rmcp::model::{ErrorCode as JsonRpcErrorCode, Tool};
+
+        use super::*;
+        use crate::wire::{ErrorBody, ErrorCode, Role, SearchResponse, SearchResult};
+
+        #[test]
+        fn error_data_carries_code_and_retryability() {
+            let cases = [
+                (
+                    ErrorCode::ValidationFailed,
+                    -32010,
+                    "validation_failed",
+                    false,
+                ),
+                (
+                    ErrorCode::VersionUnsupported,
+                    -32011,
+                    "version_unsupported",
+                    false,
+                ),
+                (ErrorCode::NotFound, -32012, "not_found", false),
+                (
+                    ErrorCode::NamespaceUnknown,
+                    -32013,
+                    "namespace_unknown",
+                    false,
+                ),
+                (
+                    ErrorCode::StorageUnavailable,
+                    -32014,
+                    "storage_unavailable",
+                    true,
+                ),
+                (ErrorCode::Conflict, -32015, "conflict", true),
+                (ErrorCode::Internal, -32016, "internal", false),
+            ];
+            for (code, jsonrpc, pond_code, retryable) in cases {
+                let error = to_error_data(&ErrorEnvelope {
+                    error: ErrorBody {
+                        code,
+                        message: "boom".to_owned(),
+                        details: serde_json::json!({"detail": 1}),
+                    },
+                });
+                assert_eq!(error.code, JsonRpcErrorCode(jsonrpc));
+                let data = error.data.unwrap();
+                assert_eq!(data["detail"], serde_json::json!(1));
+                assert_eq!(data["pond_code"], serde_json::json!(pond_code));
+                assert_eq!(data["retryable"], serde_json::json!(retryable));
+                assert!(
+                    data.get("request_id").is_none(),
+                    "MCP errors use JSON-RPC ids for correlation"
+                );
+            }
+        }
+
+        #[test]
+        fn annotate_tool_limits_sets_anthropic_meta() {
+            let schema = Arc::new(serde_json::Map::new());
+            let mut result = ListToolsResult {
+                tools: vec![
+                    Tool::new("pond_search", "Search", Arc::clone(&schema)),
+                    Tool::new("pond_get", "Get", Arc::clone(&schema)),
+                ],
+                next_cursor: None,
+                meta: None,
+            };
+            annotate_tool_limits(&mut result);
+            let value = |name: &str| {
+                result
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .and_then(|tool| tool.meta.as_ref())
+                    .and_then(|meta| meta.0.get("anthropic/maxResultSizeChars"))
+                    .and_then(serde_json::Value::as_i64)
+            };
+            assert_eq!(value("pond_search"), Some(80_000));
+            assert_eq!(value("pond_get"), Some(200_000));
+        }
+
+        #[test]
+        fn json_result_serializes_search_response_without_request_id() {
+            let response = SearchResponse {
+                sessions: vec![crate::wire::SearchSession {
+                    session_id: "s1".to_owned(),
+                    project: "pond".to_owned(),
+                    source_agent: "claude-code".to_owned(),
+                    session_messages_count: 2,
+                    matched_message_count: 1,
+                    matches: vec![SearchResult {
+                        message_id: "m1".to_owned(),
+                        role: Role::User,
+                        timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                        text: "hello".to_owned(),
+                        score: 1.0,
+                    }],
+                }],
+                matched_total: 1,
+                has_more: false,
+                next_cursor: None,
+            };
+            let result = json_result(&response).unwrap();
+            let text = result.content[0].raw.as_text().unwrap().text.as_str();
+            let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(value.get("request_id").is_none());
+            assert_eq!(value["sessions"][0]["matches"][0]["message_id"], "m1");
+        }
     }
 }

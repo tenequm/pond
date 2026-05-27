@@ -808,7 +808,7 @@ impl Store {
     }
 
     /// Pull a page of `(id, role, timestamp, search_text)` for one session,
-    /// applying `up_to` / `start_after` (exclusive) / max_messages / char-budget,
+    /// applying `up_to` / `start_after` (exclusive) / limit / byte-budget,
     /// without touching parts.lance unless `include_parts` is set. The body
     /// is `messages.search_text` (per spec.md#search, the embed-source projection).
     pub async fn paged_session_view(
@@ -878,7 +878,7 @@ impl Store {
             }));
         }
         let mut sliced = rows[start_at..].to_vec();
-        let max = scope.max_messages.clamp(1, 1000);
+        let max = scope.limit.clamp(1, 1000);
         if sliced.len() > max {
             sliced.truncate(max);
         }
@@ -886,8 +886,8 @@ impl Store {
         let mut acc = 0usize;
         let mut emitted = 0usize;
         for row in &sliced {
-            let next = acc.saturating_add(row.text.chars().count());
-            if emitted > 0 && next > scope.budget_chars {
+            let next = acc.saturating_add(row.text.len());
+            if emitted > 0 && next > scope.budget_bytes {
                 break;
             }
             acc = next;
@@ -1336,7 +1336,7 @@ impl Store {
         Ok(metas)
     }
 
-    /// Total message count per session, for `group_by_conversation` summaries.
+    /// Total message count per session, for search session summaries.
     pub async fn session_message_counts(
         &self,
         session_ids: &[String],
@@ -2491,8 +2491,8 @@ pub struct PagedScope<'a> {
     pub up_to: Option<&'a str>,
     pub start_after: Option<&'a str>,
     pub window: Option<MessageWindow<'a>>,
-    pub max_messages: usize,
-    pub budget_chars: usize,
+    pub limit: usize,
+    pub budget_bytes: usize,
     pub include_parts: bool,
 }
 

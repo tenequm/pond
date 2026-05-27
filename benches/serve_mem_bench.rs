@@ -387,9 +387,8 @@ fn search_request(query: &str, mode: Option<SearchModeWire>, limit: usize) -> Se
         mode_override: mode,
         similar_to: None,
         filters: SearchFilters::default(),
-        boost_recent: true,
-        group_by_conversation: false,
         limit,
+        cursor: None,
     }
 }
 
@@ -401,7 +400,7 @@ fn get_request(message_id: String) -> GetRequest {
         message_id: Some(message_id),
         up_to: None,
         context_depth: 0,
-        max_messages: 50,
+        limit: 50,
         include_parts: false,
         cursor: None,
     }
@@ -447,14 +446,11 @@ fn percentile(values: &[u128], p: f64) -> u128 {
 }
 
 fn first_hit_message_id(response: &SearchResponse) -> Option<String> {
-    match &response.result {
-        pond::wire::SearchResultBody::Hits { hits } => {
-            hits.first().map(|hit| hit.message_id.clone())
-        }
-        pond::wire::SearchResultBody::Groups { groups } => groups
-            .first()
-            .map(|group| group.best_hit_message_id.clone()),
-    }
+    response
+        .sessions
+        .first()
+        .and_then(|session| session.matches.first())
+        .map(|hit| hit.message_id.clone())
 }
 
 struct SearchPhase<'a> {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
 };
 use pond::{
     PROTOCOL_VERSION,
@@ -76,7 +76,7 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     Ok((temp, store, http::router(state)))
 }
 
-async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, Value) {
+async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap, Value) {
     let request = Request::builder()
         .method("POST")
         .uri(path)
@@ -85,10 +85,11 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, Value) {
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    (status, headers, serde_json::from_slice(&bytes).unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -105,13 +106,18 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
         .expect("the fixture corpus has at least one session");
 
     // POST /v1/search round-trips to a success envelope.
-    let (status, body) = post(
+    let (status, headers, body) = post(
         &app,
         "/v1/search",
         &json!({ "protocol_version": PROTOCOL_VERSION, "query": "error handling" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key("x-pond-request-id"));
+    assert!(
+        body.get("request_id").is_none(),
+        "Option B keeps request ids in the HTTP header, not the body: {body}",
+    );
     let envelope: SearchEnvelope = serde_json::from_value(body)?;
     assert!(
         matches!(envelope, SearchEnvelope::Success(_)),
@@ -119,7 +125,7 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
     );
 
     // POST /v1/get round-trips a full session by id.
-    let (status, body) = post(
+    let (status, _headers, body) = post(
         &app,
         "/v1/get",
         &json!({ "protocol_version": PROTOCOL_VERSION, "session_id": session_id }),
@@ -143,20 +149,21 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     let (_temp, _store, app) = router().await?;
 
     // version_unsupported -> 400.
-    let (status, body) = post(
+    let (status, headers, body) = post(
         &app,
         "/v1/search",
         &json!({ "protocol_version": 999, "query": "x" }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(headers.contains_key("x-pond-request-id"));
     let SearchEnvelope::Error(error) = serde_json::from_value(body)? else {
         panic!("expected an error envelope");
     };
     assert_eq!(error.error.code, ErrorCode::VersionUnsupported);
 
     // validation_failed -> 400 (get with neither session_id nor message_id).
-    let (status, body) = post(
+    let (status, _headers, body) = post(
         &app,
         "/v1/get",
         &json!({ "protocol_version": PROTOCOL_VERSION }),
@@ -169,7 +176,7 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     assert_eq!(error.error.code, ErrorCode::ValidationFailed);
 
     // not_found -> 404.
-    let (status, body) = post(
+    let (status, _headers, body) = post(
         &app,
         "/v1/get",
         &json!({ "protocol_version": PROTOCOL_VERSION, "session_id": "does-not-exist" }),

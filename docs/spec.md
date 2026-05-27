@@ -487,7 +487,7 @@ Every operation is a handler function from a request value to a response value. 
 
 ### 7.2 The request envelope
 
-Every request carries `protocol_version` (a positive integer; v1 is `1`) and an optional `namespace`. Every response - success or error - carries a server-generated `request_id` for log correlation. Schema evolution within a major version is additive only; removing or retyping a field is a major version bump. The precise wire schema is published as JSON Schema generated from the Rust types: this document specifies the contract, the generated schema is the exact artifact.
+Every request carries `protocol_version` (a positive integer; v1 is `1`) and an optional `namespace`. Every request is associated with a server-generated request id for log correlation. HTTP exposes it via the `X-Pond-Request-Id` response header; MCP correlation uses the JSON-RPC envelope `id`. Schema evolution within a major version is additive only; removing or retyping a field is a major version bump. The precise wire schema is published as JSON Schema generated from the Rust types: this document specifies the contract, the generated schema is the exact artifact.
 
 ### 7.3 Namespace
 
@@ -500,8 +500,7 @@ Every request carries `protocol_version` (a positive integer; v1 is `1`) and an 
 Success and error are mutually exclusive at the body level. An error body is one shape:
 
 ```json
-{ "error": { "code": "validation_failed", "message": "...", "details": {} },
-  "request_id": "..." }
+{ "error": { "code": "validation_failed", "message": "...", "details": {} } }
 ```
 
 The code set is closed:
@@ -520,7 +519,7 @@ Retryability is conveyed by the code; there is no separate field. `conflict` is 
 
 ### 7.5 Operations
 
-1. **`pond_search`** (`POST /v1/search`) - hybrid search; Section 8 specifies retrieval. Returns ranked message hits, each reporting which retrievers matched it.
+1. **`pond_search`** (`POST /v1/search`) - hybrid search; Section 8 specifies retrieval. Returns ranked message hits grouped by session, with the top-scoring matches per session.
 2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context.
 3. **`pond_ingest`** (`POST /v1/ingest`) - accept a batch of canonical events. Always batched, bounded by an event count and a body-size cap. Events are grouped by session and applied per session; partial success across sessions is normal and reported per row.
 4. **`pond_session_events`** (`GET /v1/sessions/{id}/events`, SSE) - stream a session's messages and parts in order. v1 is catch-up only: it scans, emits, and closes. Live-tail activates with live-write (Section 9) on the same endpoint.
@@ -558,7 +557,7 @@ The wire protocol versions through `protocol_version` and additive-only schema c
 
 Search returns messages. It is hybrid - a vector retriever and a keyword retriever, fused - and runs at message granularity. This section also specifies the embedding seam, a generic capability the session datasets consume rather than a part of them.
 
-- **Hybrid retrieval.** A search runs two retrievers over the same corpus: a BM25 full-text retriever over each message's indexed text, and a vector retriever over the message embeddings produced by the configured model. Their results are fused by per-arm score normalization: each arm's surviving raw scores (post intra-arm dedup by `session_root`) are min-max normalized to [0, 1], then summed across arms with fixed per-arm weights identified by `scripts/search-benchmarks/simulate_fusion.py`. Both retrievers operate at message granularity and agree on row identity, so fusion needs no per-chunk deduplication. When no message is embedded under the configured model the search runs full-text only; the mode is decided by the server from embedding availability, not requested on the wire, and each hit reports which retrievers matched it.
+- **Hybrid retrieval.** A search runs two retrievers over the same corpus: a BM25 full-text retriever over each message's indexed text, and a vector retriever over the message embeddings produced by the configured model. Their results are fused by per-arm score normalization: each arm's surviving raw scores (post intra-arm dedup by `session_root`) are min-max normalized to [0, 1], then summed across arms with fixed per-arm weights identified by `scripts/search-benchmarks/simulate_fusion.py`. Both retrievers operate at message granularity and agree on row identity, so fusion needs no per-chunk deduplication. When no message is embedded under the configured model the search runs full-text only; the mode is decided by the server from embedding availability, not requested on the wire. Retriever attribution is operator-only and exposed via `pond search --explain`.
 
   **`prefilter-pushdown`** {#prefilter-pushdown} - Every vector and full-text query MUST push its scalar filters into the table's scalar indexes before the retriever ranks, never as an in-memory post-filter. Why: a post-filter ranks first and filters second, so it silently returns fewer than the requested number of results and ignores the scalar indexes entirely - correctness depends on the filter running first.
 
@@ -566,7 +565,7 @@ Search returns messages. It is hybrid - a vector retriever and a keyword retriev
 
   **`language-neutral-index`** {#language-neutral-index} - The full-text index MUST tokenize every language alike; it MUST NOT apply a transform keyed to a single language. Why: pond ingests sessions in any language; a monolingual transform silently under-indexes every other. Pond indexes with a character-`ngram` tokenizer (3-5 range; rationale and experiment: `docs/researches/tokenizer-experiment-report.md`).
 
-- **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. A recency boost is applied additively by default. Results may be grouped to one summary per session. Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
+- **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. Results are grouped to one summary per session, with up to a small fixed number of top-scoring matches per session (the cap lives in code). Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
 - **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
 - **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The engine ships a fixed set of models it has loaders for; configuration selects one and supplies its vector parameters. No model is mandatory and none is named in this document - the choice and its default are configuration.
 - **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it. The embed stage of `pond sync` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.

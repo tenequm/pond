@@ -52,7 +52,7 @@ mod ingest_handler {
         sessions::{IngestEvent, IngestSummary, IngestValidator, OutcomeStatus, RowOutcome, Store},
         wire::{
             ErrorBody, ErrorCode, IngestEnvelope, IngestRequest, IngestResponse, IngestResult,
-            IngestStatus, new_request_id, validate_protocol,
+            IngestStatus, validate_protocol,
         },
     };
 
@@ -506,7 +506,6 @@ mod ingest_handler {
                     accepted,
                     rejected,
                     results,
-                    request_id: new_request_id(),
                 })
             }
             Err(failure) => IngestEnvelope::Error(map_storage(failure)),
@@ -852,8 +851,8 @@ mod get_handler {
 
     use super::{map_error, map_storage};
 
-    /// ~10000-token response budget at the `chars/4` estimator.
-    const BUDGET_CHARS: usize = 40_000;
+    /// ~10000-token response budget at the `bytes/4` estimator.
+    const BUDGET_BYTES: usize = 40_000;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -927,7 +926,7 @@ mod get_handler {
                         cursor.anchor_id.clone(),
                         cursor.up_to.clone(),
                         Some(cursor.after_message_id.clone()),
-                        request.max_messages,
+                        request.limit,
                         cursor.include_parts,
                     )
                     .await
@@ -938,7 +937,7 @@ mod get_handler {
                         cursor.anchor_id.clone(),
                         cursor.context_depth,
                         Some(cursor.after_message_id.clone()),
-                        request.max_messages,
+                        request.limit,
                         cursor.include_parts,
                     )
                     .await
@@ -951,7 +950,7 @@ mod get_handler {
                         session_id.clone(),
                         up_to.clone(),
                         None,
-                        request.max_messages,
+                        request.limit,
                         request.include_parts,
                     )
                     .await
@@ -962,7 +961,7 @@ mod get_handler {
                         message_id.clone(),
                         request.context_depth,
                         None,
-                        request.max_messages,
+                        request.limit,
                         request.include_parts,
                     )
                     .await
@@ -990,7 +989,6 @@ mod get_handler {
                 result,
                 has_more,
                 next_cursor,
-                request_id: crate::wire::new_request_id(),
             }),
             Err(error) => GetEnvelope::Error(error),
         }
@@ -1001,15 +999,15 @@ mod get_handler {
         session_id: String,
         up_to: Option<String>,
         start_after: Option<String>,
-        max_messages: usize,
+        limit: usize,
         include_parts: bool,
     ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
         let scope = PagedScope {
             up_to: up_to.as_deref(),
             start_after: start_after.as_deref(),
             window: None,
-            max_messages,
-            budget_chars: BUDGET_CHARS,
+            limit,
+            budget_bytes: BUDGET_BYTES,
             include_parts,
         };
         let view = store
@@ -1047,7 +1045,7 @@ mod get_handler {
         message_id: String,
         context_depth: usize,
         start_after: Option<String>,
-        max_messages: usize,
+        limit: usize,
         include_parts: bool,
     ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
         let session_id = store
@@ -1068,8 +1066,8 @@ mod get_handler {
                 anchor: &message_id,
                 depth: context_depth,
             }),
-            max_messages,
-            budget_chars: BUDGET_CHARS,
+            limit,
+            budget_bytes: BUDGET_BYTES,
             include_parts,
         };
         let view = store
@@ -1164,9 +1162,11 @@ mod get_handler {
 pub use get_handler::pond_get;
 
 mod search_handler {
-    //! The `pond_search` handler: hybrid (vector + BM25 + RRF) retrieval at message
-    //! granularity, with filter pushdown, recency boost, and conversation grouping
-    //! (spec.md#search, spec.md#search).
+    //! The `pond_search` handler: hybrid (vector + BM25) retrieval at message
+    //! granularity, with filter pushdown and session-grouped responses
+    //! (spec.md#search).
+
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use crate::{
         Clock, SystemClock,
@@ -1174,17 +1174,16 @@ mod search_handler {
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
-            ErrorEnvelope, Group, Hit, ProjectFilter, SearchEnvelope, SearchFilters, SearchRequest,
-            SearchResponse, SearchResultBody, new_request_id, validate_protocol,
+            ErrorEnvelope, ProjectFilter, Role, SearchCursor, SearchEnvelope, SearchFilters,
+            SearchRequest, SearchResponse, SearchResult, SearchSession, validate_protocol,
         },
     };
-    use chrono::{DateTime, NaiveDate, Utc};
+    use chrono::NaiveDate;
 
     use super::{map_error, map_storage};
 
     /// Internal branching enum for the retrieval mode. Production callers
-    /// never pick: the server decides hybrid-vs-FTS from embedder availability
-    /// (per-hit `matched_via` tells clients which retrievers ranked a row).
+    /// never pick: the server decides hybrid-vs-FTS from embedder availability.
     /// `Vector` exists for operator tooling - selected via `pond search --mode`
     /// or the `mode_override` wire field consumed by `scripts/search-benchmarks/`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1203,43 +1202,64 @@ mod search_handler {
         /// `query` and FTS arm are ignored.
         pub similar_to: Option<String>,
         pub filter: Predicate,
+        pub filters: SearchFilters,
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
-        pub boost_recent: bool,
-        pub group_by_conversation: bool,
+        pub offset: usize,
         pub min_score: f64,
     }
 
     const LIMIT_CAP: usize = 200;
+    const MAX_MATCHES_PER_SESSION: usize = 3;
+    const SEARCH_BUDGET_BYTES: usize = 60_000;
     /// Centered query-windowed body returned on every hit (spec.md#search).
     /// Calibrated for the agent-context budget: ~600 code points fits a typical
     /// match site without crowding the 10k-token `pond_get` page.
     const HIT_SNIPPET_CHARS: usize = 600;
-    /// Additive recency boost (spec.md#search). Caps at 0.05 so it stays a
-    /// tiebreaker; with `FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT = 1.135`,
-    /// `SCORE_DENOMINATOR` divides best_score by 1.185 to land in `[0, 1]`.
-    const RECENCY_MAX_BOOST: f64 = 0.05;
-    const RECENCY_DECAY_SECONDS: f64 = 604_800.0;
-    const SCORE_DENOMINATOR: f64 = FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT + RECENCY_MAX_BOOST;
+    const SCORE_DENOMINATOR: f64 = FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT;
 
     // Score-normalized hybrid fusion weights (spec.md#search). Per-arm
     // base_score is min-max normalized within the arm's pool, then the two
     // arms are combined as w_fts * norm_fts + w_vec * norm_vec. The 0.135:1
     // ratio was identified by `scripts/search-benchmarks/simulate_fusion.py` on the
     // 111-query paraphrase set: a wide plateau at w_fts in [0.09, 0.14]
-    // (S@3 = 0.640-0.649), centroid 0.135. Symmetric across arms — no
+    // (S@3 = 0.640-0.649), centroid 0.135. Symmetric across arms - no
     // per-query routing; cross-lingual queries are an agent-layer concern
     // (see the `pond_search` MCP description).
     const FTS_FUSION_WEIGHT: f64 = 0.135;
     const VECTOR_FUSION_WEIGHT: f64 = 1.0;
 
+    fn encode_search_cursor(cursor: &SearchCursor) -> String {
+        #[allow(clippy::expect_used)]
+        let bytes = serde_json::to_vec(cursor).expect("search cursor encodes as JSON");
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn decode_search_cursor(raw: &str) -> Result<SearchCursor, ErrorEnvelope> {
+        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| {
+            map_error(crate::Error::validation_field(
+                "cursor is malformed (expected opaque value from a prior response)",
+                "cursor",
+                Some(serde_json::json!(raw)),
+                Some("opaque base64url".to_owned()),
+            ))
+        })?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            map_error(crate::Error::validation_field(
+                "cursor is malformed (decode failed)",
+                "cursor",
+                Some(serde_json::json!(raw)),
+                Some("opaque cursor from a prior response".to_owned()),
+            ))
+        })
+    }
+
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid
     /// when the store has any vectors, FTS-only otherwise. The embedder is
     /// `LazyEmbedder`-loaded on the first hybrid/vector call, so FTS-only
     /// corpora never pay the model load. The response has no top-level mode
-    /// field; per-hit `matched_via` reports the retrievers that ranked each
-    /// row.
+    /// field; retriever attribution stays in `explain_search_plan`.
     ///
     /// Must run on a multi-threaded Tokio runtime: hybrid mode embeds the query via
     /// `block_in_place`, which panics on a `current_thread` runtime.
@@ -1293,7 +1313,7 @@ mod search_handler {
         embedder: &LazyEmbedder,
         request: SearchRequest,
         search: &crate::config::SearchConfig,
-        clock: &dyn Clock,
+        _clock: &dyn Clock,
     ) -> Result<SearchResponse, ErrorEnvelope> {
         let override_mode = request.mode_override.map(wire_mode_to_internal);
         let mut plan = plan_search(request, SearchMode::Fts)?;
@@ -1433,7 +1453,7 @@ mod search_handler {
         };
 
         if candidates.is_empty() {
-            return Ok(empty_response(plan.group_by_conversation));
+            return Ok(empty_response());
         }
 
         // Hydrate hit metadata (timestamp, role, project, preview source) from
@@ -1454,7 +1474,6 @@ mod search_handler {
             .map(|meta| ((meta.session_id.as_str(), meta.message_id.as_str()), meta))
             .collect::<std::collections::HashMap<_, _>>();
 
-        let now = clock.now();
         let mut scored = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let Some(meta) =
@@ -1462,12 +1481,7 @@ mod search_handler {
             else {
                 continue;
             };
-            let recency = if plan.boost_recent {
-                recency_boost(meta.timestamp, now)
-            } else {
-                0.0
-            };
-            let score = candidate.base_score + recency;
+            let score = candidate.base_score;
             if score < plan.min_score {
                 continue;
             }
@@ -1485,27 +1499,9 @@ mod search_handler {
                 .then_with(|| left.meta.message_id.cmp(&right.meta.message_id))
         });
 
-        if plan.group_by_conversation {
-            let groups = build_groups(store, &scored, plan.limit, &plan.query).await?;
-            let total = groups.len();
-            Ok(SearchResponse {
-                result: SearchResultBody::Groups { groups },
-                total,
-                request_id: new_request_id(),
-            })
-        } else {
-            let hits = scored
-                .into_iter()
-                .take(plan.limit)
-                .map(|hit| hit.into_hit(&plan.query))
-                .collect::<Vec<_>>();
-            let total = hits.len();
-            Ok(SearchResponse {
-                result: SearchResultBody::Hits { hits },
-                total,
-                request_id: new_request_id(),
-            })
-        }
+        let matched_total = scored.len();
+        let sessions = build_sessions(store, &scored, &plan.query).await?;
+        page_sessions(sessions, matched_total, &plan)
     }
 
     /// Pick the retrieval mode. An explicit caller override (operator tooling
@@ -1548,9 +1544,21 @@ mod search_handler {
 
         let _ns = super::resolve_namespace(request.namespace.as_deref())?;
 
-        let query = request.query.trim().to_owned();
-        let similar_to = request
-            .similar_to
+        let cursor = match request.cursor.as_deref() {
+            Some(raw) => Some(decode_search_cursor(raw)?),
+            None => None,
+        };
+        let (query_raw, similar_raw, filters, offset) = match cursor {
+            Some(cursor) => (
+                cursor.query,
+                cursor.similar_to,
+                cursor.filters,
+                cursor.offset,
+            ),
+            None => (request.query, request.similar_to, request.filters, 0),
+        };
+        let query = query_raw.trim().to_owned();
+        let similar_to = similar_raw
             .as_ref()
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty());
@@ -1558,7 +1566,7 @@ mod search_handler {
             return Err(map_error(crate::Error::validation_field(
                 "query must be non-empty after trim",
                 "query",
-                Some(serde_json::json!(request.query)),
+                Some(serde_json::json!(query_raw)),
                 Some("non-empty string after trim, or pass `similar_to`".to_owned()),
             )));
         }
@@ -1571,7 +1579,8 @@ mod search_handler {
             )));
         }
         let limit = request.limit.min(LIMIT_CAP);
-        let filter = build_filter(&request.filters)?;
+        let min_score = filters.min_score;
+        let filter = build_filter(&filters)?;
         // Retriever candidate pool: wider than `limit` so the fuser has
         // material to merge.
         let pool = limit.saturating_mul(5).max(50);
@@ -1580,12 +1589,12 @@ mod search_handler {
             query,
             similar_to,
             filter,
+            filters,
             pool,
             vector_pool: pool.saturating_mul(2),
             limit,
-            boost_recent: request.boost_recent,
-            group_by_conversation: request.group_by_conversation,
-            min_score: request.filters.min_score,
+            offset,
+            min_score,
         })
     }
 
@@ -1731,14 +1740,6 @@ mod search_handler {
         hits
     }
 
-    /// Additive exponential-decay recency boost (spec.md#search): caps at
-    /// [`RECENCY_MAX_BOOST`] at `age = 0`, decays to near-zero past a few weeks.
-    pub fn recency_boost(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
-        #[allow(clippy::cast_precision_loss)]
-        let age_seconds = (now - timestamp).num_seconds().max(0) as f64;
-        RECENCY_MAX_BOOST * (-age_seconds / RECENCY_DECAY_SECONDS).exp()
-    }
-
     /// Minimum query-term length considered "informative" for snippet
     /// anchoring. Shorter terms ("how", "the", "is", "my", "at") attract the
     /// `.min()` anchor to offset-near-0 because they occur very early in any
@@ -1821,18 +1822,26 @@ mod search_handler {
     }
 
     impl ScoredHit {
-        fn into_hit(self, query: &str) -> Hit {
+        fn to_search_result(&self, query: &str) -> Result<SearchResult, ErrorEnvelope> {
             let text = hit_payload(&self.meta.search_text, query);
-            Hit {
-                session_id: self.meta.session_id,
-                message_id: self.meta.message_id,
-                role: self.meta.role,
+            let role = match self.meta.role.as_str() {
+                "system" => Role::System,
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                other => {
+                    return Err(map_error(crate::Error::internal(format!(
+                        "stored message has unknown role: {other}"
+                    ))));
+                }
+            };
+            Ok(SearchResult {
+                message_id: self.meta.message_id.clone(),
+                role,
                 timestamp: self.meta.timestamp,
-                project: self.meta.project,
-                source_agent: self.meta.source_agent,
                 text,
                 score: normalize_score(self.score),
-            }
+            })
         }
     }
 
@@ -1885,41 +1894,30 @@ mod search_handler {
         })
     }
 
-    async fn build_groups(
+    async fn build_sessions(
         store: &Store,
         scored: &[ScoredHit],
-        limit: usize,
         query: &str,
-    ) -> Result<Vec<Group>, ErrorEnvelope> {
+    ) -> Result<Vec<SearchSession>, ErrorEnvelope> {
         use std::collections::BTreeMap;
 
-        // `scored` is already sorted by score descending, so the first hit seen for
-        // a session is its best-scoring match - its message_id is the
-        // `best_hit_message_id` callers use to drill in via `pond_get`.
         struct Acc {
-            best_hit_message_id: String,
             project: String,
             source_agent: String,
-            first_timestamp: DateTime<Utc>,
-            last_timestamp: DateTime<Utc>,
-            text: String,
-            best_score: f64,
+            matched_count: usize,
+            matches: Vec<SearchResult>,
         }
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
         for hit in scored {
             let root = session_root(&hit.meta.session_id).to_owned();
             let entry = groups.entry(root).or_insert_with(|| Acc {
-                best_hit_message_id: hit.meta.message_id.clone(),
                 project: hit.meta.project.clone(),
                 source_agent: hit.meta.source_agent.clone(),
-                first_timestamp: hit.meta.timestamp,
-                last_timestamp: hit.meta.timestamp,
-                text: hit_payload(&hit.meta.search_text, query),
-                best_score: hit.score,
+                matched_count: 0,
+                matches: Vec::new(),
             });
-            entry.first_timestamp = entry.first_timestamp.min(hit.meta.timestamp);
-            entry.last_timestamp = entry.last_timestamp.max(hit.meta.timestamp);
-            entry.best_score = entry.best_score.max(hit.score);
+            entry.matched_count += 1;
+            entry.matches.push(hit.to_search_result(query)?);
         }
 
         let session_ids = groups.keys().cloned().collect::<Vec<_>>();
@@ -1930,31 +1928,95 @@ mod search_handler {
 
         let mut result = groups
             .into_iter()
-            .map(|(session_id, acc)| Group {
-                session_messages_count: counts.get(&session_id).copied().unwrap_or_default(),
-                session_id,
-                best_hit_message_id: acc.best_hit_message_id,
-                project: acc.project,
-                source_agent: acc.source_agent,
-                first_timestamp: acc.first_timestamp,
-                last_timestamp: if acc.last_timestamp > acc.first_timestamp {
-                    Some(acc.last_timestamp)
-                } else {
-                    None
-                },
-                text: acc.text,
-                best_score: normalize_score(acc.best_score),
+            .map(|(session_id, mut acc)| {
+                acc.matches.sort_by(|left, right| {
+                    right
+                        .score
+                        .partial_cmp(&left.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.message_id.cmp(&right.message_id))
+                });
+                acc.matches.truncate(MAX_MATCHES_PER_SESSION);
+                SearchSession {
+                    session_messages_count: counts.get(&session_id).copied().unwrap_or_default(),
+                    session_id,
+                    project: acc.project,
+                    source_agent: acc.source_agent,
+                    matched_message_count: acc.matched_count,
+                    matches: acc.matches,
+                }
             })
             .collect::<Vec<_>>();
         result.sort_by(|left, right| {
-            right
-                .best_score
-                .partial_cmp(&left.best_score)
+            let left_score = left
+                .matches
+                .first()
+                .map(|hit| hit.score)
+                .unwrap_or_default();
+            let right_score = right
+                .matches
+                .first()
+                .map(|hit| hit.score)
+                .unwrap_or_default();
+            right_score
+                .partial_cmp(&left_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.session_id.cmp(&right.session_id))
         });
-        result.truncate(limit);
         Ok(result)
+    }
+
+    fn page_sessions(
+        sessions: Vec<SearchSession>,
+        matched_total: usize,
+        plan: &SearchPlan,
+    ) -> Result<SearchResponse, ErrorEnvelope> {
+        if plan.offset >= sessions.len() {
+            return Ok(SearchResponse {
+                sessions: Vec::new(),
+                matched_total,
+                has_more: false,
+                next_cursor: None,
+            });
+        }
+
+        let mut emitted = Vec::new();
+        let mut used_bytes = 0usize;
+        for session in sessions.iter().skip(plan.offset) {
+            if emitted.len() >= plan.limit {
+                break;
+            }
+            let bytes = serde_json::to_string(session)
+                .map_err(|error| {
+                    map_error(crate::Error::internal(format!(
+                        "failed to size search response session: {error}"
+                    )))
+                })?
+                .len();
+            if !emitted.is_empty() && used_bytes.saturating_add(bytes) > SEARCH_BUDGET_BYTES {
+                break;
+            }
+            used_bytes = used_bytes.saturating_add(bytes);
+            emitted.push(session.clone());
+        }
+
+        let next_offset = plan.offset + emitted.len();
+        let has_more = next_offset < sessions.len();
+        let next_cursor = has_more.then(|| {
+            encode_search_cursor(&SearchCursor {
+                query: plan.query.clone(),
+                similar_to: plan.similar_to.clone(),
+                filters: plan.filters.clone(),
+                offset: next_offset,
+            })
+        });
+
+        Ok(SearchResponse {
+            sessions: emitted,
+            matched_total,
+            has_more,
+            next_cursor,
+        })
     }
 
     /// Build the shared scalar filter predicate pushed into both retrievers.
@@ -2023,16 +2085,12 @@ mod search_handler {
         Ok(format!("timestamp '{date} {time}'"))
     }
 
-    fn empty_response(group_by_conversation: bool) -> SearchResponse {
-        let result = if group_by_conversation {
-            SearchResultBody::Groups { groups: Vec::new() }
-        } else {
-            SearchResultBody::Hits { hits: Vec::new() }
-        };
+    fn empty_response() -> SearchResponse {
         SearchResponse {
-            result,
-            total: 0,
-            request_id: new_request_id(),
+            sessions: Vec::new(),
+            matched_total: 0,
+            has_more: false,
+            next_cursor: None,
         }
     }
 
@@ -2136,7 +2194,7 @@ mod search_handler {
 
 pub use search_handler::{
     FusedHit, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter, explain_search_plan,
-    fuse_arms, hit_payload, plan_search, pond_search, recency_boost,
+    fuse_arms, hit_payload, plan_search, pond_search,
 };
 
 #[cfg(test)]
@@ -2145,7 +2203,7 @@ mod tests {
 
     use super::*;
     use crate::wire::{ProjectFilter, SearchFilters, SearchRequest};
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
 
     fn search_request(query: &str) -> SearchRequest {
         SearchRequest {
@@ -2155,9 +2213,8 @@ mod tests {
             mode_override: None,
             similar_to: None,
             filters: SearchFilters::default(),
-            boost_recent: true,
-            group_by_conversation: false,
             limit: 20,
+            cursor: None,
         }
     }
 
@@ -2217,20 +2274,6 @@ mod tests {
             .find(|hit| hit.key.session_id == "session-d")
             .unwrap();
         assert_eq!(d.matched_via, vec!["fts"]);
-    }
-
-    #[test]
-    fn recency_boost_matches_the_kb_formula() {
-        let now = Utc::now();
-        // Caps at +0.05 at age zero (tiebreaker-scale boost; see RECENCY_MAX_BOOST).
-        assert!((recency_boost(now, now) - 0.05).abs() < 1e-6);
-        // One half-life (7 days) decays by exactly 1/e.
-        let week = recency_boost(now - Duration::days(7), now);
-        assert!((week - 0.05 / std::f64::consts::E).abs() < 1e-3);
-        // A year out is effectively zero.
-        assert!(recency_boost(now - Duration::days(365), now) < 1e-3);
-        // Future timestamps clamp to the cap rather than exceeding it.
-        assert!((recency_boost(now + Duration::days(1), now) - 0.05).abs() < 1e-6);
     }
 
     #[test]
@@ -2375,8 +2418,6 @@ mod tests {
     fn plan_search_shapes_request_for_each_planning_input() {
         let mut request = search_request("  vector memory  ");
         request.limit = 500;
-        request.group_by_conversation = true;
-        request.boost_recent = false;
         request.filters.min_score = 0.42;
         let plan = plan_search(request, SearchMode::Hybrid).unwrap();
         assert_eq!(plan.mode, SearchMode::Hybrid);
@@ -2384,8 +2425,6 @@ mod tests {
         assert_eq!(plan.limit, 200);
         assert_eq!(plan.pool, 1000);
         assert_eq!(plan.vector_pool, 2000);
-        assert!(plan.group_by_conversation);
-        assert!(!plan.boost_recent);
         assert_eq!(plan.min_score, 0.42);
 
         // Case 2: a tiny limit floors the pools so retrievers don't starve.

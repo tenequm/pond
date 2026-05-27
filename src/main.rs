@@ -27,9 +27,9 @@ use pond::{
     substrate::{IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes},
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Group, Hit, Part,
-        PartKind, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
-        SearchResponse, SearchResultBody,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Part, PartKind,
+        ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
+        SearchResponse, SearchResult, SearchSession,
     },
 };
 
@@ -228,13 +228,6 @@ enum Command {
         /// force one arm against the same corpus.
         #[arg(long, value_enum)]
         mode: Option<CliSearchMode>,
-        /// Disable the recency boost. The server defaults to enabled (matches
-        /// the MCP/HTTP surface).
-        #[arg(long)]
-        no_boost_recent: bool,
-        /// Collapse to one row per session, keeping the best-scoring message.
-        #[arg(long)]
-        group_by_conversation: bool,
         /// Substring match by default (`--project pond` -> contains "pond"). Prefix
         /// with `re:` for regex (`--project 're:^/Users/.*/x402'`); `lit:` escapes
         /// a literal value that would otherwise be parsed as a prefix.
@@ -303,7 +296,7 @@ enum Command {
         context_depth: usize,
         /// Cap on returned messages.
         #[arg(long, default_value_t = 100)]
-        max_messages: usize,
+        limit: usize,
         /// Include per-message parts (reasoning, tool calls, tool results,
         /// files) in the response. Default off: the response carries only
         /// `messages[].text` to fit the agent-context budget.
@@ -624,8 +617,6 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             limit,
             mode,
-            no_boost_recent,
-            group_by_conversation,
             project,
             session_id,
             source_agent,
@@ -657,9 +648,8 @@ async fn main() -> anyhow::Result<()> {
                     role,
                     min_score,
                 },
-                boost_recent: !no_boost_recent,
-                group_by_conversation,
                 limit,
+                cursor: None,
             };
             if explain {
                 let plans = explain_search(&store, &embedder, &request, &loaded.search).await?;
@@ -733,7 +723,7 @@ async fn main() -> anyhow::Result<()> {
             message_id,
             up_to,
             context_depth,
-            max_messages,
+            limit,
             include_parts,
             cursor,
             format,
@@ -750,7 +740,7 @@ async fn main() -> anyhow::Result<()> {
                 message_id,
                 up_to,
                 context_depth,
-                max_messages,
+                limit,
                 include_parts,
                 cursor,
             };
@@ -2082,95 +2072,82 @@ fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::
 fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
-    match &response.result {
-        SearchResultBody::Hits { hits } => {
-            output(&format!(
-                "{} {} {}",
-                paint("search:", dim()),
-                paint(&format_thousands(response.total as u64), bold()),
-                if response.total == 1 { "hit" } else { "hits" },
-            ))?;
-            if hits.is_empty() {
-                return Ok(());
-            }
-            for (idx, hit) in hits.iter().enumerate() {
-                output("")?;
-                render_hit(idx + 1, hit)?;
-            }
-        }
-        SearchResultBody::Groups { groups } => {
-            output(&format!(
-                "{} {} {}",
-                paint("search:", dim()),
-                paint(&format_thousands(response.total as u64), bold()),
-                if response.total == 1 {
-                    "session"
-                } else {
-                    "sessions"
-                },
-            ))?;
-            if groups.is_empty() {
-                return Ok(());
-            }
-            for (idx, group) in groups.iter().enumerate() {
-                output("")?;
-                render_group(idx + 1, group)?;
-            }
-        }
+    output(&format!(
+        "{} {} matched {}  {} returned {}",
+        paint("search:", dim()),
+        paint(&format_thousands(response.matched_total as u64), bold()),
+        if response.matched_total == 1 {
+            "message"
+        } else {
+            "messages"
+        },
+        paint(&format_thousands(response.sessions.len() as u64), bold()),
+        if response.sessions.len() == 1 {
+            "session"
+        } else {
+            "sessions"
+        },
+    ))?;
+    if response.sessions.is_empty() {
+        return Ok(());
+    }
+    for (idx, session) in response.sessions.iter().enumerate() {
+        output("")?;
+        render_search_session(idx + 1, session)?;
+    }
+    if let Some(cursor) = response.next_cursor.as_deref() {
+        output("")?;
+        output(&format!("{} {}", paint("next-cursor:", dim()), cursor))?;
     }
     Ok(())
 }
 
-fn render_hit(rank: usize, hit: &Hit) -> anyhow::Result<()> {
+fn render_search_session(rank: usize, session: &SearchSession) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
+    let best_score = session
+        .matches
+        .first()
+        .map(|hit| hit.score)
+        .unwrap_or_default();
     output(&format!(
-        "{}  {}",
+        "{}  best={}  {}/{} matched",
         paint(&format!("[{rank}]"), dim()),
-        paint(&format!("{:.4}", hit.score), bold()),
+        paint(&format!("{best_score:.4}"), bold()),
+        paint(
+            &format_thousands(session.matched_message_count as u64),
+            bold(),
+        ),
+        paint(
+            &format_thousands(session.session_messages_count as u64),
+            bold(),
+        ),
     ))?;
+    output(&format!(
+        "    {}  {}  {}",
+        paint(&session.project, dim()),
+        paint(&session.source_agent, dim()),
+        paint(&session.session_id, dim()),
+    ))?;
+    for hit in &session.matches {
+        render_search_match(hit)?;
+    }
+    Ok(())
+}
+
+fn render_search_match(hit: &SearchResult) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
     output(&format!(
         "    {}  {}  {}  {}",
         paint(
             &hit.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-        paint_role(&hit.role),
-        paint(&hit.project, dim()),
+        paint_role(hit.role.as_str()),
+        paint(&format!("{:.4}", hit.score), bold()),
         paint(&hit.message_id, dim()),
     ))?;
     render_hit_text(&hit.text)?;
-    Ok(())
-}
-
-fn render_group(rank: usize, group: &Group) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    output(&format!(
-        "{}  best={}  {} messages",
-        paint(&format!("[{rank}]"), dim()),
-        paint(&format!("{:.4}", group.best_score), bold()),
-        paint(
-            &format_thousands(group.session_messages_count as u64),
-            bold(),
-        ),
-    ))?;
-    let span = match group.last_timestamp {
-        Some(last) => format!(
-            "{} -> {}",
-            group.first_timestamp.format("%Y-%m-%dT%H:%M"),
-            last.format("%Y-%m-%dT%H:%M"),
-        ),
-        None => group.first_timestamp.format("%Y-%m-%dT%H:%M").to_string(),
-    };
-    output(&format!(
-        "    {}  {}  {}  {}",
-        paint(&span, dim()),
-        paint(&group.project, dim()),
-        paint(&group.source_agent, dim()),
-        paint(&group.session_id, dim()),
-    ))?;
-    render_hit_text(&group.text)?;
     Ok(())
 }
 
@@ -2410,10 +2387,6 @@ fn render_error_pretty(error: &ErrorEnvelope) {
             paint(&format!("  details: {}", error.error.details), dim()),
         );
     }
-    eprintln!(
-        "{}",
-        paint(&format!("  request_id: {}", error.request_id), dim()),
-    );
 }
 
 fn paint_role(role: &str) -> String {
