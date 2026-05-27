@@ -162,18 +162,18 @@ When retry is exhausted on a write, the substrate raises a typed conflict signal
 
 ### 3.7 Index lifecycle
 
-**`index-write-decoupled`** {#index-write-decoupled} - Writes commit data without folding indexes. Index maintenance is operator-triggered via `pond index optimize` (Section 7.8). A trailing index is not a correctness problem: Lance reads merge index results with a flat scan over unindexed fragments, so a query before optimize returns complete results, just slower. Why: matching Lance's own design (`table.optimize()` is the canonical periodic-maintenance op) avoids per-write index rebuilds that would otherwise dominate write cost, and the earlier eager-fold contract was strictly stronger than the underlying format requires.
+**`index-write-decoupled`** {#index-write-decoupled} - Writes commit data without folding indexes. Index maintenance is operator-triggered via the update-indexes stage of `pond sync` (Section 7.8). A trailing index is not a correctness problem: Lance reads merge index results with a flat scan over unindexed fragments, so a query before maintenance returns complete results, just slower. Why: matching Lance's own design (`table.optimize()` is the canonical periodic-maintenance op) avoids per-write index rebuilds that would otherwise dominate write cost, and the earlier eager-fold contract was strictly stronger than the underlying format requires.
 
 **`index-per-family`** {#index-per-family} - The fold strategy for each `IndexIntent` is determined by its index family, not by the write that preceded it:
 
-| Family | Fold on `pond index optimize` | Why |
+| Family | Fold on `pond sync --only update-indexes` | Why |
 |---|---|---|
 | BTree (scalar) | `create_index(replace=true)` | Lance v7.0.0-beta.16's `optimize_indices` BTree path tripped `RowAddrTreeMap::from_sorted_iter` on column-update commits; rebuild from scratch avoids the bug. Switch to `optimize_indices(append)` once upstream is fixed. |
 | Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
 | Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
 | IVF_PQ (vector) | `optimize_indices(append)` | Stable-row-id IVF_PQ supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and PQ codebook carry forward. |
 
-`pond index optimize` skips indexes whose columns no write has touched; this is sound because Lance prunes index coverage only for indexes whose fields overlap a write's modified fields.
+Index maintenance skips indexes whose columns no write has touched; this is sound because Lance prunes index coverage only for indexes whose fields overlap a write's modified fields.
 
 ### 3.8 Forward-compatibility seams
 
@@ -398,11 +398,11 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 
 ### 5.5 Embeddings are derived
 
-A message's embedding has no canonical-type counterpart - it is produced by pond, not supplied by a source. It is two nullable columns on `messages`: `vector`, the embedding, and `embedding_model`, the model that produced it. Both stay null until `pond embed` fills them (Section 8); a message ingested with embedding disabled simply keeps them null.
+A message's embedding has no canonical-type counterpart - it is produced by pond, not supplied by a source. It is two nullable columns on `messages`: `vector`, the embedding, and `embedding_model`, the model that produced it. Both stay null until the embed stage of `pond sync` fills them (Section 8); a message ingested with embedding disabled simply keeps them null.
 
 **`embed-from-canonical`** {#embed-from-canonical} - A message's embedding MUST be derived from its stored `search_text`, never from the source record. Why: `search_text` is durable (`durable-copy`) and the source is not - deriving from canonical is what lets pond re-embed under a new or changed model at any later time with no source present, making a model change a re-derivation, not a migration.
 
-Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`append-only`). A model swap is a single conditional `merge_update` keyed on `target.embedding_model != source.embedding_model`: stale rows update, up-to-date rows are left alone, and the IVF_PQ is dropped before new vectors arrive (centroids belong to one distance space; the next `pond index optimize` rebuilds it). A same-dimension swap rewrites `vector` in place; a different-dimension swap adds a new column, backfills from `search_text`, drops the old, and renames - all on `messages`, never a new table. Lance's manifest history retains prior vectors, so a regressed swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
+Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`append-only`). A model swap is a single conditional `merge_update` keyed on `target.embedding_model != source.embedding_model`: stale rows update, up-to-date rows are left alone, and the IVF_PQ is dropped before new vectors arrive (centroids belong to one distance space; the next update-indexes stage rebuilds it). A same-dimension swap rewrites `vector` in place; a different-dimension swap adds a new column, backfills from `search_text`, drops the old, and renames - all on `messages`, never a new table. Lance's manifest history retains prior vectors, so a regressed swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
 
 ---
 
@@ -539,18 +539,14 @@ The MCP transport exposes only the read operations - `pond_search` and `pond_get
 
 The same handlers back a set of command-line verbs:
 
-- `pond sync` - parse and store data from the configured sources. Pure data write; never folds indexes.
-- `pond embed` - embed the backlog of un-embedded messages (Section 8). Pure data write; never folds indexes. `--force` re-embeds rows whose `embedding_model` differs from the current model via conditional merge.
+- `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge. `--import-from <archive.pond>` feeds a compact archive into the import stage.
 - `pond search [--explain]` - hybrid search from the command line. `--explain` returns Lance's `analyze_plan` output instead of results.
 - `pond get` - fetch a session, or one message with context, from the command line.
-- `pond index status` - per-intent index health: covered fragments, unindexed row counts, and whether `pond index optimize` would do work.
-- `pond index optimize [--wait]` - run Lance's `optimize()` per table: compaction, index update, and version cleanup in one atomic transaction. The three are co-located because Lance's `optimize()` commits them atomically; splitting them would lose that atomicity. Fragment Reuse Index (FRI) defers per-fragment row-address remap into index load-time by default, so compaction does not conflict with concurrent index builds. The canonical periodic-maintenance verb. `--wait` blocks until every managed index reports `num_unindexed_rows == 0`.
-- `pond index rebuild [<intent>]` - force-rebuild named index intents from scratch via `create_index(replace=true)`. Escape hatch for tokenizer-config changes or recovery from a corrupted index file.
-- `pond export` - export stored sessions as canonical ingest events, a portable snapshot byte-compatible with `pond_ingest` input, for one named session or the whole pond. Restore is a distinct mode: it serializes one named session, with its lineage (`lineage-complete-restore`, 6.2), into a target client format through that adapter's serializer. Restore is always rooted at a single named session - there is no bulk restore-to-client-format - because a restore targets a session the caller has identified, while whole-pond transfer is already served by the canonical snapshot.
-- `pond serve` - run the HTTP server, including the MCP route.
-- `pond mcp` - run the MCP server over stdio.
-- `pond status` - row counts, dataset statistics, embedding coverage, and a summary of `pond index status`.
-- `pond config` - emit an annotated configuration template.
+- `pond status` - row counts, dataset statistics, embedding coverage, and index health. It prints the cheap storage summary first, then completes the longer checks.
+- `pond serve --transport http|stdio` - run HTTP by default, or MCP over stdio.
+- `pond mcp` - alias for `pond serve --transport stdio`.
+- `pond export` - write a compact `.pond` archive containing clean index-free Lance datasets plus a manifest. Embeddings remain data columns and are preserved.
+- `pond import <archive.pond>` - restore a compact archive into the current corpus. Existing rows are deduped through the same merge-insert path as adapter import.
 
 ### 7.9 Versioning
 
@@ -573,7 +569,7 @@ Search returns messages. It is hybrid - a vector retriever and a keyword retriev
 - **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. A recency boost is applied additively by default. Results may be grouped to one summary per session. Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
 - **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
 - **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The engine ships a fixed set of models it has loaders for; configuration selects one and supplies its vector parameters. No model is mandatory and none is named in this document - the choice and its default are configuration.
-- **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it, and only by the explicit `pond embed` verb - v1 has no automatic trigger. `pond embed` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.
+- **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it. The embed stage of `pond sync` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.
 - **Opt-in.** Embedding is opt-in by configuration. With it off, `pond serve`, `pond mcp`, and `pond search` run full-text only and never load a model. With it on and at least one message embedded under the configured model, search is hybrid.
 - **Index lifecycle.** Vector and full-text columns exist from table creation; turning embeddings on or off never needs a schema migration. Index maintenance follows `index-write-decoupled` (Section 3.7). Vector search uses brute-force flat scan below the activation threshold (currently 100,000 non-null vectors); above it the trained IVF_PQ takes over. Partitions = `num_rows // 4096`; `[search].nprobes` and `[search].refine_factor` are operator-tunable for recall.
 

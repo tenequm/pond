@@ -6369,6 +6369,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]
@@ -10050,6 +10052,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap 2.14.0",
  "memchr",
  "typed-path",

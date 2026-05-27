@@ -54,37 +54,39 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
 ## Usage
 
-Ingest sessions from local sources, embed them, and search:
+Import sessions from local sources, embed them, update indexes, and search:
 
 ```sh
 pond sync
-pond embed
 pond search "how did we wire up the OCC retry loop"
 ```
 
-Run a server (HTTP + MCP on the same binary):
+Run a server:
 
 ```sh
-pond serve            # HTTP+JSON on 127.0.0.1, MCP route mounted alongside
-pond mcp              # MCP over stdio, for direct agent integration
+pond serve                         # HTTP on 127.0.0.1:9797
+pond serve --transport stdio       # MCP over stdio
+pond mcp                           # alias for stdio MCP
 ```
 
-Fetch a single session or message, or export the whole pond as canonical ingest events:
+Fetch a single session or message, or move a whole corpus:
 
 ```sh
 pond get --session-id <id>
-pond export > snapshot.jsonl
+pond export -o snapshot.pond
+pond import snapshot.pond
 ```
 
-Index maintenance is operator-triggered (writes never fold indexes; a trailing index returns complete results, just slower):
+Stages can be run independently when needed:
 
 ```sh
-pond index status
-pond index optimize --wait
-pond index rebuild <intent>     # escape hatch for tokenizer-config changes
+pond sync --only import
+pond sync --only embed
+pond sync --only update-indexes
+pond sync --import-from snapshot.pond
 ```
 
-`pond status` reports row counts, embedding coverage, and index health. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+`pond status` reports row counts, storage size, embedding coverage, and index health. It prints quick storage information first, then finishes the longer checks in front of the user. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
 ## Design
 
@@ -94,7 +96,7 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Canonical Session / Message / Part interlingua.** Owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This schema is pond's product; everything else is machinery around it.
 - **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
 - **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `no-synthesis`, `schema-honesty`, and `provenance-required` are structural, not review rules.
-- **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. Operators run `pond index optimize` on their own cadence; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
+- **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. `pond sync` runs index maintenance by default, and `pond sync --only update-indexes` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
 - **Score-normalized hybrid fusion.** Per-arm shaping (max-norm BM25 for FTS, rank-norm for vector), min-max to [0, 1], then weighted sum. Session-root-keyed dedup so cross-arm agreement compounds at the conversation level.
 - **Language-neutral full-text.** Character `ngram` tokenizer (3-5), no monolingual stemmer - pond indexes sessions in any language alike.
 - **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. MCP also exposes `schema://pond` and `stats://pond` resources.

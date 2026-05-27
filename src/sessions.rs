@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
-use lance::dataset::{AutoCleanupParams, WriteParams};
+use lance::Dataset;
+use lance::dataset::{AutoCleanupParams, WriteMode, WriteParams};
 use lance::deps::arrow_array::{
     Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
@@ -33,6 +35,32 @@ use url::Url;
 #[derive(Debug)]
 pub struct Store {
     handle: Handle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanceArchiveCounts {
+    pub sessions: usize,
+    pub messages: usize,
+    pub parts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanceArchiveVersions {
+    pub sessions: u64,
+    pub messages: u64,
+    pub parts: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanceArchiveExport {
+    pub rows: LanceArchiveCounts,
+    pub source_versions: LanceArchiveVersions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanceArchiveImport {
+    pub rows: LanceArchiveCounts,
+    pub inserted: LanceArchiveCounts,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -266,6 +294,131 @@ impl Store {
     pub async fn open_local(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let url = config::url_for_path(path)?;
         Self::open_with_options(&url, std::collections::HashMap::new()).await
+    }
+
+    /// Export clean, index-free Lance datasets into `dest`.
+    ///
+    /// This rewrites the visible rows of each table instead of copying the
+    /// dataset roots. The resulting manifests therefore contain no references
+    /// to the source store's `_indices`, while `messages.vector` and
+    /// `messages.embedding_model` remain ordinary data columns and are
+    /// preserved.
+    pub async fn export_clean_lance_datasets(&self, dest: &Path) -> Result<LanceArchiveExport> {
+        std::fs::create_dir_all(dest)
+            .with_context(|| format!("failed to create archive staging dir {}", dest.display()))?;
+        let (sessions, sessions_version) = self
+            .export_clean_table(Table::Sessions, &dest.join("sessions.lance"))
+            .await?;
+        let (messages, messages_version) = self
+            .export_clean_table(Table::Messages, &dest.join("messages.lance"))
+            .await?;
+        let (parts, parts_version) = self
+            .export_clean_table(Table::Parts, &dest.join("parts.lance"))
+            .await?;
+        Ok(LanceArchiveExport {
+            rows: LanceArchiveCounts {
+                sessions,
+                messages,
+                parts,
+            },
+            source_versions: LanceArchiveVersions {
+                sessions: sessions_version,
+                messages: messages_version,
+                parts: parts_version,
+            },
+        })
+    }
+
+    pub async fn import_clean_lance_datasets(&self, source: &Path) -> Result<LanceArchiveImport> {
+        let sessions_dataset =
+            open_archive_table(Table::Sessions, &source.join("sessions.lance")).await?;
+        let messages_dataset =
+            open_archive_table(Table::Messages, &source.join("messages.lance")).await?;
+        let parts_dataset = open_archive_table(Table::Parts, &source.join("parts.lance")).await?;
+        let (sessions, sessions_inserted) = self
+            .import_clean_table(Table::Sessions, sessions_dataset)
+            .await?;
+        let (messages, messages_inserted) = self
+            .import_clean_table(Table::Messages, messages_dataset)
+            .await?;
+        let (parts, parts_inserted) = self.import_clean_table(Table::Parts, parts_dataset).await?;
+        Ok(LanceArchiveImport {
+            rows: LanceArchiveCounts {
+                sessions,
+                messages,
+                parts,
+            },
+            inserted: LanceArchiveCounts {
+                sessions: sessions_inserted,
+                messages: messages_inserted,
+                parts: parts_inserted,
+            },
+        })
+    }
+
+    async fn export_clean_table(&self, table: Table, dest: &Path) -> Result<(usize, u64)> {
+        let dataset = self.handle.dataset(table).await?;
+        let source_version = dataset.version_id();
+        let schema = export_schema(table);
+        let mut stream = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .with_context(|| format!("failed to scan {} for archive export", table.as_str()))?;
+        let dest_uri = dest
+            .to_str()
+            .with_context(|| format!("archive path is not UTF-8: {}", dest.display()))?;
+
+        let mut rows = 0usize;
+        let mut wrote = false;
+        while let Some(batch) = stream.next().await {
+            let batch = batch
+                .with_context(|| format!("failed to read {} archive batch", table.as_str()))?;
+            rows += batch.num_rows();
+            let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+            let mut params = write_params_for_create();
+            if wrote {
+                params.mode = WriteMode::Append;
+            }
+            Dataset::write(reader, dest_uri, Some(params))
+                .await
+                .with_context(|| format!("failed to write {} archive table", table.as_str()))?;
+            wrote = true;
+        }
+
+        if !wrote {
+            let batch = RecordBatch::new_empty(schema.clone());
+            let reader = RecordBatchIterator::new([Ok(batch)], schema);
+            Dataset::write(reader, dest_uri, Some(write_params_for_create()))
+                .await
+                .with_context(|| {
+                    format!("failed to write empty {} archive table", table.as_str())
+                })?;
+        }
+        Ok((rows, source_version))
+    }
+
+    async fn import_clean_table(&self, table: Table, dataset: Dataset) -> Result<(usize, usize)> {
+        let mut stream = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .with_context(|| format!("failed to scan {} archive table", table.as_str()))?;
+        let mut rows = 0usize;
+        let mut inserted = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch
+                .with_context(|| format!("failed to read {} archive batch", table.as_str()))?;
+            let row_count = batch.num_rows();
+            rows += row_count;
+            inserted += self
+                .handle
+                .merge_insert(table, batch, row_count)
+                .await
+                .with_context(|| format!("failed to import {} archive table", table.as_str()))?
+                as usize;
+        }
+        Ok((rows, inserted))
     }
 
     pub async fn upsert_sessions(&self, sessions: &[Session]) -> Result<Vec<UpsertStatus>> {
@@ -2392,6 +2545,39 @@ pub(crate) fn write_params_for_create() -> WriteParams {
         skip_auto_cleanup: true,
         ..WriteParams::default()
     }
+}
+
+fn export_schema(table: Table) -> Arc<Schema> {
+    match table {
+        Table::Sessions => session_schema(),
+        Table::Messages => message_schema(),
+        Table::Parts => part_schema(),
+    }
+}
+
+fn ensure_schema_matches_archive(dataset: &Dataset, table: Table) -> Result<()> {
+    let expected = export_schema(table);
+    let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
+    let actual_names: Vec<_> = actual.fields().iter().map(|field| field.name()).collect();
+    let expected_names: Vec<_> = expected.fields().iter().map(|field| field.name()).collect();
+    if actual_names != expected_names {
+        anyhow::bail!(
+            "{} archive table has columns {actual_names:?} but this pond build expects {expected_names:?}",
+            table.as_str(),
+        );
+    }
+    Ok(())
+}
+
+async fn open_archive_table(table: Table, source: &Path) -> Result<Dataset> {
+    let source_uri = source
+        .to_str()
+        .with_context(|| format!("archive path is not UTF-8: {}", source.display()))?;
+    let dataset = Dataset::open(source_uri)
+        .await
+        .with_context(|| format!("failed to open {} archive table", table.as_str()))?;
+    ensure_schema_matches_archive(&dataset, table)?;
+    Ok(dataset)
 }
 
 pub(crate) fn session_schema() -> Arc<Schema> {
