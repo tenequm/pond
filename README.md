@@ -27,7 +27,15 @@ Pre-v1. The crate builds clean and the v1 surface is in place: full CLI, HTTP+JS
 
 ## Install
 
-Pond is a single static binary built from source. Linux and macOS are supported; Windows is not in v1 scope.
+Linux and macOS are supported; Windows is not in v1 scope.
+
+**macOS and Linux (Homebrew):**
+
+```sh
+brew install tenequm/tap/pond
+```
+
+**Build from source:**
 
 ```sh
 git clone https://github.com/tenequm/pond.git
