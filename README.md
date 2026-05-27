@@ -29,10 +29,11 @@ Pre-v1. The crate builds clean and the v1 surface is in place: full CLI, HTTP+JS
 
 Linux and macOS are supported; Windows is not in v1 scope.
 
-**macOS and Linux (Homebrew):**
+**Package Managers (macOS and Linux):**
 
 ```sh
-brew install tenequm/tap/pond
+brew install tenequm/tap/pond                          # Homebrew
+nix profile install github:tenequm/nur-packages#pond  # Nix
 ```
 
 **Build from source:**
