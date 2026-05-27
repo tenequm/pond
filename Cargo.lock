@@ -6352,6 +6352,7 @@ dependencies = [
  "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
+ "libc",
  "rmcp",
  "s3s",
  "s3s-fs",

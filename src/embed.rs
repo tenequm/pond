@@ -1,6 +1,14 @@
-//! The embedding stage: the e5 candle/Metal backend and the batch-oriented
-//! worker that fills `messages.vector` / `messages.embedding_model`
-//! (spec.md#search). One message produces one vector - there is no chunking.
+//! The embedding stage: candle XLM-RoBERTa FP16 ([`CandleEmbedder`]) plus
+//! the batch-oriented [`EmbedWorker`] that fills `messages.vector` /
+//! `messages.embedding_model` (spec.md#search). One message produces one
+//! vector - there is no chunking.
+//!
+//! [`LazyEmbedder`] caches a loaded backend for `pond mcp` / `pond serve`
+//! and drops it after [`DEFAULT_IDLE_EVICTION`] of no use. The drop is
+//! clean under macOS `phys_footprint` (post-drop drops to ~107 MiB
+//! regardless of backend), so time-weighted RSS over an interactive MCP
+//! session stays well under the per-instance budget despite the macOS
+//! Metal buffer pool's `iokit_mapped` retention during active queries.
 //!
 //! The worker accumulates messages and calls the model once per fixed-size
 //! batch, never once per message, and writes each batch's vectors to
@@ -9,31 +17,32 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::xlm_roberta::{Config, XLMRobertaModel};
 use tokenizers::Tokenizer;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
 use crate::sessions::{EmbeddedMessage, PendingMessage, Store, embedding_dim};
 
 /// e5's training context. The tokenizer truncates input past it before
 /// inference - one message, one vector, bounded embed cost.
-const MAX_TOKENS: usize = 512;
+pub(crate) const MAX_TOKENS: usize = 512;
 
-/// The e5 backend: XLM-RoBERTa weights on the GPU (Metal on macOS, CUDA on a
-/// `cuda`-feature non-macOS build, CPU otherwise). `forward` is `&self`, so no
-/// interior mutability is needed.
-pub struct E5Embedder {
+/// The candle e5 backend: XLM-RoBERTa FP16 weights on the GPU (Metal on
+/// macOS, CUDA on a `cuda`-feature non-macOS build, CPU otherwise).
+/// `forward` is `&self`, so no interior mutability is needed.
+pub struct CandleEmbedder {
     model: XLMRobertaModel,
     tokenizer: Tokenizer,
     device: Device,
 }
 
-impl E5Embedder {
+impl CandleEmbedder {
     /// Load the configured XLM-RoBERTa model from HuggingFace (cached after
     /// the first download) onto the best available device.
     pub fn load() -> Result<Self> {
@@ -56,12 +65,16 @@ impl E5Embedder {
                 config.hidden_size,
             ));
         }
-        let tensors = candle_core::safetensors::load(fetch("model.safetensors")?, &device)?;
-        let tensors = tensors
-            .into_iter()
-            .map(|(name, tensor)| Ok((name, tensor.to_dtype(DType::F16)?)))
-            .collect::<Result<std::collections::HashMap<_, _>>>()?;
-        let vb = VarBuilder::from_tensors(tensors, DType::F16, &device);
+        // mmap the safetensors file: candle's `safetensors::load` path uses
+        // `std::fs::read` which retains an owned `Vec<u8>` of the full FP32
+        // weights in the system allocator after drop on macOS. mmap avoids
+        // the owned-heap path. Note: candle's Metal pool retains FP32->F16
+        // cast transients regardless (iokit_mapped contribution to
+        // phys_footprint, candle-core/src/metal_backend/device.rs:44-57).
+        let model_path = fetch("model.safetensors")?;
+        #[allow(unsafe_code)]
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F16, &device)? };
         let model = XLMRobertaModel::new(&config, vb)
             .map_err(|error| anyhow!("load {id} weights: {error}"))?;
 
@@ -86,14 +99,13 @@ impl E5Embedder {
             device,
         })
     }
-
-    /// The device the weights are on - `"metal"`, `"cuda"`, or `"cpu"`.
-    pub fn device(&self) -> &'static str {
-        device_label(&self.device)
-    }
 }
 
-impl EmbedBackend for E5Embedder {
+impl Embedder for CandleEmbedder {
+    fn device(&self) -> &str {
+        device_label(&self.device)
+    }
+
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -152,46 +164,110 @@ fn device_label(device: &Device) -> &'static str {
     }
 }
 
-/// Lazy holder for the embedding backend. The candle/Metal model isn't
-/// loaded until the first hybrid search asks for it - idle `pond mcp` /
-/// `pond serve` keep RSS down to ~50 MB, and FTS-only corpora never pay the
-/// load at all because `pond_search`'s resolver only calls `get` inside the
-/// hybrid/vector branches. First call triggers the load (~2-4s) and the
-/// loaded handle is cached for the life of the process.
-#[derive(Default)]
+/// Arc-shared factory used by [`LazyEmbedder`] to build the backend on
+/// first call (or on reload after idle eviction). Arc so the loader can be
+/// cloned into `spawn_blocking` without consuming `&self`.
+type EmbedLoader = Arc<dyn Fn() -> Result<Arc<dyn Embedder>> + Send + Sync>;
+
+/// How long the cached backend can sit unused before [`LazyEmbedder::get`]
+/// drops it. Five minutes matches typical interactive-MCP conversational
+/// pauses: short enough that a model that's been unused for a turn or two
+/// is gone before the next quiet window, long enough that ordinary
+/// query bursts never pay the reload cost.
+pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(300);
+
+struct CachedBackend {
+    backend: Arc<dyn Embedder>,
+    last_use: Instant,
+}
+
+/// Lazy holder for an [`Embedder`] with idle eviction. The model isn't
+/// loaded until the first hybrid/vector call asks for it - idle `pond mcp`
+/// / `pond serve` processes pay nothing while no vector queries land. After
+/// `idle_threshold` of inactivity the cached backend is dropped on the
+/// next `get` call; under macOS `phys_footprint` the drop reclaims
+/// ~365-585 MiB cleanly (the post-drop floor is ~107 MiB regardless of
+/// backend). Reload cost is one synchronous model-load (300-500 ms),
+/// absorbed inside the human-paced gap between MCP queries.
 pub struct LazyEmbedder {
-    cell: OnceCell<Arc<dyn EmbedBackend>>,
+    loader: EmbedLoader,
+    state: Mutex<Option<CachedBackend>>,
+    idle_threshold: Duration,
 }
 
 impl LazyEmbedder {
-    pub fn new() -> Self {
-        Self::default()
+    /// candle XLM-RoBERTa FP16 (Metal on macOS / CUDA with `--features cuda`
+    /// / CPU otherwise). The pond default for every entry point.
+    pub fn candle() -> Self {
+        Self::with_loader(Arc::new(|| {
+            Ok(Arc::new(CandleEmbedder::load()?) as Arc<dyn Embedder>)
+        }))
+    }
+
+    /// Build a `LazyEmbedder` from an explicit loader. Used by the bench
+    /// harness to override the idle threshold; production callers use
+    /// [`Self::candle`].
+    pub fn with_loader(loader: EmbedLoader) -> Self {
+        Self {
+            loader,
+            state: Mutex::new(None),
+            idle_threshold: DEFAULT_IDLE_EVICTION,
+        }
+    }
+
+    /// Override the idle-eviction threshold. Pass `Duration::MAX` to disable
+    /// eviction entirely - useful in benches that want a stable steady-state.
+    #[must_use]
+    pub fn with_idle_threshold(mut self, threshold: Duration) -> Self {
+        self.idle_threshold = threshold;
+        self
     }
 
     /// Pre-seed with an already-constructed backend. Used by integration
-    /// tests that want to inject a fake `EmbedBackend` without paying the
-    /// real model-load cost.
-    pub fn from_loaded(backend: Arc<dyn EmbedBackend>) -> Self {
-        let cell = OnceCell::new();
-        let _ = cell.set(backend);
-        Self { cell }
+    /// tests that want to inject a fake `Embedder` without paying the real
+    /// model-load cost. Eviction is disabled so the test fake survives the
+    /// whole test even if a test stalls.
+    pub fn from_loaded(backend: Arc<dyn Embedder>) -> Self {
+        let preloaded = Arc::clone(&backend);
+        let loader: EmbedLoader = Arc::new(move || Ok(Arc::clone(&preloaded)));
+        Self {
+            loader,
+            state: Mutex::new(Some(CachedBackend {
+                backend,
+                last_use: Instant::now(),
+            })),
+            idle_threshold: Duration::MAX,
+        }
     }
 
-    /// Load (on first call) or return the cached handle. The candle load is
-    /// synchronous and blocking, so it runs on `spawn_blocking`; the async
-    /// caller sees a clean `await` point.
-    pub async fn get(&self) -> Result<Arc<dyn EmbedBackend>> {
-        let handle = self
-            .cell
-            .get_or_try_init(|| async {
-                tokio::task::spawn_blocking(|| {
-                    E5Embedder::load().map(|backend| Arc::new(backend) as Arc<dyn EmbedBackend>)
-                })
-                .await
-                .map_err(|join_error| anyhow!("embedder load panicked: {join_error}"))?
-            })
-            .await?;
-        Ok(handle.clone())
+    /// Load (on first call or after eviction) or return the cached handle.
+    /// The candle load is synchronous and blocking, so it runs on
+    /// `spawn_blocking`; the async caller sees a clean `await` point.
+    pub async fn get(&self) -> Result<Arc<dyn Embedder>> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = &*state
+            && now.duration_since(cached.last_use) > self.idle_threshold
+        {
+            tracing::info!(
+                idle_secs = self.idle_threshold.as_secs(),
+                "evicting idle embedder",
+            );
+            *state = None;
+        }
+        if let Some(cached) = state.as_mut() {
+            cached.last_use = now;
+            return Ok(Arc::clone(&cached.backend));
+        }
+        let loader = Arc::clone(&self.loader);
+        let backend = tokio::task::spawn_blocking(move || loader())
+            .await
+            .map_err(|join_error| anyhow!("embedder load panicked: {join_error}"))??;
+        *state = Some(CachedBackend {
+            backend: Arc::clone(&backend),
+            last_use: now,
+        });
+        Ok(backend)
     }
 }
 
@@ -251,11 +327,17 @@ pub fn format_passage(text: &str) -> String {
     format!("passage: {text}")
 }
 
-/// The embedding seam (spec.md#search): text in, vectors out. The real backend
-/// is [`E5Embedder`]; tests substitute an instrumented fake to assert
-/// batching behavior. The vector width is checked at the write boundary and
-/// the model id is whatever [`model_id`] returns at the time of the write.
-pub trait EmbedBackend: Send + Sync {
+/// The embedding seam (spec.md#search): text in, vectors out. The real
+/// backend is [`CandleEmbedder`]; tests substitute an instrumented fake
+/// to assert batching behavior. The vector width is checked at the write
+/// boundary and the model id is whatever [`model_id`] returns at the
+/// time of the write.
+pub trait Embedder: Send + Sync {
+    /// A short label naming the hardware/runtime: `"metal"`, `"cuda"`,
+    /// or `"cpu"`. Used by `pond embed` to surface what backend ran the
+    /// inference; benches print it alongside latency.
+    fn device(&self) -> &str;
+
     /// Embed a batch of texts. The returned vectors are L2-normalized and
     /// [`embedding_dim`] long, one per input.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -292,7 +374,7 @@ type ProgressFn = Box<dyn Fn(BatchProgress) + Send + Sync>;
 /// un-embedded messages. Reads `messages.search_text` directly, batches it
 /// through the backend one vector each, and writes each batch back to
 /// `messages` by primary key.
-pub struct EmbedWorker<'a, B: EmbedBackend> {
+pub struct EmbedWorker<'a, B: Embedder> {
     store: &'a Store,
     backend: &'a B,
     include_stale: bool,
@@ -312,7 +394,7 @@ pub struct EmbedWorker<'a, B: EmbedBackend> {
     cancel: Option<Arc<AtomicBool>>,
 }
 
-impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
+impl<'a, B: Embedder> EmbedWorker<'a, B> {
     /// Build a worker over `store`'s un-embedded backlog. A backend whose
     /// vectors are the wrong width is rejected at the write boundary
     /// (`embedding_update_batch`), so there is nothing to validate here.
@@ -496,8 +578,10 @@ impl<'a, B: EmbedBackend> EmbedWorker<'a, B> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn e5_prefixes_apply_the_asymmetric_retrieval_pair() {
@@ -509,5 +593,64 @@ mod tests {
             format_passage("retry uses exponential backoff"),
             "passage: retry uses exponential backoff",
         );
+    }
+
+    /// Counts how many times `LazyEmbedder` invokes its loader. Lets the
+    /// idle-eviction test detect reloads without spinning up a real model.
+    struct CountingEmbedder;
+    impl Embedder for CountingEmbedder {
+        fn device(&self) -> &str {
+            "test"
+        }
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+    }
+
+    /// `LazyEmbedder` keys eviction on `std::time::Instant`, which isn't
+    /// affected by `tokio::time::pause`. The test uses a tiny real
+    /// threshold so the suite runs in <100 ms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_embedder_evicts_after_idle_threshold() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&loads);
+        let loader: EmbedLoader = Arc::new(move || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Arc::new(CountingEmbedder) as Arc<dyn Embedder>)
+        });
+        let embedder =
+            LazyEmbedder::with_loader(loader).with_idle_threshold(Duration::from_millis(20));
+
+        embedder.get().await.unwrap();
+        assert_eq!(
+            loads.load(AtomicOrdering::SeqCst),
+            1,
+            "first get loads once"
+        );
+
+        embedder.get().await.unwrap();
+        assert_eq!(
+            loads.load(AtomicOrdering::SeqCst),
+            1,
+            "back-to-back get reuses the cached backend",
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        embedder.get().await.unwrap();
+        assert_eq!(
+            loads.load(AtomicOrdering::SeqCst),
+            2,
+            "get after the idle threshold triggers a reload",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_embedder_from_loaded_never_evicts() {
+        let preloaded = LazyEmbedder::from_loaded(Arc::new(CountingEmbedder));
+        preloaded.get().await.unwrap();
+        // Wait past any reasonable threshold; the from_loaded path uses
+        // Duration::MAX so the fake stays alive for the whole test.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        preloaded.get().await.unwrap();
     }
 }

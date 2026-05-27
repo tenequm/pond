@@ -14,9 +14,12 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 comfy-table = "7"
 dialoguer = { version = "0.12", default-features = false }
-# Embedding stack for `intfloat/multilingual-e5-small`. Backend chosen at
-# runtime in `src/embed.rs`: Metal on macOS (via the `[target.*]` block
-# below), CUDA via `--features cuda`, CPU otherwise.
+# Embedding stack for `intfloat/multilingual-e5-small`: candle XLM-RoBERTa
+# FP16 on Metal (macOS) / CUDA (`--features cuda`) / CPU. `LazyEmbedder`
+# (`src/embed.rs`) idle-evicts the loaded backend after
+# `embed::DEFAULT_IDLE_EVICTION` (5 min) of no use - the macOS Metal-buffer-pool
+# retention costs phys_footprint only during the brief active query burst
+# after each idle period.
 candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
@@ -75,6 +78,14 @@ s3s = "0.13"
 s3s-fs = "0.13"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
+# macOS-only dev-dep so `benches/serve_mem_bench.rs` can sample
+# `phys_footprint` via `libc::proc_pid_rusage(RUSAGE_INFO_V4)` - the same
+# ledger Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read.
+# RSS on macOS is wrong in both directions (overcounts shared dyld pages,
+# undercounts compressed pages); phys_footprint is the load-bearing metric.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
+
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]
 name = "embed_bench"
@@ -113,7 +124,9 @@ lto = "thin"
 codegen-units = 1
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny` not `forbid` so candle's mmap-based safetensors loader (an inherently
+# unsafe FFI to memmap2) can be opted into per-call. See src/embed.rs.
+unsafe_code = "deny"
 unreachable_pub = "warn"
 
 [lints.clippy]

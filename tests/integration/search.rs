@@ -9,7 +9,7 @@
 use pond::{
     adapter::ClaudeCodeAdapter,
     config::SearchConfig,
-    embed::{EmbedBackend, EmbedWorker, LazyEmbedder},
+    embed::{EmbedWorker, Embedder, LazyEmbedder},
     handlers::ingest_adapter,
     handlers::pond_get,
     handlers::pond_search,
@@ -30,7 +30,11 @@ const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 /// non-degenerate ranking and for the query side to embed.
 struct FakeBackend;
 
-impl EmbedBackend for FakeBackend {
+impl Embedder for FakeBackend {
+    fn device(&self) -> &str {
+        "fake"
+    }
+
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|text| pseudo_vector(text)).collect())
     }
@@ -64,7 +68,7 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedde
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
     store.optimize_indices(None, None).await?.into_result()?;
-    let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn EmbedBackend>);
+    let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn Embedder>);
     Ok((store, embedder))
 }
 
@@ -370,7 +374,7 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         group_by_conversation: false,
         limit: 50,
     };
-    let embedder = LazyEmbedder::new();
+    let embedder = LazyEmbedder::candle();
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(
         hits.iter().all(|hit| hit.message_id != "u-notify"),

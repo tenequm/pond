@@ -15,7 +15,7 @@ use axum::{
 use pond::{
     PROTOCOL_VERSION,
     adapter::ClaudeCodeAdapter,
-    embed::{EmbedBackend, EmbedWorker},
+    embed::{EmbedWorker, Embedder},
     handlers::ingest_adapter,
     sessions::{Store, embedding_dim},
     transport::{AppState, http},
@@ -30,7 +30,11 @@ const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
 struct FakeBackend;
 
-impl EmbedBackend for FakeBackend {
+impl Embedder for FakeBackend {
+    fn device(&self) -> &str {
+        "fake"
+    }
+
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|text| fake_vector(text)).collect())
     }

@@ -1170,7 +1170,7 @@ mod search_handler {
 
     use crate::{
         Clock, SystemClock,
-        embed::{EmbedBackend, LazyEmbedder, format_query},
+        embed::{Embedder, LazyEmbedder, format_query},
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
@@ -1532,7 +1532,7 @@ mod search_handler {
     /// load failure is a server-side problem, not a caller error.
     async fn load_embedder(
         embedder: &LazyEmbedder,
-    ) -> Result<std::sync::Arc<dyn EmbedBackend>, ErrorEnvelope> {
+    ) -> Result<std::sync::Arc<dyn Embedder>, ErrorEnvelope> {
         embedder.get().await.map_err(|error| {
             map_error(crate::Error::internal(format!(
                 "embedder load failed: {error}"
@@ -1867,7 +1867,7 @@ mod search_handler {
             .collect()
     }
 
-    fn embed_query(embedder: &dyn EmbedBackend, query: &str) -> Result<Vec<f32>, ErrorEnvelope> {
+    fn embed_query(embedder: &dyn Embedder, query: &str) -> Result<Vec<f32>, ErrorEnvelope> {
         let prompt = format_query(query);
         // Model inference is synchronous and CPU-bound; `block_in_place` keeps
         // it from stalling other tasks on the async worker thread. (Requires a

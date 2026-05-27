@@ -440,7 +440,7 @@ pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
 
 impl EmbeddingsConfig {
     /// Surface-level validation: model id non-empty and dim divisible by 8.
-    /// The dim/model mismatch is the load-time check inside `E5Embedder::load`,
+    /// The dim/model mismatch is the load-time check inside `CandleEmbedder::load`,
     /// which knows the model's `hidden_size`; what we can catch up front is the
     /// IVF_PQ subspace stride (`dim / 8` in `embed::index_params`).
     pub fn validate(&self) -> Result<()> {

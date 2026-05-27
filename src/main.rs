@@ -18,7 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
     config::{self, Config, DEFAULT_CONFIG_TOML},
-    embed::{BatchProgress, E5Embedder, EmbedSummary, EmbedWorker, LazyEmbedder},
+    embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
         AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, LanceArchiveCounts,
@@ -582,7 +582,7 @@ async fn main() -> anyhow::Result<()> {
                 open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
                     .await?,
             );
-            let embedder = Arc::new(LazyEmbedder::new());
+            let embedder = Arc::new(LazyEmbedder::candle());
             let state = AppState {
                 store,
                 embedder,
@@ -609,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
-            let embedder = Arc::new(LazyEmbedder::new());
+            let embedder = Arc::new(LazyEmbedder::candle());
             transport::mcp::serve_stdio(AppState {
                 store,
                 embedder,
@@ -641,7 +641,7 @@ async fn main() -> anyhow::Result<()> {
             let store =
                 Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
                     .await?;
-            let embedder = LazyEmbedder::new();
+            let embedder = LazyEmbedder::candle();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -1076,7 +1076,7 @@ async fn run_embed_stage_with_limit(
         });
     }
 
-    let embedder = E5Embedder::load()?;
+    let embedder = CandleEmbedder::load()?;
     let device = embedder.device().to_owned();
     let bar = ProgressBar::new(bar_total as u64);
     bar.set_style(

@@ -1,12 +1,15 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+// The macOS `proc_pid_rusage` FFI for phys_footprint sampling needs `unsafe`.
+#![allow(unsafe_code)]
+#![allow(unreachable_pub, dead_code)]
 
 //! Read-only memory bench for `pond mcp` / `pond serve`. Opens an existing
 //! `~/.local/share/pond/` corpus, drives realistic `pond_search` / `pond_get`
 //! workloads, and reports peak RSS per phase against a 500 MiB default target.
 //!
 //! No ingest, no embed-worker, no index build - this measures *only* the
-//! steady-state read path that a stdio MCP serves. The real `E5Embedder`
-//! loads on the first hybrid query, matching production lazy-load behavior.
+//! steady-state read path that a stdio MCP serves. The candle embedder
+//! loads lazily on the first hybrid query, matching production behavior.
 //!
 //! Phases (sequential, matches MCP's stdio request serialization):
 //!   - cold_open    : RSS right after `Store::open_local`
@@ -39,7 +42,7 @@ use clap::Parser;
 use pond::{
     PROTOCOL_VERSION,
     config::SearchConfig,
-    embed::{E5Embedder, EmbedBackend, LazyEmbedder},
+    embed::{CandleEmbedder, Embedder, LazyEmbedder},
     handlers::{pond_get, pond_search},
     sessions::Store,
     substrate::RuntimeCaps,
@@ -124,12 +127,148 @@ struct Args {
     bench: bool,
 }
 
-/// Background sampler: peak RSS via `ps -o rss=`. `peak_kb` is the running max
-/// since `start()`; `phase_peak_kb` is reset by `mark_phase_start`.
+/// macOS phys_footprint accessors (`proc_pid_rusage(RUSAGE_INFO_V4)`). This
+/// is what Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read
+/// and the only metric the kernel's Jetsam OOM-killer cares about. RSS is
+/// wrong in both directions on macOS - overcounts shared dyld pages,
+/// undercounts compressed pages. We sample both for one or two runs to
+/// quantify the gap, then drop RSS.
+#[cfg(target_os = "macos")]
+mod footprint {
+    // Mirror of `<sys/resource.h>` `rusage_info_v4` (Apple's stable layout).
+    // We need `ri_phys_footprint`, `ri_lifetime_max_phys_footprint`, and
+    // `ri_interval_max_phys_footprint` so we can read per-phase peak via
+    // `proc_reset_footprint_interval` between phases.
+    #[repr(C)]
+    #[derive(Default, Copy, Clone)]
+    pub struct RUsageInfoV4 {
+        pub ri_uuid: [u8; 16],
+        pub ri_user_time: u64,
+        pub ri_system_time: u64,
+        pub ri_pkg_idle_wkups: u64,
+        pub ri_interrupt_wkups: u64,
+        pub ri_pageins: u64,
+        pub ri_wired_size: u64,
+        pub ri_resident_size: u64,
+        pub ri_phys_footprint: u64,
+        pub ri_proc_start_abstime: u64,
+        pub ri_proc_exit_abstime: u64,
+        pub ri_child_user_time: u64,
+        pub ri_child_system_time: u64,
+        pub ri_child_pkg_idle_wkups: u64,
+        pub ri_child_interrupt_wkups: u64,
+        pub ri_child_pageins: u64,
+        pub ri_child_elapsed_abstime: u64,
+        pub ri_diskio_bytesread: u64,
+        pub ri_diskio_byteswritten: u64,
+        pub ri_cpu_time_qos_default: u64,
+        pub ri_cpu_time_qos_maintenance: u64,
+        pub ri_cpu_time_qos_background: u64,
+        pub ri_cpu_time_qos_utility: u64,
+        pub ri_cpu_time_qos_legacy: u64,
+        pub ri_cpu_time_qos_user_initiated: u64,
+        pub ri_cpu_time_qos_user_interactive: u64,
+        pub ri_billed_system_time: u64,
+        pub ri_serviced_system_time: u64,
+        pub ri_logical_writes: u64,
+        pub ri_lifetime_max_phys_footprint: u64,
+        pub ri_instructions: u64,
+        pub ri_cycles: u64,
+        pub ri_billed_energy: u64,
+        pub ri_serviced_energy: u64,
+        pub ri_interval_max_phys_footprint: u64,
+        pub ri_runnable_time: u64,
+    }
+
+    pub const RUSAGE_INFO_V4: libc::c_int = 4;
+
+    // `proc_reset_footprint_interval` lives in `<libproc_internal.h>` (private
+    // API). Stable in practice - WebKit, psutil, and footprint(1) all use it.
+    // libc doesn't declare it; declare manually.
+    unsafe extern "C" {
+        pub fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            buffer: *mut libc::c_void,
+        ) -> libc::c_int;
+        pub fn proc_reset_footprint_interval(pid: libc::c_int) -> libc::c_int;
+    }
+
+    fn read() -> Option<RUsageInfoV4> {
+        let mut info = RUsageInfoV4::default();
+        let pid = unsafe { libc::getpid() };
+        let kr = unsafe {
+            proc_pid_rusage(
+                pid,
+                RUSAGE_INFO_V4,
+                &mut info as *mut _ as *mut libc::c_void,
+            )
+        };
+        (kr == 0).then_some(info)
+    }
+
+    /// Current phys_footprint in KiB.
+    pub fn current_kb() -> Option<u64> {
+        read().map(|i| i.ri_phys_footprint / 1024)
+    }
+
+    /// Peak phys_footprint since the last `reset_interval` call, in KiB. Used
+    /// for per-phase peak instead of carrying a lifetime watermark in user
+    /// space.
+    pub fn interval_peak_kb() -> Option<u64> {
+        read().map(|i| i.ri_interval_max_phys_footprint / 1024)
+    }
+
+    /// Reset the kernel-tracked phys_footprint interval-peak counter.
+    pub fn reset_interval() {
+        let pid = unsafe { libc::getpid() };
+        unsafe {
+            let _ = proc_reset_footprint_interval(pid);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sample_phys_footprint_kb() -> Option<u64> {
+    footprint::current_kb()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sample_phys_footprint_kb() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn footprint_interval_peak_kb() -> Option<u64> {
+    footprint::interval_peak_kb()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn footprint_interval_peak_kb() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn reset_footprint_interval() {
+    footprint::reset_interval();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reset_footprint_interval() {}
+
+/// Background sampler: tracks both `ps -o rss=` (the classic RSS, overcounts
+/// shared libs on macOS) and macOS `phys_footprint` (the private-memory-cost
+/// metric Activity Monitor uses, excludes shared libs). `peak_kb` is the
+/// running max since `start()`; `phase_peak_kb` is reset by
+/// `mark_phase_start`. All `*_kb` fields are tracked in parallel for both
+/// metrics, suffixed `_pf` for phys_footprint.
 struct RssSampler {
     peak_kb: Arc<AtomicU64>,
     phase_peak_kb: Arc<AtomicU64>,
     current_kb: Arc<AtomicU64>,
+    peak_pf_kb: Arc<AtomicU64>,
+    phase_peak_pf_kb: Arc<AtomicU64>,
+    current_pf_kb: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -139,12 +278,18 @@ impl RssSampler {
         let peak_kb = Arc::new(AtomicU64::new(0));
         let phase_peak_kb = Arc::new(AtomicU64::new(0));
         let current_kb = Arc::new(AtomicU64::new(0));
+        let peak_pf_kb = Arc::new(AtomicU64::new(0));
+        let phase_peak_pf_kb = Arc::new(AtomicU64::new(0));
+        let current_pf_kb = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let pid = std::process::id().to_string();
         let handle = {
             let peak = Arc::clone(&peak_kb);
             let phase = Arc::clone(&phase_peak_kb);
             let current = Arc::clone(&current_kb);
+            let peak_pf = Arc::clone(&peak_pf_kb);
+            let phase_pf = Arc::clone(&phase_peak_pf_kb);
+            let current_pf = Arc::clone(&current_pf_kb);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
@@ -152,6 +297,11 @@ impl RssSampler {
                         current.store(kb, Ordering::Relaxed);
                         peak.fetch_max(kb, Ordering::Relaxed);
                         phase.fetch_max(kb, Ordering::Relaxed);
+                    }
+                    if let Some(kb) = sample_phys_footprint_kb() {
+                        current_pf.store(kb, Ordering::Relaxed);
+                        peak_pf.fetch_max(kb, Ordering::Relaxed);
+                        phase_pf.fetch_max(kb, Ordering::Relaxed);
                     }
                     thread::sleep(interval);
                 }
@@ -161,6 +311,9 @@ impl RssSampler {
             peak_kb,
             phase_peak_kb,
             current_kb,
+            peak_pf_kb,
+            phase_peak_pf_kb,
+            current_pf_kb,
             stop,
             handle: Some(handle),
         }
@@ -174,15 +327,39 @@ impl RssSampler {
         self.peak_kb.load(Ordering::Relaxed)
     }
 
+    fn current_pf_kb(&self) -> u64 {
+        self.current_pf_kb.load(Ordering::Relaxed)
+    }
+
+    fn peak_pf_kb(&self) -> u64 {
+        self.peak_pf_kb.load(Ordering::Relaxed)
+    }
+
     fn mark_phase_start(&self) {
-        // Reset the per-phase max to the current sample so the next read of
-        // `phase_peak_kb` reflects only what this phase did.
+        // RSS per-phase max is tracked in userspace from the current sample.
+        // phys_footprint interval-peak is tracked by the kernel via
+        // `proc_reset_footprint_interval` - resetting here means the next
+        // `ri_interval_max_phys_footprint` read returns the peak within this
+        // phase only, with no userspace sampling-race-condition risk.
         let now = self.current_kb.load(Ordering::Relaxed);
         self.phase_peak_kb.store(now, Ordering::Relaxed);
+        reset_footprint_interval();
+        // Mirror the same reset on the userspace pf atomic so any sampler
+        // reads between reset and the next sample don't carry stale values.
+        let now_pf = self.current_pf_kb.load(Ordering::Relaxed);
+        self.phase_peak_pf_kb.store(now_pf, Ordering::Relaxed);
     }
 
     fn phase_peak_kb(&self) -> u64 {
         self.phase_peak_kb.load(Ordering::Relaxed)
+    }
+
+    /// Kernel-tracked interval peak for phys_footprint since the last
+    /// `mark_phase_start`. Falls back to the userspace-sampled peak on
+    /// non-macOS or if the syscall failed.
+    fn phase_peak_pf_kb(&self) -> u64 {
+        footprint_interval_peak_kb()
+            .unwrap_or_else(|| self.phase_peak_pf_kb.load(Ordering::Relaxed))
     }
 
     fn finish(mut self) -> u64 {
@@ -239,6 +416,10 @@ struct PhaseStats {
     rss_end_kb: u64,
     rss_phase_peak_kb: u64,
     rss_global_peak_kb: u64,
+    pf_start_kb: u64,
+    pf_end_kb: u64,
+    pf_phase_peak_kb: u64,
+    pf_global_peak_kb: u64,
     notes: String,
 }
 
@@ -303,6 +484,7 @@ async fn run_search_phase(input: SearchPhase<'_>) -> Result<PhaseStats> {
         hit_sink,
     } = input;
     let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
     sampler.mark_phase_start();
     let mut elapsed_ms: Vec<u128> = Vec::with_capacity(queries.len());
 
@@ -331,6 +513,10 @@ async fn run_search_phase(input: SearchPhase<'_>) -> Result<PhaseStats> {
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
         notes: String::new(),
     })
 }
@@ -342,6 +528,7 @@ async fn run_get_phase(
     message_ids: &[String],
 ) -> Result<PhaseStats> {
     let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
     sampler.mark_phase_start();
     let mut elapsed_ms: Vec<u128> = Vec::with_capacity(message_ids.len());
 
@@ -366,6 +553,10 @@ async fn run_get_phase(
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
         notes: String::new(),
     })
 }
@@ -381,50 +572,57 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn print_phase_header() {
+    // rss_*: macOS `ps -o rss=` - overcounts shared dyld pages, undercounts
+    // compressed pages. Reported for one-or-two-run side-by-side comparison.
+    // pf_*: macOS `task_vm_info.phys_footprint` (kernel's own ledger; what
+    // Activity Monitor, Jetsam, footprint(1) all use). This is the
+    // load-bearing memory-budget metric.
     println!(
-        "{:<16}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>6}",
-        "phase", "n", "start_M", "end_M", "peak_M", "gpeak_M", "p50_ms", "p95_ms", "max_ms",
+        "{:<14}  {:>4}  {:>6}  {:>6}  {:>6}  {:>6}  {:>5}  {:>5}",
+        "phase", "n", "rssEnd", "rssPk", "pfEnd", "pfPk", "p50", "p95",
     );
-    println!("{}", "-".repeat(95));
+    println!("{}", "-".repeat(80));
 }
 
 fn print_phase_row(stat: &PhaseStats) {
-    let start_m = stat.rss_start_kb as f64 / 1024.0;
-    let end_m = stat.rss_end_kb as f64 / 1024.0;
-    let peak_m = stat.rss_phase_peak_kb as f64 / 1024.0;
-    let gpeak_m = stat.rss_global_peak_kb as f64 / 1024.0;
+    let rss_end_m = stat.rss_end_kb as f64 / 1024.0;
+    let rss_peak_m = stat.rss_phase_peak_kb as f64 / 1024.0;
+    let pf_end_m = stat.pf_end_kb as f64 / 1024.0;
+    let pf_peak_m = stat.pf_phase_peak_kb as f64 / 1024.0;
     println!(
-        "{:<16}  {:>5}  {:>7.1}  {:>7.1}  {:>7.1}  {:>7.1}  {:>7}  {:>7}  {:>6}",
+        "{:<14}  {:>4}  {:>6.1}  {:>6.1}  {:>6.1}  {:>6.1}  {:>5}  {:>5}",
         stat.name,
         stat.queries,
-        start_m,
-        end_m,
-        peak_m,
-        gpeak_m,
+        rss_end_m,
+        rss_peak_m,
+        pf_end_m,
+        pf_peak_m,
         stat.p50(),
         stat.p95(),
-        stat.max(),
     );
     if !stat.notes.is_empty() {
-        println!("                  {}", stat.notes);
+        println!("                {}", stat.notes);
     }
 }
 
-/// Probe the embedder lifecycle in isolation: load, run a few embed() calls
-/// (forces Metal command-buffer flushes -> drop_unused_buffers), drop, idle.
-/// Tracks RSS at each step so we can see whether candle's Metal buffer pool
-/// retains FP32 staging RAM after the F32 -> F16 conversion.
+/// Probe the embedder lifecycle in isolation for the selected backend:
+/// load, run a few embed() calls, drop, idle, reload. Tracks RSS at each
+/// step so we can quantify the candle/Metal buffer pool retention that
+/// shows up in `phys_footprint` (see docs/researches/embeddings.md).
 fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseStats>> {
     let mut phases = Vec::new();
+
+    let load_backend = || -> Result<CandleEmbedder> { CandleEmbedder::load() };
 
     // --- baseline ---
     thread::sleep(Duration::from_millis(300));
     let baseline = sampler.current_kb();
+    let baseline_pf = sampler.current_pf_kb();
 
-    // --- E5 load ---
+    // --- load ---
     sampler.mark_phase_start();
     let load_start = Instant::now();
-    let embedder = E5Embedder::load()?;
+    let embedder = load_backend()?;
     let load_ms = load_start.elapsed().as_millis();
     thread::sleep(Duration::from_millis(400));
     phases.push(PhaseStats {
@@ -435,25 +633,23 @@ fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseSt
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
-        notes: format!(
-            "E5Embedder::load() = {load_ms} ms; device={}",
-            embedder.device()
-        ),
+        pf_start_kb: baseline_pf,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: format!("candle::load() = {load_ms} ms"),
     });
 
     // --- embed warm + flush ---
-    // Run a handful of forward passes. Each `command_encoder()` triggers a
-    // flush check; on flush, candle's MetalDevice runs `drop_unused_buffers`,
-    // which is the only path that reclaims pool slots with strong_count==1.
     sampler.mark_phase_start();
     let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
     let mut elapsed_ms = Vec::new();
     let texts: Vec<String> = (0..8).map(|i| format!("query: probe pass {i}")).collect();
     for round in 0..6 {
         let t = Instant::now();
         let _ = embedder.embed(&texts)?;
         elapsed_ms.push(t.elapsed().as_millis());
-        // Brief pause so the sampler catches steady-state between rounds.
         if round == 0 {
             thread::sleep(Duration::from_millis(200));
         }
@@ -467,16 +663,18 @@ fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseSt
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
-        notes: "6 rounds * 8 texts; forward passes trigger Metal command flushes".to_owned(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: "6 rounds * 8 texts".to_owned(),
     });
 
     // --- drop + idle ---
     sampler.mark_phase_start();
     let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
     drop(embedder);
-    // Give the allocator/OS a moment to settle. On macOS large freed
-    // allocations typically munmap promptly; if RSS doesn't drop here, the
-    // load delta was held by something outside the embedder's drop path.
     thread::sleep(Duration::from_secs(idle_seconds.max(2)));
     phases.push(PhaseStats {
         name: "post_drop",
@@ -486,14 +684,19 @@ fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseSt
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
-        notes: format!("E5Embedder dropped; slept {idle_seconds}s"),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: format!("embedder dropped; slept {idle_seconds}s"),
     });
 
-    // --- reload to see if the second load is cheaper (fragmentation signal) ---
+    // --- reload to surface allocator fragmentation ---
     sampler.mark_phase_start();
     let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
     let reload_start = Instant::now();
-    let embedder2 = E5Embedder::load()?;
+    let embedder2 = load_backend()?;
     let reload_ms = reload_start.elapsed().as_millis();
     thread::sleep(Duration::from_millis(400));
     phases.push(PhaseStats {
@@ -504,7 +707,11 @@ fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseSt
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
-        notes: format!("E5Embedder::load() #2 = {reload_ms} ms"),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: format!("candle::load() #2 = {reload_ms} ms"),
     });
     drop(embedder2);
 
@@ -517,19 +724,18 @@ async fn main() -> Result<()> {
 
     if args.probe_embedder {
         println!("=== pond serve-mem bench: --probe-embedder ===");
-        println!("(no Store, no search; isolates the E5 model's RSS footprint)");
+        println!("(no Store, no search; isolates the candle embedder's RSS footprint)");
         println!();
         let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
         thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
         let baseline_kb = sampler.current_kb();
         println!(
-            "baseline RSS     {:.1} MiB (this process before E5 load)",
+            "baseline RSS     {:.1} MiB (this process before load)",
             baseline_kb as f64 / 1024.0,
         );
         println!();
-        let phases =
-            tokio::task::spawn_blocking(move || probe_embedder(&sampler, args.idle_seconds))
-                .await??;
+        let idle = args.idle_seconds;
+        let phases = tokio::task::spawn_blocking(move || probe_embedder(&sampler, idle)).await??;
         print_phase_header();
         for phase in &phases {
             print_phase_row(phase);
@@ -590,9 +796,11 @@ async fn main() -> Result<()> {
     // One pre-open sample so `cold_open` `start_M` is the pre-pond baseline.
     thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
     let baseline_kb = sampler.current_kb();
+    let baseline_pf_kb = sampler.current_pf_kb();
     println!(
-        "baseline RSS     {:.1} MiB (this process before pond)",
-        baseline_kb as f64 / 1024.0
+        "baseline RSS     {:.1} MiB    PF {:.1} MiB    (this process before pond)",
+        baseline_kb as f64 / 1024.0,
+        baseline_pf_kb as f64 / 1024.0,
     );
     println!();
 
@@ -613,6 +821,10 @@ async fn main() -> Result<()> {
         rss_end_kb: sampler.current_kb(),
         rss_phase_peak_kb: sampler.phase_peak_kb(),
         rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb: baseline_pf_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
         notes: format!("sessions={sessions} messages={messages} parts={parts} open_ms={open_ms}",),
     };
     // For cold_open, latency stats use the one open() call.
@@ -620,7 +832,7 @@ async fn main() -> Result<()> {
     phases.push(cold);
 
     // LazyEmbedder created but NOT loaded - matches `pond mcp` lazy behavior.
-    let embedder = LazyEmbedder::new();
+    let embedder = LazyEmbedder::candle();
     let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // ---- Phase: fts_warm ----
@@ -659,6 +871,7 @@ async fn main() -> Result<()> {
         // ---- Phase: first_hybrid ----
         sampler.mark_phase_start();
         let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
         let request = search_request(QUERIES[0], Some(SearchModeWire::Hybrid), args.limit);
         let t = Instant::now();
         let envelope = pond_search(&store, &embedder, request, &cfg).await;
@@ -676,6 +889,10 @@ async fn main() -> Result<()> {
             rss_end_kb: sampler.current_kb(),
             rss_phase_peak_kb: sampler.phase_peak_kb(),
             rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
             notes: format!("first_call_ms={first_ms} (includes E5 model load)"),
         });
 
@@ -727,6 +944,7 @@ async fn main() -> Result<()> {
     if !args.skip_idle {
         sampler.mark_phase_start();
         let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
         thread::sleep(Duration::from_secs(args.idle_seconds));
         phases.push(PhaseStats {
             name: "idle",
@@ -736,6 +954,10 @@ async fn main() -> Result<()> {
             rss_end_kb: sampler.current_kb(),
             rss_phase_peak_kb: sampler.phase_peak_kb(),
             rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
             notes: format!("slept {}s with no requests", args.idle_seconds),
         });
     }
@@ -819,7 +1041,7 @@ async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
     let cfg = SearchConfig::default();
     let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
-    let embedder = LazyEmbedder::new();
+    let embedder = LazyEmbedder::candle();
     let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let mut rows: Vec<serde_json::Value> = Vec::new();
 

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use pond::{
     adapter::ClaudeCodeAdapter,
-    embed::{DEFAULT_BATCH_SIZE, EmbedBackend, EmbedWorker},
+    embed::{DEFAULT_BATCH_SIZE, EmbedWorker, Embedder},
     handlers::ingest_adapter,
     sessions::{Store, embedding_dim},
 };
@@ -45,7 +45,11 @@ impl FakeBackend {
     }
 }
 
-impl EmbedBackend for FakeBackend {
+impl Embedder for FakeBackend {
+    fn device(&self) -> &str {
+        "fake"
+    }
+
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.counts.lock().unwrap().push(texts.len());
         self.texts.lock().unwrap().extend(texts.iter().cloned());

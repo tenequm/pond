@@ -37,7 +37,7 @@ use anyhow::Result;
 use clap::Parser;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    embed::{DEFAULT_SORT_WINDOW, E5Embedder, EmbedBackend, EmbedWorker},
+    embed::{CandleEmbedder, DEFAULT_SORT_WINDOW, EmbedWorker, Embedder},
     handlers::ingest_adapter,
     sessions::Store,
 };
@@ -105,11 +105,15 @@ struct BatchStat {
 /// Wraps the real embedder, recording the shape and wall time of every
 /// `embed()` call - one call is one worker batch.
 struct InstrumentedBackend<'a> {
-    inner: &'a dyn EmbedBackend,
+    inner: &'a dyn Embedder,
     calls: Mutex<Vec<BatchStat>>,
 }
 
-impl EmbedBackend for InstrumentedBackend<'_> {
+impl Embedder for InstrumentedBackend<'_> {
+    fn device(&self) -> &str {
+        self.inner.device()
+    }
+
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let count = texts.len();
         let max_bytes = texts.iter().map(String::len).max().unwrap_or(0);
@@ -251,7 +255,7 @@ async fn main() -> Result<()> {
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
 
     let load_start = Instant::now();
-    let embedder = E5Embedder::load()?;
+    let embedder = CandleEmbedder::load()?;
     let load_elapsed = load_start.elapsed();
     let device = embedder.device();
 

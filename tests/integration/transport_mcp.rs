@@ -9,7 +9,7 @@
 use chrono::Utc;
 use pond::{
     PROTOCOL_VERSION,
-    embed::{EmbedBackend, EmbedWorker},
+    embed::{EmbedWorker, Embedder},
     handlers::{IngestEvent, pond_ingest},
     sessions::{Store, embedding_dim},
     transport::{AppState, mcp::PondMcp},
@@ -39,7 +39,11 @@ fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
 /// Deterministic, content-dependent vectors - no model weights, exact f32s.
 struct FakeBackend;
 
-impl EmbedBackend for FakeBackend {
+impl Embedder for FakeBackend {
+    fn device(&self) -> &str {
+        "fake"
+    }
+
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts
             .iter()

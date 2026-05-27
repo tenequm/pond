@@ -19,7 +19,7 @@ use clap::Parser;
 use pond::{
     PROTOCOL_VERSION,
     config::{self, Config, SearchConfig},
-    embed::{EmbedBackend, EmbedWorker, LazyEmbedder},
+    embed::{EmbedWorker, Embedder, LazyEmbedder},
     handlers::pond_search,
     sessions::{MessageWrite, Store, embedding_dim},
     wire::{
@@ -76,7 +76,11 @@ struct BenchRow {
 
 struct FakeBackend;
 
-impl EmbedBackend for FakeBackend {
+impl Embedder for FakeBackend {
+    fn device(&self) -> &str {
+        "fake"
+    }
+
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| pseudo_vector(t)).collect())
     }
@@ -224,7 +228,7 @@ async fn run_bench(label: String, store: &Store, args: &Args, open_ms: u128) -> 
         store.optimize_indices(None, None).await?.into_result()?;
         index_ms = Some(t.elapsed().as_millis());
 
-        let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn EmbedBackend>);
+        let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn Embedder>);
         let cfg = SearchConfig::default();
         let mut fts_ms: Vec<u128> = Vec::with_capacity(args.queries);
         let mut vec_ms: Vec<u128> = Vec::with_capacity(args.queries);

@@ -89,3 +89,42 @@ Query expansion is also explicitly a caller-layer concern. Lexical expansion is 
 - `scripts/search-benchmarks/queries-en.tsv`, `queries-uk-translated.tsv` - the shipped seed sets.
 - `src/handlers.rs::fuse_arms` - the production fusion.
 - `src/handlers.rs::FTS_FUSION_WEIGHT`, `VECTOR_FUSION_WEIGHT` - the constants.
+
+## Runtime / memory footprint
+
+Bench harness: `benches/serve_mem_bench.rs` (`--probe-embedder` for isolated load/embed/drop/reload phases, full hybrid mode for end-to-end peak). The bench samples both `ps -o rss=` and macOS `phys_footprint` via `libc::proc_pid_rusage(RUSAGE_INFO_V4)`.
+
+**Load-bearing finding**: on macOS `ps rss` is wrong in both directions - overcounts shared dyld pages (Metal frameworks, CoreFoundation, libonnxruntime.dylib) and undercounts compressed pages. The correct metric is `phys_footprint`, which Activity Monitor, the Jetsam OOM killer, `top` MEM, and `footprint(1)` all read. Steady-state PF for candle Metal e5-small was measured at 691 MiB vs RSS 435 MiB - opposite of what the candle 0.10 + Apple Silicon "buffer pool" diagnosis would predict from RSS alone. Switching to `phys_footprint` reranked every backend comparison.
+
+**Decision (2026-05-27)**: drop the alternative ORT query backend, candle on every platform, evict the cached model after `DEFAULT_IDLE_EVICTION = 5 min` of no use. Time-weighted PF for typical MCP usage ~165 MiB; idle PF (post-eviction) is the 107 MiB process floor regardless of backend.
+
+### Linked sources
+
+candle:
+- [PR #3197 - bound temporary buffer cache](https://github.com/huggingface/candle/pull/3197). Adds `CANDLE_METAL_CACHE_LIMIT_MB` / `CANDLE_METAL_PENDING_LIMIT_MB` env vars to force pool eviction; confirmed by pcuenca to flatten Stable Diffusion macOS RSS. Stalled in review since 2026-02. Not in 0.10.2. The cleanest knob for candle-Metal phys_footprint if it ever lands.
+- [PR #3419 - PreallocKvCache + ConcatKvCache leak fix](https://github.com/huggingface/candle/pull/3419). Fixes a `BackpropOp` leak in `ConcatKvCache` that affects every candle decoder model. Not directly relevant to BERT-class encoder embedding (no KV cache), but shared evidence that candle's memory bookkeeping has open structural issues.
+- [PR #3503 - BF16 CPU matmul via F32 cast](https://github.com/huggingface/candle/pull/3503). Adds BF16 matmul on the gemm / MKL / Accelerate CPU backends by casting to F32 and back via SIMD bulk conversion. Open. Not directly memory-relevant but unlocks BF16 weight loading on CPU - useful if we ever ship a BF16-quantized e5-small variant.
+- [PR #3511 - Metal concurrent dispatching](https://github.com/huggingface/candle/pull/3511). Concurrent kernel dispatch with automatic memory barriers via read/write dependency detection. +10-20% tok/s on multiple models. Companion to #3532 (intra-encoder vs inter-encoder parallelism). Merged.
+- [PR #3532 - improved Metal inter-encoder sync and gemv](https://github.com/huggingface/candle/pull/3532). Mutex-guard around compute/blit encoders, switches to untracked mtl buffers with explicit Input/Output dependency tracking so independent encoders run in parallel. Targets Metal command-buffer overhead and synchronization, not buffer-pool retention per se, but in the same path as the Metal-pool issues that inflate our phys_footprint. Merged.
+- [PR #3555 - expose `kernel_mul_mm_id` MoE matmul wrapper](https://github.com/huggingface/candle/pull/3555). Lifts the single-pass MoE-fused matmul shader to callable Rust. Not relevant to e5-small (not MoE), tracked for completeness as part of candle's Metal-kernel surface evolution.
+- [Issue #3464 - StorageModeShared weights pool](https://github.com/huggingface/candle/issues/3464). `new_buffer_with_data` puts permanent weight buffers into the same Metal pool as transients; pool walk on every allocation, weights stay shared/CPU-coherent forever instead of uploaded-and-freed-from-host. Direct contributor to `iokit_mapped` inflation we measured. No fix in flight.
+- [Issue #2271 - autoreleasepool workaround](https://github.com/huggingface/candle/issues/2271). The objc2 migration (#3064, merged 2025-08-29) did not fully fix the leak; reproduced on master in 2026-03.
+
+ONNX Runtime:
+- [microsoft/onnxruntime#28231 - M5 Pro YOLOv8n RSS 381 MB vs PF 53 MB](https://github.com/microsoft/onnxruntime/issues/28231). The cleanest published RSS-to-phys_footprint ratio for a BERT-class ORT workload on Apple Silicon. KleidiAI LHS-cache identified as the dominant grow-then-plateau source; fix in [PR #28363](https://github.com/microsoft/onnxruntime/pull/28363).
+- [microsoft/onnxruntime#11627 - `enable_cpu_mem_arena = false`](https://github.com/microsoft/onnxruntime/issues/11627). 2 MB model went 5792 MiB → 217 MiB RSS by disabling the arena. The single biggest documented ORT memory lever.
+- [microsoft/onnxruntime#9152 - BERT per-thread scaling](https://github.com/microsoft/onnxruntime/issues/9152). 160 / 310 / 610 MB at 1 / 2 / 4 intra-op threads, explains why fastembed's `with_intra_threads(num_cpus)` is the second-biggest RSS leak on Apple Silicon.
+- [microsoft/onnxruntime PR #27136 - `mlas.disable_kleidiai`](https://github.com/microsoft/onnxruntime/pull/27136). Session config to disable the per-thread int8-GEMM workspace. Lands in ORT 1.25+; pyke's prebuilt is 1.24.2, so the key is silently ignored. Tested, no movement.
+- [microsoft/onnxruntime#23768 - `arena_extend_strategy = kSameAsRequested`](https://github.com/microsoft/onnxruntime/issues/23768). Middle-ground option that keeps the arena but bounds its growth via `OrtArenaCfg`. Not exposed by `pykeio/ort` 2.0.0-rc.12 SessionBuilder; reachable only via `Environment::create_and_register_allocator` + `.with_env_allocators()`.
+- [microsoft/onnxruntime#27767 - 15-43 GB RSS on M3 Pro Node.js](https://github.com/microsoft/onnxruntime/issues/27767). Evidence that macOS ARM64 has unique ORT allocator pathologies in JS bindings - not our case, but rules out "ORT macOS is exactly like ORT Linux."
+- [k2-fsa/sherpa-onnx#3032 - "2x model size" macOS rule](https://github.com/k2-fsa/sherpa-onnx/issues/3032). SenseVoice INT8 230 MB → 450 MB RSS by default; confirms the macOS-specific arena retention.
+
+mistral.rs:
+- [issue #1738 - severe Metal memory leak on Apple Silicon](https://github.com/EricLBuehler/mistral.rs/issues/1738). Throughput collapse on M3 Ultra continuous batching - swap thrashing, scheduler starvation. Same iokit_mapped retention family as candle. Closed but symptomatic of the broader Apple-Metal/Rust ML-runtime memory accounting gap.
+
+macOS memory accounting:
+- [bazhenov.me - Activity Monitor anatomy](https://bazhenov.me/posts/activity-monitor-anatomy). Definitive walkthrough of `phys_mem` vs `phys_footprint` ledgers and the `proc_pid_rusage` path.
+- [alexey-pelykh.com - the RSS illusion](https://alexey-pelykh.com/blog/rss-illusion-hidden-gpu-memory). 4.1 GB RSS vs 62.7 GB phys_footprint across 95 Claude processes; documents the iokit_mapped category we hit.
+- [rmk40/memlimit](https://github.com/rmk40/memlimit). C reference for cross-platform process-memory: phys_footprint on macOS, PSS on Linux (`/proc/PID/smaps_rollup`).
+- [Bun PR #22352](https://github.com/oven-sh/bun/pull/22352). Bun's `process.memoryUsage.rss()` switched from RSS to `task_vm_info.phys_footprint`; concrete reference pattern for the Rust FFI.
+- [psutil commit 36bd1b5](https://github.com/giampaolo/psutil/commit/36bd1b5214664672e7d1fcfd68a367553e3e76dc). psutil docs recommend phys_footprint over RSS for macOS memory monitoring.
