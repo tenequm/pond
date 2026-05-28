@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  # Manual fire of `publish-release-dry-run` to validate the goreleaser pipeline
+  # (build + archive) without touching releases, the homebrew tap, or NUR.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -72,6 +76,32 @@ jobs:
           distribution: goreleaser
           version: '~> v2'
           args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      - run: kache stats
+
+  publish-release-dry-run:
+    name: publish-release-dry-run
+    needs: build-and-test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - uses: cachix/install-nix-action@v31
+
+      - run: kache stats
+      # `--snapshot` skips publishing: no GH release, no tap PR, no NUR push.
+      # Just builds + archives so we can validate the pipeline end-to-end.
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
