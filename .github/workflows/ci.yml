@@ -23,16 +23,22 @@ jobs:
     runs-on: [self-hosted, linux, x64, bl]
     steps:
       - uses: actions/checkout@v6.0.2
-        with:
-          fetch-depth: 0   # release-plz needs full git history for changelog
 
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
 
-      - name: release-plz
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: release-plz/action@v0.5
+  release:
+    name: release
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, bl]
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0   # release-plz needs full git history for changelog
+
+      - uses: release-plz/action@v0.5
         with:
           command: release
         env:
