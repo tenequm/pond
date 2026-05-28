@@ -23,9 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
 
+      - run: kache stats
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
+      - run: kache stats
 
   release:
     name: release
@@ -37,8 +39,10 @@ jobs:
         with:
           fetch-depth: 0   # release-plz needs full git history for changelog
 
+      - run: kache stats
       - uses: release-plz/action@v0.5
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: kache stats
