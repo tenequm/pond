@@ -15,20 +15,9 @@ tasks:
       set -euo pipefail
       mkdir -p target/dist
 
-      eval "$(awk -F' *= *' '
-        /^\[storage\]/ {in_storage=1; next}
-        /^\[/          {in_storage=0}
-        in_storage && /^AWS_/ {
-          gsub(/"/, "", $2)
-          print "export "$1"="$2
-        }
-      ' "$HOME/.config/pond/config.toml")"
-      : "${AWS_ACCESS_KEY_ID:?missing}" "${AWS_SECRET_ACCESS_KEY:?missing}" \
-        "${AWS_REGION:?missing}" "${AWS_ENDPOINT:?missing}"
-
       BUCKET=ttq
-      # AWS_ENDPOINT in config is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
-      S3_ENDPOINT="${AWS_ENDPOINT/${BUCKET}./}"
+      # KACHE_S3_ENDPOINT is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
+      S3_ENDPOINT="${KACHE_S3_ENDPOINT/${BUCKET}./}"
       BUILDX_PREFIX=pond-buildkit/multiarch
 
       kubectl -n pond-buildkit scale deploy/pond-hetzner0 --replicas=1
@@ -39,10 +28,10 @@ tasks:
         --progress=plain \
         --platform linux/amd64 \
         --target output \
-        --cache-from "type=s3,region=${AWS_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY}" \
-        --cache-to   "type=s3,region=${AWS_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY},mode=max" \
-        --secret "id=kache_s3_access_key,env=AWS_ACCESS_KEY_ID" \
-        --secret "id=kache_s3_secret_key,env=AWS_SECRET_ACCESS_KEY" \
+        --cache-from "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY}" \
+        --cache-to   "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY},mode=max" \
+        --secret "id=kache_s3_access_key,env=KACHE_S3_ACCESS_KEY" \
+        --secret "id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY" \
         --output "type=local,dest=target/dist" \
         -f Dockerfile \
         .

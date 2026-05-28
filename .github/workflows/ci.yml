@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual fire of `publish-release-dry-run` to validate the goreleaser pipeline
-  # (build + archive) without touching releases, the homebrew tap, or NUR.
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,31 +16,38 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Cap C-build parallelism (aws-lc-sys et al.) to avoid swap-thrash on the
-  # 4-core self-hosted runner; Rust parallelism (cargo -j) is left at default.
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
-  MAKEFLAGS: -j2
 
 jobs:
   build-and-test:
     name: build-and-test
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
-        with:
-          clean: false   # keep target/ between runs for cargo freshness + kache
 
-      - run: kache stats
+      # protoc (prost) is not on the runner image; cmake/clang/openssl are.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev
+
+      # Installs kache, sets RUSTC_WRAPPER=kache, syncs the build cache from the
+      # ttq bucket (kache sync --pull/--push). Same S3 prefix as the cluster
+      # build, so the x86_64-unknown-linux-gnu compile cache is shared.
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          s3-bucket: ttq
+          s3-endpoint: https://nbg1.your-objectstorage.com
+          s3-region: nbg1
+          s3-prefix: kache/pond
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
-      - run: kache stats
 
   release-plz:
     name: release-plz
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
@@ -64,7 +68,13 @@ jobs:
     name: publish-release
     needs: release-plz
     if: needs.release-plz.outputs.releases_created == 'true'
+    # Self-hosted: provides the allowlisted network path to the cluster API.
+    # Cluster *config* (kubeconfig, buildx builder, S3 creds) is bootstrapped
+    # from secrets below, so the runner needs no pre-provisioned pond setup -
+    # only docker+buildx, kubectl, and moon installed.
     runs-on: [self-hosted, linux, x64]
+    env:
+      KUBECONFIG: ${{ github.workspace }}/.kube-cascade
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -74,22 +84,55 @@ jobs:
       # nix-hash, required by goreleaser's `nix` block to compute the NUR sha256.
       - uses: cachix/install-nix-action@v31
 
-      - run: kache stats
+      - name: Bootstrap cluster access + buildx builder
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
+        run: |
+          printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          # buildx builder state is client-side; on a fresh runner re-register it.
+          # Drop any stale in-cluster deployment first so create is idempotent.
+          if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
+            kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
+            docker buildx create --name pond-hetzner --driver kubernetes \
+              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+              --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+              --platform linux/amd64
+          fi
+
+      # Cross-compiles all 4 targets on the Hetzner buildkit pool (kache S3 +
+      # bazel-remote), exactly as local; drops binaries in target/dist/.
+      - name: Build dist binaries
+        run: moon run pond:build-dist
+        env:
+          KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          KACHE_S3_REGION: nbg1
+          # Bucket-virtual-host form; build-dist strips the bucket subdomain to
+          # derive the buildx S3 cache endpoint.
+          KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+
+      # builder: prebuilt - packages target/dist/ into archives + brew/nix/release.
       - uses: goreleaser/goreleaser-action@v7
         with:
-          distribution: goreleaser
+          distribution: goreleaser-pro   # `builder: prebuilt` is a Pro feature
           version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      - run: kache stats
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
 
-  publish-release-dry-run:
-    name: publish-release-dry-run
+  # Exercises the full cluster build + packaging on PRs without publishing, so a
+  # release can be verified before merge. Same-repo PRs only (fork PRs get no
+  # secrets and must not run on the self-hosted runner).
+  publish-dry-run:
+    name: publish-dry-run
     needs: build-and-test
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
+    env:
+      KUBECONFIG: ${{ github.workspace }}/.kube-cascade
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -98,15 +141,43 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
-      - run: kache stats
-      # `--snapshot` skips publishing: no GH release, no tap PR, no NUR push.
-      # Just builds + archives so we can validate the pipeline end-to-end.
+      - name: Bootstrap cluster access + buildx builder
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
+        run: |
+          printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
+            kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
+            docker buildx create --name pond-hetzner --driver kubernetes \
+              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+              --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+              --platform linux/amd64
+          fi
+
+      - name: Build dist binaries
+        run: moon run pond:build-dist
+        env:
+          KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          KACHE_S3_REGION: nbg1
+          KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+
+      # --snapshot: build + archive only - no GH release, tap PR, or NUR push.
       - uses: goreleaser/goreleaser-action@v7
         with:
-          distribution: goreleaser
+          distribution: goreleaser-pro
           version: '~> v2'
           args: release --snapshot --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      - run: kache stats
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pond-dist-${{ github.sha }}
+          path: |
+            target/dist/pond-*
+            dist/**/*.tar.xz
+            dist/**/*.zip
+          if-no-files-found: error
+          retention-days: 7

@@ -2,25 +2,28 @@
 version: 2
 project_name: pond
 
-before:
-  hooks:
-    - rustup default stable
-
 builds:
+  # Binaries are cross-compiled upstream by `moon run pond:build-dist` (Hetzner
+  # buildkit) into target/dist/. goreleaser only packages them - it does not build.
   - id: pond
-    builder: rust
+    builder: prebuilt
     binary: pond
-    # `tool` defaults to "cargo", `command` defaults to "zigbuild".
-    flags:
-      - --profile=dist
-    targets:
-      - x86_64-unknown-linux-gnu
-      - aarch64-apple-darwin
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - { goos: darwin, goarch: amd64 }   # no Intel mac
+      - { goos: windows, goarch: arm64 }  # no windows arm64
+    prebuilt:
+      # Map goreleaser's goos/goarch to the Rust-triple filenames build-dist emits.
+      path: 'target/dist/pond-{{ if eq .Os "darwin" }}aarch64-apple-darwin{{ else if and (eq .Os "linux") (eq .Arch "amd64") }}x86_64-unknown-linux-gnu{{ else if and (eq .Os "linux") (eq .Arch "arm64") }}aarch64-unknown-linux-gnu{{ else }}x86_64-pc-windows-gnu.exe{{ end }}'
 
 archives:
   - id: pond
     formats: [tar.xz]
-    name_template: "{{ .ProjectName }}-{{ .Target }}"
+    format_overrides:
+      - { goos: windows, formats: [zip] }
+    # Preserve the existing `pond-<rust-triple>` asset names (stable download URLs).
+    name_template: 'pond-{{ if eq .Os "darwin" }}aarch64-apple-darwin{{ else if and (eq .Os "linux") (eq .Arch "amd64") }}x86_64-unknown-linux-gnu{{ else if and (eq .Os "linux") (eq .Arch "arm64") }}aarch64-unknown-linux-gnu{{ else }}x86_64-pc-windows-gnu{{ end }}'
 
 brews:
   - name: pond
