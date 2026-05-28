@@ -43,6 +43,7 @@ jobs:
       - uses: release-plz/action@v0.5
         with:
           command: release
+          dry_run: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: kache stats
