@@ -23,9 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0   # moon diffs against `main`; needs full history + origin/main
 
-      # protoc (prost) is not on the runner image; cmake/clang/openssl are.
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev
+      - uses: arduino/setup-protoc@v3
 
       # Installs kache, sets RUSTC_WRAPPER=kache, syncs the build cache from the
       # ttq bucket (kache sync --pull/--push). Same S3 prefix as the cluster
@@ -39,15 +40,12 @@ jobs:
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
 
-      - name: Install moon
-        run: |
-          curl -fsSL https://moonrepo.dev/install/moon.sh | bash
-          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
+      - uses: moonrepo/setup-toolchain@v0
 
-      # fmt/clippy/test run through moon (cache + orchestration); kache (above)
-      # is the RUSTC_WRAPPER compile cache. moon's bazel-remote output cache is
-      # configured in .moon/workspace.yml and hits where it's reachable.
-      - run: moon run pond:format pond:lint pond:test
+      # `moon ci` runs the affected tasks (respecting runInCI); scoped to
+      # format/lint/test so build-dist (cluster build) stays out of this job.
+      # kache (above) is the RUSTC_WRAPPER compile cache.
+      - run: moon ci :format :lint :test
 
   release-plz:
     name: release-plz
