@@ -28,7 +28,7 @@ use crate::{
         PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, GetMessage, GetSession, Message, Part, PartKind, Role, Session},
+    wire::{FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session},
 };
 use url::Url;
 
@@ -82,7 +82,7 @@ impl IndexIntents {
 
 /// A message awaiting embedding: its primary key plus the `search_text` to
 /// embed. The vector lives on the same `messages` row, so no denormalized
-/// filter columns are needed (spec.md#embed-from-canonical).
+/// filter columns are needed (spec.md#session-embed-from-canonical).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
     pub session_id: String,
@@ -729,8 +729,8 @@ impl Store {
 
     /// `session_id -> wall-clock time of the Lance manifest version that
     /// last wrote the row` for the per-session staleness skip
-    /// (spec.md#event-ordering). Reads Lance's `_row_last_updated_at_version` system
-    /// column (available because pond enables stable row ids per spec.md#stable-row-ids)
+    /// (spec.md#adapter-integrity-event-ordering). Reads Lance's `_row_last_updated_at_version` system
+    /// column (available because pond enables stable row ids per spec.md#lance-table-creation-stable-row-ids)
     /// and joins it against `Dataset::versions()` for commit timestamps.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
         use lance::deps::arrow_array::UInt64Array;
@@ -784,159 +784,248 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn get_message_context(
-        &self,
-        message_id: &str,
-        context_depth: usize,
-    ) -> Result<Option<(Session, Vec<MessageWithParts>)>> {
-        let Some(target) = self.find_message(message_id).await? else {
-            return Ok(None);
-        };
-        let session_id = target.session_id().to_owned();
-        let session = self.find_session(&session_id).await?.with_context(|| {
-            format!("message {message_id} references missing session {session_id}")
-        })?;
-        let session_messages = self.messages_for_session(&session_id).await?;
-
-        let target_pos = session_messages
-            .iter()
-            .position(|message| message.message.id() == message_id)
-            .unwrap_or_default();
-        let start = target_pos.saturating_sub(context_depth);
-        let end = (target_pos + context_depth + 1).min(session_messages.len());
-        Ok(Some((session, session_messages[start..end].to_vec())))
-    }
-
-    /// Pull a page of `(id, role, timestamp, search_text)` for one session,
-    /// applying `up_to` / `start_after` (exclusive) / limit / byte-budget,
-    /// without touching parts.lance unless `include_parts` is set. The body
-    /// is `messages.search_text` (per spec.md#search, the embed-source projection).
-    pub async fn paged_session_view(
+    /// Whole-session view for `pond_get` session mode (spec.md#protocol).
+    /// Conversational filters to `search_text IS NOT NULL`; Complete and
+    /// Verbatim scan every message. Every mode attaches compact part summaries;
+    /// Verbatim additionally inlines full parts. `after_id` is an exclusive
+    /// lower bound (a message id); the page is bounded by `limit` and a byte
+    /// budget and never cuts mid-message.
+    pub async fn session_view(
         &self,
         session_id: &str,
-        scope: PagedScope<'_>,
-    ) -> Result<Option<PagedSessionView>> {
-        let Some(raw) = self.find_session(session_id).await? else {
-            return Ok(None);
+        params: SessionViewParams<'_>,
+    ) -> Result<GetLookup<SessionPage>> {
+        let Some(session) = self.find_session(session_id).await? else {
+            return Ok(GetLookup::NotFound);
         };
 
+        let mut rows = match params.mode {
+            ResponseMode::Conversational => self
+                .scan_conversational_messages(session_id)
+                .await?
+                .into_iter()
+                .map(|row| ScanRow {
+                    id: row.message_id,
+                    role: row.role,
+                    timestamp: row.timestamp,
+                    text: Some(row.text.into_inner()),
+                    content: None,
+                })
+                .collect(),
+            ResponseMode::Complete | ResponseMode::Verbatim => {
+                self.scan_all_messages(session_id).await?
+            }
+        };
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+
+        let start_at = match params.after_id {
+            // Append-only stream: a real anchor never vanishes, so an unknown
+            // `after_id` is a stale/mistyped client cursor, not "start over".
+            Some(after) => match rows.iter().position(|row| row.id == after) {
+                Some(idx) => idx + 1,
+                None => return Ok(GetLookup::UnknownAfterId),
+            },
+            None => 0,
+        };
+        let remaining = rows.get(start_at..).unwrap_or(&[]);
+        let emitted_count = page_by(remaining, params.limit, params.budget_bytes, |row| {
+            row.text.as_deref().map_or(0, str::len)
+        });
+        let emitted = &remaining[..emitted_count];
+        let messages_remaining = remaining.len() - emitted_count;
+        let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
+
+        // Conversational/Complete only summarize parts; Verbatim inlines every
+        // part (blobs included).
+        let mut parts_by_message = match params.mode {
+            ResponseMode::Verbatim => self.parts_for_messages(session_id, &ids).await?,
+            ResponseMode::Conversational | ResponseMode::Complete => {
+                self.summary_parts_for_messages(session_id, &ids).await?
+            }
+        };
+        let messages = emitted
+            .iter()
+            .map(|row| RetrievedMessage {
+                id: row.id.clone(),
+                role: row.role,
+                timestamp: row.timestamp,
+                text: row.text.clone(),
+                content: row.content.clone(),
+                parts: parts_by_message
+                    .remove(&(session_id.to_owned(), row.id.clone()))
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(GetLookup::Found(SessionPage {
+            session,
+            messages,
+            messages_remaining,
+        }))
+    }
+
+    /// Message-scope retrieval for `pond_get` message mode (spec.md#protocol):
+    /// the target with its full parts (paginated by `after_id` over part
+    /// ordinals, then budget) plus up to `2*context_depth` siblings around it.
+    /// `None` when no stored message carries `message_id`. Sibling parts are
+    /// carried for summarizing; the target's parts ride `target_parts`.
+    pub async fn message_view(
+        &self,
+        message_id: &str,
+        params: MessageViewParams<'_>,
+    ) -> Result<GetLookup<MessagePage>> {
+        let Some(session_id) = self.session_id_for_message(message_id).await? else {
+            return Ok(GetLookup::NotFound);
+        };
+        let Some(session) = self.find_session(&session_id).await? else {
+            return Ok(GetLookup::NotFound);
+        };
+        let mut rows = self.scan_all_messages(&session_id).await?;
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        let Some(target_pos) = rows.iter().position(|row| row.id == message_id) else {
+            return Ok(GetLookup::NotFound);
+        };
+
+        let start = target_pos.saturating_sub(params.context_depth);
+        let end = (target_pos + params.context_depth + 1).min(rows.len());
+        let window = &rows[start..end];
+        let window_ids: Vec<String> = window.iter().map(|row| row.id.clone()).collect();
+        // The target's full parts (blobs included) ride the response; siblings
+        // are only summarized, but they share this one window scan.
+        let mut parts_by_message = self.parts_for_messages(&session_id, &window_ids).await?;
+
+        let all_parts = parts_by_message
+            .remove(&(session_id.clone(), message_id.to_owned()))
+            .unwrap_or_default();
+        let start_part = match params.after_id {
+            // Exclusive over ordinals: parts are ordinal-sorted, so the first
+            // part past the anchor's ordinal is the page start. An anchor absent
+            // from the target's parts is a stale/mistyped client cursor.
+            Some(after) => match all_parts.iter().find(|part| part.id == after) {
+                Some(anchor) => all_parts
+                    .iter()
+                    .position(|part| part.ordinal > anchor.ordinal)
+                    .unwrap_or(all_parts.len()),
+                None => return Ok(GetLookup::UnknownAfterId),
+            },
+            None => 0,
+        };
+        let remaining_parts = all_parts.get(start_part..).unwrap_or(&[]);
+        let part_count = page_by(remaining_parts, params.limit, params.budget_bytes, |part| {
+            serde_json::to_string(part).map_or(0, |json| json.len())
+        });
+        let target_parts = remaining_parts[..part_count].to_vec();
+        let target_parts_remaining = remaining_parts.len() - part_count;
+
+        let target_row = &rows[target_pos];
+        let target = RetrievedMessage {
+            id: target_row.id.clone(),
+            role: target_row.role,
+            timestamp: target_row.timestamp,
+            text: target_row.text.clone(),
+            content: target_row.content.clone(),
+            // Target structure is carried in full by `target_parts`.
+            parts: Vec::new(),
+        };
+        let siblings = window
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| start + idx != target_pos)
+            .map(|(_, row)| RetrievedMessage {
+                id: row.id.clone(),
+                role: row.role,
+                timestamp: row.timestamp,
+                text: row.text.clone(),
+                content: row.content.clone(),
+                parts: parts_by_message
+                    .get(&(session_id.clone(), row.id.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(GetLookup::Found(MessagePage {
+            session,
+            target,
+            target_parts,
+            target_parts_remaining,
+            siblings,
+        }))
+    }
+
+    async fn scan_all_messages(&self, session_id: &str) -> Result<Vec<ScanRow>> {
         let batch = self
             .handle
             .scan_batch(
                 Table::Messages,
                 Some(&Predicate::Eq("session_id", session_id.into())),
-                &["id", "timestamp", "role", "search_text"],
+                &["id", "timestamp", "role", "search_text", "content"],
             )
             .await?;
-
-        let mut rows: Vec<MessageRow> = Vec::with_capacity(batch.num_rows());
+        let mut rows = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let id = string(&batch, "id", row)?.context("message id is null")?;
             let role =
                 role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
             let timestamp = datetime(&batch, "timestamp", row)?;
-            let text = string(&batch, "search_text", row)?.unwrap_or_default();
-            rows.push(MessageRow {
+            rows.push(ScanRow {
                 id,
                 role,
                 timestamp,
-                text,
+                text: string(&batch, "search_text", row)?,
+                content: string(&batch, "content", row)?,
             });
         }
-        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        Ok(rows)
+    }
 
-        if let Some(up_to) = scope.up_to {
-            let Some(idx) = rows.iter().position(|row| row.id == up_to) else {
-                anyhow::bail!("up_to message not found in session: {session_id}/{up_to}");
-            };
-            rows.truncate(idx + 1);
+    /// Conversational scan over one session: rows ordered by
+    /// `(timestamp, id)`, `IsNotNull("search_text")` pushed down at the
+    /// read seam (spec.md#search-prefilter-pushdown).
+    pub async fn scan_conversational_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ConversationalRow>> {
+        let filter = Predicate::And(vec![
+            Predicate::Eq("session_id", session_id.into()),
+            Predicate::IsNotNull("search_text"),
+        ]);
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&filter),
+                &["id", "timestamp", "role", "search_text"],
+            )
+            .await?;
+
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let message_id = string(&batch, "id", row)?.context("message id is null")?;
+            let role =
+                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+            let timestamp = datetime(&batch, "timestamp", row)?;
+            let text_str = string(&batch, "search_text", row)?.context(
+                "search_text null after IsNotNull pushdown - storage invariant violated",
+            )?;
+            rows.push(ConversationalRow {
+                session_id: session_id.to_owned(),
+                message_id,
+                role,
+                timestamp,
+                text: SearchText(text_str),
+            });
         }
-
-        if let Some(window) = scope.window.as_ref() {
-            let Some(anchor_pos) = rows.iter().position(|row| row.id == window.anchor) else {
-                anyhow::bail!("anchor message not found in session: {}", window.anchor);
-            };
-            let start = anchor_pos.saturating_sub(window.depth);
-            let end = (anchor_pos + window.depth + 1).min(rows.len());
-            rows = rows[start..end].to_vec();
-        }
-
-        let start_at = match scope.start_after {
-            Some(after) => match rows.iter().position(|row| row.id == after) {
-                Some(idx) => idx + 1,
-                None => 0,
-            },
-            None => 0,
-        };
-        if start_at >= rows.len() {
-            return Ok(Some(PagedSessionView {
-                session: get_session_from(raw),
-                messages: Vec::new(),
-                parts: Vec::new(),
-                has_more: false,
-                next_after: None,
-            }));
-        }
-        let mut sliced = rows[start_at..].to_vec();
-        let max = scope.limit.clamp(1, 1000);
-        if sliced.len() > max {
-            sliced.truncate(max);
-        }
-
-        let mut acc = 0usize;
-        let mut emitted = 0usize;
-        for row in &sliced {
-            let next = acc.saturating_add(row.text.len());
-            if emitted > 0 && next > scope.budget_bytes {
-                break;
-            }
-            acc = next;
-            emitted += 1;
-        }
-        let has_more = emitted < sliced.len();
-        let next_after = if has_more {
-            Some(sliced[emitted - 1].id.clone())
-        } else {
-            None
-        };
-        sliced.truncate(emitted);
-
-        let parts = if scope.include_parts {
-            let ids: Vec<String> = sliced.iter().map(|row| row.id.clone()).collect();
-            let mut by_message = self.parts_for_messages(session_id, &ids).await?;
-            let mut all = Vec::new();
-            for row in &sliced {
-                let key = (session_id.to_owned(), row.id.clone());
-                if let Some(parts) = by_message.remove(&key) {
-                    all.extend(parts);
-                }
-            }
-            all
-        } else {
-            Vec::new()
-        };
-
-        let messages = sliced
-            .into_iter()
-            .map(|row| GetMessage {
-                id: row.id,
-                role: row.role,
-                timestamp: row.timestamp,
-                text: row.text,
-            })
-            .collect();
-
-        Ok(Some(PagedSessionView {
-            session: get_session_from(raw),
-            messages,
-            parts,
-            has_more,
-            next_after,
-        }))
+        rows.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Ok(rows)
     }
 
     /// Locate the session id for a stored message. Cheap when only the routing
-    /// hint is needed - callers that need the message itself use `find_message`.
+    /// hint is needed - callers that need the messages use `scan_all_messages`.
     pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
         let batch = self
             .handle
@@ -1030,7 +1119,7 @@ impl Store {
 
     /// Write a batch of embeddings into `messages`: set `vector` and
     /// `embedding_model` on each row by `(session_id, id)`
-    /// (spec.md#embed-from-canonical). The column update goes through the
+    /// (spec.md#session-embed-from-canonical). The column update goes through the
     /// write seam and lands as a new manifest version (`append-only`).
     pub async fn write_embeddings(&self, rows: &[EmbeddedMessage]) -> Result<()> {
         if rows.is_empty() {
@@ -1044,7 +1133,7 @@ impl Store {
     }
 
     /// Stream the backlog of messages needing embedding: rows with `search_text`
-    /// set whose `vector` is null (spec.md#embed-from-canonical).
+    /// set whose `vector` is null (spec.md#session-embed-from-canonical).
     pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
             let filter = Predicate::And(vec![
@@ -1081,7 +1170,7 @@ impl Store {
     /// Stream messages that are either never embedded or stale under the
     /// current model. `pond embed --force` feeds this to the same unconditional
     /// merge_update as the normal backlog; the filter makes that semantically
-    /// equivalent to the conditional update in spec.md#embed-from-canonical.
+    /// equivalent to the conditional update in spec.md#session-embed-from-canonical.
     pub fn pending_or_stale_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
             let filter = Predicate::And(vec![
@@ -1183,7 +1272,7 @@ impl Store {
     }
 
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
-    /// scalar predicate (spec.md#prefilter-pushdown). Combines the caller's
+    /// scalar predicate (spec.md#search-prefilter-pushdown). Combines the caller's
     /// filter with `vector IS NOT NULL` to exclude un-embedded rows from the
     /// scan; the brute-force kNN path requires this (the IVF_PQ path would
     /// skip them anyway). The single-active-model invariant lets pond drop
@@ -1236,7 +1325,7 @@ impl Store {
     }
 
     /// The DataFusion plan string for a filtered vector scan - the
-    /// `prefilter-pushdown` regression guard reads it.
+    /// `search-prefilter-pushdown` regression guard reads it.
     pub async fn explain_vector_plan(
         &self,
         query: &[f32],
@@ -1421,7 +1510,7 @@ impl Store {
     }
 
     /// Run the per-table maintenance cycle (compact + indices) across every
-    /// table, never short-circuiting. spec.md#index-write-decoupled: indices
+    /// table, never short-circuiting. spec.md#lance-index-maintenance: indices
     /// and compaction commit independently, so a hot writer that starves
     /// compaction on one table does not abort the index work the operator
     /// asked for on other tables (or even on the same table).
@@ -1536,7 +1625,7 @@ impl Store {
     }
 
     /// On-disk byte totals per dataset, sized through Lance's object store
-    /// (spec.md#storage-via-lance) so `pond status` works on any backend.
+    /// (spec.md#lance-chokepoints-storage) so `pond status` works on any backend.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         self.handle.table_sizes().await
     }
@@ -1642,31 +1731,6 @@ impl Store {
         Ok(Some(widened))
     }
 
-    /// Rare standalone message-id lookup; no `messages.id` index, so Lance
-    /// full-scans with the predicate.
-    async fn find_message(&self, message_id: &str) -> Result<Option<Message>> {
-        let batch = self
-            .handle
-            .scan_batch(
-                Table::Messages,
-                Some(&Predicate::Eq("id", message_id.into())),
-                &[
-                    "session_id",
-                    "id",
-                    "timestamp",
-                    "role",
-                    "content",
-                    "options",
-                ],
-            )
-            .await?;
-        if batch.num_rows() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(message_from_batch(&batch, 0)?))
-        }
-    }
-
     async fn messages_for_session(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         let batch = self
             .handle
@@ -1709,18 +1773,50 @@ impl Store {
             .collect())
     }
 
-    async fn parts_for_messages(
+    /// Every part of these messages, full fidelity (file blobs included). The
+    /// canonical read primitive - restore/export, verbatim mode, and the
+    /// message-mode target all need the complete set.
+    pub async fn parts_for_messages(
         &self,
         session_id: &str,
         message_ids: &[String],
     ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
+        self.scan_parts(session_id, message_ids, None).await
+    }
+
+    /// Only the parts that yield a [`PartSummary`] ([`SUMMARY_PART_TYPES`]),
+    /// skipping `text`/`reasoning` (and their blobs) that would summarize to
+    /// nothing. For the summary-only reads (conversational/complete session
+    /// views, search hits) - it never feeds restore/export.
+    pub async fn summary_parts_for_messages(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
+        self.scan_parts(session_id, message_ids, Some(SUMMARY_PART_TYPES))
+            .await
+    }
+
+    async fn scan_parts(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+        part_types: Option<&[&str]>,
+    ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
         if message_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let predicate = Predicate::And(vec![
+        let mut clauses = vec![
             Predicate::Eq("session_id", session_id.into()),
             in_predicate("message_id", message_ids),
-        ]);
+        ];
+        if let Some(types) = part_types {
+            clauses.push(Predicate::In(
+                "type",
+                types.iter().map(|&t| t.into()).collect(),
+            ));
+        }
+        let predicate = Predicate::And(clauses);
         let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
         let mut scanner = self
             .handle
@@ -1796,7 +1892,7 @@ pub enum IngestEvent {
 ///
 /// Fields are bucketed by population so the summary never conflates "100
 /// validator-rejected rows in 1 bad session" with "100 separate failures."
-/// The shape is set by spec.md#event-ordering.
+/// The shape is set by spec.md#adapter-integrity-event-ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
     /// Rows actually written to Lance.
@@ -1807,7 +1903,7 @@ pub struct IngestSummary {
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
     /// session with one bad part stays in this bucket as 1, not as "the
-    /// whole substream." Per spec.md#adapter-dedup, adapters SHOULD dedupe their
+    /// whole substream." Per spec.md#adapter-integrity-dedup, adapters SHOULD dedupe their
     /// own emissions upstream when source replay is expected; the
     /// validator's in-batch HashSet is a safety net, not a feature
     /// adapters may rely on. If this bucket grows on a clean adapter,
@@ -1821,8 +1917,13 @@ pub struct IngestSummary {
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
+    /// Files that produced no importable session and were benignly skipped:
+    /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
+    /// metadata file), or an unextractable header. Never an error or a drop;
+    /// the underlying cause is logged at `POND_LOG=debug`.
+    pub skipped_empty: usize,
     /// Sessions short-circuited via the per-session staleness skip
-    /// (spec.md#event-ordering): file `mtime` was at or before the wall-clock time
+    /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
     pub skipped_fresh: usize,
     /// Storage-layer failures whose retries were exhausted (commit
@@ -1830,7 +1931,7 @@ pub struct IngestSummary {
     /// runs.
     pub storage_errors: usize,
     /// Oversized values truncated to a bounded sentinel at the seam
-    /// (spec.md#bounded-values); the rest of each such record is intact.
+    /// (spec.md#adapter-bounded-values); the rest of each such record is intact.
     pub truncated_values: usize,
     /// Histogram of stable reason keys for the combined `dropped_events +
     /// dropped_sessions` populations. Keys are `&'static str` (see the
@@ -1844,7 +1945,7 @@ pub struct IngestSummary {
 /// the per-row `RowError::reason_key`. `&'static str` so consumers can
 /// match by identity rather than prose. Adding a new variant: pick a short
 /// snake_case identifier, route it from the validator/adapter, and update
-/// the per-row outcome docs in `docs/spec.md#event-ordering`.
+/// the per-row outcome docs in `docs/spec.md#adapter-integrity-event-ordering`.
 pub const DROP_REASON_DUPLICATE_MESSAGE_ID: &str = "duplicate_message_id";
 pub const DROP_REASON_DUPLICATE_PART_KEY: &str = "duplicate_part_key";
 pub const DROP_REASON_MESSAGE_BEFORE_SESSION: &str = "message_before_session";
@@ -1953,7 +2054,7 @@ struct BufferedPart {
 /// batches: sessions, messages, parts). A validation error on a single event
 /// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
 /// continues; only Session-level invariants (immutable source_agent / project
-/// on re-write) drop the whole substream (spec.md#event-ordering).
+/// on re-write) drop the whole substream (spec.md#adapter-integrity-event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the current one), they accumulate in
@@ -2275,7 +2376,7 @@ fn error_outcome(
 /// Session-level rejection (immutable `source_agent` / `project` violation):
 /// emit exactly one Error outcome on the Session row. The buffered messages
 /// and parts of this substream are *not* surfaced as per-row errors - their
-/// loss is implied by the single session-rejection (spec.md#event-ordering).
+/// loss is implied by the single session-rejection (spec.md#adapter-integrity-event-ordering).
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -2470,6 +2571,26 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Non-empty conversational text (spec.md#search).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchText(String);
+
+impl SearchText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for SearchText {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageWithParts {
     pub message: Message,
@@ -2482,50 +2603,103 @@ pub struct SessionWithMessages {
     pub messages: Vec<MessageWithParts>,
 }
 
-/// Parameters for `Store::paged_session_view`. `start_after` is exclusive
-/// (the cursor's "resume past this message id" semantics). `window` carries
-/// the message-scope `(anchor, context_depth)` slice from `pond_get(message_id=
-/// ..., context_depth=...)`; absent for whole-session reads.
 #[derive(Debug, Clone)]
-pub struct PagedScope<'a> {
-    pub up_to: Option<&'a str>,
-    pub start_after: Option<&'a str>,
-    pub window: Option<MessageWindow<'a>>,
+pub struct SessionViewParams<'a> {
+    pub mode: ResponseMode,
+    pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
-    pub include_parts: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct MessageWindow<'a> {
-    pub anchor: &'a str,
-    pub depth: usize,
+#[derive(Debug, Clone)]
+pub struct MessageViewParams<'a> {
+    pub context_depth: usize,
+    pub after_id: Option<&'a str>,
+    pub limit: usize,
+    pub budget_bytes: usize,
+}
+
+/// Outcome of a `pond_get` lookup. Separates a missing target (the handler
+/// maps it to `not_found`) from a stale/unknown `after_id` (mapped to
+/// `validation_failed`): the message/part stream is append-only, so an anchor
+/// that was ever valid never disappears - an unknown one is always a client
+/// error, never a reason to silently restart the page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetLookup<T> {
+    NotFound,
+    UnknownAfterId,
+    Found(T),
+}
+
+/// Canonical retrieval result for `pond_get` session mode: the stored session
+/// plus the page of messages (each with its `Part`s) and a remaining count.
+/// Protocol-shaping into `GetResult`/`MessageView` happens in the handler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPage {
+    pub session: Session,
+    pub messages: Vec<RetrievedMessage>,
+    pub messages_remaining: usize,
+}
+
+/// Canonical retrieval result for `pond_get` message mode. `target.parts` is
+/// empty - the target's parts ride `target_parts` (paginated); `siblings` carry
+/// their parts so the handler can summarize them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessagePage {
+    pub session: Session,
+    pub target: RetrievedMessage,
+    pub target_parts: Vec<Part>,
+    pub target_parts_remaining: usize,
+    pub siblings: Vec<RetrievedMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PagedSessionView {
-    pub session: GetSession,
-    pub messages: Vec<GetMessage>,
+pub struct RetrievedMessage {
+    pub id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
+    pub text: Option<String>,
+    pub content: Option<String>,
     pub parts: Vec<Part>,
-    pub has_more: bool,
-    pub next_after: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct MessageRow {
+struct ScanRow {
     id: String,
     role: Role,
     timestamp: DateTime<Utc>,
-    text: String,
+    text: Option<String>,
+    content: Option<String>,
 }
 
-fn get_session_from(session: Session) -> GetSession {
-    GetSession {
-        id: session.id,
-        source_agent: session.source_agent,
-        project: (*session.project).clone(),
-        created_at: session.created_at,
+/// One row of the conversational scan. `text` is non-empty by
+/// `IsNotNull("search_text")` pushdown (spec.md#search).
+#[derive(Debug, Clone)]
+pub struct ConversationalRow {
+    pub session_id: String,
+    pub message_id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
+    pub text: SearchText,
+}
+
+/// Number of leading `items` that fit within `limit` and the byte budget,
+/// sizing each by `size`. Always emits at least one (a single oversize item
+/// never blocks its own page); the budget then stops the page at the next item
+/// boundary.
+fn page_by<T>(items: &[T], limit: usize, budget_bytes: usize, size: impl Fn(&T) -> usize) -> usize {
+    let capped = items.len().min(limit.clamp(1, 1000));
+    let mut acc = 0usize;
+    let mut emitted = 0usize;
+    for item in &items[..capped] {
+        let next = acc.saturating_add(size(item));
+        if emitted > 0 && next > budget_bytes {
+            break;
+        }
+        acc = next;
+        emitted += 1;
     }
+    emitted
 }
 
 fn role_from_str(value: &str) -> Result<Role> {
@@ -2614,7 +2788,7 @@ fn statuses_from_inserted(total: usize, inserted_rows: u64) -> Vec<UpsertStatus>
 }
 
 // Bare logical table names: the lance-namespace Directory impl owns the
-// `.lance` directory suffix (spec.md#catalog-seam). No consumer reconstructs
+// `.lance` directory suffix (spec.md#lance-chokepoints-catalog). No consumer reconstructs
 // a `.lance` path.
 pub(crate) const SESSIONS: &str = "sessions";
 pub(crate) const MESSAGES: &str = "messages";
@@ -2637,7 +2811,7 @@ const IVF_PQ_NUM_BITS: u8 = 8;
 const IVF_PQ_SUB_VECTOR_STRIDE: usize = 8;
 const IVF_PQ_MAX_ITERS: usize = 15;
 
-/// FTS tokenizer constants (spec.md#language-neutral-index): character ngrams
+/// FTS tokenizer constants (spec.md#search-language-neutral-index): character ngrams
 /// in `[3, 5]`. 4-5-grams discriminate, min=3 keeps 3-char tokens
 /// (`FTS`, `OCC`) searchable.
 const FTS_NGRAM_MIN: u32 = 3;
@@ -2738,7 +2912,7 @@ pub fn init_embedding_dim(dim: usize) {
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond export` snapshots
-/// plus deferred Lance tags (spec.md#durable-copy). `skip_auto_cleanup`
+/// plus deferred Lance tags (spec.md#session-durable-copy). `skip_auto_cleanup`
 /// suppresses the per-commit hook so cleanup stays operator-driven via
 /// `pond index optimize` (one LIST per command instead of per write).
 pub(crate) fn write_params_for_create() -> WriteParams {
@@ -2818,7 +2992,7 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("project", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
-        // The message's derived embedding (spec.md#embed-from-canonical):
+        // The message's derived embedding (spec.md#session-embed-from-canonical):
         // both null until `pond embed` fills them, set together thereafter.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
@@ -2833,7 +3007,7 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         primary_field("id", DataType::Utf8, false),
         Field::new("ordinal", DataType::Int32, false),
         Field::new("type", DataType::Utf8, false),
-        // spec.md#part-provenance: conversation vs harness-injected; search
+        // spec.md#model-part-provenance: conversation vs harness-injected; search
         // reads this column to exclude injected scaffolding.
         Field::new("provenance", DataType::Utf8, false),
         json_field("variant_data", false),
@@ -2937,7 +3111,7 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
 /// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
 /// is split before the running total of its text columns reaches this, and a
 /// single cell at or above it is rejected rather than left to panic inside
-/// `StringArray::from` (spec.md#bounded-values).
+/// `StringArray::from` (spec.md#adapter-bounded-values).
 const COLUMN_BYTE_BUDGET: usize = 1 << 30;
 
 /// Contiguous row ranges whose summed text-column byte cost each stays within
@@ -3133,7 +3307,7 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<R
             )),
             // `vector` / `embedding_model` are written null at ingest; every
             // message starts un-embedded and `pond embed` fills them later
-            // (spec.md#embed-from-canonical).
+            // (spec.md#session-embed-from-canonical).
             new_null_array(&embedding_vector_type(), rows.len()),
             new_null_array(&DataType::Utf8, rows.len()),
             Arc::new(LargeBinaryArray::from_iter_values(
@@ -3155,7 +3329,7 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(parts.len());
     // The blob column is a BinaryArray, exempt from the text-column bound
-    // (spec.md#bounded-values); only the StringArray columns are budgeted.
+    // (spec.md#adapter-bounded-values); only the StringArray columns are budgeted.
     for ((part, variant), encoded) in parts.iter().zip(&variant_data).zip(&options) {
         let columns = [
             part.session_id.len(),
@@ -3677,7 +3851,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordering_violation_drops_only_the_offending_event() -> anyhow::Result<()> {
-        // Per-event drop semantics (spec.md#event-ordering): a Part with no preceding
+        // Per-event drop semantics (spec.md#adapter-integrity-event-ordering): a Part with no preceding
         // Message is dropped on the spot, with one Error outcome surfaced. The
         // rest of the substream continues normally - subsequent valid messages
         // and parts get written.
@@ -4158,7 +4332,7 @@ mod tests {
             )
             .await?;
 
-        // The load-bearing assertion (spec.md#prefilter-pushdown): the predicate
+        // The load-bearing assertion (spec.md#search-prefilter-pushdown): the predicate
         // is served by a scalar-index node, not a postfilter `FilterExec`. (A
         // `FilterExec` for the KNN-internal `_distance IS NOT NULL` is expected
         // and unrelated.)

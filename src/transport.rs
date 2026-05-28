@@ -2,9 +2,9 @@
 //! handlers. Both transports dispatch to the same handler functions - no
 //! per-transport behavior divergence.
 //!
-//! HTTP exposes `POST /v1/search`, `POST /v1/get`, `POST /v1/ingest`, and the
-//! SSE `GET /v1/sessions/{id}/events` stream. MCP exposes only `pond_search` /
-//! `pond_get` (the kb-parity surface); ingest stays HTTP-only and CLI-only.
+//! HTTP exposes `POST /v1/search`, `POST /v1/get`, and `POST /v1/ingest`. MCP
+//! exposes only `pond_search` / `pond_get` (the kb-parity surface); ingest
+//! stays HTTP-only and CLI-only.
 
 use std::sync::Arc;
 
@@ -27,33 +27,25 @@ pub mod http {
 
     use std::net::{IpAddr, SocketAddr};
 
-    use std::{convert::Infallible, time::Duration};
-
     use anyhow::Context;
     use axum::{
         Json, Router,
-        extract::{DefaultBodyLimit, Path, Query, State},
+        extract::{DefaultBodyLimit, State},
         http::{HeaderValue, StatusCode},
-        response::{
-            IntoResponse, Response,
-            sse::{Event, KeepAlive, Sse},
-        },
-        routing::{get as get_route, post},
+        response::{IntoResponse, Response},
+        routing::post,
     };
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
-    use serde::Deserialize;
     use tokio::net::TcpListener;
 
     use super::AppState;
     use crate::{
-        handlers::{
-            parse_since, pond_get, pond_ingest, pond_search, pond_session_events, resolve_namespace,
-        },
+        handlers::{pond_get, pond_ingest, pond_search},
         wire::{
-            ErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, IngestEnvelope, IngestRequest,
-            SearchEnvelope, SearchRequest, default_namespace, new_request_id,
+            ErrorCode, GetEnvelope, GetRequest, IngestEnvelope, IngestRequest, SearchEnvelope,
+            SearchRequest, default_namespace, new_request_id,
         },
     };
 
@@ -77,10 +69,6 @@ pub mod http {
             .route("/v1/search", post(search))
             .route("/v1/get", post(get))
             .route("/v1/ingest", post(ingest))
-            .route(
-                "/v1/sessions/{session_id}/events",
-                get_route(session_events),
-            )
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
@@ -156,64 +144,6 @@ pub mod http {
         with_request_id((status, Json(envelope)).into_response())
     }
 
-    /// Query string for `GET /v1/sessions/{session_id}/events`
-    /// (spec.md#protocol). `since` resumes after a prior event id; the
-    /// `Last-Event-ID` HTTP header is honored as a fallback for EventSource
-    /// auto-reconnect.
-    #[derive(Debug, Deserialize)]
-    struct SessionEventsQuery {
-        #[serde(default)]
-        since: Option<String>,
-        #[serde(default)]
-        namespace: Option<String>,
-    }
-
-    /// `GET /v1/sessions/{session_id}/events` SSE handler. Catch-up only in
-    /// v1: emits canonical message stubs strictly after `since` in
-    /// `(timestamp, message_id)` order, then `end`. SSE keepalive every 15s.
-    async fn session_events(
-        State(state): State<AppState>,
-        Path(session_id): Path<String>,
-        headers: axum::http::HeaderMap,
-        Query(params): Query<SessionEventsQuery>,
-    ) -> Response {
-        if let Err(envelope) = resolve_namespace(params.namespace.as_deref()) {
-            let code = envelope.error.code.clone();
-            return error_response(code, envelope);
-        }
-
-        let since_raw = params.since.clone().or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned)
-        });
-        let since = parse_since(since_raw.as_deref());
-
-        match pond_session_events(&state.store, &session_id, since).await {
-            Ok(events) => {
-                let stream = tokio_stream::iter(events.into_iter().map(|sse| {
-                    let payload = sse.data.to_string();
-                    Ok::<_, Infallible>(Event::default().event(sse.event).id(sse.id).data(payload))
-                }));
-                with_request_id(
-                    Sse::new(stream)
-                        .keep_alive(
-                            KeepAlive::new()
-                                .interval(Duration::from_secs(15))
-                                .text("keepalive"),
-                        )
-                        .into_response(),
-                )
-            }
-            Err(envelope) => error_response(envelope.error.code.clone(), envelope),
-        }
-    }
-
-    fn error_response(code: ErrorCode, envelope: ErrorEnvelope) -> Response {
-        with_request_id((status_for(&code), Json(envelope)).into_response())
-    }
-
     fn with_request_id(mut response: Response) -> Response {
         if let Ok(value) = HeaderValue::from_str(&new_request_id()) {
             response.headers_mut().insert("x-pond-request-id", value);
@@ -265,7 +195,7 @@ pub mod mcp {
         handlers::pond_search as run_search,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter,
-            SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
+            ResponseMode, SearchEnvelope, SearchFilters, SearchRequest, default_namespace,
         },
     };
 
@@ -290,14 +220,17 @@ in language B via the vector arm. The FTS arm is character-ngram-based and \
 only matches surface tokens, so for cross-lingual queries expect most signal \
 to come from the vector arm.
 
-pond_get: message_id (one message + context_depth messages of thread context \
-each side) OR session_id (full session; up_to truncates, limit caps at 1000). \
-The default response carries `messages[].text` only; pass \
-`include_parts=true` to also receive the per-message parts (reasoning, tool \
-calls, tool results, files). Responses are paginated with a `~10000-token \
-budget; when `has_more` is true the response carries an opaque `next_cursor` \
-- pass it back as `cursor` to fetch the next page (originating session_id / \
-message_id / include_parts are re-supplied automatically).";
+pond_get: message_id (the target message's full parts, paginated, plus \
+context_depth sibling messages each side) OR session_id (the whole session). \
+Session mode takes response_mode: \"conversational\" (default - human/model \
+text with compact parts_summary per message), \"complete\" (all messages \
+including system/tool carriers, with parts_summary), or \"verbatim\" (all \
+messages with full parts inline; heaviest). limit defaults to 20, caps at \
+1000. Every per-message view carries parts_summary (kind + short label); \
+verbatim adds full parts. Responses are bounded by a size budget: when \
+messages_remaining > 0 (session mode) or target_parts_remaining > 0 (message \
+mode), pass the last returned id back as after_id to fetch the next page. Not \
+for bulk export - use `pond export`.";
 
     /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -342,37 +275,43 @@ message_id / include_parts are re-supplied automatically).";
         cursor: Option<String>,
     }
 
-    /// `pond_get` MCP tool parameters. One of `message_id` / `session_id` /
-    /// `cursor` is required.
+    /// `pond_get` MCP tool parameters. Exactly one of `message_id` /
+    /// `session_id` is required.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpGetParams {
-        /// Retrieve this message plus surrounding thread context.
+        /// Retrieve this message: its full parts plus `context_depth` sibling
+        /// messages each side. `response_mode` is ignored in this mode.
         #[serde(default)]
         message_id: Option<String>,
         /// Retrieve this whole session (mutually exclusive with message_id).
         #[serde(default)]
         session_id: Option<String>,
-        /// With session_id: truncate the session at and including this
-        /// message id (restore-to-a-point).
-        #[serde(default)]
-        up_to: Option<String>,
         /// With message_id: messages of thread context to include on each side.
         #[serde(default)]
         context_depth: Option<usize>,
-        /// Cap on returned messages. Default 100, max 1000.
+        /// Cap on returned messages (session mode) or parts (message mode).
+        /// Default 20, max 1000.
         #[serde(default)]
         limit: Option<usize>,
-        /// When true, the response also carries each message's parts
-        /// (reasoning, tool calls, tool results, files). Default false: the
-        /// response carries only `messages[].text` to fit the agent-context
-        /// budget; pass true when full parts are needed for restore-style flows.
+        /// Session-mode depth: "conversational" (default; human/model text
+        /// only, with part summaries), "complete" (all messages incl. carriers,
+        /// with part summaries), or "verbatim" (all messages with full parts
+        /// inline). Ignored in message mode.
         #[serde(default)]
-        include_parts: Option<bool>,
-        /// Opaque continuation token from a prior response's `next_cursor`.
-        /// When set, the originating `session_id` / `message_id` /
-        /// `include_parts` are re-supplied from the cursor automatically.
+        response_mode: Option<String>,
+        /// Exclusive continuation anchor from a prior response: the last
+        /// `message_id` (session mode) or last `part_id` (message mode).
         #[serde(default)]
-        cursor: Option<String>,
+        after_id: Option<String>,
+    }
+
+    fn parse_response_mode(value: Option<String>) -> ResponseMode {
+        match value.as_deref() {
+            Some("complete") => ResponseMode::Complete,
+            Some("verbatim") => ResponseMode::Verbatim,
+            // None or any other value falls back to the conversational default.
+            _ => ResponseMode::Conversational,
+        }
     }
 
     /// The pond MCP server: holds the shared state and the generated tool router.
@@ -439,12 +378,14 @@ message_id / include_parts are re-supplied automatically).";
 
         #[tool(
             description = "Retrieve stored conversation content. With `message_id`: that \
-                           message plus `context_depth` messages of thread context each side. \
-                           With `session_id`: the full session. Default response carries \
-                           `messages[].text` only; pass `include_parts=true` to also receive \
-                           parts (reasoning, tool calls, tool results, files). Responses are \
-                           bounded by a ~10000-token budget - when `has_more` is true, pass \
-                           `next_cursor` back as `cursor` to fetch the next page."
+                           message's full parts (paginated) plus `context_depth` sibling \
+                           messages each side. With `session_id`: the session at one of three \
+                           `response_mode`s - \"conversational\" (default; text + part \
+                           summaries), \"complete\" (all messages + part summaries), or \
+                           \"verbatim\" (all messages with full parts inline). Responses are \
+                           bounded by a size budget; when `messages_remaining` (or \
+                           `target_parts_remaining`) is > 0, pass the last id back as `after_id` \
+                           to page on. Not for bulk export - use `pond export`."
         )]
         async fn pond_get(
             &self,
@@ -455,11 +396,10 @@ message_id / include_parts are re-supplied automatically).";
                 namespace: Some(default_namespace()),
                 session_id: params.session_id,
                 message_id: params.message_id,
-                up_to: params.up_to,
                 context_depth: params.context_depth.unwrap_or(0),
-                limit: params.limit.unwrap_or(100),
-                include_parts: params.include_parts.unwrap_or(false),
-                cursor: params.cursor,
+                limit: params.limit.unwrap_or(20),
+                response_mode: parse_response_mode(params.response_mode),
+                after_id: params.after_id,
             };
             match run_get(&self.state.store, request).await {
                 GetEnvelope::Success(response) => json_result(&response),
@@ -756,6 +696,7 @@ message_id / include_parts are re-supplied automatically).";
                         timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
                         text: "hello".to_owned(),
                         score: 1.0,
+                        parts_summary: Vec::new(),
                     }],
                 }],
                 matched_total: 1,

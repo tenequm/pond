@@ -108,6 +108,20 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
             text: s("the answer is forty-two"),
         },
     };
+    let tool_call = Part {
+        session_id: SESSION_ID.to_owned(),
+        id: "mcp-test-part-toolcall".to_owned(),
+        message_id: MESSAGE_ID.to_owned(),
+        ordinal: 2,
+        provenance: Provenance::Conversational,
+        options: Default::default(),
+        kind: PartKind::ToolCall {
+            call_id: s("toolu_mcptest"),
+            name: s("Bash"),
+            params: json!({}),
+            provider_executed: false,
+        },
+    };
 
     let envelope = pond_ingest(
         &store,
@@ -119,6 +133,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
                 IngestEvent::Message(message),
                 IngestEvent::Part(reasoning),
                 IngestEvent::Part(text),
+                IngestEvent::Part(tool_call),
             ],
         },
     )
@@ -195,28 +210,37 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         )
         .await?;
     let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session {
-        session,
-        messages,
-        parts,
-    } = response.result
-    else {
+    assert_eq!(response.session.id, SESSION_ID);
+    let GetResult::Session { messages, .. } = response.result else {
         panic!("expected a session result");
     };
-    assert_eq!(session.id, SESSION_ID);
-    assert!(
-        parts.is_empty(),
-        "default include_parts=false: parts elided from response"
-    );
     assert!(
         !messages.is_empty(),
-        "session has at least one message in the trimmed response"
+        "session has at least one message in the conversational response"
+    );
+    assert!(
+        messages.iter().all(|message| message.parts.is_none()),
+        "conversational mode elides full parts"
+    );
+    assert!(
+        messages
+            .iter()
+            .flat_map(|message| &message.parts_summary)
+            .all(|summary| summary.kind != "text" && summary.kind != "reasoning"),
+        "conversational summaries drop the redundant text and reasoning kinds"
+    );
+    assert!(
+        messages.iter().any(|message| message
+            .parts_summary
+            .iter()
+            .any(|summary| summary.kind == "tool_call")),
+        "conversational mode surfaces structural parts (the tool_call)"
     );
 
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "session_id": SESSION_ID, "include_parts": true })
+                json!({ "session_id": SESSION_ID, "response_mode": "verbatim" })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -224,15 +248,19 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         )
         .await?;
     let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session { parts, .. } = response.result else {
+    let GetResult::Session { messages, .. } = response.result else {
         panic!("expected a session result");
     };
     assert!(
-        parts.iter().any(|part| matches!(
-            &part.kind,
-            PartKind::Reasoning { text: Some(text) } if text.as_str() == REASONING_TEXT
-        )),
-        "include_parts=true returns the reasoning part in full"
+        messages
+            .iter()
+            .filter_map(|message| message.parts.as_ref())
+            .flatten()
+            .any(|part| matches!(
+                &part.kind,
+                PartKind::Reasoning { text: Some(text) } if text.as_str() == REASONING_TEXT
+            )),
+        "verbatim mode returns the reasoning part in full"
     );
 
     // A wire error (unknown session) surfaces as a JSON-RPC tool error.

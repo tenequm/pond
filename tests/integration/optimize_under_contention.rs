@@ -60,7 +60,7 @@ fn make_part(session_id: &str, idx: usize, text: &str) -> Part {
 
 /// Smoke: two `Store`s opened against the same `shared-memory://` authority
 /// see each other's bytes. The reader is opened *after* the writer commits
-/// because pond's `handle-freshness` window (spec.md#3.5) is 5 s for non-local
+/// because pond's `lance-handle-freshness` window (spec.md#3.5) is 5 s for non-local
 /// URLs - an already-open handle would not see the new commit for that long.
 /// Opening fresh dodges the cache and exercises the real plumbing: the
 /// shared-memory pool delivers the same `Arc<InMemory>` to both registries.

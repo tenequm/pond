@@ -81,7 +81,7 @@ Three classes of failures remain. None is a fusion bug; they are harder problems
 2. **Cross-encoder reranker.** Top-K rerank with Qwen3-Reranker-8B (Fireworks `qwen3-reranker-8b`) lifted paraphrased S@3 from 0.649 to 0.739 (+0.09 absolute, +14% relative). Deferred for v1: the gain doesn't justify the operational surface of a new model dependency (local 80MB-600MB ONNX + 20-80ms/query, or API key + ~200ms network + per-query cost). Revisit when real users (not benchmarks) report quality issues.
 3. **Cross-lingual queries against a corpus dominated by another language.** Handled at the agent layer (the caller issues probes in both languages and unions hits by `session_id`); pond does not translate internally. The `pond_search` MCP description carries this guidance.
 
-Query expansion is also explicitly a caller-layer concern. Lexical expansion is forbidden by `spec.md#language-neutral-index` (per-language transforms silently corrupt other languages); semantic expansion needs an LLM call pond's substrate deliberately omits.
+Query expansion is also explicitly a caller-layer concern. Lexical expansion is forbidden by `spec.md#search-language-neutral-index` (per-language transforms silently corrupt other languages); semantic expansion needs an LLM call pond's substrate deliberately omits.
 
 ## Files
 

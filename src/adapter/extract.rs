@@ -17,7 +17,7 @@
 //! payload, database row). pond ships `impl Source for serde_json::Value`
 //! for JSON-flavored adapters; the trait carries no transport assumptions.
 //!
-//! See spec.md#no-synthesis, spec.md#schema-honesty, and spec.md#lossless-projection for the underlying principles.
+//! See spec.md#model-no-synthesis, spec.md#model-schema-honesty, and spec.md#model-lossless-projection for the underlying principles.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,7 +87,7 @@ fn wrap<T>(value: T) -> Extracted<T> {
 // Arrow `Utf8` columns address with an `i32` offset buffer: no stored text
 // value may approach `i32::MAX`. The seam caps every extracted value at
 // `LEAF_CAP`, truncating an oversized leaf to a head-preserving marker
-// (spec.md#bounded-values).
+// (spec.md#adapter-bounded-values).
 pub(crate) const LEAF_CAP: usize = 10 * 1024 * 1024;
 
 static TRUNCATED_VALUES: AtomicU64 = AtomicU64::new(0);
@@ -115,7 +115,7 @@ fn truncation_marker(original_bytes: usize) -> String {
 /// of `head` plus the `<pond:truncated N bytes>` marker, the whole staying
 /// within `LEAF_CAP`. `original` is the value's true byte length, which may
 /// exceed `head.len()` when the caller streamed and discarded the tail. The
-/// sole definition of the truncation shape (spec.md#bounded-values). Caller
+/// sole definition of the truncation shape (spec.md#adapter-bounded-values). Caller
 /// guarantees `head.len() > LEAF_CAP`.
 pub(crate) fn truncate_to_marker(head: &[u8], original: usize) -> String {
     let marker = truncation_marker(original);

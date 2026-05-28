@@ -15,7 +15,7 @@ pub struct Session {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// spec.md#parent-pointer-coherence: when set, `parent_session_id`
+    /// spec.md#model-parent-pointer-coherence: when set, `parent_session_id`
     /// MUST also be set. Spawn-only sources (claude-code subagents,
     /// nanoclaw) leave this `None`; fork-with-cut-point sources
     /// (pi-mono) populate both pointers together.
@@ -147,9 +147,9 @@ impl Role {
 }
 
 /// Whether a Part's content is conversation or harness-injected scaffolding
-/// (spec.md#part-provenance). No `Default` and no `#[serde(default)]` on the
+/// (spec.md#model-part-provenance). No `Default` and no `#[serde(default)]` on the
 /// `Part.provenance` field below: constructing a Part without classifying it
-/// MUST be a compile error (spec.md#provenance-required).
+/// MUST be a compile error (spec.md#adapter-provenance-required).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
@@ -172,7 +172,7 @@ pub struct Part {
     pub id: String,
     pub message_id: String,
     pub ordinal: i32,
-    /// Conversation vs harness-injected (spec.md#part-provenance). Mandatory,
+    /// Conversation vs harness-injected (spec.md#model-part-provenance). Mandatory,
     /// no serde default - search reads it to exclude injected scaffolding.
     pub provenance: Provenance,
     #[serde(default)]
@@ -215,7 +215,7 @@ pub enum PartKind {
         /// `None` when the source carried no tool name. claude-code
         /// always carries it on `tool_use` rows; codex-cli sometimes
         /// has placeholder shapes. The seal makes synthesized names
-        /// unconstructable from adapter code (spec.md#no-synthesis).
+        /// unconstructable from adapter code (spec.md#model-no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         params: Value,
@@ -230,7 +230,7 @@ pub enum PartKind {
         /// the adapter resolves via a per-file `tool_use_id -> name`
         /// map and surfaces a miss (e.g. compaction pruned the originating
         /// call) as `None`, never as a fabricated string
-        /// (spec.md#no-synthesis).
+        /// (spec.md#model-no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         is_failure: bool,
@@ -295,6 +295,10 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
+// The success/error size gap is fine here: a `GetEnvelope` is one per-request
+// return value, serialized immediately - never stored in bulk where the gap
+// would waste memory.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetEnvelope {
@@ -307,29 +311,52 @@ pub struct GetRequest {
     pub protocol_version: u16,
     #[serde(default)]
     pub namespace: Option<String>,
+    // Mutually exclusive scopes.
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub message_id: Option<String>,
-    #[serde(default)]
-    pub up_to: Option<String>,
+    /// `message_id` mode only: symmetric window radius, mirroring `grep -C`.
+    /// Returns up to `2*context_depth` siblings around the target. Ignored in
+    /// session mode.
     #[serde(default)]
     pub context_depth: usize,
     #[serde(default = "default_get_limit")]
     pub limit: usize,
+    /// Ignored in `message_id` mode (that mode always returns the target with
+    /// its full parts, paginated).
     #[serde(default)]
-    pub include_parts: bool,
+    pub response_mode: ResponseMode,
+    /// Exclusive continuation anchor: last `message_id` in session mode, last
+    /// `part_id` in message mode. The append-only invariant means one id is
+    /// enough state - no opaque cursor.
     #[serde(default)]
-    pub cursor: Option<String>,
+    pub after_id: Option<String>,
 }
 
+/// How much of each message `pond_get` materializes (spec.md#protocol).
+/// Ignored when `message_id` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseMode {
+    /// `search_text IS NOT NULL` conversational view + part summaries.
+    #[default]
+    Conversational,
+    /// All messages (including carriers) + part summaries.
+    Complete,
+    /// All messages + full parts inline (heaviest mode).
+    Verbatim,
+}
+
+/// The session header is always present; `result` carries the mode-specific
+/// payload, discriminated by a `scope` tag (spec.md#protocol). Flattened so a
+/// client reads `session` / `scope` / payload fields off one object - no
+/// `session.session` nesting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetResponse {
+    pub session: GetSession,
     #[serde(flatten)]
     pub result: GetResult,
-    pub has_more: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 /// Trimmed session header (spec.md#protocol): adapter-redundant `options`,
@@ -343,28 +370,159 @@ pub struct GetSession {
     pub created_at: DateTime<Utc>,
 }
 
+impl GetSession {
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            source_agent: session.source_agent.clone(),
+            project: (*session.project).clone(),
+            created_at: session.created_at,
+        }
+    }
+}
+
+/// Per-message view in a `pond_get` response. `parts_summary` is always
+/// present (possibly empty); `parts` is populated only in Verbatim mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GetMessage {
+pub struct MessageView {
     pub id: String,
     pub role: Role,
     pub timestamp: DateTime<Utc>,
-    pub text: String,
+    /// Conversational text (`search_text`); absent for carrier rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// System-message content string, when the source carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub parts_summary: Vec<PartSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<ResponsePart>>,
 }
 
+/// Compact per-part descriptor (spec.md#protocol): enough to tell what a
+/// message carries without paying for full content. `call_id` is populated
+/// for `tool_call` / `tool_result` only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+pub struct PartSummary {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+}
+
+impl PartSummary {
+    /// Project a canonical [`PartKind`] into its compact response descriptor, or
+    /// `None` for a kind that does not earn a summary. Exhaustive on purpose - a
+    /// new `PartKind` variant must decide here. `call_id` is carried for
+    /// `tool_call` / `tool_result` only.
+    ///
+    /// `text` and `reasoning` return `None`: a text part's content already rides
+    /// the message's `text`/`content` (a summary would duplicate it), and
+    /// reasoning is deliberately not surfaced by default (its full body is still
+    /// reachable in verbatim mode). The kinds that survive are exactly
+    /// [`SUMMARY_PART_TYPES`].
+    pub fn for_kind(kind: &PartKind) -> Option<Self> {
+        let (label, call_id) = match kind {
+            PartKind::Text { .. } | PartKind::Reasoning { .. } => return None,
+            PartKind::File {
+                media_type,
+                file_name,
+                ..
+            } => (
+                Some(file_name.clone().unwrap_or_else(|| media_type.clone())),
+                None,
+            ),
+            PartKind::ToolCall { name, call_id, .. } => {
+                (name.as_deref().cloned(), call_id.as_deref().cloned())
+            }
+            PartKind::ToolResult {
+                name,
+                call_id,
+                is_failure,
+                ..
+            } => {
+                let label = name.as_deref().map(|name| {
+                    if *is_failure {
+                        format!("{name} (failed)")
+                    } else {
+                        name.clone()
+                    }
+                });
+                (label, call_id.as_deref().cloned())
+            }
+            PartKind::ToolApprovalRequest { approval_id, .. } => (Some(approval_id.clone()), None),
+            PartKind::ToolApprovalResponse {
+                approval_id,
+                approved,
+                ..
+            } => {
+                let verb = if *approved { "approved" } else { "denied" };
+                (Some(format!("{approval_id} ({verb})")), None)
+            }
+        };
+        Some(Self {
+            kind: kind.type_name().to_owned(),
+            label,
+            call_id,
+        })
+    }
+}
+
+/// Canonical part `type` names that yield a [`PartSummary`] - every kind except
+/// `text` and `reasoning` (see [`PartSummary::for_kind`], the source of truth).
+/// The summary read paths filter the parts scan to these so a text/reasoning
+/// heavy session never loads parts that would summarize to nothing.
+pub const SUMMARY_PART_TYPES: &[&str] = &[
+    "file",
+    "tool_call",
+    "tool_result",
+    "tool_approval_request",
+    "tool_approval_response",
+];
+
+/// A `Part` as it rides a `pond_get` response (spec.md#protocol): the canonical
+/// part minus `session_id` / `message_id`, which the enclosing session and
+/// message already identify. Built from a canonical [`Part`] in the handler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsePart {
+    pub id: String,
+    pub ordinal: i32,
+    pub provenance: Provenance,
+    #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+    pub options: ProviderOptions,
+    #[serde(flatten)]
+    pub kind: PartKind,
+}
+
+impl ResponsePart {
+    pub fn from_part(part: Part) -> Self {
+        Self {
+            id: part.id,
+            ordinal: part.ordinal,
+            provenance: part.provenance,
+            options: part.options,
+            kind: part.kind,
+        }
+    }
+}
+
+/// Mode-specific `pond_get` payload, tagged by `scope` and flattened into
+/// `GetResponse` alongside the shared session header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
 pub enum GetResult {
     Session {
-        session: GetSession,
-        messages: Vec<GetMessage>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        parts: Vec<Part>,
+        messages: Vec<MessageView>,
+        messages_remaining: usize,
     },
     Message {
-        session: GetSession,
-        messages: Vec<GetMessage>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        parts: Vec<Part>,
+        target: MessageView,
+        target_parts: Vec<ResponsePart>,
+        target_parts_remaining: usize,
+        /// Up to `2*context_depth` messages around the target (target excluded).
+        siblings: Vec<MessageView>,
     },
 }
 
@@ -399,7 +557,7 @@ pub struct SearchRequest {
     /// When set, retrieve messages similar to this stored message - pond uses
     /// the message's stored `vector` directly as the query, runs vector-only
     /// kNN, and ignores `query` and the FTS arm. The stored vector was
-    /// derived from `search_text` (`spec.md#embed-from-canonical`), so the
+    /// derived from `search_text` (`spec.md#session-embed-from-canonical`), so the
     /// signal is already filtered of harness-injected parts. Filters and
     /// `limit` still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +627,10 @@ pub struct SearchResult {
     pub timestamp: DateTime<Utc>,
     pub text: String,
     pub score: f64,
+    /// Populated only for user-role hits: distinguishes a plain-text prompt
+    /// from one carrying file attachments or multi-part scaffolding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts_summary: Vec<PartSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -531,7 +693,7 @@ pub struct IngestResult {
 pub enum IngestStatus {
     /// New PK; `merge_insert` wrote a fresh row.
     Inserted,
-    /// PK existed; `merge_insert` matched it (no-op per spec.md#additive-sync).
+    /// PK existed; `merge_insert` matched it (no-op per spec.md#adapter-integrity-additive-sync).
     Matched,
     /// Per-row failure: validation or storage error. See `error` field.
     Error,
@@ -552,7 +714,7 @@ pub fn default_namespace() -> String {
 }
 
 fn default_get_limit() -> usize {
-    100
+    20
 }
 
 pub fn validate_protocol(version: u16) -> Result<(), ErrorEnvelope> {

@@ -71,7 +71,7 @@ fn serialize_session(
     // Native replays verbatim `options.source.raw_record` rows (session_meta,
     // then one per message); `codex_session_meta` / `codex_response_item` below
     // are foreign-only. Replay echoes a frozen snapshot - safe only while
-    // canonical is append-only (spec.md#additive-sync).
+    // canonical is append-only (spec.md#adapter-integrity-additive-sync).
     let mut records = Vec::new();
     if fidelity == RestoreFidelity::Native
         && let Some(raw) = raw_record(&session.session.options)
@@ -92,7 +92,7 @@ fn serialize_session(
         // Foreign restore: a System message (a rule-3 carrier, or a source's
         // own system/developer turn) has no idiomatic home in another
         // client's transcript - drop it; the content stays in canonical
-        // (spec.md#native-restore-lossless, foreign clause).
+        // (spec.md#adapter-native-restore-lossless, foreign clause).
         if matches!(message.message, Message::System { .. }) {
             continue;
         }
@@ -537,7 +537,7 @@ fn message_events(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // spec.md#part-provenance: a `developer` record is a harness instruction
+    // spec.md#model-part-provenance: a `developer` record is a harness instruction
     // block; a `user`-slot record whose body is `<environment_context>` or an
     // `# AGENTS.md instructions` blob is injected context, not a genuine
     // prompt. Everything else in a message record is conversation.
@@ -602,7 +602,7 @@ fn message_events(
     Ok(events)
 }
 
-/// Provenance of a codex `message` record (spec.md#part-provenance). A
+/// Provenance of a codex `message` record (spec.md#model-part-provenance). A
 /// `developer` record is a harness instruction block; a `user`-slot record
 /// whose only content is `<environment_context>` or `# AGENTS.md instructions`
 /// is injected context rather than a typed prompt. v1 codex never interleaves
@@ -653,7 +653,7 @@ fn tool_call_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
-        // spec.md#part-provenance: the model authored the tool call.
+        // spec.md#model-part-provenance: the model authored the tool call.
         provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::ToolCall {
@@ -686,7 +686,7 @@ fn custom_tool_call_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
-        // spec.md#part-provenance: the model authored the tool call.
+        // spec.md#model-part-provenance: the model authored the tool call.
         provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::ToolCall {
@@ -719,7 +719,7 @@ fn custom_tool_result_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
-        // spec.md#part-provenance: tool output is runtime-produced.
+        // spec.md#model-part-provenance: tool output is runtime-produced.
         provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
@@ -762,7 +762,7 @@ fn tool_result_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
-        // spec.md#part-provenance: tool output is runtime-produced.
+        // spec.md#model-part-provenance: tool output is runtime-produced.
         provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
@@ -814,7 +814,7 @@ fn reasoning_events(
         id: part_id(message_id, 0),
         message_id: message_id.to_owned(),
         ordinal: 0,
-        // spec.md#part-provenance: model-authored reasoning.
+        // spec.md#model-part-provenance: model-authored reasoning.
         provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::Reasoning { text: summary },
@@ -905,7 +905,7 @@ mod tests {
         Ok(())
     }
 
-    /// spec.md#part-provenance: a `developer` record and a `user`-slot record
+    /// spec.md#model-part-provenance: a `developer` record and a `user`-slot record
     /// whose body is `<environment_context>` are harness-injected; a genuine
     /// user prompt and an assistant message are conversation.
     #[test]

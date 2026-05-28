@@ -5,7 +5,7 @@ use pond::{
     handlers::pond_get,
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::Store,
-    wire::{GetEnvelope, GetRequest},
+    wire::{GetEnvelope, GetRequest, ResponseMode},
 };
 use tempfile::TempDir;
 
@@ -33,27 +33,29 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 namespace: Some("local".to_owned()),
                 session_id: Some(session_id.clone()),
                 message_id: None,
-                up_to: None,
                 context_depth: 0,
                 limit: 1000,
-                include_parts: true,
-                cursor: None,
+                response_mode: ResponseMode::Conversational,
+                after_id: None,
             },
         )
         .await;
         let GetEnvelope::Success(response) = envelope else {
             panic!("expected successful pond_get for {session_id}");
         };
-        let pond::wire::GetResult::Session {
-            session, messages, ..
-        } = response.result
-        else {
+        assert_eq!(response.session.id, *session_id);
+        let pond::wire::GetResult::Session { messages, .. } = response.result else {
             panic!("expected session result");
         };
-        assert_eq!(session.id, *session_id);
         assert!(!messages.is_empty());
 
-        let target = messages[0].id.clone();
+        let target = messages
+            .iter()
+            .find(|m| m.text.as_deref().is_some_and(|text| !text.is_empty()))
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                panic!("session {session_id} has no conversational message in the fixture corpus")
+            });
         let envelope = pond_get(
             &store,
             GetRequest {
@@ -61,11 +63,10 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 namespace: Some("local".to_owned()),
                 session_id: None,
                 message_id: Some(target),
-                up_to: None,
                 context_depth: 1,
                 limit: 100,
-                include_parts: false,
-                cursor: None,
+                response_mode: ResponseMode::Conversational,
+                after_id: None,
             },
         )
         .await;

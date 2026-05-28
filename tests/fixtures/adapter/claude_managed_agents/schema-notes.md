@@ -141,7 +141,7 @@ different `type`s, all sharing the implicit parent of the most recent
 
 ## Relationship to pond's append-only-log framing
 
-Pond's `docs/spec.md#append-only` rule cites the Anthropic
+Pond's `docs/spec.md#lance-append-only` rule cites the Anthropic
 Managed Agents session-as-event-log framing. This sample is the canonical
 reference for what that framing looks like on the wire. Specifically:
 

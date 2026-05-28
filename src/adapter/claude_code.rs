@@ -106,7 +106,7 @@ fn serialize_session(
     }
     // Native replays the verbatim `options.source.raw_record`; `claude_record`
     // below is foreign-only. Replay echoes a frozen snapshot - safe only while
-    // canonical is append-only (spec.md#additive-sync).
+    // canonical is append-only (spec.md#adapter-integrity-additive-sync).
     let mut records = Vec::with_capacity(messages.len());
     let mut parent_uuid = None::<String>;
     for message in &messages {
@@ -209,7 +209,7 @@ fn claude_record(
     // `user` and `assistant` rows: a tool result is a `user` row, and there
     // is no in-transcript system turn - a System message (a rule-3 carrier or
     // a source's own system/developer turn) has no idiomatic home and is
-    // dropped; the content stays in canonical (spec.md#native-restore-lossless,
+    // dropped; the content stays in canonical (spec.md#adapter-native-restore-lossless,
     // foreign clause).
     let row_role = match &message.message {
         Message::System { .. } => return None,
@@ -518,7 +518,7 @@ fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
 /// Resolved metadata for one subagent JSONL file. `agent_type` is read from
 /// the sibling `.meta.json` for the `source_agent` label; `meta` keeps that
 /// file's full verbatim content so native restore reproduces it
-/// (spec.md#native-restore-lossless). Both are `None` when the meta file is
+/// (spec.md#adapter-native-restore-lossless). Both are `None` when the meta file is
 /// absent or unreadable (the label falls back to `claude-code/subagent`).
 struct SubagentDescriptor {
     parent_uuid: String,
@@ -654,7 +654,7 @@ fn message_events(
     let mut parts = Vec::new();
     let message = match (role, content) {
         ("user", Value::String(text)) => {
-            // spec.md#part-provenance: a user-slot turn is conversation only
+            // spec.md#model-part-provenance: a user-slot turn is conversation only
             // when it is a genuine human prompt; harness-injected wrappers and
             // `isMeta` rows are scaffolding.
             let provenance = user_text_provenance(row, text);
@@ -693,7 +693,7 @@ fn message_events(
         }
         ("user", Value::Array(items)) => {
             // Classify the whole user message once: v1 claude-code never mixes
-            // provenance within a single message (spec.md#part-provenance).
+            // provenance within a single message (spec.md#model-part-provenance).
             let provenance = user_array_provenance(row, items);
             parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
                 user_part(session_id, uuid, ordinal, item, state, provenance)
@@ -802,7 +802,7 @@ fn user_part(
 }
 
 fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
-    // spec.md#part-provenance: assistant content - text, reasoning, tool calls -
+    // spec.md#model-part-provenance: assistant content - text, reasoning, tool calls -
     // is model-authored, hence conversational. `tool_result` parts never appear
     // on an assistant message.
     match value.get("type").and_then(Value::as_str) {
@@ -882,7 +882,7 @@ fn tool_result_part(
     let call_id = extract_str(value, "tool_use_id");
     // `tool_result` source rows don't carry the tool name; it's resolved
     // via the per-file `tool_use_id -> name` map. Misses (compaction pruned
-    // the originating `tool_use`) surface as `None` per spec.md#no-synthesis
+    // the originating `tool_use`) surface as `None` per spec.md#model-no-synthesis
     // (schema-honesty: the field is `Option<Extracted<T>>`, not a fabricated
     // string).
     let name = value
@@ -899,7 +899,7 @@ fn tool_result_part(
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
         ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
-        // spec.md#part-provenance: tool output is runtime-produced, not
+        // spec.md#model-part-provenance: tool output is runtime-produced, not
         // conversation.
         provenance: Provenance::Injected,
         options: empty_options(),
@@ -1027,7 +1027,7 @@ fn is_meta_row(row: &Value) -> bool {
 }
 
 /// Harness-injected wrappers claude-code places inside a user-slot turn
-/// (spec.md#part-provenance): task notifications, slash-command echoes,
+/// (spec.md#model-part-provenance): task notifications, slash-command echoes,
 /// local-command caveats, interrupt notices.
 fn is_injected_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
@@ -1075,7 +1075,7 @@ fn user_array_provenance(row: &Value, items: &[Value]) -> Provenance {
 mod tests {
     //! Conformance tests for the claude-code adapter's data-shape contract:
     //! subagent path derivation, replay dedup, tool-name resolution, and the
-    //! "no synthesized values" invariant (spec.md#no-synthesis, spec.md#schema-honesty, and spec.md#lossless-projection).
+    //! "no synthesized values" invariant (spec.md#model-no-synthesis, spec.md#model-schema-honesty, and spec.md#model-lossless-projection).
     //!
     //! Each test builds a tiny synthetic corpus under a `TempDir` so the
     //! assertions exercise the real adapter end-to-end without depending on
@@ -1378,7 +1378,7 @@ mod tests {
         Ok(())
     }
 
-    /// spec.md#part-provenance: a genuine human prompt classifies
+    /// spec.md#model-part-provenance: a genuine human prompt classifies
     /// `conversational`; a harness `<task-notification>` user-slot turn and an
     /// `isMeta` row classify `injected`.
     #[test]
@@ -1407,7 +1407,7 @@ mod tests {
 
     /// Ingest a session carrying a `<task-notification>` user message and a
     /// genuine prompt; the notification's part must be `injected` and the
-    /// prompt's `conversational` (spec.md#part-provenance).
+    /// prompt's `conversational` (spec.md#model-part-provenance).
     #[tokio::test(flavor = "multi_thread")]
     async fn task_notification_message_yields_injected_parts() -> anyhow::Result<()> {
         let corpus = TempDir::new()?;

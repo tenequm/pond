@@ -110,14 +110,14 @@ pub trait Adapter: Send + Sync {
     fn discover(&self) -> DiscoverFuture<'_>;
 
     /// Stream events with a [`SkipOracle`] the adapter MAY consult to
-    /// short-circuit per-session re-decoding (spec.md#event-ordering). Default impl
+    /// short-circuit per-session re-decoding (spec.md#adapter-integrity-event-ordering). Default impl
     /// ignores the oracle.
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a>;
 }
 
 /// Per-session watermark lookup: when did pond last write this session?
 /// Backed by Lance's `_row_last_updated_at_version` joined to the manifest
-/// commit timestamp (spec.md#event-ordering). Adapter compares this to the source
+/// commit timestamp (spec.md#adapter-integrity-event-ordering). Adapter compares this to the source
 /// file's mtime to decide whether to re-decode.
 pub trait SkipOracle: Send + Sync {
     fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
@@ -138,7 +138,8 @@ impl SkipOracle for NoopOracle {
 pub enum AdapterYield {
     Event(IngestEvent),
     Skipped {
-        session_id: String,
+        /// `None` for files that never yield a session id (empty `.jsonl`).
+        session_id: Option<String>,
         project: Option<String>,
         reason: SkipReason,
     },
@@ -147,6 +148,10 @@ pub enum AdapterYield {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     Fresh,
+    /// File produced no importable session (empty `.jsonl`, sidecar-only rows,
+    /// or an unextractable header). Benign: counted, never an error or a
+    /// per-event drop. The underlying cause is logged at `POND_LOG=debug`.
+    Empty,
 }
 
 pub type AdapterYieldStream<'a> =

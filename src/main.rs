@@ -24,12 +24,15 @@ use pond::{
         AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, LanceArchiveCounts,
         LanceArchiveExport, LanceArchiveImport, OptimizeOutcome, RowTotals, Store,
     },
-    substrate::{IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes},
+    substrate::{
+        IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableOptimizeOutcome,
+        TableSizes,
+    },
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Part, PartKind,
-        ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
-        SearchResponse, SearchResult, SearchSession,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
+        PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
+        SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
     },
 };
 
@@ -79,6 +82,24 @@ impl From<CliSearchMode> for SearchModeWire {
             CliSearchMode::Fts => SearchModeWire::Fts,
             CliSearchMode::Vector => SearchModeWire::Vector,
             CliSearchMode::Hybrid => SearchModeWire::Hybrid,
+        }
+    }
+}
+
+/// CLI surface for `pond get --response-mode`. Maps 1:1 to wire `ResponseMode`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliResponseMode {
+    Conversational,
+    Complete,
+    Verbatim,
+}
+
+impl From<CliResponseMode> for ResponseMode {
+    fn from(mode: CliResponseMode) -> Self {
+        match mode {
+            CliResponseMode::Conversational => ResponseMode::Conversational,
+            CliResponseMode::Complete => ResponseMode::Complete,
+            CliResponseMode::Verbatim => ResponseMode::Verbatim,
         }
     }
 }
@@ -268,7 +289,7 @@ enum Command {
     /// Fetch a session or message.
     #[command(group(ArgGroup::new("get_selector")
         .required(true)
-        .args(["session_id", "message_id", "cursor"])))]
+        .args(["session_id", "message_id"])))]
     Get {
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
@@ -282,29 +303,27 @@ enum Command {
         /// Fetch a single message by id. Mutually exclusive with `--session-id`.
         #[arg(long, value_name = "ID")]
         message_id: Option<String>,
-        /// Truncate session output at this message id. Requires `--session-id`.
-        #[arg(
-            long,
-            value_name = "ID",
-            requires = "session_id",
-            conflicts_with = "message_id"
-        )]
-        up_to: Option<String>,
-        /// For `--message-id` mode: include this many surrounding messages
-        /// from the same session. Ignored in session mode.
+        /// For `--message-id` mode: include this many sibling messages on each
+        /// side (grep -C style). Ignored in session mode.
         #[arg(long, default_value_t = 0)]
         context_depth: usize,
-        /// Cap on returned messages.
-        #[arg(long, default_value_t = 100)]
+        /// Cap on returned messages (session mode) or parts (message mode).
+        #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Include per-message parts (reasoning, tool calls, tool results,
-        /// files) in the response. Default off: the response carries only
-        /// `messages[].text` to fit the agent-context budget.
-        #[arg(long)]
-        include_parts: bool,
-        /// Opaque continuation token from a prior response's `next_cursor`.
-        #[arg(long, value_name = "CURSOR")]
-        cursor: Option<String>,
+        /// Session-mode depth: conversational (text + part summaries), complete
+        /// (all messages + summaries), or verbatim (full parts inline). Ignored
+        /// with `--message-id`.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliResponseMode::Conversational,
+            conflicts_with = "message_id"
+        )]
+        response_mode: CliResponseMode,
+        /// Continuation anchor from a prior response: last message id (session)
+        /// or last part id (message). Exclusive lower bound.
+        #[arg(long, value_name = "ID")]
+        after_id: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
     },
@@ -536,10 +555,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if stages.embed {
-                summary.embed = Some(run_embed_stage(&store, force_embed).await?);
+                run_embed_stage(&store, force_embed).await?;
             }
             if stages.update_indexes {
-                summary.indexes = Some(run_update_indexes_stage(&store).await?);
+                run_update_indexes_stage(&store).await?;
             }
             render_sync_summary(&summary)?;
         }
@@ -555,7 +574,7 @@ async fn main() -> anyhow::Result<()> {
                 open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
                     .await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
-            if !summary.summary.cancelled && summary.summary.messages > 0 {
+            if !summary.cancelled && summary.messages > 0 {
                 let outcome = run_update_indexes_stage(&store).await?;
                 if outcome.any_indices_failed() {
                     std::process::exit(1);
@@ -721,11 +740,10 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             session_id,
             message_id,
-            up_to,
             context_depth,
             limit,
-            include_parts,
-            cursor,
+            response_mode,
+            after_id,
             format,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
@@ -738,11 +756,10 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 session_id,
                 message_id,
-                up_to,
                 context_depth,
                 limit,
-                include_parts,
-                cursor,
+                response_mode: ResponseMode::from(response_mode),
+                after_id,
             };
             let envelope = handlers::pond_get(&store, request).await;
             if !render_get_envelope(format, &envelope)? {
@@ -959,22 +976,13 @@ impl SyncStages {
     }
 }
 
+/// Only the import recap survives to `render_sync_summary`; embed and index
+/// each print their own line as they finish, so their outcomes aren't threaded
+/// back here.
 #[derive(Debug, Default)]
 struct SyncRunSummary {
     ingest: Option<IngestSummary>,
     archive_import: Option<LanceArchiveImport>,
-    embed: Option<EmbedStageSummary>,
-    indexes: Option<OptimizeOutcome>,
-}
-
-#[derive(Debug, Clone)]
-struct EmbedStageSummary {
-    summary: EmbedSummary,
-    device: Option<String>,
-    backlog: usize,
-    already_embedded: usize,
-    eligible_total: usize,
-    model: &'static str,
 }
 
 async fn run_import_stage(
@@ -1002,6 +1010,7 @@ async fn run_import_stage(
         total.dropped_sessions += summary.dropped_sessions;
         total.skipped_files += summary.skipped_files;
         total.skipped_fresh += summary.skipped_fresh;
+        total.skipped_empty += summary.skipped_empty;
         total.storage_errors += summary.storage_errors;
         total.truncated_values += summary.truncated_values;
         for (reason, count) in summary.drop_reasons {
@@ -1011,7 +1020,7 @@ async fn run_import_stage(
     Ok(total)
 }
 
-async fn run_embed_stage(store: &Store, force: bool) -> anyhow::Result<EmbedStageSummary> {
+async fn run_embed_stage(store: &Store, force: bool) -> anyhow::Result<EmbedSummary> {
     run_embed_stage_with_limit(store, force, None, "--force-embed").await
 }
 
@@ -1020,7 +1029,7 @@ async fn run_embed_stage_with_limit(
     force: bool,
     limit: Option<usize>,
     force_hint: &'static str,
-) -> anyhow::Result<EmbedStageSummary> {
+) -> anyhow::Result<EmbedSummary> {
     let stale = store.stale_embedding_count().await?;
     if stale > 0 {
         if !force {
@@ -1047,23 +1056,16 @@ async fn run_embed_stage_with_limit(
         Some(cap) => backlog.min(cap),
         None => backlog,
     };
-    output(&format!(
-        "{} backlog={} already_embedded={} eligible_total={} model={}",
-        pond::output::paint("embed:", pond::output::dim()),
-        format_thousands(bar_total as u64),
-        format_thousands(progress.embedded as u64),
-        format_thousands(progress.total as u64),
-        progress.model,
-    ))?;
     if bar_total == 0 && stale == 0 {
-        return Ok(EmbedStageSummary {
-            summary: EmbedSummary::default(),
-            device: None,
-            backlog: bar_total,
-            already_embedded: progress.embedded,
-            eligible_total: progress.total,
-            model: progress.model,
-        });
+        // Nothing to embed: one line, no bar, no device (embedder not loaded).
+        output(&format!(
+            "{}  0 new \u{b7} {}/{} \u{b7} {}",
+            pond::output::paint("embed:", pond::output::dim()),
+            format_thousands(progress.embedded as u64),
+            format_thousands(progress.total as u64),
+            short_model(progress.model),
+        ))?;
+        return Ok(EmbedSummary::default());
     }
 
     let embedder = CandleEmbedder::load()?;
@@ -1102,11 +1104,14 @@ async fn run_embed_stage_with_limit(
     }
     let summary = worker.run().await?;
     bar.finish_and_clear();
+    let covered = progress.embedded + summary.messages;
     output(&format!(
-        "{} done: batches={} messages={} device={}{}",
+        "{}  {} new \u{b7} {}/{} \u{b7} {} ({}){}",
         pond::output::paint("embed:", pond::output::dim()),
-        summary.batches,
-        summary.messages,
+        format_thousands(summary.messages as u64),
+        format_thousands(covered as u64),
+        format_thousands(progress.total as u64),
+        short_model(progress.model),
         device,
         if summary.cancelled {
             " (interrupted)"
@@ -1114,89 +1119,71 @@ async fn run_embed_stage_with_limit(
             ""
         },
     ))?;
-    Ok(EmbedStageSummary {
-        summary,
-        device: Some(device),
-        backlog: bar_total,
-        already_embedded: progress.embedded,
-        eligible_total: progress.total,
-        model: progress.model,
-    })
+    Ok(summary)
 }
 
 async fn run_update_indexes_stage(store: &Store) -> anyhow::Result<OptimizeOutcome> {
-    output(&pond::output::paint(
-        "update-indexes: folding new rows into search indexes...",
-        pond::output::dim(),
-    ))?;
     let (progress, bar) = optimize_progress_bar();
     let outcome = store.optimize_indices(Some(progress), None).await?;
     bar.finish_and_clear();
-    render_optimize_outcome(&outcome)?;
+    let per_table = outcome
+        .tables
+        .iter()
+        .map(|entry| format!("{} {}", entry.table.as_str(), index_entry_status(entry)))
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ");
+    output(&format!(
+        "{}  {}",
+        pond::output::paint("index:", pond::output::dim()),
+        per_table,
+    ))?;
+    render_optimize_hints(&outcome)?;
     Ok(outcome)
 }
 
+/// Final one-line import recap. Embed and index each print their own concise
+/// line during their stage, so this is import-only: `sync: N new . M unchanged
+/// . K empty . D dropped`, with `errors` appended only when nonzero.
 fn render_sync_summary(summary: &SyncRunSummary) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint, red, yellow};
+    use pond::output::{dim, paint};
 
-    let mut parts = Vec::new();
-    if let Some(ingest) = &summary.ingest {
-        parts.push(format!(
-            "import inserted={} matched={} dropped={} skipped={}",
+    let line = if let Some(ingest) = &summary.ingest {
+        let unchanged = ingest.matched + ingest.skipped_fresh;
+        let dropped = ingest.dropped_events + ingest.dropped_sessions;
+        let errors = ingest.skipped_files + ingest.storage_errors;
+        let mut line = format!(
+            "{} new \u{b7} {} unchanged \u{b7} {} empty \u{b7} {} dropped",
             format_thousands(ingest.inserted as u64),
-            format_thousands(ingest.matched as u64),
-            format_thousands((ingest.dropped_events + ingest.dropped_sessions) as u64),
-            format_thousands((ingest.skipped_files + ingest.skipped_fresh) as u64),
-        ));
-    }
-    if let Some(imported) = &summary.archive_import {
-        parts.push(format!(
-            "import archive_rows={} inserted={}",
-            format_thousands(
-                (imported.rows.sessions + imported.rows.messages + imported.rows.parts) as u64,
-            ),
-            format_thousands(
-                (imported.inserted.sessions + imported.inserted.messages + imported.inserted.parts)
-                    as u64,
-            ),
-        ));
-    }
-    if let Some(embed) = &summary.embed {
-        let suffix = match embed.device.as_deref() {
-            Some(device) => format!(" device={device}"),
-            None => String::new(),
-        };
-        parts.push(format!(
-            "embed messages={} backlog={} embedded={}/{} model={}{}",
-            format_thousands(embed.summary.messages as u64),
-            format_thousands(embed.backlog as u64),
-            format_thousands(embed.already_embedded as u64),
-            format_thousands(embed.eligible_total as u64),
-            embed.model,
-            suffix,
-        ));
-    }
-    if let Some(indexes) = &summary.indexes {
-        let failed = indexes.any_indices_failed();
-        parts.push(format!(
-            "update-indexes {}",
-            if failed {
-                paint("failed", red())
-            } else {
-                paint("ok", bold())
-            }
-        ));
-        if failed {
-            output(&paint(
-                "sync: index maintenance reported failures; see table above",
-                yellow(),
-            ))?;
+            format_thousands(unchanged as u64),
+            format_thousands(ingest.skipped_empty as u64),
+            format_thousands(dropped as u64),
+        );
+        if errors > 0 {
+            line.push_str(&format!(
+                " \u{b7} {} errors",
+                format_thousands(errors as u64)
+            ));
         }
-    }
-    if parts.is_empty() {
-        output(&format!("{} no stages ran", paint("sync:", dim())))?;
+        Some(line)
     } else {
-        output(&format!("{} {}", paint("sync:", dim()), parts.join(" | ")))?;
+        summary.archive_import.as_ref().map(|imported| {
+            format!(
+                "{} rows imported from archive \u{b7} {} new",
+                format_thousands(
+                    (imported.rows.sessions + imported.rows.messages + imported.rows.parts) as u64,
+                ),
+                format_thousands(
+                    (imported.inserted.sessions
+                        + imported.inserted.messages
+                        + imported.inserted.parts) as u64,
+                ),
+            )
+        })
+    };
+    // No import stage ran (e.g. `--only embed`): the embed/index stages already
+    // printed their own lines, so there's nothing left to recap.
+    if let Some(line) = line {
+        output(&format!("{}  {line}", paint("sync:", dim())))?;
     }
     Ok(())
 }
@@ -1412,17 +1399,19 @@ async fn sync_with_progress(
         ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
     bar.set_style(
         ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:24}] {pos}/{len} sessions  {wide_msg}",
+            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} \u{b7} {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
     );
-    bar.set_prefix(name.to_owned());
+    // Pad to the widest adapter name so stacked bars align.
+    bar.set_prefix(format!("{name:<12}"));
     bar.enable_steady_tick(Duration::from_millis(250));
 
     let mut messages: u64 = 0;
     let mut errors: u64 = 0;
     let mut drops: u64 = 0;
+    let mut skipped_empty: u64 = 0;
     let started = std::time::Instant::now();
     let bar_ref = &bar;
 
@@ -1477,13 +1466,22 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Empty => {
+                    skipped_empty += 1;
+                    status_label = "empty";
+                    dropped_count = 0;
+                    optional_reason = None;
+                }
             }
             messages += outcome.messages as u64;
             // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
             // the bulk are routine successes already counted by the bar's
             // pos/len/msg counters. `pond::sync` at INFO still carries the
             // full per-session detail for `POND_LOG=pond::sync=info` runs.
-            if !matches!(outcome.status, SyncStatus::Ok | SyncStatus::Fresh) {
+            if !matches!(
+                outcome.status,
+                SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
+            ) {
                 bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
             }
             match optional_reason.as_deref() {
@@ -1520,12 +1518,21 @@ async fn sync_with_progress(
     })
     .await?;
 
-    bar.finish_with_message(format!(
-        "{} msgs  {} dropped  {} err  done",
-        format_thousands(messages),
-        format_thousands(drops),
-        format_thousands(errors),
-    ));
+    let mut tail = format!("{} msgs", format_thousands(messages));
+    if skipped_empty > 0 {
+        tail.push_str(&format!(
+            " \u{b7} {} empty",
+            format_thousands(skipped_empty)
+        ));
+    }
+    if drops > 0 {
+        tail.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
+    }
+    if errors > 0 {
+        tail.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
+    }
+    tail.push_str("   done");
+    bar.finish_with_message(tail);
     Ok(summary)
 }
 
@@ -1536,7 +1543,7 @@ async fn sync_with_progress(
 /// [00:04:33] claude-code skip  /Users/tenequm/.../58a96901-....jsonl: empty jsonl session
 /// ```
 fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str>) -> String {
-    use pond::output::{green, paint, red, yellow};
+    use pond::output::{dim, green, paint, red, yellow};
 
     let (raw_tag, tag_style) = match &outcome.status {
         SyncStatus::Ok => ("ok  ", green()),
@@ -1544,6 +1551,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Skipped { .. } => ("skip", red()),
         SyncStatus::Rejected { .. } => ("rej ", red()),
         SyncStatus::Fresh => ("fresh", green()),
+        SyncStatus::Empty => ("empty", dim()),
     };
     let tag = paint(raw_tag, tag_style);
     if matches!(outcome.status, SyncStatus::Fresh) {
@@ -1566,13 +1574,27 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
 fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64().max(0.001);
     let msg_per_sec = (messages as f64) / secs;
-    format!(
-        "{} msgs  {} dropped  {} err  {:.0} msg/s",
+    let mut out = format!(
+        "{} msgs \u{b7} {:.0} msg/s",
         format_thousands(messages),
-        format_thousands(drops),
-        format_thousands(errors),
         msg_per_sec,
-    )
+    );
+    // Only surface the trouble counters once they're nonzero; a clean run
+    // stays short enough to fit the bar without truncation.
+    if drops > 0 {
+        out.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
+    }
+    if errors > 0 {
+        out.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
+    }
+    out
+}
+
+/// Display form of an embedding model id: the segment after the last `/`, so
+/// `intfloat/multilingual-e5-small` -> `multilingual-e5-small`. Org prefixes
+/// add width without information for the human-facing sync lines.
+fn short_model(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
 }
 
 /// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
@@ -1637,13 +1659,10 @@ async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
 }
 
 /// Build the spinner + progress callback pair for index maintenance.
-/// `PhaseStart` updates the spinner so the operator sees what's running;
-/// `PhaseDone` writes a completed line via `output()` (stdout) so per-phase
-/// timing is captured by pipes and scripts too. The bar's draw target is
-/// stderr; when stderr isn't a TTY the bar silently degrades and only the
-/// `output()` lines are visible.
+/// `PhaseStart` updates the spinner so the operator sees what's running live;
+/// per-phase timing lands at `POND_LOG=pond=debug` rather than the default
+/// output, which carries one `index:` summary line instead.
 fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
-    use pond::output::{dim, paint};
     let bar = ProgressBar::new_spinner();
     bar.set_style(
         ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {wide_msg}")
@@ -1668,20 +1687,20 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
             phase,
             elapsed_ms,
         } => {
-            let line = format!(
-                "  {:9}  {:<14}  {} ms",
-                table.as_str(),
-                phase.label(),
-                format_thousands(elapsed_ms),
+            tracing::debug!(
+                target: "pond::sync",
+                table = table.as_str(),
+                phase = phase.label(),
+                elapsed_ms,
+                "index phase done"
             );
-            let _ = output(&paint(&line, dim()));
         }
     });
     (callback, bar)
 }
 
 fn render_optimize_outcome(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint, red, yellow};
+    use pond::output::{bold, paint};
     let mut table = new_table();
     table.set_header(vec!["table", "indices", "compaction"]);
     for entry in &outcome.tables {
@@ -1693,10 +1712,16 @@ fn render_optimize_outcome(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
     }
     output(&paint("index maintenance", bold()))?;
     output(&table.to_string())?;
-    let mut hinted = false;
+    render_optimize_hints(outcome)
+}
+
+/// Deferral and failure lines only, no per-table table. Used by `pond sync`,
+/// whose summary line already carries per-table status; the table would just
+/// repeat it.
+fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
+    use pond::output::{dim, paint, red, yellow};
     for entry in &outcome.tables {
         if matches!(entry.compaction, PhaseOutcome::SkippedConflict) {
-            hinted = true;
             output(&format!(
                 "{}  compaction on {} deferred: concurrent writer; rerun once it finishes",
                 paint("hint", dim()),
@@ -1710,18 +1735,30 @@ fn render_optimize_outcome(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
                 &format!("error  indices on {}: {error:#}", entry.table.as_str()),
                 red(),
             ))?;
-            hinted = true;
         }
         if let PhaseOutcome::Failed(error) = &entry.compaction {
             output(&paint(
                 &format!("error  compaction on {}: {error:#}", entry.table.as_str()),
                 yellow(),
             ))?;
-            hinted = true;
         }
     }
-    let _ = hinted;
     Ok(())
+}
+
+/// One table's combined status for the `pond sync` summary line: the worst of
+/// its two phases, painted. `ok` covers Ok/Noop/NotAttempted.
+fn index_entry_status(entry: &TableOptimizeOutcome) -> String {
+    use pond::output::{paint, red, yellow};
+    if entry.indices.is_failed() || entry.compaction.is_failed() {
+        paint("failed", red())
+    } else if matches!(entry.indices, PhaseOutcome::SkippedConflict)
+        || matches!(entry.compaction, PhaseOutcome::SkippedConflict)
+    {
+        paint("deferred", yellow())
+    } else {
+        "ok".to_owned()
+    }
 }
 
 fn phase_cell(outcome: &PhaseOutcome, _phase: &str) -> Cell {
@@ -2160,22 +2197,8 @@ fn render_hit_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
-
-    let (session, messages, parts) = match &response.result {
-        GetResult::Session {
-            session,
-            messages,
-            parts,
-        }
-        | GetResult::Message {
-            session,
-            messages,
-            parts,
-        } => (session, messages, parts),
-    };
-
     output(&format!(
         "{} {}  source={}  project={}",
         paint("session", dim()),
@@ -2190,79 +2213,143 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
             &session.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-    ))?;
+    ))
+}
 
-    let mut parts_by_msg: std::collections::HashMap<&str, Vec<&Part>> =
-        std::collections::HashMap::new();
-    for part in parts {
-        parts_by_msg
-            .entry(part.message_id.as_str())
-            .or_default()
-            .push(part);
-    }
-    for parts_for_msg in parts_by_msg.values_mut() {
-        parts_for_msg.sort_by_key(|p| p.ordinal);
-    }
+fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
 
-    for (idx, message) in messages.iter().enumerate() {
-        output("")?;
-        let parts_for_msg = parts_by_msg
-            .get(message.id.as_str())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        render_message(idx + 1, message, parts_for_msg)?;
-    }
-
-    output("")?;
-    let mut footer = format!(
-        "{} {} messages",
-        paint("(total:", dim()),
-        paint(&format_thousands(messages.len() as u64), bold()),
-    );
-    if !parts.is_empty() {
-        footer.push_str(&format!(
-            ", {} parts",
-            paint(&format_thousands(parts.len() as u64), bold()),
-        ));
-    }
-    if response.has_more {
-        footer.push_str(&format!(" {}", paint("[more]", dim())));
-    }
-    footer.push_str(&paint(")", dim()));
-    output(&footer)?;
-    if let Some(cursor) = response.next_cursor.as_deref() {
-        output(&format!("{} {}", paint("next-cursor:", dim()), cursor))?;
+    render_session_header(&response.session)?;
+    match &response.result {
+        GetResult::Session {
+            messages,
+            messages_remaining,
+        } => {
+            for (idx, message) in messages.iter().enumerate() {
+                output("")?;
+                let parts = message.parts.as_deref().unwrap_or(&[]);
+                render_message_view(idx + 1, message, parts, false)?;
+            }
+            output("")?;
+            let mut footer = format!(
+                "{} {} messages",
+                paint("(total:", dim()),
+                paint(&format_thousands(messages.len() as u64), bold()),
+            );
+            if *messages_remaining > 0 {
+                footer.push_str(&format!(
+                    " {} remaining {}",
+                    paint(&format_thousands(*messages_remaining as u64), bold()),
+                    paint("[more]", dim()),
+                ));
+            }
+            footer.push_str(&paint(")", dim()));
+            output(&footer)?;
+            if *messages_remaining > 0
+                && let Some(last) = messages.last()
+            {
+                output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+            }
+        }
+        GetResult::Message {
+            target,
+            target_parts,
+            target_parts_remaining,
+            siblings,
+        } => {
+            // Interleave the target with its siblings in timestamp order so the
+            // thread reads top-to-bottom; the target carries its full parts.
+            let mut thread: Vec<(&MessageView, bool)> =
+                siblings.iter().map(|view| (view, false)).collect();
+            thread.push((target, true));
+            thread.sort_by_key(|(view, _)| view.timestamp);
+            for (idx, (view, is_target)) in thread.iter().enumerate() {
+                output("")?;
+                let parts = if *is_target {
+                    target_parts.as_slice()
+                } else {
+                    &[]
+                };
+                render_message_view(idx + 1, view, parts, *is_target)?;
+            }
+            if *target_parts_remaining > 0 {
+                output("")?;
+                output(&format!(
+                    "{} {} parts remaining {}",
+                    paint("(target:", dim()),
+                    paint(&format_thousands(*target_parts_remaining as u64), bold()),
+                    paint("[more])", dim()),
+                ))?;
+                if let Some(last) = target_parts.last() {
+                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn render_message(
+/// Render one message view: header, text/content, then either full parts (when
+/// supplied - verbatim session parts or a message-mode target) or the compact
+/// part summaries otherwise.
+fn render_message_view(
     rank: usize,
-    message: &pond::wire::GetMessage,
-    parts: &[&Part],
+    view: &MessageView,
+    full_parts: &[ResponsePart],
+    is_target: bool,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
+    let marker = if is_target {
+        paint("  <- target", dim())
+    } else {
+        String::new()
+    };
     output(&format!(
-        "{}  {}  {}  {}",
+        "{}  {}  {}  {}{marker}",
         paint(&format!("[{rank}]"), dim()),
         paint(
-            &message.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            &view.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-        paint_role(message.role.as_str()),
-        paint(&message.id, dim()),
+        paint_role(view.role.as_str()),
+        paint(&view.id, dim()),
     ))?;
-    if !message.text.is_empty() {
-        render_hit_text(&message.text)?;
-    }
-    for part in parts {
-        render_part(part)?;
+    // When full parts are present they are the complete content; rendering
+    // `text` (a search_text projection of those same parts) too would just
+    // double the body.
+    if full_parts.is_empty() {
+        if let Some(text) = &view.text {
+            render_hit_text(text)?;
+        }
+        if let Some(content) = &view.content {
+            render_hit_text(content)?;
+        }
+        for summary in &view.parts_summary {
+            render_part_summary(summary)?;
+        }
+    } else {
+        for part in full_parts {
+            render_part(part)?;
+        }
     }
     Ok(())
 }
 
-fn render_part(part: &Part) -> anyhow::Result<()> {
+fn render_part_summary(summary: &PartSummary) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let mut line = format!("[{}]", summary.kind);
+    if let Some(label) = &summary.label {
+        line.push(' ');
+        line.push_str(label);
+    }
+    if let Some(call_id) = &summary.call_id {
+        line.push_str(&format!(" call_id={call_id}"));
+    }
+    output(&format!("    {}", paint(&line, dim())))
+}
+
+fn render_part(part: &ResponsePart) -> anyhow::Result<()> {
     use pond::output::{dim, paint, yellow};
 
     let prefix = paint(">", dim());

@@ -2,29 +2,111 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  # Manual fire of `publish-release-dry-run` to validate the goreleaser pipeline
+  # (build + archive) without touching releases, the homebrew tap, or NUR.
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+
+# Newer push or PR update on the same ref supersedes the older in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Cap C-build parallelism (aws-lc-sys et al.) to avoid swap-thrash on the
+  # 4-core self-hosted runner; Rust parallelism (cargo -j) is left at default.
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  MAKEFLAGS: -j2
 
 jobs:
-  rust:
-    name: Rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  build-and-test:
+    name: build-and-test
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          clean: false   # keep target/ between runs for cargo freshness + kache
 
-      # Reads channel + components from rust-toolchain.toml so it stays the
-      # single source of truth for the Rust version; also bundles rust-cache.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
-
+      - run: kache stats
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
+      - run: kache stats
+
+  release-plz:
+    name: release-plz
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0   # release-plz needs full git history for changelog
+
+      - id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          # Default (no command) runs both `release-pr` and `release`.
+          # `dry_run` applies only to `release`; `release-pr` opens PRs for real.
+          dry_run: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+
+  publish-release:
+    name: publish-release
+    needs: release-plz
+    if: needs.release-plz.outputs.releases_created == 'true'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          clean: false
+
+      # nix-hash, required by goreleaser's `nix` block to compute the NUR sha256.
+      - uses: cachix/install-nix-action@v31
+
+      - run: kache stats
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      - run: kache stats
+
+  publish-release-dry-run:
+    name: publish-release-dry-run
+    needs: build-and-test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - uses: cachix/install-nix-action@v31
+
+      - run: kache stats
+      # `--snapshot` skips publishing: no GH release, no tap PR, no NUR push.
+      # Just builds + archives so we can validate the pipeline end-to-end.
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      - run: kache stats

@@ -17,10 +17,11 @@ Thumbs.db
 *.swp
 
 .env*
+.secrets*
 tmp/
 .mcp.json
-.claude/*local.json
-.claude
+/.claude/*local.json
+/.claude
 .agents/skills/
 skills-lock.json
 /benches/corpus/

@@ -31,7 +31,7 @@
 
 ## Repo layout
 
-- One flat crate. `src/` holds module folders (`adapter/`, `embed/`) alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
+- One flat crate. `src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
 
 ## Documentation
 
@@ -49,7 +49,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## Comments
 
 <comments>
-A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
+A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#model-no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
 
 <example>
 // spec.md#protocol: typed `conflict` for OCC failures, not `storage_unavailable`.
