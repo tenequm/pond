@@ -69,3 +69,4 @@ tasks:
     options:
       cache: true
       outputStyle: stream
+      runInCI: false   # cluster build runs in publish jobs, not `moon ci`

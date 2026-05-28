@@ -42,10 +42,13 @@ jobs:
 
       - uses: moonrepo/setup-toolchain@v0
 
-      # `moon ci` runs the affected tasks (respecting runInCI); scoped to
-      # format/lint/test so build-dist (cluster build) stays out of this job.
-      # kache (above) is the RUSTC_WRAPPER compile cache.
-      - run: moon ci :format :lint :test
+      # Materialize the pinned toolchain once - moon runs tasks in parallel and
+      # concurrent on-demand rustup installs race on ~/.rustup.
+      - run: rustup show
+
+      # Runs every affected task with runInCI=true (format/lint/test); build-dist
+      # sets runInCI:false. kache (above) is the RUSTC_WRAPPER compile cache.
+      - run: moon ci
 
   release-plz:
     name: release-plz
