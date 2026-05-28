@@ -1,4 +1,4 @@
-//! Object-store / remote backend integration (spec.md#handle-freshness,
+//! Object-store / remote backend integration (spec.md#lance-handle-freshness,
 //! spec.md#substrate).
 //!
 //! Lance's default `ObjectStoreRegistry` ships `memory://`, which we use as

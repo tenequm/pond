@@ -3,7 +3,7 @@
 //!
 //! The read path is plain `std::fs` on `spawn_blocking`: `tokio::fs` is itself
 //! `spawn_blocking` underneath and benchmarks far slower. Every record is
-//! bounded before it leaves this module (spec.md#bounded-values) - a line
+//! bounded before it leaves this module (spec.md#adapter-bounded-values) - a line
 //! within `RECORD_CAP` via `serde_json` + `bound_value`, a longer line via the
 //! `struson` cap-parser so peak memory stays bounded.
 

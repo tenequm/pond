@@ -53,7 +53,7 @@ async fn concurrent_writers_on_same_data_dir_serialize_without_conflict() -> any
     out_b??;
 
     // Either existing store handle sees the converged state. Local-FS
-    // refresh window is zero (spec.md#handle-freshness), so a long-lived reader
+    // refresh window is zero (spec.md#lance-handle-freshness), so a long-lived reader
     // picks up another writer's commit on the next read without waiting.
     let (sessions, _, _) = store_a.row_counts().await?;
     assert_eq!(

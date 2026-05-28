@@ -209,7 +209,7 @@ async fn sse_text(app: &Router, uri: &str) -> (StatusCode, String) {
 async fn session_events_addresses_a_subagent_id_with_an_encoded_slash() -> anyhow::Result<()> {
     let (_temp, store, app) = router().await?;
     // A subagent session id contains a `/` (`<parent>/agent-<hash>`,
-    // spec.md#opaque-ids). Clients percent-encode it in the path; axum decodes
+    // spec.md#adapter-integrity-opaque-ids). Clients percent-encode it in the path; axum decodes
     // the `{session_id}` segment, so the slashed id round-trips to
     // `get_session` and the SSE route serves the subagent session.
     let subagent_id = store

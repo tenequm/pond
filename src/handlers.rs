@@ -5,7 +5,7 @@ fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
 /// Typed identifier for the namespace a wire request targets. v1 is
 /// single-namespace, so every successful resolve returns `root()`; the
 /// type lets future multi-namespace routing land without churning call
-/// sites (spec.md#namespace-resolution).
+/// sites (spec.md#wire-namespace-resolution).
 #[derive(Debug, Clone)]
 pub struct NamespaceIdent(pub Vec<String>);
 
@@ -119,7 +119,7 @@ mod ingest_handler {
         Rejected {
             reason: String,
         },
-        /// Per-session staleness skip (spec.md#event-ordering): adapter short-circuited
+        /// Per-session staleness skip (spec.md#adapter-integrity-event-ordering): adapter short-circuited
         /// the file decode because `mtime < MAX(messages.timestamp)`.
         Fresh,
     }
@@ -726,7 +726,7 @@ mod export_handler {
     //! Sessions are emitted in lexicographic id order; within each session,
     //! messages run in `(timestamp, message_id)` order and each message's
     //! parts immediately follow in `ordinal` order. Matches the
-    //! spec.md#event-ordering ordering contract so the output
+    //! spec.md#adapter-integrity-event-ordering ordering contract so the output
     //! re-imports without re-ordering.
 
     use anyhow::{Context, Result};
@@ -802,7 +802,7 @@ mod export_handler {
 pub use export_handler::{ExportSummary, pond_export};
 
 mod restore_handler {
-    //! `restore_lineage` (spec.md#lineage-complete-restore): collect the named
+    //! `restore_lineage` (spec.md#adapter-lineage-complete-restore): collect the named
     //! session plus its direct subagent children for the `pond export session
     //! --as` restore path. The spawn graph is one level deep; a collected
     //! child that is itself a parent means a deeper graph, which is a typed
@@ -823,7 +823,7 @@ mod restore_handler {
         for child in store.child_sessions(session_id).await? {
             if !store.child_sessions(&child.id).await?.is_empty() {
                 bail!(
-                    "lineage-complete-restore supports one subagent level; session {} has child sessions",
+                    "adapter-lineage-complete-restore supports one subagent level; session {} has child sessions",
                     child.id
                 );
             }

@@ -166,7 +166,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # `pond sync` runs an interactive discovery against the known default paths
 # and writes the picks back here.
 #
-# Future wrap: pond is single-namespace in v1 (spec.md#namespace-resolution); `[sources]` is
+# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[sources]` is
 # flat here. When multi-namespace pond lands, source registration becomes
 # per-tenant under `[namespaces.<ns>.sources.<adapter>]`. Pre-v1 the schema
 # is breakable; the rename is operationally free until a real second tenant
@@ -229,7 +229,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # variables of the same name are read by `object_store` automatically;
 # values in this block override them. pond does not parse these.
 #
-# Future wrap: pond is single-namespace in v1 (spec.md#namespace-resolution); `[storage]` is
+# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[storage]` is
 # flat here on the assumption of one bucket per pond. When multi-namespace
 # pond lands and tenants need separate buckets/regions, this becomes
 # `[namespaces.<ns>.storage]`. Pre-v1 the schema is breakable; the rename is

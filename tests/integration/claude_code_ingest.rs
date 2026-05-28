@@ -53,7 +53,13 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
         assert_eq!(session.id, *session_id);
         assert!(!messages.is_empty());
 
-        let target = messages[0].id.clone();
+        let target = messages
+            .iter()
+            .find(|m| !m.text.is_empty())
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                panic!("session {session_id} has no conversational message in the fixture corpus")
+            });
         let envelope = pond_get(
             &store,
             GetRequest {

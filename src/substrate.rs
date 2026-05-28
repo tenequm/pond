@@ -101,7 +101,7 @@ pub enum IndexParamsKind {
     Scalar(BuiltinIndexType),
     /// `InvertedIndexParams` with a character `ngram` tokenizer in the
     /// `[min, max]` range and stemming / stop-words off
-    /// (spec.md#language-neutral-index).
+    /// (spec.md#search-language-neutral-index).
     InvertedFtsNgram { min: u32, max: u32 },
     /// `VectorIndexParams::ivf_pq` with cosine metric (e5 vectors are
     /// L2-normalized). `sub_vectors = embedding_dim / 8` and `num_bits = 8`
@@ -201,7 +201,7 @@ impl std::fmt::Display for ConflictExhausted {
 impl std::error::Error for ConflictExhausted {}
 
 /// Per-phase result for one table's pass through `Handle::optimize_table`.
-/// spec.md#substrate 3.7 (`index-write-decoupled`): the indices phase and the
+/// spec.md#substrate 3.7 (`lance-index-maintenance`): the indices phase and the
 /// compaction phase get independent retry budgets and independent commits,
 /// so a hot writer that starves the Rewrite cannot abort the index Update.
 #[derive(Debug)]
@@ -301,7 +301,7 @@ fn is_conflict_exhausted(error: &anyhow::Error) -> bool {
 
 /// On-disk byte totals for the three session datasets, plus everything else
 /// under the data-dir root. Sized by listing through Lance's object-store
-/// layer (spec.md#storage-via-lance) so `file://` and `s3://` behave alike.
+/// layer (spec.md#lance-chokepoints-storage) so `file://` and `s3://` behave alike.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TableSizes {
     pub sessions: u64,
@@ -484,11 +484,11 @@ pub struct Handle {
     session: Arc<Session>,
     /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
     /// future hosted pond swaps to "rest" without touching read/write paths
-    /// (spec.md#catalog-seam).
+    /// (spec.md#lance-chokepoints-catalog).
     nm: Arc<dyn LanceNamespace>,
     /// Namespace identifier this handle binds to. v1 is always `root()`; the
     /// typed seam matches `resolve_namespace`'s return so multi-namespace
-    /// routing can land without churning call sites (spec.md#namespace-resolution).
+    /// routing can land without churning call sites (spec.md#wire-namespace-resolution).
     nm_ident: NamespaceIdent,
     /// Object-store options threaded through every `DatasetBuilder` and
     /// `Dataset::write` call so refresh / index-creation paths inherit the
@@ -501,7 +501,7 @@ pub struct Handle {
     location: Url,
     /// Cached `parts.lance` open metadata, used the first time a caller asks
     /// for parts. Holds the namespace probe shape so the lazy open re-uses the
-    /// same `catalog-seam` path as the eager opens for sessions/messages.
+    /// same `lance-chokepoints-catalog` path as the eager opens for sessions/messages.
     parts_refresh_after: Duration,
 }
 
@@ -603,7 +603,7 @@ impl Handle {
             metadata_cache_bytes,
             Arc::new(ObjectStoreRegistry::default()),
         ));
-        // Build the lance-namespace catalog seam once (spec.md#catalog-seam).
+        // Build the lance-namespace catalog seam once (spec.md#lance-chokepoints-catalog).
         // The `root` property is whatever URL the Directory impl understands;
         // `uri_to_url` (lance-io/object_store.rs) accepts both bare paths and
         // URLs, so passing the scheme-qualified URL for local FS works the
@@ -623,7 +623,7 @@ impl Handle {
             .await
             .context("failed to connect lance Directory namespace")?;
         let nm_ident = NamespaceIdent::root();
-        // spec.md#handle-freshness: refresh window is scheme-keyed. Local-FS
+        // spec.md#lance-handle-freshness: refresh window is scheme-keyed. Local-FS
         // manifest reads are microsecond-cheap, so `0` (always-refresh) is
         // essentially free and removes the stale-read window entirely. Object
         // stores have real per-call cost; `5s` caps manifest fetch overhead at
@@ -695,7 +695,7 @@ impl Handle {
 
     /// Insert-only merge: append new rows, never overwrite a matched PK.
     /// Returns rows inserted. The fold lives separately under
-    /// `Handle::optimize_table` (spec.md#index-write-decoupled).
+    /// `Handle::optimize_table` (spec.md#lance-index-maintenance).
     pub(crate) async fn merge_insert(
         &self,
         table: Table,
@@ -791,7 +791,7 @@ impl Handle {
     /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
     /// BTree combine bug; Bitmap, FTS, and IVF_PQ fold via append.
     ///
-    /// spec.md#substrate 3.7 (`index-write-decoupled`): indices and compaction
+    /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
     /// that starves compaction (Rewrite) does not abort the index build
     /// (Update) the operator actually asked for.
@@ -914,7 +914,7 @@ impl Handle {
         scanner_with_prefilter(&dataset, predicate)
     }
     /// Single read entry point: prefilter via `predicate`, optionally
-    /// project, return the prepared `Scanner` (spec.md#read-seam).
+    /// project, return the prepared `Scanner` (spec.md#lance-chokepoints-read).
     pub async fn scan(
         &self,
         table: Table,
@@ -992,7 +992,7 @@ impl Handle {
     }
 
     /// Resolve each table's stored location through the namespace catalog
-    /// (spec.md#catalog-seam) - no hardcoded `.lance` suffix.
+    /// (spec.md#lance-chokepoints-catalog) - no hardcoded `.lance` suffix.
     async fn table_location(&self, table_name: &str) -> Result<String> {
         let request = DescribeTableRequest {
             id: Some(self.nm_ident.as_table_id(table_name)),
@@ -1010,7 +1010,7 @@ impl Handle {
 
     /// On-disk byte totals for the three datasets plus the data-dir remainder.
     /// Every byte is sized by listing through Lance's object store
-    /// (spec.md#storage-via-lance), identical for `file://` and `s3://`.
+    /// (spec.md#lance-chokepoints-storage), identical for `file://` and `s3://`.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         let registry = Arc::new(ObjectStoreRegistry::default());
         let params = ObjectStoreParams {
@@ -1157,7 +1157,7 @@ impl Handle {
         let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
         let base = self.retry.initial_backoff.saturating_mul(multiplier);
         // Symmetric +/- `jitter` factor de-correlates concurrent retriers on
-        // a contended manifest (spec.md#retry-jitter); clamped to `max_backoff`.
+        // a contended manifest (spec.md#lance-retry-jitter); clamped to `max_backoff`.
         let factor = (1.0 + self.retry.jitter * (fastrand::f64() * 2.0 - 1.0)).max(0.0);
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
@@ -1166,7 +1166,7 @@ impl Handle {
 /// retry block. Distinct from the indices phase so a hot writer that loses the
 /// Rewrite race here does not abort index work the operator actually asked for.
 ///
-/// spec.md#index-write-decoupled mandates FRI on by default, but at
+/// spec.md#lance-index-maintenance mandates FRI on by default, but at
 /// v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
 /// panics in `optimize.rs::commit_compaction` with "defer_index_remap
 /// requires row_addrs but none were provided": `rewrite_files` skips

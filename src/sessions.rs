@@ -82,7 +82,7 @@ impl IndexIntents {
 
 /// A message awaiting embedding: its primary key plus the `search_text` to
 /// embed. The vector lives on the same `messages` row, so no denormalized
-/// filter columns are needed (spec.md#embed-from-canonical).
+/// filter columns are needed (spec.md#session-embed-from-canonical).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingMessage {
     pub session_id: String,
@@ -729,8 +729,8 @@ impl Store {
 
     /// `session_id -> wall-clock time of the Lance manifest version that
     /// last wrote the row` for the per-session staleness skip
-    /// (spec.md#event-ordering). Reads Lance's `_row_last_updated_at_version` system
-    /// column (available because pond enables stable row ids per spec.md#stable-row-ids)
+    /// (spec.md#adapter-integrity-event-ordering). Reads Lance's `_row_last_updated_at_version` system
+    /// column (available because pond enables stable row ids per spec.md#lance-table-creation-stable-row-ids)
     /// and joins it against `Dataset::versions()` for commit timestamps.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
         use lance::deps::arrow_array::UInt64Array;
@@ -808,9 +808,10 @@ impl Store {
     }
 
     /// Pull a page of `(id, role, timestamp, search_text)` for one session,
-    /// applying `up_to` / `start_after` (exclusive) / limit / byte-budget,
-    /// without touching parts.lance unless `include_parts` is set. The body
-    /// is `messages.search_text` (per spec.md#search, the embed-source projection).
+    /// applying `up_to` / `start_after` (exclusive) / limit / byte-budget.
+    /// Default (`!include_parts`) returns the conversational view only
+    /// (spec.md#search); `include_parts=true` returns the full set and
+    /// attaches each message's Parts.
     pub async fn paged_session_view(
         &self,
         session_id: &str,
@@ -820,29 +821,45 @@ impl Store {
             return Ok(None);
         };
 
-        let batch = self
-            .handle
-            .scan_batch(
-                Table::Messages,
-                Some(&Predicate::Eq("session_id", session_id.into())),
-                &["id", "timestamp", "role", "search_text"],
-            )
-            .await?;
-
-        let mut rows: Vec<MessageRow> = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let id = string(&batch, "id", row)?.context("message id is null")?;
-            let role =
-                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
-            let timestamp = datetime(&batch, "timestamp", row)?;
-            let text = string(&batch, "search_text", row)?.unwrap_or_default();
-            rows.push(MessageRow {
-                id,
-                role,
-                timestamp,
-                text,
-            });
-        }
+        let mut rows: Vec<MessageRow> = if scope.include_parts {
+            // Full-set scan for the restore path: includes catch-all system
+            // carriers whose search_text is null. The empty-string surrogate
+            // here is safe - the caller fetches parts to see the content.
+            let batch = self
+                .handle
+                .scan_batch(
+                    Table::Messages,
+                    Some(&Predicate::Eq("session_id", session_id.into())),
+                    &["id", "timestamp", "role", "search_text"],
+                )
+                .await?;
+            let mut rows = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let id = string(&batch, "id", row)?.context("message id is null")?;
+                let role =
+                    role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+                let timestamp = datetime(&batch, "timestamp", row)?;
+                let text = string(&batch, "search_text", row)?.unwrap_or_default();
+                rows.push(MessageRow {
+                    id,
+                    role,
+                    timestamp,
+                    text,
+                });
+            }
+            rows
+        } else {
+            self.scan_conversational_messages(session_id)
+                .await?
+                .into_iter()
+                .map(|row| MessageRow {
+                    id: row.message_id,
+                    role: row.role,
+                    timestamp: row.timestamp,
+                    text: row.text.into_inner(),
+                })
+                .collect()
+        };
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
 
         if let Some(up_to) = scope.up_to {
@@ -933,6 +950,51 @@ impl Store {
             has_more,
             next_after,
         }))
+    }
+
+    /// Conversational scan over one session: rows ordered by
+    /// `(timestamp, id)`, `IsNotNull("search_text")` pushed down at the
+    /// read seam (spec.md#search-prefilter-pushdown).
+    pub async fn scan_conversational_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ConversationalRow>> {
+        let filter = Predicate::And(vec![
+            Predicate::Eq("session_id", session_id.into()),
+            Predicate::IsNotNull("search_text"),
+        ]);
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&filter),
+                &["id", "timestamp", "role", "search_text"],
+            )
+            .await?;
+
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let message_id = string(&batch, "id", row)?.context("message id is null")?;
+            let role =
+                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+            let timestamp = datetime(&batch, "timestamp", row)?;
+            let text_str = string(&batch, "search_text", row)?.context(
+                "search_text null after IsNotNull pushdown - storage invariant violated",
+            )?;
+            rows.push(ConversationalRow {
+                session_id: session_id.to_owned(),
+                message_id,
+                role,
+                timestamp,
+                text: SearchText(text_str),
+            });
+        }
+        rows.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Ok(rows)
     }
 
     /// Locate the session id for a stored message. Cheap when only the routing
@@ -1030,7 +1092,7 @@ impl Store {
 
     /// Write a batch of embeddings into `messages`: set `vector` and
     /// `embedding_model` on each row by `(session_id, id)`
-    /// (spec.md#embed-from-canonical). The column update goes through the
+    /// (spec.md#session-embed-from-canonical). The column update goes through the
     /// write seam and lands as a new manifest version (`append-only`).
     pub async fn write_embeddings(&self, rows: &[EmbeddedMessage]) -> Result<()> {
         if rows.is_empty() {
@@ -1044,7 +1106,7 @@ impl Store {
     }
 
     /// Stream the backlog of messages needing embedding: rows with `search_text`
-    /// set whose `vector` is null (spec.md#embed-from-canonical).
+    /// set whose `vector` is null (spec.md#session-embed-from-canonical).
     pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
             let filter = Predicate::And(vec![
@@ -1081,7 +1143,7 @@ impl Store {
     /// Stream messages that are either never embedded or stale under the
     /// current model. `pond embed --force` feeds this to the same unconditional
     /// merge_update as the normal backlog; the filter makes that semantically
-    /// equivalent to the conditional update in spec.md#embed-from-canonical.
+    /// equivalent to the conditional update in spec.md#session-embed-from-canonical.
     pub fn pending_or_stale_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
             let filter = Predicate::And(vec![
@@ -1183,7 +1245,7 @@ impl Store {
     }
 
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
-    /// scalar predicate (spec.md#prefilter-pushdown). Combines the caller's
+    /// scalar predicate (spec.md#search-prefilter-pushdown). Combines the caller's
     /// filter with `vector IS NOT NULL` to exclude un-embedded rows from the
     /// scan; the brute-force kNN path requires this (the IVF_PQ path would
     /// skip them anyway). The single-active-model invariant lets pond drop
@@ -1236,7 +1298,7 @@ impl Store {
     }
 
     /// The DataFusion plan string for a filtered vector scan - the
-    /// `prefilter-pushdown` regression guard reads it.
+    /// `search-prefilter-pushdown` regression guard reads it.
     pub async fn explain_vector_plan(
         &self,
         query: &[f32],
@@ -1421,7 +1483,7 @@ impl Store {
     }
 
     /// Run the per-table maintenance cycle (compact + indices) across every
-    /// table, never short-circuiting. spec.md#index-write-decoupled: indices
+    /// table, never short-circuiting. spec.md#lance-index-maintenance: indices
     /// and compaction commit independently, so a hot writer that starves
     /// compaction on one table does not abort the index work the operator
     /// asked for on other tables (or even on the same table).
@@ -1536,7 +1598,7 @@ impl Store {
     }
 
     /// On-disk byte totals per dataset, sized through Lance's object store
-    /// (spec.md#storage-via-lance) so `pond status` works on any backend.
+    /// (spec.md#lance-chokepoints-storage) so `pond status` works on any backend.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         self.handle.table_sizes().await
     }
@@ -1796,7 +1858,7 @@ pub enum IngestEvent {
 ///
 /// Fields are bucketed by population so the summary never conflates "100
 /// validator-rejected rows in 1 bad session" with "100 separate failures."
-/// The shape is set by spec.md#event-ordering.
+/// The shape is set by spec.md#adapter-integrity-event-ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
     /// Rows actually written to Lance.
@@ -1807,7 +1869,7 @@ pub struct IngestSummary {
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
     /// session with one bad part stays in this bucket as 1, not as "the
-    /// whole substream." Per spec.md#adapter-dedup, adapters SHOULD dedupe their
+    /// whole substream." Per spec.md#adapter-integrity-dedup, adapters SHOULD dedupe their
     /// own emissions upstream when source replay is expected; the
     /// validator's in-batch HashSet is a safety net, not a feature
     /// adapters may rely on. If this bucket grows on a clean adapter,
@@ -1822,7 +1884,7 @@ pub struct IngestSummary {
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
     /// Sessions short-circuited via the per-session staleness skip
-    /// (spec.md#event-ordering): file `mtime` was at or before the wall-clock time
+    /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
     pub skipped_fresh: usize,
     /// Storage-layer failures whose retries were exhausted (commit
@@ -1830,7 +1892,7 @@ pub struct IngestSummary {
     /// runs.
     pub storage_errors: usize,
     /// Oversized values truncated to a bounded sentinel at the seam
-    /// (spec.md#bounded-values); the rest of each such record is intact.
+    /// (spec.md#adapter-bounded-values); the rest of each such record is intact.
     pub truncated_values: usize,
     /// Histogram of stable reason keys for the combined `dropped_events +
     /// dropped_sessions` populations. Keys are `&'static str` (see the
@@ -1844,7 +1906,7 @@ pub struct IngestSummary {
 /// the per-row `RowError::reason_key`. `&'static str` so consumers can
 /// match by identity rather than prose. Adding a new variant: pick a short
 /// snake_case identifier, route it from the validator/adapter, and update
-/// the per-row outcome docs in `docs/spec.md#event-ordering`.
+/// the per-row outcome docs in `docs/spec.md#adapter-integrity-event-ordering`.
 pub const DROP_REASON_DUPLICATE_MESSAGE_ID: &str = "duplicate_message_id";
 pub const DROP_REASON_DUPLICATE_PART_KEY: &str = "duplicate_part_key";
 pub const DROP_REASON_MESSAGE_BEFORE_SESSION: &str = "message_before_session";
@@ -1953,7 +2015,7 @@ struct BufferedPart {
 /// batches: sessions, messages, parts). A validation error on a single event
 /// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
 /// continues; only Session-level invariants (immutable source_agent / project
-/// on re-write) drop the whole substream (spec.md#event-ordering).
+/// on re-write) drop the whole substream (spec.md#adapter-integrity-event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the current one), they accumulate in
@@ -2275,7 +2337,7 @@ fn error_outcome(
 /// Session-level rejection (immutable `source_agent` / `project` violation):
 /// emit exactly one Error outcome on the Session row. The buffered messages
 /// and parts of this substream are *not* surfaced as per-row errors - their
-/// loss is implied by the single session-rejection (spec.md#event-ordering).
+/// loss is implied by the single session-rejection (spec.md#adapter-integrity-event-ordering).
 fn error_outcomes_for_substream(
     session_index: usize,
     session: &Session,
@@ -2470,6 +2532,26 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Non-empty conversational text (spec.md#search).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchText(String);
+
+impl SearchText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for SearchText {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageWithParts {
     pub message: Message,
@@ -2517,6 +2599,17 @@ struct MessageRow {
     role: Role,
     timestamp: DateTime<Utc>,
     text: String,
+}
+
+/// One row of the conversational scan. `text` is non-empty by
+/// `IsNotNull("search_text")` pushdown (spec.md#search).
+#[derive(Debug, Clone)]
+pub struct ConversationalRow {
+    pub session_id: String,
+    pub message_id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
+    pub text: SearchText,
 }
 
 fn get_session_from(session: Session) -> GetSession {
@@ -2614,7 +2707,7 @@ fn statuses_from_inserted(total: usize, inserted_rows: u64) -> Vec<UpsertStatus>
 }
 
 // Bare logical table names: the lance-namespace Directory impl owns the
-// `.lance` directory suffix (spec.md#catalog-seam). No consumer reconstructs
+// `.lance` directory suffix (spec.md#lance-chokepoints-catalog). No consumer reconstructs
 // a `.lance` path.
 pub(crate) const SESSIONS: &str = "sessions";
 pub(crate) const MESSAGES: &str = "messages";
@@ -2637,7 +2730,7 @@ const IVF_PQ_NUM_BITS: u8 = 8;
 const IVF_PQ_SUB_VECTOR_STRIDE: usize = 8;
 const IVF_PQ_MAX_ITERS: usize = 15;
 
-/// FTS tokenizer constants (spec.md#language-neutral-index): character ngrams
+/// FTS tokenizer constants (spec.md#search-language-neutral-index): character ngrams
 /// in `[3, 5]`. 4-5-grams discriminate, min=3 keeps 3-char tokens
 /// (`FTS`, `OCC`) searchable.
 const FTS_NGRAM_MIN: u32 = 3;
@@ -2738,7 +2831,7 @@ pub fn init_embedding_dim(dim: usize) {
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond export` snapshots
-/// plus deferred Lance tags (spec.md#durable-copy). `skip_auto_cleanup`
+/// plus deferred Lance tags (spec.md#session-durable-copy). `skip_auto_cleanup`
 /// suppresses the per-commit hook so cleanup stays operator-driven via
 /// `pond index optimize` (one LIST per command instead of per write).
 pub(crate) fn write_params_for_create() -> WriteParams {
@@ -2818,7 +2911,7 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("project", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
-        // The message's derived embedding (spec.md#embed-from-canonical):
+        // The message's derived embedding (spec.md#session-embed-from-canonical):
         // both null until `pond embed` fills them, set together thereafter.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
@@ -2833,7 +2926,7 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         primary_field("id", DataType::Utf8, false),
         Field::new("ordinal", DataType::Int32, false),
         Field::new("type", DataType::Utf8, false),
-        // spec.md#part-provenance: conversation vs harness-injected; search
+        // spec.md#model-part-provenance: conversation vs harness-injected; search
         // reads this column to exclude injected scaffolding.
         Field::new("provenance", DataType::Utf8, false),
         json_field("variant_data", false),
@@ -2937,7 +3030,7 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
 /// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
 /// is split before the running total of its text columns reaches this, and a
 /// single cell at or above it is rejected rather than left to panic inside
-/// `StringArray::from` (spec.md#bounded-values).
+/// `StringArray::from` (spec.md#adapter-bounded-values).
 const COLUMN_BYTE_BUDGET: usize = 1 << 30;
 
 /// Contiguous row ranges whose summed text-column byte cost each stays within
@@ -3133,7 +3226,7 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<R
             )),
             // `vector` / `embedding_model` are written null at ingest; every
             // message starts un-embedded and `pond embed` fills them later
-            // (spec.md#embed-from-canonical).
+            // (spec.md#session-embed-from-canonical).
             new_null_array(&embedding_vector_type(), rows.len()),
             new_null_array(&DataType::Utf8, rows.len()),
             Arc::new(LargeBinaryArray::from_iter_values(
@@ -3155,7 +3248,7 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(parts.len());
     // The blob column is a BinaryArray, exempt from the text-column bound
-    // (spec.md#bounded-values); only the StringArray columns are budgeted.
+    // (spec.md#adapter-bounded-values); only the StringArray columns are budgeted.
     for ((part, variant), encoded) in parts.iter().zip(&variant_data).zip(&options) {
         let columns = [
             part.session_id.len(),
@@ -3677,7 +3770,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordering_violation_drops_only_the_offending_event() -> anyhow::Result<()> {
-        // Per-event drop semantics (spec.md#event-ordering): a Part with no preceding
+        // Per-event drop semantics (spec.md#adapter-integrity-event-ordering): a Part with no preceding
         // Message is dropped on the spot, with one Error outcome surfaced. The
         // rest of the substream continues normally - subsequent valid messages
         // and parts get written.
@@ -4158,7 +4251,7 @@ mod tests {
             )
             .await?;
 
-        // The load-bearing assertion (spec.md#prefilter-pushdown): the predicate
+        // The load-bearing assertion (spec.md#search-prefilter-pushdown): the predicate
         // is served by a scalar-index node, not a postfilter `FilterExec`. (A
         // `FilterExec` for the KNN-internal `_distance IS NOT NULL` is expected
         // and unrelated.)

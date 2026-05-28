@@ -112,7 +112,7 @@ async fn assert_no_duplicate_pks(root: &Path) -> anyhow::Result<()> {
 
 async fn assert_unique(root: &Path, table: &str, columns: &[&str]) -> anyhow::Result<()> {
     // The lance-namespace Directory impl owns the `.lance` directory suffix
-    // (spec.md#catalog-seam); pond's table-name constants are bare logical
+    // (spec.md#lance-chokepoints-catalog); pond's table-name constants are bare logical
     // names, so the on-disk dir is a single-suffix `<table>.lance`.
     let uri = root
         .join(format!("{table}.lance"))

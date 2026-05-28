@@ -1,5 +1,5 @@
 //! Real S3-wire backend via in-process s3s-fs (spec.md#substrate,
-//! spec.md#storage-via-lance). Proves Lance's commit handler reaches
+//! spec.md#lance-chokepoints-storage). Proves Lance's commit handler reaches
 //! `If-None-Match: *` -> 412 PreconditionFailed end-to-end, which `memory://`
 //! sidesteps.
 #![allow(clippy::expect_used, clippy::unwrap_used)]

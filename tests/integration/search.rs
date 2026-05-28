@@ -314,7 +314,7 @@ async fn search_returns_one_session_row_with_top_matches_per_session() -> anyhow
     Ok(())
 }
 
-/// spec.md#part-provenance: a harness `<task-notification>` message must be
+/// spec.md#model-part-provenance: a harness `<task-notification>` message must be
 /// absent from search results yet still returned in full by `pond_get`.
 #[tokio::test(flavor = "multi_thread")]
 async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -> anyhow::Result<()>
@@ -370,17 +370,37 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         "an injected task-notification must never surface as a search hit"
     );
 
-    let GetEnvelope::Success(response) =
+    let GetEnvelope::Success(default_response) =
         pond_get(&store, get_request_text_only(session_uuid)).await
     else {
         panic!("pond_get must succeed");
     };
-    let GetResult::Session { messages, .. } = response.result else {
+    let GetResult::Session {
+        messages: default_messages,
+        ..
+    } = default_response.result
+    else {
         panic!("session get returns a session result");
     };
     assert!(
-        messages.iter().any(|m| m.id == "u-notify"),
-        "the injected message is preserved and returned by pond_get"
+        default_messages.iter().all(|m| m.id != "u-notify"),
+        "injected message is filtered from the conversational view by default (spec.md#search)"
+    );
+
+    let GetEnvelope::Success(restore_response) = pond_get(&store, get_request(session_uuid)).await
+    else {
+        panic!("pond_get must succeed with include_parts=true");
+    };
+    let GetResult::Session {
+        messages: restore_messages,
+        ..
+    } = restore_response.result
+    else {
+        panic!("session get returns a session result");
+    };
+    assert!(
+        restore_messages.iter().any(|m| m.id == "u-notify"),
+        "injected message is preserved and reachable via include_parts=true"
     );
     Ok(())
 }

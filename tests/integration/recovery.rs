@@ -1,4 +1,4 @@
-//! Durable-copy story (spec.md#durable-copy): `pond export` produces a portable
+//! Durable-copy story (spec.md#session-durable-copy): `pond export` produces a portable
 //! snapshot of canonical session rows that can be ingested into a fresh store.
 //! This test proves the loop round-trips identical row counts and identical
 //! `pond export` output.

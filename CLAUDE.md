@@ -49,7 +49,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## Comments
 
 <comments>
-A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
+A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#model-no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
 
 <example>
 // spec.md#protocol: typed `conflict` for OCC failures, not `storage_unavailable`.

@@ -15,7 +15,7 @@ pub struct Session {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// spec.md#parent-pointer-coherence: when set, `parent_session_id`
+    /// spec.md#model-parent-pointer-coherence: when set, `parent_session_id`
     /// MUST also be set. Spawn-only sources (claude-code subagents,
     /// nanoclaw) leave this `None`; fork-with-cut-point sources
     /// (pi-mono) populate both pointers together.
@@ -147,9 +147,9 @@ impl Role {
 }
 
 /// Whether a Part's content is conversation or harness-injected scaffolding
-/// (spec.md#part-provenance). No `Default` and no `#[serde(default)]` on the
+/// (spec.md#model-part-provenance). No `Default` and no `#[serde(default)]` on the
 /// `Part.provenance` field below: constructing a Part without classifying it
-/// MUST be a compile error (spec.md#provenance-required).
+/// MUST be a compile error (spec.md#adapter-provenance-required).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
@@ -172,7 +172,7 @@ pub struct Part {
     pub id: String,
     pub message_id: String,
     pub ordinal: i32,
-    /// Conversation vs harness-injected (spec.md#part-provenance). Mandatory,
+    /// Conversation vs harness-injected (spec.md#model-part-provenance). Mandatory,
     /// no serde default - search reads it to exclude injected scaffolding.
     pub provenance: Provenance,
     #[serde(default)]
@@ -215,7 +215,7 @@ pub enum PartKind {
         /// `None` when the source carried no tool name. claude-code
         /// always carries it on `tool_use` rows; codex-cli sometimes
         /// has placeholder shapes. The seal makes synthesized names
-        /// unconstructable from adapter code (spec.md#no-synthesis).
+        /// unconstructable from adapter code (spec.md#model-no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         params: Value,
@@ -230,7 +230,7 @@ pub enum PartKind {
         /// the adapter resolves via a per-file `tool_use_id -> name`
         /// map and surfaces a miss (e.g. compaction pruned the originating
         /// call) as `None`, never as a fabricated string
-        /// (spec.md#no-synthesis).
+        /// (spec.md#model-no-synthesis).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Extracted<String>>,
         is_failure: bool,
@@ -399,7 +399,7 @@ pub struct SearchRequest {
     /// When set, retrieve messages similar to this stored message - pond uses
     /// the message's stored `vector` directly as the query, runs vector-only
     /// kNN, and ignores `query` and the FTS arm. The stored vector was
-    /// derived from `search_text` (`spec.md#embed-from-canonical`), so the
+    /// derived from `search_text` (`spec.md#session-embed-from-canonical`), so the
     /// signal is already filtered of harness-injected parts. Filters and
     /// `limit` still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,7 +531,7 @@ pub struct IngestResult {
 pub enum IngestStatus {
     /// New PK; `merge_insert` wrote a fresh row.
     Inserted,
-    /// PK existed; `merge_insert` matched it (no-op per spec.md#additive-sync).
+    /// PK existed; `merge_insert` matched it (no-op per spec.md#adapter-integrity-additive-sync).
     Matched,
     /// Per-row failure: validation or storage error. See `error` field.
     Error,
