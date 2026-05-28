@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: pond
+
+before:
+  hooks:
+    - rustup default stable
+
+builds:
+  - id: pond
+    builder: rust
+    binary: pond
+    # `tool` defaults to "cargo", `command` defaults to "zigbuild".
+    flags:
+      - --profile=dist
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-apple-darwin
+
+archives:
+  - id: pond
+    formats: [tar.xz]
+    name_template: "{{ .ProjectName }}-{{ .Target }}"
+
+brews:
+  - name: pond
+    repository:
+      owner: tenequm
+      name: homebrew-tap
+      token: "{{ .Env.GH_RELEASE_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/tenequm/pond
+    description: Lossless storage and hybrid search for AI agent sessions, across every agentic client.
+    license: Apache-2.0
+
+nix:
+  - name: pond
+    repository:
+      owner: tenequm
+      name: nur-packages
+      branch: main
+      token: "{{ .Env.GH_RELEASE_TOKEN }}"
+    path: pkgs/pond/default.nix
+    homepage: https://github.com/tenequm/pond
+    description: Lossless storage and hybrid search for AI agent sessions, across every agentic client.
+    license: asl20
+    main_program: pond
+
+# release-plz owns CHANGELOG.md; don't double-generate.
+changelog:
+  disable: true
