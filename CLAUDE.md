@@ -22,7 +22,7 @@
 
 ## Dependencies
 
-- Lance crates are pinned to git tag `v7.0.0-beta.16`. Don't bump or switch to crates.io without explicit ask.
+- Lance crates are pinned to git tag `v7.0.0`. Don't bump or switch to crates.io without explicit ask.
 
 ## Errors
 

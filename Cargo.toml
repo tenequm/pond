@@ -24,38 +24,37 @@ candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
 fastrand = "2"
-hf-hub = "0.4"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
-lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
-lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0", features = ["protoc"] }
+lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
 half = { version = "2.1", default-features = false }
-lance-datafusion = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16", features = ["protoc"] }
-lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
+lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 tempfile = "3.25"
 # Streaming JSON pull-parser for the adapter seam's oversized-line slow path:
 # records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays
 # bounded (see src/adapter/jsonl.rs).
 struson = "0.7"
 thiserror = "2.0.18"
-tokenizers = "0.21"
-tokio = { version = "1.52", features = ["full"] }
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
+tokio = { version = "1.52", features = ["fs", "io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.18"
 toml = "1.1"
-toml_edit = "0.23"
+toml_edit = "0.25"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 walkdir = "2.5"
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
@@ -67,7 +66,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0-beta.16" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
@@ -106,7 +105,10 @@ harness = false
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo
 # only a step-debugger uses. Faster codegen on every rebuild.
 [profile.dev]
-debug = "line-tables-only"
+opt-level = 0
+incremental = true
+split-debuginfo = "unpacked"   # faster linking on Mac
+debug = 1                       # faster than debug = 2
 
 # Optimize dependency crates even in dev/test - the hot code (lance, arrow,
 # candle) lives there; pond's own crate stays unoptimized for fast rebuilds.

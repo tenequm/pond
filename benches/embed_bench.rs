@@ -133,11 +133,10 @@ impl Embedder for InstrumentedBackend<'_> {
         // report + JSON). This is what lets you watch the cold-to-steady curve
         // and per-batch padding waste *as the run goes*, not only at the end.
         let padded = count.saturating_mul(max_bytes);
-        let waste_pct = if padded > 0 {
-            100 - (sum_bytes.saturating_mul(100) / padded)
-        } else {
-            0
-        };
+        let waste_pct = sum_bytes
+            .saturating_mul(100)
+            .checked_div(padded)
+            .map_or(0, |used_pct| 100 - used_pct);
         eprintln!(
             "  batch {:>3}  count={:>3}  max_bytes={:>8}  elapsed={:>7}ms  waste={:>3}%",
             calls.len(),
@@ -357,7 +356,7 @@ fn report(r: &Report<'_>) {
     };
 
     let mut slowest: Vec<&BatchStat> = r.stats.iter().collect();
-    slowest.sort_unstable_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+    slowest.sort_unstable_by_key(|b| std::cmp::Reverse(b.elapsed_ms));
 
     let fmt_batch = |stat: &BatchStat| -> String {
         let batch_waste = if stat.count * stat.max_bytes > 0 {
