@@ -39,9 +39,15 @@ jobs:
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
 
-      - run: cargo fmt --check
-      - run: cargo clippy --locked -- -D warnings
-      - run: cargo test --locked
+      - name: Install moon
+        run: |
+          curl -fsSL https://moonrepo.dev/install/moon.sh | bash
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
+
+      # fmt/clippy/test run through moon (cache + orchestration); kache (above)
+      # is the RUSTC_WRAPPER compile cache. moon's bazel-remote output cache is
+      # configured in .moon/workspace.yml and hits where it's reachable.
+      - run: moon run pond:format pond:lint pond:test
 
   release-plz:
     name: release-plz

@@ -1548,7 +1548,10 @@ mod search_handler {
         }
         snippet.extend(&chars[start..end]);
         if end < chars.len() {
-            snippet.push_str(&format!(" [+{} more chars; pond_get for full]", chars.len() - end));
+            snippet.push_str(&format!(
+                " [+{} more chars; pond_get for full]",
+                chars.len() - end
+            ));
         }
         snippet
     }
@@ -2079,10 +2082,12 @@ mod tests {
             text.contains("NEEDLE"),
             "text is the match-windowed snippet: {text}"
         );
-        // `query_snippet` adds up to "..." on each side, so account for the +6.
+        // The <=600-char window is wrapped with truncation markers
+        // ("[N chars before] " / " [+N more chars; pond_get for full]"); allow for their length.
         assert!(
-            text.chars().count() <= 600 + 6,
-            "snippet is bounded by HIT_SNIPPET_CHARS"
+            text.chars().count() <= 600 + 64,
+            "snippet window is bounded by HIT_SNIPPET_CHARS plus markers: {}",
+            text.chars().count()
         );
     }
 

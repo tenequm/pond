@@ -394,7 +394,7 @@ pub struct MessageView {
     /// System-message content string, when the source carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts_summary: Vec<PartSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<ResponsePart>>,

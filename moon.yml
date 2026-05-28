@@ -4,7 +4,26 @@ env:
   CARGO_TERM_COLOR: always
   BUILDX_BUILDER: pond-hetzner
 
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.{toml,lock}'
+    - 'rust-toolchain.toml'
+  tests:
+    - 'tests/**/*'
+    - 'benches/**/*'
+
 tasks:
+  format:
+    command: 'cargo fmt --check'
+    inputs: ['@group(sources)', '@group(tests)']
+  lint:
+    command: 'cargo clippy --locked -- -D warnings'
+    inputs: ['@group(sources)', '@group(tests)']
+  test:
+    command: 'cargo test --locked'
+    inputs: ['@group(sources)', '@group(tests)']
+
   # One-time builder setup (pool is amd64 cpx42, isolated by nodeselector):
   #   docker buildx create --name pond-hetzner --driver kubernetes \
   #     --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
@@ -38,11 +57,8 @@ tasks:
       ls -lh target/dist/
       for f in target/dist/pond-*; do file "$f"; done
     inputs:
-      - 'src/**/*'
-      - 'tests/**/*'
-      - 'benches/**/*'
-      - 'Cargo.{toml,lock}'
-      - 'rust-toolchain.toml'
+      - '@group(sources)'
+      - '@group(tests)'
       - 'Dockerfile'
       - '.dockerignore'
     outputs:
