@@ -8,10 +8,9 @@ permissions:
   contents: write
   pull-requests: write
 
-# Cancel in-flight runs only on pull_request events (push to main keeps its
-# own group via `run_id`). https://docs.github.com/en/actions/using-jobs/using-concurrency#example-using-a-fallback-value
+# Newer push or PR update on the same ref supersedes the older in-flight run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
