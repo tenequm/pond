@@ -36,6 +36,7 @@ tasks:
       kubectl -n pond-buildkit wait deploy/pond-hetzner0 --for=condition=available --timeout=10m
 
       docker buildx build \
+        --progress=plain \
         --platform linux/amd64 \
         --target output \
         --cache-from "type=s3,region=${AWS_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY}" \
