@@ -36,29 +36,26 @@ jobs:
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, x64]
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
       - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0   # release-plz needs full git history for changelog
-          clean: false     # keep target/ between runs for cargo freshness + kache
 
-      - run: kache stats
-      - uses: release-plz/action@v0.5
+      - id: release-plz
+        uses: release-plz/action@v0.5
         with:
           # Default (no command) runs both `release-pr` and `release`.
           # `dry_run` applies only to `release`; `release-pr` opens PRs for real.
           dry_run: true
         env:
-          # GH_RELEASE_TOKEN (fine-grained PAT) lets release-plz trigger
-          # downstream workflows (binary publish, tap PRs). The default
-          # GITHUB_TOKEN does not cascade workflow_run events.
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      - run: kache stats
 
   publish-release:
     name: publish-release
-    needs: build-and-test
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: release-plz
+    if: needs.release-plz.outputs.releases_created == 'true'
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6.0.2
