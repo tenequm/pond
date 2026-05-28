@@ -13,11 +13,9 @@ env:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, bl]
     steps:
       - uses: actions/checkout@v6.0.2
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
 
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
