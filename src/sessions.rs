@@ -28,7 +28,7 @@ use crate::{
         PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, GetMessage, GetSession, Message, Part, PartKind, Role, Session},
+    wire::{FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session},
 };
 use url::Url;
 
@@ -784,172 +784,199 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn get_message_context(
-        &self,
-        message_id: &str,
-        context_depth: usize,
-    ) -> Result<Option<(Session, Vec<MessageWithParts>)>> {
-        let Some(target) = self.find_message(message_id).await? else {
-            return Ok(None);
-        };
-        let session_id = target.session_id().to_owned();
-        let session = self.find_session(&session_id).await?.with_context(|| {
-            format!("message {message_id} references missing session {session_id}")
-        })?;
-        let session_messages = self.messages_for_session(&session_id).await?;
-
-        let target_pos = session_messages
-            .iter()
-            .position(|message| message.message.id() == message_id)
-            .unwrap_or_default();
-        let start = target_pos.saturating_sub(context_depth);
-        let end = (target_pos + context_depth + 1).min(session_messages.len());
-        Ok(Some((session, session_messages[start..end].to_vec())))
-    }
-
-    /// Pull a page of `(id, role, timestamp, search_text)` for one session,
-    /// applying `up_to` / `start_after` (exclusive) / limit / byte-budget.
-    /// Default (`!include_parts`) returns the conversational view only
-    /// (spec.md#search); `include_parts=true` returns the full set and
-    /// attaches each message's Parts.
-    pub async fn paged_session_view(
+    /// Whole-session view for `pond_get` session mode (spec.md#protocol).
+    /// Conversational filters to `search_text IS NOT NULL`; Complete and
+    /// Verbatim scan every message. Every mode attaches compact part summaries;
+    /// Verbatim additionally inlines full parts. `after_id` is an exclusive
+    /// lower bound (a message id); the page is bounded by `limit` and a byte
+    /// budget and never cuts mid-message.
+    pub async fn session_view(
         &self,
         session_id: &str,
-        scope: PagedScope<'_>,
-    ) -> Result<Option<PagedSessionView>> {
-        let Some(raw) = self.find_session(session_id).await? else {
-            return Ok(None);
+        params: SessionViewParams<'_>,
+    ) -> Result<GetLookup<SessionPage>> {
+        let Some(session) = self.find_session(session_id).await? else {
+            return Ok(GetLookup::NotFound);
         };
 
-        let mut rows: Vec<MessageRow> = if scope.include_parts {
-            // Full-set scan for the restore path: includes catch-all system
-            // carriers whose search_text is null. The empty-string surrogate
-            // here is safe - the caller fetches parts to see the content.
-            let batch = self
-                .handle
-                .scan_batch(
-                    Table::Messages,
-                    Some(&Predicate::Eq("session_id", session_id.into())),
-                    &["id", "timestamp", "role", "search_text"],
-                )
-                .await?;
-            let mut rows = Vec::with_capacity(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                let id = string(&batch, "id", row)?.context("message id is null")?;
-                let role =
-                    role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
-                let timestamp = datetime(&batch, "timestamp", row)?;
-                let text = string(&batch, "search_text", row)?.unwrap_or_default();
-                rows.push(MessageRow {
-                    id,
-                    role,
-                    timestamp,
-                    text,
-                });
-            }
-            rows
-        } else {
-            self.scan_conversational_messages(session_id)
+        let mut rows = match params.mode {
+            ResponseMode::Conversational => self
+                .scan_conversational_messages(session_id)
                 .await?
                 .into_iter()
-                .map(|row| MessageRow {
+                .map(|row| ScanRow {
                     id: row.message_id,
                     role: row.role,
                     timestamp: row.timestamp,
-                    text: row.text.into_inner(),
+                    text: Some(row.text.into_inner()),
+                    content: None,
                 })
-                .collect()
+                .collect(),
+            ResponseMode::Complete | ResponseMode::Verbatim => {
+                self.scan_all_messages(session_id).await?
+            }
         };
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
 
-        if let Some(up_to) = scope.up_to {
-            let Some(idx) = rows.iter().position(|row| row.id == up_to) else {
-                anyhow::bail!("up_to message not found in session: {session_id}/{up_to}");
-            };
-            rows.truncate(idx + 1);
-        }
-
-        if let Some(window) = scope.window.as_ref() {
-            let Some(anchor_pos) = rows.iter().position(|row| row.id == window.anchor) else {
-                anyhow::bail!("anchor message not found in session: {}", window.anchor);
-            };
-            let start = anchor_pos.saturating_sub(window.depth);
-            let end = (anchor_pos + window.depth + 1).min(rows.len());
-            rows = rows[start..end].to_vec();
-        }
-
-        let start_at = match scope.start_after {
+        let start_at = match params.after_id {
+            // Append-only stream: a real anchor never vanishes, so an unknown
+            // `after_id` is a stale/mistyped client cursor, not "start over".
             Some(after) => match rows.iter().position(|row| row.id == after) {
                 Some(idx) => idx + 1,
-                None => 0,
+                None => return Ok(GetLookup::UnknownAfterId),
             },
             None => 0,
         };
-        if start_at >= rows.len() {
-            return Ok(Some(PagedSessionView {
-                session: get_session_from(raw),
-                messages: Vec::new(),
-                parts: Vec::new(),
-                has_more: false,
-                next_after: None,
-            }));
-        }
-        let mut sliced = rows[start_at..].to_vec();
-        let max = scope.limit.clamp(1, 1000);
-        if sliced.len() > max {
-            sliced.truncate(max);
-        }
+        let remaining = rows.get(start_at..).unwrap_or(&[]);
+        let emitted_count = page_by(remaining, params.limit, params.budget_bytes, |row| {
+            row.text.as_deref().map_or(0, str::len)
+        });
+        let emitted = &remaining[..emitted_count];
+        let messages_remaining = remaining.len() - emitted_count;
+        let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
 
-        let mut acc = 0usize;
-        let mut emitted = 0usize;
-        for row in &sliced {
-            let next = acc.saturating_add(row.text.len());
-            if emitted > 0 && next > scope.budget_bytes {
-                break;
+        // Conversational/Complete only summarize parts; Verbatim inlines every
+        // part (blobs included).
+        let mut parts_by_message = match params.mode {
+            ResponseMode::Verbatim => self.parts_for_messages(session_id, &ids).await?,
+            ResponseMode::Conversational | ResponseMode::Complete => {
+                self.summary_parts_for_messages(session_id, &ids).await?
             }
-            acc = next;
-            emitted += 1;
-        }
-        let has_more = emitted < sliced.len();
-        let next_after = if has_more {
-            Some(sliced[emitted - 1].id.clone())
-        } else {
-            None
         };
-        sliced.truncate(emitted);
-
-        let parts = if scope.include_parts {
-            let ids: Vec<String> = sliced.iter().map(|row| row.id.clone()).collect();
-            let mut by_message = self.parts_for_messages(session_id, &ids).await?;
-            let mut all = Vec::new();
-            for row in &sliced {
-                let key = (session_id.to_owned(), row.id.clone());
-                if let Some(parts) = by_message.remove(&key) {
-                    all.extend(parts);
-                }
-            }
-            all
-        } else {
-            Vec::new()
-        };
-
-        let messages = sliced
-            .into_iter()
-            .map(|row| GetMessage {
-                id: row.id,
+        let messages = emitted
+            .iter()
+            .map(|row| RetrievedMessage {
+                id: row.id.clone(),
                 role: row.role,
                 timestamp: row.timestamp,
-                text: row.text,
+                text: row.text.clone(),
+                content: row.content.clone(),
+                parts: parts_by_message
+                    .remove(&(session_id.to_owned(), row.id.clone()))
+                    .unwrap_or_default(),
             })
             .collect();
 
-        Ok(Some(PagedSessionView {
-            session: get_session_from(raw),
+        Ok(GetLookup::Found(SessionPage {
+            session,
             messages,
-            parts,
-            has_more,
-            next_after,
+            messages_remaining,
         }))
+    }
+
+    /// Message-scope retrieval for `pond_get` message mode (spec.md#protocol):
+    /// the target with its full parts (paginated by `after_id` over part
+    /// ordinals, then budget) plus up to `2*context_depth` siblings around it.
+    /// `None` when no stored message carries `message_id`. Sibling parts are
+    /// carried for summarizing; the target's parts ride `target_parts`.
+    pub async fn message_view(
+        &self,
+        message_id: &str,
+        params: MessageViewParams<'_>,
+    ) -> Result<GetLookup<MessagePage>> {
+        let Some(session_id) = self.session_id_for_message(message_id).await? else {
+            return Ok(GetLookup::NotFound);
+        };
+        let Some(session) = self.find_session(&session_id).await? else {
+            return Ok(GetLookup::NotFound);
+        };
+        let mut rows = self.scan_all_messages(&session_id).await?;
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        let Some(target_pos) = rows.iter().position(|row| row.id == message_id) else {
+            return Ok(GetLookup::NotFound);
+        };
+
+        let start = target_pos.saturating_sub(params.context_depth);
+        let end = (target_pos + params.context_depth + 1).min(rows.len());
+        let window = &rows[start..end];
+        let window_ids: Vec<String> = window.iter().map(|row| row.id.clone()).collect();
+        // The target's full parts (blobs included) ride the response; siblings
+        // are only summarized, but they share this one window scan.
+        let mut parts_by_message = self.parts_for_messages(&session_id, &window_ids).await?;
+
+        let all_parts = parts_by_message
+            .remove(&(session_id.clone(), message_id.to_owned()))
+            .unwrap_or_default();
+        let start_part = match params.after_id {
+            // Exclusive over ordinals: parts are ordinal-sorted, so the first
+            // part past the anchor's ordinal is the page start. An anchor absent
+            // from the target's parts is a stale/mistyped client cursor.
+            Some(after) => match all_parts.iter().find(|part| part.id == after) {
+                Some(anchor) => all_parts
+                    .iter()
+                    .position(|part| part.ordinal > anchor.ordinal)
+                    .unwrap_or(all_parts.len()),
+                None => return Ok(GetLookup::UnknownAfterId),
+            },
+            None => 0,
+        };
+        let remaining_parts = all_parts.get(start_part..).unwrap_or(&[]);
+        let part_count = page_by(remaining_parts, params.limit, params.budget_bytes, |part| {
+            serde_json::to_string(part).map_or(0, |json| json.len())
+        });
+        let target_parts = remaining_parts[..part_count].to_vec();
+        let target_parts_remaining = remaining_parts.len() - part_count;
+
+        let target_row = &rows[target_pos];
+        let target = RetrievedMessage {
+            id: target_row.id.clone(),
+            role: target_row.role,
+            timestamp: target_row.timestamp,
+            text: target_row.text.clone(),
+            content: target_row.content.clone(),
+            // Target structure is carried in full by `target_parts`.
+            parts: Vec::new(),
+        };
+        let siblings = window
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| start + idx != target_pos)
+            .map(|(_, row)| RetrievedMessage {
+                id: row.id.clone(),
+                role: row.role,
+                timestamp: row.timestamp,
+                text: row.text.clone(),
+                content: row.content.clone(),
+                parts: parts_by_message
+                    .get(&(session_id.clone(), row.id.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(GetLookup::Found(MessagePage {
+            session,
+            target,
+            target_parts,
+            target_parts_remaining,
+            siblings,
+        }))
+    }
+
+    async fn scan_all_messages(&self, session_id: &str) -> Result<Vec<ScanRow>> {
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::Eq("session_id", session_id.into())),
+                &["id", "timestamp", "role", "search_text", "content"],
+            )
+            .await?;
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let id = string(&batch, "id", row)?.context("message id is null")?;
+            let role =
+                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+            let timestamp = datetime(&batch, "timestamp", row)?;
+            rows.push(ScanRow {
+                id,
+                role,
+                timestamp,
+                text: string(&batch, "search_text", row)?,
+                content: string(&batch, "content", row)?,
+            });
+        }
+        Ok(rows)
     }
 
     /// Conversational scan over one session: rows ordered by
@@ -998,7 +1025,7 @@ impl Store {
     }
 
     /// Locate the session id for a stored message. Cheap when only the routing
-    /// hint is needed - callers that need the message itself use `find_message`.
+    /// hint is needed - callers that need the messages use `scan_all_messages`.
     pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
         let batch = self
             .handle
@@ -1704,31 +1731,6 @@ impl Store {
         Ok(Some(widened))
     }
 
-    /// Rare standalone message-id lookup; no `messages.id` index, so Lance
-    /// full-scans with the predicate.
-    async fn find_message(&self, message_id: &str) -> Result<Option<Message>> {
-        let batch = self
-            .handle
-            .scan_batch(
-                Table::Messages,
-                Some(&Predicate::Eq("id", message_id.into())),
-                &[
-                    "session_id",
-                    "id",
-                    "timestamp",
-                    "role",
-                    "content",
-                    "options",
-                ],
-            )
-            .await?;
-        if batch.num_rows() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(message_from_batch(&batch, 0)?))
-        }
-    }
-
     async fn messages_for_session(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
         let batch = self
             .handle
@@ -1771,18 +1773,50 @@ impl Store {
             .collect())
     }
 
-    async fn parts_for_messages(
+    /// Every part of these messages, full fidelity (file blobs included). The
+    /// canonical read primitive - restore/export, verbatim mode, and the
+    /// message-mode target all need the complete set.
+    pub async fn parts_for_messages(
         &self,
         session_id: &str,
         message_ids: &[String],
     ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
+        self.scan_parts(session_id, message_ids, None).await
+    }
+
+    /// Only the parts that yield a [`PartSummary`] ([`SUMMARY_PART_TYPES`]),
+    /// skipping `text`/`reasoning` (and their blobs) that would summarize to
+    /// nothing. For the summary-only reads (conversational/complete session
+    /// views, search hits) - it never feeds restore/export.
+    pub async fn summary_parts_for_messages(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
+        self.scan_parts(session_id, message_ids, Some(SUMMARY_PART_TYPES))
+            .await
+    }
+
+    async fn scan_parts(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+        part_types: Option<&[&str]>,
+    ) -> Result<BTreeMap<(String, String), Vec<Part>>> {
         if message_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let predicate = Predicate::And(vec![
+        let mut clauses = vec![
             Predicate::Eq("session_id", session_id.into()),
             in_predicate("message_id", message_ids),
-        ]);
+        ];
+        if let Some(types) = part_types {
+            clauses.push(Predicate::In(
+                "type",
+                types.iter().map(|&t| t.into()).collect(),
+            ));
+        }
+        let predicate = Predicate::And(clauses);
         let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
         let mut scanner = self
             .handle
@@ -2564,41 +2598,73 @@ pub struct SessionWithMessages {
     pub messages: Vec<MessageWithParts>,
 }
 
-/// Parameters for `Store::paged_session_view`. `start_after` is exclusive
-/// (the cursor's "resume past this message id" semantics). `window` carries
-/// the message-scope `(anchor, context_depth)` slice from `pond_get(message_id=
-/// ..., context_depth=...)`; absent for whole-session reads.
 #[derive(Debug, Clone)]
-pub struct PagedScope<'a> {
-    pub up_to: Option<&'a str>,
-    pub start_after: Option<&'a str>,
-    pub window: Option<MessageWindow<'a>>,
+pub struct SessionViewParams<'a> {
+    pub mode: ResponseMode,
+    pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
-    pub include_parts: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct MessageWindow<'a> {
-    pub anchor: &'a str,
-    pub depth: usize,
+#[derive(Debug, Clone)]
+pub struct MessageViewParams<'a> {
+    pub context_depth: usize,
+    pub after_id: Option<&'a str>,
+    pub limit: usize,
+    pub budget_bytes: usize,
+}
+
+/// Outcome of a `pond_get` lookup. Separates a missing target (the handler
+/// maps it to `not_found`) from a stale/unknown `after_id` (mapped to
+/// `validation_failed`): the message/part stream is append-only, so an anchor
+/// that was ever valid never disappears - an unknown one is always a client
+/// error, never a reason to silently restart the page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetLookup<T> {
+    NotFound,
+    UnknownAfterId,
+    Found(T),
+}
+
+/// Canonical retrieval result for `pond_get` session mode: the stored session
+/// plus the page of messages (each with its `Part`s) and a remaining count.
+/// Protocol-shaping into `GetResult`/`MessageView` happens in the handler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPage {
+    pub session: Session,
+    pub messages: Vec<RetrievedMessage>,
+    pub messages_remaining: usize,
+}
+
+/// Canonical retrieval result for `pond_get` message mode. `target.parts` is
+/// empty - the target's parts ride `target_parts` (paginated); `siblings` carry
+/// their parts so the handler can summarize them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessagePage {
+    pub session: Session,
+    pub target: RetrievedMessage,
+    pub target_parts: Vec<Part>,
+    pub target_parts_remaining: usize,
+    pub siblings: Vec<RetrievedMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PagedSessionView {
-    pub session: GetSession,
-    pub messages: Vec<GetMessage>,
+pub struct RetrievedMessage {
+    pub id: String,
+    pub role: Role,
+    pub timestamp: DateTime<Utc>,
+    pub text: Option<String>,
+    pub content: Option<String>,
     pub parts: Vec<Part>,
-    pub has_more: bool,
-    pub next_after: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct MessageRow {
+struct ScanRow {
     id: String,
     role: Role,
     timestamp: DateTime<Utc>,
-    text: String,
+    text: Option<String>,
+    content: Option<String>,
 }
 
 /// One row of the conversational scan. `text` is non-empty by
@@ -2612,13 +2678,23 @@ pub struct ConversationalRow {
     pub text: SearchText,
 }
 
-fn get_session_from(session: Session) -> GetSession {
-    GetSession {
-        id: session.id,
-        source_agent: session.source_agent,
-        project: (*session.project).clone(),
-        created_at: session.created_at,
+/// Number of leading `items` that fit within `limit` and the byte budget,
+/// sizing each by `size`. Always emits at least one (a single oversize item
+/// never blocks its own page); the budget then stops the page at the next item
+/// boundary.
+fn page_by<T>(items: &[T], limit: usize, budget_bytes: usize, size: impl Fn(&T) -> usize) -> usize {
+    let capped = items.len().min(limit.clamp(1, 1000));
+    let mut acc = 0usize;
+    let mut emitted = 0usize;
+    for item in &items[..capped] {
+        let next = acc.saturating_add(size(item));
+        if emitted > 0 && next > budget_bytes {
+            break;
+        }
+        acc = next;
+        emitted += 1;
     }
+    emitted
 }
 
 fn role_from_str(value: &str) -> Result<Role> {

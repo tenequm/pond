@@ -541,12 +541,13 @@ impl Table {
 struct DatasetSet {
     sessions: Mutex<CachedDataset>,
     messages: Mutex<CachedDataset>,
-    /// `parts.lance` opens lazily on the first read or write that needs it
-    /// (`pond_get(include_parts=true)`, ingest with Part events, hydration
-    /// during grouped search). MCP processes that only serve trimmed `pond_get`
-    /// and `pond_search` never touch this file, saving its metadata pages and
-    /// file handle at cold-open. The OnceCell makes init single-flight; the
-    /// inner `Mutex<CachedDataset>` then behaves identically to the other two.
+    /// `parts.lance` opens lazily on the first read or write that needs it:
+    /// any `pond_get` (every mode reads parts to build summaries), grouped
+    /// search hydrating user-hit summaries, or ingest with Part events. A
+    /// process that does none of those skips the file, saving its metadata
+    /// pages and file handle at cold-open. The OnceCell makes init
+    /// single-flight; the inner `Mutex<CachedDataset>` then behaves identically
+    /// to the other two.
     parts: OnceCell<Mutex<CachedDataset>>,
 }
 #[derive(Debug)]

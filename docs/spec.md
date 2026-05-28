@@ -61,10 +61,10 @@ A session's path through pond:
                      storage substrate (Lance)
                                  |
                                  v
-                  search  /  get  /  session-events
+                       search  /  get
 ```
 
-Many client formats parse into one canonical model; any adapter can serialize that model back out, to a harness format or - deferred - to a provider API shape. Canonical persists in the storage substrate - a generic Lance engine that search, get, and session-events all read from. The session datasets are merely its first consumer; Section 9 names the rest.
+Many client formats parse into one canonical model; any adapter can serialize that model back out, to a harness format or - deferred - to a provider API shape. Canonical persists in the storage substrate - a generic Lance engine that search and get both read from. The session datasets are merely its first consumer; Section 9 names the rest.
 
 ### 1.7 How to read this document
 
@@ -522,9 +522,8 @@ Retryability is conveyed by the code; there is no separate field. `conflict` is 
 ### 7.5 Operations
 
 1. **`pond_search`** (`POST /v1/search`) - hybrid search; Section 8 specifies retrieval. Returns ranked message hits grouped by session, with the top-scoring matches per session.
-2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context. Returns `search_text` per message; `include_parts=true` additionally returns each message's Parts.
+2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context. Session mode takes a `response_mode`: `conversational` (the default - human/model text, with a compact `parts_summary` per message), `complete` (all messages including system/tool carriers, with `parts_summary`), or `verbatim` (all messages with full Parts inline). Message mode returns the target's full Parts (paginated) plus `context_depth` sibling messages each side. Pages are bounded by a size budget and never cut mid-message; when `messages_remaining` (session) or `target_parts_remaining` (message) is non-zero, the caller pages on by passing the last returned id as `after_id`. Not for bulk export - that is the restore/export path.
 3. **`pond_ingest`** (`POST /v1/ingest`) - accept a batch of canonical events. Always batched, bounded by an event count and a body-size cap. Events are grouped by session and applied per session; partial success across sessions is normal and reported per row.
-4. **`pond_session_events`** (`GET /v1/sessions/{id}/events`, SSE) - stream a session's messages and parts in order. v1 is catch-up only: it scans, emits, and closes. Live-tail activates with live-write (Section 9) on the same endpoint.
 
 Two resources, `schema://pond` and `stats://pond`, expose the search-field documentation and dataset statistics.
 
@@ -534,7 +533,7 @@ A `pond_ingest` event is one canonical object - a Session, a Message, or a Part 
 
 ### 7.7 MCP surface
 
-The MCP transport exposes only the read operations - `pond_search` and `pond_get` - as tools, plus the two resources. Ingest and session-events stay HTTP-and-CLI only. Why: MCP's role is read access for an agent; ingest is an operator action.
+The MCP transport exposes only the read operations - `pond_search` and `pond_get` - as tools, plus the two resources. Ingest stays HTTP-and-CLI only. Why: MCP's role is read access for an agent; ingest is an operator action.
 
 ### 7.8 CLI verbs
 
@@ -563,12 +562,12 @@ Search returns messages. It is hybrid - a vector retriever and a keyword retriev
 
   **`search-prefilter-pushdown`** {#search-prefilter-pushdown} - Every vector and full-text query MUST push its scalar filters into the table's scalar indexes before the retriever ranks, never as an in-memory post-filter. Why: a post-filter ranks first and filters second, so it silently returns fewer than the requested number of results and ignores the scalar indexes entirely - correctness depends on the filter running first.
 
-- **Indexed text.** `search_text` is the conversation: one text field per message, built at ingest by one pond-core function applied uniformly to every message - per-source customization is rejected so the search corpus has one predictable shape. It concatenates, in order, the text of TextParts and the metadata of FileParts that carry `provenance: conversational` (Section 4.7). It is null for system and tool messages, and for any message left with no conversational text - a bare tool call, or a message whose only content is harness-injected. Reasoning text, tool-call bodies, tool results, approval parts, and harness-injected parts are deliberately not indexed; they live in `parts` and reach the caller only via `pond_get` with `include_parts=true`. Excluding injected parts is not per-source customization: the conversational-or-injected decision is made once at the adapter seam (`model-part-provenance`, Section 6) and recorded as `Part.provenance`, so this function reads a canonical field and stays uniform.
+- **Indexed text.** `search_text` is the conversation: one text field per message, built at ingest by one pond-core function applied uniformly to every message - per-source customization is rejected so the search corpus has one predictable shape. It concatenates, in order, the text of TextParts and the metadata of FileParts that carry `provenance: conversational` (Section 4.7). It is null for system and tool messages, and for any message left with no conversational text - a bare tool call, or a message whose only content is harness-injected. Reasoning text, tool-call bodies, tool results, approval parts, and harness-injected parts are deliberately not indexed; they live in `parts` and reach the caller only via `pond_get` (verbatim session mode, or message mode for a single message). Excluding injected parts is not per-source customization: the conversational-or-injected decision is made once at the adapter seam (`model-part-provenance`, Section 6) and recorded as `Part.provenance`, so this function reads a canonical field and stays uniform.
 
   **`search-language-neutral-index`** {#search-language-neutral-index} - The full-text index MUST tokenize every language alike; it MUST NOT apply a transform keyed to a single language. Why: pond ingests sessions in any language; a monolingual transform silently under-indexes every other. Pond indexes with a character-`ngram` tokenizer (3-5 range; rationale and experiment: `docs/researches/tokenizer-experiment-report.md`).
 
 - **Filters and ranking.** A search accepts filters on project, session, source agent, role, and a time range, plus a minimum score. Results are grouped to one summary per session, with up to a small fixed number of top-scoring matches per session (the cap lives in code). Filter columns are denormalized onto the searched tables (Section 5) so every filter pushes down without a cross-table join.
-- **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
+- **Hit payload.** A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. A user-role hit additionally carries a compact `parts_summary` (the same per-Part descriptor `pond_get` returns), so a prompt that attached files is distinguishable from a plain-text one without a second fetch; other roles omit it. The full message - including the parts excluded from the indexed text - remains available through `pond_get`.
 - **The embedding seam.** Turning text into vectors is a generic capability, not a session concept. It sits behind one seam - a backend interface that takes text and returns vectors - so a local model today and a remote provider later are the same shape to everything above. The engine ships a fixed set of models it has loaders for; configuration selects one and supplies its vector parameters. No model is mandatory and none is named in this document - the choice and its default are configuration.
 - **Producing embeddings.** Embeddings are derived, not source data: they are produced after ingest, never during it. The embed stage of `pond sync` walks the backlog of un-embedded messages - those whose `vector` is null, or whose `embedding_model` is not the configured model - and fills `vector` and `embedding_model` through the embedding seam, one vector per message. The seam is generic: a future consumer that wants vectors reuses it over its own table.
 - **Opt-in.** Embedding is opt-in by configuration. With it off, `pond serve`, `pond mcp`, and `pond search` run full-text only and never load a model. With it on and at least one message embedded under the configured model, search is hybrid.

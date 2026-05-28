@@ -398,11 +398,10 @@ fn get_request(message_id: String) -> GetRequest {
         namespace: Some("local".to_owned()),
         session_id: None,
         message_id: Some(message_id),
-        up_to: None,
         context_depth: 0,
         limit: 50,
-        include_parts: false,
-        cursor: None,
+        response_mode: pond::wire::ResponseMode::Conversational,
+        after_id: None,
     }
 }
 

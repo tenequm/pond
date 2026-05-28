@@ -27,9 +27,9 @@ use pond::{
     substrate::{IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes},
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, Part, PartKind,
-        ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
-        SearchResponse, SearchResult, SearchSession,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
+        PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
+        SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
     },
 };
 
@@ -79,6 +79,24 @@ impl From<CliSearchMode> for SearchModeWire {
             CliSearchMode::Fts => SearchModeWire::Fts,
             CliSearchMode::Vector => SearchModeWire::Vector,
             CliSearchMode::Hybrid => SearchModeWire::Hybrid,
+        }
+    }
+}
+
+/// CLI surface for `pond get --response-mode`. Maps 1:1 to wire `ResponseMode`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliResponseMode {
+    Conversational,
+    Complete,
+    Verbatim,
+}
+
+impl From<CliResponseMode> for ResponseMode {
+    fn from(mode: CliResponseMode) -> Self {
+        match mode {
+            CliResponseMode::Conversational => ResponseMode::Conversational,
+            CliResponseMode::Complete => ResponseMode::Complete,
+            CliResponseMode::Verbatim => ResponseMode::Verbatim,
         }
     }
 }
@@ -268,7 +286,7 @@ enum Command {
     /// Fetch a session or message.
     #[command(group(ArgGroup::new("get_selector")
         .required(true)
-        .args(["session_id", "message_id", "cursor"])))]
+        .args(["session_id", "message_id"])))]
     Get {
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
@@ -282,29 +300,27 @@ enum Command {
         /// Fetch a single message by id. Mutually exclusive with `--session-id`.
         #[arg(long, value_name = "ID")]
         message_id: Option<String>,
-        /// Truncate session output at this message id. Requires `--session-id`.
-        #[arg(
-            long,
-            value_name = "ID",
-            requires = "session_id",
-            conflicts_with = "message_id"
-        )]
-        up_to: Option<String>,
-        /// For `--message-id` mode: include this many surrounding messages
-        /// from the same session. Ignored in session mode.
+        /// For `--message-id` mode: include this many sibling messages on each
+        /// side (grep -C style). Ignored in session mode.
         #[arg(long, default_value_t = 0)]
         context_depth: usize,
-        /// Cap on returned messages.
-        #[arg(long, default_value_t = 100)]
+        /// Cap on returned messages (session mode) or parts (message mode).
+        #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Include per-message parts (reasoning, tool calls, tool results,
-        /// files) in the response. Default off: the response carries only
-        /// `messages[].text` to fit the agent-context budget.
-        #[arg(long)]
-        include_parts: bool,
-        /// Opaque continuation token from a prior response's `next_cursor`.
-        #[arg(long, value_name = "CURSOR")]
-        cursor: Option<String>,
+        /// Session-mode depth: conversational (text + part summaries), complete
+        /// (all messages + summaries), or verbatim (full parts inline). Ignored
+        /// with `--message-id`.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliResponseMode::Conversational,
+            conflicts_with = "message_id"
+        )]
+        response_mode: CliResponseMode,
+        /// Continuation anchor from a prior response: last message id (session)
+        /// or last part id (message). Exclusive lower bound.
+        #[arg(long, value_name = "ID")]
+        after_id: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
     },
@@ -721,11 +737,10 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             session_id,
             message_id,
-            up_to,
             context_depth,
             limit,
-            include_parts,
-            cursor,
+            response_mode,
+            after_id,
             format,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
@@ -738,11 +753,10 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 session_id,
                 message_id,
-                up_to,
                 context_depth,
                 limit,
-                include_parts,
-                cursor,
+                response_mode: ResponseMode::from(response_mode),
+                after_id,
             };
             let envelope = handlers::pond_get(&store, request).await;
             if !render_get_envelope(format, &envelope)? {
@@ -2160,22 +2174,8 @@ fn render_hit_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
-
-    let (session, messages, parts) = match &response.result {
-        GetResult::Session {
-            session,
-            messages,
-            parts,
-        }
-        | GetResult::Message {
-            session,
-            messages,
-            parts,
-        } => (session, messages, parts),
-    };
-
     output(&format!(
         "{} {}  source={}  project={}",
         paint("session", dim()),
@@ -2190,79 +2190,143 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
             &session.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-    ))?;
+    ))
+}
 
-    let mut parts_by_msg: std::collections::HashMap<&str, Vec<&Part>> =
-        std::collections::HashMap::new();
-    for part in parts {
-        parts_by_msg
-            .entry(part.message_id.as_str())
-            .or_default()
-            .push(part);
-    }
-    for parts_for_msg in parts_by_msg.values_mut() {
-        parts_for_msg.sort_by_key(|p| p.ordinal);
-    }
+fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+    use pond::output::{bold, dim, paint};
 
-    for (idx, message) in messages.iter().enumerate() {
-        output("")?;
-        let parts_for_msg = parts_by_msg
-            .get(message.id.as_str())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        render_message(idx + 1, message, parts_for_msg)?;
-    }
-
-    output("")?;
-    let mut footer = format!(
-        "{} {} messages",
-        paint("(total:", dim()),
-        paint(&format_thousands(messages.len() as u64), bold()),
-    );
-    if !parts.is_empty() {
-        footer.push_str(&format!(
-            ", {} parts",
-            paint(&format_thousands(parts.len() as u64), bold()),
-        ));
-    }
-    if response.has_more {
-        footer.push_str(&format!(" {}", paint("[more]", dim())));
-    }
-    footer.push_str(&paint(")", dim()));
-    output(&footer)?;
-    if let Some(cursor) = response.next_cursor.as_deref() {
-        output(&format!("{} {}", paint("next-cursor:", dim()), cursor))?;
+    render_session_header(&response.session)?;
+    match &response.result {
+        GetResult::Session {
+            messages,
+            messages_remaining,
+        } => {
+            for (idx, message) in messages.iter().enumerate() {
+                output("")?;
+                let parts = message.parts.as_deref().unwrap_or(&[]);
+                render_message_view(idx + 1, message, parts, false)?;
+            }
+            output("")?;
+            let mut footer = format!(
+                "{} {} messages",
+                paint("(total:", dim()),
+                paint(&format_thousands(messages.len() as u64), bold()),
+            );
+            if *messages_remaining > 0 {
+                footer.push_str(&format!(
+                    " {} remaining {}",
+                    paint(&format_thousands(*messages_remaining as u64), bold()),
+                    paint("[more]", dim()),
+                ));
+            }
+            footer.push_str(&paint(")", dim()));
+            output(&footer)?;
+            if *messages_remaining > 0
+                && let Some(last) = messages.last()
+            {
+                output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+            }
+        }
+        GetResult::Message {
+            target,
+            target_parts,
+            target_parts_remaining,
+            siblings,
+        } => {
+            // Interleave the target with its siblings in timestamp order so the
+            // thread reads top-to-bottom; the target carries its full parts.
+            let mut thread: Vec<(&MessageView, bool)> =
+                siblings.iter().map(|view| (view, false)).collect();
+            thread.push((target, true));
+            thread.sort_by_key(|(view, _)| view.timestamp);
+            for (idx, (view, is_target)) in thread.iter().enumerate() {
+                output("")?;
+                let parts = if *is_target {
+                    target_parts.as_slice()
+                } else {
+                    &[]
+                };
+                render_message_view(idx + 1, view, parts, *is_target)?;
+            }
+            if *target_parts_remaining > 0 {
+                output("")?;
+                output(&format!(
+                    "{} {} parts remaining {}",
+                    paint("(target:", dim()),
+                    paint(&format_thousands(*target_parts_remaining as u64), bold()),
+                    paint("[more])", dim()),
+                ))?;
+                if let Some(last) = target_parts.last() {
+                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn render_message(
+/// Render one message view: header, text/content, then either full parts (when
+/// supplied - verbatim session parts or a message-mode target) or the compact
+/// part summaries otherwise.
+fn render_message_view(
     rank: usize,
-    message: &pond::wire::GetMessage,
-    parts: &[&Part],
+    view: &MessageView,
+    full_parts: &[ResponsePart],
+    is_target: bool,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
+    let marker = if is_target {
+        paint("  <- target", dim())
+    } else {
+        String::new()
+    };
     output(&format!(
-        "{}  {}  {}  {}",
+        "{}  {}  {}  {}{marker}",
         paint(&format!("[{rank}]"), dim()),
         paint(
-            &message.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            &view.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             dim(),
         ),
-        paint_role(message.role.as_str()),
-        paint(&message.id, dim()),
+        paint_role(view.role.as_str()),
+        paint(&view.id, dim()),
     ))?;
-    if !message.text.is_empty() {
-        render_hit_text(&message.text)?;
-    }
-    for part in parts {
-        render_part(part)?;
+    // When full parts are present they are the complete content; rendering
+    // `text` (a search_text projection of those same parts) too would just
+    // double the body.
+    if full_parts.is_empty() {
+        if let Some(text) = &view.text {
+            render_hit_text(text)?;
+        }
+        if let Some(content) = &view.content {
+            render_hit_text(content)?;
+        }
+        for summary in &view.parts_summary {
+            render_part_summary(summary)?;
+        }
+    } else {
+        for part in full_parts {
+            render_part(part)?;
+        }
     }
     Ok(())
 }
 
-fn render_part(part: &Part) -> anyhow::Result<()> {
+fn render_part_summary(summary: &PartSummary) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let mut line = format!("[{}]", summary.kind);
+    if let Some(label) = &summary.label {
+        line.push(' ');
+        line.push_str(label);
+    }
+    if let Some(call_id) = &summary.call_id {
+        line.push_str(&format!(" call_id={call_id}"));
+    }
+    output(&format!("    {}", paint(&line, dim())))
+}
+
+fn render_part(part: &ResponsePart) -> anyhow::Result<()> {
     use pond::output::{dim, paint, yellow};
 
     let prefix = paint(">", dim());

@@ -574,150 +574,6 @@ pub use ingest_handler::{
     pond_ingest,
 };
 
-mod session_events_handler {
-    //! `pond_session_events` (spec.md#protocol): catch-up SSE stream over a
-    //! stored session's messages. v1 scope is read-after-`since`: scan
-    //! messages strictly after the resume point in `(timestamp, message_id)`
-    //! order, emit a canonical-content stub per row, then `end` and close.
-    //! Live-tail activates with live-write (section 4) on the same endpoint
-    //! without a wire change. Full-fidelity event replay (parts, metadata)
-    //! is not in scope - agents fetch parts via `pond_get(include_parts=true)`.
-
-    use crate::{
-        sessions::{MessageWithParts, Store},
-        wire::ErrorEnvelope,
-    };
-    use serde_json::{Value, json};
-
-    use super::{map_error, map_storage};
-
-    /// Parsed `since` query parameter.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum Since {
-        /// No `since`: emit `session` header + every message + `end`.
-        None,
-        /// `since=session:<id>`: emit every message + `end`; the client has
-        /// already seen the header from a prior connection.
-        Header,
-        /// `since=end:<id>`: idempotent terminator; emit `end` and close.
-        End,
-        /// `since=<message_id>`: resume from `(timestamp, id) > since.row`.
-        Message(String),
-    }
-
-    /// Decode a `since` query value. Empty / missing -> `None`. Prefixes
-    /// `session:` / `end:` map to the matching `Header` / `End` variants
-    /// regardless of the value carried after the colon (the server already
-    /// knows the session id from the path). A bare value is treated as a
-    /// message id; `since=unknown` cases bubble up to the per-row resume
-    /// logic, which surfaces them as `validation_failed`.
-    pub fn parse_since(value: Option<&str>) -> Since {
-        match value {
-            None => Since::None,
-            Some(raw) => {
-                if raw.is_empty() {
-                    Since::None
-                } else if let Some(rest) = raw.strip_prefix("session:") {
-                    let _ = rest;
-                    Since::Header
-                } else if let Some(rest) = raw.strip_prefix("end:") {
-                    let _ = rest;
-                    Since::End
-                } else {
-                    Since::Message(raw.to_owned())
-                }
-            }
-        }
-    }
-
-    /// Server-Sent Events event ready to encode by the transport layer.
-    /// Identity (`event` + `id` + `data`) is spec.md#protocol verbatim.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct SseEvent {
-        pub event: &'static str,
-        pub id: String,
-        pub data: Value,
-    }
-
-    /// Plan a session-events response: validate the session exists, parse
-    /// `since`, locate the cutoff, and emit the ordered list of events the
-    /// transport will stream. Returns a typed error envelope on `not_found`
-    /// (unknown session id) or `validation_failed` (unknown `since`); all
-    /// storage errors map to `storage_unavailable`.
-    pub async fn pond_session_events(
-        store: &Store,
-        session_id: &str,
-        since: Since,
-    ) -> Result<Vec<SseEvent>, ErrorEnvelope> {
-        let stored = store.get_session(session_id).await.map_err(map_storage)?;
-        let Some(stored) = stored else {
-            return Err(map_error(crate::Error::not_found(
-                "session",
-                json!(session_id),
-                "session not found",
-            )));
-        };
-
-        if since == Since::End {
-            return Ok(vec![end_event(session_id)]);
-        }
-
-        let mut events = Vec::new();
-        if since == Since::None {
-            events.push(SseEvent {
-                event: "session",
-                id: format!("session:{session_id}"),
-                data: serde_json::to_value(&stored.session).unwrap_or(Value::Null),
-            });
-        }
-
-        let messages = stored.messages;
-        let start_at = match &since {
-            Since::None | Since::Header | Since::End => 0,
-            Since::Message(message_id) => {
-                let position = messages
-                    .iter()
-                    .position(|message| message.message.id() == message_id);
-                match position {
-                    Some(index) => index + 1,
-                    None => {
-                        return Err(map_error(crate::Error::validation_field(
-                            "since references a message id that does not exist in this session",
-                            "since",
-                            Some(json!(message_id)),
-                            Some("message_id present in this session".to_owned()),
-                        )));
-                    }
-                }
-            }
-        };
-
-        for message in &messages[start_at..] {
-            events.push(message_event(message));
-        }
-        events.push(end_event(session_id));
-        Ok(events)
-    }
-
-    fn message_event(message: &MessageWithParts) -> SseEvent {
-        SseEvent {
-            event: "message",
-            id: message.message.id().to_owned(),
-            data: json!({ "message": message.message }),
-        }
-    }
-
-    fn end_event(session_id: &str) -> SseEvent {
-        SseEvent {
-            event: "end",
-            id: format!("end:{session_id}"),
-            data: json!({ "reason": "caught_up" }),
-        }
-    }
-}
-
-pub use session_events_handler::{Since, SseEvent, parse_since, pond_session_events};
-
 mod export_handler {
     //! `pond_export` (spec.md#protocol): walk every session in the store and
     //! emit its canonical event stream as JSONL - one `IngestEvent` per line.
@@ -841,66 +697,59 @@ mod restore_handler {
 pub use restore_handler::restore_lineage;
 
 mod get_handler {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use serde::{Deserialize, Serialize};
-
     use crate::{
-        sessions::{MessageWindow, PagedScope, PagedSessionView, Store},
-        wire::{GetEnvelope, GetRequest, GetResponse, GetResult, validate_protocol},
+        sessions::{GetLookup, MessageViewParams, RetrievedMessage, SessionViewParams, Store},
+        wire::{
+            GetEnvelope, GetRequest, GetResponse, GetResult, GetSession, MessageView, PartSummary,
+            ResponseMode, ResponsePart, validate_protocol,
+        },
     };
 
     use super::{map_error, map_storage};
 
-    /// ~10000-token response budget at the `bytes/4` estimator.
-    const BUDGET_BYTES: usize = 40_000;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum CursorScope {
-        Session,
-        Message,
+    /// Project canonical retrieval data into the response DTO. In `verbatim` the
+    /// full parts ride `parts` and `text`/`content` are dropped - they would just
+    /// duplicate the inlined text part; otherwise the compact summary rides along
+    /// and full parts are elided.
+    fn to_message_view(message: RetrievedMessage, verbatim: bool) -> MessageView {
+        if verbatim {
+            return MessageView {
+                id: message.id,
+                role: message.role,
+                timestamp: message.timestamp,
+                text: None,
+                content: None,
+                parts_summary: Vec::new(),
+                parts: Some(
+                    message
+                        .parts
+                        .into_iter()
+                        .map(ResponsePart::from_part)
+                        .collect(),
+                ),
+            };
+        }
+        let parts_summary = message
+            .parts
+            .iter()
+            .filter_map(|part| PartSummary::for_kind(&part.kind))
+            .collect();
+        MessageView {
+            id: message.id,
+            role: message.role,
+            timestamp: message.timestamp,
+            text: message.text,
+            content: message.content,
+            parts_summary,
+            parts: None,
+        }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct Cursor {
-        scope: CursorScope,
-        anchor_id: String,
-        after_message_id: String,
-        #[serde(default)]
-        include_parts: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        up_to: Option<String>,
-        #[serde(default)]
-        context_depth: usize,
-    }
-
-    fn encode_cursor(cursor: &Cursor) -> String {
-        // Cursor is plain owned types (String / Option<String> / bool / usize /
-        // enum); serde_json can't fail on it, so an explicit panic message
-        // beats threading an infallible Result up to the response shape.
-        #[allow(clippy::expect_used)]
-        let bytes = serde_json::to_vec(cursor).expect("cursor encodes as JSON");
-        URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    fn decode_cursor(raw: &str) -> Result<Cursor, crate::wire::ErrorEnvelope> {
-        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| {
-            map_error(crate::Error::validation_field(
-                "cursor is malformed (expected opaque value from a prior response)",
-                "cursor",
-                Some(serde_json::json!(raw)),
-                Some("opaque base64url".to_owned()),
-            ))
-        })?;
-        serde_json::from_slice(&bytes).map_err(|_| {
-            map_error(crate::Error::validation_field(
-                "cursor is malformed (decode failed)",
-                "cursor",
-                Some(serde_json::json!(raw)),
-                Some("opaque cursor from a prior response".to_owned()),
-            ))
-        })
-    }
+    /// Server response budget, sized to the declared
+    /// `_meta["anthropic/maxResultSizeChars"]` cap (~200KB / ~50k tokens). The
+    /// server stops adding messages (or parts) when the next would exceed it;
+    /// `messages_remaining` / `target_parts_remaining` then signal pagination.
+    const BUDGET_BYTES: usize = 200_000;
 
     pub async fn pond_get(store: &Store, request: GetRequest) -> GetEnvelope {
         if let Err(error) = validate_protocol(request.protocol_version) {
@@ -910,252 +759,131 @@ mod get_handler {
             return GetEnvelope::Error(envelope);
         }
 
-        let cursor = match request.cursor.as_deref() {
-            Some(raw) => Some(match decode_cursor(raw) {
-                Ok(cursor) => cursor,
-                Err(envelope) => return GetEnvelope::Error(envelope),
-            }),
-            None => None,
+        let response = match (&request.session_id, &request.message_id) {
+            (Some(session_id), None) => session_result(store, session_id, &request).await,
+            (None, Some(message_id)) => message_result(store, message_id, &request).await,
+            (Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
+                "session_id and message_id are mutually exclusive",
+                "message_id",
+                request.message_id.clone().map(serde_json::Value::String),
+                Some("omit when session_id is present".to_owned()),
+            ))),
+            (None, None) => Err(map_error(crate::Error::validation(
+                "one of session_id or message_id is required",
+            ))),
         };
 
-        let outcome = match cursor {
-            Some(cursor) => match cursor.scope {
-                CursorScope::Session => {
-                    session_page(
-                        store,
-                        cursor.anchor_id.clone(),
-                        cursor.up_to.clone(),
-                        Some(cursor.after_message_id.clone()),
-                        request.limit,
-                        cursor.include_parts,
-                    )
-                    .await
-                }
-                CursorScope::Message => {
-                    message_page(
-                        store,
-                        cursor.anchor_id.clone(),
-                        cursor.context_depth,
-                        Some(cursor.after_message_id.clone()),
-                        request.limit,
-                        cursor.include_parts,
-                    )
-                    .await
-                }
-            },
-            None => match (&request.session_id, &request.message_id, &request.up_to) {
-                (Some(session_id), None, up_to) => {
-                    session_page(
-                        store,
-                        session_id.clone(),
-                        up_to.clone(),
-                        None,
-                        request.limit,
-                        request.include_parts,
-                    )
-                    .await
-                }
-                (None, Some(message_id), None) => {
-                    message_page(
-                        store,
-                        message_id.clone(),
-                        request.context_depth,
-                        None,
-                        request.limit,
-                        request.include_parts,
-                    )
-                    .await
-                }
-                (None, Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
-                    "up_to is valid only with session_id",
-                    "up_to",
-                    request.up_to.clone().map(serde_json::Value::String),
-                    Some("only valid with session_id".to_owned()),
-                ))),
-                (Some(_), Some(_), _) => Err(map_error(crate::Error::validation_field(
-                    "session_id and message_id are mutually exclusive",
-                    "message_id",
-                    request.message_id.clone().map(serde_json::Value::String),
-                    Some("omit when session_id is present".to_owned()),
-                ))),
-                (None, None, _) => Err(map_error(crate::Error::validation(
-                    "one of session_id, message_id, or cursor is required",
-                ))),
-            },
-        };
-
-        match outcome {
-            Ok((result, has_more, next_cursor)) => GetEnvelope::Success(GetResponse {
-                result,
-                has_more,
-                next_cursor,
-            }),
+        match response {
+            Ok(response) => GetEnvelope::Success(response),
             Err(error) => GetEnvelope::Error(error),
         }
     }
 
-    async fn session_page(
-        store: &Store,
-        session_id: String,
-        up_to: Option<String>,
-        start_after: Option<String>,
-        limit: usize,
-        include_parts: bool,
-    ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
-        let scope = PagedScope {
-            up_to: up_to.as_deref(),
-            start_after: start_after.as_deref(),
-            window: None,
-            limit,
-            budget_bytes: BUDGET_BYTES,
-            include_parts,
-        };
-        let view = store
-            .paged_session_view(&session_id, scope)
-            .await
-            .map_err(map_storage)?;
-        let Some(view) = view else {
-            return Err(map_error(crate::Error::not_found(
-                "session",
-                serde_json::json!(session_id),
-                format!("session not found: {session_id}"),
-            )));
-        };
-        let (next_cursor, has_more) = build_next_cursor(
-            &view,
-            CursorScope::Session,
-            &session_id,
-            up_to.clone(),
-            0,
-            include_parts,
-        );
-        Ok((
-            GetResult::Session {
-                session: view.session,
-                messages: view.messages,
-                parts: view.parts,
-            },
-            has_more,
-            next_cursor,
+    /// Map a stale/unknown `after_id` to a `validation_failed` naming the fix
+    /// (spec.md#protocol); `anchor_of` describes the id the client should supply.
+    fn unknown_after_id(request: &GetRequest, anchor_of: &str) -> crate::wire::ErrorEnvelope {
+        map_error(crate::Error::validation_field(
+            "after_id not found (stale or mistyped continuation anchor)",
+            "after_id",
+            request.after_id.clone().map(serde_json::Value::String),
+            Some(format!("a {anchor_of} from a prior page of this read")),
         ))
     }
 
-    async fn message_page(
+    async fn session_result(
         store: &Store,
-        message_id: String,
-        context_depth: usize,
-        start_after: Option<String>,
-        limit: usize,
-        include_parts: bool,
-    ) -> Result<(GetResult, bool, Option<String>), crate::wire::ErrorEnvelope> {
-        let session_id = store
-            .session_id_for_message(&message_id)
+        session_id: &str,
+        request: &GetRequest,
+    ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
+        let params = SessionViewParams {
+            mode: request.response_mode,
+            after_id: request.after_id.as_deref(),
+            limit: request.limit,
+            budget_bytes: BUDGET_BYTES,
+        };
+        let view = match store
+            .session_view(session_id, params)
             .await
             .map_err(map_storage)?
-            .ok_or_else(|| {
-                map_error(crate::Error::not_found(
+        {
+            GetLookup::NotFound => {
+                return Err(map_error(crate::Error::not_found(
+                    "session",
+                    serde_json::json!(session_id),
+                    format!("session not found: {session_id}"),
+                )));
+            }
+            GetLookup::UnknownAfterId => return Err(unknown_after_id(request, "message id")),
+            GetLookup::Found(view) => view,
+        };
+        let verbatim = matches!(request.response_mode, ResponseMode::Verbatim);
+        Ok(GetResponse {
+            session: GetSession::from_session(&view.session),
+            result: GetResult::Session {
+                messages: view
+                    .messages
+                    .into_iter()
+                    .map(|message| to_message_view(message, verbatim))
+                    .collect(),
+                messages_remaining: view.messages_remaining,
+            },
+        })
+    }
+
+    async fn message_result(
+        store: &Store,
+        message_id: &str,
+        request: &GetRequest,
+    ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
+        let params = MessageViewParams {
+            context_depth: request.context_depth,
+            after_id: request.after_id.as_deref(),
+            limit: request.limit,
+            budget_bytes: BUDGET_BYTES,
+        };
+        let view = match store
+            .message_view(message_id, params)
+            .await
+            .map_err(map_storage)?
+        {
+            GetLookup::NotFound => {
+                return Err(map_error(crate::Error::not_found(
                     "message",
                     serde_json::json!(message_id),
                     format!("message not found: {message_id}"),
-                ))
-            })?;
-        let scope = PagedScope {
-            up_to: None,
-            start_after: start_after.as_deref(),
-            window: Some(MessageWindow {
-                anchor: &message_id,
-                depth: context_depth,
-            }),
-            limit,
-            budget_bytes: BUDGET_BYTES,
-            include_parts,
+                )));
+            }
+            GetLookup::UnknownAfterId => return Err(unknown_after_id(request, "part id")),
+            GetLookup::Found(view) => view,
         };
-        let view = store
-            .paged_session_view(&session_id, scope)
-            .await
-            .map_err(map_storage)?;
-        let Some(view) = view else {
-            return Err(map_error(crate::Error::not_found(
-                "session",
-                serde_json::json!(session_id),
-                format!("session not found: {session_id}"),
-            )));
+        // The target's body rides `target_parts` (paginated, full); carrying
+        // `text`/`content` on the header too would just duplicate it.
+        let target = MessageView {
+            id: view.target.id,
+            role: view.target.role,
+            timestamp: view.target.timestamp,
+            text: None,
+            content: None,
+            parts_summary: Vec::new(),
+            parts: None,
         };
-        let (next_cursor, has_more) = build_next_cursor(
-            &view,
-            CursorScope::Message,
-            &message_id,
-            None,
-            context_depth,
-            include_parts,
-        );
-        Ok((
-            GetResult::Message {
-                session: view.session,
-                messages: view.messages,
-                parts: view.parts,
+        Ok(GetResponse {
+            session: GetSession::from_session(&view.session),
+            result: GetResult::Message {
+                target,
+                target_parts: view
+                    .target_parts
+                    .into_iter()
+                    .map(ResponsePart::from_part)
+                    .collect(),
+                target_parts_remaining: view.target_parts_remaining,
+                siblings: view
+                    .siblings
+                    .into_iter()
+                    .map(|sibling| to_message_view(sibling, false))
+                    .collect(),
             },
-            has_more,
-            next_cursor,
-        ))
-    }
-
-    fn build_next_cursor(
-        view: &PagedSessionView,
-        scope: CursorScope,
-        anchor_id: &str,
-        up_to: Option<String>,
-        context_depth: usize,
-        include_parts: bool,
-    ) -> (Option<String>, bool) {
-        match view.next_after.as_deref() {
-            Some(after) => (
-                Some(encode_cursor(&Cursor {
-                    scope,
-                    anchor_id: anchor_id.to_owned(),
-                    after_message_id: after.to_owned(),
-                    include_parts,
-                    up_to,
-                    context_depth,
-                })),
-                view.has_more,
-            ),
-            None => (None, false),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #![allow(clippy::unwrap_used)]
-        use super::*;
-
-        #[test]
-        fn cursor_round_trips_through_base64url_json() {
-            let cursor = Cursor {
-                scope: CursorScope::Session,
-                anchor_id: "s-1".to_owned(),
-                after_message_id: "m-7".to_owned(),
-                include_parts: true,
-                up_to: Some("m-9".to_owned()),
-                context_depth: 0,
-            };
-            let raw = encode_cursor(&cursor);
-            let back = decode_cursor(&raw).unwrap();
-            assert!(matches!(back.scope, CursorScope::Session));
-            assert_eq!(back.anchor_id, "s-1");
-            assert_eq!(back.after_message_id, "m-7");
-            assert!(back.include_parts);
-            assert_eq!(back.up_to.as_deref(), Some("m-9"));
-        }
-
-        #[test]
-        fn malformed_cursor_returns_validation_failed() {
-            let envelope = decode_cursor("not-base64!!!").unwrap_err();
-            assert_eq!(
-                envelope.error.code,
-                crate::wire::ErrorCode::ValidationFailed
-            );
-        }
+        })
     }
 }
 
@@ -1174,11 +902,13 @@ mod search_handler {
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
-            ErrorEnvelope, ProjectFilter, Role, SearchCursor, SearchEnvelope, SearchFilters,
-            SearchRequest, SearchResponse, SearchResult, SearchSession, validate_protocol,
+            ErrorEnvelope, PartSummary, ProjectFilter, Role, SearchCursor, SearchEnvelope,
+            SearchFilters, SearchRequest, SearchResponse, SearchResult, SearchSession,
+            validate_protocol,
         },
     };
     use chrono::NaiveDate;
+    use std::collections::HashMap;
 
     use super::{map_error, map_storage};
 
@@ -1822,7 +1552,11 @@ mod search_handler {
     }
 
     impl ScoredHit {
-        fn to_search_result(&self, query: &str) -> Result<SearchResult, ErrorEnvelope> {
+        fn to_search_result(
+            &self,
+            query: &str,
+            summaries: &HashMap<(String, String), Vec<PartSummary>>,
+        ) -> Result<SearchResult, ErrorEnvelope> {
             let text = hit_payload(&self.meta.search_text, query);
             let role = match self.meta.role.as_str() {
                 "system" => Role::System,
@@ -1835,12 +1569,23 @@ mod search_handler {
                     ))));
                 }
             };
+            // Only user hits earn a parts_summary (FilePart signal); see the
+            // rationale in spec.md#search.
+            let parts_summary = if matches!(role, Role::User) {
+                summaries
+                    .get(&(self.meta.session_id.clone(), self.meta.message_id.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             Ok(SearchResult {
                 message_id: self.meta.message_id.clone(),
                 role,
                 timestamp: self.meta.timestamp,
                 text,
                 score: normalize_score(self.score),
+                parts_summary,
             })
         }
     }
@@ -1907,6 +1652,35 @@ mod search_handler {
             matched_count: usize,
             matches: Vec<SearchResult>,
         }
+        // Precompute part summaries for user-role hits, grouped by their actual
+        // session id (a subagent hit's parts live under `root/agent-...`, not
+        // the grouping root).
+        let mut user_ids_by_session: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for hit in scored {
+            if hit.meta.role == "user" {
+                user_ids_by_session
+                    .entry(hit.meta.session_id.clone())
+                    .or_default()
+                    .push(hit.meta.message_id.clone());
+            }
+        }
+        let mut summaries: HashMap<(String, String), Vec<PartSummary>> = HashMap::new();
+        for (session_id, message_ids) in &user_ids_by_session {
+            for (key, parts) in store
+                .summary_parts_for_messages(session_id, message_ids)
+                .await
+                .map_err(map_storage)?
+            {
+                summaries.insert(
+                    key,
+                    parts
+                        .iter()
+                        .filter_map(|part| PartSummary::for_kind(&part.kind))
+                        .collect(),
+                );
+            }
+        }
+
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
         for hit in scored {
             let root = session_root(&hit.meta.session_id).to_owned();
@@ -1917,7 +1691,7 @@ mod search_handler {
                 matches: Vec::new(),
             });
             entry.matched_count += 1;
-            entry.matches.push(hit.to_search_result(query)?);
+            entry.matches.push(hit.to_search_result(query, &summaries)?);
         }
 
         let session_ids = groups.keys().cloned().collect::<Vec<_>>();

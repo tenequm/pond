@@ -16,8 +16,8 @@ use pond::{
     sessions::{Store, embedding_dim},
     wire::PartKind,
     wire::{
-        GetEnvelope, GetRequest, GetResult, ProjectFilter, Role, SearchEnvelope, SearchFilters,
-        SearchRequest,
+        GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, Role, SearchEnvelope,
+        SearchFilters, SearchRequest,
     },
 };
 use std::sync::Arc;
@@ -95,11 +95,10 @@ fn get_request(session_id: &str) -> GetRequest {
         namespace: Some("local".to_owned()),
         session_id: Some(session_id.to_owned()),
         message_id: None,
-        up_to: None,
         context_depth: 0,
         limit: 1000,
-        include_parts: true,
-        cursor: None,
+        response_mode: ResponseMode::Verbatim,
+        after_id: None,
     }
 }
 
@@ -140,10 +139,10 @@ async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
         let GetEnvelope::Success(response) = pond_get(store, get_request(&session_id)).await else {
             continue;
         };
-        let GetResult::Session { parts, .. } = response.result else {
+        let GetResult::Session { messages, .. } = response.result else {
             continue;
         };
-        for part in &parts {
+        for part in messages.iter().filter_map(|m| m.parts.as_ref()).flatten() {
             if let PartKind::Text { text: Some(text) } = &part.kind {
                 let words = text.split_whitespace().take(8).collect::<Vec<_>>();
                 if words.len() >= 4 {
@@ -161,11 +160,10 @@ fn get_request_text_only(session_id: &str) -> GetRequest {
         namespace: Some("local".to_owned()),
         session_id: Some(session_id.to_owned()),
         message_id: None,
-        up_to: None,
         context_depth: 0,
         limit: 1000,
-        include_parts: false,
-        cursor: None,
+        response_mode: ResponseMode::Conversational,
+        after_id: None,
     }
 }
 
@@ -389,7 +387,7 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
 
     let GetEnvelope::Success(restore_response) = pond_get(&store, get_request(session_uuid)).await
     else {
-        panic!("pond_get must succeed with include_parts=true");
+        panic!("pond_get must succeed in verbatim mode");
     };
     let GetResult::Session {
         messages: restore_messages,
@@ -400,18 +398,17 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
     };
     assert!(
         restore_messages.iter().any(|m| m.id == "u-notify"),
-        "injected message is preserved and reachable via include_parts=true"
+        "injected message is preserved and reachable in verbatim mode"
     );
     Ok(())
 }
 
-/// `pond_get` paginates over the 10k-token char budget: a session whose
-/// `search_text` totals more than the budget returns `has_more=true` and a
-/// continuation cursor; the continuation re-runs without re-supplying the
-/// originating session_id.
+/// `pond_get` paginates over the response byte budget: a session whose
+/// `search_text` totals more than the budget returns `messages_remaining > 0`,
+/// and re-requesting with `after_id` set to the last returned message id
+/// surfaces the rest, disjoint from the first page.
 #[tokio::test(flavor = "multi_thread")]
-async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() -> anyhow::Result<()>
-{
+async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Result<()> {
     use chrono::{TimeZone, Utc};
     use pond::wire::{IngestRequest, Message, Provenance, ProviderOptions, Session};
     use pond::{adapter, handlers};
@@ -430,7 +427,9 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
         options: ProviderOptions::new(),
     };
 
-    let huge_text = "abc def ghi jkl ".repeat(2000);
+    // ~80KB per message; three of them exceed the ~200KB page budget so the
+    // first page stops mid-session.
+    let huge_text = "abc def ghi jkl ".repeat(5000);
     let mut events: Vec<pond::handlers::IngestEvent> =
         vec![pond::handlers::IngestEvent::Session(session)];
     for index in 0..3 {
@@ -477,38 +476,45 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
             namespace: Some("local".to_owned()),
             session_id: Some(session_id.clone()),
             message_id: None,
-            up_to: None,
             context_depth: 0,
             limit: 1000,
-            include_parts: false,
-            cursor: None,
+            response_mode: ResponseMode::Conversational,
+            after_id: None,
         },
     )
     .await;
     let GetEnvelope::Success(first_response) = first else {
         panic!("first page must succeed");
     };
+    let GetResult::Session {
+        messages: first_messages,
+        messages_remaining,
+        ..
+    } = first_response.result
+    else {
+        panic!("first page is session-scope");
+    };
     assert!(
-        first_response.has_more,
+        messages_remaining > 0,
         "long corpus must trip the page budget"
     );
-    let cursor = first_response
-        .next_cursor
-        .clone()
-        .expect("has_more implies next_cursor");
+    let after_id = first_messages
+        .last()
+        .expect("first page is non-empty")
+        .id
+        .clone();
 
     let second = pond_get(
         &store,
         GetRequest {
             protocol_version: pond::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
-            session_id: None,
+            session_id: Some(session_id.clone()),
             message_id: None,
-            up_to: None,
             context_depth: 0,
             limit: 1000,
-            include_parts: false,
-            cursor: Some(cursor),
+            response_mode: ResponseMode::Conversational,
+            after_id: Some(after_id),
         },
     )
     .await;
@@ -520,14 +526,7 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
         ..
     } = second_response.result
     else {
-        panic!("session-scope cursor must return a session result");
-    };
-    let GetResult::Session {
-        messages: first_messages,
-        ..
-    } = first_response.result
-    else {
-        panic!("first page is session-scope");
+        panic!("continuation must return a session result");
     };
     assert!(
         !second_messages.is_empty(),
@@ -539,7 +538,7 @@ async fn pond_get_paginates_over_the_char_budget_with_a_self_contained_cursor() 
         second_messages
             .iter()
             .all(|m| !first_ids.contains(m.id.as_str())),
-        "cursor pages must be disjoint"
+        "after_id pages must be disjoint"
     );
 
     Ok(())
