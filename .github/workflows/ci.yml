@@ -17,8 +17,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: ci
+  build-and-test:
+    name: build-and-test
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6.0.2
@@ -31,9 +31,9 @@ jobs:
       - run: cargo test --locked
       - run: kache stats
 
-  release:
-    name: release
-    needs: ci
+  release-plz:
+    name: release-plz
+    needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, x64]
     steps:
@@ -54,9 +54,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
       - run: kache stats
 
-  goreleaser:
-    name: goreleaser
-    needs: ci
+  publish-release:
+    name: publish-release
+    needs: build-and-test
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: [self-hosted, linux, x64]
     steps:
