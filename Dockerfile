@@ -53,9 +53,12 @@ ENV PROTOC=/usr/bin/protoc \
 
 COPY . .
 
-# macOS builds alone: cargo feature unification across a multi-target invocation
-# leaks candle's macOS-only `metal` feature into non-macOS targets. The non-Apple
-# targets share no such gated feature, so they batch into one invocation.
+# Cargo unifies features across all targets in one invocation, leaking
+# cfg-gated deps across platforms. macOS and Windows each build alone: macOS pulls
+# candle's macOS-only `metal`, and the two linux targets enable xet-data's
+# `cfg(not(windows))` sha2 `asm` feature, which drags sha2-asm (a Windows
+# compile_error!) into the Windows build. The two linux targets gate nothing
+# against each other, so they batch together.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
@@ -65,8 +68,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     bash -ec '\
       kache sync --pull && \
       cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
+      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu && \
       cargo zigbuild --locked --profile dist \
-        --target x86_64-pc-windows-gnu \
         --target aarch64-unknown-linux-gnu \
         --target x86_64-unknown-linux-gnu && \
       kache sync --push && \
