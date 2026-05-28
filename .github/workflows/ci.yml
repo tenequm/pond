@@ -45,7 +45,8 @@ jobs:
       - run: kache stats
       - uses: release-plz/action@v0.5
         with:
-          command: release
+          # Default (no command) runs both `release-pr` and `release`.
+          # `dry_run` applies only to `release`; `release-pr` opens PRs for real.
           dry_run: true
         env:
           # GH_RELEASE_TOKEN (fine-grained PAT) lets release-plz trigger
