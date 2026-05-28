@@ -5,7 +5,8 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 # Cancel in-flight runs only on pull_request events (push to main keeps its
 # own group via `run_id`). https://docs.github.com/en/actions/using-jobs/using-concurrency#example-using-a-fallback-value
@@ -17,12 +18,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust
+  ci:
+    name: ci
     runs-on: [self-hosted, linux, x64, bl]
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0   # release-plz needs full git history for changelog
 
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
+
+      - name: release-plz
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
