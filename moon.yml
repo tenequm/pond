@@ -1,0 +1,64 @@
+language: rust
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILDX_BUILDER: pond-hetzner
+
+tasks:
+  # One-time builder setup (pool is amd64 cpx42, isolated by nodeselector):
+  #   docker buildx create --name pond-hetzner --driver kubernetes \
+  #     --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+  #     --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+  #     --platform linux/amd64 --bootstrap
+  build-dist:
+    script: |
+      set -euo pipefail
+      mkdir -p target/dist
+
+      eval "$(awk -F' *= *' '
+        /^\[storage\]/ {in_storage=1; next}
+        /^\[/          {in_storage=0}
+        in_storage && /^AWS_/ {
+          gsub(/"/, "", $2)
+          print "export "$1"="$2
+        }
+      ' "$HOME/.config/pond/config.toml")"
+      : "${AWS_ACCESS_KEY_ID:?missing}" "${AWS_SECRET_ACCESS_KEY:?missing}" \
+        "${AWS_REGION:?missing}" "${AWS_ENDPOINT:?missing}"
+
+      BUCKET=ttq
+      # AWS_ENDPOINT in config is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
+      S3_ENDPOINT="${AWS_ENDPOINT/${BUCKET}./}"
+      BUILDX_PREFIX=pond-buildkit/multiarch
+
+      kubectl -n pond-buildkit scale deploy/pond-hetzner0 --replicas=1
+      kubectl -n pond-buildkit annotate --overwrite deploy/pond-hetzner0 pond.io/last-build=$(date -u +%s)
+      kubectl -n pond-buildkit wait deploy/pond-hetzner0 --for=condition=available --timeout=10m
+
+      docker buildx build \
+        --platform linux/amd64 \
+        --target output \
+        --cache-from "type=s3,region=${AWS_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY}" \
+        --cache-to   "type=s3,region=${AWS_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY},mode=max" \
+        --secret "id=kache_s3_access_key,env=AWS_ACCESS_KEY_ID" \
+        --secret "id=kache_s3_secret_key,env=AWS_SECRET_ACCESS_KEY" \
+        --output "type=local,dest=target/dist" \
+        -f Dockerfile \
+        .
+      ls -lh target/dist/
+      for f in target/dist/pond-*; do file "$f"; done
+    inputs:
+      - 'src/**/*'
+      - 'tests/**/*'
+      - 'benches/**/*'
+      - 'Cargo.{toml,lock}'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile'
+      - '.dockerignore'
+    outputs:
+      - 'target/dist/pond-universal2-apple-darwin'
+      - 'target/dist/pond-x86_64-pc-windows-gnu.exe'
+      - 'target/dist/pond-aarch64-unknown-linux-gnu'
+    options:
+      cache: true
+      outputStyle: stream
