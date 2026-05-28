@@ -3,6 +3,13 @@ name = "pond"
 version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
+repository = "https://github.com/tenequm/pond"
+homepage = "https://github.com/tenequm/pond"
+documentation = "https://github.com/tenequm/pond/blob/main/docs/spec.md"
+readme = "README.md"
+keywords = ["ai", "agents", "mcp", "lance", "search"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 anstyle = "1"

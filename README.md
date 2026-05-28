@@ -1,11 +1,16 @@
 # pond
 
+[![CI](https://github.com/tenequm/pond/actions/workflows/ci.yml/badge.svg)](https://github.com/tenequm/pond/actions/workflows/ci.yml)
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
+
+Lossless storage and hybrid search for AI agent sessions, across every agentic client.
 
 Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. Your history, your search, your sessions - independent of the agent vendor that made them.
 
 One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
+
+Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md).
 
 ## Table of Contents
 
@@ -23,7 +28,7 @@ Every agentic CLI ships its own session format and its own search surface. Switc
 
 Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, hybrid search (BM25 + vector, score-normalized fusion), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
 
-Pre-v1. The crate builds clean and the v1 surface is in place: full CLI, HTTP+JSON and MCP transports, hybrid search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md) for the locked-in specification.
+The v1 surface includes: full CLI, HTTP+JSON and MCP transports, hybrid search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration.
 
 ## Install
 
@@ -126,7 +131,7 @@ Issues and pull requests are welcome. The most useful contributions right now:
 - Pointers to additional reference schemas or session samples worth snapshotting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
 
-For larger changes, open an issue first to discuss the direction.
+For larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](SECURITY.md).
 
 ## License
 

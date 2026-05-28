@@ -1,0 +1,3 @@
+# lance git deps block crates.io publish; release-plz runs in git-tag mode only.
+[workspace]
+publish = false

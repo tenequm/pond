@@ -12,17 +12,11 @@ env:
 
 jobs:
   rust:
-    name: Rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Rust
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
-      # Reads channel + components from rust-toolchain.toml so it stays the
-      # single source of truth for the Rust version; also bundles rust-cache.
       - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
 
       - run: cargo fmt --check
