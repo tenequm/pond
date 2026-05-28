@@ -138,7 +138,8 @@ impl SkipOracle for NoopOracle {
 pub enum AdapterYield {
     Event(IngestEvent),
     Skipped {
-        session_id: String,
+        /// `None` for files that never yield a session id (empty `.jsonl`).
+        session_id: Option<String>,
         project: Option<String>,
         reason: SkipReason,
     },
@@ -147,6 +148,10 @@ pub enum AdapterYield {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     Fresh,
+    /// File produced no importable session (empty `.jsonl`, sidecar-only rows,
+    /// or an unextractable header). Benign: counted, never an error or a
+    /// per-event drop. The underlying cause is logged at `POND_LOG=debug`.
+    Empty,
 }
 
 pub type AdapterYieldStream<'a> =

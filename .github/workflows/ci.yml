@@ -19,6 +19,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Cap C-build parallelism (aws-lc-sys et al.) to avoid swap-thrash on the
+  # 4-core self-hosted runner; Rust parallelism (cargo -j) is left at default.
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  MAKEFLAGS: -j2
 
 jobs:
   build-and-test:

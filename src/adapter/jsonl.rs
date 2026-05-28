@@ -133,7 +133,7 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
                 && mtime <= ingested
             {
                 yield Ok(AdapterYield::Skipped {
-                    session_id: id.clone(),
+                    session_id: Some(id.clone()),
                     project: None,
                     reason: SkipReason::Fresh,
                 });
@@ -264,10 +264,28 @@ fn read_one_file<D: JsonlTree>(
         }
     }
 
+    // A file that yields no importable session - empty, sidecar-only, or an
+    // unextractable header - is a benign skip, not a per-event drop. Routing it
+    // through `Skipped` (session_id=None) keeps it off the in-flight session in
+    // the handler, so a header failure can't be misattributed to whatever
+    // session preceded it in the stream. The cause is debug-logged, not lost.
+    if rows.is_empty() {
+        emit!(Ok(AdapterYield::Skipped {
+            session_id: None,
+            project: None,
+            reason: SkipReason::Empty,
+        }));
+        return true;
+    }
     let session = match driver.session(path, &rows) {
         Ok(session) => session,
         Err(error) => {
-            emit!(Err(error));
+            tracing::debug!(%error, "skipping file with no extractable session");
+            emit!(Ok(AdapterYield::Skipped {
+                session_id: None,
+                project: None,
+                reason: SkipReason::Empty,
+            }));
             return true;
         }
     };

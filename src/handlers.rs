@@ -122,6 +122,10 @@ mod ingest_handler {
         /// Per-session staleness skip (spec.md#adapter-integrity-event-ordering): adapter short-circuited
         /// the file decode because `mtime < MAX(messages.timestamp)`.
         Fresh,
+        /// File produced no importable session (empty `.jsonl`, sidecar-only
+        /// rows, or an unextractable header). Benign: counted in
+        /// `skipped_empty`, never an error or a drop.
+        Empty,
     }
 
     #[derive(Debug, Default)]
@@ -232,12 +236,18 @@ mod ingest_handler {
                     reason,
                 }) => {
                     let status = match reason {
-                        SkipReason::Fresh => SyncStatus::Fresh,
+                        SkipReason::Fresh => {
+                            summary.skipped_fresh += 1;
+                            SyncStatus::Fresh
+                        }
+                        SkipReason::Empty => {
+                            summary.skipped_empty += 1;
+                            SyncStatus::Empty
+                        }
                     };
-                    summary.skipped_fresh += 1;
                     on_event(SyncEvent::SessionDone(SessionOutcome {
                         project,
-                        session_id: Some(session_id),
+                        session_id,
                         messages: 0,
                         status,
                     }));

@@ -1917,6 +1917,11 @@ pub struct IngestSummary {
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
+    /// Files that produced no importable session and were benignly skipped:
+    /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
+    /// metadata file), or an unextractable header. Never an error or a drop;
+    /// the underlying cause is logged at `POND_LOG=debug`.
+    pub skipped_empty: usize,
     /// Sessions short-circuited via the per-session staleness skip
     /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
