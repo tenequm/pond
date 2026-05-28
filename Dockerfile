@@ -67,11 +67,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=secret,id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY \
     bash -ec '\
       kache sync --pull && \
-      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
-      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu && \
       cargo zigbuild --locked --profile dist \
         --target aarch64-unknown-linux-gnu \
         --target x86_64-unknown-linux-gnu && \
+      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu && \
+      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
       kache sync --push && \
       mkdir -p /app/out && \
       cp target/aarch64-apple-darwin/dist/pond        /app/out/pond-aarch64-apple-darwin && \
