@@ -57,9 +57,10 @@ tasks:
       - 'Dockerfile'
       - '.dockerignore'
     outputs:
-      - 'target/dist/pond-universal2-apple-darwin'
+      - 'target/dist/pond-aarch64-apple-darwin'
       - 'target/dist/pond-x86_64-pc-windows-gnu.exe'
       - 'target/dist/pond-aarch64-unknown-linux-gnu'
+      - 'target/dist/pond-x86_64-unknown-linux-gnu'
     options:
       cache: true
       outputStyle: stream

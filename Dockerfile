@@ -36,13 +36,12 @@ RUN mkdir -p /root/.config/kache && \
     printf '[cache.remote]\ntype = "s3"\n' > /root/.config/kache/config.toml
 
 # `profile = "minimal"` + targets-in-toml does not reliably fetch rust-std for non-host targets.
-# universal2 builds both x86_64 and aarch64 darwin internally; we add them explicitly.
 COPY rust-toolchain.toml /app/rust-toolchain.toml
 RUN rustup show && \
-    rustup target add x86_64-apple-darwin \
-                      aarch64-apple-darwin \
+    rustup target add aarch64-apple-darwin \
                       x86_64-pc-windows-gnu \
-                      aarch64-unknown-linux-gnu
+                      aarch64-unknown-linux-gnu \
+                      x86_64-unknown-linux-gnu
 
 ENV PROTOC=/usr/bin/protoc \
     CARGO_TERM_COLOR=always \
@@ -54,8 +53,9 @@ ENV PROTOC=/usr/bin/protoc \
 
 COPY . .
 
-# Separate cargo invocations per target: cargo feature unification across
-# multi-target leaks candle's macOS-only `metal` feature into non-macOS targets.
+# macOS builds alone: cargo feature unification across a multi-target invocation
+# leaks candle's macOS-only `metal` feature into non-macOS targets. The non-Apple
+# targets share no such gated feature, so they batch into one invocation.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
@@ -64,14 +64,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=secret,id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY \
     bash -ec '\
       kache sync --pull && \
-      cargo zigbuild --locked --profile dist --target universal2-apple-darwin && \
-      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu && \
-      cargo zigbuild --locked --profile dist --target aarch64-unknown-linux-gnu && \
+      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
+      cargo zigbuild --locked --profile dist \
+        --target x86_64-pc-windows-gnu \
+        --target aarch64-unknown-linux-gnu \
+        --target x86_64-unknown-linux-gnu && \
       kache sync --push && \
       mkdir -p /app/out && \
-      cp target/universal2-apple-darwin/dist/pond     /app/out/pond-universal2-apple-darwin && \
+      cp target/aarch64-apple-darwin/dist/pond        /app/out/pond-aarch64-apple-darwin && \
       cp target/x86_64-pc-windows-gnu/dist/pond.exe   /app/out/pond-x86_64-pc-windows-gnu.exe && \
-      cp target/aarch64-unknown-linux-gnu/dist/pond   /app/out/pond-aarch64-unknown-linux-gnu \
+      cp target/aarch64-unknown-linux-gnu/dist/pond   /app/out/pond-aarch64-unknown-linux-gnu && \
+      cp target/x86_64-unknown-linux-gnu/dist/pond    /app/out/pond-x86_64-unknown-linux-gnu \
     '
 
 FROM scratch AS output
