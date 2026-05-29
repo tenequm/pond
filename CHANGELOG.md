@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/tenequm/pond/compare/v0.2.1...v0.2.2) - 2026-05-29
+
+### Other
+
+- *(readme)* replace standard-readme badge with crates.io version
+- *(readme)* drop CI badge
+- export KUBECONFIG so buildx subprocess inherits it
+- set KUBECONFIG from $RUNNER_TEMP in-step, not job env
+- fix goreleaser dirty-tree + add release recovery dispatch
+
 ## [0.2.1](https://github.com/tenequm/pond/compare/v0.2.0...v0.2.1) - 2026-05-28
 
 ### Fixed
