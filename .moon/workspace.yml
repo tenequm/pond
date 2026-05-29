@@ -5,9 +5,11 @@ projects:
 vcs:
   defaultBranch: 'main'
 
-# IP-allowlisted, no app-level auth (ingress whitelist-source-range).
 remote:
   host: 'grpcs://bazel-remote.cascade.fyi:443'
+  auth:
+    headers:
+      Authorization: '${BAZEL_REMOTE_AUTH}'
   cache:
     instanceName: 'pond'
     compression: 'zstd'

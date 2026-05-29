@@ -16,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
 
 jobs:
   build-and-test:
@@ -24,13 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
         with:
-          fetch-depth: 0   # moon diffs against `main`; needs full history + origin/main
+          fetch-depth: 0
 
       - uses: arduino/setup-protoc@v3
 
-      # Installs kache, sets RUSTC_WRAPPER=kache, syncs the build cache from the
-      # ttq bucket (kache sync --pull/--push). Same S3 prefix as the cluster
-      # build, so the x86_64-unknown-linux-gnu compile cache is shared.
       - uses: kunobi-ninja/kache-action@v1
         with:
           s3-bucket: ttq
@@ -41,13 +39,7 @@ jobs:
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
 
       - uses: moonrepo/setup-toolchain@v0
-
-      # Materialize the pinned toolchain once - moon runs tasks in parallel and
-      # concurrent on-demand rustup installs race on ~/.rustup.
-      - run: rustup show
-
-      # Runs every affected task with runInCI=true (format/lint/test); build-dist
-      # sets runInCI:false. kache (above) is the RUSTC_WRAPPER compile cache.
+      - uses: moonrepo/setup-rust@v1
       - run: moon ci
 
   release-plz:
