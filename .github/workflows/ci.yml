@@ -88,10 +88,6 @@ jobs:
     # from secrets below, so the runner needs no pre-provisioned pond setup -
     # only docker+buildx, kubectl, and moon installed.
     runs-on: [self-hosted, linux, x64]
-    env:
-      # Outside the repo checkout: goreleaser aborts on a dirty tree, and a
-      # kubeconfig written into the workspace counts as an untracked file.
-      KUBECONFIG: ${{ runner.temp }}/.kube-cascade
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -108,9 +104,13 @@ jobs:
         env:
           KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
         run: |
+          # Keep the kubeconfig OUT of the repo checkout: goreleaser aborts on a
+          # dirty tree, and a kubeconfig in the workspace is an untracked file.
+          # ($RUNNER_TEMP is only available in steps, not at job-level env.)
+          KUBECONFIG="$RUNNER_TEMP/.kube-cascade"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
           # Remove any kubeconfig a prior run left in the workspace (clean:false
-          # preserves untracked files); a stray copy here would dirty the tree
-          # and fail goreleaser.
+          # preserves untracked files) so it can't dirty the tree.
           rm -f "${{ github.workspace }}/.kube-cascade"
           printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
           chmod 600 "$KUBECONFIG"
