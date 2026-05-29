@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Recovery path: re-run packaging (binaries + Homebrew + NUR + GitHub release
+  # assets) for an already-tagged release, e.g. when goreleaser failed after
+  # release-plz already published to crates.io. Runs only `publish-release`
+  # against the given tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)package, e.g. v0.2.1"
+        required: true
 
 permissions:
   contents: write
@@ -21,6 +30,8 @@ env:
 jobs:
   build-and-test:
     name: build-and-test
+    # Skip on the recovery dispatch - it only re-runs publish-release for a tag.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6.0.2
@@ -68,19 +79,27 @@ jobs:
   publish-release:
     name: publish-release
     needs: release-plz
-    if: needs.release-plz.outputs.releases_created == 'true'
+    # Runs after release-plz cuts a release, OR on a manual recovery dispatch.
+    # always()+!cancelled() lets it run on workflow_dispatch even though
+    # release-plz is skipped there (its `if` is push-only).
+    if: ${{ always() && !cancelled() && (needs.release-plz.outputs.releases_created == 'true' || github.event_name == 'workflow_dispatch') }}
     # Self-hosted: provides the allowlisted network path to the cluster API.
     # Cluster *config* (kubeconfig, buildx builder, S3 creds) is bootstrapped
     # from secrets below, so the runner needs no pre-provisioned pond setup -
     # only docker+buildx, kubectl, and moon installed.
     runs-on: [self-hosted, linux, x64]
     env:
-      KUBECONFIG: ${{ github.workspace }}/.kube-cascade
+      # Outside the repo checkout: goreleaser aborts on a dirty tree, and a
+      # kubeconfig written into the workspace counts as an untracked file.
+      KUBECONFIG: ${{ runner.temp }}/.kube-cascade
     steps:
       - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
           clean: false
+          # On recovery dispatch, check out the tag so goreleaser releases it;
+          # empty ref (push flow) checks out the triggering commit.
+          ref: ${{ inputs.tag }}
 
       # nix-hash, required by goreleaser's `nix` block to compute the NUR sha256.
       - uses: cachix/install-nix-action@v31
@@ -89,6 +108,10 @@ jobs:
         env:
           KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
         run: |
+          # Remove any kubeconfig a prior run left in the workspace (clean:false
+          # preserves untracked files); a stray copy here would dirty the tree
+          # and fail goreleaser.
+          rm -f "${{ github.workspace }}/.kube-cascade"
           printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
           chmod 600 "$KUBECONFIG"
           # buildx builder state is client-side; on a fresh runner re-register it.
