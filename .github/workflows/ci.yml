@@ -56,11 +56,11 @@ jobs:
 
       - id: release-plz
         uses: release-plz/action@v0.5
-        with:
-          # Default (no command) runs both `release-pr` and `release`:
-          # `release-pr` opens/updates the release PR; `release` cuts the tag +
-          # GitHub release once an unreleased version bump lands on main.
-          dry_run: false
+        # No `dry_run` input on purpose: the action adds `--dry-run` whenever the
+        # input is non-empty (it tests `-n`, so even `dry_run: false` enables it).
+        # Omitting it is the only way to actually publish. Default command runs
+        # both `release-pr` (opens the release PR) and `release` (cuts the tag +
+        # crates.io publish + GitHub release once a release-plz-* branch merges).
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
