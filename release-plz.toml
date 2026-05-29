@@ -1,4 +1,4 @@
-# lance git deps block crates.io publish; release-plz runs in git-tag mode only.
+# pond is a binary, not a library: no crates.io publish, git-tag mode only.
 [workspace]
 publish = false
 # Only cut a release when the release PR is merged; ignore manual Cargo.toml
