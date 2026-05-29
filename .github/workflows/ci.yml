@@ -40,7 +40,7 @@ jobs:
 
       - uses: moonrepo/setup-toolchain@v0
       - uses: moonrepo/setup-rust@v1
-      - run: moon ci
+      - run: moon run pond:format pond:lint pond:test
 
   release-plz:
     name: release-plz
