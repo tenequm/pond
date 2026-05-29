@@ -63,6 +63,7 @@ jobs:
           dry_run: false
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-release:
     name: publish-release

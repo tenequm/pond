@@ -1,13 +1,23 @@
 [package]
-name = "pond"
+# Published to crates.io as `pond-db` (the `pond` name is taken by an unrelated
+# crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
+# command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
+name = "pond-db"
 version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
 repository = "https://github.com/tenequm/pond"
 documentation = "https://github.com/tenequm/pond/blob/main/docs/spec.md"
-keywords = ["ai", "agents", "mcp", "lance", "search"]
+keywords = ["agents", "mcp", "lance", "search", "session-logs"]
 categories = ["command-line-utilities", "database"]
+
+[lib]
+name = "pond"
+
+[[bin]]
+name = "pond"
+path = "src/main.rs"
 
 [dependencies]
 anstyle = "1"
