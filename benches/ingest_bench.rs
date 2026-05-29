@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
                         sync_partial += 1;
                         sync_partial_drops += *dropped_events as u64;
                     }
-                    SyncStatus::Ok | SyncStatus::Fresh => {}
+                    SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty => {}
                 }
             }
         })
