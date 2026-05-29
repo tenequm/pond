@@ -40,7 +40,7 @@ jobs:
 
       - uses: moonrepo/setup-toolchain@v0
       - uses: moonrepo/setup-rust@v1
-      - run: moon ci
+      - run: moon run pond:format pond:lint pond:test
 
   release-plz:
     name: release-plz
@@ -91,13 +91,11 @@ jobs:
           chmod 600 "$KUBECONFIG"
           # buildx builder state is client-side; on a fresh runner re-register it.
           # Drop any stale in-cluster deployment first so create is idempotent.
-          if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
-            kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
-            docker buildx create --name pond-hetzner --driver kubernetes \
-              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
-              --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
-              --platform linux/amd64
-          fi
+          docker buildx rm pond-hetzner 2>/dev/null || true
+          docker buildx create --name pond-hetzner --driver kubernetes \
+            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
+            --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+            --platform linux/amd64
 
       # Cross-compiles all 4 targets on the Hetzner buildkit pool (kache S3 +
       # bazel-remote), exactly as local; drops binaries in target/dist/.
@@ -146,13 +144,11 @@ jobs:
         run: |
           printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
           chmod 600 "$KUBECONFIG"
-          if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
-            kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
-            docker buildx create --name pond-hetzner --driver kubernetes \
-              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
-              --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
-              --platform linux/amd64
-          fi
+          docker buildx rm pond-hetzner 2>/dev/null || true
+          docker buildx create --name pond-hetzner --driver kubernetes \
+            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
+            --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+            --platform linux/amd64
 
       - name: Build dist binaries
         run: moon run pond:build-dist
