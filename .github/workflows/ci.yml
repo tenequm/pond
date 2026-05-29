@@ -107,7 +107,10 @@ jobs:
           # Keep the kubeconfig OUT of the repo checkout: goreleaser aborts on a
           # dirty tree, and a kubeconfig in the workspace is an untracked file.
           # ($RUNNER_TEMP is only available in steps, not at job-level env.)
-          KUBECONFIG="$RUNNER_TEMP/.kube-cascade"
+          # export (not just assign) so subprocesses in this step - e.g.
+          # `docker buildx create --driver kubernetes` - inherit it; GITHUB_ENV
+          # carries it to later steps (build-dist's kubectl).
+          export KUBECONFIG="$RUNNER_TEMP/.kube-cascade"
           echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
           # Remove any kubeconfig a prior run left in the workspace (clean:false
           # preserves untracked files) so it can't dirty the tree.
