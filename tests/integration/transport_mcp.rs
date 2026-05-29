@@ -12,7 +12,7 @@ use pond::{
     handlers::{IngestEvent, pond_ingest},
     sessions::{Store, embedding_dim},
     transport::{AppState, mcp::PondMcp},
-    wire::{GetResponse, GetResult, IngestEnvelope, IngestRequest, SearchResponse},
+    wire::{IngestEnvelope, IngestRequest},
     wire::{Message, Part, PartKind, Provenance, Session},
 };
 use rmcp::{
@@ -153,7 +153,14 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
     })
 }
 
+/// The MCP surface returns the rendered transcript as a text block and no
+/// `structured_content` (it would shadow the transcript on the Claude Code
+/// client), so the test asserts on the transcript text directly.
 fn tool_text(result: &CallToolResult) -> &str {
+    assert!(
+        result.structured_content.is_none(),
+        "MCP results are transcript-only; structured data lives on the HTTP /v1 API"
+    );
     result
         .content
         .first()
@@ -194,10 +201,19 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
                 .with_arguments(json!({ "query": "answer" }).as_object().unwrap().clone()),
         )
         .await?;
-    let search: SearchResponse = serde_json::from_str(tool_text(&result))?;
-    assert_eq!(search.matched_total, 1);
-    assert_eq!(search.sessions.len(), 1);
-    assert_eq!(search.sessions[0].matches.len(), 1);
+    let search = tool_text(&result);
+    assert!(
+        search.starts_with("pond_search: 1 matches in 1 sessions, showing 1."),
+        "search transcript header states the totals: {search}"
+    );
+    assert!(
+        search.contains(SESSION_ID),
+        "the session header carries the session id: {search}"
+    );
+    assert!(
+        search.contains("the answer is forty-two"),
+        "the matched text is rendered: {search}"
+    );
 
     let result = client
         .call_tool(
@@ -209,32 +225,26 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
             ),
         )
         .await?;
-    let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    assert_eq!(response.session.id, SESSION_ID);
-    let GetResult::Session { messages, .. } = response.result else {
-        panic!("expected a session result");
-    };
+    let conversational = tool_text(&result);
     assert!(
-        !messages.is_empty(),
-        "session has at least one message in the conversational response"
+        conversational.starts_with(&format!("pond_get: session {SESSION_ID} (conversational)")),
+        "get transcript header names the session and mode: {conversational}"
     );
     assert!(
-        messages.iter().all(|message| message.parts.is_none()),
-        "conversational mode elides full parts"
+        conversational.contains("key:"),
+        "the get transcript carries a key legend: {conversational}"
     );
     assert!(
-        messages
-            .iter()
-            .flat_map(|message| &message.parts_summary)
-            .all(|summary| summary.kind != "text" && summary.kind != "reasoning"),
-        "conversational summaries drop the redundant text and reasoning kinds"
+        conversational.contains("the answer is forty-two"),
+        "conversational mode renders the message text: {conversational}"
     );
     assert!(
-        messages.iter().any(|message| message
-            .parts_summary
-            .iter()
-            .any(|summary| summary.kind == "tool_call")),
-        "conversational mode surfaces structural parts (the tool_call)"
+        conversational.contains("-> Bash [toolu_mcptest]"),
+        "conversational mode surfaces the tool_call as a one-liner: {conversational}"
+    );
+    assert!(
+        !conversational.contains(REASONING_TEXT),
+        "conversational mode elides reasoning: {conversational}"
     );
 
     let result = client
@@ -247,20 +257,10 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
             ),
         )
         .await?;
-    let response: GetResponse = serde_json::from_str(tool_text(&result))?;
-    let GetResult::Session { messages, .. } = response.result else {
-        panic!("expected a session result");
-    };
+    let verbatim = tool_text(&result);
     assert!(
-        messages
-            .iter()
-            .filter_map(|message| message.parts.as_ref())
-            .flatten()
-            .any(|part| matches!(
-                &part.kind,
-                PartKind::Reasoning { text: Some(text) } if text.as_str() == REASONING_TEXT
-            )),
-        "verbatim mode returns the reasoning part in full"
+        verbatim.contains(REASONING_TEXT),
+        "verbatim mode renders the reasoning part in full: {verbatim}"
     );
 
     // A wire error (unknown session) surfaces as a JSON-RPC tool error.

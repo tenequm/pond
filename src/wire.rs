@@ -394,7 +394,7 @@ pub struct MessageView {
     /// System-message content string, when the source carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts_summary: Vec<PartSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<ResponsePart>>,
@@ -585,20 +585,31 @@ pub enum SearchModeWire {
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SearchFilters {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectFilter>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_date: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default)]
+    // Skip the default 0.0 so an unfiltered cursor/request stays compact.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
+}
+
+impl SearchFilters {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -638,6 +649,7 @@ pub struct SearchCursor {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similar_to: Option<String>,
+    #[serde(default, skip_serializing_if = "SearchFilters::is_default")]
     pub filters: SearchFilters,
     pub offset: usize,
 }

@@ -1,0 +1,67 @@
+language: rust
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILDX_BUILDER: pond-hetzner
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.{toml,lock}'
+    - 'rust-toolchain.toml'
+  tests:
+    - 'tests/**/*'
+    - 'benches/**/*'
+
+tasks:
+  format:
+    command: 'cargo fmt --check'
+    inputs: ['@group(sources)', '@group(tests)']
+  lint:
+    command: 'cargo clippy --locked -- -D warnings'
+    inputs: ['@group(sources)', '@group(tests)']
+  test:
+    command: 'cargo test --locked'
+    inputs: ['@group(sources)', '@group(tests)']
+
+  # One-time builder setup (pool is amd64 cpx42, isolated by nodeselector):
+  #   docker buildx create --name pond-hetzner --driver kubernetes \
+  #     --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
+  #     --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+  #     --platform linux/amd64 --bootstrap
+  build-dist:
+    script: |
+      set -euo pipefail
+      mkdir -p target/dist
+
+      BUCKET=ttq
+      # KACHE_S3_ENDPOINT is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
+      S3_ENDPOINT="${KACHE_S3_ENDPOINT/${BUCKET}./}"
+      BUILDX_PREFIX=pond-buildkit/multiarch
+
+      docker buildx build \
+        --progress=plain \
+        --platform linux/amd64 \
+        --target output \
+        --cache-from "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY}" \
+        --cache-to   "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY},mode=max,ignore-error=true" \
+        --secret "id=kache_s3_access_key,env=KACHE_S3_ACCESS_KEY" \
+        --secret "id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY" \
+        --output "type=local,dest=target/dist" \
+        -f Dockerfile \
+        .
+      ls -lh target/dist/
+      for f in target/dist/pond-*; do file "$f"; done
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - 'Dockerfile'
+      - '.dockerignore'
+    outputs:
+      - 'target/dist/pond-aarch64-apple-darwin'
+      - 'target/dist/pond-x86_64-pc-windows-gnu.exe'
+      - 'target/dist/pond-aarch64-unknown-linux-gnu'
+      - 'target/dist/pond-x86_64-unknown-linux-gnu'
+    options:
+      cache: true
+      outputStyle: stream

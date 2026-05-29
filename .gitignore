@@ -41,3 +41,6 @@ skills-lock.json
 # Corpus snapshot enumerates the operator's projects by name; aggregate
 # stats appear inline in the benchmark report. Regenerate via `pond status`.
 /docs/researches/embeddings/snapshot.txt
+
+# moon local cache (rebuilt on demand; never commit)
+/.moon/cache/

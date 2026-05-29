@@ -1,15 +1,23 @@
 [package]
-name = "pond"
+# Published to crates.io as `pond-db` (the `pond` name is taken by an unrelated
+# crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
+# command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
+name = "pond-db"
 version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
 repository = "https://github.com/tenequm/pond"
-homepage = "https://github.com/tenequm/pond"
 documentation = "https://github.com/tenequm/pond/blob/main/docs/spec.md"
-readme = "README.md"
-keywords = ["ai", "agents", "mcp", "lance", "search"]
+keywords = ["agents", "mcp", "lance", "search", "session-logs"]
 categories = ["command-line-utilities", "database"]
+
+[lib]
+name = "pond"
+
+[[bin]]
+name = "pond"
+path = "src/main.rs"
 
 [dependencies]
 anstyle = "1"
@@ -33,15 +41,15 @@ candle-transformers = "0.10"
 fastrand = "2"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
-lance = { git = "https://github.com/lance-format/lance", tag = "v7.0.0", features = ["protoc"] }
-lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance = { version = "7.0.0", features = ["protoc"] }
+lance-arrow = "7.0.0"
 half = { version = "2.1", default-features = false }
-lance-file = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
-lance-index = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
-lance-io = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
-lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-file = "7.0.0"
+lance-index = "7.0.0"
+lance-io = "7.0.0"
+lance-linalg = "7.0.0"
+lance-namespace = "7.0.0"
+lance-namespace-impls = "7.0.0"
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -73,7 +81,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v7.0.0" }
+lance-linalg = "7.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"

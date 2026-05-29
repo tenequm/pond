@@ -1539,13 +1539,19 @@ mod search_handler {
         let start = center.saturating_sub(half);
         let end = (start + HIT_SNIPPET_CHARS).min(chars.len());
         let start = end.saturating_sub(HIT_SNIPPET_CHARS);
+        // Truncation markers carry the omitted-char counts so the agent knows
+        // this is a windowed slice and roughly how much it's missing; the hit's
+        // `message_id` is the handle to fetch the rest via `pond_get`.
         let mut snippet = String::new();
         if start > 0 {
-            snippet.push_str("...");
+            snippet.push_str(&format!("[{start} chars before] "));
         }
         snippet.extend(&chars[start..end]);
         if end < chars.len() {
-            snippet.push_str("...");
+            snippet.push_str(&format!(
+                " [+{} more chars; pond_get for full]",
+                chars.len() - end
+            ));
         }
         snippet
     }
@@ -2076,10 +2082,12 @@ mod tests {
             text.contains("NEEDLE"),
             "text is the match-windowed snippet: {text}"
         );
-        // `query_snippet` adds up to "..." on each side, so account for the +6.
+        // The <=600-char window is wrapped with truncation markers
+        // ("[N chars before] " / " [+N more chars; pond_get for full]"); allow for their length.
         assert!(
-            text.chars().count() <= 600 + 6,
-            "snippet is bounded by HIT_SNIPPET_CHARS"
+            text.chars().count() <= 600 + 64,
+            "snippet window is bounded by HIT_SNIPPET_CHARS plus markers: {}",
+            text.chars().count()
         );
     }
 

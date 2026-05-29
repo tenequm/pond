@@ -1,0 +1,15 @@
+# moon v2.x workspace config. One flat crate at the repo root (per CLAUDE.md).
+projects:
+  pond: '.'
+
+vcs:
+  defaultBranch: 'main'
+
+remote:
+  host: 'grpcs://bazel-remote.cascade.fyi:443'
+  auth:
+    headers:
+      Authorization: '${BAZEL_REMOTE_AUTH}'
+  cache:
+    instanceName: 'pond'
+    compression: 'zstd'

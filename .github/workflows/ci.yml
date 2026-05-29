@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual fire of `publish-release-dry-run` to validate the goreleaser pipeline
-  # (build + archive) without touching releases, the homebrew tap, or NUR.
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,10 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Cap C-build parallelism (aws-lc-sys et al.) to avoid swap-thrash on the
-  # 4-core self-hosted runner; Rust parallelism (cargo -j) is left at default.
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
-  MAKEFLAGS: -j2
+  BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
 
 jobs:
   build-and-test:
@@ -31,19 +25,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
         with:
-          clean: false   # keep target/ between runs for cargo freshness + kache
+          fetch-depth: 0
 
-      - run: kache stats
-      - run: cargo fmt --check
-      - run: cargo clippy --locked -- -D warnings
-      - run: cargo test --locked
-      - run: kache stats
+      - uses: arduino/setup-protoc@v3
+
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          s3-bucket: ttq
+          s3-endpoint: https://nbg1.your-objectstorage.com
+          s3-region: nbg1
+          s3-prefix: kache/pond
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+
+      - uses: moonrepo/setup-toolchain@v0
+      - uses: moonrepo/setup-rust@v1
+      - run: moon run pond:format pond:lint pond:test
 
   release-plz:
     name: release-plz
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
@@ -54,17 +57,25 @@ jobs:
       - id: release-plz
         uses: release-plz/action@v0.5
         with:
-          # Default (no command) runs both `release-pr` and `release`.
-          # `dry_run` applies only to `release`; `release-pr` opens PRs for real.
-          dry_run: true
+          # Default (no command) runs both `release-pr` and `release`:
+          # `release-pr` opens/updates the release PR; `release` cuts the tag +
+          # GitHub release once an unreleased version bump lands on main.
+          dry_run: false
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-release:
     name: publish-release
     needs: release-plz
     if: needs.release-plz.outputs.releases_created == 'true'
+    # Self-hosted: provides the allowlisted network path to the cluster API.
+    # Cluster *config* (kubeconfig, buildx builder, S3 creds) is bootstrapped
+    # from secrets below, so the runner needs no pre-provisioned pond setup -
+    # only docker+buildx, kubectl, and moon installed.
     runs-on: [self-hosted, linux, x64]
+    env:
+      KUBECONFIG: ${{ github.workspace }}/.kube-cascade
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -74,39 +85,39 @@ jobs:
       # nix-hash, required by goreleaser's `nix` block to compute the NUR sha256.
       - uses: cachix/install-nix-action@v31
 
-      - run: kache stats
+      - name: Bootstrap cluster access + buildx builder
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
+        run: |
+          printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          # buildx builder state is client-side; on a fresh runner re-register it.
+          # Drop any stale in-cluster deployment first so create is idempotent.
+          docker buildx rm pond-hetzner 2>/dev/null || true
+          docker buildx create --name pond-hetzner --driver kubernetes \
+            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
+            --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+            --platform linux/amd64
+
+      # Cross-compiles all 4 targets on the Hetzner buildkit pool (kache S3 +
+      # bazel-remote), exactly as local; drops binaries in target/dist/.
+      - name: Build dist binaries
+        run: moon run pond:build-dist
+        env:
+          KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          KACHE_S3_REGION: nbg1
+          # Bucket-virtual-host form; build-dist strips the bucket subdomain to
+          # derive the buildx S3 cache endpoint.
+          KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+
+      # builder: prebuilt - packages target/dist/ into archives + brew/nix/release.
       - uses: goreleaser/goreleaser-action@v7
         with:
-          distribution: goreleaser
+          distribution: goreleaser-pro   # `builder: prebuilt` is a Pro feature
           version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      - run: kache stats
-
-  publish-release-dry-run:
-    name: publish-release-dry-run
-    needs: build-and-test
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - uses: actions/checkout@v6.0.2
-        with:
-          fetch-depth: 0
-          clean: false
-
-      - uses: cachix/install-nix-action@v31
-
-      - run: kache stats
-      # `--snapshot` skips publishing: no GH release, no tap PR, no NUR push.
-      # Just builds + archives so we can validate the pipeline end-to-end.
-      - uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --snapshot --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      - run: kache stats
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
