@@ -1,6 +1,5 @@
 # pond
 
-[![CI](https://github.com/tenequm/pond/actions/workflows/ci.yml/badge.svg)](https://github.com/tenequm/pond/actions/workflows/ci.yml)
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
