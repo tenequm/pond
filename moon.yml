@@ -26,7 +26,7 @@ tasks:
 
   # One-time builder setup (pool is amd64 cpx42, isolated by nodeselector):
   #   docker buildx create --name pond-hetzner --driver kubernetes \
-  #     --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+  #     --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
   #     --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
   #     --platform linux/amd64 --bootstrap
   build-dist:
@@ -38,10 +38,6 @@ tasks:
       # KACHE_S3_ENDPOINT is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
       S3_ENDPOINT="${KACHE_S3_ENDPOINT/${BUCKET}./}"
       BUILDX_PREFIX=pond-buildkit/multiarch
-
-      kubectl -n pond-buildkit scale deploy/pond-hetzner0 --replicas=1
-      kubectl -n pond-buildkit annotate --overwrite deploy/pond-hetzner0 pond.io/last-build=$(date -u +%s)
-      kubectl -n pond-buildkit wait deploy/pond-hetzner0 --for=condition=available --timeout=10m
 
       docker buildx build \
         --progress=plain \

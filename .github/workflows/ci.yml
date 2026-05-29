@@ -94,7 +94,7 @@ jobs:
           if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
             kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
             docker buildx create --name pond-hetzner --driver kubernetes \
-              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+              --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
               --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
               --platform linux/amd64
           fi
@@ -149,7 +149,7 @@ jobs:
           if ! docker buildx inspect pond-hetzner >/dev/null 2>&1; then
             kubectl -n pond-buildkit delete deploy pond-hetzner0 --ignore-not-found
             docker buildx create --name pond-hetzner --driver kubernetes \
-              --driver-opt namespace=pond-buildkit,replicas=0,nodeselector=workload=buildkit \
+              --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
               --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
               --platform linux/amd64
           fi
