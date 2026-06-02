@@ -25,6 +25,19 @@ archives:
     # Preserve the existing `pond-<rust-triple>` asset names (stable download URLs).
     name_template: 'pond-{{ if eq .Os "darwin" }}aarch64-apple-darwin{{ else if and (eq .Os "linux") (eq .Arch "amd64") }}x86_64-unknown-linux-gnu{{ else if and (eq .Os "linux") (eq .Arch "arm64") }}aarch64-unknown-linux-gnu{{ else }}x86_64-pc-windows-gnu{{ end }}'
 
+release:
+  # pond is private; private-repo release assets 404 for unauthenticated clients
+  # (incl. brew/nix). Publish binaries to the public homebrew-tap so the download
+  # URLs below resolve. release-plz still cuts the tag + changelog on pond itself.
+  github:
+    owner: tenequm
+    name: homebrew-tap
+  # Namespace the tap release tag per-app so the tap can host other private CLIs
+  # without version-tag collisions (.Tag is the raw vX.Y.Z). The url_templates in
+  # brews/nix below must match this exactly - their default uses the unprefixed
+  # .Tag and would 404.
+  tag: "pond-{{ .Tag }}"
+
 brews:
   - name: pond
     repository:
@@ -32,7 +45,8 @@ brews:
       name: homebrew-tap
       token: "{{ .Env.GH_RELEASE_TOKEN }}"
     directory: Formula
-    homepage: https://github.com/tenequm/pond
+    url_template: "https://github.com/tenequm/homebrew-tap/releases/download/pond-{{ .Tag }}/{{ .ArtifactName }}"
+    homepage: https://github.com/tenequm/homebrew-tap
     description: Lossless storage and hybrid search for AI agent sessions, across every agentic client.
     license: Apache-2.0
 
@@ -44,7 +58,8 @@ nix:
       branch: main
       token: "{{ .Env.GH_RELEASE_TOKEN }}"
     path: pkgs/pond/default.nix
-    homepage: https://github.com/tenequm/pond
+    url_template: "https://github.com/tenequm/homebrew-tap/releases/download/pond-{{ .Tag }}/{{ .ArtifactName }}"
+    homepage: https://github.com/tenequm/homebrew-tap
     description: Lossless storage and hybrid search for AI agent sessions, across every agentic client.
     license: asl20
     main_program: pond
