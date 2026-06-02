@@ -50,8 +50,15 @@ RUN mkdir -p /root/.config/kache && \
 # rcodesign (apple-codesign): re-sign the darwin binary on Linux after the
 # post-link sdk rewrite below; arm64 macOS rejects a binary whose signature the
 # byte-patch invalidated, so we must ad-hoc re-sign. vtool/codesign are macOS-only.
-ARG RCODESIGN_VERSION=0.29.0
-RUN curl -fsSL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+# This ARG MUST NOT be named with an `RCODESIGN_` prefix: rcodesign reads every
+# `RCODESIGN_*` env var as a config key (figment `Env::prefixed`, always applied -
+# `--config-file /dev/null` suppresses only file configs, not env), and buildkit
+# exports build ARGs as env vars into every RUN in the stage. So an
+# `RCODESIGN_VERSION` ARG reaches the sign step below as config key `version` and
+# aborts it with `UnknownField("version")`. Renaming off the prefix is the
+# upstream-documented fix (apple-platform-rs#143).
+ARG CODESIGN_VERSION=0.29.0
+RUN curl -fsSL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${CODESIGN_VERSION}/apple-codesign-${CODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
       | tar -xz -C /tmp && \
     install -m 0755 "$(find /tmp -name rcodesign -type f | head -1)" /usr/local/bin/rcodesign && \
     rm -rf /tmp/apple-codesign*
