@@ -43,7 +43,6 @@ jobs:
           fetch-depth: 0
           clean: false
 
-      - uses: arduino/setup-protoc@v3
       - run: moon run pond:format
       - run: moon run pond:lint
       - run: moon run pond:test

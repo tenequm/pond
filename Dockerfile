@@ -16,8 +16,11 @@ RUN set -eux && \
 # on duplicate linked dylibs - but only when the binary records LC_BUILD_VERSION
 # sdk >= 26. zig bakes that sdk field in by version, ignoring SDKROOT entirely:
 # 0.16 records 26.x (dyld aborts), 0.15.2 records 15.5 (dyld tolerates the
-# duplicate, binary runs). Do NOT bump to 0.16+ until the duplicate load command
-# is fixed upstream (same class as ziglang/zig#117).
+# duplicate, binary runs). Root cause is zig over-emitting per-library load
+# commands that newer dyld rejects (ziglang/zig#24349); the LC_RPATH variant of
+# this hit macOS 26 + zig 0.16 in ziglang/zig#25311 and was fixed there for
+# RPATH only - the LC_LOAD_DYLIB/libobjc variant still ships broken in 0.16. Do
+# NOT bump to 0.16+ until that's fixed upstream.
 RUN pip3 install --no-cache-dir --break-system-packages ziglang==0.15.2
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
