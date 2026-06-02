@@ -37,7 +37,7 @@ RUN curl -fsSL -o /tmp/sdk.tar.xz \
     rm /tmp/sdk.tar.xz
 ENV SDKROOT=/opt/sdks/MacOSX${MACOSX_SDK_VERSION}.sdk
 
-ARG KACHE_VERSION=v0.3.1
+ARG KACHE_VERSION=v0.4.1
 RUN curl -fsSL "https://github.com/kunobi-ninja/kache/releases/download/${KACHE_VERSION}/kache-x86_64-unknown-linux-musl.tar.gz" \
       | tar -xz -C /tmp && \
     install -m 0755 "$(find /tmp -name kache -type f | head -1)" /usr/local/bin/kache && \

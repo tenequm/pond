@@ -28,6 +28,7 @@ tasks:
   #   docker buildx create --name pond-hetzner --driver kubernetes \
   #     --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
   #     --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
+  #     --driver-opt persistent-volume-claim.requests.storage=100Gi \
   #     --platform linux/amd64 --bootstrap
   build-dist:
     script: |
