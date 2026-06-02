@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "Apache-2.0"
 description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
