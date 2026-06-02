@@ -24,10 +24,10 @@ tasks:
     command: 'cargo test --locked'
     inputs: ['@group(sources)', '@group(tests)']
 
-  # One-time builder setup (pool is amd64 cpx42, isolated by nodeselector):
+  # One-time builder setup (pool is amd64 ccx43, isolated by nodeselector):
   #   docker buildx create --name pond-hetzner --driver kubernetes \
   #     --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
-  #     --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+  #     --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
   #     --platform linux/amd64 --bootstrap
   build-dist:
     script: |

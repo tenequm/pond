@@ -119,16 +119,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=secret,id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY \
     bash -ec '\
       kache sync --pull && \
+      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
       cargo zigbuild --locked --profile dist \
         --target aarch64-unknown-linux-gnu \
         --target x86_64-unknown-linux-gnu && \
       cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu && \
-      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin && \
-      kache sync --push && \
+      kache sync --push \
+    '
+
+# Package step, separate from the compile above so a darwin patch/sign failure
+# re-runs in seconds instead of recompiling. Reads the binaries back from the
+# same target/ cache mount. rcodesign needs --config-file /dev/null: with no
+# explicit config it auto-discovers a profile and aborts ("UnknownField version").
+RUN --mount=type=cache,target=/app/target,sharing=locked \
+    bash -ec '\
       mkdir -p /app/out && \
       cp target/aarch64-apple-darwin/dist/pond        /app/out/pond-aarch64-apple-darwin && \
       python3 /usr/local/bin/patch-macos-sdk.py /app/out/pond-aarch64-apple-darwin && \
-      rcodesign sign /app/out/pond-aarch64-apple-darwin && \
+      rcodesign --config-file /dev/null sign /app/out/pond-aarch64-apple-darwin && \
       chmod +x /app/out/pond-aarch64-apple-darwin && \
       cp target/x86_64-pc-windows-gnu/dist/pond.exe   /app/out/pond-x86_64-pc-windows-gnu.exe && \
       cp target/aarch64-unknown-linux-gnu/dist/pond   /app/out/pond-aarch64-unknown-linux-gnu && \

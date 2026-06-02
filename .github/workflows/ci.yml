@@ -116,7 +116,7 @@ jobs:
           docker buildx rm pond-hetzner 2>/dev/null || true
           docker buildx create --name pond-hetzner --driver kubernetes \
             --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
-            --driver-opt requests.cpu=6,requests.memory=12Gi,limits.memory=14Gi \
+            --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
             --platform linux/amd64
 
       # Cross-compiles all 4 targets on the Hetzner buildkit pool (kache S3 +
