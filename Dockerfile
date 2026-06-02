@@ -11,17 +11,15 @@ RUN set -eux && \
         python3 python3-pip unzip gnupg protobuf-compiler && \
     apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Pin zig < 0.16. cargo-zigbuild's zig linker emits a duplicate libobjc.A.dylib
-# LC_LOAD_DYLIB (Apple's ld coalesces it; zig doesn't), and macOS 26 dyld aborts
-# on duplicate linked dylibs - but only when the binary records LC_BUILD_VERSION
-# sdk >= 26. zig bakes that sdk field in by version, ignoring SDKROOT entirely:
-# 0.16 records 26.x (dyld aborts), 0.15.2 records 15.5 (dyld tolerates the
-# duplicate, binary runs). Root cause is zig over-emitting per-library load
-# commands that newer dyld rejects (ziglang/zig#24349); the LC_RPATH variant of
-# this hit macOS 26 + zig 0.16 in ziglang/zig#25311 and was fixed there for
-# RPATH only - the LC_LOAD_DYLIB/libobjc variant still ships broken in 0.16. Do
-# NOT bump to 0.16+ until that's fixed upstream.
-RUN pip3 install --no-cache-dir --break-system-packages ziglang==0.15.2
+# cargo-zigbuild's zig linker emits a duplicate libobjc.A.dylib LC_LOAD_DYLIB
+# (Apple's ld coalesces it; zig doesn't), which macOS 26 dyld rejects - but only
+# when the binary records LC_BUILD_VERSION sdk >= 26, which zig bakes in by
+# version regardless of SDKROOT. We keep zig 0.16 (downgrading to a version that
+# records sdk < 26 breaks the aws-lc-sys link - cargo-zigbuild#377) and instead
+# rewrite the recorded sdk to < 26 + re-sign after linking (the macos post-link
+# step in the build below). Same bug class as ziglang/zig#24349 / #25311 (the
+# LC_RPATH variant, fixed upstream; the libobjc/LC_LOAD_DYLIB variant is not).
+RUN pip3 install --no-cache-dir --break-system-packages ziglang==0.16.0
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo install --locked cargo-zigbuild
@@ -48,6 +46,46 @@ RUN curl -fsSL "https://github.com/kunobi-ninja/kache/releases/download/${KACHE_
 # No KACHE_REMOTE_TYPE env var exists - this two-line file is required to activate s3.
 RUN mkdir -p /root/.config/kache && \
     printf '[cache.remote]\ntype = "s3"\n' > /root/.config/kache/config.toml
+
+# rcodesign (apple-codesign): re-sign the darwin binary on Linux after the
+# post-link sdk rewrite below; arm64 macOS rejects a binary whose signature the
+# byte-patch invalidated, so we must ad-hoc re-sign. vtool/codesign are macOS-only.
+ARG RCODESIGN_VERSION=0.29.0
+RUN curl -fsSL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /tmp && \
+    install -m 0755 "$(find /tmp -name rcodesign -type f | head -1)" /usr/local/bin/rcodesign && \
+    rm -rf /tmp/apple-codesign*
+
+# Rewrite a macOS binary's LC_BUILD_VERSION.sdk (and legacy LC_VERSION_MIN_MACOSX)
+# to 15.0 so macOS 26 dyld tolerates zig's duplicate libobjc load command. Pure
+# Python (Linux has no vtool); handles thin + fat Mach-O, edits in place.
+RUN cat > /usr/local/bin/patch-macos-sdk.py <<'PY'
+import sys, struct
+TARGET = (15 << 16)  # 15.0.0, encoded X<<16 | Y<<8 | Z
+MH_MAGIC_64 = 0xfeedfacf
+FAT_MAGIC, FAT_CIGAM = 0xcafebabe, 0xbebafeca
+LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX = 0x32, 0x24
+
+def patch_thin(buf, base):
+    end = '<' if struct.unpack_from('<I', buf, base)[0] == MH_MAGIC_64 else '>'
+    ncmds = struct.unpack_from(end + 'I', buf, base + 16)[0]
+    off = base + 32  # sizeof(mach_header_64)
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from(end + 'II', buf, off)
+        if cmd == LC_BUILD_VERSION:
+            struct.pack_into(end + 'I', buf, off + 16, TARGET)  # after cmd,size,platform,minos
+        elif cmd == LC_VERSION_MIN_MACOSX:
+            struct.pack_into(end + 'I', buf, off + 12, TARGET)  # after cmd,size,version
+        off += cmdsize
+
+data = bytearray(open(sys.argv[1], 'rb').read())
+if struct.unpack_from('>I', data, 0)[0] in (FAT_MAGIC, FAT_CIGAM):
+    for i in range(struct.unpack_from('>I', data, 4)[0]):
+        patch_thin(data, struct.unpack_from('>I', data, 8 + i * 20 + 8)[0])
+else:
+    patch_thin(data, 0)
+open(sys.argv[1], 'wb').write(data)
+PY
 
 # `profile = "minimal"` + targets-in-toml does not reliably fetch rust-std for non-host targets.
 COPY rust-toolchain.toml /app/rust-toolchain.toml
@@ -89,6 +127,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       kache sync --push && \
       mkdir -p /app/out && \
       cp target/aarch64-apple-darwin/dist/pond        /app/out/pond-aarch64-apple-darwin && \
+      python3 /usr/local/bin/patch-macos-sdk.py /app/out/pond-aarch64-apple-darwin && \
+      rcodesign sign /app/out/pond-aarch64-apple-darwin && \
+      chmod +x /app/out/pond-aarch64-apple-darwin && \
       cp target/x86_64-pc-windows-gnu/dist/pond.exe   /app/out/pond-x86_64-pc-windows-gnu.exe && \
       cp target/aarch64-unknown-linux-gnu/dist/pond   /app/out/pond-aarch64-unknown-linux-gnu && \
       cp target/x86_64-unknown-linux-gnu/dist/pond    /app/out/pond-x86_64-unknown-linux-gnu \
