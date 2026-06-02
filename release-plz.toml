@@ -8,3 +8,9 @@ publish_no_verify = true
 # Only cut a release when the release PR is merged; ignore manual Cargo.toml
 # bumps on main. Safer than the default `release_always = true`.
 release_always = false
+# Don't run cargo-semver-checks on release-pr. It defaults on for any crate with
+# a library, and builds rustdoc for pond + the whole candle/lance graph on every
+# release PR (~13 min on the cache-less hosted runner). pond-db's lib is internal
+# to the CLI - no external crate depends on its API - so API-break checks add no
+# value here, only latency.
+semver_check = false
