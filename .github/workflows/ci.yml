@@ -34,34 +34,16 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64]
     steps:
-      # clean: false keeps target/ (and other untracked build state) on the
-      # persistent self-hosted disk between runs, so cargo rebuilds incrementally
-      # instead of from scratch. git still resets tracked files to the ref.
+      # clean: false persists target/ + caches on the self-hosted disk between
+      # runs (incremental rebuilds). moon, cargo/rustc, protoc, and kache (the
+      # global RUSTC_WRAPPER, with its own S3 daemon) are preinstalled on the
+      # ci-runner user - no setup actions needed.
       - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
           clean: false
 
       - uses: arduino/setup-protoc@v3
-
-      - uses: kunobi-ninja/kache-action@v1
-        with:
-          s3-bucket: ttq
-          s3-endpoint: https://nbg1.your-objectstorage.com
-          s3-region: nbg1
-          s3-prefix: kache/pond
-          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
-
-      # cache: false - ~/.proto, ~/.cargo and target/ already persist on the
-      # self-hosted disk (clean: false above), so the 10GB GitHub Actions cache
-      # only churned/evicted redundantly. moon's remote cache + kache cover the rest.
-      - uses: moonrepo/setup-toolchain@v0
-        with:
-          cache: false
-      - uses: moonrepo/setup-rust@v1
-        with:
-          cache: false
       - run: moon run pond:format
       - run: moon run pond:lint
       - run: moon run pond:test
