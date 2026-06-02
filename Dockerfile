@@ -11,17 +11,22 @@ RUN set -eux && \
         python3 python3-pip unzip gnupg protobuf-compiler && \
     apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir --break-system-packages ziglang
+# Pin zig < 0.16. cargo-zigbuild's zig linker emits a duplicate libobjc.A.dylib
+# LC_LOAD_DYLIB (Apple's ld coalesces it; zig doesn't), and macOS 26 dyld aborts
+# on duplicate linked dylibs - but only when the binary records LC_BUILD_VERSION
+# sdk >= 26. zig bakes that sdk field in by version, ignoring SDKROOT entirely:
+# 0.16 records 26.x (dyld aborts), 0.15.2 records 15.5 (dyld tolerates the
+# duplicate, binary runs). Do NOT bump to 0.16+ until the duplicate load command
+# is fixed upstream (same class as ziglang/zig#117).
+RUN pip3 install --no-cache-dir --break-system-packages ziglang==0.15.2
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo install --locked cargo-zigbuild
 
-# Pin a pre-26 macOS SDK. cargo-zigbuild's zig linker emits a duplicate
-# libobjc.A.dylib LC_LOAD_DYLIB (Apple's ld coalesces it; zig doesn't), and
-# macOS 26 dyld aborts on duplicate linked dylibs - but only when the binary
-# records SDK >= 26. Building against 15.5 records sdk < 26, so dyld tolerates
-# the duplicate and the binary runs. Do NOT bump to 26.x without first
-# eliminating the duplicate load command (same class as ziglang/zig#117).
+# SDKROOT supplies the macOS framework/lib stubs the link step needs (candle's
+# metal feature pulls Metal/Foundation). It does NOT set the recorded
+# LC_BUILD_VERSION sdk - the zig version above owns that. Any recent SDK links;
+# 15.5 is pinned for reproducibility.
 ARG MACOSX_SDK_VERSION=15.5
 ARG MACOSX_SDK_SHA256=c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 RUN curl -fsSL -o /tmp/sdk.tar.xz \
