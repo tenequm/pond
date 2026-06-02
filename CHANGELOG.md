@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/tenequm/pond/compare/v0.2.2...v0.2.3) - 2026-06-02
+
+### Fixed
+
+- *(build)* pin macOS SDK to 15.5 to avoid dyld duplicate-dylib abort
+- *(release)* publish binaries to public homebrew-tap
+
+### Other
+
+- split moon format/lint/test into separate steps
+- disable release-plz semver-checks to speed up release PRs
+
 ## [0.2.2](https://github.com/tenequm/pond/compare/v0.2.1...v0.2.2) - 2026-05-29
 
 ### Other
