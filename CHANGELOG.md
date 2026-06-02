@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/tenequm/pond/compare/v0.2.3...v0.2.4) - 2026-06-02
+
+### Fixed
+
+- *(build)* pin zig 0.15.2 so darwin binary records sdk<26
+
+### Other
+
+- drop redundant setup-protoc; cite real zig tickets for dylib bug
+
 ## [0.2.3](https://github.com/tenequm/pond/compare/v0.2.2...v0.2.3) - 2026-06-02
 
 ### Fixed
