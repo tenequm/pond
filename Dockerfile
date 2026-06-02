@@ -16,8 +16,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo install --locked cargo-zigbuild
 
-ARG MACOSX_SDK_VERSION=26.1
-ARG MACOSX_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c
+# Pin a pre-26 macOS SDK. cargo-zigbuild's zig linker emits a duplicate
+# libobjc.A.dylib LC_LOAD_DYLIB (Apple's ld coalesces it; zig doesn't), and
+# macOS 26 dyld aborts on duplicate linked dylibs - but only when the binary
+# records SDK >= 26. Building against 15.5 records sdk < 26, so dyld tolerates
+# the duplicate and the binary runs. Do NOT bump to 26.x without first
+# eliminating the duplicate load command (same class as ziglang/zig#117).
+ARG MACOSX_SDK_VERSION=15.5
+ARG MACOSX_SDK_SHA256=c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 RUN curl -fsSL -o /tmp/sdk.tar.xz \
       "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOSX_SDK_VERSION}/MacOSX${MACOSX_SDK_VERSION}.sdk.tar.xz" && \
     echo "${MACOSX_SDK_SHA256}  /tmp/sdk.tar.xz" | sha256sum -c - && \
