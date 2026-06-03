@@ -7,6 +7,9 @@ target/
 
 # OS
 .DS_Store
+# AppleDouble sidecars (`._name`) that macOS leaves on the self-hosted runner's
+# clean:false tree; otherwise they read as untracked and `cargo publish` aborts.
+._*
 Thumbs.db
 
 # Logs
