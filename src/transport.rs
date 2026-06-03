@@ -205,15 +205,16 @@ pub mod mcp {
     /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
-(default 10, max 200), project (path substring), session_id (exact session \
-match), source_agent, role (user|assistant|system|tool), from_date / to_date \
-(YYYY-MM-DD), cursor (opaque continuation token).
+(returned sessions; default 10, max 200), project (path substring), session_id \
+(exact session match), source_agent, role (user|assistant|system|tool), \
+from_date / to_date (YYYY-MM-DD), cursor (opaque continuation token).
 
 pond_search response: a transcript. The first line states totals \
 (`matched_total` is the message count before `limit` and byte-budget \
-truncation), then each hit is a `--- [n] score | role | time | message_id | \
-project | agent | session ---` rule followed by its matched text (a ~600-char \
-indexed window). Up to 3 top-scoring hits per session, score-desc; `score` is \
+truncation), then results are grouped by session, ordered by each session's \
+best hit. Each session lists up to 3 top-scoring hits, score-desc; each hit is \
+a `--- [n] score | role | time | message_id | project | agent | session ---` \
+rule followed by its matched text (a ~600-char indexed window). `score` is \
 normalized to [0.0, 1.0] within one response. When more remain, a `cursor:` \
 footer carries the token to pass back as `cursor`; rank may shift between \
 pages if the corpus changes.
@@ -247,7 +248,7 @@ open it. Not for bulk export - use `pond export`.";
         /// every other call.
         #[serde(default)]
         query: Option<String>,
-        /// Max hits to return. Default 10, server-capped at 200.
+        /// Max sessions to return. Default 10, server-capped at 200.
         #[serde(default)]
         limit: Option<usize>,
         /// Filter to projects whose path contains this substring.
@@ -339,10 +340,11 @@ open it. Not for bulk export - use `pond export`.";
         #[tool(
             description = "Hybrid (vector + BM25) search over stored conversation history. \
                            Returns a readable transcript: a leading `key:` line explains the \
-                           format and the first line states totals, then each hit is a \
-                           `--- [n] score | role | time | message_id | project | agent | \
-                           session ---` delimiter rule followed by the matched text. Pass a \
-                           returned `message_id` to `pond_get` for full text. Common args: \
+                           format and the first line states totals, then results are grouped by \
+                           session, ordered by each session's best hit. Each hit is a `--- [n] \
+                           score | role | time | message_id | project | agent | session ---` \
+                           delimiter rule followed by the matched text. Pass a returned \
+                           `message_id` to `pond_get` for full text. Common args: \
                            query (semantic - concepts, not project names), then project / \
                            from_date / to_date to scope. Advanced: source_agent (e.g. \
                            \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
@@ -666,18 +668,38 @@ open it. Not for bulk export - use `pond export`.";
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "pond_search: {} matches in {} sessions, showing {}{}.",
+            "pond_search: {} matching messages, showing {} hits from {} sessions{}.",
             response.matched_total,
-            response.sessions.len(),
             shown,
+            response.sessions.len(),
             sim,
         );
         let _ = writeln!(
             out,
-            "key: \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; pass cursor to page."
+            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; pass cursor to page."
         );
         let mut index = 0;
-        for session in &response.sessions {
+        for (session_index, session) in response.sessions.iter().enumerate() {
+            let best = session
+                .matches
+                .first()
+                .map(|hit| hit.score)
+                .unwrap_or_default();
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "{}",
+                rule_line(&format!(
+                    "session [{}] best {:.2} | {}/{} matched | {} | {} | {}",
+                    session_index + 1,
+                    best,
+                    session.matched_message_count,
+                    session.session_messages_count,
+                    session.project,
+                    session.source_agent,
+                    session.session_id,
+                )),
+            );
             for hit in &session.matches {
                 index += 1;
                 let _ = writeln!(out);
@@ -1199,10 +1221,21 @@ open it. Not for bulk export - use `pond export`.";
             };
 
             let transcript = render_search_transcript(&response, &request);
-            assert!(transcript.starts_with("pond_search: 1 matches in 1 sessions, showing 1."));
-            assert!(transcript.contains("key: \"--- [n] score | role | time | message_id"));
-            // Flat indexed hit: score/role/time/id and the session metadata
-            // folded into one delimiter rule, no separate `#` header.
+            assert!(
+                transcript.starts_with(
+                    "pond_search: 1 matching messages, showing 1 hits from 1 sessions."
+                )
+            );
+            assert!(
+                transcript
+                    .contains("key: session rules group hits by session, ordered by best hit")
+            );
+            assert!(
+                transcript
+                    .contains("--- session [1] best 1.00 | 1/2 matched | pond | claude-code | s1")
+            );
+            // Hit lines stay flat and indexed so callers can still extract
+            // message_id from the same delimiter shape.
             assert!(transcript.contains(
                 "--- [1] 1.00 | user | 1970-01-01 00:00:00Z | m1 | pond | claude-code | s1"
             ));
