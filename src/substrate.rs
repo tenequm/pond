@@ -1553,28 +1553,18 @@ async fn open_or_create_via_ns(
         .with_context(|| format!("failed to create table {table_name}"))
 }
 
+// lance-namespace sometimes nests one `lance::Error::Namespace` inside another
+// before the underlying `NamespaceError`; walk the whole `.source()` chain
+// rather than only matching the outer variant.
 fn is_namespace_error_code(error: &lance::Error, code: ErrorCode) -> bool {
-    match error {
-        lance::Error::Namespace { source, .. } => {
-            error_chain_has_namespace_code(source.as_ref(), code)
-        }
-        _ => false,
+    if !matches!(error, lance::Error::Namespace { .. }) {
+        return false;
     }
-}
-
-fn error_chain_has_namespace_code(
-    error: &(dyn std::error::Error + 'static),
-    code: ErrorCode,
-) -> bool {
-    if let Some(namespace_error) = error.downcast_ref::<NamespaceError>() {
-        return namespace_error.code() == code;
-    }
-    if let Some(lance_error) = error.downcast_ref::<lance::Error>() {
-        return is_namespace_error_code(lance_error, code);
-    }
-    error
-        .source()
-        .is_some_and(|source| error_chain_has_namespace_code(source, code))
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |link| {
+        link.source()
+    })
+    .filter_map(|link| link.downcast_ref::<NamespaceError>())
+    .any(|inner| inner.code() == code)
 }
 
 fn scanner_with_prefilter(
@@ -1681,6 +1671,32 @@ fn like_contains(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn namespace_error_code_walks_wrapped_chain() {
+        let direct = lance::Error::namespace_source(Box::new(NamespaceError::TableNotFound {
+            message: "missing".into(),
+        }));
+        assert!(is_namespace_error_code(&direct, ErrorCode::TableNotFound));
+
+        let wrapped = lance::Error::namespace_source(Box::new(direct));
+        assert!(is_namespace_error_code(&wrapped, ErrorCode::TableNotFound));
+
+        let other_code =
+            lance::Error::namespace_source(Box::new(NamespaceError::NamespaceNotFound {
+                message: "nope".into(),
+            }));
+        assert!(!is_namespace_error_code(
+            &other_code,
+            ErrorCode::TableNotFound
+        ));
+
+        let not_namespace = lance::Error::internal("unrelated");
+        assert!(!is_namespace_error_code(
+            &not_namespace,
+            ErrorCode::TableNotFound
+        ));
+    }
 
     /// Round-trip: opening a fresh data dir through `lance-namespace`
     /// produces all three tables, and `Handle::scan` returns an empty batch
