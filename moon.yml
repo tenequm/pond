@@ -217,19 +217,3 @@ tasks:
       git -C nur push
     options:
       cache: false
-
-  # Sign dist/*.{tar.xz,zip} with minisign so `cargo binstall` can verify them
-  # (pubkey in Cargo.toml). Env: MINISIGN_SECRET_KEY (secret-key file contents),
-  # V. Needs minisign on PATH (CI provides it via `nix shell nixpkgs#minisign`).
-  sign-dist:
-    script: |
-      set -euo pipefail
-      key="$(mktemp)"
-      trap 'rm -f "$key"' EXIT
-      printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
-      for f in dist/pond-*.tar.xz dist/pond-*.zip; do
-        minisign -S -W -s "$key" -t "pond $V" -x "$f.sig" -m "$f"
-      done
-      ls -1 dist/*.sig
-    options:
-      cache: false

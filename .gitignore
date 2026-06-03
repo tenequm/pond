@@ -26,6 +26,14 @@ tmp/
 skills-lock.json
 /benches/corpus/
 
+# Release pipeline artifacts created in the working tree. The self-hosted runner
+# uses clean:false, so these persist between runs and would otherwise dirty the
+# tree and make `cargo publish` refuse to release.
+/dist/
+/tap/
+/nur/
+/minisign*
+
 # Benchmark fixtures/results and any query set derived from the operator's
 # corpus capture full conversation content (including API keys, wallet
 # addresses, and private project paths embedded in indexed messages). The

@@ -49,13 +49,6 @@ bin-dir = "{ bin }{ binary-ext }"
 [package.metadata.binstall.overrides."x86_64-pc-windows-gnu"]
 pkg-fmt = "zip"
 
-# minisign signatures for `cargo binstall`: it downloads `{ url }.sig` and
-# verifies against this pubkey. Assets are signed in CI by moon's `sign-dist`
-# task with the MINISIGN_SECRET_KEY secret (a passwordless minisign key).
-[package.metadata.binstall.signing]
-algorithm = "minisign"
-pubkey = "RWSoCP2uc6YVH3hzzhdcLhwMsyriGUNPwSY+3JN9/SjmRFAfQPpeQeDQ"
-
 [lib]
 name = "pond"
 
