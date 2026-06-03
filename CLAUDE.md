@@ -41,6 +41,7 @@
 
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
 - Don't add or maintain changelog entries; pond has no changelog and doesn't need one.
+- pond is a pre-1.0 release-plz-managed crate. Mark breaking commits with `<type>!:` (or a `BREAKING CHANGE:` footer) so release-plz bumps `0.X.0` instead of patch. When squash-merging a breaking PR, pass the subject via `gh pr merge --squash -t "feat(scope)!: ..."` so the `!` survives the squash.
 
 ## Minimalism
 
