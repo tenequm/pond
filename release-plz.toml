@@ -9,9 +9,3 @@ publish_no_verify = true
 # default). The release PR still drives version/changelog; this just also covers
 # the case where the bump is already on main but unpublished.
 release_always = true
-# Don't run cargo-semver-checks on release-pr. It defaults on for any crate with
-# a library, and builds rustdoc for pond + the whole candle/lance graph on every
-# release PR (~13 min on the cache-less hosted runner). pond-db's lib is internal
-# to the CLI - no external crate depends on its API - so API-break checks add no
-# value here, only latency.
-semver_check = false

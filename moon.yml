@@ -52,17 +52,119 @@ tasks:
         -f Dockerfile \
         .
       ls -lh target/dist/
-      for f in target/dist/pond-*; do file "$f"; done
+
+      # Package into the archive names brew/nix reference, `pond` at the root.
+      mkdir -p dist
+      for t in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+        install -m755 "target/dist/pond-$t" pond
+        tar -cJf "dist/pond-$t.tar.xz" pond
+      done
+      install -m755 target/dist/pond-x86_64-pc-windows-gnu.exe pond.exe
+      zip -j "dist/pond-x86_64-pc-windows-gnu.zip" pond.exe
+      rm -f pond pond.exe
+      ( cd dist && sha256sum pond-* > checksums.txt )
+      ls -lh dist/
     inputs:
       - '@group(sources)'
       - '@group(tests)'
       - 'Dockerfile'
       - '.dockerignore'
     outputs:
-      - 'target/dist/pond-aarch64-apple-darwin'
-      - 'target/dist/pond-x86_64-pc-windows-gnu.exe'
-      - 'target/dist/pond-aarch64-unknown-linux-gnu'
-      - 'target/dist/pond-x86_64-unknown-linux-gnu'
+      - 'dist/pond-aarch64-apple-darwin.tar.xz'
+      - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'
+      - 'dist/pond-aarch64-unknown-linux-gnu.tar.xz'
+      - 'dist/pond-x86_64-pc-windows-gnu.zip'
+      - 'dist/checksums.txt'
     options:
       cache: true
       outputStyle: stream
+
+  # Render Formula/pond.rb from dist/*.tar.xz and push to the tap.
+  # Env: V (version), GH_RELEASE_TOKEN. Run locally after build-dist to recover.
+  publish-brew:
+    script: |
+      set -euo pipefail
+      base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
+      sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
+      rm -rf tap
+      git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/homebrew-tap" tap
+      cat > tap/Formula/pond.rb <<EOF
+      # typed: false
+      # frozen_string_literal: true
+      class Pond < Formula
+        desc "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
+        homepage "https://github.com/tenequm/homebrew-tap"
+        version "$V"
+        license "Apache-2.0"
+        on_macos do
+          if Hardware::CPU.arm?
+            url "$base/pond-aarch64-apple-darwin.tar.xz"
+            sha256 "$(sha aarch64-apple-darwin)"
+            def install; bin.install "pond"; end
+          end
+        end
+        on_linux do
+          if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+            url "$base/pond-x86_64-unknown-linux-gnu.tar.xz"
+            sha256 "$(sha x86_64-unknown-linux-gnu)"
+            def install; bin.install "pond"; end
+          end
+          if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+            url "$base/pond-aarch64-unknown-linux-gnu.tar.xz"
+            sha256 "$(sha aarch64-unknown-linux-gnu)"
+            def install; bin.install "pond"; end
+          end
+        end
+      end
+      EOF
+      git -C tap add Formula/pond.rb
+      git -C tap diff --quiet --staged || git -C tap -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
+      git -C tap push
+    options:
+      cache: false
+
+  # Render pkgs/pond/default.nix from dist/*.tar.xz and push to nur-packages.
+  # Env: V, GH_RELEASE_TOKEN, plus nix on PATH (nix-hash). Run locally after build-dist.
+  publish-nur:
+    script: |
+      set -euo pipefail
+      base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
+      nix32() { nix-hash --type sha256 --to-base32 "$(sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1)"; }
+      rm -rf nur
+      git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/nur-packages" nur
+      mkdir -p nur/pkgs/pond
+      cat > nur/pkgs/pond/default.nix <<EOF
+      { lib, fetchurl, stdenvNoCC }:
+      let
+        inherit (stdenvNoCC.hostPlatform) system;
+        shaMap = {
+          x86_64-linux = "$(nix32 x86_64-unknown-linux-gnu)";
+          aarch64-linux = "$(nix32 aarch64-unknown-linux-gnu)";
+          aarch64-darwin = "$(nix32 aarch64-apple-darwin)";
+        };
+        urlMap = {
+          x86_64-linux = "$base/pond-x86_64-unknown-linux-gnu.tar.xz";
+          aarch64-linux = "$base/pond-aarch64-unknown-linux-gnu.tar.xz";
+          aarch64-darwin = "$base/pond-aarch64-apple-darwin.tar.xz";
+        };
+      in
+      stdenvNoCC.mkDerivation {
+        pname = "pond";
+        version = "$V";
+        src = fetchurl { url = urlMap.\${system}; sha256 = shaMap.\${system}; };
+        sourceRoot = ".";
+        installPhase = ''mkdir -p \$out/bin && cp ./pond \$out/bin/pond'';
+        meta = {
+          description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client.";
+          homepage = "https://github.com/tenequm/homebrew-tap";
+          license = lib.licenses.asl20;
+          mainProgram = "pond";
+          platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
+        };
+      }
+      EOF
+      git -C nur add pkgs/pond/default.nix
+      git -C nur diff --quiet --staged || git -C nur -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
+      git -C nur push
+    options:
+      cache: false
