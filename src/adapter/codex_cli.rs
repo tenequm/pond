@@ -844,6 +844,26 @@ mod tests {
 
     const FIXTURES: &str = "tests/fixtures/adapter/codex_cli/sessions";
 
+    #[test]
+    fn probe_default_finds_codex_sessions_under_home() {
+        let temp = TempDir::new().unwrap();
+        let expected = temp.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&expected).unwrap();
+        let env = Env::with_home(temp.path());
+
+        let probe = CodexCliFactory.probe_default(&env);
+        assert_eq!(
+            probe
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some(expected.to_str().unwrap()),
+        );
+
+        std::fs::remove_dir_all(&expected).unwrap();
+        assert!(CodexCliFactory.probe_default(&env).is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
         let adapter = CodexCliAdapter::new(FIXTURES);

@@ -428,7 +428,10 @@ pub(crate) fn empty_options() -> ProviderOptions {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::Path;
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
@@ -443,7 +446,14 @@ pub(crate) mod test_support {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
         ingest_adapter(&store, adapter, &NoopOracle, |_| {}).await?;
-        for session_id in store.session_ids().await? {
+        let session_ids = store.session_ids().await?;
+        assert!(
+            !session_ids.is_empty(),
+            "native restore fixture must ingest at least one session",
+        );
+
+        let mut restored_paths = BTreeSet::new();
+        for session_id in session_ids {
             let Some(session) = store.get_session(&session_id).await? else {
                 anyhow::bail!("session id listed by store was not readable: {session_id}");
             };
@@ -453,6 +463,37 @@ pub(crate) mod test_support {
                 let expected_bytes = std::fs::read(&expected)
                     .map_err(|err| anyhow::anyhow!("read {}: {err}", expected.display()))?;
                 assert_json_file_equal(&expected, &expected_bytes, &file.bytes)?;
+                restored_paths.insert(file.relative_path);
+            }
+        }
+        assert_eq!(
+            restored_paths,
+            source_json_files(source_root)?,
+            "native restore must emit exactly the source JSON/JSONL file set",
+        );
+        Ok(())
+    }
+
+    fn source_json_files(root: &Path) -> anyhow::Result<BTreeSet<PathBuf>> {
+        let mut out = BTreeSet::new();
+        collect_source_json_files(root, root, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_source_json_files(
+        root: &Path,
+        dir: &Path,
+        out: &mut BTreeSet<PathBuf>,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_source_json_files(root, &path, out)?;
+                continue;
+            }
+            if let Some("json" | "jsonl") = path.extension().and_then(|ext| ext.to_str()) {
+                out.insert(path.strip_prefix(root)?.to_path_buf());
             }
         }
         Ok(())
@@ -487,52 +528,5 @@ pub(crate) mod test_support {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).map_err(Into::into))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use super::*;
-    use serde_json::Value;
-    use tempfile::TempDir;
-
-    #[test]
-    fn each_factory_probes_its_default_under_an_injected_home() {
-        // Per-adapter discovery lives on each factory's `probe_default`, not in
-        // a central name->path table. Driving each one with an injected `home`
-        // proves the rule lives where the format lives.
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let claude_dir = home.join(".claude").join("projects");
-        let codex_dir = home.join(".codex").join("sessions");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::create_dir_all(&codex_dir).unwrap();
-
-        let env = Env::with_home(home);
-
-        let claude_probe = ClaudeCodeFactory.probe_default(&env);
-        assert_eq!(
-            claude_probe
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(Value::as_str),
-            Some(claude_dir.to_str().unwrap()),
-        );
-
-        let codex_probe = CodexCliFactory.probe_default(&env);
-        assert_eq!(
-            codex_probe
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(Value::as_str),
-            Some(codex_dir.to_str().unwrap()),
-        );
-
-        // Removing the codex marker dir drops just that factory's probe.
-        std::fs::remove_dir_all(&codex_dir).unwrap();
-        assert!(CodexCliFactory.probe_default(&env).is_none());
-        assert!(ClaudeCodeFactory.probe_default(&env).is_some());
     }
 }

@@ -36,7 +36,8 @@ use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_path,
     extract::{bound_value, extract_raw_record, extract_str},
-    part_id,
+    jsonl::RECORD_CAP,
+    part_id, raw_record,
 };
 
 const NAME: &str = "opencode";
@@ -197,10 +198,8 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
             else {
                 continue;
             };
-            let mtime = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .map(DateTime::<Utc>::from);
+            validate_path_id("session file name", &session_id, &path)?;
+            let mtime = session_file_set_mtime(root, &path, &session_id)?;
             out.push(SessionFile {
                 session_id,
                 path,
@@ -210,6 +209,34 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+fn session_file_set_mtime(
+    root: &Path,
+    session_path: &Path,
+    session_id: &str,
+) -> Result<Option<DateTime<Utc>>, AdapterError> {
+    let mut newest = json_mtime(session_path);
+    let message_dir = root.join("message").join(session_id);
+    for message_path in list_json_sorted(&message_dir)? {
+        newest = newest.max(json_mtime(&message_path));
+        let Some(message_id) = message_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        validate_path_id("message file name", message_id, &message_path)?;
+        let part_dir = root.join("part").join(message_id);
+        for part_path in list_json_sorted(&part_dir)? {
+            newest = newest.max(json_mtime(&part_path));
+        }
+    }
+    Ok(newest)
+}
+
+fn json_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
 }
 
 fn read_sessions(
@@ -253,6 +280,11 @@ fn read_one_session(
         }
     };
     let session_id = session.id.clone();
+    if let Err(error) = validate_path_id("session id", &session_id, &file.path) {
+        emit!(Err(error));
+        return true;
+    }
+    let session_created_at = session.created_at;
     emit!(Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
     let message_dir = adapter.root.join("message").join(&session_id);
@@ -279,6 +311,10 @@ fn read_one_session(
             )));
             continue;
         };
+        if let Err(error) = validate_path_id("message id", message_id, &message_path) {
+            emit!(Err(error));
+            continue;
+        }
         let part_dir = adapter.root.join("part").join(message_id);
         let part_files = match list_json_sorted(&part_dir) {
             Ok(files) => files,
@@ -288,21 +324,13 @@ fn read_one_session(
             }
         };
         let mut parts = Vec::with_capacity(part_files.len());
-        let mut part_error = None;
         for part_path in part_files {
             match read_json(&part_path) {
                 Ok(value) => parts.push(value),
-                Err(error) => {
-                    part_error = Some(error);
-                    break;
-                }
+                Err(error) => emit!(Err(error)),
             }
         }
-        if let Some(error) = part_error {
-            emit!(Err(error));
-            continue;
-        }
-        match build_message_events(&session_id, &message_value, &parts) {
+        match build_message_events(&session_id, &message_value, &parts, session_created_at) {
             Ok(events) => {
                 for event in events {
                     emit!(Ok(AdapterYield::Event(event)));
@@ -317,6 +345,16 @@ fn read_one_session(
 /// Read one JSON file, bounding every string leaf at the seam cap
 /// (spec.md#adapter-bounded-values) before it leaves this module.
 fn read_json(path: &Path) -> Result<Value, AdapterError> {
+    let len = std::fs::metadata(path)
+        .map_err(|error| AdapterError::io(NAME, path.display().to_string(), error))?
+        .len();
+    if len > RECORD_CAP as u64 {
+        return Err(AdapterError::schema(
+            NAME,
+            path.display().to_string(),
+            format!("json file exceeds adapter record cap: {len} bytes > {RECORD_CAP}"),
+        ));
+    }
     let bytes = std::fs::read(path)
         .map_err(|error| AdapterError::io(NAME, path.display().to_string(), error))?;
     let mut value: Value = serde_json::from_slice(&bytes)
@@ -347,6 +385,17 @@ fn list_json_sorted(dir: &Path) -> Result<Vec<PathBuf>, AdapterError> {
     Ok(out)
 }
 
+fn validate_path_id(kind: &str, id: &str, path: &Path) -> Result<(), AdapterError> {
+    if id.contains('/') || id.contains('\\') || id.contains("..") || Path::new(id).is_absolute() {
+        return Err(AdapterError::schema(
+            NAME,
+            path.display().to_string(),
+            format!("{kind} contains a path separator or traversal marker: {id}"),
+        ));
+    }
+    Ok(())
+}
+
 fn session_from_value(value: &Value, path: &Path) -> Result<Session, AdapterError> {
     let display = path.display().to_string();
     let id = value
@@ -362,11 +411,7 @@ fn session_from_value(value: &Value, path: &Path) -> Result<Session, AdapterErro
     let project = extract_str(value, "directory")
         .ok_or_else(|| AdapterError::schema(NAME, display, "session missing `directory`"))?;
 
-    let mut options = ProviderOptions::new();
-    options.insert(
-        "opencode".to_owned(),
-        json!({ "raw_record": extract_raw_record(value) }),
-    );
+    let options = opencode_raw(value);
 
     Ok(Session {
         id,
@@ -391,13 +436,14 @@ fn build_message_events(
     session_id: &str,
     message_value: &Value,
     part_values: &[Value],
+    default_timestamp: DateTime<Utc>,
 ) -> Result<Vec<IngestEvent>, AdapterError> {
     let message_id = message_value
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| AdapterError::schema(NAME, session_id.to_owned(), "message missing `id`"))?;
     let role = message_value.get("role").and_then(Value::as_str);
-    let timestamp = millis_at(message_value, &["time", "created"]).unwrap_or_else(anchor_ts);
+    let timestamp = millis_at(message_value, &["time", "created"]).unwrap_or(default_timestamp);
 
     let options = opencode_raw(message_value);
     let message = match role {
@@ -429,7 +475,7 @@ fn build_message_events(
     let mut events = vec![IngestEvent::Message(message)];
     let mut deferred = Vec::new();
     for (ordinal, part_value) in part_values.iter().enumerate() {
-        let mapped = map_part(session_id, message_id, ordinal, part_value, timestamp);
+        let mapped = map_part(session_id, message_id, ordinal, part_value, timestamp)?;
         events.push(IngestEvent::Part(mapped.part));
         if let Some(split) = mapped.tool_split {
             deferred.push(split);
@@ -464,15 +510,18 @@ fn map_part(
     ordinal: usize,
     value: &Value,
     message_ts: DateTime<Utc>,
-) -> MappedPart {
+) -> Result<MappedPart, AdapterError> {
     let kind = value.get("type").and_then(Value::as_str);
     let id = value
         .get("id")
         .and_then(Value::as_str)
-        .map_or_else(|| part_id(message_id, ordinal), ToOwned::to_owned);
+        .ok_or_else(|| AdapterError::schema(NAME, message_id.to_owned(), "part missing `id`"))?
+        .to_owned();
 
     if kind == Some("tool") {
-        return tool_part(session_id, message_id, &id, ordinal, value, message_ts);
+        return Ok(tool_part(
+            session_id, message_id, &id, ordinal, value, message_ts,
+        ));
     }
 
     let (provenance, part_kind) = match kind {
@@ -485,7 +534,7 @@ fn map_part(
         _ => (Provenance::Injected, PartKind::Text { text: None }),
     };
 
-    MappedPart {
+    Ok(MappedPart {
         part: Part {
             session_id: session_id.to_owned(),
             id,
@@ -496,7 +545,7 @@ fn map_part(
             kind: part_kind,
         },
         tool_split: None,
-    }
+    })
 }
 
 /// spec.md#model-part-provenance: opencode marks harness-injected text parts
@@ -625,8 +674,11 @@ fn tool_part(
 fn opencode_raw(value: &Value) -> ProviderOptions {
     let mut options = ProviderOptions::new();
     options.insert(
-        "opencode".to_owned(),
-        json!({ "raw_record": extract_raw_record(value) }),
+        "source".to_owned(),
+        json!({
+            "adapter": NAME,
+            "raw_record": extract_raw_record(value),
+        }),
     );
     options
 }
@@ -648,14 +700,6 @@ fn millis_at(value: &Value, path: &[&str]) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_millis(cursor.as_i64()?)
 }
 
-/// Recover the stored source record for native restore.
-fn opencode_raw_record(options: &ProviderOptions) -> Option<Value> {
-    options
-        .get("opencode")
-        .and_then(|o| o.get("raw_record"))
-        .cloned()
-}
-
 fn is_synthetic(options: &ProviderOptions) -> bool {
     options
         .get("opencode")
@@ -672,7 +716,7 @@ fn serialize_native(
     // are skipped, re-fusing into the single source `tool` part. Replay echoes
     // a frozen snapshot - safe only while canonical is append-only
     // (spec.md#adapter-integrity-additive-sync).
-    let session_raw = opencode_raw_record(&session.session.options).ok_or_else(|| {
+    let session_raw = raw_record(&session.session.options).ok_or_else(|| {
         AdapterError::schema(
             NAME,
             session.session.id.clone(),
@@ -699,7 +743,7 @@ fn serialize_native(
 
     for message in &session.messages {
         if !is_synthetic(message.message.options())
-            && let Some(raw) = opencode_raw_record(message.message.options())
+            && let Some(raw) = raw_record(message.message.options())
         {
             files.push(RestoredFile {
                 relative_path: PathBuf::from("message")
@@ -711,7 +755,7 @@ fn serialize_native(
         for part in &message.parts {
             // A part that carries a `raw_record` maps 1:1 to a source file at
             // `part/<message_id>/<part_id>.json`; synthetic split parts do not.
-            if let Some(raw) = opencode_raw_record(&part.options) {
+            if let Some(raw) = raw_record(&part.options) {
                 files.push(RestoredFile {
                     relative_path: PathBuf::from("part")
                         .join(&part.message_id)
@@ -845,13 +889,6 @@ fn encode_project(project: &str) -> String {
         .collect()
 }
 
-/// A message always carries `time.created`, so this is unreachable for real
-/// data; a constant epoch anchor keeps the timestamp total without inventing a
-/// plausible-looking "now" (and without a non-deterministic `Utc::now()`).
-fn anchor_ts() -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(0).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     //! End-to-end test for the opencode adapter: ingest the committed
@@ -861,10 +898,51 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
+    use crate::{
+        adapter::extract::LEAF_CAP, handlers::ingest_adapter, sessions::Store, wire::PartKind,
+    };
     use tempfile::TempDir;
 
     const FIXTURES: &str = "tests/fixtures/adapter/opencode/storage";
+    const FRESH_SESSION_ID: &str = "ses_6405e5a5cffeIG2QHRuTmm4mA7";
+    const FRESH_MESSAGE_ID: &str = "msg_zzzzfresh0001";
+    const FRESH_PART_ID: &str = "prt_zzzzfresh0001";
+
+    struct FixedOracle {
+        session_id: &'static str,
+        ingested_at: DateTime<Utc>,
+    }
+
+    impl crate::adapter::SkipOracle for FixedOracle {
+        fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+            (session_id == self.session_id).then_some(self.ingested_at)
+        }
+    }
+
+    #[test]
+    fn probe_default_finds_opencode_storage_under_home() {
+        let temp = TempDir::new().unwrap();
+        let expected = temp
+            .path()
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("storage");
+        std::fs::create_dir_all(&expected).unwrap();
+        let env = Env::with_home(temp.path());
+
+        let probe = OpencodeFactory.probe_default(&env);
+        assert_eq!(
+            probe
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some(expected.to_str().unwrap()),
+        );
+
+        std::fs::remove_dir_all(&expected).unwrap();
+        assert!(OpencodeFactory.probe_default(&env).is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
@@ -876,6 +954,152 @@ mod tests {
             std::path::Path::new(FIXTURES),
         )
         .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn freshness_uses_message_and_part_file_mtimes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("storage");
+        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+
+        let store_dir = temp.path().join("store");
+        let store = Store::open_local(&store_dir).await?;
+        let adapter = OpencodeAdapter::new(&source);
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        let watermark = Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        append_fresh_opencode_turn(&source)?;
+
+        let oracle = FixedOracle {
+            session_id: FRESH_SESSION_ID,
+            ingested_at: watermark,
+        };
+        ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
+
+        let session = store
+            .get_session(FRESH_SESSION_ID)
+            .await?
+            .expect("fixture session round-trips");
+        let fresh = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == FRESH_MESSAGE_ID)
+            .expect("message added after the session file mtime must land");
+        assert!(
+            fresh.parts.iter().any(|part| matches!(
+                &part.kind,
+                PartKind::Text { text } if text.as_deref().map(|value| value.as_str()) == Some("fresh opencode text")
+            )),
+            "fresh message part must land with the re-read session",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_part_file_drops_only_that_part() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("storage");
+        write_minimal_session(&source, "ses_badpart", "msg_badpart")?;
+        let part_dir = source.join("part").join("msg_badpart");
+        std::fs::write(part_dir.join("prt_000_bad.json"), b"{not json")?;
+        write_json_file(
+            &part_dir.join("prt_999_good.json"),
+            &json!({
+                "id": "prt_999_good",
+                "sessionID": "ses_badpart",
+                "messageID": "msg_badpart",
+                "type": "text",
+                "text": "valid sibling survives",
+                "synthetic": false,
+            }),
+        )?;
+
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&source),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+
+        assert_eq!(summary.dropped_events, 1);
+        let session = store
+            .get_session("ses_badpart")
+            .await?
+            .expect("session with one malformed part still lands");
+        let message = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == "msg_badpart")
+            .expect("message with valid sibling part still lands");
+        assert!(message.parts.iter().any(|part| {
+            matches!(
+                &part.kind,
+                PartKind::Text { text }
+                    if text.as_deref().map(String::as_str) == Some("valid sibling survives")
+            )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_message_timestamp_uses_session_anchor() -> anyhow::Result<()> {
+        let session_anchor =
+            DateTime::parse_from_rfc3339("2026-05-05T12:13:14Z")?.with_timezone(&Utc);
+        let events = build_message_events(
+            "ses_anchor",
+            &json!({"id": "msg_no_time", "role": "user"}),
+            &[],
+            session_anchor,
+        )?;
+
+        let IngestEvent::Message(message) = &events[0] else {
+            panic!("first event is the message");
+        };
+        assert_eq!(message.timestamp(), session_anchor);
+        Ok(())
+    }
+
+    #[test]
+    fn source_part_without_id_is_schema_error() {
+        let session_anchor = DateTime::from_timestamp_millis(1_765_000_000_000).unwrap();
+        let error = build_message_events(
+            "ses_missing_part_id",
+            &json!({
+                "id": "msg_missing_part_id",
+                "role": "assistant",
+                "time": { "created": 1_765_000_000_000i64 },
+            }),
+            &[json!({"type": "text", "text": "cannot restore its filename"})],
+            session_anchor,
+        )
+        .expect_err("part ids are required for native filename replay");
+
+        assert!(error.to_string().contains("part missing `id`"));
+    }
+
+    #[test]
+    fn read_json_bounds_oversized_string_leaves() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("oversized.json");
+        write_json_file(
+            &path,
+            &json!({
+                "id": "oversized",
+                "text": "x".repeat(LEAF_CAP + 100),
+            }),
+        )?;
+
+        let value = read_json(&path)?;
+        let text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("text leaf survives as a bounded marker");
+        assert!(text.len() <= LEAF_CAP);
+        assert!(text.ends_with(&format!("{} bytes>", LEAF_CAP + 100)));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -947,6 +1171,7 @@ mod tests {
 
         let mut call_ids = std::collections::HashSet::new();
         let mut result_ids = std::collections::HashSet::new();
+        let mut saw_failure = false;
         for session_id in store.session_ids().await? {
             let session = store
                 .get_session(&session_id)
@@ -960,11 +1185,24 @@ mod tests {
                                 call_ids.insert(id.clone());
                             }
                         }
-                        PartKind::ToolResult { call_id, .. } => {
+                        PartKind::ToolResult {
+                            call_id,
+                            is_failure,
+                            result,
+                            ..
+                        } => {
                             assert!(
                                 matches!(stored.message, Message::Tool { .. }),
                                 "a ToolResult must live on a Tool-role message",
                             );
+                            if *is_failure {
+                                saw_failure = true;
+                                assert_ne!(
+                                    result,
+                                    &Value::Null,
+                                    "failed tool results must carry the source error/output payload",
+                                );
+                            }
                             if let Some(id) = call_id.as_deref() {
                                 result_ids.insert(id.clone());
                             }
@@ -979,6 +1217,156 @@ mod tests {
             call_ids, result_ids,
             "every tool call's id is matched by its split-off result",
         );
+        assert!(
+            saw_failure,
+            "fixture has at least one failed opencode tool result"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_serialization_reparses_as_opencode() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
+        let origin = crate::adapter::PiCodingAgentAdapter::new(
+            "tests/fixtures/adapter/pi-coding-agent/sessions",
+        );
+        ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
+        let session_id = origin_store
+            .session_ids()
+            .await?
+            .into_iter()
+            .next()
+            .expect("pi fixture has sessions");
+        let session = origin_store
+            .get_session(&session_id)
+            .await?
+            .expect("fixture session is readable");
+
+        let restored_root = temp.path().join("opencode-storage");
+        write_restored_files(
+            &restored_root,
+            OpencodeFactory.serialize(&session, RestoreFidelity::Foreign)?,
+        )?;
+        let restored_store = Store::open_local(temp.path().join("restored-store")).await?;
+        let summary = ingest_adapter(
+            &restored_store,
+            &OpencodeAdapter::new(&restored_root),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+
+        assert!(summary.accepted() > 0);
+        assert_eq!(summary.dropped_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn path_ids_reject_separators_and_traversal() {
+        let path = std::path::Path::new("session/project/session.json");
+        assert!(validate_path_id("session id", "ses_safe", path).is_ok());
+        assert!(validate_path_id("session id", "../ses", path).is_err());
+        assert!(validate_path_id("session id", "/tmp/ses", path).is_err());
+        assert!(validate_path_id("message id", "msg/a", path).is_err());
+        assert!(validate_path_id("message id", "msg\\a", path).is_err());
+    }
+
+    fn append_fresh_opencode_turn(root: &std::path::Path) -> anyhow::Result<()> {
+        let message_dir = root.join("message").join(FRESH_SESSION_ID);
+        let part_dir = root.join("part").join(FRESH_MESSAGE_ID);
+        std::fs::create_dir_all(&message_dir)?;
+        std::fs::create_dir_all(&part_dir)?;
+        std::fs::write(
+            message_dir.join(format!("{FRESH_MESSAGE_ID}.json")),
+            serde_json::to_vec(&json!({
+                "id": FRESH_MESSAGE_ID,
+                "sessionID": FRESH_SESSION_ID,
+                "role": "user",
+                "time": { "created": 1759859999000i64 }
+            }))?,
+        )?;
+        std::fs::write(
+            part_dir.join(format!("{FRESH_PART_ID}.json")),
+            serde_json::to_vec(&json!({
+                "id": FRESH_PART_ID,
+                "sessionID": FRESH_SESSION_ID,
+                "messageID": FRESH_MESSAGE_ID,
+                "type": "text",
+                "text": "fresh opencode text",
+                "synthetic": false
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    fn write_minimal_session(
+        root: &std::path::Path,
+        session_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        write_json_file(
+            &root
+                .join("session")
+                .join("project")
+                .join(format!("{session_id}.json")),
+            &json!({
+                "id": session_id,
+                "projectID": "project",
+                "directory": "/tmp/project",
+                "time": { "created": 1_765_000_000_000i64, "updated": 1_765_000_000_000i64 },
+            }),
+        )?;
+        write_json_file(
+            &root
+                .join("message")
+                .join(session_id)
+                .join(format!("{message_id}.json")),
+            &json!({
+                "id": message_id,
+                "sessionID": session_id,
+                "role": "assistant",
+                "time": { "created": 1_765_000_000_001i64 },
+            }),
+        )?;
+        std::fs::create_dir_all(root.join("part").join(message_id))?;
+        Ok(())
+    }
+
+    fn write_json_file(path: &std::path::Path, value: &Value) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec(value)?)?;
+        Ok(())
+    }
+
+    fn write_restored_files(
+        root: &std::path::Path,
+        files: Vec<RestoredFile>,
+    ) -> anyhow::Result<()> {
+        for file in files {
+            let path = root.join(file.relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, file.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let source = entry.path();
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir(&source, &target)?;
+            } else {
+                std::fs::copy(&source, &target)?;
+            }
+        }
         Ok(())
     }
 }
