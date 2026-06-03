@@ -1,0 +1,17 @@
+[book]
+title = "pond"
+authors = ["tenequm"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../target/book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/tenequm/pond"
+edit-url-template = "https://github.com/tenequm/pond/edit/main/docs/src/{path}"
+
+[output.html.search]
+use-boolean-and = true

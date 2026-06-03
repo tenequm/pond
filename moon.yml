@@ -96,7 +96,7 @@ tasks:
       # frozen_string_literal: true
       class Pond < Formula
         desc "Lossless storage and hybrid search for sessions from any AI agent client"
-        homepage "https://pond.sh"
+        homepage "https://pond.cascade.fyi/"
         version "$V"
         license "Apache-2.0"
 
@@ -202,7 +202,7 @@ tasks:
 
         meta = {
           description = "Lossless storage and hybrid search for sessions from any AI agent client";
-          homepage = "https://pond.sh";
+          homepage = "https://pond.cascade.fyi/";
           changelog = "https://github.com/tenequm/pond/blob/v\${version}/CHANGELOG.md";
           license = lib.licenses.asl20;
           mainProgram = "pond";

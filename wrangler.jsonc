@@ -1,0 +1,11 @@
+{
+  "name": "pond-docs",
+  "compatibility_date": "2026-06-03",
+  "assets": {
+    "directory": "./target/book",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    { "pattern": "pond.cascade.fyi", "custom_domain": true }
+  ]
+}
