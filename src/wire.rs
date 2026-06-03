@@ -18,7 +18,7 @@ pub struct Session {
     /// spec.md#model-parent-pointer-coherence: when set, `parent_session_id`
     /// MUST also be set. Spawn-only sources (claude-code subagents,
     /// nanoclaw) leave this `None`; fork-with-cut-point sources
-    /// (pi-mono) populate both pointers together.
+    /// (pi-coding-agent) populate both pointers together.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_message_id: Option<String>,
     pub source_agent: String,

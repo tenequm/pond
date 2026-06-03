@@ -33,7 +33,7 @@ mod discovery;
 pub mod extract;
 mod jsonl;
 mod opencode;
-mod pi;
+mod pi_coding_agent;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
@@ -43,7 +43,7 @@ pub use extract::{
     extract_str, extract_value,
 };
 pub use opencode::{OpencodeAdapter, OpencodeFactory};
-pub use pi::{PiAdapter, PiFactory};
+pub use pi_coding_agent::{PiCodingAgentAdapter, PiCodingAgentFactory};
 
 /// Stateless face of an adapter type: how the registry knows about it without
 /// instantiating it. One implementation per known format, registered in
@@ -327,7 +327,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &ClaudeCodeFactory,
         &CodexCliFactory,
         &OpencodeFactory,
-        &PiFactory,
+        &PiCodingAgentFactory,
     ]
 }
 

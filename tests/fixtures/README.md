@@ -2,7 +2,7 @@
 
 Curated, anonymized session captures from 8 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
-serve as the test fixtures for the v1 SourceAdapter implementations (see
+serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
 
 Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20).
@@ -16,7 +16,7 @@ platform, captured from local storage or platform exports, anonymized.
 
 Constraints baked in:
 
-- **Native on-disk layout preserved.** A SourceAdapter that walks a real user
+- **Native on-disk layout preserved.** An adapter that walks a real user
   install (`~/.claude/projects/...`, `~/.codex/sessions/...`, etc.) sees the
   same directory shape, the same filename conventions, the same sidecar files
   when pointed at these samples. Discovery code is testable end to end.
@@ -45,11 +45,11 @@ adapter/
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   openclaw/                  openclaw runtime
   opencode/                  opencode CLI
-  pi/                        pi-mono CLI
+  pi-coding-agent/           pi-coding-agent CLI
 ```
 
 Each platform subdir mirrors that platform's native on-disk path layout so a
-SourceAdapter can be tested by pointing its discovery code directly at the
+adapter can be tested by pointing its discovery code directly at the
 sample tree.
 
 ## Per-platform notes
@@ -209,7 +209,7 @@ sample tree.
   reasoning parts) plus an assistant-message `error` field; it also exercises
   the `tool` `error` state.
 
-### pi (pi-mono CLI)
+### pi (pi-coding-agent CLI)
 
 - Source path: `~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<ulid>.jsonl`
 - Layout: encoded-cwd as dir name (one per project), `<timestamp>_<ulid>.jsonl`
@@ -297,7 +297,7 @@ be applied to refreshed samples.
 - Codex `encrypted_content` Fernet payloads (opaque; pond cannot decrypt;
   preserved for schema fidelity)
 - claude_app `_audit_hmac` field values (cryptographically invalid against
-  modified content but the field is kept so SourceAdapters see it)
+  modified content but the field is kept so adapters see it)
 - Cowork system prompts (identical across all Claude Desktop users;
   preserved for schema fidelity)
 - Public OSS-product hostnames in scraped tool-result content where they
@@ -305,7 +305,7 @@ be applied to refreshed samples.
 
 ## Known fixture gaps
 
-Tracked shortfalls where a future SourceAdapter would have untested surface.
+Tracked shortfalls where a future adapter would have untested surface.
 Update as gaps are closed.
 
 - **claude_managed_agents - single session.** All 9 event types are present

@@ -1,13 +1,13 @@
 # opencode reference snapshot
 
-Source: https://github.com/anomalyco/opencode
-Local clone: `~/pjv/anomalyco/opencode/`
+Source: https://github.com/sst/opencode
+Local clone: `~/pjv/sst/opencode/`
 Commit: `fea9a0bd4c1c9d9b66af84a43936a84626d723d8`
 Snapshot date: 2026-05-07
 
 ## Why these files
 
-Reference for designing pond's canonical Part union and message/session schemas (see `/docs/design.md` section 6). Files preserve their original package-relative paths under this directory.
+Reference for designing pond's canonical Part union and message/session schemas (see `docs/spec.md#adapters`). Files preserve their original package-relative paths under this directory.
 
 ## Ranked relevance (most useful first)
 
