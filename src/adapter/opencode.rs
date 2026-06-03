@@ -35,9 +35,9 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_path,
-    extract::{bound_value, extract_raw_record, extract_str},
+    extract::{bound_value, extract_str},
     jsonl::RECORD_CAP,
-    part_id, raw_record,
+    part_id, part_ordinal, raw_record, source_options, validate_path_id,
 };
 
 const NAME: &str = "opencode";
@@ -118,18 +118,39 @@ impl Adapter for OpencodeAdapter {
                 Err(join) => { yield Err(join_error(join)); return; }
             };
 
+            // Subtree mtime walks happen ONLY when the oracle has a watermark
+            // for this session - on a first ingest (or NoopOracle) every walk
+            // is wasted work since there's nothing to compare against.
             let mut survivors = Vec::with_capacity(files.len());
-            for file in files {
-                if let Some(ingested) = oracle.last_ingested_at(&file.session_id)
-                    && let Some(mtime) = file.mtime
-                    && mtime <= ingested
-                {
-                    yield Ok(AdapterYield::Skipped {
-                        session_id: Some(file.session_id.clone()),
-                        project: None,
-                        reason: SkipReason::Fresh,
-                    });
-                    continue;
+            for mut file in files {
+                if let Some(ingested) = oracle.last_ingested_at(&file.session_id) {
+                    let walk = {
+                        let root = adapter.root.clone();
+                        let session_path = file.path.clone();
+                        let session_id = file.session_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            walk_session_subtree(&root, &session_path, &session_id)
+                        })
+                        .await
+                    };
+                    let walk = match walk {
+                        Ok(Ok(walk)) => walk,
+                        Ok(Err(error)) => { yield Err(error); return; }
+                        Err(join) => { yield Err(join_error(join)); return; }
+                    };
+                    if let Some(mtime) = walk.newest_mtime
+                        && mtime <= ingested
+                    {
+                        yield Ok(AdapterYield::Skipped {
+                            session_id: Some(file.session_id.clone()),
+                            project: None,
+                            reason: SkipReason::Fresh,
+                        });
+                        continue;
+                    }
+                    // Cache the walk so the read pass doesn't re-list the
+                    // same dirs (we already paid for them above).
+                    file.cached_subtree = Some(walk);
                 }
                 survivors.push(file);
             }
@@ -157,11 +178,24 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
     )
 }
 
-/// One session file located on disk, with the cheap freshness inputs.
+/// One session file located on disk. `cached_subtree` is populated only when
+/// the freshness pre-walk happened (i.e. the oracle had a watermark for this
+/// session); the read pass reuses the listings instead of re-walking.
 struct SessionFile {
     session_id: String,
     path: PathBuf,
-    mtime: Option<DateTime<Utc>>,
+    cached_subtree: Option<SubtreeWalk>,
+}
+
+/// Result of one subtree walk: the newest mtime across session+messages+parts
+/// (for the freshness check) and the directory listings (so the read pass
+/// doesn't redo them).
+struct SubtreeWalk {
+    newest_mtime: Option<DateTime<Utc>>,
+    message_files: Vec<PathBuf>,
+    /// One entry per message file, in the same order; each is the sorted list
+    /// of part files for that message. Empty vec = message has no parts.
+    part_files_by_message: Vec<Vec<PathBuf>>,
 }
 
 /// Walk `<root>/session/<projectID>/<sessionID>.json`, sorted for deterministic
@@ -198,12 +232,16 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
             else {
                 continue;
             };
-            validate_path_id("session file name", &session_id, &path)?;
-            let mtime = session_file_set_mtime(root, &path, &session_id)?;
+            validate_path_id(
+                NAME,
+                "session file name",
+                &session_id,
+                path.display().to_string(),
+            )?;
             out.push(SessionFile {
                 session_id,
                 path,
-                mtime,
+                cached_subtree: None,
             });
         }
     }
@@ -211,25 +249,42 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
     Ok(out)
 }
 
-fn session_file_set_mtime(
+/// Walk one session's full subtree: the session file, every message file under
+/// `message/<sid>/`, every part file under `part/<mid>/`. Returns the newest
+/// mtime seen plus the cached listings so the read pass can reuse them.
+fn walk_session_subtree(
     root: &Path,
     session_path: &Path,
     session_id: &str,
-) -> Result<Option<DateTime<Utc>>, AdapterError> {
+) -> Result<SubtreeWalk, AdapterError> {
     let mut newest = json_mtime(session_path);
     let message_dir = root.join("message").join(session_id);
-    for message_path in list_json_sorted(&message_dir)? {
-        newest = newest.max(json_mtime(&message_path));
+    let message_files = list_json_sorted(&message_dir)?;
+    let mut part_files_by_message = Vec::with_capacity(message_files.len());
+    for message_path in &message_files {
+        newest = newest.max(json_mtime(message_path));
         let Some(message_id) = message_path.file_stem().and_then(|stem| stem.to_str()) else {
+            part_files_by_message.push(Vec::new());
             continue;
         };
-        validate_path_id("message file name", message_id, &message_path)?;
+        validate_path_id(
+            NAME,
+            "message file name",
+            message_id,
+            message_path.display().to_string(),
+        )?;
         let part_dir = root.join("part").join(message_id);
-        for part_path in list_json_sorted(&part_dir)? {
-            newest = newest.max(json_mtime(&part_path));
+        let parts = list_json_sorted(&part_dir)?;
+        for part_path in &parts {
+            newest = newest.max(json_mtime(part_path));
         }
+        part_files_by_message.push(parts);
     }
-    Ok(newest)
+    Ok(SubtreeWalk {
+        newest_mtime: newest,
+        message_files,
+        part_files_by_message,
+    })
 }
 
 fn json_mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -245,7 +300,7 @@ fn read_sessions(
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) {
     for session in sessions {
-        if !read_one_session(adapter, &session, tx) {
+        if !read_one_session(adapter, session, tx) {
             return;
         }
     }
@@ -254,7 +309,7 @@ fn read_sessions(
 /// Returns `false` when the consumer dropped the receiver and the read should stop.
 fn read_one_session(
     adapter: &OpencodeAdapter,
-    file: &SessionFile,
+    file: SessionFile,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
     macro_rules! emit {
@@ -280,23 +335,37 @@ fn read_one_session(
         }
     };
     let session_id = session.id.clone();
-    if let Err(error) = validate_path_id("session id", &session_id, &file.path) {
+    if let Err(error) = validate_path_id(
+        NAME,
+        "session id",
+        &session_id,
+        file.path.display().to_string(),
+    ) {
         emit!(Err(error));
         return true;
     }
     let session_created_at = session.created_at;
     emit!(Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
-    let message_dir = adapter.root.join("message").join(&session_id);
-    let message_files = match list_json_sorted(&message_dir) {
-        Ok(files) => files,
-        Err(error) => {
-            emit!(Err(error));
-            return true;
+    // Reuse the freshness pre-walk's listings when present; otherwise list now.
+    let (message_files, mut part_files_by_message) = match file.cached_subtree {
+        Some(walk) => (walk.message_files, walk.part_files_by_message),
+        None => {
+            let message_dir = adapter.root.join("message").join(&session_id);
+            let files = match list_json_sorted(&message_dir) {
+                Ok(files) => files,
+                Err(error) => {
+                    emit!(Err(error));
+                    return true;
+                }
+            };
+            (files, Vec::new())
         }
     };
-    for message_path in message_files {
-        let message_value = match read_json(&message_path) {
+    let use_cache = !part_files_by_message.is_empty();
+
+    for (index, message_path) in message_files.iter().enumerate() {
+        let message_value = match read_json(message_path) {
             Ok(value) => value,
             Err(error) => {
                 emit!(Err(error));
@@ -311,16 +380,25 @@ fn read_one_session(
             )));
             continue;
         };
-        if let Err(error) = validate_path_id("message id", message_id, &message_path) {
+        if let Err(error) = validate_path_id(
+            NAME,
+            "message id",
+            message_id,
+            message_path.display().to_string(),
+        ) {
             emit!(Err(error));
             continue;
         }
-        let part_dir = adapter.root.join("part").join(message_id);
-        let part_files = match list_json_sorted(&part_dir) {
-            Ok(files) => files,
-            Err(error) => {
-                emit!(Err(error));
-                continue;
+        let part_files = if use_cache {
+            std::mem::take(&mut part_files_by_message[index])
+        } else {
+            let part_dir = adapter.root.join("part").join(message_id);
+            match list_json_sorted(&part_dir) {
+                Ok(files) => files,
+                Err(error) => {
+                    emit!(Err(error));
+                    continue;
+                }
             }
         };
         let mut parts = Vec::with_capacity(part_files.len());
@@ -343,11 +421,14 @@ fn read_one_session(
 }
 
 /// Read one JSON file, bounding every string leaf at the seam cap
-/// (spec.md#adapter-bounded-values) before it leaves this module.
+/// (spec.md#adapter-bounded-values) before it leaves this module. One open +
+/// one metadata syscall on the handle - avoids the duplicate `std::fs::metadata`
+/// + `std::fs::read` pair on the ~1k-file real corpus.
 fn read_json(path: &Path) -> Result<Value, AdapterError> {
-    let len = std::fs::metadata(path)
-        .map_err(|error| AdapterError::io(NAME, path.display().to_string(), error))?
-        .len();
+    use std::io::Read;
+    let io = |source| AdapterError::io(NAME, path.display().to_string(), source);
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
     if len > RECORD_CAP as u64 {
         return Err(AdapterError::schema(
             NAME,
@@ -355,8 +436,8 @@ fn read_json(path: &Path) -> Result<Value, AdapterError> {
             format!("json file exceeds adapter record cap: {len} bytes > {RECORD_CAP}"),
         ));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| AdapterError::io(NAME, path.display().to_string(), error))?;
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes).map_err(io)?;
     let mut value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AdapterError::parse(NAME, path.display().to_string(), 1, error))?;
     bound_value(&mut value);
@@ -383,17 +464,6 @@ fn list_json_sorted(dir: &Path) -> Result<Vec<PathBuf>, AdapterError> {
     }
     out.sort();
     Ok(out)
-}
-
-fn validate_path_id(kind: &str, id: &str, path: &Path) -> Result<(), AdapterError> {
-    if id.contains('/') || id.contains('\\') || id.contains("..") || Path::new(id).is_absolute() {
-        return Err(AdapterError::schema(
-            NAME,
-            path.display().to_string(),
-            format!("{kind} contains a path separator or traversal marker: {id}"),
-        ));
-    }
-    Ok(())
 }
 
 fn session_from_value(value: &Value, path: &Path) -> Result<Session, AdapterError> {
@@ -463,11 +533,11 @@ fn build_message_events(
         // shell, compaction); keep them as System carriers rather than drop
         // them (spec.md#adapter-integrity-no-silent-drops). The raw record
         // survives in options; the role label is the content.
-        other => Message::System {
+        _ => Message::System {
             id: message_id.to_owned(),
             session_id: session_id.to_owned(),
             timestamp,
-            content: other.and_then(|_| extract_str(message_value, "role")),
+            content: extract_str(message_value, "role"),
             options,
         },
     };
@@ -539,7 +609,7 @@ fn map_part(
             session_id: session_id.to_owned(),
             id,
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance,
             options: opencode_raw(value),
             kind: part_kind,
@@ -572,13 +642,12 @@ fn reasoning_kind(value: &Value) -> PartKind {
 }
 
 fn file_kind(value: &Value) -> PartKind {
-    // A generic MIME default is a transport descriptor, not a synthesized field
-    // value (spec.md#model-no-synthesis).
+    // spec.md#model-no-synthesis: an absent mime hint is faithfully `None`,
+    // not a synthesized `application/octet-stream` placeholder.
     let media_type = value
         .get("mime")
         .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+        .map(ToOwned::to_owned);
     let file_name = value
         .get("filename")
         .and_then(Value::as_str)
@@ -611,16 +680,33 @@ fn tool_part(
     let name = extract_str(value, "tool");
     let state = value.get("state");
     let status = state.and_then(|s| s.get("status")).and_then(Value::as_str);
-    let input = state
-        .and_then(|s| s.get("input"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    let result_ts = millis_at(value, &["state", "time", "end"]).unwrap_or(message_ts);
+
+    // Take input/output by moving them out of a single owned `state` clone
+    // rather than cloning each field separately - on the real corpus a fused
+    // tool part fans into three records (call + tool message + result), each
+    // of which used to clone its own slice of `state`.
+    let mut owned_state = state.cloned().unwrap_or(Value::Null);
+    let (input, result) = match owned_state.as_object_mut() {
+        Some(map) => {
+            let input = map.remove("input").unwrap_or(Value::Null);
+            let result = map
+                .remove("output")
+                .or_else(|| map.remove("error"))
+                .unwrap_or_else(|| {
+                    // No output/error - the rest of `state` IS the payload.
+                    std::mem::take(&mut owned_state)
+                });
+            (input, result)
+        }
+        None => (Value::Null, Value::Null),
+    };
 
     let tool_call = Part {
         session_id: session_id.to_owned(),
         id: id.to_owned(),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         // spec.md#model-part-provenance: the model authored the tool call.
         provenance: Provenance::Conversational,
         options: opencode_raw(value),
@@ -633,13 +719,6 @@ fn tool_part(
     };
 
     let tool_message_id = format!("{id}/result");
-    let result_ts = millis_at(value, &["state", "time", "end"]).unwrap_or(message_ts);
-    let result = state
-        .and_then(|s| s.get("output").or_else(|| s.get("error")))
-        .cloned()
-        .or_else(|| state.cloned())
-        .unwrap_or(Value::Null);
-
     let tool_message = Message::Tool {
         id: tool_message_id.clone(),
         session_id: session_id.to_owned(),
@@ -671,16 +750,9 @@ fn tool_part(
     }
 }
 
+#[inline]
 fn opencode_raw(value: &Value) -> ProviderOptions {
-    let mut options = ProviderOptions::new();
-    options.insert(
-        "source".to_owned(),
-        json!({
-            "adapter": NAME,
-            "raw_record": extract_raw_record(value),
-        }),
-    );
-    options
+    source_options(NAME, value)
 }
 
 /// Marks a canonical record the adapter synthesized (the `Tool` message and
@@ -716,13 +788,14 @@ fn serialize_native(
     // are skipped, re-fusing into the single source `tool` part. Replay echoes
     // a frozen snapshot - safe only while canonical is append-only
     // (spec.md#adapter-integrity-additive-sync).
-    let session_raw = raw_record(&session.session.options).ok_or_else(|| {
-        AdapterError::schema(
-            NAME,
-            session.session.id.clone(),
-            "native restore needs the stored session raw_record",
-        )
-    })?;
+    //
+    // spec.md#adapter-native-restore-lossless: when the session lacks a stored
+    // `raw_record` (older ingest, foreign-sourced session), native is
+    // impossible. We downgrade to foreign and stamp `actual_fidelity` so the
+    // caller can surface the downgrade instead of getting a silent surprise.
+    let Some(session_raw) = raw_record(&session.session.options) else {
+        return serialize_foreign(session);
+    };
     let project_id = session_raw
         .get("projectID")
         .and_then(Value::as_str)
@@ -734,34 +807,37 @@ fn serialize_native(
             )
         })?;
 
-    let mut files = vec![RestoredFile {
-        relative_path: PathBuf::from("session")
+    let mut files = vec![RestoredFile::new(
+        PathBuf::from("session")
             .join(project_id)
             .join(format!("{}.json", session.session.id)),
-        bytes: encode(&session_raw, &session.session.id)?,
-    }];
+        encode(&session_raw, &session.session.id)?,
+        RestoreFidelity::Native,
+    )];
 
     for message in &session.messages {
         if !is_synthetic(message.message.options())
             && let Some(raw) = raw_record(message.message.options())
         {
-            files.push(RestoredFile {
-                relative_path: PathBuf::from("message")
+            files.push(RestoredFile::new(
+                PathBuf::from("message")
                     .join(&session.session.id)
                     .join(format!("{}.json", message.message.id())),
-                bytes: encode(&raw, message.message.id())?,
-            });
+                encode(&raw, message.message.id())?,
+                RestoreFidelity::Native,
+            ));
         }
         for part in &message.parts {
             // A part that carries a `raw_record` maps 1:1 to a source file at
             // `part/<message_id>/<part_id>.json`; synthetic split parts do not.
             if let Some(raw) = raw_record(&part.options) {
-                files.push(RestoredFile {
-                    relative_path: PathBuf::from("part")
+                files.push(RestoredFile::new(
+                    PathBuf::from("part")
                         .join(&part.message_id)
                         .join(format!("{}.json", part.id)),
-                    bytes: encode(&raw, &part.id)?,
-                });
+                    encode(&raw, &part.id)?,
+                    RestoreFidelity::Native,
+                ));
             }
         }
     }
@@ -784,12 +860,13 @@ fn serialize_foreign(
         "directory": &*session.session.project,
         "time": { "created": created, "updated": created },
     });
-    let mut files = vec![RestoredFile {
-        relative_path: PathBuf::from("session")
+    let mut files = vec![RestoredFile::new(
+        PathBuf::from("session")
             .join(&project_id)
             .join(format!("{}.json", session.session.id)),
-        bytes: encode(&session_record, &session.session.id)?,
-    }];
+        encode(&session_record, &session.session.id)?,
+        RestoreFidelity::Foreign,
+    )];
 
     for message in &session.messages {
         let role = match message.message {
@@ -805,22 +882,24 @@ fn serialize_foreign(
             "role": role,
             "time": { "created": created },
         });
-        files.push(RestoredFile {
-            relative_path: PathBuf::from("message")
+        files.push(RestoredFile::new(
+            PathBuf::from("message")
                 .join(&session.session.id)
                 .join(format!("{}.json", message.message.id())),
-            bytes: encode(&record, message.message.id())?,
-        });
+            encode(&record, message.message.id())?,
+            RestoreFidelity::Foreign,
+        ));
         for part in &message.parts {
             let Some(record) = foreign_part(&session.session.id, part) else {
                 continue;
             };
-            files.push(RestoredFile {
-                relative_path: PathBuf::from("part")
+            files.push(RestoredFile::new(
+                PathBuf::from("part")
                     .join(message.message.id())
                     .join(format!("{}.json", part.id)),
-                bytes: encode(&record, &part.id)?,
-            });
+                encode(&record, &part.id)?,
+                RestoreFidelity::Foreign,
+            ));
         }
     }
     Ok(files)
@@ -920,28 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn probe_default_finds_opencode_storage_under_home() {
-        let temp = TempDir::new().unwrap();
-        let expected = temp
-            .path()
-            .join(".local")
-            .join("share")
-            .join("opencode")
-            .join("storage");
-        std::fs::create_dir_all(&expected).unwrap();
-        let env = Env::with_home(temp.path());
-
-        let probe = OpencodeFactory.probe_default(&env);
-        assert_eq!(
-            probe
-                .as_ref()
-                .and_then(|value| value.get("path"))
-                .and_then(Value::as_str),
-            Some(expected.to_str().unwrap()),
-        );
-
-        std::fs::remove_dir_all(&expected).unwrap();
-        assert!(OpencodeFactory.probe_default(&env).is_none());
+    fn probe_default_finds_opencode_storage_under_home() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &OpencodeFactory,
+            &[".local", "share", "opencode", "storage"],
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1244,7 +1306,7 @@ mod tests {
             .expect("fixture session is readable");
 
         let restored_root = temp.path().join("opencode-storage");
-        write_restored_files(
+        crate::adapter::write_restored_files(
             &restored_root,
             OpencodeFactory.serialize(&session, RestoreFidelity::Foreign)?,
         )?;
@@ -1264,12 +1326,12 @@ mod tests {
 
     #[test]
     fn path_ids_reject_separators_and_traversal() {
-        let path = std::path::Path::new("session/project/session.json");
-        assert!(validate_path_id("session id", "ses_safe", path).is_ok());
-        assert!(validate_path_id("session id", "../ses", path).is_err());
-        assert!(validate_path_id("session id", "/tmp/ses", path).is_err());
-        assert!(validate_path_id("message id", "msg/a", path).is_err());
-        assert!(validate_path_id("message id", "msg\\a", path).is_err());
+        let where_ = "session/project/session.json";
+        assert!(validate_path_id(NAME, "session id", "ses_safe", where_).is_ok());
+        assert!(validate_path_id(NAME, "session id", "../ses", where_).is_err());
+        assert!(validate_path_id(NAME, "session id", "/tmp/ses", where_).is_err());
+        assert!(validate_path_id(NAME, "message id", "msg/a", where_).is_err());
+        assert!(validate_path_id(NAME, "message id", "msg\\a", where_).is_err());
     }
 
     fn append_fresh_opencode_turn(root: &std::path::Path) -> anyhow::Result<()> {
@@ -1338,20 +1400,6 @@ mod tests {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_vec(value)?)?;
-        Ok(())
-    }
-
-    fn write_restored_files(
-        root: &std::path::Path,
-        files: Vec<RestoredFile>,
-    ) -> anyhow::Result<()> {
-        for file in files {
-            let path = root.join(file.relative_path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, file.bytes)?;
-        }
         Ok(())
     }
 

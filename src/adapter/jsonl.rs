@@ -127,7 +127,8 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
 
         let heads = {
             let driver = driver.clone();
-            tokio::task::spawn_blocking(move || collect_heads(&driver)).await
+            let oracle_is_empty = oracle.is_empty();
+            tokio::task::spawn_blocking(move || collect_heads(&driver, oracle_is_empty)).await
         };
         let heads = match heads {
             Ok(Ok(heads)) => heads,
@@ -180,7 +181,10 @@ struct FileHead {
     session_id: Option<String>,
 }
 
-fn collect_heads<D: JsonlTree>(driver: &D) -> Result<Vec<FileHead>, AdapterError> {
+fn collect_heads<D: JsonlTree>(
+    driver: &D,
+    oracle_is_empty: bool,
+) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
     let files = collect_jsonl_files(driver.root())
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
@@ -190,8 +194,17 @@ fn collect_heads<D: JsonlTree>(driver: &D) -> Result<Vec<FileHead>, AdapterError
             .and_then(|meta| meta.modified())
             .ok()
             .map(DateTime::<Utc>::from);
-        let first_line = peek_first_line(&path).unwrap_or_default();
-        let session_id = driver.peek_session_id(&path, &first_line);
+        // First-line peek + driver parse cost roughly one open + 4 KB read +
+        // a JSON decode per file. On a first-time ingest (`NoopOracle` or
+        // any oracle with no watermarks) `last_ingested_at` will always
+        // return `None`, so the peek result would never feed the freshness
+        // check - skip it.
+        let session_id = if oracle_is_empty {
+            None
+        } else {
+            let first_line = peek_first_line(&path).unwrap_or_default();
+            driver.peek_session_id(&path, &first_line)
+        };
         heads.push(FileHead {
             path,
             mtime,

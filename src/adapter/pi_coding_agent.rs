@@ -30,7 +30,7 @@ use super::{
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text,
     jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
-    jsonl_bytes, part_id, raw_record,
+    jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
 const NAME: &str = "pi-coding-agent";
@@ -73,28 +73,40 @@ fn serialize_session(
     // below is the foreign-only reconstruction. Replay echoes a frozen
     // snapshot - safe only while canonical is append-only
     // (spec.md#adapter-integrity-additive-sync).
+    //
+    // spec.md#adapter-native-restore-lossless: if Native is requested but the
+    // session has no stored `raw_record`, we downgrade to foreign and stamp
+    // `actual_fidelity` so the caller can signal the downgrade. Mirrors
+    // opencode's behavior - both adapters serve the best they can and tell
+    // the truth about what they served.
+    let session_raw = raw_record(&session.session.options);
+    let actual = match fidelity {
+        RestoreFidelity::Native if session_raw.is_some() => RestoreFidelity::Native,
+        _ => RestoreFidelity::Foreign,
+    };
+
     let mut records = Vec::new();
-    if fidelity == RestoreFidelity::Native
-        && let Some(raw) = raw_record(&session.session.options)
-    {
-        records.push(raw);
+    if actual == RestoreFidelity::Native {
+        records.push(session_raw.unwrap_or_else(|| pi_session_record(session)));
     } else {
         records.push(pi_session_record(session));
     }
 
-    let mut messages = session.messages.clone();
-    if fidelity == RestoreFidelity::Native {
+    // Sort message references rather than cloning the whole vec; restore is a
+    // hot path when users `pond restore` large sessions.
+    let mut messages: Vec<&crate::sessions::MessageWithParts> = session.messages.iter().collect();
+    if actual == RestoreFidelity::Native {
         messages.sort_by(|left, right| {
             source_line(left.message.options())
                 .cmp(&source_line(right.message.options()))
                 .then_with(|| by_timestamp_then_id(left, right))
         });
     } else {
-        messages.sort_by(by_timestamp_then_id);
+        messages.sort_by(|left, right| by_timestamp_then_id(left, right));
     }
 
     for message in &messages {
-        if fidelity == RestoreFidelity::Native
+        if actual == RestoreFidelity::Native
             && let Some(raw) = raw_record(message.message.options())
         {
             records.push(raw);
@@ -110,10 +122,11 @@ fn serialize_session(
         records.push(pi_message_record(message));
     }
 
-    Ok(vec![RestoredFile {
-        relative_path: pi_relative_path(session),
-        bytes: jsonl_bytes(NAME, &records)?,
-    }])
+    Ok(vec![RestoredFile::new(
+        pi_relative_path(session),
+        jsonl_bytes(NAME, &records)?,
+        actual,
+    )])
 }
 
 /// Reproduce the on-disk `sessions/<slug>/<file>.jsonl` path from the slug and
@@ -175,6 +188,11 @@ fn pi_inner_message(message: &crate::sessions::MessageWithParts) -> Value {
             "timestamp": epoch_ms,
         }),
         Message::Tool { .. } => {
+            // spec.md#adapter-native-restore-lossless (foreign clause): a
+            // canonical Tool message with no ToolResult part - or with parts
+            // that lack call_id/name - serializes with empty-string slots.
+            // That's lossy by design for foreign restore; the unaltered
+            // source still lives in canonical and in `raw_record`.
             let part = message.parts.first();
             let (call_id, name, is_error, result) = match part.map(|p| &p.kind) {
                 Some(PartKind::ToolResult {
@@ -199,8 +217,13 @@ fn pi_inner_message(message: &crate::sessions::MessageWithParts) -> Value {
                 "timestamp": epoch_ms,
             })
         }
-        // System carriers are dropped before reaching here (foreign clause).
-        Message::System { .. } => Value::Null,
+        // serialize_session drops System carriers before reaching here in
+        // foreign mode, and native mode replays the source row verbatim - so
+        // this arm only fires if a caller invokes pi_message_record on a
+        // System message directly. Unreachable on every legitimate path.
+        Message::System { .. } => {
+            unreachable!("System messages are not serialized through pi_inner_message")
+        }
     }
 }
 
@@ -531,7 +554,7 @@ fn user_part(session_id: &str, message_id: &str, ordinal: usize, item: &Value) -
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         // spec.md#model-part-provenance: a genuine human prompt is conversation.
         provenance: Provenance::Conversational,
         options: empty_options(),
@@ -576,7 +599,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, item: &Val
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         provenance: Provenance::Conversational,
         options,
         kind,
@@ -658,23 +681,11 @@ mod tests {
     const FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
 
     #[test]
-    fn probe_default_finds_pi_sessions_under_home() {
-        let temp = TempDir::new().unwrap();
-        let expected = temp.path().join(".pi").join("agent").join("sessions");
-        std::fs::create_dir_all(&expected).unwrap();
-        let env = Env::with_home(temp.path());
-
-        let probe = PiCodingAgentFactory.probe_default(&env);
-        assert_eq!(
-            probe
-                .as_ref()
-                .and_then(|value| value.get("path"))
-                .and_then(Value::as_str),
-            Some(expected.to_str().unwrap()),
-        );
-
-        std::fs::remove_dir_all(&expected).unwrap();
-        assert!(PiCodingAgentFactory.probe_default(&env).is_none());
+    fn probe_default_finds_pi_sessions_under_home() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &PiCodingAgentFactory,
+            &[".pi", "agent", "sessions"],
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -909,7 +920,7 @@ mod tests {
             .expect("fixture session is readable");
 
         let restored_root = temp.path().join("pi-corpus");
-        write_restored_files(
+        crate::adapter::write_restored_files(
             &restored_root,
             PiCodingAgentFactory.serialize(&session, RestoreFidelity::Foreign)?,
         )?;
@@ -963,20 +974,6 @@ mod tests {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, jsonl_bytes(NAME, records)?)?;
-        Ok(())
-    }
-
-    fn write_restored_files(
-        root: &std::path::Path,
-        files: Vec<RestoredFile>,
-    ) -> anyhow::Result<()> {
-        for file in files {
-            let path = root.join(file.relative_path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, file.bytes)?;
-        }
         Ok(())
     }
 }

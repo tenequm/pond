@@ -29,7 +29,7 @@ use super::{
     },
     extracted_text,
     jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
-    jsonl_bytes, part_id, raw_record,
+    jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
 /// Per-file streaming state that persists across rows of one JSONL file.
@@ -133,25 +133,27 @@ fn serialize_session(
         records.push(record);
     }
 
-    let mut files = vec![RestoredFile {
-        relative_path: claude_relative_path(session),
-        bytes: jsonl_bytes(NAME, &records)?,
-    }];
+    let mut files = vec![RestoredFile::new(
+        claude_relative_path(session),
+        jsonl_bytes(NAME, &records)?,
+        fidelity,
+    )];
     if session.session.parent_session_id.is_some()
         && let Some(meta) = subagent_meta_record(session)
     {
         let mut meta_path = files[0].relative_path.clone();
         meta_path.set_extension("meta.json");
-        files.push(RestoredFile {
-            relative_path: meta_path,
-            bytes: serde_json::to_vec(&meta).map_err(|err| {
+        files.push(RestoredFile::new(
+            meta_path,
+            serde_json::to_vec(&meta).map_err(|err| {
                 AdapterError::schema(
                     NAME,
                     &session.session.id,
                     format!("json encode failed: {err}"),
                 )
             })?,
-        });
+            fidelity,
+        ));
     }
     Ok(files)
 }
@@ -752,7 +754,7 @@ fn text_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         provenance,
         options: empty_options(),
         kind: PartKind::Text { text },
@@ -810,7 +812,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: signature_options(value),
             kind: PartKind::Reasoning {
@@ -821,7 +823,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
@@ -835,7 +837,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
@@ -891,7 +893,7 @@ fn tool_result_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         // spec.md#model-part-provenance: tool output is runtime-produced, not
         // conversation.
         provenance: Provenance::Injected,
@@ -919,8 +921,7 @@ fn file_part(
         .get("media_type")
         .or_else(|| value.get("mime_type"))
         .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+        .map(ToOwned::to_owned);
     let file_name = value
         .get("file_name")
         .or_else(|| value.get("name"))
@@ -944,7 +945,7 @@ fn file_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         provenance,
         options: empty_options(),
         kind: PartKind::File {
@@ -1082,23 +1083,11 @@ mod tests {
     const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
 
     #[test]
-    fn probe_default_finds_claude_projects_under_home() {
-        let temp = TempDir::new().unwrap();
-        let expected = temp.path().join(".claude").join("projects");
-        std::fs::create_dir_all(&expected).unwrap();
-        let env = Env::with_home(temp.path());
-
-        let probe = ClaudeCodeFactory.probe_default(&env);
-        assert_eq!(
-            probe
-                .as_ref()
-                .and_then(|value| value.get("path"))
-                .and_then(Value::as_str),
-            Some(expected.to_str().unwrap()),
-        );
-
-        std::fs::remove_dir_all(&expected).unwrap();
-        assert!(ClaudeCodeFactory.probe_default(&env).is_none());
+    fn probe_default_finds_claude_projects_under_home() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &ClaudeCodeFactory,
+            &[".claude", "projects"],
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]

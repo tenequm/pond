@@ -2537,7 +2537,9 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
                 if let Some(file_name) = file_name {
                     chunks.push(file_name.clone());
                 }
-                chunks.push(media_type.clone());
+                if let Some(media_type) = media_type {
+                    chunks.push(media_type.clone());
+                }
                 if let FileData::Url(uri) = data {
                     chunks.push(uri.clone());
                 }
@@ -4003,7 +4005,7 @@ mod tests {
             make_part(
                 0,
                 PartKind::File {
-                    media_type: "text/plain".to_owned(),
+                    media_type: Some("text/plain".to_owned()),
                     file_name: Some("a.txt".to_owned()),
                     data: FileData::Bytes(b"alpha".to_vec()),
                 },
@@ -4011,7 +4013,7 @@ mod tests {
             make_part(
                 1,
                 PartKind::File {
-                    media_type: "text/plain".to_owned(),
+                    media_type: Some("text/plain".to_owned()),
                     file_name: Some("b.txt".to_owned()),
                     data: FileData::String("beta".to_owned()),
                 },
@@ -4023,7 +4025,7 @@ mod tests {
             make_part(
                 2,
                 PartKind::File {
-                    media_type: "application/octet-stream".to_owned(),
+                    media_type: Some("application/octet-stream".to_owned()),
                     file_name: None,
                     data: FileData::Url("https://example.com/file".to_owned()),
                 },
@@ -4031,7 +4033,7 @@ mod tests {
             make_part(
                 3,
                 PartKind::File {
-                    media_type: "image/png".to_owned(),
+                    media_type: Some("image/png".to_owned()),
                     file_name: Some("c.png".to_owned()),
                     data: FileData::Bytes(vec![0x89, 0x50, 0x4e, 0x47]),
                 },
@@ -4063,7 +4065,7 @@ mod tests {
             provenance: crate::wire::Provenance::Conversational,
             options: ProviderOptions::new(),
             kind: PartKind::File {
-                media_type: "text/plain".to_owned(),
+                media_type: Some("text/plain".to_owned()),
                 file_name: Some("payload.txt".to_owned()),
                 data: FileData::Bytes(b"pond".to_vec()),
             },
