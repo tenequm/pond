@@ -23,7 +23,7 @@ use lance_io::object_store::{
 };
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
-use lance_namespace::error::NamespaceError;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
 use std::{
@@ -1524,12 +1524,7 @@ async fn open_or_create_via_ns(
             return Ok(dataset);
         }
         Err(error) => match &error {
-            lance::Error::Namespace { source, .. }
-                if matches!(
-                    source.downcast_ref::<NamespaceError>(),
-                    Some(NamespaceError::TableNotFound { .. })
-                ) =>
-            {
+            error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
                 // fall through to create
             }
             _ => {
@@ -1556,6 +1551,30 @@ async fn open_or_create_via_ns(
     Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
         .await
         .with_context(|| format!("failed to create table {table_name}"))
+}
+
+fn is_namespace_error_code(error: &lance::Error, code: ErrorCode) -> bool {
+    match error {
+        lance::Error::Namespace { source, .. } => {
+            error_chain_has_namespace_code(source.as_ref(), code)
+        }
+        _ => false,
+    }
+}
+
+fn error_chain_has_namespace_code(
+    error: &(dyn std::error::Error + 'static),
+    code: ErrorCode,
+) -> bool {
+    if let Some(namespace_error) = error.downcast_ref::<NamespaceError>() {
+        return namespace_error.code() == code;
+    }
+    if let Some(lance_error) = error.downcast_ref::<lance::Error>() {
+        return is_namespace_error_code(lance_error, code);
+    }
+    error
+        .source()
+        .is_some_and(|source| error_chain_has_namespace_code(source, code))
 }
 
 fn scanner_with_prefilter(
