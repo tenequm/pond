@@ -5,6 +5,13 @@ projects:
 vcs:
   defaultBranch: 'main'
 
+# .claude/ and .agents/ hold local Claude Code settings and skill symlinks that
+# point outside the repo; moon's vcs walk follows them, so exclude from hashing.
+hasher:
+  ignorePatterns:
+    - '.claude/**/*'
+    - '.agents/**/*'
+
 remote:
   host: 'grpcs://bazel-remote.cascade.fyi:443'
   auth:

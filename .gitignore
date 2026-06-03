@@ -22,7 +22,7 @@ tmp/
 .mcp.json
 /.claude/*local.json
 /.claude
-.agents/skills/
+.agents/
 skills-lock.json
 /benches/corpus/
 
