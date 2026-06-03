@@ -123,10 +123,14 @@ jobs:
       # BEFORE crates.io so a publish can't outrun its own binaries.
       - name: Release binaries to homebrew-tap
         env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        # Explicit globs, not dist/*: the self-hosted runner persists dist/ and
+        # carries stale goreleaser-era files (incl a 0-byte digests.txt that
+        # GitHub rejects with "Bad Content-Length"). pond-* + checksums.txt is
+        # exactly our archives, signatures, and checksums.
         run: |
-          gh release create "pond-v$V" dist/* --repo tenequm/homebrew-tap \
+          gh release create "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap \
             --title "pond v$V" --notes "pond v$V" \
-          || gh release upload "pond-v$V" dist/* --repo tenequm/homebrew-tap --clobber
+          || gh release upload "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap --clobber
 
       # crates.io + git tag + GitHub release on pond.
       - uses: release-plz/action@v0.5
@@ -145,4 +149,4 @@ jobs:
       # Mirror the binaries onto pond's own (private) release.
       - name: Mirror binaries to pond release
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
-        run: gh release upload "v$V" dist/* --repo tenequm/pond --clobber
+        run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
