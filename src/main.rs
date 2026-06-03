@@ -2378,8 +2378,9 @@ fn render_part(part: &ResponsePart) -> anyhow::Result<()> {
             ..
         } => {
             output(&format!(
-                "    {} media_type={media_type} file_name={}",
+                "    {} media_type={} file_name={}",
                 paint("[file]", yellow()),
+                media_type.as_deref().unwrap_or("-"),
                 file_name.as_deref().unwrap_or("-"),
             ))?;
         }

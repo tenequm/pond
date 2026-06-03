@@ -201,7 +201,12 @@ pub enum PartKind {
         text: Option<Extracted<String>>,
     },
     File {
-        media_type: String,
+        /// `None` when the source row carried no MIME hint. Sealed against
+        /// `unwrap_or("application/octet-stream")`-style fallbacks: an absent
+        /// type is faithfully absent, not a synthesized default
+        /// (spec.md#model-no-synthesis).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_name: Option<String>,
         data: FileData,
@@ -430,10 +435,7 @@ impl PartSummary {
                 media_type,
                 file_name,
                 ..
-            } => (
-                Some(file_name.clone().unwrap_or_else(|| media_type.clone())),
-                None,
-            ),
+            } => (file_name.clone().or_else(|| media_type.clone()), None),
             PartKind::ToolCall { name, call_id, .. } => {
                 (name.as_deref().cloned(), call_id.as_deref().cloned())
             }
