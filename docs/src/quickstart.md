@@ -1,33 +1,25 @@
 # Quickstart
 
-Import sessions from local sources, embed them, update indexes, and search:
+1. Install pond (see [Install](./install.md)).
 
-```sh
-pond sync
-pond search "how did we wire up the OCC retry loop"
-```
+2. Ingest your local sessions:
 
-Add pond as an MCP server (pick your client):
+   ```sh
+   pond sync
+   ```
 
-```sh
-claude mcp add -s user pond -- pond mcp   # Claude Code
-codex mcp add pond -- pond mcp            # Codex
-```
+3. Add pond as an MCP server in your agent client:
 
-Run a server:
+   ```sh
+   claude mcp add -s user pond -- pond mcp   # Claude Code
+   codex mcp add pond -- pond mcp            # Codex
+   ```
 
-```sh
-pond serve                         # HTTP on 127.0.0.1:9797
-pond serve --transport stdio       # MCP over stdio
-pond mcp                           # alias for stdio MCP
-```
+4. Now just ask your agent - it searches your history through pond for you:
 
-Fetch a single session or message, or move a whole corpus:
+   - "search my past sessions for how we fixed the OCC retry race"
+   - "what did we decide about the storage substrate, and why?"
+   - "pick up where we left off on the tokenizer experiment"
+   - "find the exact command from when we set up that config"
 
-```sh
-pond get --session-id <id>
-pond export -o snapshot.pond
-pond import snapshot.pond
-```
-
-`pond status` reports row counts, storage size, embedding coverage, and index health.
+pond runs hybrid search across every session from every client - including sessions made in a different tool than the one you're asking in. Re-run `pond sync` to pick up new sessions.
