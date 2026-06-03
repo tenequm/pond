@@ -9,9 +9,10 @@ permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# Concurrency is per-job, not workflow-level: a workflow-level cancel-in-progress
+# also kills an in-flight release mid-publish (after release-plz cuts the tag, the
+# is_release gate is false forever, so an interrupted publish can't auto-recover).
+# So builds stay cancellable while publish-release is made non-cancellable below.
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +21,8 @@ env:
 jobs:
   build-and-test:
     runs-on: [self-hosted, linux, x64]
+    # A newer push to the same ref supersedes an in-flight build.
+    concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
     steps:
       # clean: false persists target/ + caches on the self-hosted disk between
       # runs. moon, cargo/rustc, protoc, and kache are preinstalled on the runner.
@@ -68,6 +71,9 @@ jobs:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
     runs-on: [self-hosted, linux, x64]
+    # Never cancel a release mid-publish: a newer push queues behind this run
+    # instead of killing it between release-plz tagging and the four publishes.
+    concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
     steps:
       - uses: actions/checkout@v6.0.2
         with: { fetch-depth: 0, clean: false, persist-credentials: false }
