@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/tenequm/pond/compare/v0.2.8...v0.2.9) - 2026-06-03
+
+### Added
+
+- *(adapter)* add pi and opencode source adapters
+
+### Fixed
+
+- *(substrate)* handle wrapped namespace table-not-found errors
+- *(adapter)* apply polish-review fixes across opencode, pi, seam, and writer
+- *(adapter)* harden pi and opencode adapters per review
+
+### Other
+
+- *(substrate)* collapse namespace error-chain walker
+- rename pi adapter to pi-coding-agent
+
 ## [0.2.8](https://github.com/tenequm/pond/compare/v0.2.7...v0.2.8) - 2026-06-03
 
 ### Added
