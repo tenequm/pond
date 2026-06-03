@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/tenequm/pond/compare/v0.2.7...v0.2.8) - 2026-06-03
+
+### Added
+
+- *(release)* binstall metadata, minisign signing, and package polish
+
+### Other
+
+- *(moon)* exclude local .claude/.agents tooling from input hashing
+- *(release)* replace goreleaser-Pro with release-plz + moon publishing
+
 ## [0.2.7](https://github.com/tenequm/pond/compare/v0.2.6...v0.2.7) - 2026-06-02
 
 ### Other

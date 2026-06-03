@@ -105,21 +105,32 @@ jobs:
           echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
 
       # Sign the archives so `cargo binstall` can verify them (pubkey is in
-      # Cargo.toml). minisign comes from nixpkgs via the nix installed above.
+      # Cargo.toml). Use a static minisign binary, not `nix shell` - the latter
+      # needs the nix daemon, which this self-hosted runner user can't reach.
       - name: Sign binaries (minisign)
-        run: nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#minisign --command moon run pond:sign-dist
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           V: ${{ steps.ver.outputs.v }}
+        run: |
+          set -euo pipefail
+          curl -sSL https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz -o minisign.tar.gz
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  minisign.tar.gz" | sha256sum -c -
+          tar xzf minisign.tar.gz
+          export PATH="$PWD/minisign-linux/x86_64:$PATH"
+          moon run pond:sign-dist
 
       # Public release on the tap (binaries live here; pond is private). Created
       # BEFORE crates.io so a publish can't outrun its own binaries.
       - name: Release binaries to homebrew-tap
         env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        # Explicit globs, not dist/*: the self-hosted runner persists dist/ and
+        # carries stale goreleaser-era files (incl a 0-byte digests.txt that
+        # GitHub rejects with "Bad Content-Length"). pond-* + checksums.txt is
+        # exactly our archives, signatures, and checksums.
         run: |
-          gh release create "pond-v$V" dist/* --repo tenequm/homebrew-tap \
+          gh release create "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap \
             --title "pond v$V" --notes "pond v$V" \
-          || gh release upload "pond-v$V" dist/* --repo tenequm/homebrew-tap --clobber
+          || gh release upload "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap --clobber
 
       # crates.io + git tag + GitHub release on pond.
       - uses: release-plz/action@v0.5
@@ -138,4 +149,4 @@ jobs:
       # Mirror the binaries onto pond's own (private) release.
       - name: Mirror binaries to pond release
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
-        run: gh release upload "v$V" dist/* --repo tenequm/pond --clobber
+        run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
