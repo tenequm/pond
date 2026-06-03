@@ -20,6 +20,10 @@ Pond keeps every AI conversation you've ever had intact and searchable, and lets
 
 One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
 
+Current automatically synced agent clients:
+- Claude Code CLI
+- Codex CLI
+
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md).
 
 ## Table of Contents

@@ -11,12 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(release)* binstall metadata, minisign signing, and package polish
+- *(mcp)* enrich the tool surface for better agent discoverability
+- *(docs)* add an mdBook documentation site
+- *(release)* cargo-binstall metadata and richer crates.io package fields, so prebuilt binaries install via `cargo binstall pond-db`
+
+### Changed
+
+- *(release)* replace goreleaser-Pro with a release-plz + moon publishing pipeline (crates.io, Homebrew tap, NUR)
 
 ### Other
 
 - *(moon)* exclude local .claude/.agents tooling from input hashing
-- *(release)* replace goreleaser-Pro with release-plz + moon publishing
 
 ## [0.2.7](https://github.com/tenequm/pond/compare/v0.2.6...v0.2.7) - 2026-06-02
 
