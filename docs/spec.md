@@ -475,7 +475,7 @@ Each adapter has a round-trip codec test: parse a committed fixture to canonical
 
 ### 6.9 v1 adapters
 
-Claude Code and Codex, each with both faces, including the cross pairs. Per-source extraction detail - how each adapter resolves `project`, what its `source_agent` brand is, its on-disk layout - lives in that adapter's own code, which is its documentation.
+Claude Code, Codex, opencode, and pi. Claude Code and Codex carry both faces including the foreign cross pairs; opencode and pi carry native restore (round-trip tested per Section 6.8) plus best-effort foreign serialization. opencode is the first source that is not one JSONL file per session - a content-addressed `session`/`message`/`part` split tree - so it drives the read seam directly rather than through the shared JSONL helper. Per-source extraction detail - how each adapter resolves `project`, what its `source_agent` brand is, its on-disk layout - lives in that adapter's own code, which is its documentation.
 
 ---
 

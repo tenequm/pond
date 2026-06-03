@@ -32,6 +32,8 @@ mod codex_cli;
 mod discovery;
 pub mod extract;
 mod jsonl;
+mod opencode;
+mod pi;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
@@ -40,6 +42,8 @@ pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
 };
+pub use opencode::{OpencodeAdapter, OpencodeFactory};
+pub use pi::{PiAdapter, PiFactory};
 
 /// Stateless face of an adapter type: how the registry knows about it without
 /// instantiating it. One implementation per known format, registered in
@@ -319,7 +323,12 @@ impl std::error::Error for AdapterError {
 /// adds one `&Factory` here plus one file under `src/adapter/`. Order is the
 /// order discovery presents to the operator.
 pub fn registry() -> &'static [&'static dyn AdapterFactory] {
-    &[&ClaudeCodeFactory, &CodexCliFactory]
+    &[
+        &ClaudeCodeFactory,
+        &CodexCliFactory,
+        &OpencodeFactory,
+        &PiFactory,
+    ]
 }
 
 /// Look up a factory by name. Returns `None` for unknown names; callers
