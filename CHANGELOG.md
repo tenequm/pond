@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.9](https://github.com/tenequm/pond/compare/v0.2.8...v0.2.9) - 2026-06-03
+## [0.3.0](https://github.com/tenequm/pond/compare/v0.2.8...v0.3.0) - 2026-06-03
 
 ### Added
 
