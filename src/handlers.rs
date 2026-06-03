@@ -110,7 +110,7 @@ mod ingest_handler {
         Partial {
             dropped_events: usize,
             /// First drop's error message; subsequent drops counted, not
-            /// retained. Full detail at `POND_LOG=pond=debug`.
+            /// retained. Full detail at `-vv` (debug) verbosity.
             first_drop_reason: Option<String>,
         },
         Skipped {
@@ -210,8 +210,8 @@ mod ingest_handler {
         // order against `validator.flush()`'s outcome stream.
         let mut pending_dones: std::collections::VecDeque<PendingDone> =
             std::collections::VecDeque::new();
-        // Perf probe accumulators. Logged once at the end of the run under
-        // `POND_LOG=pond=info` so a single sync emits one tidy summary plus
+        // Perf probe accumulators. Logged once at the end of the run at `-v`
+        // (info) verbosity so a single sync emits one tidy summary plus
         // per-merge_insert lines from substrate. Visible only at INFO; never
         // affects normal output.
         let mut decode_total = std::time::Duration::ZERO;

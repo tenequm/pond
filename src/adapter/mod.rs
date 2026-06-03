@@ -37,7 +37,10 @@ mod pi_coding_agent;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
-pub use discovery::{Candidate, discover, prompt_and_persist};
+pub use discovery::{
+    Candidate, PromptOutcome, discover, persist_accept, persist_decline, probe_unconfigured,
+    prompt_and_persist, prompt_each,
+};
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
@@ -187,7 +190,7 @@ pub enum SkipReason {
     Fresh,
     /// File produced no importable session (empty `.jsonl`, sidecar-only rows,
     /// or an unextractable header). Benign: counted, never an error or a
-    /// per-event drop. The underlying cause is logged at `POND_LOG=debug`.
+    /// per-event drop. The underlying cause is logged at `-vv` (debug) verbosity.
     Empty,
 }
 

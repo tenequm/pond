@@ -1630,53 +1630,6 @@ impl Store {
         self.handle.table_sizes().await
     }
 
-    /// Histogram of Unicode script classes in `messages.search_text`, computed
-    /// from a sample of up to `max_messages` non-null rows. Returned classes
-    /// are sorted descending by character count. Lets `pond status` tell an
-    /// agent whether the corpus is monolingual or mixed - the agent then knows
-    /// whether bilingual querying is worth attempting (cross-lingual recall is
-    /// a caller-layer concern; pond does not translate internally).
-    pub async fn text_script_histogram(&self, max_messages: usize) -> Result<Vec<(String, usize)>> {
-        use std::collections::HashMap;
-        let filter = Predicate::IsNotNull("search_text");
-        let projection: &[&str] = &["search_text"];
-        let scanner = self
-            .handle
-            .scan(
-                Table::Messages,
-                ScanOpts::with_predicate_and_projection(&filter, projection),
-            )
-            .await?;
-        let mut batches = scanner
-            .try_into_stream()
-            .await
-            .context("failed to open messages stream for script histogram")?;
-        let mut counts: HashMap<&'static str, usize> = HashMap::new();
-        let mut sampled = 0usize;
-        'outer: while let Some(batch) = batches.next().await {
-            let batch = batch?;
-            for row in 0..batch.num_rows() {
-                if sampled >= max_messages {
-                    break 'outer;
-                }
-                if let Some(text) = string(&batch, "search_text", row)? {
-                    for ch in text.chars() {
-                        if let Some(class) = classify_script(ch) {
-                            *counts.entry(class).or_default() += 1;
-                        }
-                    }
-                    sampled += 1;
-                }
-            }
-        }
-        let mut histogram: Vec<(String, usize)> = counts
-            .into_iter()
-            .map(|(name, count)| (name.to_owned(), count))
-            .collect();
-        histogram.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        Ok(histogram)
-    }
-
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
         let batch = self
             .handle
@@ -1895,10 +1848,31 @@ pub enum IngestEvent {
 /// The shape is set by spec.md#adapter-integrity-event-ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
-    /// Rows actually written to Lance.
+    /// Rows actually written to Lance, summed across all three tables.
+    /// Use the per-table fields below for user-facing counts; this stays
+    /// for `accepted()` and existing wire callers.
     pub inserted: usize,
     /// Rows that already existed (merge_insert no-op match).
     pub matched: usize,
+    /// Session rows inserted this pass.
+    pub sessions_inserted: usize,
+    /// Message rows inserted this pass (total - includes tool calls,
+    /// tool results, and other non-searchable messages).
+    pub messages_inserted_total: usize,
+    /// Subset of `messages_inserted_total` whose `search_text` is non-null
+    /// (eligible for FTS + semantic indexing). The user-facing "messages"
+    /// count in `pond sync` / `pond status` reads this field.
+    pub messages_inserted_searchable: usize,
+    /// Part rows inserted this pass.
+    pub parts_inserted: usize,
+    /// Session rows already-present (merge_insert matched).
+    pub sessions_matched: usize,
+    /// Message rows already-present (merge_insert matched), total.
+    pub messages_matched_total: usize,
+    /// Subset of `messages_matched_total` with `search_text`.
+    pub messages_matched_searchable: usize,
+    /// Part rows already-present.
+    pub parts_matched: usize,
     /// Events the validator dropped under per-event-drop policy (ordering
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
@@ -1920,7 +1894,7 @@ pub struct IngestSummary {
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
-    /// the underlying cause is logged at `POND_LOG=debug`.
+    /// the underlying cause is logged at `-vv` (debug) verbosity.
     pub skipped_empty: usize,
     /// Sessions short-circuited via the per-session staleness skip
     /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
@@ -1966,8 +1940,34 @@ impl IngestSummary {
     pub fn add_outcomes(&mut self, outcomes: &[RowOutcome]) {
         for outcome in outcomes {
             match outcome.status {
-                OutcomeStatus::Inserted => self.inserted += 1,
-                OutcomeStatus::Matched => self.matched += 1,
+                OutcomeStatus::Inserted => {
+                    self.inserted += 1;
+                    match outcome.kind {
+                        "session" => self.sessions_inserted += 1,
+                        "message" => {
+                            self.messages_inserted_total += 1;
+                            if outcome.searchable {
+                                self.messages_inserted_searchable += 1;
+                            }
+                        }
+                        "part" => self.parts_inserted += 1,
+                        _ => {}
+                    }
+                }
+                OutcomeStatus::Matched => {
+                    self.matched += 1;
+                    match outcome.kind {
+                        "session" => self.sessions_matched += 1,
+                        "message" => {
+                            self.messages_matched_total += 1;
+                            if outcome.searchable {
+                                self.messages_matched_searchable += 1;
+                            }
+                        }
+                        "part" => self.parts_matched += 1,
+                        _ => {}
+                    }
+                }
                 OutcomeStatus::Error => {
                     // Session-level rejection: exactly one session-kind Error
                     // outcome (see `error_outcomes_for_substream`). Per-event
@@ -2002,6 +2002,11 @@ pub struct RowOutcome {
     pub pk: Value,
     pub status: OutcomeStatus,
     pub error: Option<RowError>,
+    /// True iff `kind == "message"` AND the underlying row carries
+    /// `search_text`. Drives `IngestSummary::messages_inserted_searchable`
+    /// so the CLI can show "searchable" message deltas distinct from raw
+    /// inserts. Always false for session/part rows.
+    pub searchable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2165,6 +2170,7 @@ impl IngestValidator {
                     reason: None,
                     reason_key: Some(DROP_REASON_EMPTY_SOURCE_AGENT),
                 }),
+                searchable: false,
             }]);
         }
         if trimmed.len() != session.source_agent.len() {
@@ -2186,6 +2192,7 @@ impl IngestValidator {
                     reason: None,
                     reason_key: Some(DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION),
                 }),
+                searchable: false,
             }]);
         }
 
@@ -2370,6 +2377,7 @@ fn error_outcome(
             reason: None,
             reason_key: Some(reason_key),
         }),
+        searchable: false,
     }
 }
 
@@ -2397,6 +2405,7 @@ fn error_outcomes_for_substream(
             reason,
             reason_key: Some(reason_key),
         }),
+        searchable: false,
     }]
 }
 
@@ -2415,20 +2424,28 @@ fn success_outcomes_for_substream(
         "session",
         Value::String(session.id.clone()),
         status,
+        false,
     ));
     for buffered in messages {
         let pk = Value::Array(vec![
             Value::String(buffered.message.session_id().to_owned()),
             Value::String(buffered.message.id().to_owned()),
         ]);
-        outcomes.push(success_outcome(buffered.index, "message", pk, status));
+        let searchable = buffered.search_text.is_some();
+        outcomes.push(success_outcome(
+            buffered.index,
+            "message",
+            pk,
+            status,
+            searchable,
+        ));
         for part in &buffered.parts {
             let part_pk = Value::Array(vec![
                 Value::String(part.part.session_id.clone()),
                 Value::String(part.part.message_id.clone()),
                 Value::String(part.part.id.clone()),
             ]);
-            outcomes.push(success_outcome(part.index, "part", part_pk, status));
+            outcomes.push(success_outcome(part.index, "part", part_pk, status, false));
         }
     }
     outcomes
@@ -2439,6 +2456,7 @@ fn success_outcome(
     kind: &'static str,
     pk: Value,
     status: UpsertStatus,
+    searchable: bool,
 ) -> RowOutcome {
     let status = match status {
         UpsertStatus::Inserted => OutcomeStatus::Inserted,
@@ -2450,6 +2468,7 @@ fn success_outcome(
         pk,
         status,
         error: None,
+        searchable,
     }
 }
 
@@ -2798,11 +2817,11 @@ pub(crate) const PARTS: &str = "parts";
 
 /// FTS index name on `messages.search_text`. Stable so status and index
 /// creation name the same index.
-pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
+pub const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// IVF_PQ index name on `messages.vector` (spec.md#search). Stable so the
 /// activation check and index creation name the same index.
-pub(crate) const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
+pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 
 /// IVF_PQ tuning constants (spec.md#search):
 /// - num_bits = 8 (256 centroids per PQ subspace; needs >= 256 vectors)
@@ -3556,33 +3575,6 @@ fn uint64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .with_context(|| format!("column {name} is not UInt64"))
-}
-
-/// Map a character to its Unicode script class name, or `None` for
-/// non-alphabetic characters (digits, punctuation, whitespace). Used by
-/// `Store::text_script_histogram` to surface corpus language mix in
-/// `pond status`. The ranges cover the scripts most likely to appear in
-/// agent-session transcripts; everything else collapses to `"Other"` so the
-/// histogram stays bounded.
-fn classify_script(ch: char) -> Option<&'static str> {
-    if !ch.is_alphabetic() {
-        return None;
-    }
-    let code = ch as u32;
-    match code {
-        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some("Latin"),
-        0x0370..=0x03FF => Some("Greek"),
-        0x0400..=0x052F => Some("Cyrillic"),
-        0x0590..=0x05FF => Some("Hebrew"),
-        0x0600..=0x06FF | 0x0750..=0x077F => Some("Arabic"),
-        0x0900..=0x097F => Some("Devanagari"),
-        0x0E00..=0x0E7F => Some("Thai"),
-        0x3040..=0x309F => Some("Hiragana"),
-        0x30A0..=0x30FF => Some("Katakana"),
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF => Some("Han"),
-        0xAC00..=0xD7AF | 0x1100..=0x11FF => Some("Hangul"),
-        _ => Some("Other"),
-    }
 }
 
 pub(crate) fn string(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>> {

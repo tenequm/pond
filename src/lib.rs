@@ -103,6 +103,15 @@ pub mod output {
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "{message}").context("failed to write command output")
     }
+
+    /// Stderr counterpart to [`line`]. Per rust-cli/book stdout-vs-stderr
+    /// discipline, anything that is not "the result" (progress, prompts,
+    /// disclaimers, hints, interim status) belongs here so piping stdout to a
+    /// file or another command yields the machine-readable view alone.
+    pub fn line_err(message: &str) -> anyhow::Result<()> {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "{message}").context("failed to write command meta")
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

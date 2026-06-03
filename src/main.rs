@@ -22,11 +22,12 @@ use pond::{
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
         AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, LanceArchiveCounts,
-        LanceArchiveExport, LanceArchiveImport, OptimizeOutcome, RowTotals, Store,
+        LanceArchiveExport, LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX,
+        OptimizeOutcome, RowTotals, Store,
     },
     substrate::{
-        IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableOptimizeOutcome,
-        TableSizes,
+        IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes,
+        index_lag_threshold,
     },
     transport::{self, AppState},
     wire::{
@@ -137,6 +138,11 @@ fn parse_data_dir(input: &str) -> anyhow::Result<Url> {
 #[derive(Debug, Parser)]
 #[command(name = "pond", version, about = "Session storage and retrieval")]
 struct Cli {
+    /// `-v` / `-vv` / `-vvv` raise the tracing log level; `-q` / `-qq` lower
+    /// it. The display layout itself is independent of this knob - see
+    /// per-command flags like `pond status --adapters` for that.
+    #[command(flatten)]
+    verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::WarnLevel>,
     #[command(subcommand)]
     command: Command,
 }
@@ -149,9 +155,11 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Include detailed per-index and per-project rows.
+        /// Show one section per adapter, including the per-project tables
+        /// and per-intent index detail. Implies `--include-subagents` so the
+        /// rollup reconciles with the data-dir row counts above.
         #[arg(long)]
-        verbose: bool,
+        adapters: bool,
         /// Show one section per `source_agent` (including sub-agents like
         /// `claude-code/general-purpose`). Default rolls sessions up to the
         /// main agent only.
@@ -178,6 +186,10 @@ enum Command {
         /// Re-embed stale rows after an embedding model change.
         #[arg(long)]
         force_embed: bool,
+        /// Auto-accept every probe prompt; non-interactive runs use this to
+        /// enable freshly-detected adapters without a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
@@ -490,36 +502,46 @@ enum OutputFormat {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    human_panic::setup_panic!();
 
     let cli = Cli::parse();
+    init_tracing(cli.verbose.tracing_level_filter());
+
     match cli.command {
         Command::Status {
             data_dir,
             config,
-            verbose,
+            adapters,
             include_subagents,
         } => {
+            // --adapters needs sub-agents broken out so the per-adapter
+            // rollup reconciles with the data-dir row counts above.
+            let include_subagents = include_subagents || adapters;
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store =
                 Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
                     .await?;
-            let sizes = store.table_sizes().await?;
-            render_status_header(&data_dir, &sizes)?;
-            output(&format!(
-                "{} checking corpus, embeddings, indexes...",
-                pond::output::paint("status:", pond::output::dim()),
-            ))?;
-            // Sample is bounded so this remains O(sample) and `pond status`
-            // stays sub-second on a million-message corpus.
-            let (stats, index_status, embedding, scripts) = tokio::try_join!(
+            let (sizes, stats, index_status, embedding) = tokio::try_join!(
+                store.table_sizes(),
                 store.corpus_stats(include_subagents),
                 store.index_status(),
                 store.embedding_progress(),
-                store.text_script_histogram(2000),
             )?;
-            render_status_checks(&stats, &index_status, embedding, &scripts, verbose)?;
+            render_status_header(&data_dir, &sizes, &stats.totals)?;
+            render_status_checks(&stats, &index_status, embedding, adapters)?;
+            let probes = adapter::probe_unconfigured(&loaded.sources);
+            if !probes.is_empty() {
+                let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
+                output_err(&pond::output::paint(
+                    &format!(
+                        "hint     {} unconfigured adapter(s): {} - run `pond sync` to enable",
+                        probes.len(),
+                        names.join(", "),
+                    ),
+                    pond::output::dim(),
+                ))?;
+            }
         }
         Command::Sync {
             adapter,
@@ -528,12 +550,13 @@ async fn main() -> anyhow::Result<()> {
             only,
             skip,
             force_embed,
+            yes,
             data_dir,
             config,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
-            let loaded = Config::load(&config_file)?;
+            let mut loaded = Config::load(&config_file)?;
             let store =
                 open_store_with_spinner(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
                     .await?;
@@ -544,15 +567,31 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let mut summary = SyncRunSummary::default();
+            let did_archive_import = import_from.is_some();
+            if stages.import
+                && !did_archive_import
+                && let Some(name) = adapter.as_deref()
+            {
+                maybe_reenable_positional(&mut loaded, &config_file, name, yes).await?;
+            }
             if stages.import {
                 if let Some(path) = import_from {
                     summary.archive_import = Some(import_pond_archive(&store, &path).await?);
                 } else {
                     summary.ingest = Some(
-                        run_import_stage(&store, &loaded, &config_file, adapter, source_dir)
-                            .await?,
+                        run_import_stage(
+                            &store,
+                            &loaded,
+                            &config_file,
+                            adapter.clone(),
+                            source_dir,
+                        )
+                        .await?,
                     );
                 }
+            }
+            if stages.import && adapter.is_none() && !did_archive_import {
+                handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
             }
             if stages.embed {
                 run_embed_stage(&store, force_embed).await?;
@@ -560,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
             if stages.update_indexes {
                 run_update_indexes_stage(&store).await?;
             }
-            render_sync_summary(&summary)?;
+            render_sync_summary(&store, &summary).await?;
         }
         Command::Embed {
             data_dir,
@@ -854,22 +893,138 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
     // Lance's IVF_PQ builder warns once per empty centroid during merge
     // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
     // It already handles the case - records a zero-sized partition and continues -
     // so the warning is benign log noise during index maintenance.
-    // POND_LOG / RUST_LOG still override this default.
-    let filter = EnvFilter::try_from_env("POND_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("warn,lance::index::vector::builder=error"));
-
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("{cli_level},lance::index::vector::builder=error"))
+    });
     fmt().with_env_filter(filter).with_writer(io::stderr).init();
 }
 
 #[allow(clippy::print_stdout)]
 fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
+}
+
+fn output_err(message: &str) -> anyhow::Result<()> {
+    pond::output::line_err(message)
+}
+
+/// Partition `outcomes` into accepts/declines, persist both, and refresh
+/// `loaded` from disk. Shared between the post-import probe sweep and the
+/// positional re-enable path.
+fn apply_outcomes(
+    loaded: &mut Config,
+    config_file: &Path,
+    outcomes: &[adapter::PromptOutcome],
+) -> anyhow::Result<usize> {
+    let accepts: Vec<adapter::Candidate> = outcomes
+        .iter()
+        .filter(|o| o.enable)
+        .map(|o| o.candidate.clone())
+        .collect();
+    let declines: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.enable)
+        .map(|o| o.candidate.name.as_str())
+        .collect();
+    if !accepts.is_empty() {
+        adapter::persist_accept(config_file, &accepts)?;
+    }
+    if !declines.is_empty() {
+        adapter::persist_decline(config_file, &declines)?;
+    }
+    if !accepts.is_empty() || !declines.is_empty() {
+        *loaded = Config::load(config_file)?;
+    }
+    Ok(accepts.len())
+}
+
+/// `pond sync <name>` positional override. When `<name>` is currently
+/// absent or `enabled = false`, re-probe just that one adapter and prompt
+/// (or auto-accept on `--yes`). Used to re-enable a previously-declined
+/// adapter without editing `config.toml` by hand.
+async fn maybe_reenable_positional(
+    loaded: &mut Config,
+    config_file: &Path,
+    name: &str,
+    auto_accept: bool,
+) -> anyhow::Result<()> {
+    use serde_json::Value;
+    use std::io::IsTerminal;
+    let present = loaded.sources.get(name);
+    let is_enabled = present
+        .and_then(|b| b.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if is_enabled {
+        return Ok(());
+    }
+    let candidates = adapter::discover(Some(name));
+    if candidates.is_empty() {
+        bail!("no `[sources.{name}]` and probe returned nothing; add the entry manually");
+    }
+    if !auto_accept && !std::io::stdin().is_terminal() {
+        bail!(
+            "source [{name}] is disabled and stdin is not a terminal; pass --yes or re-run on a TTY"
+        );
+    }
+    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
+    let accepted = apply_outcomes(loaded, config_file, &outcomes)?;
+    if accepted == 0 {
+        bail!("declined; nothing to sync");
+    }
+    Ok(())
+}
+
+/// After `pond sync`'s import stage, prompt the operator about any
+/// freshly-detectable adapter that has no `[sources.<name>]` section yet.
+/// `enabled = true`/`enabled = false` is persisted either way so the
+/// decision sticks; only the positional `pond sync <name>` re-prompts a
+/// previously-declined adapter. Non-TTY runs (and `--yes` runs without a
+/// TTY) emit a one-line stderr hint and continue without writing - the
+/// operator can re-run on a TTY to opt in/out.
+async fn handle_probe_prompt(
+    store: &Store,
+    loaded: &mut Config,
+    config_file: &Path,
+    auto_accept: bool,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let candidates = adapter::probe_unconfigured(&loaded.sources);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let interactive = std::io::stdin().is_terminal();
+    if !interactive && !auto_accept {
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        output_err(&pond::output::paint(
+            &format!(
+                "hint     {} unconfigured adapter(s): {} - run `pond sync` on a TTY to enable",
+                candidates.len(),
+                names.join(", "),
+            ),
+            pond::output::dim(),
+        ))?;
+        return Ok(());
+    }
+    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
+    apply_outcomes(loaded, config_file, &outcomes)?;
+    for outcome in &outcomes {
+        if outcome.enable && outcome.sync_now {
+            let _ = run_import_stage(
+                store,
+                loaded,
+                config_file,
+                Some(outcome.candidate.name.clone()),
+                None,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Open the store with an indicatif spinner ticking while
@@ -1057,23 +1212,20 @@ async fn run_embed_stage_with_limit(
         None => backlog,
     };
     if bar_total == 0 && stale == 0 {
-        // Nothing to embed: one line, no bar, no device (embedder not loaded).
-        output(&format!(
-            "{}  0 new \u{b7} {}/{} \u{b7} {}",
-            pond::output::paint("embed:", pond::output::dim()),
-            format_thousands(progress.embedded as u64),
-            format_thousands(progress.total as u64),
-            short_model(progress.model),
-        ))?;
+        // No backlog and no stale rows: stage is silent. The summary's
+        // `indexes` line will confirm "semantic ready" downstream.
         return Ok(EmbedSummary::default());
     }
 
     let embedder = CandleEmbedder::load()?;
     let device = embedder.device().to_owned();
-    let bar = ProgressBar::new(bar_total as u64);
+    let bar = ProgressBar::with_draw_target(
+        Some(bar_total as u64),
+        indicatif::ProgressDrawTarget::stderr_with_hz(8),
+    );
     bar.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} embed [{elapsed_precise}] [{bar:24}] {pos}/{len} ({percent}%) {per_sec} eta {eta}",
+            "semantic indexing [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -1090,11 +1242,15 @@ async fn run_embed_stage_with_limit(
             std::process::exit(130);
         });
     }
+    let started = std::time::Instant::now();
     let bar_for_callback = bar.clone();
     let mut worker = EmbedWorker::new(store, &embedder)
         .with_cancel(cancel)
         .with_progress(move |progress: BatchProgress| {
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            let rate = progress.total_messages as f64 / secs;
             bar_for_callback.set_position(progress.total_messages as u64);
+            bar_for_callback.set_message(format!("{rate:.0} msgs/s"));
         });
     if force {
         worker = worker.include_stale();
@@ -1104,21 +1260,19 @@ async fn run_embed_stage_with_limit(
     }
     let summary = worker.run().await?;
     bar.finish_and_clear();
-    let covered = progress.embedded + summary.messages;
-    output(&format!(
-        "{}  {} new \u{b7} {}/{} \u{b7} {} ({}){}",
-        pond::output::paint("embed:", pond::output::dim()),
-        format_thousands(summary.messages as u64),
-        format_thousands(covered as u64),
-        format_thousands(progress.total as u64),
-        short_model(progress.model),
-        device,
-        if summary.cancelled {
-            " (interrupted)"
+    if summary.messages > 0 {
+        let label = if summary.cancelled {
+            "semantic indexing (interrupted)"
         } else {
-            ""
-        },
-    ))?;
+            "semantic indexing"
+        };
+        output(&format!(
+            "{}  +{} indexed  ({})",
+            pond::output::paint(label, pond::output::dim()),
+            format_thousands(summary.messages as u64),
+            device,
+        ))?;
+    }
     Ok(summary)
 }
 
@@ -1126,65 +1280,73 @@ async fn run_update_indexes_stage(store: &Store) -> anyhow::Result<OptimizeOutco
     let (progress, bar) = optimize_progress_bar();
     let outcome = store.optimize_indices(Some(progress), None).await?;
     bar.finish_and_clear();
-    let per_table = outcome
-        .tables
-        .iter()
-        .map(|entry| format!("{} {}", entry.table.as_str(), index_entry_status(entry)))
-        .collect::<Vec<_>>()
-        .join(" \u{b7} ");
-    output(&format!(
-        "{}  {}",
-        pond::output::paint("index:", pond::output::dim()),
-        per_table,
-    ))?;
+    // No `index:` recap line: the `render_sync_summary` (or `pond status`)
+    // `indexes  text + semantic ready` line is the single source of truth
+    // for index health. Hints below still fire on real conflicts / failures.
     render_optimize_hints(&outcome)?;
     Ok(outcome)
 }
 
-/// Final one-line import recap. Embed and index each print their own concise
-/// line during their stage, so this is import-only: `sync: N new . M unchanged
-/// . K empty . D dropped`, with `errors` appended only when nonzero.
-fn render_sync_summary(summary: &SyncRunSummary) -> anyhow::Result<()> {
+/// Final recap of a `pond sync` run. Three-line shape:
+///
+/// ```text
+///
+/// indexes   text + semantic ready
+/// added     +44 sessions, +2,337 messages
+/// stored    8,460 sessions, 172,710 messages
+///
+/// (messages = searchable text rows; use -v for full counts)
+/// ```
+///
+/// `added` is suppressed when both deltas are zero (a no-op sync still
+/// always prints the `stored` line so an operator can confirm corpus
+/// state without re-running `pond status`). The trailing disclaimer
+/// goes to stderr per the rust-cli/book result-vs-meta discipline.
+async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
-    let line = if let Some(ingest) = &summary.ingest {
-        let unchanged = ingest.matched + ingest.skipped_fresh;
-        let dropped = ingest.dropped_events + ingest.dropped_sessions;
-        let errors = ingest.skipped_files + ingest.storage_errors;
-        let mut line = format!(
-            "{} new \u{b7} {} unchanged \u{b7} {} empty \u{b7} {} dropped",
-            format_thousands(ingest.inserted as u64),
-            format_thousands(unchanged as u64),
-            format_thousands(ingest.skipped_empty as u64),
-            format_thousands(dropped as u64),
-        );
-        if errors > 0 {
-            line.push_str(&format!(
-                " \u{b7} {} errors",
-                format_thousands(errors as u64)
-            ));
-        }
-        Some(line)
+    let (sessions_added, messages_added) = if let Some(ingest) = &summary.ingest {
+        (
+            ingest.sessions_inserted as u64,
+            ingest.messages_inserted_searchable as u64,
+        )
+    } else if let Some(imported) = &summary.archive_import {
+        (
+            imported.inserted.sessions as u64,
+            imported.inserted.messages as u64,
+        )
     } else {
-        summary.archive_import.as_ref().map(|imported| {
-            format!(
-                "{} rows imported from archive \u{b7} {} new",
-                format_thousands(
-                    (imported.rows.sessions + imported.rows.messages + imported.rows.parts) as u64,
-                ),
-                format_thousands(
-                    (imported.inserted.sessions
-                        + imported.inserted.messages
-                        + imported.inserted.parts) as u64,
-                ),
-            )
-        })
+        (0, 0)
     };
-    // No import stage ran (e.g. `--only embed`): the embed/index stages already
-    // printed their own lines, so there's nothing left to recap.
-    if let Some(line) = line {
-        output(&format!("{}  {line}", paint("sync:", dim())))?;
+
+    let (index_status, embedding, stats) = tokio::try_join!(
+        store.index_status(),
+        store.embedding_progress(),
+        store.corpus_stats(false),
+    )?;
+    let health = classify_index_health(&index_status, index_lag_threshold(), &embedding);
+
+    output("")?;
+    output(&render_indexes_line(&health))?;
+    if sessions_added + messages_added > 0 {
+        output(&format!(
+            "{}     +{} sessions, +{} messages",
+            paint("added", dim()),
+            format_thousands(sessions_added),
+            format_thousands(messages_added),
+        ))?;
     }
+    output(&format!(
+        "{}    {} sessions, {} messages",
+        paint("stored", dim()),
+        format_thousands(stats.totals.sessions),
+        format_thousands(embedding.total as u64),
+    ))?;
+    output_err("")?;
+    output_err(&paint(
+        "(messages = searchable text rows; use -v for full counts)",
+        dim(),
+    ))?;
     Ok(())
 }
 
@@ -1399,7 +1561,7 @@ async fn sync_with_progress(
         ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
     bar.set_style(
         ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} \u{b7} {wide_msg}",
+            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} sessions  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -1411,7 +1573,6 @@ async fn sync_with_progress(
     let mut messages: u64 = 0;
     let mut errors: u64 = 0;
     let mut drops: u64 = 0;
-    let mut skipped_empty: u64 = 0;
     let started = std::time::Instant::now();
     let bar_ref = &bar;
 
@@ -1467,7 +1628,10 @@ async fn sync_with_progress(
                     optional_reason = None;
                 }
                 SyncStatus::Empty => {
-                    skipped_empty += 1;
+                    // Sidecar/metadata files shrink the denominator so the
+                    // bar lands at `N/N sessions` instead of leaving a gap.
+                    let len = bar_ref.length().unwrap_or(0);
+                    bar_ref.set_length(len.saturating_sub(1));
                     status_label = "empty";
                     dropped_count = 0;
                     optional_reason = None;
@@ -1477,7 +1641,7 @@ async fn sync_with_progress(
             // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
             // the bulk are routine successes already counted by the bar's
             // pos/len/msg counters. `pond::sync` at INFO still carries the
-            // full per-session detail for `POND_LOG=pond::sync=info` runs.
+            // full per-session detail at `-v` verbosity.
             if !matches!(
                 outcome.status,
                 SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
@@ -1507,7 +1671,10 @@ async fn sync_with_progress(
                     "session done"
                 ),
             }
-            bar_ref.inc(1);
+            if !matches!(outcome.status, SyncStatus::Empty) {
+                // Empty already shrunk `len`; ticking `pos` would over-count.
+                bar_ref.inc(1);
+            }
             bar_ref.set_message(format_bar_message(
                 messages,
                 drops,
@@ -1518,22 +1685,35 @@ async fn sync_with_progress(
     })
     .await?;
 
-    let mut tail = format!("{} msgs", format_thousands(messages));
-    if skipped_empty > 0 {
-        tail.push_str(&format!(
-            " \u{b7} {} empty",
-            format_thousands(skipped_empty)
-        ));
-    }
-    if drops > 0 {
-        tail.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
-    }
-    if errors > 0 {
-        tail.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
-    }
-    tail.push_str("   done");
+    let tail = format_sync_outcome(&summary, drops, errors);
     bar.finish_with_message(tail);
     Ok(summary)
+}
+
+/// Frozen per-adapter bar tail after `sync_with_progress` finishes. Replaces
+/// the in-flight throughput display (`N msgs / X msgs/s`) with the outcome
+/// counts so scroll-back tells the story of what landed, not what was
+/// decoded. Empty/sidecar files are intentionally not surfaced here -
+/// per design they are part of normal operation, not a signal to the user.
+fn format_sync_outcome(summary: &IngestSummary, drops: u64, errors: u64) -> String {
+    let new_sessions = summary.sessions_inserted as u64;
+    let new_messages = summary.messages_inserted_searchable as u64;
+    let mut tail = if new_sessions == 0 && new_messages == 0 {
+        "up to date".to_owned()
+    } else {
+        format!(
+            "+{} sessions (+{} messages)",
+            format_thousands(new_sessions),
+            format_thousands(new_messages),
+        )
+    };
+    if drops > 0 {
+        tail.push_str(&format!("  {} dropped", format_thousands(drops)));
+    }
+    if errors > 0 {
+        tail.push_str(&format!("  {} err", format_thousands(errors)));
+    }
+    tail
 }
 
 /// One greppable per-session log line. Examples:
@@ -1575,26 +1755,19 @@ fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration)
     let secs = elapsed.as_secs_f64().max(0.001);
     let msg_per_sec = (messages as f64) / secs;
     let mut out = format!(
-        "{} msgs \u{b7} {:.0} msg/s",
+        "{} msgs  {:.0} msgs/s",
         format_thousands(messages),
         msg_per_sec,
     );
     // Only surface the trouble counters once they're nonzero; a clean run
     // stays short enough to fit the bar without truncation.
     if drops > 0 {
-        out.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
+        out.push_str(&format!("  {} dropped", format_thousands(drops)));
     }
     if errors > 0 {
-        out.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
+        out.push_str(&format!("  {} err", format_thousands(errors)));
     }
     out
-}
-
-/// Display form of an embedding model id: the segment after the last `/`, so
-/// `intfloat/multilingual-e5-small` -> `multilingual-e5-small`. Org prefixes
-/// add width without information for the human-facing sync lines.
-fn short_model(id: &str) -> &str {
-    id.rsplit('/').next().unwrap_or(id)
 }
 
 /// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
@@ -1660,8 +1833,8 @@ async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
 
 /// Build the spinner + progress callback pair for index maintenance.
 /// `PhaseStart` updates the spinner so the operator sees what's running live;
-/// per-phase timing lands at `POND_LOG=pond=debug` rather than the default
-/// output, which carries one `index:` summary line instead.
+/// per-phase timing lands at `-vv` (debug) verbosity rather than the default
+/// output, which carries one `indexes` line in the sync/status footer instead.
 fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
     let bar = ProgressBar::new_spinner();
     bar.set_style(
@@ -1746,21 +1919,6 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One table's combined status for the `pond sync` summary line: the worst of
-/// its two phases, painted. `ok` covers Ok/Noop/NotAttempted.
-fn index_entry_status(entry: &TableOptimizeOutcome) -> String {
-    use pond::output::{paint, red, yellow};
-    if entry.indices.is_failed() || entry.compaction.is_failed() {
-        paint("failed", red())
-    } else if matches!(entry.indices, PhaseOutcome::SkippedConflict)
-        || matches!(entry.compaction, PhaseOutcome::SkippedConflict)
-    {
-        paint("deferred", yellow())
-    } else {
-        "ok".to_owned()
-    }
-}
-
 fn phase_cell(outcome: &PhaseOutcome, _phase: &str) -> Cell {
     use pond::output::{dim, paint, red, yellow};
     match outcome {
@@ -1808,30 +1966,42 @@ fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_status_header(data_url: &Url, sizes: &TableSizes) -> anyhow::Result<()> {
+fn render_status_header(
+    data_url: &Url,
+    sizes: &TableSizes,
+    totals: &RowTotals,
+) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&paint("pond status", bold()))?;
     output(&format!("{}  {}", paint("data-dir", dim()), data_url))?;
 
     let mut table = new_table();
-    let total = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
-    for (label, bytes) in [
-        ("sessions", sizes.sessions),
-        ("messages", sizes.messages),
-        ("parts", sizes.parts),
-        ("other", sizes.other),
-    ] {
+    let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
+    let rows = [
+        ("sessions", sizes.sessions, Some(totals.sessions)),
+        ("messages", sizes.messages, Some(totals.messages)),
+        ("parts", sizes.parts, Some(totals.parts)),
+        ("other", sizes.other, None),
+    ];
+    for (label, bytes, rows_opt) in rows {
         table.add_row(vec![
             Cell::new(format!("  {label}")),
             Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
+            Cell::new(
+                rows_opt
+                    .map(|n| format!("{} rows", format_thousands(n)))
+                    .unwrap_or_default(),
+            )
+            .set_alignment(CellAlignment::Right),
         ]);
     }
     table.add_row(vec![
         Cell::new("  total").add_attribute(Attribute::Bold),
-        Cell::new(format_bytes(total))
+        Cell::new(format_bytes(total_bytes))
             .set_alignment(CellAlignment::Right)
             .add_attribute(Attribute::Bold),
+        Cell::new(""),
     ]);
     output(&table.to_string())?;
     Ok(())
@@ -1843,87 +2013,20 @@ fn render_status_checks(
     stats: &CorpusStats,
     index_status: &[IndexStatus],
     embedding: EmbeddingProgress,
-    scripts: &[(String, usize)],
-    verbose: bool,
+    adapters: bool,
 ) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint, yellow};
+    use pond::output::{dim, paint, yellow};
 
-    let RowTotals {
-        sessions,
-        messages,
-        parts,
-    } = stats.totals;
     output("")?;
+    let health = classify_index_health(index_status, index_lag_threshold(), &embedding);
+    output(&render_indexes_line(&health))?;
     output(&format!(
-        "{}  {} sessions  {} messages  {} parts",
-        paint("totals", dim()),
-        paint(&format_thousands(sessions), bold()),
-        paint(&format_thousands(messages), bold()),
-        paint(&format_thousands(parts), bold()),
+        "{}    {} sessions, {} messages",
+        paint("stored", dim()),
+        format_thousands(stats.totals.sessions),
+        format_thousands(embedding.total as u64),
     ))?;
-    let pending = embedding.total.saturating_sub(embedding.embedded);
-    if embedding.total == 0 {
-        output(&format!(
-            "{}  no embeddable messages (model={})",
-            paint("embeddings", dim()),
-            embedding.model,
-        ))?;
-    } else if pending == 0 {
-        output(&format!(
-            "{}  {}/{} messages  model={}",
-            paint("embeddings", dim()),
-            paint(&format_thousands(embedding.embedded as u64), bold()),
-            paint(&format_thousands(embedding.total as u64), bold()),
-            embedding.model,
-        ))?;
-    } else {
-        output(&paint(
-            &format!(
-                "embeddings  {}/{} messages  model={} - run `pond sync --only embed` to fill the {} backlog",
-                format_thousands(embedding.embedded as u64),
-                format_thousands(embedding.total as u64),
-                embedding.model,
-                format_thousands(pending as u64),
-            ),
-            yellow(),
-        ))?;
-    }
-    let index_backlog: usize = index_status
-        .iter()
-        .map(|status| status.unindexed_rows)
-        .sum();
-    let existing_indices = index_status.iter().filter(|status| status.exists).count();
-    if index_status.is_empty() {
-        output(&format!(
-            "{}  no configured indexes",
-            paint("indexes", dim())
-        ))?;
-    } else if index_backlog == 0 && existing_indices == index_status.len() {
-        output(&format!(
-            "{}  {}/{} ready",
-            paint("indexes", dim()),
-            existing_indices,
-            index_status.len(),
-        ))?;
-    } else if index_backlog == 0 {
-        output(&format!(
-            "{}  {}/{} built; no unindexed rows",
-            paint("indexes", dim()),
-            existing_indices,
-            index_status.len(),
-        ))?;
-    } else {
-        output(&paint(
-            &format!(
-                "indexes  {}/{} built - {} unindexed row(s), run `pond sync --only update-indexes`",
-                existing_indices,
-                index_status.len(),
-                format_thousands(index_backlog as u64),
-            ),
-            yellow(),
-        ))?;
-    }
-    if verbose {
+    if adapters {
         output("")?;
         output(&paint("index detail", dim()))?;
         for status in index_status {
@@ -1942,60 +2045,119 @@ fn render_status_checks(
             }
         }
     }
-    // Surfaces the corpus's language mix so an agent can decide whether
-    // bilingual querying is worth attempting (cross-lingual recall is a
-    // caller-layer concern; pond does not translate internally - see the
-    // `pond_search` MCP description). Sample is bounded; total = sum of
-    // alphabetic characters in the sampled `search_text`.
-    if !scripts.is_empty() {
-        let total: usize = scripts.iter().map(|(_, count)| *count).sum();
-        if total > 0 {
-            let parts = scripts
-                .iter()
-                .filter(|(_, count)| *count > 0)
-                .map(|(name, count)| {
-                    let pct = (*count as f64 / total as f64) * 100.0;
-                    format!("{name} {pct:.0}%")
-                })
-                .collect::<Vec<_>>()
-                .join("  ");
-            output(&format!("{}  {parts}", paint("scripts", dim())))?;
-        }
-    }
-    if !stats.include_subagents && verbose {
-        output(&paint(
-            "  note: totals above include sub-agent sessions; the rollup below shows main-agent only. Pass `--include-subagents` for the per-agent breakdown.",
-            dim(),
-        ))?;
-    }
 
-    if !verbose {
+    if !adapters {
         output(&format!(
-            "{}  {} adapter(s), top projects hidden; pass `--verbose` for project tables",
+            "{}    {} adapter(s); pass `--adapters` for project tables",
             paint("sources", dim()),
             stats.adapters.len(),
         ))?;
-        return Ok(());
-    }
-
-    // Render adapters in registry order so the layout matches the discovery
-    // picker; adapters present in the data but not in the registry append at
-    // the bottom (defensive: catches deleted adapters whose data is still on
-    // disk).
-    let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
-        .adapters
-        .iter()
-        .map(|stat| (stat.adapter.as_str(), stat))
-        .collect();
-    for factory in adapter::registry() {
-        if let Some(stat) = by_name.remove(factory.name()) {
+    } else {
+        // Render adapters in registry order so the layout matches the discovery
+        // picker; adapters present in the data but not in the registry append at
+        // the bottom (defensive: catches deleted adapters whose data is still on
+        // disk).
+        let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
+            .adapters
+            .iter()
+            .map(|stat| (stat.adapter.as_str(), stat))
+            .collect();
+        for factory in adapter::registry() {
+            if let Some(stat) = by_name.remove(factory.name()) {
+                render_adapter_block(stat)?;
+            }
+        }
+        for stat in by_name.values() {
             render_adapter_block(stat)?;
         }
     }
-    for stat in by_name.values() {
-        render_adapter_block(stat)?;
-    }
+    output_err("")?;
+    output_err(&paint(
+        "(messages = searchable text rows; use -v for full counts)",
+        dim(),
+    ))?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum IndexHealthState {
+    NotBuilt,
+    Ready,
+    Pending(u64),
+}
+
+#[derive(Debug, Clone)]
+struct IndexHealth {
+    text: IndexHealthState,
+    semantic: IndexHealthState,
+}
+
+/// `Ready` means the substrate's lag guard is intentionally batching; queries
+/// fall through to the brute-force scan over a small remainder. `Pending(N)`
+/// means the trailing fragment count crossed the threshold and a fold is owed.
+fn classify_index_health(
+    statuses: &[IndexStatus],
+    lag_threshold: usize,
+    embedding: &EmbeddingProgress,
+) -> IndexHealth {
+    use IndexHealthState::*;
+
+    fn classify_one(status: &IndexStatus, lag_threshold: usize) -> IndexHealthState {
+        if !status.exists {
+            return NotBuilt;
+        }
+        if status.unindexed_rows == 0 || status.unindexed_fragments < lag_threshold {
+            Ready
+        } else {
+            Pending(status.unindexed_rows as u64)
+        }
+    }
+
+    let mut text = NotBuilt;
+    let mut semantic = NotBuilt;
+    for status in statuses {
+        match status.intent_name.as_str() {
+            MESSAGES_FTS_INDEX => text = classify_one(status, lag_threshold),
+            MESSAGES_VECTOR_INDEX => semantic = classify_one(status, lag_threshold),
+            _ => {}
+        }
+    }
+    // Semantic search misses unembedded rows even when IVF_PQ's own
+    // unindexed-fragments check passes.
+    let embed_backlog = embedding.total.saturating_sub(embedding.embedded);
+    if embed_backlog > 0 && matches!(semantic, Ready) {
+        semantic = Pending(embed_backlog as u64);
+    }
+    IndexHealth { text, semantic }
+}
+
+fn render_indexes_line(health: &IndexHealth) -> String {
+    use IndexHealthState::*;
+    use pond::output::{dim, paint, yellow};
+
+    let body = match (&health.text, &health.semantic) {
+        (Ready, Ready) => "text + semantic ready".to_owned(),
+        _ => {
+            let text_part = match &health.text {
+                Ready => "text ready".to_owned(),
+                Pending(n) => format!("text {} pending", format_thousands(*n)),
+                NotBuilt => "text not built".to_owned(),
+            };
+            let semantic_part = match &health.semantic {
+                Ready => "semantic ready".to_owned(),
+                Pending(n) => format!("semantic {} pending", format_thousands(*n)),
+                NotBuilt => "semantic below activation threshold".to_owned(),
+            };
+            format!("{text_part} . {semantic_part}")
+        }
+    };
+    let any_pending = matches!(health.text, Pending(_)) || matches!(health.semantic, Pending(_));
+    let label = if any_pending {
+        paint("indexes", yellow())
+    } else {
+        paint("indexes", dim())
+    };
+    format!("{label}   {body}")
 }
 
 fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
