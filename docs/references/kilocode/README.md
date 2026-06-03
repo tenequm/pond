@@ -7,7 +7,7 @@ Snapshot date: 2026-05-07
 
 ## Why these files
 
-Reference for designing pond's canonical Part union and message/session schemas (see `/docs/design.md` section 6). kilocode's `packages/opencode/` directory is a fork/extension of opencode, so much of this overlaps with `docs/references/opencode/`. Worth keeping both: kilocode adds editor-context, plan-followup logic, and a few schema deltas.
+Reference for designing pond's canonical Part union and message/session schemas (see `docs/spec.md#adapters`). kilocode's `packages/opencode/` directory is a fork/extension of opencode, so much of this overlaps with `docs/references/opencode/`. Worth keeping both: kilocode adds editor-context, plan-followup logic, and a few schema deltas.
 
 ## Ranked relevance (most useful first)
 
@@ -27,7 +27,7 @@ Reference for designing pond's canonical Part union and message/session schemas 
 
 ## kilocode-specific extensions vs opencode baseline
 
-- `editorContext` field on `User` message (visible files, open tabs, active file, shell). Pond's design already calls this out in section 6.
+- `editorContext` field on `User` message (visible files, open tabs, active file, shell). Pond's adapter contract already leaves source-specific fields in `options`.
 - `EditorContext` schema lives in `packages/opencode/src/kilocode/editor-context.ts`.
 - Plan-followup logic + cost propagation in `KiloSessionPrompt` namespace.
 - Subtask, Agent, StepStart/StepFinish, Compaction with `tail_start_id`, Retry parts (all aligned with pond's "Harness extensions" list).

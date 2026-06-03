@@ -2,11 +2,13 @@
 
 Lossless storage and hybrid search for AI agent sessions, across every agentic client.
 
-pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not only the one that made it.
+pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. One Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not only the one that made it.
 
 Current automatically synced agent clients:
 - Claude Code CLI
 - Codex CLI
+- opencode CLI
+- pi-coding-agent CLI
 
 ## Install
 

@@ -1,4 +1,4 @@
-# pi-mono reference snapshot
+# pi-coding-agent reference snapshot
 
 Source: https://github.com/badlogic/pi-mono
 Local clone: `~/pjv/badlogic/pi-mono/`
@@ -7,9 +7,9 @@ Snapshot date: 2026-05-07
 
 ## Why these files
 
-Pond's design doc cites pi-mono twice (`/docs/design.md` section 16):
+Pond keeps this snapshot for two adapter-design concerns:
 - **Lifted**: leaf-cursor branching via `parent_message_id` graph + the conformance test matrix (cross-provider handoff, image-tool-result, tool-call-without-result, unicode-surrogate).
-- **Rejected**: pi-mono's silent-skip-malformed-line ingest. Pond requires schema-validated decode with logged errors.
+- **Rejected**: pi-coding-agent's silent-skip-malformed-line ingest. Pond requires schema-validated decode with logged errors.
 
 This dir keeps both the patterns we want to copy and the exact code we explicitly reject, so we have ground truth in front of us when implementing.
 
@@ -41,6 +41,6 @@ This dir keeps both the patterns we want to copy and the exact code we explicitl
 
 ## Structural notes
 
-- **Typing**: plain TypeScript interfaces + discriminated unions. No Zod, no Effect. Streaming events live in a separate union (`AssistantMessageEvent`) discriminated by `type`, distinct from the persisted message types. Pond's design currently lists Start/Delta/End as Part variants in section 6 - reconcile against this (pi-mono keeps streaming events out of storage; opencode unifies them with a `time` field).
+- **Typing**: plain TypeScript interfaces + discriminated unions. No Zod, no Effect. Streaming events live in a separate union (`AssistantMessageEvent`) discriminated by `type`, distinct from the persisted message types. pi-coding-agent keeps streaming events out of storage; opencode unifies them with a `time` field.
 - **Branching primitive**: every `SessionEntry` carries `id` (8-char short UUID) + `parentId` (string | null). DAG is reconstructed by walking parent chain from a leafId. `fork(entryId)` writes a new session file with the given entry as new root. This is the pattern pond's section 19.5 should keep.
-- **Malformed-line silent-skip (rejected by pond)**: `packages/coding-agent/src/core/session-manager.ts` lines 288-299 (`parseSessionEntries`), 445-453 (`loadEntriesFromFile`), 556-561 (`buildSessionInfo`). Each wraps `JSON.parse(line)` in try/catch with a `// Skip malformed lines` comment. Pond's SourceAdapter must instead emit a logged decode error per failed line.
+- **Malformed-line silent-skip (rejected by pond)**: `packages/coding-agent/src/core/session-manager.ts` lines 288-299 (`parseSessionEntries`), 445-453 (`loadEntriesFromFile`), 556-561 (`buildSessionInfo`). Each wraps `JSON.parse(line)` in try/catch with a `// Skip malformed lines` comment. Pond's adapter must instead emit a logged decode error per failed line.

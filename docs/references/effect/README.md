@@ -14,7 +14,7 @@ Browse the upstream files at the exact snapshot commits:
 
 ## Why these files
 
-Reference for the canonical `effect/unstable/ai` Prompt + Response part unions, tool / toolkit / MCP shapes, and per-provider mapping code that pond's design points at as the moat-shape for its own Rust serde types (see `/docs/design.md` and `/docs/design-v2.md`). Files preserve their original package-relative paths under this directory so the origin of every line is unambiguous.
+Reference for the canonical `effect/unstable/ai` Prompt + Response part unions, tool / toolkit / MCP shapes, and per-provider mapping code that pond's specification points at as the moat-shape for its own Rust serde types (see `docs/spec.md#model`). Files preserve their original package-relative paths under this directory so the origin of every line is unambiguous.
 
 Generated client files (`Generated.ts`) were excluded from every provider package - they are auto-emitted from upstream OpenAPI specs and are too large to be useful in a snapshot. The hand-authored mapping logic, telemetry, error types, and config were copied in full.
 

@@ -1,14 +1,14 @@
-//! pi coding-agent adapter (github.com/badlogic/pi-mono).
+//! pi-coding-agent adapter (github.com/badlogic/pi-mono).
 //!
 //! Source path: `~/.pi/agent/sessions/<project-slug>/<ISO-ts>_<uuid>.jsonl`.
 //! One `.jsonl` file per session; each line is a typed record linked via a
-//! `parentId` -> `id` chain (pi-mono's leaf-cursor DAG). Top-level types:
+//! `parentId` -> `id` chain (pi-coding-agent's leaf-cursor DAG). Top-level types:
 //! `session` (consumed up front for Session), `model_change` /
 //! `thinking_level_change` / `compaction` (session-state carriers kept as
 //! System messages), and `message` (the per-turn model interaction, with
 //! roles user / assistant / toolResult and content nested under `.message`).
 //!
-//! v1 stores the linear log ordered by source line; pi's `parentId` fork
+//! v1 stores the linear log ordered by source line; pi-coding-agent's `parentId` fork
 //! graph (spec.md#deferred: multi-level fork lineage) is not collapsed into
 //! `parent_message_id` but preserved verbatim in `options.source.raw_record`
 //! for a future branching consumer.
@@ -33,19 +33,21 @@ use super::{
     jsonl_bytes, part_id, raw_record,
 };
 
-const NAME: &str = "pi";
+const NAME: &str = "pi-coding-agent";
 
-/// Stateless factory: opens [`PiAdapter`] instances and probes for the
+/// Stateless factory: opens [`PiCodingAgentAdapter`] instances and probes for the
 /// canonical install location under `~/.pi/agent/sessions`.
-pub struct PiFactory;
+pub struct PiCodingAgentFactory;
 
-impl AdapterFactory for PiFactory {
+impl AdapterFactory for PiCodingAgentFactory {
     fn name(&self) -> &'static str {
         NAME
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        Ok(Box::new(PiAdapter::new(config_path(NAME, config)?)))
+        Ok(Box::new(PiCodingAgentAdapter::new(config_path(
+            NAME, config,
+        )?)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -244,20 +246,20 @@ fn pi_content_item(part: &Part) -> Value {
     }
 }
 
-/// Configured pi reader. Walks a tree of `*.jsonl` files under [`Self::root`]
+/// Configured pi-coding-agent reader. Walks a tree of `*.jsonl` files under [`Self::root`]
 /// and yields canonical events in source order per session.
 #[derive(Debug, Clone)]
-pub struct PiAdapter {
+pub struct PiCodingAgentAdapter {
     root: PathBuf,
 }
 
-impl PiAdapter {
+impl PiCodingAgentAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 }
 
-impl Adapter for PiAdapter {
+impl Adapter for PiCodingAgentAdapter {
     fn discover(&self) -> DiscoverFuture<'_> {
         jsonl_tree_discover(self)
     }
@@ -267,8 +269,8 @@ impl Adapter for PiAdapter {
     }
 }
 
-impl JsonlTree for PiAdapter {
-    // pi's `toolResult` records carry their own `toolName`, so unlike
+impl JsonlTree for PiCodingAgentAdapter {
+    // pi-coding-agent's `toolResult` records carry their own `toolName`, so unlike
     // claude-code / codex-cli the adapter needs no per-file call_id -> name map.
     type State = ();
 
@@ -510,7 +512,7 @@ fn message_events(
                 options: row_options(row, line),
             }
         }
-        other => return Err(format!("unsupported pi message role {other}")),
+        other => return Err(format!("unsupported pi-coding-agent message role {other}")),
     };
 
     let mut events = Vec::with_capacity(parts.len() + 1);
@@ -649,24 +651,24 @@ fn thinking_options(item: &Value) -> ProviderOptions {
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end test for the pi adapter: ingest the committed fixture corpus
+    //! End-to-end test for the pi-coding-agent adapter: ingest the committed fixture corpus
     //! and assert pond's canonical Session/Message/Part shape comes out the
-    //! other side. The fixture lives under `tests/fixtures/adapter/pi/`.
+    //! other side. The fixture lives under `tests/fixtures/adapter/pi-coding-agent/`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
 
-    const FIXTURES: &str = "tests/fixtures/adapter/pi/sessions";
+    const FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
-        let adapter = PiAdapter::new(FIXTURES);
+        let adapter = PiCodingAgentAdapter::new(FIXTURES);
         crate::adapter::test_support::assert_native_restore(
-            &PiFactory,
+            &PiCodingAgentFactory,
             &adapter,
-            // pi relative paths embed the `sessions/` segment, so the corpus
+            // pi-coding-agent relative paths embed the `sessions/` segment, so the corpus
             // root is FIXTURES' parent, not FIXTURES itself.
             std::path::Path::new(FIXTURES)
                 .parent()
@@ -676,10 +678,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pi_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {
+    async fn pi_coding_agent_adapter_ingests_fixture_corpus_into_canonical_shape()
+    -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = PiAdapter::new(FIXTURES);
+        let adapter = PiCodingAgentAdapter::new(FIXTURES);
 
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert!(summary.accepted() > 0, "ingest must accept rows");
@@ -691,9 +694,9 @@ mod tests {
         assert_eq!(summary.skipped_files, 0, "no whole-file skips expected");
 
         let (sessions, messages, parts) = store.row_counts().await?;
-        assert!(sessions > 0, "at least one pi session");
-        assert!(messages > 0, "at least one pi message");
-        assert!(parts > 0, "at least one pi Part");
+        assert!(sessions > 0, "at least one pi-coding-agent session");
+        assert!(messages > 0, "at least one pi-coding-agent message");
+        assert!(parts > 0, "at least one pi-coding-agent Part");
 
         let mut saw_tool_call = false;
         let mut saw_tool_result = false;
@@ -731,7 +734,7 @@ mod tests {
     async fn tool_results_are_injected_assistant_parts_are_conversational() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = PiAdapter::new(FIXTURES);
+        let adapter = PiCodingAgentAdapter::new(FIXTURES);
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         for session_id in store.session_ids().await? {

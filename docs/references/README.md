@@ -8,9 +8,9 @@ Snapshot date: 2026-05-07. Each subdir's README pins the upstream commit it was 
 
 | Path | Source | Why |
 |------|--------|-----|
-| `opencode/` | https://github.com/anomalyco/opencode | Effect Schema canonical Part union + SDK-generated TypeScript; provider replay shapes; storage schema. The closest existing model to what pond's design section 6 describes. |
+| `opencode/` | https://github.com/sst/opencode | Effect Schema canonical Part union + SDK-generated TypeScript; provider replay shapes; storage schema. The closest existing model to what `docs/spec.md#adapters` describes. |
 | `kilocode/` | https://github.com/kilo-org/kilocode | Fork of opencode. Adds `editorContext` on UserMessage, plan-followup logic, kilocode-specific session events. |
-| `pi-mono/` | https://github.com/badlogic/pi-mono | Source of pond's leaf-cursor branching (`parent_message_id` graph) and conformance test matrix (cross-provider handoff, image-tool-result, tool-call-without-result). Also contains the silent-skip-malformed-line ingest pattern pond explicitly rejects (see pi-mono README for line numbers). |
+| `pi-coding-agent/` | https://github.com/badlogic/pi-mono | Source of pond's pi-coding-agent leaf-cursor branching (`parent_message_id` graph) and conformance test matrix (cross-provider handoff, image-tool-result, tool-call-without-result). Also contains the silent-skip-malformed-line ingest pattern pond explicitly rejects (see the subdir README for line numbers). |
 | `effect/` | https://github.com/Effect-TS/effect-smol (v4) and https://github.com/Effect-TS/effect (v3) | Verbatim copy of the canonical `effect/unstable/ai` Prompt + Response part unions, Tool / Toolkit / MCP shapes, and per-provider mapping code (Anthropic, OpenAI, OpenAI-compatible, OpenRouter, Amazon Bedrock, Google). The shape pond's design copies as Rust serde types. SHAs pinned in the subdir README. |
 | `otel-genai-semconv.md` | https://github.com/open-telemetry/semantic-conventions-genai (commit `914c6f46...`) | Synthesized GenAI semantic-conventions reference: `gen_ai.*` attribute registry, span shapes, events, JSON schemas for input/output messages and tool definitions, metrics, value registries. Useful for naming + the message-payload JSON schemas. |
 

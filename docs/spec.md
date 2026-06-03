@@ -77,12 +77,12 @@ Many client formats parse into one canonical model; any adapter can serialize th
 
 ## 2. Scope {#scope}
 
-pond v1 is deliberately narrow: one application, two source formats, two deployments. This section fixes that boundary. Work scoped out of v1 is in Section 9; the non-goals here are different - they are stable positions, not deferrals.
+pond v1 is deliberately narrow: one application, an adapter registry, two deployments. This section fixes that boundary. Work scoped out of v1 is in Section 9; the non-goals here are different - they are stable positions, not deferrals.
 
 ### 2.1 What v1 ships
 
 1. **One application: sessions.** Lossless ingest, storage, and hybrid search of agentic-client sessions. Sessions are the first consumer of the storage substrate (Section 3); future consumers are in Section 9.
-2. **Two source formats: Claude Code and Codex.** Each is a bidirectional codec - it parses its own format into canonical and serializes canonical back, including the cross pairs (a Codex session restored as Claude Code, and the reverse).
+2. **An open adapter registry.** Source-format support is defined by the registry in code, not enumerated or capped by this specification. Every registered adapter is a bidirectional codec under Section 6: it parses its own format into canonical and serializes canonical back to a client format.
 3. **Two transports.** An HTTP+JSON API (primary) and an MCP server, both dispatching to one shared set of handlers.
 4. **Two deployments: personal and hosted.** Described next.
 
@@ -473,9 +473,9 @@ Adapters are listed in one registry; adding an adapter is a new file plus one li
 
 Each adapter has a round-trip codec test: parse a committed fixture to canonical, serialize it back native, and assert the result is value-equal to the fixture - this is what enforces `adapter-native-restore-lossless` and exercises `model-lossless-projection`. Foreign serialization is tested for validity in the target format and reviewed against a golden file.
 
-### 6.9 v1 adapters
+### 6.9 Adapter set
 
-Claude Code, Codex, opencode, and pi. Claude Code and Codex carry both faces including the foreign cross pairs; opencode and pi carry native restore (round-trip tested per Section 6.8) plus best-effort foreign serialization. opencode is the first source that is not one JSONL file per session - a content-addressed `session`/`message`/`part` split tree - so it drives the read seam directly rather than through the shared JSONL helper. Per-source extraction detail - how each adapter resolves `project`, what its `source_agent` brand is, its on-disk layout - lives in that adapter's own code, which is its documentation.
+The adapter set is intentionally not listed here. The registry in `src/adapter/mod.rs` is the source of truth for which formats a build supports, and Section 6 is the contract every registered adapter must satisfy. Per-source extraction detail - how an adapter resolves `project`, what its `source_agent` brand is, its on-disk layout, and which source records it deliberately does not ingest - lives in that adapter's own code, which is its documentation.
 
 ---
 
@@ -586,7 +586,7 @@ These are scoped out of v1. None requires a schema migration or a cross-cutting 
    - **A versioned-document store shaped like agent memory stores** - small text documents with an immutable version history. The substrate's manifest versioning aligns naturally with this.
 2. **Future source adapters.** A new adapter adds no substrate or schema change - it is a new file and a registry line (Section 6).
    - **A Managed Agents adapter**, including multi-agent sessions: a coordinator and its delegated agent threads map onto linked Sessions through `parent_session_id` and `parent_message_id`. The spawn case already works for v1 sources (Claude Code subagents ingest as linked child Sessions); the Managed Agents adapter is the next step.
-   - **Other clients** - OpenCode, Cursor, aider, Gemini CLI, and more.
+   - **Other clients** - additional agentic clients such as Cursor, aider, Gemini CLI, and more.
 3. **Provider-target restore.** Restoring a canonical session into a provider API request shape (Anthropic, OpenAI, Bedrock, Gemini), as opposed to a harness session-log format. Always foreign, and additionally constrained to produce API-valid output.
 4. **Live-write.** Ingesting events as a session runs, rather than after it ends. The substrate work this needs - a per-shard write-ahead layer, a scanner that merges in-memory and on-disk generations, a sharded writer - is real implementation work; the forward-compatibility seams of Section 3 are what keep their activation a substrate swap rather than a rewrite.
 5. **Hosted multi-tenant.** Mapping each tenant to a child Lance namespace, and swapping the directory catalog for a hosted one. The catalog seam and the single namespace-resolution point (Sections 3 and 7) are the seams this rides.
