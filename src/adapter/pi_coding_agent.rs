@@ -29,7 +29,7 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
     jsonl_bytes, part_id, raw_record,
 };
 
@@ -107,7 +107,7 @@ fn serialize_session(
         if matches!(message.message, Message::System { .. }) {
             continue;
         }
-        records.push(pi_message_record(session, message));
+        records.push(pi_message_record(message));
     }
 
     Ok(vec![RestoredFile {
@@ -141,13 +141,6 @@ fn encode_project(project: &str) -> String {
     project.replace(['/', '.'], "-")
 }
 
-fn source_line(options: &ProviderOptions) -> Option<u64> {
-    options
-        .get("source")
-        .and_then(|source| source.get("line"))
-        .and_then(Value::as_u64)
-}
-
 fn pi_session_record(session: &crate::sessions::SessionWithMessages) -> Value {
     json!({
         "type": "session",
@@ -158,23 +151,17 @@ fn pi_session_record(session: &crate::sessions::SessionWithMessages) -> Value {
     })
 }
 
-fn pi_message_record(
-    session: &crate::sessions::SessionWithMessages,
-    message: &crate::sessions::MessageWithParts,
-) -> Value {
+fn pi_message_record(message: &crate::sessions::MessageWithParts) -> Value {
     json!({
         "type": "message",
         "id": message.message.id(),
         "parentId": message.message.options().get("source").and_then(|s| s.get("parent_id")),
         "timestamp": message.message.timestamp().to_rfc3339_opts(SecondsFormat::Millis, true),
-        "message": pi_inner_message(session, message),
+        "message": pi_inner_message(message),
     })
 }
 
-fn pi_inner_message(
-    _session: &crate::sessions::SessionWithMessages,
-    message: &crate::sessions::MessageWithParts,
-) -> Value {
+fn pi_inner_message(message: &crate::sessions::MessageWithParts) -> Value {
     let epoch_ms = message.message.timestamp().timestamp_millis();
     match &message.message {
         Message::User { .. } => json!({
@@ -512,7 +499,15 @@ fn message_events(
                 options: row_options(row, line),
             }
         }
-        other => return Err(format!("unsupported pi-coding-agent message role {other}")),
+        // Unknown nested roles are still parseable source records. Preserve the
+        // row as a System carrier instead of turning it into a counted drop.
+        _ => Message::System {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp,
+            content: extract_str(message_value, "role"),
+            options: row_options(row, line),
+        },
     };
 
     let mut events = Vec::with_capacity(parts.len() + 1);
@@ -662,6 +657,26 @@ mod tests {
 
     const FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
 
+    #[test]
+    fn probe_default_finds_pi_sessions_under_home() {
+        let temp = TempDir::new().unwrap();
+        let expected = temp.path().join(".pi").join("agent").join("sessions");
+        std::fs::create_dir_all(&expected).unwrap();
+        let env = Env::with_home(temp.path());
+
+        let probe = PiCodingAgentFactory.probe_default(&env);
+        assert_eq!(
+            probe
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some(expected.to_str().unwrap()),
+        );
+
+        std::fs::remove_dir_all(&expected).unwrap();
+        assert!(PiCodingAgentFactory.probe_default(&env).is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
         let adapter = PiCodingAgentAdapter::new(FIXTURES);
@@ -728,6 +743,190 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unknown_nested_message_role_becomes_system_carrier() -> anyhow::Result<()> {
+        let row = json!({
+            "type": "message",
+            "id": "mystery-message",
+            "message": {
+                "role": "mysteryRole",
+                "content": [{"type": "text", "text": "not yet understood"}]
+            }
+        });
+        let events = events_from_row(
+            "session-1",
+            42,
+            &row,
+            DateTime::parse_from_rfc3339("2026-04-28T18:47:32.280Z")?.with_timezone(&Utc),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(events.len(), 1);
+        let IngestEvent::Message(Message::System {
+            id,
+            content,
+            options,
+            ..
+        }) = &events[0]
+        else {
+            panic!("unknown role must produce a System carrier");
+        };
+        assert_eq!(id, "mystery-message");
+        assert_eq!(content.as_deref().map(String::as_str), Some("mysteryRole"));
+        assert_eq!(
+            raw_record(options)
+                .and_then(|raw| raw.get("message").cloned())
+                .and_then(|message| message.get("role").cloned()),
+            Some(json!("mysteryRole")),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_parent_ids_and_compaction_summary_are_preserved() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("sessions");
+        let path = root
+            .join("project")
+            .join("2026-05-01T00-00-00-000Z_fork.jsonl");
+        write_jsonl_file(
+            &path,
+            &[
+                json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-fork-session",
+                    "timestamp": "2026-05-01T00:00:00.000Z",
+                    "cwd": "/tmp/pi-fork",
+                }),
+                json!({
+                    "type": "message",
+                    "id": "parent-message",
+                    "timestamp": "2026-05-01T00:00:01.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "parent"}],
+                    },
+                }),
+                json!({
+                    "type": "message",
+                    "id": "child-a",
+                    "parentId": "parent-message",
+                    "timestamp": "2026-05-01T00:00:02.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "branch a"}],
+                    },
+                }),
+                json!({
+                    "type": "message",
+                    "id": "child-b",
+                    "parentId": "parent-message",
+                    "timestamp": "2026-05-01T00:00:03.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "branch b"}],
+                    },
+                }),
+                json!({
+                    "type": "compaction",
+                    "id": "compact-1",
+                    "parentId": "child-b",
+                    "timestamp": "2026-05-01T00:00:04.000Z",
+                    "summary": "compact summary",
+                }),
+            ],
+        )?;
+
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &PiCodingAgentAdapter::new(&root),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        assert_eq!(summary.dropped_events, 0);
+
+        let session = store
+            .get_session("pi-fork-session")
+            .await?
+            .expect("fixture session lands");
+        let child_a = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == "child-a")
+            .expect("first fork child lands");
+        let child_b = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == "child-b")
+            .expect("second fork child lands");
+        for child in [child_a, child_b] {
+            assert_eq!(
+                child
+                    .message
+                    .options()
+                    .get("source")
+                    .and_then(|source| source.get("parent_id"))
+                    .and_then(Value::as_str),
+                Some("parent-message"),
+            );
+        }
+        assert!(source_line(child_a.message.options()) < source_line(child_b.message.options()));
+
+        let compact = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == "compact-1")
+            .expect("compaction carrier lands");
+        let Message::System { content, .. } = &compact.message else {
+            panic!("compaction is preserved as a System carrier");
+        };
+        assert_eq!(
+            content.as_deref().map(String::as_str),
+            Some("compact summary")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_serialization_reparses_as_pi_coding_agent() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
+        let origin =
+            crate::adapter::OpencodeAdapter::new("tests/fixtures/adapter/opencode/storage");
+        ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
+        let session_id = origin_store
+            .session_ids()
+            .await?
+            .into_iter()
+            .next()
+            .expect("opencode fixture has sessions");
+        let session = origin_store
+            .get_session(&session_id)
+            .await?
+            .expect("fixture session is readable");
+
+        let restored_root = temp.path().join("pi-corpus");
+        write_restored_files(
+            &restored_root,
+            PiCodingAgentFactory.serialize(&session, RestoreFidelity::Foreign)?,
+        )?;
+        let restored_store = Store::open_local(temp.path().join("restored-store")).await?;
+        let summary = ingest_adapter(
+            &restored_store,
+            &PiCodingAgentAdapter::new(restored_root.join("sessions")),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+
+        assert!(summary.accepted() > 0);
+        assert_eq!(summary.dropped_events, 0);
+        Ok(())
+    }
+
     /// spec.md#model-part-provenance: a tool result is harness-injected; an
     /// assistant turn's text/reasoning/tool-call parts are conversation.
     #[tokio::test(flavor = "multi_thread")]
@@ -755,6 +954,28 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn write_jsonl_file(path: &std::path::Path, records: &[Value]) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, jsonl_bytes(NAME, records)?)?;
+        Ok(())
+    }
+
+    fn write_restored_files(
+        root: &std::path::Path,
+        files: Vec<RestoredFile>,
+    ) -> anyhow::Result<()> {
+        for file in files {
+            let path = root.join(file.relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, file.bytes)?;
         }
         Ok(())
     }

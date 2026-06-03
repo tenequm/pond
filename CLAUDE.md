@@ -65,7 +65,13 @@ A good pond comment names the WHY a reader can't see from the code itself: a hid
 ## Adapter seam (load-bearing)
 
 - The adapter seam enforces correctness via types - synthesized values (sentinel strings, fallback defaults like `"unknown"`, `"function"`, `""`) MUST NOT compile, and the seam is transport-agnostic via `Source`/`Extracted<T>` so file, HTTP, and stream adapters share one set of primitives.
+- Keep `src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`src/adapter/<adapter>.rs`) next to the factory/reader they describe.
 - Unit tests live in `#[cfg(test)] mod tests` at the bottom of the source file they test; `tests/` is reserved for genuine cross-module integration suites only.
+
+## Seam boundaries
+
+- Seam modules define contracts, generic invariants, and cross-implementation helpers only. They must not accumulate implementation-specific policy from one source, provider, transport, storage backend, CLI surface, or fixture corpus. If a rule would need a concrete adapter/client/provider/backend name to explain it, keep it out of the seam and put it in the owning implementation module.
+- Before adding a helper to a seam module, verify it has at least two real callers and no caller-specific assumptions. If it encodes a fallback path, naming scheme, freshness heuristic, restore shape, source option detail, provider request quirk, backend behavior, or UI convention for one implementation, it belongs beside that implementation instead.
 
 ## CLI output stack
 

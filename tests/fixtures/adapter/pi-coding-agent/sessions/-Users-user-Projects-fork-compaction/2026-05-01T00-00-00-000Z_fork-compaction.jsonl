@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"pi-fork-compaction-session","timestamp":"2026-05-01T00:00:00.000Z","cwd":"/Users/user/Projects/fork-compaction"}
+{"type":"message","id":"parent-message","timestamp":"2026-05-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"parent"}]}}
+{"type":"message","id":"child-a","parentId":"parent-message","timestamp":"2026-05-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"branch a"}]}}
+{"type":"message","id":"child-b","parentId":"parent-message","timestamp":"2026-05-01T00:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"branch b"}]}}
+{"type":"compaction","id":"compact-1","parentId":"child-b","timestamp":"2026-05-01T00:00:04.000Z","summary":"compact summary"}

@@ -23,11 +23,14 @@ use super::{
     AdapterError, AdapterYield, AdapterYieldStream, DiscoverFuture, SkipOracle, SkipReason,
     extract::{LEAF_CAP, bound_value, truncate_to_marker},
 };
-use crate::{sessions::IngestEvent, wire::Session};
+use crate::{
+    sessions::IngestEvent,
+    wire::{ProviderOptions, Session},
+};
 
 /// Fast-path / slow-path split and the largest record `serde_json` parses in
 /// one shot. 3x the largest legitimate whole record in a real-corpus survey.
-const RECORD_CAP: usize = 32 * 1024 * 1024;
+pub(crate) const RECORD_CAP: usize = 32 * 1024 * 1024;
 
 /// Event-channel bound; doubles as backpressure - the blocking reader parks on
 /// `blocking_send` when the consumer lags.
@@ -37,6 +40,13 @@ const CHANNEL_CAP: usize = 256;
 pub(crate) struct BoundedRow {
     pub line: usize,
     pub value: Value,
+}
+
+pub(crate) fn source_line(options: &ProviderOptions) -> Option<u64> {
+    options
+        .get("source")
+        .and_then(|source| source.get("line"))
+        .and_then(Value::as_u64)
 }
 
 /// A "walk a tree, one `.jsonl` per session, line equals record" adapter. The

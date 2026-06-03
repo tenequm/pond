@@ -28,7 +28,7 @@ use super::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
     jsonl_bytes, part_id, raw_record,
 };
 
@@ -178,13 +178,6 @@ fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathB
             .join(format!("{agent}.jsonl"));
     }
     PathBuf::from(encoded_project).join(format!("{}.jsonl", session.session.id))
-}
-
-fn source_line(options: &ProviderOptions) -> Option<u64> {
-    options
-        .get("source")
-        .and_then(|source| source.get("line"))
-        .and_then(Value::as_u64)
 }
 
 fn encode_project(project: &str) -> String {
@@ -1087,6 +1080,26 @@ mod tests {
     use tempfile::TempDir;
 
     const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
+
+    #[test]
+    fn probe_default_finds_claude_projects_under_home() {
+        let temp = TempDir::new().unwrap();
+        let expected = temp.path().join(".claude").join("projects");
+        std::fs::create_dir_all(&expected).unwrap();
+        let env = Env::with_home(temp.path());
+
+        let probe = ClaudeCodeFactory.probe_default(&env);
+        assert_eq!(
+            probe
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some(expected.to_str().unwrap()),
+        );
+
+        std::fs::remove_dir_all(&expected).unwrap();
+        assert!(ClaudeCodeFactory.probe_default(&env).is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
