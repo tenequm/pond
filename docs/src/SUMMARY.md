@@ -1,7 +1,5 @@
 # Summary
 
-[Introduction](./introduction.md)
+[Quickstart](./quickstart.md)
 
-- [Install](./install.md)
-- [Quickstart](./quickstart.md)
 - [Specification](./specification.md)
