@@ -52,3 +52,6 @@ skills-lock.json
 
 # moon local cache (rebuilt on demand; never commit)
 /.moon/cache/
+
+# wrangler local state/cache (created by `wrangler deploy`)
+/.wrangler/
