@@ -106,9 +106,28 @@ pond sync --only import
 pond sync --only embed
 pond sync --only update-indexes
 pond sync --import-from snapshot.pond
+pond sync -y                       # auto-accept probe prompts (non-TTY runs)
 ```
 
-`pond status` reports row counts, storage size, embedding coverage, and index health. It prints quick storage information first, then finishes the longer checks in front of the user. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+`pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + searchable messages), and `sources` (configured adapter count). Pass `--adapters` for per-project tables and per-intent index detail. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+
+### Configuration
+
+`pond` discovers sources interactively on first run and writes them to `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. Re-enable interactively with `pond sync <name>`.
+
+```toml
+[sources.claude-code]
+enabled = true
+path = "~/.claude/projects"
+
+[sources.codex-cli]
+enabled = false                    # kept in config, skipped on `pond sync`
+path = "~/.codex/sessions"
+```
+
+### Verbosity
+
+Root-level `-v` / `-vv` / `-vvv` raise the tracing level (info / debug / trace); `-q` / `-qq` lower it. The default surfaces warnings only. `RUST_LOG` overrides the CLI flag when set; `POND_LOG` is no longer honored.
 
 ## Design
 

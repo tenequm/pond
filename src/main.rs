@@ -591,7 +591,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if stages.import && adapter.is_none() && !did_archive_import {
-                handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
+                let extra = handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
+                match summary.ingest.as_mut() {
+                    Some(existing) => existing.merge(&extra),
+                    None => summary.ingest = Some(extra),
+                }
             }
             if stages.embed {
                 run_embed_stage(&store, force_embed).await?;
@@ -991,11 +995,12 @@ async fn handle_probe_prompt(
     loaded: &mut Config,
     config_file: &Path,
     auto_accept: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IngestSummary> {
     use std::io::IsTerminal;
+    let mut accumulated = IngestSummary::default();
     let candidates = adapter::probe_unconfigured(&loaded.sources);
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(accumulated);
     }
     let interactive = std::io::stdin().is_terminal();
     if !interactive && !auto_accept {
@@ -1008,13 +1013,13 @@ async fn handle_probe_prompt(
             ),
             pond::output::dim(),
         ))?;
-        return Ok(());
+        return Ok(accumulated);
     }
     let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
     apply_outcomes(loaded, config_file, &outcomes)?;
     for outcome in &outcomes {
         if outcome.enable && outcome.sync_now {
-            let _ = run_import_stage(
+            let summary = run_import_stage(
                 store,
                 loaded,
                 config_file,
@@ -1022,9 +1027,10 @@ async fn handle_probe_prompt(
                 None,
             )
             .await?;
+            accumulated.merge(&summary);
         }
     }
-    Ok(())
+    Ok(accumulated)
 }
 
 /// Open the store with an indicatif spinner ticking while
@@ -1149,28 +1155,28 @@ async fn run_import_stage(
 ) -> anyhow::Result<IngestSummary> {
     let sources = resolve_sync_sources(loaded, config_file, adapter.as_deref(), source_dir)?;
     if sources.is_empty() {
-        output(&format!(
-            "{} no sources configured or discovered",
-            pond::output::paint("import:", pond::output::dim()),
-        ))?;
+        let disabled = loaded.disabled_source_names();
+        let label = pond::output::paint("import:", pond::output::dim());
+        if disabled.is_empty() {
+            output(&format!(
+                "{label} no sources configured. Run `pond sync` on a TTY to detect adapters, or add `[sources.<name>]` blocks to {}.",
+                config_file.display(),
+            ))?;
+        } else {
+            output(&format!(
+                "{label} no enabled sources. Found {} disabled: {}. Add `enabled = true` to the section in {}, or re-enable interactively with `pond sync <name>`.",
+                disabled.len(),
+                disabled.join(", "),
+                config_file.display(),
+            ))?;
+        }
         return Ok(IngestSummary::default());
     }
     let watermarks = StoredWatermarks::new(store.session_last_ingested_at().await?);
     let mut total = IngestSummary::default();
     for (name, blob) in sources {
         let summary = sync_with_progress(store, &name, blob, &watermarks).await?;
-        total.inserted += summary.inserted;
-        total.matched += summary.matched;
-        total.dropped_events += summary.dropped_events;
-        total.dropped_sessions += summary.dropped_sessions;
-        total.skipped_files += summary.skipped_files;
-        total.skipped_fresh += summary.skipped_fresh;
-        total.skipped_empty += summary.skipped_empty;
-        total.storage_errors += summary.storage_errors;
-        total.truncated_values += summary.truncated_values;
-        for (reason, count) in summary.drop_reasons {
-            *total.drop_reasons.entry(reason).or_insert(0) += count;
-        }
+        total.merge(&summary);
     }
     Ok(total)
 }
@@ -1225,7 +1231,7 @@ async fn run_embed_stage_with_limit(
     );
     bar.set_style(
         ProgressStyle::with_template(
-            "semantic indexing [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
+            "semantic embedding [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -1262,12 +1268,12 @@ async fn run_embed_stage_with_limit(
     bar.finish_and_clear();
     if summary.messages > 0 {
         let label = if summary.cancelled {
-            "semantic indexing (interrupted)"
+            "semantic embedding (interrupted)"
         } else {
-            "semantic indexing"
+            "semantic embedding"
         };
         output(&format!(
-            "{}  +{} indexed  ({})",
+            "{}  +{} messages  ({})",
             pond::output::paint(label, pond::output::dim()),
             format_thousands(summary.messages as u64),
             device,

@@ -320,10 +320,14 @@ mod ingest_handler {
                     // commit them in one parallel 3-table merge_insert.
                     if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH {
                         let flush_start = std::time::Instant::now();
-                        let flush_outcomes = validator.flush(store).await?;
+                        let (flush_outcomes, flush_counts) = validator.flush(store).await?;
                         validator_total += flush_start.elapsed();
                         validator_count += 1;
-                        summary.add_outcomes(&flush_outcomes);
+                        // Counts come from the pre-existence sweep inside the
+                        // flush, not from per-row outcomes (which would
+                        // double-count if we also called `add_outcomes`).
+                        summary.add_outcomes_errors_only(&flush_outcomes);
+                        summary.add_batch(&flush_counts);
                         drain_pending_dones(&mut pending_dones, &flush_outcomes, &mut on_event);
                     }
                 }
@@ -379,10 +383,11 @@ mod ingest_handler {
             });
         }
         let validator_start = std::time::Instant::now();
-        let final_outcomes = validator.finish(store).await?;
+        let (final_outcomes, final_counts) = validator.finish(store).await?;
         validator_total += validator_start.elapsed();
         validator_count += 1;
-        summary.add_outcomes(&final_outcomes);
+        summary.add_outcomes_errors_only(&final_outcomes);
+        summary.add_batch(&final_counts);
         drain_pending_dones(&mut pending_dones, &final_outcomes, &mut on_event);
 
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
@@ -534,7 +539,9 @@ mod ingest_handler {
             let mut chunk = validator.push(store, index, event).await?;
             outcomes.append(&mut chunk);
         }
-        let mut tail = validator.finish(store).await?;
+        // HTTP wire path keeps using per-row outcomes for `IngestResult`;
+        // the batch counts are CLI-only.
+        let (mut tail, _counts) = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
         Ok(outcomes)
