@@ -175,6 +175,7 @@ pub struct IndexStatus {
     pub table: Table,
     pub intent_name: String,
     pub fragments_covered: usize,
+    pub unindexed_fragments: usize,
     pub unindexed_rows: usize,
     pub exists: bool,
 }
@@ -1458,6 +1459,7 @@ async fn index_status(
                 table,
                 intent_name: intent.name.to_owned(),
                 fragments_covered: 0,
+                unindexed_fragments: total_fragments,
                 unindexed_rows: total_rows,
                 exists,
             });
@@ -1467,6 +1469,7 @@ async fn index_status(
             .unindexed_fragments(intent.name)
             .await
             .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
+        let unindexed_fragments = unindexed.len();
         let unindexed_rows = unindexed
             .iter()
             .map(|fragment| fragment.num_rows().unwrap_or(0))
@@ -1474,7 +1477,8 @@ async fn index_status(
         statuses.push(IndexStatus {
             table,
             intent_name: intent.name.to_owned(),
-            fragments_covered: total_fragments.saturating_sub(unindexed.len()),
+            fragments_covered: total_fragments.saturating_sub(unindexed_fragments),
+            unindexed_fragments,
             unindexed_rows,
             exists,
         });
