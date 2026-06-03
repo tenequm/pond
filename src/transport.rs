@@ -233,7 +233,9 @@ response_mode: \"conversational\" (default - human/model text only), \
 \"complete\" (all messages incl. carriers, tools as one-liners), or \
 \"verbatim\" (full part bodies inline; heaviest). limit defaults to 20, caps \
 at 1000. Bounded by a size budget: when the footer shows `after_id=`, pass it \
-back to page. Not for bulk export - use `pond export`.";
+back to page. A whole-session response also lists the session's subagents (each \
+stored as its own session) in a footer; pass a listed id back as session_id to \
+open it. Not for bulk export - use `pond export`.";
 
     /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -254,7 +256,8 @@ back to page. Not for bulk export - use `pond export`.";
         /// Filter to one session (exact match).
         #[serde(default)]
         session_id: Option<String>,
-        /// Filter to one source agent (e.g. "claude-code").
+        /// Filter to one source agent, e.g. "claude-code" or
+        /// "claude-code/general-purpose" (a subagent).
         #[serde(default)]
         source_agent: Option<String>,
         /// Filter by message role: "user" or "assistant".
@@ -339,9 +342,13 @@ back to page. Not for bulk export - use `pond export`.";
                            format and the first line states totals, then each hit is a \
                            `--- [n] score | role | time | message_id | project | agent | \
                            session ---` delimiter rule followed by the matched text. Pass a \
-                           returned `message_id` to `pond_get` for full text; pass `cursor` \
-                           to page. Keep `query` semantic; use `project` / `session_id` \
-                           filters for scope."
+                           returned `message_id` to `pond_get` for full text. Common args: \
+                           query (semantic - concepts, not project names), then project / \
+                           from_date / to_date to scope. Advanced: source_agent (e.g. \
+                           \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
+                           similar_to (vector-only neighbors of a message_id), cursor (paging). \
+                           Scores are relative within one response; there is no min_score.",
+            annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
             &self,
@@ -386,16 +393,16 @@ back to page. Not for bulk export - use `pond export`.";
 
         #[tool(
             description = "Retrieve stored conversation content as a readable transcript \
-                           (a leading `key:` line explains the format). With `message_id`: \
-                           the requested message (marked `>`) plus `context_depth` sibling \
-                           messages each side, with its tool/file parts shown in full. With \
-                           `session_id`: the session at one of three `response_mode`s - \
-                           \"conversational\" (default; human/model text only), \"complete\" \
-                           (all messages, tools as one-liners), or \"verbatim\" (full part \
-                           bodies inline). Bounded by a size budget; when the footer shows an \
-                           `after_id=`, pass it back to page on. Tool/result lines render as \
-                           `-> name [call_id]` / `<- name [call_id] (ok|failed)`. Not for \
-                           bulk export - use `pond export`."
+                           (a leading `key:` line explains the format). Common: session_id \
+                           (whole session; pair with response_mode \
+                           conversational|complete|verbatim) OR message_id (that message \
+                           marked `>`, plus context_depth sibling messages each side, with \
+                           its tool/file parts in full). A session_id response lists the \
+                           session's subagents in a footer so you can open each. Advanced: \
+                           limit (cap), after_id (paging - pass the value the footer shows). \
+                           Tool/result lines render as `-> name [call_id]` / `<- name \
+                           [call_id] (ok|failed)`. Not for bulk export - use `pond export`.",
+            annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_get(
             &self,
@@ -413,7 +420,21 @@ back to page. Not for bulk export - use `pond export`.";
             };
             match run_get(&self.state.store, request.clone()).await {
                 GetEnvelope::Success(response) => {
-                    Ok(tool_result(render_get_transcript(&response, &request)))
+                    let mut transcript = render_get_transcript(&response, &request);
+                    // Spawn-only subagents are stored as their own sessions
+                    // (spec.md#datasets); surface them on the parent's first page
+                    // so an agent can open each (otherwise they are undiscoverable
+                    // from the MCP surface). Best-effort: a lookup failure just
+                    // omits the footer rather than failing the get.
+                    if request.message_id.is_none()
+                        && request.after_id.is_none()
+                        && let Ok(children) =
+                            self.state.store.child_sessions(&response.session.id).await
+                        && !children.is_empty()
+                    {
+                        transcript.push_str(&render_subagents_footer(&children));
+                    }
+                    Ok(tool_result(transcript))
                 }
                 GetEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
@@ -433,9 +454,18 @@ back to page. Not for bulk export - use `pond export`.";
                     .build(),
             )
             .with_instructions(
-                "pond: session storage and retrieval. Tools: pond_search (hybrid search \
-                 over conversation history), pond_get (retrieve a message with thread \
-                 context, or a full session). Resources: schema://pond, stats://pond.",
+                "pond recalls past agent sessions (Claude Code and others) - prior work, \
+                 decisions, and context across sessions, not the live conversation. \
+                 Workflow: pond_search to find relevant messages, then pond_get to read \
+                 full text by message_id or a whole session by session_id; both return \
+                 readable transcripts, not JSON. Scope with filters, not the query: project \
+                 (path substring), session_id, source_agent, role, from_date / to_date - \
+                 keep query semantic (concepts, not project names). Scores are relative \
+                 within one response; there is no min_score. Subagents are stored as their \
+                 own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
+                 on a parent session lists them in a footer so you can open each. Deeper \
+                 reference on demand: resource schema://pond (all filters + response format), \
+                 stats://pond (corpus + embedding stats).",
             )
         }
 
@@ -577,6 +607,25 @@ back to page. Not for bulk export - use `pond export`.";
     /// structured wire shape use the HTTP `/v1/*` JSON API instead.
     fn tool_result(transcript: String) -> CallToolResult {
         CallToolResult::success(vec![Content::text(transcript)])
+    }
+
+    /// Footer for a `pond_get` session response listing the session's spawn-only
+    /// subagents. Each subagent is its own session (spec.md#datasets) addressable
+    /// by the printed id, so the caller can open any with `pond_get(session_id)`;
+    /// without this they are invisible from the MCP surface.
+    fn render_subagents_footer(children: &[crate::wire::Session]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "subagents ({}) - pass an id to pond_get(session_id=...):",
+            children.len()
+        );
+        for child in children {
+            let _ = writeln!(out, "  {} | {}", child.id, child.source_agent);
+        }
+        out
     }
 
     /// `YYYY-MM-DD HH:MM:SSZ` - compact, sortable, timezone-explicit.
