@@ -9,3 +9,8 @@ publish_no_verify = true
 # default). The release PR still drives version/changelog; this just also covers
 # the case where the bump is already on main but unpublished.
 release_always = true
+# pond ships as a CLI + MCP server; the `pond` lib exists only so the binary and
+# integration tests share code, not as a public API others depend on. cargo-
+# semver-checks guards library consumers we don't have, so skip it - it otherwise
+# adds a multi-minute cold rustdoc build of the heavy dep tree to every release.
+semver_check = false
