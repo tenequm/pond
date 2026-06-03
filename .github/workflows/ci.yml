@@ -104,6 +104,14 @@ jobs:
         run: |
           echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
 
+      # Sign the archives so `cargo binstall` can verify them (pubkey is in
+      # Cargo.toml). minisign comes from nixpkgs via the nix installed above.
+      - name: Sign binaries (minisign)
+        run: nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#minisign --command moon run pond:sign-dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          V: ${{ steps.ver.outputs.v }}
+
       # Public release on the tap (binaries live here; pond is private). Created
       # BEFORE crates.io so a publish can't outrun its own binaries.
       - name: Release binaries to homebrew-tap

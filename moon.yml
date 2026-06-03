@@ -92,28 +92,50 @@ tasks:
       # typed: false
       # frozen_string_literal: true
       class Pond < Formula
-        desc "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
-        homepage "https://github.com/tenequm/homebrew-tap"
+        desc "Lossless storage and hybrid search for sessions from any AI agent client"
+        homepage "https://pond.sh"
         version "$V"
         license "Apache-2.0"
+
+        livecheck do
+          url "https://github.com/tenequm/homebrew-tap"
+          strategy :github_releases
+          regex(/^pond[._-]v?(\d+(?:\.\d+)+)\$/i)
+        end
+
         on_macos do
           if Hardware::CPU.arm?
             url "$base/pond-aarch64-apple-darwin.tar.xz"
             sha256 "$(sha aarch64-apple-darwin)"
-            def install; bin.install "pond"; end
+
+            def install
+              bin.install "pond"
+            end
           end
         end
+
         on_linux do
           if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
             url "$base/pond-x86_64-unknown-linux-gnu.tar.xz"
             sha256 "$(sha x86_64-unknown-linux-gnu)"
-            def install; bin.install "pond"; end
+
+            def install
+              bin.install "pond"
+            end
           end
           if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
             url "$base/pond-aarch64-unknown-linux-gnu.tar.xz"
             sha256 "$(sha aarch64-unknown-linux-gnu)"
-            def install; bin.install "pond"; end
+
+            def install
+              bin.install "pond"
+            end
           end
+        end
+
+        test do
+          assert_match "pond #{version}", shell_output("#{bin}/pond --version")
+          system bin/"pond", "--help"
         end
       end
       EOF
@@ -134,9 +156,11 @@ tasks:
       git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/nur-packages" nur
       mkdir -p nur/pkgs/pond
       cat > nur/pkgs/pond/default.nix <<EOF
-      { lib, fetchurl, stdenvNoCC }:
+      { lib, fetchurl, stdenv, autoPatchelfHook, zlib }:
       let
-        inherit (stdenvNoCC.hostPlatform) system;
+        inherit (stdenv) hostPlatform;
+        inherit (hostPlatform) system;
+        version = "$V";
         shaMap = {
           x86_64-linux = "$(nix32 x86_64-unknown-linux-gnu)";
           aarch64-linux = "$(nix32 aarch64-unknown-linux-gnu)";
@@ -148,23 +172,61 @@ tasks:
           aarch64-darwin = "$base/pond-aarch64-apple-darwin.tar.xz";
         };
       in
-      stdenvNoCC.mkDerivation {
+      stdenv.mkDerivation {
         pname = "pond";
-        version = "$V";
-        src = fetchurl { url = urlMap.\${system}; sha256 = shaMap.\${system}; };
+        inherit version;
+
+        src = fetchurl {
+          url = urlMap.\${system};
+          sha256 = shaMap.\${system};
+        };
+
         sourceRoot = ".";
-        installPhase = ''mkdir -p \$out/bin && cp ./pond \$out/bin/pond'';
+
+        # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
+        # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
+        nativeBuildInputs = lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
+
+        # The released Linux build is CPU-only candle + vendored onig + rustls,
+        # so the sole dynamic deps beyond glibc are libgcc_s/libstdc++.
+        buildInputs = lib.optionals hostPlatform.isLinux [ stdenv.cc.cc.lib zlib ];
+
+        installPhase = ''
+          runHook preInstall
+          install -Dm755 pond \$out/bin/pond
+          runHook postInstall
+        '';
+
         meta = {
-          description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client.";
-          homepage = "https://github.com/tenequm/homebrew-tap";
+          description = "Lossless storage and hybrid search for sessions from any AI agent client";
+          homepage = "https://pond.sh";
+          changelog = "https://github.com/tenequm/pond/blob/v\${version}/CHANGELOG.md";
           license = lib.licenses.asl20;
           mainProgram = "pond";
+          sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
           platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
+          maintainers = with lib.maintainers; [ ];
         };
       }
       EOF
       git -C nur add pkgs/pond/default.nix
       git -C nur diff --quiet --staged || git -C nur -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
       git -C nur push
+    options:
+      cache: false
+
+  # Sign dist/*.{tar.xz,zip} with minisign so `cargo binstall` can verify them
+  # (pubkey in Cargo.toml). Env: MINISIGN_SECRET_KEY (secret-key file contents),
+  # V. Needs minisign on PATH (CI provides it via `nix shell nixpkgs#minisign`).
+  sign-dist:
+    script: |
+      set -euo pipefail
+      key="$(mktemp)"
+      trap 'rm -f "$key"' EXIT
+      printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+      for f in dist/pond-*.tar.xz dist/pond-*.zip; do
+        minisign -S -W -s "$key" -t "pond $V" -x "$f.sig" -m "$f"
+      done
+      ls -1 dist/*.sig
     options:
       cache: false

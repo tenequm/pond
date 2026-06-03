@@ -5,12 +5,56 @@
 name = "pond-db"
 version = "0.2.7"
 edition = "2024"
+# MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
+rust-version = "1.95"
 license = "Apache-2.0"
-description = "Lossless storage and hybrid search for AI agent sessions, across every agentic client."
+description = "Lossless storage and hybrid search for sessions from any AI agent client"
 repository = "https://github.com/tenequm/pond"
+homepage = "https://pond.sh"
 documentation = "https://github.com/tenequm/pond/blob/main/docs/spec.md"
+readme = "README.md"
 keywords = ["agents", "mcp", "lance", "search", "session-logs"]
-categories = ["command-line-utilities", "database"]
+categories = ["command-line-utilities", "database", "artificial-intelligence"]
+# Publish only what `cargo install` compiles. The repo's bulk is dev-only:
+# tests/fixtures (~10 MiB) and docs/references vendored trees + PDFs (~5 MiB).
+# benches/ stays - the [[bench]] targets declare paths cargo resolves on build.
+exclude = [
+    "tests/",
+    "docs/",
+    "scripts/",
+    "ops/",
+    ".github/",
+    ".moon/",
+    "moon.yml",
+    "Dockerfile",
+    ".dockerignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "SECURITY.md",
+    "release-plz.toml",
+    "*.pdf",
+    "**/.DS_Store",
+]
+
+# cargo-binstall: binaries live on the PUBLIC homebrew-tap release (pond is a
+# private repo), under tag `pond-vX.Y.Z` with `pond` at the archive root - so the
+# URL is fully custom; binstall's default `{ repo }` + `v{version}` tag would
+# 404. `{ bin }` resolves to `pond` (the [[bin]] name), not the crate `pond-db`.
+[package.metadata.binstall]
+pkg-url = "https://github.com/tenequm/homebrew-tap/releases/download/pond-v{ version }/pond-{ target }{ archive-suffix }"
+pkg-fmt = "txz"
+bin-dir = "{ bin }{ binary-ext }"
+
+# Windows ships a .zip; every other target is .tar.xz.
+[package.metadata.binstall.overrides."x86_64-pc-windows-gnu"]
+pkg-fmt = "zip"
+
+# minisign signatures for `cargo binstall`: it downloads `{ url }.sig` and
+# verifies against this pubkey. Assets are signed in CI by moon's `sign-dist`
+# task with the MINISIGN_SECRET_KEY secret (a passwordless minisign key).
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWSoCP2uc6YVH3hzzhdcLhwMsyriGUNPwSY+3JN9/SjmRFAfQPpeQeDQ"
 
 [lib]
 name = "pond"
