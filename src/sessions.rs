@@ -4453,11 +4453,7 @@ mod tests {
         for (idx, mid) in ["m3", "m4", "m5"].iter().enumerate() {
             let pid = format!("p{}", idx + 3);
             validator
-                .push(
-                    &store,
-                    idx * 2 + 1,
-                    IngestEvent::Message(user_message(mid)),
-                )
+                .push(&store, idx * 2 + 1, IngestEvent::Message(user_message(mid)))
                 .await?;
             validator
                 .push(
