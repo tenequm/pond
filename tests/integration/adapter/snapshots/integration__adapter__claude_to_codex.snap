@@ -1,5 +1,5 @@
 ---
-source: tests/integration/restore.rs
+source: tests/integration/adapter/mod.rs
 expression: render_files(&files)
 ---
 ### sessions/2026/04/07/rollout-2026-04-07T18-42-20-5d1e9ffd-ebbc-4ae6-8d3a-501f5cda6dc9.jsonl

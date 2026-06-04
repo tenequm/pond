@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::path::Path;
+
 use pond::{
-    adapter::ClaudeCodeAdapter,
+    adapter::{AdapterFactory, ClaudeCodeAdapter, ClaudeCodeFactory, RestoreFidelity},
     handlers::pond_get,
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::Store,
@@ -160,7 +162,7 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
     // `include_subagents=false` (the CLI default): sub-branded sessions
     // (`source_agent` with a `/`) are filtered out of the breakdown, so no
     // adapter row carries a `/` and the breakdown sums to strictly less than
-    // `totals` - the fixture corpus has one subagent session.
+    // `totals` - the fixture corpus has two subagent sessions.
     assert!(stats.adapters.iter().all(|s| !s.adapter.contains('/')));
     let filtered_messages: u64 = stats.adapters.iter().map(|s| s.messages).sum();
     assert!(filtered_messages < stats.totals.messages);
@@ -184,5 +186,124 @@ async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
         "a subagent session must surface as its own claude-code/<type> row",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_writes_parent_and_direct_subagent_child() -> anyhow::Result<()> {
+    let source = TempDir::new()?;
+    write_claude_parent_child(source.path())?;
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(source.path());
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    let parent = store
+        .get_session("parent-session")
+        .await?
+        .expect("parent ingested");
+    let child = store
+        .get_session("parent-session/agent-abc123")
+        .await?
+        .expect("child ingested");
+    let mut files = Vec::new();
+    for session in [&parent, &child] {
+        files.extend(ClaudeCodeFactory.serialize(session, RestoreFidelity::Native)?);
+    }
+    assert!(
+        files
+            .iter()
+            .any(|f| f.relative_path.ends_with("parent-session.jsonl"))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.relative_path.ends_with("subagents/agent-abc123.jsonl"))
+    );
+    assert!(files.iter().any(|f| {
+        f.relative_path
+            .ends_with("subagents/agent-abc123.meta.json")
+    }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_writes_parent_and_workflow_nested_subagent_child() -> anyhow::Result<()> {
+    let source = TempDir::new()?;
+    write_claude_parent_workflow_child(source.path())?;
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(source.path());
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    let parent = store
+        .get_session("parent-session")
+        .await?
+        .expect("parent ingested");
+    let child = store
+        .get_session("parent-session/workflows/wf_test01/agent-xyz789")
+        .await?
+        .expect("nested workflow child ingested under the full path-derived id");
+    let mut files = Vec::new();
+    for session in [&parent, &child] {
+        files.extend(ClaudeCodeFactory.serialize(session, RestoreFidelity::Native)?);
+    }
+    assert!(
+        files
+            .iter()
+            .any(|f| f.relative_path.ends_with("parent-session.jsonl"))
+    );
+    // The nested workflow path round-trips verbatim, not collapsed to the flat
+    // `subagents/agent-<hash>.jsonl` shape.
+    assert!(files.iter().any(|f| {
+        f.relative_path
+            .ends_with("subagents/workflows/wf_test01/agent-xyz789.jsonl")
+    }));
+    assert!(files.iter().any(|f| {
+        f.relative_path
+            .ends_with("subagents/workflows/wf_test01/agent-xyz789.meta.json")
+    }));
+    Ok(())
+}
+
+fn write_claude_parent_child(root: &Path) -> anyhow::Result<()> {
+    let project = root.join("-tmp-restore");
+    let subagents = project.join("parent-session").join("subagents");
+    std::fs::create_dir_all(&subagents)?;
+    std::fs::write(
+        project.join("parent-session.jsonl"),
+        r#"{"type":"user","uuid":"parent-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/restore","message":{"role":"user","content":"hi"}}"#,
+    )?;
+    std::fs::write(
+        subagents.join("agent-abc123.jsonl"),
+        r#"{"type":"assistant","uuid":"child-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:01.000Z","cwd":"/tmp/restore","message":{"role":"assistant","content":[{"type":"text","text":"child"}]}}"#,
+    )?;
+    std::fs::write(
+        subagents.join("agent-abc123.meta.json"),
+        r#"{"agentType":"general-purpose","description":"fixture child"}"#,
+    )?;
+    Ok(())
+}
+
+fn write_claude_parent_workflow_child(root: &Path) -> anyhow::Result<()> {
+    let project = root.join("-tmp-restore");
+    let wf = project
+        .join("parent-session")
+        .join("subagents")
+        .join("workflows")
+        .join("wf_test01");
+    std::fs::create_dir_all(&wf)?;
+    std::fs::write(
+        project.join("parent-session.jsonl"),
+        r#"{"type":"user","uuid":"parent-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/restore","message":{"role":"user","content":"hi"}}"#,
+    )?;
+    std::fs::write(
+        wf.join("agent-xyz789.jsonl"),
+        r#"{"type":"assistant","uuid":"wf-child-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:02.000Z","cwd":"/tmp/restore/sub","message":{"role":"assistant","content":[{"type":"text","text":"workflow child"}]}}"#,
+    )?;
+    std::fs::write(
+        wf.join("agent-xyz789.meta.json"),
+        r#"{"agentType":"general-purpose","description":"workflow fixture child"}"#,
+    )?;
     Ok(())
 }

@@ -70,6 +70,15 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
         row: &BoundedRow,
         state: &mut Self::State,
     ) -> Result<Vec<IngestEvent>, String>;
+
+    /// A file the adapter structurally recognizes as a sidecar whose specific
+    /// shape this version cannot ingest. Returning `Some(reason)` makes the read
+    /// loop skip the file as a VISIBLE, counted failure instead of deriving a
+    /// content-borrowed id that could silently merge it into another session.
+    /// Default: no such category.
+    fn unsupported_reason(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// Path-bearing io error; callers remap it into an [`AdapterError`].
@@ -297,6 +306,17 @@ fn read_one_file<D: JsonlTree>(
             session_id: None,
             project: None,
             reason: SkipReason::Empty,
+        }));
+        return true;
+    }
+    // A file the driver flags as a recognized-but-unsupported sidecar is a
+    // visible failure, not a benign skip: it must never fall through to a
+    // content-derived id that could merge it into another session.
+    if let Some(reason) = driver.unsupported_reason(path) {
+        emit!(Ok(AdapterYield::Skipped {
+            session_id: None,
+            project: None,
+            reason: SkipReason::Unsupported(reason),
         }));
         return true;
     }

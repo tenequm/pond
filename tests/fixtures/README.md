@@ -5,7 +5,8 @@ ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
 
-Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20).
+Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
+claude_code nested workflow-subagent sample added 2026-06-04).
 
 ## Why
 
@@ -94,7 +95,11 @@ sample tree.
   (`structuredPatch` for Edits, file contents for Reads, etc.). A session
   that used the Task tool also has a `<session-uuid>/subagents/` sidecar
   directory: one `agent-<hash>.jsonl` transcript per subagent plus a sibling
-  `agent-<hash>.meta.json` (`{agentType, description, toolUseId}`).
+  `agent-<hash>.meta.json` (`{agentType, description, toolUseId}`). The workflow
+  runner nests transcripts one level deeper, at
+  `<session-uuid>/subagents/workflows/<wf-id>/agent-<hash>.jsonl` (+ sibling
+  `.meta.json`); subagent detection keys off the `subagents/` ancestor at any
+  depth and derives the child id from the full path below it.
 - Samples: 10 sessions. The original 3 (`myproject-a/b/c`) are one session
   each across 3 projects and 3 CLI versions: 2.1.68 is the older format (no
   SessionStart attachment, no `last-prompt` / `permission-mode` standalone

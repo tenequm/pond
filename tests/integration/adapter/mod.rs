@@ -1,17 +1,25 @@
+//! Per-adapter integration suites, mirroring `src/adapter/`. One file per
+//! adapter (`claude_code.rs`, ...). This module root holds only the
+//! cross-adapter interop tests (the foreign-restore matrix) and their shared
+//! harness - the seam analog of `src/adapter/mod.rs`, which likewise carries
+//! the cross-adapter test support. Single-adapter behavior stays in its
+//! per-adapter file.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
 
 use pond::{
     adapter::{
-        Adapter, AdapterFactory, ClaudeCodeAdapter, ClaudeCodeFactory, CodexCliAdapter,
-        CodexCliFactory, RestoreFidelity,
+        Adapter, ClaudeCodeAdapter, ClaudeCodeFactory, CodexCliAdapter, CodexCliFactory,
+        RestoreFidelity,
     },
     handlers::ingest_adapter,
     sessions::Store,
     wire::Message,
 };
 use tempfile::TempDir;
+
+mod claude_code;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_restore_codex_to_claude_reparses() -> anyhow::Result<()> {
@@ -35,46 +43,6 @@ async fn foreign_restore_claude_to_codex_reparses() -> anyhow::Result<()> {
         "5d1e9ffd-ebbc-4ae6-8d3a-501f5cda6dc9",
     )
     .await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn restore_writes_parent_and_direct_subagent_child() -> anyhow::Result<()> {
-    let source = TempDir::new()?;
-    write_claude_parent_child(source.path())?;
-    let store_dir = TempDir::new()?;
-    let store = Store::open_local(store_dir.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(source.path());
-    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
-
-    let parent = store
-        .get_session("parent-session")
-        .await?
-        .expect("parent ingested");
-    let child = store
-        .get_session("parent-session/agent-abc123")
-        .await?
-        .expect("child ingested");
-    let out = TempDir::new()?;
-    let mut files = Vec::new();
-    for session in [&parent, &child] {
-        files.extend(ClaudeCodeFactory.serialize(session, RestoreFidelity::Native)?);
-    }
-    write_restored(out.path(), &files)?;
-    assert!(
-        files
-            .iter()
-            .any(|f| f.relative_path.ends_with("parent-session.jsonl"))
-    );
-    assert!(
-        files
-            .iter()
-            .any(|f| f.relative_path.ends_with("subagents/agent-abc123.jsonl"))
-    );
-    assert!(files.iter().any(|f| {
-        f.relative_path
-            .ends_with("subagents/agent-abc123.meta.json")
-    }));
-    Ok(())
 }
 
 enum TargetRoot {
@@ -168,23 +136,4 @@ fn render_files(files: &[pond::adapter::RestoredFile]) -> String {
         }
     }
     out
-}
-
-fn write_claude_parent_child(root: &Path) -> anyhow::Result<()> {
-    let project = root.join("-tmp-restore");
-    let subagents = project.join("parent-session").join("subagents");
-    std::fs::create_dir_all(&subagents)?;
-    std::fs::write(
-        project.join("parent-session.jsonl"),
-        r#"{"type":"user","uuid":"parent-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/restore","message":{"role":"user","content":"hi"}}"#,
-    )?;
-    std::fs::write(
-        subagents.join("agent-abc123.jsonl"),
-        r#"{"type":"assistant","uuid":"child-message","sessionId":"parent-session","timestamp":"2026-01-01T00:00:01.000Z","cwd":"/tmp/restore","message":{"role":"assistant","content":[{"type":"text","text":"child"}]}}"#,
-    )?;
-    std::fs::write(
-        subagents.join("agent-abc123.meta.json"),
-        r#"{"agentType":"general-purpose","description":"fixture child"}"#,
-    )?;
-    Ok(())
 }

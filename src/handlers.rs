@@ -244,6 +244,10 @@ mod ingest_handler {
                             summary.skipped_empty += 1;
                             SyncStatus::Empty
                         }
+                        SkipReason::Unsupported(reason) => {
+                            summary.skipped_files += 1;
+                            SyncStatus::Skipped { reason }
+                        }
                     };
                     on_event(SyncEvent::SessionDone(SessionOutcome {
                         project,

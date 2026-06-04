@@ -1,5 +1,5 @@
 ---
-source: tests/integration/restore.rs
+source: tests/integration/adapter/mod.rs
 expression: render_files(&files)
 ---
 ### -Users-user-Projects-myproject-a/019c6c57-e2a9-7373-802e-dfcba907221b.jsonl
