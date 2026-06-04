@@ -168,8 +168,7 @@ impl Adapter for ClaudeDesktopAppAdapter {
             }
 
             let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
-            let reader = adapter.clone();
-            let handle = tokio::task::spawn_blocking(move || read_sessions(&reader, survivors, &tx));
+            let handle = tokio::task::spawn_blocking(move || read_sessions(survivors, &tx));
             while let Some(item) = rx.recv().await {
                 yield item;
             }
@@ -261,12 +260,11 @@ fn newest_mtime(path: &Path) -> Option<DateTime<Utc>> {
 }
 
 fn read_sessions(
-    adapter: &ClaudeDesktopAppAdapter,
     sessions: Vec<CoworkSession>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) {
     for session in sessions {
-        if !read_one_session(adapter, session, tx) {
+        if !read_one_session(session, tx) {
             return;
         }
     }
@@ -274,7 +272,6 @@ fn read_sessions(
 
 /// Returns `false` when the consumer dropped the receiver and the read should stop.
 fn read_one_session(
-    _adapter: &ClaudeDesktopAppAdapter,
     file: CoworkSession,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
@@ -874,10 +871,10 @@ fn serialize_session(
     // stored `raw_record`) in source-line order, plus the metadata file from the
     // session's stored `raw_record`. spec.md#adapter-native-restore-lossless:
     // a session ingested without raw records (foreign-sourced) can't be replayed
-    // natively, so we downgrade to foreign and stamp the actual fidelity.
+    // natively, so we re-enter forcing Foreign (which stamps actual_fidelity).
     let session_raw = raw_record(&session.session.options);
     if fidelity == RestoreFidelity::Native && session_raw.is_none() {
-        return serialize_foreign(session);
+        return serialize_session(session, RestoreFidelity::Foreign);
     }
 
     let relative_dir = session
@@ -942,24 +939,6 @@ fn serialize_session(
         ));
     }
     Ok(files)
-}
-
-fn serialize_foreign(
-    session: &crate::sessions::SessionWithMessages,
-) -> Result<Vec<RestoredFile>, AdapterError> {
-    let mut downgraded = serialize_session_foreign_only(session)?;
-    for file in &mut downgraded {
-        file.actual_fidelity = RestoreFidelity::Foreign;
-    }
-    Ok(downgraded)
-}
-
-fn serialize_session_foreign_only(
-    session: &crate::sessions::SessionWithMessages,
-) -> Result<Vec<RestoredFile>, AdapterError> {
-    // Re-enter the main path forcing foreign so a Native request that lacked raw
-    // records still produces a best-effort, re-ingestable tree.
-    serialize_session(session, RestoreFidelity::Foreign)
 }
 
 /// Best-effort metadata for a foreign session: the fields `build_session`

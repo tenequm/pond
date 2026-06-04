@@ -100,7 +100,12 @@ impl Adapter for ClaudeAiExportAdapter {
                 read_conversations(&path).map(|conversations| {
                     conversations
                         .iter()
-                        .filter(|conv| !messages_of(conv).is_empty())
+                        // Match what events_with actually emits: a session needs an
+                        // honest `uuid` (its id) and at least one message.
+                        .filter(|conv| {
+                            conv.get("uuid").and_then(Value::as_str).is_some()
+                                && !messages_of(conv).is_empty()
+                        })
                         .count()
                 })
             })
