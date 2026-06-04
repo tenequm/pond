@@ -818,11 +818,24 @@ open it. Not for bulk export - use `pond export`.";
                 if *messages_remaining > 0
                     && let Some(last) = messages.last()
                 {
-                    let _ = writeln!(
-                        out,
-                        "... {} more messages; pass after_id={} to pond_get to continue",
-                        messages_remaining, last.id,
-                    );
+                    match request.session_from {
+                        SessionFrom::Start => {
+                            let _ = writeln!(
+                                out,
+                                "... {} more messages; pass after_id={} to pond_get to continue",
+                                messages_remaining, last.id,
+                            );
+                        }
+                        // Tail page: the remaining messages are *earlier*, before this
+                        // page. after_id only pages forward, so it can't reach them -
+                        // point back to the start instead of a cursor that dead-ends.
+                        SessionFrom::End => {
+                            let _ = writeln!(
+                                out,
+                                "... {messages_remaining} earlier messages precede this tail; call pond_get with session_from=\"start\" to read from the beginning",
+                            );
+                        }
+                    }
                 }
             }
             GetResult::Message {
