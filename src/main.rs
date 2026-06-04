@@ -568,8 +568,13 @@ async fn main() -> anyhow::Result<()> {
             }
             let mut summary = SyncRunSummary::default();
             let did_archive_import = import_from.is_some();
+            // `--source-dir` is an explicit one-off bypass of `[sources.<name>]`
+            // (resolve_sync_sources honors it directly), so skip the config-based
+            // re-enable - otherwise a probe-less adapter with no config entry
+            // (e.g. claude-ai-export) errors before the override is applied.
             if stages.import
                 && !did_archive_import
+                && source_dir.is_none()
                 && let Some(name) = adapter.as_deref()
             {
                 maybe_reenable_positional(&mut loaded, &config_file, name, yes).await?;

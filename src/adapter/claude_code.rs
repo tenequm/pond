@@ -363,8 +363,14 @@ impl JsonlTree for ClaudeCodeAdapter {
         // child id (its leaf isn't `agent-<hash>.jsonl`) must NOT fall back to
         // its content `sessionId` - that id is the parent's, so it would
         // silently merge into the parent session. Fail visibly and wait for an
-        // adapter update instead. See spec.md#datasets.
-        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        // adapter update instead - EXCEPT the Workflow runner's `journal.jsonl`,
+        // a known control file that carries no `sessionId`, so it falls through
+        // to `session()` and is dropped as a benign Empty skip rather than
+        // flagged as an unrecognized transcript layout. See spec.md#datasets.
+        if subagents_dir(path).is_some()
+            && subagent_ids(path).is_none()
+            && !is_workflow_control_file(path)
+        {
             return Some(format!(
                 "{}: subagent transcript layout not recognized by this pond version; \
                  skipped so it is not merged into the parent session - update pond and \
@@ -374,6 +380,16 @@ impl JsonlTree for ClaudeCodeAdapter {
         }
         None
     }
+}
+
+/// The Workflow runner writes `journal.jsonl` (its resume/cache journal of agent
+/// `started`/`result` events) beside the `agent-<hash>.jsonl` transcripts under
+/// `subagents/workflows/<wf-id>/`. It carries no `sessionId` and only duplicates
+/// content already in those transcripts, so it is a control file to ignore (a
+/// benign Empty skip), not an unrecognized transcript layout. See spec.md#datasets.
+fn is_workflow_control_file(path: &Path) -> bool {
+    subagents_dir(path).is_some()
+        && path.file_name().and_then(|n| n.to_str()) == Some("journal.jsonl")
 }
 
 /// Walk one raw row's `message.content[]` array (if any) and stash every
@@ -402,6 +418,17 @@ fn capture_tool_call_names(row: &Value, map: &mut HashMap<String, Extracted<Stri
 
 fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
     let path_display = path.display().to_string();
+    // A non-agent leaf under `subagents/` (e.g. the Workflow runner's
+    // journal.jsonl) would borrow the parent's content `sessionId` and silently
+    // merge; refuse structurally rather than rely on the row lacking one.
+    // spec.md#datasets.
+    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        return Err(AdapterError::schema(
+            NAME,
+            path_display,
+            "sidecar/control file under subagents/ has no session of its own",
+        ));
+    }
     let mut created_at = None;
     let mut project: Option<Extracted<String>> = None;
     let mut version = None;
@@ -1836,6 +1863,186 @@ mod tests {
         }
         assert!(found, "orphan tool_result part must be present");
         // Sanity: even an orphan should not be reported as a drop.
+        Ok(())
+    }
+
+    /// The Workflow runner's `journal.jsonl` under `subagents/workflows/<wf>/`
+    /// is a known control file, not an unrecognized transcript - it must NOT be
+    /// flagged unsupported (it falls through to a benign Empty skip).
+    #[test]
+    fn workflow_journal_is_a_control_file_not_unsupported() {
+        let adapter = ClaudeCodeAdapter::new("/tmp/pond-test-root");
+        let journal = std::path::Path::new(
+            "/root/-proj/55555555-5555-5555-5555-555555555555/subagents/workflows/wf_030e6487-da6/journal.jsonl",
+        );
+        assert!(is_workflow_control_file(journal));
+        assert!(
+            adapter.unsupported_reason(journal).is_none(),
+            "journal.jsonl is a known control file, not an unsupported layout",
+        );
+    }
+
+    /// Regression guard against narrowing the net too far: a genuinely unknown
+    /// leaf under `subagents/` is still flagged unsupported, while a recognized
+    /// `agent-<hash>.jsonl` is not.
+    #[test]
+    fn unknown_subagents_leaf_is_still_unsupported() {
+        let adapter = ClaudeCodeAdapter::new("/tmp/pond-test-root");
+        let unknown = std::path::Path::new(
+            "/root/-proj/PARENT/subagents/workflows/wf_x/transcript-001.jsonl",
+        );
+        assert!(
+            adapter.unsupported_reason(unknown).is_some(),
+            "an unrecognized non-agent, non-journal leaf must still fail visibly",
+        );
+        assert!(!is_workflow_control_file(unknown));
+
+        let agent = std::path::Path::new("/root/-proj/PARENT/subagents/agent-abc123def456.jsonl");
+        assert!(
+            adapter.unsupported_reason(agent).is_none(),
+            "a recognized agent transcript is resolvable, not unsupported",
+        );
+    }
+
+    /// End-to-end: a workflow dir holding both a real `agent-<hash>.jsonl`
+    /// transcript and the runner's `journal.jsonl`. The agent transcript
+    /// ingests as a child session; the journal is a benign skip (no
+    /// `skipped_files` failure) and its rows never merge into the parent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_journal_skipped_benignly_while_sibling_agent_ingests() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "77777777-7777-7777-7777-777777777777";
+        let wf_id = "wf_030e6487-da6";
+        let agent_hash = "a38f4724ef3864da8";
+        let wf_dir = project_dir
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join(wf_id);
+        std::fs::create_dir_all(&wf_dir)?;
+
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-06-04T00:00:00.000Z",
+            "message": {"role": "user", "content": "hi parent"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        let agent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-agent-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-06-04T00:01:00.000Z",
+            "message": {"role": "user", "content": "workflow agent prompt"},
+        });
+        std::fs::write(
+            wf_dir.join(format!("agent-{agent_hash}.jsonl")),
+            format!("{agent_row}\n"),
+        )?;
+
+        // The Workflow journal: control events only, no sessionId.
+        std::fs::write(
+            wf_dir.join("journal.jsonl"),
+            "{\"type\":\"started\",\"key\":\"v2:abc\",\"agentId\":\"a38f\"}\n\
+             {\"type\":\"result\",\"key\":\"v2:abc\",\"agentId\":\"a38f\",\"result\":{}}\n",
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            summary.skipped_files, 0,
+            "journal.jsonl is a control file (benign Empty skip), not an unsupported failure",
+        );
+
+        let child = store
+            .get_session(&format!(
+                "{parent_uuid}/workflows/{wf_id}/agent-{agent_hash}"
+            ))
+            .await?
+            .expect("the sibling agent transcript still ingests as a child session");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(parent_uuid)
+        );
+
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests");
+        assert_eq!(
+            parent.messages.len(),
+            1,
+            "journal rows must NOT merge into the parent session",
+        );
+        Ok(())
+    }
+
+    /// Hardening: even a journal.jsonl whose rows DO carry the parent
+    /// `sessionId` must not merge - the guard is structural, not contingent on
+    /// the journal lacking one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_journal_with_parent_sessionid_still_not_merged() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "88888888-8888-8888-8888-888888888888";
+        let wf_dir = project_dir
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_abc01234-def");
+        std::fs::create_dir_all(&wf_dir)?;
+
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-06-04T00:00:00.000Z",
+            "message": {"role": "user", "content": "parent only"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        // A journal carrying the PARENT sessionId (hypothetical future shape):
+        // the structural guard must still refuse to merge it.
+        let journal_row = serde_json::json!({
+            "type": "started",
+            "key": "v2:abc",
+            "agentId": "a1",
+            "sessionId": parent_uuid,
+            "message": {"role": "user", "content": "must not merge"},
+        });
+        std::fs::write(wf_dir.join("journal.jsonl"), format!("{journal_row}\n"))?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            summary.skipped_files, 0,
+            "journal is a benign Empty skip, not an unsupported failure",
+        );
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests");
+        assert_eq!(
+            parent.messages.len(),
+            1,
+            "journal row must NOT merge even when it carries the parent sessionId",
+        );
         Ok(())
     }
 }
