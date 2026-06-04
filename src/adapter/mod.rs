@@ -27,7 +27,9 @@ use crate::{
     wire::ProviderOptions,
 };
 
+mod claude_ai_export;
 mod claude_code;
+mod claude_desktop_app;
 mod codex_cli;
 mod discovery;
 pub mod extract;
@@ -35,7 +37,9 @@ mod jsonl;
 mod opencode;
 mod pi_coding_agent;
 
+pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
+pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
 pub use discovery::{
     Candidate, PromptOutcome, discover, persist_accept, persist_decline, probe_unconfigured,
@@ -367,6 +371,8 @@ impl std::error::Error for AdapterError {
 pub fn registry() -> &'static [&'static dyn AdapterFactory] {
     &[
         &ClaudeCodeFactory,
+        &ClaudeDesktopAppFactory,
+        &ClaudeAiExportFactory,
         &CodexCliFactory,
         &OpencodeFactory,
         &PiCodingAgentFactory,
