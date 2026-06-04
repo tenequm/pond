@@ -961,11 +961,11 @@ open it. Not for bulk export - use `pond export`.";
                 file_name,
                 ..
             } => {
-                let _ = writeln!(
-                    out,
-                    "  [file {}]",
-                    file_name.as_deref().unwrap_or(media_type)
-                );
+                let label = file_name
+                    .as_deref()
+                    .or(media_type.as_deref())
+                    .unwrap_or("file");
+                let _ = writeln!(out, "  [file {label}]");
             }
             PartKind::ToolApprovalRequest { approval_id, .. } => {
                 let _ = writeln!(out, "  [approval request {approval_id}]");

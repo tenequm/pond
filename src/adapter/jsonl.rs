@@ -23,11 +23,14 @@ use super::{
     AdapterError, AdapterYield, AdapterYieldStream, DiscoverFuture, SkipOracle, SkipReason,
     extract::{LEAF_CAP, bound_value, truncate_to_marker},
 };
-use crate::{sessions::IngestEvent, wire::Session};
+use crate::{
+    sessions::IngestEvent,
+    wire::{ProviderOptions, Session},
+};
 
 /// Fast-path / slow-path split and the largest record `serde_json` parses in
 /// one shot. 3x the largest legitimate whole record in a real-corpus survey.
-const RECORD_CAP: usize = 32 * 1024 * 1024;
+pub(crate) const RECORD_CAP: usize = 32 * 1024 * 1024;
 
 /// Event-channel bound; doubles as backpressure - the blocking reader parks on
 /// `blocking_send` when the consumer lags.
@@ -37,6 +40,13 @@ const CHANNEL_CAP: usize = 256;
 pub(crate) struct BoundedRow {
     pub line: usize,
     pub value: Value,
+}
+
+pub(crate) fn source_line(options: &ProviderOptions) -> Option<u64> {
+    options
+        .get("source")
+        .and_then(|source| source.get("line"))
+        .and_then(Value::as_u64)
 }
 
 /// A "walk a tree, one `.jsonl` per session, line equals record" adapter. The
@@ -60,6 +70,15 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
         row: &BoundedRow,
         state: &mut Self::State,
     ) -> Result<Vec<IngestEvent>, String>;
+
+    /// A file the adapter structurally recognizes as a sidecar whose specific
+    /// shape this version cannot ingest. Returning `Some(reason)` makes the read
+    /// loop skip the file as a VISIBLE, counted failure instead of deriving a
+    /// content-borrowed id that could silently merge it into another session.
+    /// Default: no such category.
+    fn unsupported_reason(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// Path-bearing io error; callers remap it into an [`AdapterError`].
@@ -117,7 +136,8 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
 
         let heads = {
             let driver = driver.clone();
-            tokio::task::spawn_blocking(move || collect_heads(&driver)).await
+            let oracle_is_empty = oracle.is_empty();
+            tokio::task::spawn_blocking(move || collect_heads(&driver, oracle_is_empty)).await
         };
         let heads = match heads {
             Ok(Ok(heads)) => heads,
@@ -170,7 +190,10 @@ struct FileHead {
     session_id: Option<String>,
 }
 
-fn collect_heads<D: JsonlTree>(driver: &D) -> Result<Vec<FileHead>, AdapterError> {
+fn collect_heads<D: JsonlTree>(
+    driver: &D,
+    oracle_is_empty: bool,
+) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
     let files = collect_jsonl_files(driver.root())
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
@@ -180,8 +203,17 @@ fn collect_heads<D: JsonlTree>(driver: &D) -> Result<Vec<FileHead>, AdapterError
             .and_then(|meta| meta.modified())
             .ok()
             .map(DateTime::<Utc>::from);
-        let first_line = peek_first_line(&path).unwrap_or_default();
-        let session_id = driver.peek_session_id(&path, &first_line);
+        // First-line peek + driver parse cost roughly one open + 4 KB read +
+        // a JSON decode per file. On a first-time ingest (`NoopOracle` or
+        // any oracle with no watermarks) `last_ingested_at` will always
+        // return `None`, so the peek result would never feed the freshness
+        // check - skip it.
+        let session_id = if oracle_is_empty {
+            None
+        } else {
+            let first_line = peek_first_line(&path).unwrap_or_default();
+            driver.peek_session_id(&path, &first_line)
+        };
         heads.push(FileHead {
             path,
             mtime,
@@ -274,6 +306,17 @@ fn read_one_file<D: JsonlTree>(
             session_id: None,
             project: None,
             reason: SkipReason::Empty,
+        }));
+        return true;
+    }
+    // A file the driver flags as a recognized-but-unsupported sidecar is a
+    // visible failure, not a benign skip: it must never fall through to a
+    // content-derived id that could merge it into another session.
+    if let Some(reason) = driver.unsupported_reason(path) {
+        emit!(Ok(AdapterYield::Skipped {
+            session_id: None,
+            project: None,
+            reason: SkipReason::Unsupported(reason),
         }));
         return true;
     }

@@ -5,8 +5,8 @@
 // at the same directory level need explicit `#[path]` to point inside the
 // `integration/` folder.
 
-#[path = "integration/claude_code_ingest.rs"]
-mod claude_code_ingest;
+#[path = "integration/adapter/mod.rs"]
+mod adapter;
 #[path = "integration/embed.rs"]
 mod embed;
 #[path = "integration/lance_smoke.rs"]
@@ -17,8 +17,6 @@ mod optimize_under_contention;
 mod recovery;
 #[path = "integration/remote_backend.rs"]
 mod remote_backend;
-#[path = "integration/restore.rs"]
-mod restore;
 #[path = "integration/s3_backend.rs"]
 mod s3_backend;
 #[path = "integration/search.rs"]

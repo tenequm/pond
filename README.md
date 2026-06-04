@@ -18,11 +18,13 @@ codex mcp add pond -- pond mcp            # Codex
 
 Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. Your history, your search, your sessions - independent of the agent vendor that made them.
 
-One Rust binary that ingests sessions from any agentic client (Claude Code, Codex, and more on the roadmap) into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
+One Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
 
 Current automatically synced agent clients:
 - Claude Code CLI
 - Codex CLI
+- opencode CLI
+- pi-coding-agent CLI
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md).
 
@@ -104,9 +106,28 @@ pond sync --only import
 pond sync --only embed
 pond sync --only update-indexes
 pond sync --import-from snapshot.pond
+pond sync -y                       # auto-accept probe prompts (non-TTY runs)
 ```
 
-`pond status` reports row counts, storage size, embedding coverage, and index health. It prints quick storage information first, then finishes the longer checks in front of the user. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+`pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + searchable messages), and `sources` (configured adapter count). Pass `--adapters` for per-project tables and per-intent index detail. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+
+### Configuration
+
+`pond` discovers sources interactively on first run and writes them to `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. Re-enable interactively with `pond sync <name>`.
+
+```toml
+[sources.claude-code]
+enabled = true
+path = "~/.claude/projects"
+
+[sources.codex-cli]
+enabled = false                    # kept in config, skipped on `pond sync`
+path = "~/.codex/sessions"
+```
+
+### Verbosity
+
+Root-level `-v` / `-vv` / `-vvv` raise the tracing level (info / debug / trace); `-q` / `-qq` lower it. The default surfaces warnings only. `RUST_LOG` overrides the CLI flag when set; `POND_LOG` is no longer honored.
 
 ## Design
 
@@ -132,11 +153,11 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 | `docs/references/effect/` | github.com/Effect-TS/effect | Effect v4 Prompt/Response Part unions. Pond's canonical types copy this shape. |
 | `docs/references/opencode/` | github.com/sst/opencode | Effect Schema canonical Part union; SDK types; storage schema. |
 | `docs/references/kilocode/` | github.com/kilo-org/kilocode | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
-| `docs/references/pi-mono/` | github.com/badlogic/pi-mono | Leaf-cursor branching and cross-provider conformance test matrix. |
+| `docs/references/pi-coding-agent/` | github.com/badlogic/pi-mono | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
 | `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
 | `docs/references/recursive-language-models-study-2512.24601v3.pdf` | arXiv 2512.24601 | Long context as a queryable environment; recursion as sub-agent spawning - corroborates the linked-Sessions branching model. |
-| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as SourceAdapter test fixtures. |
+| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

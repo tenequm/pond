@@ -11,6 +11,7 @@
 ## Tests
 
 - Layout: unit tests live in `#[cfg(test)] mod tests` next to the code they test (`src/...`). All integration tests are bundled into one binary at `tests/integration.rs`, with each suite as a module under `tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
+- Adapter-specific integration tests go in `tests/integration/adapter/<adapter>.rs` (mirroring `src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `tests/integration/adapter/mod.rs`, the seam analog of `src/adapter/mod.rs`.
 - Run everything: `cargo test`.
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
@@ -41,6 +42,7 @@
 
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
 - Don't add or maintain changelog entries; pond has no changelog and doesn't need one.
+- pond is a pre-1.0 release-plz-managed crate. Mark breaking commits with `<type>!:` (or a `BREAKING CHANGE:` footer) so release-plz bumps `0.X.0` instead of patch. When squash-merging a breaking PR, pass the subject via `gh pr merge --squash -t "feat(scope)!: ..."` so the `!` survives the squash.
 
 ## Minimalism
 
@@ -65,7 +67,13 @@ A good pond comment names the WHY a reader can't see from the code itself: a hid
 ## Adapter seam (load-bearing)
 
 - The adapter seam enforces correctness via types - synthesized values (sentinel strings, fallback defaults like `"unknown"`, `"function"`, `""`) MUST NOT compile, and the seam is transport-agnostic via `Source`/`Extracted<T>` so file, HTTP, and stream adapters share one set of primitives.
+- Keep `src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`src/adapter/<adapter>.rs`) next to the factory/reader they describe.
 - Unit tests live in `#[cfg(test)] mod tests` at the bottom of the source file they test; `tests/` is reserved for genuine cross-module integration suites only.
+
+## Seam boundaries
+
+- Seam modules define contracts, generic invariants, and cross-implementation helpers only. They must not accumulate implementation-specific policy from one source, provider, transport, storage backend, CLI surface, or fixture corpus. If a rule would need a concrete adapter/client/provider/backend name to explain it, keep it out of the seam and put it in the owning implementation module.
+- Before adding a helper to a seam module, verify it has at least two real callers and no caller-specific assumptions. If it encodes a fallback path, naming scheme, freshness heuristic, restore shape, source option detail, provider request quirk, backend behavior, or UI convention for one implementation, it belongs beside that implementation instead.
 
 ## CLI output stack
 

@@ -32,14 +32,21 @@ mod codex_cli;
 mod discovery;
 pub mod extract;
 mod jsonl;
+mod opencode;
+mod pi_coding_agent;
 
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
-pub use discovery::{Candidate, discover, prompt_and_persist};
+pub use discovery::{
+    Candidate, PromptOutcome, discover, persist_accept, persist_decline, probe_unconfigured,
+    prompt_and_persist, prompt_each,
+};
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
 };
+pub use opencode::{OpencodeAdapter, OpencodeFactory};
+pub use pi_coding_agent::{PiCodingAgentAdapter, PiCodingAgentFactory};
 
 /// Stateless face of an adapter type: how the registry knows about it without
 /// instantiating it. One implementation per known format, registered in
@@ -82,6 +89,27 @@ pub enum RestoreFidelity {
 pub struct RestoredFile {
     pub relative_path: PathBuf,
     pub bytes: Vec<u8>,
+    /// Fidelity actually served when this file was produced. Equal to the
+    /// requested fidelity unless the adapter had to downgrade (e.g. caller
+    /// asked `Native` but the session lacks a stored `raw_record`, so the
+    /// adapter served `Foreign`). spec.md#adapter-native-restore-lossless:
+    /// native may be impossible on older logs; the signal lets the CLI warn
+    /// rather than silently degrade.
+    pub actual_fidelity: RestoreFidelity,
+}
+
+impl RestoredFile {
+    pub(crate) fn new(
+        relative_path: impl Into<PathBuf>,
+        bytes: Vec<u8>,
+        actual_fidelity: RestoreFidelity,
+    ) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            bytes,
+            actual_fidelity,
+        }
+    }
 }
 
 /// Live, configured adapter instance. Holds whatever handle the source needs
@@ -121,6 +149,14 @@ pub trait Adapter: Send + Sync {
 /// file's mtime to decide whether to re-decode.
 pub trait SkipOracle: Send + Sync {
     fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
+
+    /// Fast-path hint: the oracle has no watermarks at all (first ingest or
+    /// `NoopOracle`). Lets adapters skip the per-file work needed to ask
+    /// `last_ingested_at` - typically the JSONL header peek + driver parse.
+    /// Defaults to `false` so existing oracles stay correct without changes.
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 /// `SkipOracle` that always returns `None`. Used by tests and benches that
@@ -131,6 +167,10 @@ pub struct NoopOracle;
 impl SkipOracle for NoopOracle {
     fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
         None
+    }
+
+    fn is_empty(&self) -> bool {
+        true
     }
 }
 
@@ -145,13 +185,19 @@ pub enum AdapterYield {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     Fresh,
     /// File produced no importable session (empty `.jsonl`, sidecar-only rows,
     /// or an unextractable header). Benign: counted, never an error or a
-    /// per-event drop. The underlying cause is logged at `POND_LOG=debug`.
+    /// per-event drop. The underlying cause is logged at `-vv` (debug) verbosity.
     Empty,
+    /// File is structurally a known sidecar whose specific shape this adapter
+    /// version can't ingest. Surfaced as a visible, counted failure - NOT a
+    /// benign skip - so the gap is actionable and the file is never folded into
+    /// another session under a borrowed id. The payload is the user-facing
+    /// reason naming the file and the fix.
+    Unsupported(String),
 }
 
 pub type AdapterYieldStream<'a> =
@@ -319,7 +365,12 @@ impl std::error::Error for AdapterError {
 /// adds one `&Factory` here plus one file under `src/adapter/`. Order is the
 /// order discovery presents to the operator.
 pub fn registry() -> &'static [&'static dyn AdapterFactory] {
-    &[&ClaudeCodeFactory, &CodexCliFactory]
+    &[
+        &ClaudeCodeFactory,
+        &CodexCliFactory,
+        &OpencodeFactory,
+        &PiCodingAgentFactory,
+    ]
 }
 
 /// Look up a factory by name. Returns `None` for unknown names; callers
@@ -394,6 +445,162 @@ pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {
         .cloned()
 }
 
+/// Standard `options.source = {adapter, raw_record}` shape used by every
+/// adapter that captures its source record for native restore. Centralized so
+/// the writer side of the raw-record convention lives next to the reader
+/// ([`raw_record`]); per-adapter side-fields (e.g. claude-code's `cwd`,
+/// codex-cli's `git`) extend this map after construction.
+pub(crate) fn source_options(adapter: &'static str, raw: &Value) -> ProviderOptions {
+    let mut options = ProviderOptions::new();
+    options.insert(
+        "source".to_owned(),
+        serde_json::json!({
+            "adapter": adapter,
+            "raw_record": extract_raw_record(raw),
+        }),
+    );
+    options
+}
+
+/// `Part.ordinal` is stored as `i32`; ingest counts as `usize`. A session
+/// could in principle exceed `i32::MAX` parts, in which case we clamp rather
+/// than drop the record.
+#[inline]
+pub(crate) fn part_ordinal(ordinal: usize) -> i32 {
+    i32::try_from(ordinal).unwrap_or(i32::MAX)
+}
+
+/// Reject `/`, `\`, `..`, and absolute paths in any segment that will become
+/// part of a filesystem path during restore. Centralizing it here keeps every
+/// adapter's restore-write path on the same allowlist; the writer
+/// ([`write_restored_files`]) re-applies it as a defense-in-depth check on
+/// every segment regardless of which adapter built the `RestoredFile`.
+pub(crate) fn validate_path_id(
+    adapter: &'static str,
+    kind: &str,
+    id: &str,
+    location: impl Into<String>,
+) -> Result<(), AdapterError> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || std::path::Path::new(id).is_absolute()
+    {
+        return Err(AdapterError::schema(
+            adapter,
+            location,
+            format!("{kind} contains a path separator or traversal marker: {id}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically write a batch of `RestoredFile`s under `root`. Every path
+/// segment is re-validated and the joined path is required to stay inside
+/// `root` (spec.md#adapter-native-restore-lossless: restore writes are
+/// adapter-supplied, but the gate lives at the writer so a single audit
+/// covers every adapter today and tomorrow). On partial failure the
+/// half-written tree is discarded before the error is returned.
+///
+/// Currently exercised only by adapter tests; the production restore CLI
+/// will route through this same helper when it lands.
+#[allow(dead_code)]
+pub(crate) fn write_restored_files(
+    root: &Path,
+    files: Vec<RestoredFile>,
+) -> Result<(), AdapterError> {
+    // Stage under a sibling temp dir and atomically rename so a partial
+    // failure cannot leave a half-populated restore in place.
+    let parent = root.parent().unwrap_or_else(|| Path::new("."));
+    let stem = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("restore");
+    let staging = parent.join(format!(".{stem}.tmp"));
+    let io =
+        |location: String, source: std::io::Error| AdapterError::io("restore", location, source);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| io(staging.display().to_string(), e))?;
+
+    let result = (|| -> Result<(), AdapterError> {
+        for file in files {
+            write_one_into_staging(&staging, &file)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    // Replace any existing restore root; the staging dir becomes the new root.
+    let _ = std::fs::remove_dir_all(root);
+    if let Some(parent) = root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
+    }
+    std::fs::rename(&staging, root).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        io(root.display().to_string(), e)
+    })?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn write_one_into_staging(staging: &Path, file: &RestoredFile) -> Result<(), AdapterError> {
+    // Validate every segment of the supplied relative path.
+    for component in file.relative_path.components() {
+        use std::path::Component;
+        let segment = match component {
+            Component::Normal(s) => s,
+            Component::CurDir => continue,
+            // Absolute prefixes, root, and `..` are categorically rejected -
+            // a restored file's relative_path is by contract relative + safe.
+            _ => {
+                return Err(AdapterError::schema(
+                    "restore",
+                    file.relative_path.display().to_string(),
+                    "relative_path component is not a normal name",
+                ));
+            }
+        };
+        let Some(text) = segment.to_str() else {
+            return Err(AdapterError::schema(
+                "restore",
+                file.relative_path.display().to_string(),
+                "relative_path segment is not UTF-8",
+            ));
+        };
+        validate_path_id(
+            "restore",
+            "relative_path segment",
+            text,
+            file.relative_path.display().to_string(),
+        )?;
+    }
+
+    let dest = staging.join(&file.relative_path);
+    // Defense-in-depth: confirm the joined path is still inside the staging
+    // dir even if every individual segment passed the syntactic check.
+    if !dest.starts_with(staging) {
+        return Err(AdapterError::schema(
+            "restore",
+            file.relative_path.display().to_string(),
+            "relative_path escaped the restore root after join",
+        ));
+    }
+    let io =
+        |location: String, source: std::io::Error| AdapterError::io("restore", location, source);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
+    }
+    std::fs::write(&dest, &file.bytes).map_err(|e| io(dest.display().to_string(), e))?;
+    Ok(())
+}
+
 pub(crate) fn extracted_text(value: &Option<Extracted<String>>) -> &str {
     value.as_deref().map(String::as_str).unwrap_or("")
 }
@@ -419,12 +626,51 @@ pub(crate) fn empty_options() -> ProviderOptions {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::Path;
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
 
+    use serde_json::Value;
     use tempfile::TempDir;
 
-    use super::{Adapter, AdapterFactory, NoopOracle, RestoreFidelity};
+    use super::{Adapter, AdapterFactory, Env, NoopOracle, RestoreFidelity};
     use crate::{handlers::ingest_adapter, sessions::Store};
+
+    /// Shared probe_default contract: when the adapter's expected install
+    /// subpath exists under an injected `HOME`, `probe_default` returns it;
+    /// when the path is removed, it returns `None`. Each adapter owns its
+    /// `probe_default_*` test (per the seam-boundaries rule) but the shape
+    /// is the same, so the helper takes the factory + its expected subpath.
+    pub(crate) fn assert_probe_default(
+        factory: &dyn AdapterFactory,
+        expected_subpath: &[&str],
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let mut expected = temp.path().to_path_buf();
+        for segment in expected_subpath {
+            expected.push(segment);
+        }
+        std::fs::create_dir_all(&expected)?;
+        let env = Env::with_home(temp.path());
+
+        let probe = factory.probe_default(&env);
+        let got = probe
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        anyhow::ensure!(
+            got == expected.to_str(),
+            "factory must probe its install path: got {got:?}, expected {expected:?}",
+        );
+
+        std::fs::remove_dir_all(&expected)?;
+        anyhow::ensure!(
+            factory.probe_default(&env).is_none(),
+            "probe_default must be None once the install path disappears",
+        );
+        Ok(())
+    }
 
     pub(crate) async fn assert_native_restore(
         factory: &dyn AdapterFactory,
@@ -434,7 +680,14 @@ pub(crate) mod test_support {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
         ingest_adapter(&store, adapter, &NoopOracle, |_| {}).await?;
-        for session_id in store.session_ids().await? {
+        let session_ids = store.session_ids().await?;
+        assert!(
+            !session_ids.is_empty(),
+            "native restore fixture must ingest at least one session",
+        );
+
+        let mut restored_paths = BTreeSet::new();
+        for session_id in session_ids {
             let Some(session) = store.get_session(&session_id).await? else {
                 anyhow::bail!("session id listed by store was not readable: {session_id}");
             };
@@ -444,6 +697,37 @@ pub(crate) mod test_support {
                 let expected_bytes = std::fs::read(&expected)
                     .map_err(|err| anyhow::anyhow!("read {}: {err}", expected.display()))?;
                 assert_json_file_equal(&expected, &expected_bytes, &file.bytes)?;
+                restored_paths.insert(file.relative_path);
+            }
+        }
+        assert_eq!(
+            restored_paths,
+            source_json_files(source_root)?,
+            "native restore must emit exactly the source JSON/JSONL file set",
+        );
+        Ok(())
+    }
+
+    fn source_json_files(root: &Path) -> anyhow::Result<BTreeSet<PathBuf>> {
+        let mut out = BTreeSet::new();
+        collect_source_json_files(root, root, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_source_json_files(
+        root: &Path,
+        dir: &Path,
+        out: &mut BTreeSet<PathBuf>,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_source_json_files(root, &path, out)?;
+                continue;
+            }
+            if let Some("json" | "jsonl") = path.extension().and_then(|ext| ext.to_str()) {
+                out.insert(path.strip_prefix(root)?.to_path_buf());
             }
         }
         Ok(())
@@ -478,52 +762,5 @@ pub(crate) mod test_support {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).map_err(Into::into))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use super::*;
-    use serde_json::Value;
-    use tempfile::TempDir;
-
-    #[test]
-    fn each_factory_probes_its_default_under_an_injected_home() {
-        // Per-adapter discovery lives on each factory's `probe_default`, not in
-        // a central name->path table. Driving each one with an injected `home`
-        // proves the rule lives where the format lives.
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let claude_dir = home.join(".claude").join("projects");
-        let codex_dir = home.join(".codex").join("sessions");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::create_dir_all(&codex_dir).unwrap();
-
-        let env = Env::with_home(home);
-
-        let claude_probe = ClaudeCodeFactory.probe_default(&env);
-        assert_eq!(
-            claude_probe
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(Value::as_str),
-            Some(claude_dir.to_str().unwrap()),
-        );
-
-        let codex_probe = CodexCliFactory.probe_default(&env);
-        assert_eq!(
-            codex_probe
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(Value::as_str),
-            Some(codex_dir.to_str().unwrap()),
-        );
-
-        // Removing the codex marker dir drops just that factory's probe.
-        std::fs::remove_dir_all(&codex_dir).unwrap();
-        assert!(CodexCliFactory.probe_default(&env).is_none());
-        assert!(ClaudeCodeFactory.probe_default(&env).is_some());
     }
 }

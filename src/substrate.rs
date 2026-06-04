@@ -23,7 +23,7 @@ use lance_io::object_store::{
 };
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
-use lance_namespace::error::NamespaceError;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
 use std::{
@@ -175,6 +175,7 @@ pub struct IndexStatus {
     pub table: Table,
     pub intent_name: String,
     pub fragments_covered: usize,
+    pub unindexed_fragments: usize,
     pub unindexed_rows: usize,
     pub exists: bool,
 }
@@ -1458,6 +1459,7 @@ async fn index_status(
                 table,
                 intent_name: intent.name.to_owned(),
                 fragments_covered: 0,
+                unindexed_fragments: total_fragments,
                 unindexed_rows: total_rows,
                 exists,
             });
@@ -1467,6 +1469,7 @@ async fn index_status(
             .unindexed_fragments(intent.name)
             .await
             .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
+        let unindexed_fragments = unindexed.len();
         let unindexed_rows = unindexed
             .iter()
             .map(|fragment| fragment.num_rows().unwrap_or(0))
@@ -1474,7 +1477,8 @@ async fn index_status(
         statuses.push(IndexStatus {
             table,
             intent_name: intent.name.to_owned(),
-            fragments_covered: total_fragments.saturating_sub(unindexed.len()),
+            fragments_covered: total_fragments.saturating_sub(unindexed_fragments),
+            unindexed_fragments,
             unindexed_rows,
             exists,
         });
@@ -1524,12 +1528,7 @@ async fn open_or_create_via_ns(
             return Ok(dataset);
         }
         Err(error) => match &error {
-            lance::Error::Namespace { source, .. }
-                if matches!(
-                    source.downcast_ref::<NamespaceError>(),
-                    Some(NamespaceError::TableNotFound { .. })
-                ) =>
-            {
+            error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
                 // fall through to create
             }
             _ => {
@@ -1556,6 +1555,20 @@ async fn open_or_create_via_ns(
     Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
         .await
         .with_context(|| format!("failed to create table {table_name}"))
+}
+
+// lance-namespace sometimes nests one `lance::Error::Namespace` inside another
+// before the underlying `NamespaceError`; walk the whole `.source()` chain
+// rather than only matching the outer variant.
+fn is_namespace_error_code(error: &lance::Error, code: ErrorCode) -> bool {
+    if !matches!(error, lance::Error::Namespace { .. }) {
+        return false;
+    }
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |link| {
+        link.source()
+    })
+    .filter_map(|link| link.downcast_ref::<NamespaceError>())
+    .any(|inner| inner.code() == code)
 }
 
 fn scanner_with_prefilter(
@@ -1662,6 +1675,32 @@ fn like_contains(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn namespace_error_code_walks_wrapped_chain() {
+        let direct = lance::Error::namespace_source(Box::new(NamespaceError::TableNotFound {
+            message: "missing".into(),
+        }));
+        assert!(is_namespace_error_code(&direct, ErrorCode::TableNotFound));
+
+        let wrapped = lance::Error::namespace_source(Box::new(direct));
+        assert!(is_namespace_error_code(&wrapped, ErrorCode::TableNotFound));
+
+        let other_code =
+            lance::Error::namespace_source(Box::new(NamespaceError::NamespaceNotFound {
+                message: "nope".into(),
+            }));
+        assert!(!is_namespace_error_code(
+            &other_code,
+            ErrorCode::TableNotFound
+        ));
+
+        let not_namespace = lance::Error::internal("unrelated");
+        assert!(!is_namespace_error_code(
+            &not_namespace,
+            ErrorCode::TableNotFound
+        ));
+    }
 
     /// Round-trip: opening a fresh data dir through `lance-namespace`
     /// produces all three tables, and `Handle::scan` returns an empty batch

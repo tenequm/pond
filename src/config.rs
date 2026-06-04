@@ -173,10 +173,15 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # exists.
 #
 # [sources.claude-code]
+# enabled = true
 # path = \"~/.claude/projects\"
 #
 # [sources.codex-cli]
+# enabled = true
 # path = \"~/.codex/sessions\"
+#
+# Set `enabled = false` to keep the section but skip it on `pond sync`;
+# re-enable via `pond sync <adapter>`.
 
 # Embeddings. Search runs hybrid (vector + FTS) whenever the store has any
 # vectors, and FTS-only otherwise - the model loads lazily on the first hybrid
@@ -396,28 +401,69 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. With
-    /// `adapter = None` returns every entry (the no-arg sync path); with
-    /// `Some(name)` returns just that one or errors if it's not in config.
-    /// The caller is responsible for the discovery fallback when this returns
-    /// an empty list. Each tuple's `Value` is the opaque config blob to hand
-    /// to the matching factory's `open()`.
+    /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. Only
+    /// sections with `enabled = true` flow through; sections with
+    /// `enabled = false` (or absent) are treated as opt-out and the
+    /// per-adapter blob (minus `enabled`) is handed to the factory's
+    /// `open()`. With `adapter = None` returns every enabled entry; with
+    /// `Some(name)` returns just that one - and errors if it's not in
+    /// config OR if it's currently disabled (the caller should then
+    /// re-prompt or report).
     pub fn resolve_sources(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
         match adapter {
             None => Ok(self
                 .sources
                 .iter()
-                .map(|(name, blob)| (name.clone(), blob.clone()))
+                .filter_map(|(name, blob)| take_enabled(name, blob))
                 .collect()),
             Some(name) => {
                 let blob = self
                     .sources
                     .get(name)
                     .ok_or_else(|| anyhow!("no [sources.{name}] entry in config"))?;
-                Ok(vec![(name.to_owned(), blob.clone())])
+                take_enabled(name, blob).map(|entry| vec![entry]).ok_or_else(|| {
+                    anyhow!(
+                        "source [{name}] is disabled (enabled = false); run `pond sync {name}` to re-enable"
+                    )
+                })
             }
         }
     }
+
+    /// Names that are configured but currently `enabled = false`. Used by
+    /// `pond sync` post-import to know not to re-probe an adapter the user
+    /// already declined (the decline persists; re-prompt only via the
+    /// positional override `pond sync <name>`).
+    pub fn disabled_source_names(&self) -> Vec<&str> {
+        self.sources
+            .iter()
+            .filter_map(|(name, blob)| {
+                let enabled = blob
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if enabled { None } else { Some(name.as_str()) }
+            })
+            .collect()
+    }
+}
+
+/// Inner helper: return `Some((name, blob))` when the source section is
+/// enabled, stripping the discriminator from the blob before handing it on;
+/// `None` when the section is missing `enabled` or has `enabled = false`.
+fn take_enabled(name: &str, blob: &Value) -> Option<(String, Value)> {
+    let enabled = blob
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let mut clean = blob.clone();
+    if let Some(obj) = clean.as_object_mut() {
+        obj.remove("enabled");
+    }
+    Some((name.to_owned(), clean))
 }
 
 /// Tilde-expand `path` against an explicit `home`. Filesystem-shaped adapters
@@ -594,21 +640,30 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let body = "\
 [sources.claude-code]
+enabled = true
 path = \"/srv/claude\"
 
 [sources.codex-cli]
+enabled = true
 path = \"/srv/codex\"
+
+[sources.opencode]
+enabled = false
 ";
         let path = temp.path().join("config.toml");
         std::fs::write(&path, body).expect("write config");
         let config = Config::load(&path).unwrap();
 
-        // None -> everything in [sources.*]
+        // None -> only enabled entries
         let all = config.resolve_sources(None).unwrap();
         assert_eq!(all.len(), 2);
         let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"claude-code"));
         assert!(names.contains(&"codex-cli"));
+        // The `enabled` discriminator never reaches the adapter blob.
+        for (_, blob) in &all {
+            assert!(blob.get("enabled").is_none(), "enabled should be stripped");
+        }
 
         // Some(name) -> one entry, opaque JSON blob
         let one = config.resolve_sources(Some("codex-cli")).unwrap();
@@ -619,8 +674,19 @@ path = \"/srv/codex\"
             Some("/srv/codex"),
         );
 
+        // Disabled positional -> errors with the recovery hint baked in.
+        let disabled = config.resolve_sources(Some("opencode"));
+        let err = disabled
+            .expect_err("disabled adapter must error")
+            .to_string();
+        assert!(err.contains("enabled = false"), "got: {err}");
+        assert!(err.contains("pond sync opencode"), "got: {err}");
+
         // Unknown -> error
         assert!(config.resolve_sources(Some("nope")).is_err());
+
+        // disabled_source_names lists exactly the off ones.
+        assert_eq!(config.disabled_source_names(), vec!["opencode"]);
     }
 
     #[test]

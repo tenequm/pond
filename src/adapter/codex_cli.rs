@@ -32,7 +32,7 @@ use super::{
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
     extracted_text,
     jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
-    jsonl_bytes, part_id, raw_record,
+    jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
 const NAME: &str = "codex-cli";
@@ -98,10 +98,11 @@ fn serialize_session(
         }
         records.push(codex_response_item(message));
     }
-    Ok(vec![RestoredFile {
-        relative_path: codex_relative_path(session),
-        bytes: jsonl_bytes(NAME, &records)?,
-    }])
+    Ok(vec![RestoredFile::new(
+        codex_relative_path(session),
+        jsonl_bytes(NAME, &records)?,
+        fidelity,
+    )])
 }
 
 fn codex_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
@@ -553,7 +554,7 @@ fn message_events(
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance,
             options: empty_options(),
             kind: PartKind::Text { text },
@@ -843,6 +844,14 @@ mod tests {
     use tempfile::TempDir;
 
     const FIXTURES: &str = "tests/fixtures/adapter/codex_cli/sessions";
+
+    #[test]
+    fn probe_default_finds_codex_sessions_under_home() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &CodexCliFactory,
+            &[".codex", "sessions"],
+        )
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {

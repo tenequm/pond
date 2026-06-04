@@ -28,8 +28,8 @@ use super::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
-    jsonl_bytes, part_id, raw_record,
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
+    jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
 /// Per-file streaming state that persists across rows of one JSONL file.
@@ -133,25 +133,27 @@ fn serialize_session(
         records.push(record);
     }
 
-    let mut files = vec![RestoredFile {
-        relative_path: claude_relative_path(session),
-        bytes: jsonl_bytes(NAME, &records)?,
-    }];
+    let mut files = vec![RestoredFile::new(
+        claude_relative_path(session),
+        jsonl_bytes(NAME, &records)?,
+        fidelity,
+    )];
     if session.session.parent_session_id.is_some()
         && let Some(meta) = subagent_meta_record(session)
     {
         let mut meta_path = files[0].relative_path.clone();
         meta_path.set_extension("meta.json");
-        files.push(RestoredFile {
-            relative_path: meta_path,
-            bytes: serde_json::to_vec(&meta).map_err(|err| {
+        files.push(RestoredFile::new(
+            meta_path,
+            serde_json::to_vec(&meta).map_err(|err| {
                 AdapterError::schema(
                     NAME,
                     &session.session.id,
                     format!("json encode failed: {err}"),
                 )
             })?,
-        });
+            fidelity,
+        ));
     }
     Ok(files)
 }
@@ -166,25 +168,21 @@ fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathB
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| encode_project(&session.session.project));
     if let Some(parent) = &session.session.parent_session_id {
-        let agent = session
+        // The child id is `<parent>/<child_suffix>`; the suffix is the file's
+        // path under `subagents/` (`agent-<hash>` flat, or
+        // `workflows/<wf-id>/agent-<hash>` nested), so stripping the parent
+        // prefix reconstructs the on-disk path verbatim.
+        let child_suffix = session
             .session
             .id
-            .rsplit('/')
-            .next()
+            .strip_prefix(&format!("{parent}/"))
             .unwrap_or(&session.session.id);
         return PathBuf::from(encoded_project)
             .join(parent)
             .join("subagents")
-            .join(format!("{agent}.jsonl"));
+            .join(format!("{child_suffix}.jsonl"));
     }
     PathBuf::from(encoded_project).join(format!("{}.jsonl", session.session.id))
-}
-
-fn source_line(options: &ProviderOptions) -> Option<u64> {
-    options
-        .get("source")
-        .and_then(|source| source.get("line"))
-        .and_then(Value::as_u64)
 }
 
 fn encode_project(project: &str) -> String {
@@ -327,8 +325,15 @@ impl JsonlTree for ClaudeCodeAdapter {
     }
 
     fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String> {
-        if let Some((parent_uuid, agent_hash)) = subagent_ids(path) {
-            return Some(format!("{parent_uuid}/agent-{agent_hash}"));
+        // A file under `subagents/` takes its id from the path, never from the
+        // row's content `sessionId` (that's the parent's). A recognized child
+        // peeks to its child id; an unrecognized one returns `None` so it stays
+        // out of the freshness gate and its `unsupported_reason` failure
+        // re-surfaces on every sync rather than being skipped as `Fresh` under
+        // the parent's borrowed watermark. See spec.md#datasets.
+        if subagents_dir(path).is_some() {
+            let (parent_uuid, child_suffix, _) = subagent_ids(path)?;
+            return Some(format!("{parent_uuid}/{child_suffix}"));
         }
         let row: Value = serde_json::from_str(first_line).ok()?;
         row.get("sessionId")?.as_str().map(ToOwned::to_owned)
@@ -351,6 +356,23 @@ impl JsonlTree for ClaudeCodeAdapter {
         }
         capture_tool_call_names(&row.value, &mut state.tool_call_names);
         events_from_row(&session.id, row.line, &row.value, session.created_at, state)
+    }
+
+    fn unsupported_reason(&self, path: &Path) -> Option<String> {
+        // A `.jsonl` under a `subagents/` ancestor that we can't resolve to a
+        // child id (its leaf isn't `agent-<hash>.jsonl`) must NOT fall back to
+        // its content `sessionId` - that id is the parent's, so it would
+        // silently merge into the parent session. Fail visibly and wait for an
+        // adapter update instead. See spec.md#datasets.
+        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+            return Some(format!(
+                "{}: subagent transcript layout not recognized by this pond version; \
+                 skipped so it is not merged into the parent session - update pond and \
+                 re-run `pond sync`",
+                path.display()
+            ));
+        }
+        None
     }
 }
 
@@ -419,23 +441,29 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
         AdapterError::schema(NAME, at_first, "session has no parseable timestamp")
     })?;
 
-    // Subagent detection. Claude Code stores each subagent's transcript at
-    // `<parent_dir>/<parent_uuid>/subagents/agent-<hash>.jsonl`, with a
-    // sibling `agent-<hash>.meta.json` carrying `{agentType, description}`.
-    // The subagent file shares the parent's `sessionId` in row content (so
-    // the validator's "project is immutable" rule rejects it under the
-    // pre-2026-05-16 layering). The fix is to derive a child id and link
-    // back via `parent_session_id`. See spec.md#datasets.
+    // Subagent detection. Claude Code stores each subagent's transcript under
+    // the session's `subagents/` sidecar - either flat
+    // (`<parent_dir>/<parent_uuid>/subagents/agent-<hash>.jsonl`) or, for the
+    // workflow runner, nested
+    // (`.../subagents/workflows/<wf-id>/agent-<hash>.jsonl`) - with a sibling
+    // `agent-<hash>.meta.json` carrying `{agentType, description}`. Every such
+    // file shares the parent's `sessionId` in row content, so ingesting it under
+    // that id collides with the parent (the validator's "project is immutable"
+    // rule rejects a cwd-shifted one, and a same-cwd one silently merges). The
+    // fix is to derive a child id from the path - keyed off the `subagents/`
+    // ancestor at any depth - and link back via `parent_session_id`. See
+    // spec.md#datasets.
     let subagent = subagent_descriptor(path);
     let project_dir = source_project_dir(path, subagent.is_some());
     let (session_id, parent_session_id, source_agent, subagent_options) = match subagent {
         Some(SubagentDescriptor {
             parent_uuid,
+            child_suffix,
             agent_hash,
             agent_type,
             meta,
         }) => {
-            let child_id = format!("{parent_uuid}/agent-{agent_hash}");
+            let child_id = format!("{parent_uuid}/{child_suffix}");
             let agent_label = agent_type
                 .as_deref()
                 .map(|t| format!("claude-code/{t}"))
@@ -504,8 +532,12 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
 }
 
 fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
+    // The project dir is the grandparent of `subagents/` regardless of how
+    // deeply the transcript nests below it (`.../<project>/<parent_uuid>/
+    // subagents/...`), so climb from the `subagents/` ancestor rather than a
+    // fixed number of `.parent()` hops.
     let project_dir = if is_subagent {
-        path.parent().and_then(Path::parent).and_then(Path::parent)
+        subagents_dir(path)?.parent()?.parent()
     } else {
         path.parent()
     };
@@ -515,6 +547,21 @@ fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// The `subagents/` directory in `path`'s ancestry, if any. Depth-independent:
+/// matches both the flat `<parent_uuid>/subagents/agent-<hash>.jsonl` and the
+/// nested workflow `<parent_uuid>/subagents/workflows/<wf-id>/agent-<hash>.jsonl`
+/// layouts. The directory directly above it is the parent session uuid.
+fn subagents_dir(path: &Path) -> Option<&Path> {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if dir.file_name().and_then(|n| n.to_str()) == Some("subagents") {
+            return Some(dir);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// Resolved metadata for one subagent JSONL file. `agent_type` is read from
 /// the sibling `.meta.json` for the `source_agent` label; `meta` keeps that
 /// file's full verbatim content so native restore reproduces it
@@ -522,32 +569,43 @@ fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
 /// absent or unreadable (the label falls back to `claude-code/subagent`).
 struct SubagentDescriptor {
     parent_uuid: String,
+    child_suffix: String,
     agent_hash: String,
     agent_type: Option<String>,
     meta: Option<Value>,
 }
 
-/// Parent uuid and agent hash from the subagent on-disk layout
-///   `.../-<encoded-cwd>/<parent_uuid>/subagents/agent-<hash>.jsonl`
-/// `None` for any path not matching that shape (the common case).
-fn subagent_ids(path: &Path) -> Option<(String, String)> {
+/// `(parent_uuid, child_suffix, agent_hash)` for a subagent transcript, or
+/// `None` for any path without a `subagents/` ancestor or a non-`agent-<hash>`
+/// leaf (the common case: top-level session files). `child_suffix` is the file's
+/// path relative to its `subagents/` ancestor with `.jsonl` stripped -
+/// `agent-<hash>` flat, `workflows/<wf-id>/agent-<hash>` nested - so the derived
+/// child id `<parent_uuid>/<child_suffix>` round-trips back to the on-disk path
+/// on native restore. `agent_hash` keys the sibling `.meta.json` lookup.
+fn subagent_ids(path: &Path) -> Option<(String, String, String)> {
     let file_name = path.file_name()?.to_str()?;
     let agent_hash = file_name
         .strip_prefix("agent-")?
         .strip_suffix(".jsonl")?
         .to_owned();
-    let subagents_dir = path.parent()?;
-    if subagents_dir.file_name()?.to_str()? != "subagents" {
-        return None;
-    }
-    let parent_uuid = subagents_dir.parent()?.file_name()?.to_str()?.to_owned();
-    Some((parent_uuid, agent_hash))
+    let subagents = subagents_dir(path)?;
+    let parent_uuid = subagents.parent()?.file_name()?.to_str()?.to_owned();
+    // The child id must be `/`-canonical on every platform (the rest of the
+    // adapter and `claude_relative_path` assume `/`), but a relative path carries
+    // the OS separator - normalize it. No-op on POSIX.
+    let child_suffix = path
+        .strip_prefix(subagents)
+        .ok()?
+        .with_extension("")
+        .to_str()?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    Some((parent_uuid, child_suffix, agent_hash))
 }
 
 /// [`subagent_ids`] plus the sibling `agent-<hash>.meta.json` - `agentType` for
 /// the `source_agent` label, the whole file for lossless sidecar restore.
 fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
-    let (parent_uuid, agent_hash) = subagent_ids(path)?;
+    let (parent_uuid, child_suffix, agent_hash) = subagent_ids(path)?;
     let meta_path = path.parent()?.join(format!("agent-{agent_hash}.meta.json"));
     let (agent_type, meta) = match std::fs::read(&meta_path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -582,6 +640,7 @@ fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
 
     Some(SubagentDescriptor {
         parent_uuid,
+        child_suffix,
         agent_hash,
         agent_type,
         meta,
@@ -759,7 +818,7 @@ fn text_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         provenance,
         options: empty_options(),
         kind: PartKind::Text { text },
@@ -817,7 +876,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: signature_options(value),
             kind: PartKind::Reasoning {
@@ -828,7 +887,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
@@ -842,7 +901,7 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
             session_id: session_id.to_owned(),
             id: part_id(message_id, ordinal),
             message_id: message_id.to_owned(),
-            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+            ordinal: part_ordinal(ordinal),
             provenance: Provenance::Conversational,
             options: empty_options(),
             kind: PartKind::ToolCall {
@@ -898,7 +957,7 @@ fn tool_result_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         // spec.md#model-part-provenance: tool output is runtime-produced, not
         // conversation.
         provenance: Provenance::Injected,
@@ -926,8 +985,7 @@ fn file_part(
         .get("media_type")
         .or_else(|| value.get("mime_type"))
         .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+        .map(ToOwned::to_owned);
     let file_name = value
         .get("file_name")
         .or_else(|| value.get("name"))
@@ -951,7 +1009,7 @@ fn file_part(
         session_id: session_id.to_owned(),
         id: part_id(message_id, ordinal),
         message_id: message_id.to_owned(),
-        ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
+        ordinal: part_ordinal(ordinal),
         provenance,
         options: empty_options(),
         kind: PartKind::File {
@@ -1087,6 +1145,14 @@ mod tests {
     use tempfile::TempDir;
 
     const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
+
+    #[test]
+    fn probe_default_finds_claude_projects_under_home() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &ClaudeCodeFactory,
+            &[".claude", "projects"],
+        )
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
@@ -1242,6 +1308,256 @@ mod tests {
             .await?
             .expect("derived child id even without meta");
         assert_eq!(child.session.source_agent, "claude-code/subagent");
+        Ok(())
+    }
+
+    /// Nested workflow-runner subagent:
+    ///   `<parent_uuid>/subagents/workflows/<wf-id>/agent-<hash>.jsonl`.
+    /// Same parent `sessionId` in row content AND a shifted `cwd`. The adapter
+    /// must derive a distinct child id from the FULL path under `subagents/`
+    /// (not collapse onto the parent), so it neither collides on the immutable
+    /// `project` nor silently merges into the parent. Regression for the
+    /// workflow-layout sync rejection. See spec.md#datasets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_nested_subagent_derives_distinct_child_not_parent_collision()
+    -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "44444444-4444-4444-4444-444444444444";
+        let wf_id = "wf_abcd1234-ef0";
+        let agent_hash = "cafef00dbaadf00d1";
+        let wf_dir = project_dir
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join(wf_id);
+        std::fs::create_dir_all(&wf_dir)?;
+
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-20T00:00:00.000Z",
+            "message": {"role": "user", "content": "hi parent"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        // Shifted cwd: pre-fix this collided with the parent's immutable project.
+        let subagent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-wf-sub-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test/packages/sub",
+            "isSidechain": true,
+            "agentId": agent_hash,
+            "timestamp": "2026-05-20T00:01:00.000Z",
+            "message": {"role": "user", "content": "workflow subagent prompt"},
+        });
+        std::fs::write(
+            wf_dir.join(format!("agent-{agent_hash}.jsonl")),
+            format!("{subagent_row}\n"),
+        )?;
+        std::fs::write(
+            wf_dir.join(format!("agent-{agent_hash}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"workflow child"}"#,
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            summary.dropped_sessions, 0,
+            "nested workflow subagent must NOT collide with the parent project",
+        );
+
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests under the bare uuid");
+        assert_eq!(&*parent.session.project, "/tmp/pond-test");
+        assert_eq!(parent.session.parent_session_id, None);
+
+        let child_id = format!("{parent_uuid}/workflows/{wf_id}/agent-{agent_hash}");
+        let child = store
+            .get_session(&child_id)
+            .await?
+            .expect("workflow subagent surfaces under the full nested child id");
+        assert_eq!(child.session.source_agent, "claude-code/general-purpose");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(parent_uuid)
+        );
+        assert_eq!(
+            &*child.session.project, "/tmp/pond-test/packages/sub",
+            "child keeps its own cwd-derived project, distinct from the parent",
+        );
+        let subagent_meta = child
+            .session
+            .options
+            .get("subagent")
+            .expect("options.subagent present");
+        assert_eq!(subagent_meta["hash"], serde_json::json!(agent_hash));
+        Ok(())
+    }
+
+    /// A `.jsonl` under `subagents/` whose leaf is NOT `agent-<hash>.jsonl` (a
+    /// layout this pond version doesn't understand) must FAIL VISIBLY rather
+    /// than fall back to its content `sessionId` (the parent's) and silently
+    /// merge into the parent session. It is counted as an unsupported skip and
+    /// contributes no rows. See spec.md#datasets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrecognized_subagents_file_fails_visibly_not_merged() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "55555555-5555-5555-5555-555555555555";
+        let unknown_dir = project_dir
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_future01-aaa");
+        std::fs::create_dir_all(&unknown_dir)?;
+
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-only",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-20T00:00:00.000Z",
+            "message": {"role": "user", "content": "parent message"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        // Same parent sessionId AND same cwd: pre-guard this would have merged
+        // silently into the parent. The leaf name is not `agent-<hash>.jsonl`.
+        let unknown_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-should-not-merge",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-20T00:02:00.000Z",
+            "message": {"role": "user", "content": "must not land under parent"},
+        });
+        std::fs::write(
+            unknown_dir.join("transcript-001.jsonl"),
+            format!("{unknown_row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        assert_eq!(
+            summary.skipped_files, 1,
+            "the unrecognized subagents/ transcript must be a visible, counted skip",
+        );
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests");
+        assert_eq!(
+            parent.messages.len(),
+            1,
+            "the unrecognized file's row must NOT be merged into the parent session",
+        );
+        assert!(
+            parent
+                .messages
+                .iter()
+                .all(|m| m.message.id() != "u-should-not-merge"),
+            "parent must not absorb the unrecognized file's message",
+        );
+        Ok(())
+    }
+
+    /// Re-sync visibility: an unrecognized `subagents/` file must STILL surface as
+    /// a visible `Unsupported` skip when the parent already carries a freshness
+    /// watermark. Its content `sessionId` is the parent's, so peeking it would let
+    /// the freshness gate skip the file as `Fresh` under the parent's watermark and
+    /// hide the failure. `peek_session_id` returns `None` for it instead, keeping
+    /// it out of the gate. Regression for the re-sync visibility leak. See
+    /// spec.md#datasets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrecognized_subagents_file_stays_visible_under_parent_watermark() -> anyhow::Result<()>
+    {
+        struct ParentAlreadyFresh;
+        impl crate::adapter::SkipOracle for ParentAlreadyFresh {
+            fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
+                // Far-future watermark: every source mtime is `<= ingested`, so a
+                // peeked id WOULD trip the freshness gate. The guard must keep the
+                // unrecognized file out of the gate regardless.
+                Some(
+                    DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                )
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+        }
+
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "66666666-6666-6666-6666-666666666666";
+        let unknown_dir = project_dir
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_future02-bbb");
+        std::fs::create_dir_all(&unknown_dir)?;
+
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-fresh",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-20T00:00:00.000Z",
+            "message": {"role": "user", "content": "parent message"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        // Same parent sessionId, leaf not `agent-<hash>.jsonl`: pre-fix this would
+        // peek the parent's id and be fresh-skipped under the far-future watermark.
+        let unknown_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-resync-should-stay-visible",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-20T00:02:00.000Z",
+            "message": {"role": "user", "content": "must stay visible"},
+        });
+        std::fs::write(
+            unknown_dir.join("transcript-002.jsonl"),
+            format!("{unknown_row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &ParentAlreadyFresh, |_| {}).await?;
+
+        assert_eq!(
+            summary.skipped_files, 1,
+            "the unrecognized transcript must stay a visible Unsupported skip, not be fresh-skipped under the parent's watermark",
+        );
+        // The parent file legitimately fresh-skips under the far-future watermark;
+        // the unrecognized file must NOT join it (pre-fix `skipped_fresh` would be 2).
+        assert_eq!(
+            summary.skipped_fresh, 1,
+            "only the parent may fresh-skip; the unrecognized file must not borrow its watermark",
+        );
         Ok(())
     }
 
