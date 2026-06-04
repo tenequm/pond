@@ -197,7 +197,7 @@ pub mod mcp {
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse,
             GetResult, MessageView, PartKind, PartSummary, ProjectFilter, ResponseMode,
             ResponsePart, SearchEnvelope, SearchFilters, SearchRequest, SearchResponse,
-            default_namespace,
+            SessionFrom, default_namespace,
         },
     };
 
@@ -261,6 +261,11 @@ open it. Not for bulk export - use `pond export`.";
         /// "claude-code/general-purpose" (a subagent).
         #[serde(default)]
         source_agent: Option<String>,
+        /// Include subagent / sub-task sessions. Default false: search targets
+        /// the main sessions where the human and agent talked. Set true to
+        /// include subagent sessions (source_agent like "claude-code/<name>").
+        #[serde(default)]
+        include_subagents: Option<bool>,
         /// Filter by message role: "user" or "assistant".
         #[serde(default)]
         role: Option<String>,
@@ -306,10 +311,23 @@ open it. Not for bulk export - use `pond export`.";
         /// inline). Ignored in message mode.
         #[serde(default)]
         response_mode: Option<String>,
+        /// Session mode only: which end to read `limit` messages from -
+        /// "start" (oldest, default) or "end" (most recent, e.g. to recover
+        /// recent context after compaction). Results stay chronological;
+        /// ignored in message mode.
+        #[serde(default)]
+        session_from: Option<String>,
         /// Exclusive continuation anchor from a prior response: the last
         /// `message_id` (session mode) or last `part_id` (message mode).
         #[serde(default)]
         after_id: Option<String>,
+    }
+
+    fn parse_session_from(value: Option<String>) -> SessionFrom {
+        match value.as_deref() {
+            Some("end") => SessionFrom::End,
+            _ => SessionFrom::Start,
+        }
     }
 
     fn parse_response_mode(value: Option<String>) -> ResponseMode {
@@ -348,7 +366,8 @@ open it. Not for bulk export - use `pond export`.";
                            query (semantic - concepts, not project names), then project / \
                            from_date / to_date to scope. Advanced: source_agent (e.g. \
                            \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
-                           similar_to (vector-only neighbors of a message_id), cursor (paging). \
+                           similar_to (vector-only neighbors of a message_id), cursor (paging), \
+                           include_subagents (subagent sessions are excluded by default). \
                            Scores are relative within one response; there is no min_score.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
@@ -372,6 +391,7 @@ open it. Not for bulk export - use `pond export`.";
                     // footgun for agent callers. CLI / HTTP still exposes it
                     // for the bench harness.
                     min_score: 0.0,
+                    include_subagents: params.include_subagents.unwrap_or(false),
                 },
                 limit: params.limit.unwrap_or(10),
                 cursor: params.cursor,
@@ -401,7 +421,10 @@ open it. Not for bulk export - use `pond export`.";
                            marked `>`, plus context_depth sibling messages each side, with \
                            its tool/file parts in full). A session_id response lists the \
                            session's subagents in a footer so you can open each. Advanced: \
-                           limit (cap), after_id (paging - pass the value the footer shows). \
+                           limit (cap), after_id (paging - pass the value the footer shows), \
+                           session_from (\"start\"|\"end\"; \"end\" returns the most recent \
+                           messages, \
+                           e.g. to recover context after compaction). \
                            Tool/result lines render as `-> name [call_id]` / `<- name \
                            [call_id] (ok|failed)`. Not for bulk export - use `pond export`.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -418,6 +441,7 @@ open it. Not for bulk export - use `pond export`.";
                 context_depth: params.context_depth.unwrap_or(0),
                 limit: params.limit.unwrap_or(20),
                 response_mode: parse_response_mode(params.response_mode),
+                session_from: parse_session_from(params.session_from),
                 after_id: params.after_id,
             };
             match run_get(&self.state.store, request.clone()).await {
@@ -465,7 +489,10 @@ open it. Not for bulk export - use `pond export`.";
                  keep query semantic (concepts, not project names). Scores are relative \
                  within one response; there is no min_score. Subagents are stored as their \
                  own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
-                 on a parent session lists them in a footer so you can open each. Deeper \
+                 on a parent session lists them in a footer so you can open each. Recover \
+                 context lost to compaction: find this session via pond_search (a distinctive \
+                 recent topic + project + from_date=today), then pond_get(session_id, \
+                 session_from=\"end\") for the recent pre-compaction turns. Deeper \
                  reference on demand: resource schema://pond (all filters + response format), \
                  stats://pond (corpus + embedding stats).",
             )
@@ -653,10 +680,24 @@ open it. Not for bulk export - use `pond export`.";
 
     fn render_search_transcript(response: &SearchResponse, request: &SearchRequest) -> String {
         use std::fmt::Write;
+        // Must mirror build_filter's default-exclusion condition, else the note lies.
+        let subagent_note = if !request.filters.include_subagents
+            && request.filters.session_id.is_none()
+            && request.filters.source_agent.is_none()
+        {
+            " Subagent sessions excluded; pass include_subagents=true to include them."
+        } else {
+            ""
+        };
         if response.sessions.is_empty() {
             return match request.similar_to.as_deref() {
-                Some(id) => format!("pond_search: no matches similar to {id}.\n"),
-                None => format!("pond_search: no matches for {:?}.\n", request.query),
+                Some(id) => format!("pond_search: no matches similar to {id}.{subagent_note}\n"),
+                None => {
+                    format!(
+                        "pond_search: no matches for {:?}.{subagent_note}\n",
+                        request.query
+                    )
+                }
             };
         }
         let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
@@ -668,11 +709,12 @@ open it. Not for bulk export - use `pond export`.";
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "pond_search: {} matching messages, showing {} hits from {} sessions{}.",
+            "pond_search: {} matching messages, showing {} hits from {} sessions{}.{}",
             response.matched_total,
             shown,
             response.sessions.len(),
             sim,
+            subagent_note,
         );
         let _ = writeln!(
             out,
@@ -776,11 +818,24 @@ open it. Not for bulk export - use `pond export`.";
                 if *messages_remaining > 0
                     && let Some(last) = messages.last()
                 {
-                    let _ = writeln!(
-                        out,
-                        "... {} more messages; pass after_id={} to pond_get to continue",
-                        messages_remaining, last.id,
-                    );
+                    match request.session_from {
+                        SessionFrom::Start => {
+                            let _ = writeln!(
+                                out,
+                                "... {} more messages; pass after_id={} to pond_get to continue",
+                                messages_remaining, last.id,
+                            );
+                        }
+                        // Tail page: the remaining messages are *earlier*, before this
+                        // page. after_id only pages forward, so it can't reach them -
+                        // point back to the start instead of a cursor that dead-ends.
+                        SessionFrom::End => {
+                            let _ = writeln!(
+                                out,
+                                "... {messages_remaining} earlier messages precede this tail; call pond_get with session_from=\"start\" to read from the beginning",
+                            );
+                        }
+                    }
                 }
             }
             GetResult::Message {
@@ -1176,6 +1231,7 @@ open it. Not for bulk export - use `pond export`.";
                 context_depth: 0,
                 limit: 20,
                 response_mode: ResponseMode::default(),
+                session_from: SessionFrom::default(),
                 after_id: None,
             };
 

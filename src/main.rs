@@ -34,6 +34,7 @@ use pond::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
         PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
         SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
+        SessionFrom,
     },
 };
 
@@ -101,6 +102,22 @@ impl From<CliResponseMode> for ResponseMode {
             CliResponseMode::Conversational => ResponseMode::Conversational,
             CliResponseMode::Complete => ResponseMode::Complete,
             CliResponseMode::Verbatim => ResponseMode::Verbatim,
+        }
+    }
+}
+
+/// CLI surface for `pond get --from`. Maps 1:1 to wire `SessionFrom`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSessionFrom {
+    Start,
+    End,
+}
+
+impl From<CliSessionFrom> for SessionFrom {
+    fn from(value: CliSessionFrom) -> Self {
+        match value {
+            CliSessionFrom::Start => SessionFrom::Start,
+            CliSessionFrom::End => SessionFrom::End,
         }
     }
 }
@@ -270,6 +287,9 @@ enum Command {
         session_id: Option<String>,
         #[arg(long)]
         source_agent: Option<String>,
+        /// Include subagent sessions (excluded by default).
+        #[arg(long)]
+        include_subagents: bool,
         /// ISO date (YYYY-MM-DD) lower bound, inclusive.
         #[arg(long)]
         from_date: Option<String>,
@@ -332,6 +352,15 @@ enum Command {
             conflicts_with = "message_id"
         )]
         response_mode: CliResponseMode,
+        /// Session mode only: which end to read from - start (oldest, default)
+        /// or end (most recent, e.g. to recover context after compaction).
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliSessionFrom::Start,
+            conflicts_with = "message_id"
+        )]
+        session_from: CliSessionFrom,
         /// Continuation anchor from a prior response: last message id (session)
         /// or last part id (message). Exclusive lower bound.
         #[arg(long, value_name = "ID")]
@@ -687,6 +716,7 @@ async fn main() -> anyhow::Result<()> {
             project,
             session_id,
             source_agent,
+            include_subagents,
             from_date,
             to_date,
             role,
@@ -714,6 +744,7 @@ async fn main() -> anyhow::Result<()> {
                     to_date,
                     role,
                     min_score,
+                    include_subagents,
                 },
                 limit,
                 cursor: None,
@@ -791,6 +822,7 @@ async fn main() -> anyhow::Result<()> {
             context_depth,
             limit,
             response_mode,
+            session_from,
             after_id,
             format,
         } => {
@@ -807,10 +839,12 @@ async fn main() -> anyhow::Result<()> {
                 context_depth,
                 limit,
                 response_mode: ResponseMode::from(response_mode),
+                session_from: SessionFrom::from(session_from),
                 after_id,
             };
+            let view_from = request.session_from;
             let envelope = handlers::pond_get(&store, request).await;
-            if !render_get_envelope(format, &envelope)? {
+            if !render_get_envelope(format, &envelope, view_from)? {
                 std::process::exit(1);
             }
         }
@@ -2257,7 +2291,11 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
     }
 }
 
-fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::Result<bool> {
+fn render_get_envelope(
+    format: OutputFormat,
+    envelope: &GetEnvelope,
+    session_from: SessionFrom,
+) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
             output(
@@ -2268,7 +2306,7 @@ fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::
         }
         OutputFormat::Pretty => match envelope {
             GetEnvelope::Success(response) => {
-                render_get_pretty(response)?;
+                render_get_pretty(response, session_from)?;
                 Ok(true)
             }
             GetEnvelope::Error(error) => {
@@ -2389,7 +2427,7 @@ fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()>
     ))
 }
 
-fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+fn render_get_pretty(response: &GetResponse, session_from: SessionFrom) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     render_session_header(&response.session)?;
@@ -2404,6 +2442,10 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
                 render_message_view(idx + 1, message, parts, false)?;
             }
             output("")?;
+            // Tail page: the remaining messages are *earlier*, before this page;
+            // after_id only pages forward, so label them "earlier" and omit the
+            // dead-end cursor (the start path keeps the forward after-id cursor).
+            let tail = matches!(session_from, SessionFrom::End);
             let mut footer = format!(
                 "{} {} messages",
                 paint("(total:", dim()),
@@ -2411,17 +2453,22 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
             );
             if *messages_remaining > 0 {
                 footer.push_str(&format!(
-                    " {} remaining {}",
+                    " {} {}",
                     paint(&format_thousands(*messages_remaining as u64), bold()),
-                    paint("[more]", dim()),
+                    paint(if tail { "earlier" } else { "remaining [more]" }, dim()),
                 ));
             }
             footer.push_str(&paint(")", dim()));
             output(&footer)?;
-            if *messages_remaining > 0
-                && let Some(last) = messages.last()
-            {
-                output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+            if *messages_remaining > 0 {
+                if tail {
+                    output(&paint(
+                        "session-from: start to read from the beginning",
+                        dim(),
+                    ))?;
+                } else if let Some(last) = messages.last() {
+                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+                }
             }
         }
         GetResult::Message {

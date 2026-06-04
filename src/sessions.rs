@@ -28,7 +28,10 @@ use crate::{
         PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session},
+    wire::{
+        FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session,
+        SessionFrom,
+    },
 };
 use url::Url;
 
@@ -885,11 +888,33 @@ impl Store {
             None => 0,
         };
         let remaining = rows.get(start_at..).unwrap_or(&[]);
-        let emitted_count = page_by(remaining, params.limit, params.budget_bytes, |row| {
-            row.text.as_deref().map_or(0, str::len)
-        });
-        let emitted = &remaining[..emitted_count];
-        let messages_remaining = remaining.len() - emitted_count;
+        let (emitted, messages_remaining) = match params.session_from {
+            SessionFrom::Start => {
+                let n = page_by(remaining, params.limit, params.budget_bytes, |row| {
+                    row.text.as_deref().map_or(0, str::len)
+                });
+                (&remaining[..n], remaining.len() - n)
+            }
+            // Tail: the newest messages that fit `limit` and the byte budget,
+            // dropping oldest first; the newest is always kept and the page
+            // stays chronological so the agent reads the flow forward.
+            SessionFrom::End => {
+                let mut bytes = 0usize;
+                let mut start = remaining.len();
+                for row in remaining.iter().rev() {
+                    if remaining.len() - start >= params.limit {
+                        break;
+                    }
+                    let size = row.text.as_deref().map_or(0, str::len);
+                    if start < remaining.len() && bytes + size > params.budget_bytes {
+                        break;
+                    }
+                    bytes += size;
+                    start -= 1;
+                }
+                (&remaining[start..], start)
+            }
+        };
         let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
 
         // Conversational/Complete only summarize parts; Verbatim inlines every
@@ -2821,6 +2846,7 @@ pub struct SessionViewParams<'a> {
     pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
+    pub session_from: SessionFrom,
 }
 
 #[derive(Debug, Clone)]
