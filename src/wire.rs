@@ -337,6 +337,11 @@ pub struct GetRequest {
     /// enough state - no opaque cursor.
     #[serde(default)]
     pub after_id: Option<String>,
+    /// Session mode only: which end to read `limit` messages from - `start`
+    /// (oldest, default) or `end` (most recent). Results stay chronological;
+    /// ignored in message mode.
+    #[serde(default)]
+    pub session_from: SessionFrom,
 }
 
 /// How much of each message `pond_get` materializes (spec.md#protocol).
@@ -351,6 +356,17 @@ pub enum ResponseMode {
     Complete,
     /// All messages + full parts inline (heaviest mode).
     Verbatim,
+}
+
+/// Which end of a session `pond_get` reads its page from (spec.md#protocol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionFrom {
+    /// Oldest messages first (the session's start).
+    #[default]
+    Start,
+    /// Most recent messages (the session's tail), still chronological.
+    End,
 }
 
 /// The session header is always present; `result` carries the mode-specific
@@ -602,12 +618,20 @@ pub struct SearchFilters {
     // Skip the default 0.0 so an unfiltered cursor/request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
+    /// Include subagent sessions (`source_agent` like `claude-code/<name>`).
+    /// Default false: a search targets the human-facing main sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_subagents: bool,
 }
 
 impl SearchFilters {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero_f64(value: &f64) -> bool {

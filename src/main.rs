@@ -34,6 +34,7 @@ use pond::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
         PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
         SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
+        SessionFrom,
     },
 };
 
@@ -101,6 +102,22 @@ impl From<CliResponseMode> for ResponseMode {
             CliResponseMode::Conversational => ResponseMode::Conversational,
             CliResponseMode::Complete => ResponseMode::Complete,
             CliResponseMode::Verbatim => ResponseMode::Verbatim,
+        }
+    }
+}
+
+/// CLI surface for `pond get --from`. Maps 1:1 to wire `SessionFrom`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSessionFrom {
+    Start,
+    End,
+}
+
+impl From<CliSessionFrom> for SessionFrom {
+    fn from(value: CliSessionFrom) -> Self {
+        match value {
+            CliSessionFrom::Start => SessionFrom::Start,
+            CliSessionFrom::End => SessionFrom::End,
         }
     }
 }
@@ -270,6 +287,9 @@ enum Command {
         session_id: Option<String>,
         #[arg(long)]
         source_agent: Option<String>,
+        /// Include subagent sessions (excluded by default).
+        #[arg(long)]
+        include_subagents: bool,
         /// ISO date (YYYY-MM-DD) lower bound, inclusive.
         #[arg(long)]
         from_date: Option<String>,
@@ -332,6 +352,15 @@ enum Command {
             conflicts_with = "message_id"
         )]
         response_mode: CliResponseMode,
+        /// Session mode only: which end to read from - start (oldest, default)
+        /// or end (most recent, e.g. to recover context after compaction).
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliSessionFrom::Start,
+            conflicts_with = "message_id"
+        )]
+        session_from: CliSessionFrom,
         /// Continuation anchor from a prior response: last message id (session)
         /// or last part id (message). Exclusive lower bound.
         #[arg(long, value_name = "ID")]
@@ -687,6 +716,7 @@ async fn main() -> anyhow::Result<()> {
             project,
             session_id,
             source_agent,
+            include_subagents,
             from_date,
             to_date,
             role,
@@ -714,6 +744,7 @@ async fn main() -> anyhow::Result<()> {
                     to_date,
                     role,
                     min_score,
+                    include_subagents,
                 },
                 limit,
                 cursor: None,
@@ -791,6 +822,7 @@ async fn main() -> anyhow::Result<()> {
             context_depth,
             limit,
             response_mode,
+            session_from,
             after_id,
             format,
         } => {
@@ -807,6 +839,7 @@ async fn main() -> anyhow::Result<()> {
                 context_depth,
                 limit,
                 response_mode: ResponseMode::from(response_mode),
+                session_from: SessionFrom::from(session_from),
                 after_id,
             };
             let envelope = handlers::pond_get(&store, request).await;

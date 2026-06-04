@@ -821,6 +821,7 @@ mod get_handler {
             after_id: request.after_id.as_deref(),
             limit: request.limit,
             budget_bytes: BUDGET_BYTES,
+            session_from: request.session_from,
         };
         let view = match store
             .session_view(session_id, params)
@@ -1868,6 +1869,19 @@ mod search_handler {
             ));
         }
 
+        // spec.md#search: subagent sessions (`source_agent` with a "/") are
+        // excluded by default; an explicit session_id/source_agent filter means
+        // the caller is already scoping, so the exclusion would only fight it.
+        if !filters.include_subagents
+            && filters.session_id.is_none()
+            && filters.source_agent.is_none()
+        {
+            clauses.push(Predicate::Not(Box::new(Predicate::LikeContains(
+                "source_agent",
+                "/".to_owned(),
+            ))));
+        }
+
         Ok(Predicate::And(clauses))
     }
 
@@ -2167,6 +2181,7 @@ mod tests {
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
             min_score: 0.0,
+            include_subagents: false,
         };
         let sql = build_filter(&filters).unwrap().to_lance();
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
@@ -2175,10 +2190,20 @@ mod tests {
         assert!(sql.contains("role = 'assistant'"));
         assert!(sql.contains("timestamp >="));
         assert!(sql.contains("timestamp <="));
+        // session_id/source_agent set => default subagent exclusion is skipped.
+        assert!(!sql.contains("NOT ("));
 
-        // Empty filters produce no predicate.
         assert_eq!(
             build_filter(&SearchFilters::default()).unwrap().to_lance(),
+            "NOT (source_agent LIKE '%/%' ESCAPE '\\')",
+        );
+        assert_eq!(
+            build_filter(&SearchFilters {
+                include_subagents: true,
+                ..SearchFilters::default()
+            })
+            .unwrap()
+            .to_lance(),
             "",
         );
     }

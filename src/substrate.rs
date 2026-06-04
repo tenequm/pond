@@ -349,6 +349,7 @@ pub enum Predicate {
     Lte(&'static str, ScalarValue),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
+    Not(Box<Predicate>),
 }
 impl Predicate {
     pub fn to_lance(&self) -> String {
@@ -392,6 +393,14 @@ impl Predicate {
                     String::new()
                 } else {
                     format!("({body})")
+                }
+            }
+            Self::Not(inner) => {
+                let body = inner.to_lance();
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!("NOT ({body})")
                 }
             }
         }

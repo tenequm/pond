@@ -38,6 +38,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 context_depth: 0,
                 limit: 1000,
                 response_mode: ResponseMode::Conversational,
+                session_from: Default::default(),
                 after_id: None,
             },
         )
@@ -68,6 +69,7 @@ async fn claude_code_fixtures_round_trip_and_get() -> anyhow::Result<()> {
                 context_depth: 1,
                 limit: 100,
                 response_mode: ResponseMode::Conversational,
+                session_from: Default::default(),
                 after_id: None,
             },
         )

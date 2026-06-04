@@ -98,6 +98,7 @@ fn get_request(session_id: &str) -> GetRequest {
         context_depth: 0,
         limit: 1000,
         response_mode: ResponseMode::Verbatim,
+        session_from: Default::default(),
         after_id: None,
     }
 }
@@ -163,6 +164,7 @@ fn get_request_text_only(session_id: &str) -> GetRequest {
         context_depth: 0,
         limit: 1000,
         response_mode: ResponseMode::Conversational,
+        session_from: Default::default(),
         after_id: None,
     }
 }
@@ -479,6 +481,7 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             context_depth: 0,
             limit: 1000,
             response_mode: ResponseMode::Conversational,
+            session_from: Default::default(),
             after_id: None,
         },
     )
@@ -514,6 +517,7 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             context_depth: 0,
             limit: 1000,
             response_mode: ResponseMode::Conversational,
+            session_from: Default::default(),
             after_id: Some(after_id),
         },
     )
@@ -539,6 +543,120 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             .iter()
             .all(|m| !first_ids.contains(m.id.as_str())),
         "after_id pages must be disjoint"
+    );
+
+    Ok(())
+}
+
+/// `pond_get(session_from = "end")` returns the newest `limit` messages of a
+/// session in chronological order (the compaction-recovery path); `start`
+/// returns the oldest. The two are disjoint ends of the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn pond_get_session_from_end_returns_the_recent_tail() -> anyhow::Result<()> {
+    use chrono::{TimeZone, Utc};
+    use pond::wire::{
+        GetResult as WireGetResult, IngestRequest, Message, Provenance, ProviderOptions, Session,
+        SessionFrom,
+    };
+    use pond::{adapter, handlers};
+
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+
+    let session_id = "tail-session".to_owned();
+    let session = Session {
+        id: session_id.clone(),
+        parent_session_id: None,
+        parent_message_id: None,
+        source_agent: "claude-code".to_owned(),
+        created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        project: adapter::extract_str(&serde_json::json!({"x": "pond-tail"}), "x").unwrap(),
+        options: ProviderOptions::new(),
+    };
+    let mut events: Vec<pond::handlers::IngestEvent> =
+        vec![pond::handlers::IngestEvent::Session(session)];
+    for index in 0..5u32 {
+        let message_id = format!("tail-msg-{index}");
+        events.push(pond::handlers::IngestEvent::Message(Message::User {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, index + 1, 0).unwrap(),
+            options: ProviderOptions::new(),
+        }));
+        events.push(pond::handlers::IngestEvent::Part(pond::wire::Part {
+            session_id: session_id.clone(),
+            id: format!("tail-part-{index}"),
+            message_id,
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: pond::wire::PartKind::Text {
+                text: adapter::extract_str(
+                    &serde_json::json!({ "x": format!("message {index}") }),
+                    "x",
+                ),
+            },
+        }));
+    }
+    let envelope = handlers::pond_ingest(
+        &store,
+        IngestRequest {
+            protocol_version: pond::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            events,
+        },
+    )
+    .await;
+    assert!(
+        matches!(envelope, pond::wire::IngestEnvelope::Success(_)),
+        "ingest should succeed: {envelope:?}"
+    );
+
+    let request = |from: SessionFrom| GetRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        session_id: Some(session_id.clone()),
+        message_id: None,
+        context_depth: 0,
+        limit: 2,
+        response_mode: ResponseMode::Conversational,
+        session_from: from,
+        after_id: None,
+    };
+    let page = |envelope: GetEnvelope| -> (Vec<String>, usize) {
+        let GetEnvelope::Success(response) = envelope else {
+            panic!("get must succeed");
+        };
+        let WireGetResult::Session {
+            messages,
+            messages_remaining,
+            ..
+        } = response.result
+        else {
+            panic!("session-scope result expected");
+        };
+        (
+            messages.into_iter().map(|m| m.id).collect(),
+            messages_remaining,
+        )
+    };
+
+    let (end_ids, end_remaining) = page(pond_get(&store, request(SessionFrom::End)).await);
+    assert_eq!(
+        end_ids,
+        ["tail-msg-3", "tail-msg-4"],
+        "end returns the newest two, in chronological order"
+    );
+    assert_eq!(
+        end_remaining, 3,
+        "three older messages remain before the tail"
+    );
+
+    let (start_ids, _) = page(pond_get(&store, request(SessionFrom::Start)).await);
+    assert_eq!(
+        start_ids,
+        ["tail-msg-0", "tail-msg-1"],
+        "start returns the oldest two"
     );
 
     Ok(())
