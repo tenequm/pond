@@ -59,6 +59,9 @@ path = "src/main.rs"
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
+# ndjson export writer for `pond_sql_query` (already in the tree via the arrow
+# stack; named directly here for the `LineDelimitedWriter`).
+arrow-json = "58.3"
 async-stream = "0.3.6"
 axum = "0.8.9"
 base64 = "0.22"
@@ -82,6 +85,10 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
 lance = { version = "7.0.0", features = ["protoc"] }
 lance-arrow = "7.0.0"
+# `pond_sql_query` registers lance's JSON / contains_tokens UDFs on the SQL
+# SessionContext via `lance_datafusion::udf::register_functions`. Already in
+# the tree transitively; named here to reach that one function.
+lance-datafusion = "7.0.0"
 half = { version = "2.1", default-features = false }
 lance-file = "7.0.0"
 lance-index = "7.0.0"
@@ -89,6 +96,10 @@ lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
+# Parquet export writer for `pond_sql_query`. The only genuinely new compiled
+# crate the SQL tool adds (lance reads/writes its own format, not parquet).
+# `arrow` feature only; results are written uncompressed via `ArrowWriter`.
+parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

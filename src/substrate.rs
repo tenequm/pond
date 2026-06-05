@@ -696,6 +696,76 @@ impl Handle {
         &self.storage_options
     }
 
+    /// Object-store URI for a `pond_sql_query` export artifact:
+    /// `<location>/exports/<name>`. A sibling of the `*.lance` table dirs;
+    /// the Directory namespace tracks tables in its `__manifest` table rather
+    /// than by listing prefixes, so this prefix is never seen as a table
+    /// (lance-namespace-impls dir/manifest.rs). Never `register_table`'d.
+    fn export_uri(&self, name: &str) -> String {
+        format!(
+            "{}/exports/{name}",
+            self.location.as_str().trim_end_matches('/')
+        )
+    }
+
+    /// `ObjectStoreParams` carrying the handle's `storage_options` so raw
+    /// object-store opens (export I/O, `table_sizes` listing) inherit the same
+    /// credentials/region as the dataset opens. Empty options -> no accessor.
+    fn object_store_params(&self) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
+                Arc::new(StorageOptionsAccessor::with_static_options(
+                    self.storage_options.clone(),
+                ))
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Write a `pond_sql_query` export artifact, reusing the handle's
+    /// storage_options so S3 installs inherit the same credentials.
+    pub(crate) async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let uri = self.export_uri(name);
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &self.object_store_params())
+                .await
+                .with_context(|| format!("failed to open object store for {uri}"))?;
+        store
+            .put(&path, bytes)
+            .await
+            .with_context(|| format!("failed to write export {uri}"))?;
+        Ok(())
+    }
+
+    /// Read a `pond_sql_query` export artifact back (for the
+    /// `pond-sql-export://` MCP resource).
+    pub(crate) async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
+        let uri = self.export_uri(name);
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &self.object_store_params())
+                .await
+                .with_context(|| format!("failed to open object store for {uri}"))?;
+        let bytes = store
+            .read_one_all(&path)
+            .await
+            .with_context(|| format!("failed to read export {uri}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Local filesystem path of an export artifact, when the data dir is
+    /// `file://`. The stdio MCP client shares this filesystem, so it can read
+    /// the file directly (e.g. duckdb/polars) instead of pulling base64 via
+    /// `resources/read`. `None` on object-store installs.
+    pub(crate) fn export_local_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        if self.location.scheme() != "file" {
+            return None;
+        }
+        let dir = self.location.to_file_path().ok()?;
+        Some(dir.join("exports").join(name))
+    }
+
     pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
         Ok((
             self.count_rows(Table::Sessions).await?,
@@ -1024,14 +1094,7 @@ impl Handle {
     /// (spec.md#lance-chokepoints-storage), identical for `file://` and `s3://`.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         let registry = Arc::new(ObjectStoreRegistry::default());
-        let params = ObjectStoreParams {
-            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
-                Arc::new(StorageOptionsAccessor::with_static_options(
-                    self.storage_options.clone(),
-                ))
-            }),
-            ..Default::default()
-        };
+        let params = self.object_store_params();
 
         let sessions = self
             .listed_size(

@@ -401,6 +401,7 @@ fn get_request(message_id: String) -> GetRequest {
         context_depth: 0,
         limit: 50,
         response_mode: pond::wire::ResponseMode::Conversational,
+        session_from: pond::wire::SessionFrom::Start,
         after_id: None,
     }
 }
