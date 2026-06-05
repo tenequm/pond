@@ -306,6 +306,12 @@ pub struct SearchConfig {
     /// commits during high-rate ingest.
     #[serde(default)]
     pub index_lag_threshold: Option<usize>,
+    /// Sub-target fragment count past which the compaction phase runs (it also
+    /// runs once those fragments hold a whole target fragment's worth of rows).
+    /// Default 64 stops the automated sync re-compacting the trailing fragment
+    /// every pass; 0 compacts every pass.
+    #[serde(default)]
+    pub compaction_fragment_cap: Option<usize>,
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master

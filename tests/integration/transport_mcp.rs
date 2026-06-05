@@ -144,7 +144,7 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
     );
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store.optimize_indices(None, 0).await?.into_result()?;
 
     Ok(AppState {
         store: Arc::new(store),

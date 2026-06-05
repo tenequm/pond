@@ -174,25 +174,6 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
     chrono::Duration::days(1)
 }
 
-/// Cleanup parameters for the compaction phase of `pond index optimize`.
-/// `delete_unverified=true` overrides Lance's 7-day in-progress safety
-/// guard - required to reclaim files younger than 7 days, unsafe under
-/// concurrent writers.
-#[derive(Debug, Clone, Copy)]
-pub struct CleanupConfig {
-    pub older_than: chrono::Duration,
-    pub delete_unverified: bool,
-}
-
-impl Default for CleanupConfig {
-    fn default() -> Self {
-        Self {
-            older_than: default_cleanup_older_than(),
-            delete_unverified: false,
-        }
-    }
-}
-
 /// What `pond status` reports: where the data lives, total rows per table,
 /// and a per-(adapter, project) breakdown built from one `messages` scan.
 #[derive(Debug, Clone)]
@@ -1599,15 +1580,14 @@ impl Store {
     pub async fn optimize_indices(
         &self,
         progress: Option<OptimizeProgressFn>,
-        cleanup: Option<CleanupConfig>,
+        compaction_cap: usize,
     ) -> Result<OptimizeOutcome> {
-        let cleanup = cleanup.unwrap_or_default();
         let policy = pond_index_intents();
         let mut tables = Vec::with_capacity(3);
         for (table, intents) in policy.all() {
             let outcome = self
                 .handle
-                .optimize_table(table, intents, progress.as_ref(), cleanup)
+                .optimize_table(table, intents, progress.as_ref(), compaction_cap)
                 .await;
             tables.push(outcome);
         }
@@ -1644,14 +1624,10 @@ impl Store {
         &self,
         vector_threshold: usize,
     ) -> Result<OptimizeOutcome> {
-        let cleanup = CleanupConfig::default();
         let policy = pond_index_intents_with_vector_threshold(vector_threshold);
         let mut tables = Vec::with_capacity(3);
         for (table, intents) in policy.all() {
-            let outcome = self
-                .handle
-                .optimize_table(table, intents, None, cleanup)
-                .await;
+            let outcome = self.handle.optimize_table(table, intents, None, 0).await;
             tables.push(outcome);
         }
         Ok(OptimizeOutcome { tables })
@@ -4250,7 +4226,7 @@ mod tests {
         ];
         store.upsert_parts(&batch_b).await?;
 
-        store.optimize_indices(None, None).await?.into_result()?;
+        store.optimize_indices(None, 0).await?.into_result()?;
 
         Ok(())
     }
@@ -4641,7 +4617,7 @@ mod tests {
         // emits `ScalarIndexQuery` whenever the index exists.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
-        store.optimize_indices(None, None).await?.into_result()?;
+        store.optimize_indices(None, 0).await?.into_result()?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store

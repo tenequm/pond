@@ -21,9 +21,9 @@ use pond::{
     embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
-        AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, LanceArchiveCounts,
-        LanceArchiveExport, LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX,
-        OptimizeOutcome, RowTotals, Store,
+        AdapterStats, CorpusStats, EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport,
+        LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals,
+        Store,
     },
     substrate::{
         IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes,
@@ -396,114 +396,10 @@ enum IndexCommand {
     Optimize {
         #[arg(long)]
         wait: bool,
-        /// Override the manifest-retention window for this run.
-        /// Accepts Ns/Nm/Nh/Nd (default: 1d). Implies aggressive deletion
-        /// (delete_unverified=true): reclaims files Lance's 7-day in-progress
-        /// guard would otherwise protect. Unsafe under concurrent writers;
-        /// see --vacuum for a one-shot full reclaim.
-        #[arg(long, value_parser = parse_retention_arg)]
-        cleanup_older_than: Option<chrono::Duration>,
-        /// Reclaim every orphan immediately. Sugar for
-        /// `--cleanup-older-than 0s`. Same safety caveat applies.
-        #[arg(long, conflicts_with = "cleanup_older_than")]
-        vacuum: bool,
-        /// Skip the confirmation prompt when aggressive cleanup is enabled.
-        /// Required for non-interactive use of --vacuum / --cleanup-older-than.
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
     Rebuild {
         intent: Option<String>,
     },
-}
-
-/// `clap` value-parser for `--cleanup-older-than`. Accepts `Ns`/`Nm`/`Nh`/`Nd`
-/// (or bare `N` interpreted as seconds). Mirrors LanceDB's docs without taking
-/// a humantime dependency.
-fn parse_retention_arg(input: &str) -> Result<chrono::Duration, String> {
-    let trimmed = input.trim();
-    let split_at = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (num, unit) = trimmed.split_at(split_at);
-    let n: i64 = num
-        .parse()
-        .map_err(|_| format!("invalid duration {input:?} (expected like `1h`, `30m`, `0s`)"))?;
-    match unit {
-        "s" | "" => Ok(chrono::Duration::seconds(n)),
-        "m" => Ok(chrono::Duration::minutes(n)),
-        "h" => Ok(chrono::Duration::hours(n)),
-        "d" => Ok(chrono::Duration::days(n)),
-        _ => Err(format!(
-            "unknown duration unit {unit:?} in {input:?} (use s/m/h/d)"
-        )),
-    }
-}
-
-fn format_retention(d: chrono::Duration) -> String {
-    let s = d.num_seconds();
-    if s == 0 {
-        return "0s".into();
-    }
-    if s.rem_euclid(86_400) == 0 {
-        return format!("{}d", s / 86_400);
-    }
-    if s.rem_euclid(3_600) == 0 {
-        return format!("{}h", s / 3_600);
-    }
-    if s.rem_euclid(60) == 0 {
-        return format!("{}m", s / 60);
-    }
-    format!("{s}s")
-}
-
-/// Resolve `--cleanup-older-than` / `--vacuum` / `--yes` into a `CleanupConfig`
-/// override (or `None` to use pond's safe default). Any explicit retention flag
-/// implies `delete_unverified=true` to bypass Lance's 7-day in-progress guard;
-/// that bypass is unsafe under concurrent writers, so a confirmation prompt
-/// fires unless `--yes` is set (non-interactive callers must pass `--yes`).
-fn resolve_cleanup_config(
-    cleanup_older_than: Option<chrono::Duration>,
-    vacuum: bool,
-    yes: bool,
-) -> anyhow::Result<Option<CleanupConfig>> {
-    let aggressive = vacuum || cleanup_older_than.is_some();
-    if !aggressive {
-        return Ok(None);
-    }
-    let older_than = if vacuum {
-        chrono::Duration::zero()
-    } else {
-        cleanup_older_than.unwrap_or_else(chrono::Duration::zero)
-    };
-    let cfg = CleanupConfig {
-        older_than,
-        delete_unverified: true,
-    };
-    let warning = format!(
-        "warning: cleanup_older_than={} with delete_unverified=true.\n\
-         warning: this deletes orphan files newer than Lance's 7-day in-progress guard.\n\
-         warning: ensure no other pond writer (serve, sync, embed) is active on this data dir.",
-        format_retention(cfg.older_than),
-    );
-    eprintln!("{}", pond::output::paint(&warning, pond::output::yellow()));
-    if yes {
-        return Ok(Some(cfg));
-    }
-    if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "refusing to run aggressive cleanup non-interactively; pass --yes to confirm"
-        );
-    }
-    let proceed = dialoguer::Confirm::new()
-        .with_prompt("Continue?")
-        .default(false)
-        .interact()
-        .context("failed to read confirmation")?;
-    if !proceed {
-        anyhow::bail!("aborted by operator");
-    }
-    Ok(Some(cfg))
 }
 
 /// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
@@ -635,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
                 run_embed_stage(&store, force_embed).await?;
             }
             if stages.update_indexes {
-                run_update_indexes_stage(&store).await?;
+                run_update_indexes_stage(&store, configured_compaction_cap(&loaded)).await?;
             }
             render_sync_summary(&store, &summary).await?;
         }
@@ -652,7 +548,8 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
             if !summary.cancelled && summary.messages > 0 {
-                let outcome = run_update_indexes_stage(&store).await?;
+                let outcome =
+                    run_update_indexes_stage(&store, configured_compaction_cap(&config)).await?;
                 if outcome.any_indices_failed() {
                     std::process::exit(1);
                 }
@@ -774,27 +671,11 @@ async fn main() -> anyhow::Result<()> {
                     let statuses = store.index_status().await?;
                     render_index_status(&statuses)?;
                 }
-                IndexCommand::Optimize {
-                    wait,
-                    cleanup_older_than,
-                    vacuum,
-                    yes,
-                } => {
-                    let cleanup = resolve_cleanup_config(cleanup_older_than, vacuum, yes)?;
-                    if let Some(c) = cleanup {
-                        output(&format!(
-                            "{}  cleanup_older_than={}{}",
-                            pond::output::paint("optimize:", pond::output::dim()),
-                            format_retention(c.older_than),
-                            if c.delete_unverified {
-                                " (aggressive)"
-                            } else {
-                                ""
-                            },
-                        ))?;
-                    }
+                IndexCommand::Optimize { wait } => {
                     let (progress, bar) = optimize_progress_bar();
-                    let outcome = store.optimize_indices(Some(progress), cleanup).await?;
+                    let outcome = store
+                        .optimize_indices(Some(progress), configured_compaction_cap(&loaded))
+                        .await?;
                     bar.finish_and_clear();
                     render_optimize_outcome(&outcome)?;
                     if wait {
@@ -1321,9 +1202,22 @@ async fn run_embed_stage_with_limit(
     Ok(summary)
 }
 
-async fn run_update_indexes_stage(store: &Store) -> anyhow::Result<OptimizeOutcome> {
+/// Compaction fragment cap from `[search].compaction_fragment_cap`, or the default.
+fn configured_compaction_cap(config: &Config) -> usize {
+    config
+        .search
+        .compaction_fragment_cap
+        .unwrap_or(pond::substrate::DEFAULT_COMPACTION_FRAGMENT_CAP)
+}
+
+async fn run_update_indexes_stage(
+    store: &Store,
+    compaction_cap: usize,
+) -> anyhow::Result<OptimizeOutcome> {
     let (progress, bar) = optimize_progress_bar();
-    let outcome = store.optimize_indices(Some(progress), None).await?;
+    let outcome = store
+        .optimize_indices(Some(progress), compaction_cap)
+        .await?;
     bar.finish_and_clear();
     // No `index:` recap line: the `render_sync_summary` (or `pond status`)
     // `indexes  text + semantic ready` line is the single source of truth

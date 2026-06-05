@@ -67,7 +67,7 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedde
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store.optimize_indices(None, 0).await?.into_result()?;
     let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn Embedder>);
     Ok((store, embedder))
 }
