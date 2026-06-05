@@ -245,21 +245,24 @@ stored as its own session) in a footer; pass a listed id back as session_id to \
 open it. Not for bulk export - use `pond export`.";
 
     /// Static documentation served as the `schema://pond-sql` resource: the
-    /// table/column schema, dialect, function set, and conventions for
-    /// `pond_sql_query`. Loaded on demand so the tool description stays tight.
+    /// table/column schema, dialect, function set, output modes, pagination
+    /// pattern, drilling pattern, and worked examples for `pond_sql_query`.
+    /// Loaded on demand so the tool description stays tight.
     const SQL_SCHEMA_DOC: &str = "\
 pond_sql_query runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
 over three registered tables. Read-only is hard-enforced: anything other than a \
-single SELECT/WITH query is rejected (no INSERT/UPDATE/DELETE/CREATE/DROP/COPY/\
-EXPLAIN/SET). It complements pond_search (semantic recall) - use it for filtering, \
-joins, and aggregation over metadata; use pond_search for meaning-based search.
+single SELECT/WITH (or EXPLAIN of one) is rejected (no INSERT/UPDATE/DELETE/\
+CREATE/DROP/COPY/SET). It complements pond_search (semantic recall) - use it for \
+filtering, joins, and aggregation over metadata; use pond_search for meaning-based \
+search.
 
 Tables and columns:
 - messages(session_id text, id text, timestamp timestamp(us, UTC), role text \
 {user|assistant|system|tool}, source_agent text, project text, content text NULL, \
 search_text text NULL, embedding_model text NULL, options json). The embedding \
-`vector` column exists but is never returned (omitted from results); you may still \
-filter on it, e.g. `vector IS NOT NULL`.
+`vector` column exists but is never returned (omitted from results) and explicit \
+projection of it is rejected; you may still filter on it in WHERE, e.g. `vector \
+IS NOT NULL`. For semantic search, use pond_search.
 - sessions(id text, parent_session_id text NULL, parent_message_id text NULL, \
 source_agent text, created_at timestamp(us, UTC), project text, options json).
 - parts(session_id text, message_id text, id text, ordinal int, type text, \
@@ -283,18 +286,117 @@ fts('messages', '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') - 
 compose with WHERE/JOIN/GROUP BY around it. Vector/semantic search is NOT available \
 in SQL; use pond_search for that.
 
-Functions: standard SQL (GROUP BY/HAVING/ORDER BY/LIMIT/JOIN/UNION/DISTINCT/CTE/\
-subquery/CASE/CAST), aggregates (count, count(distinct), sum, avg, min, max, \
-stddev, median, approx_distinct), date (date_trunc, date_part, date_bin, to_char, \
-now), regex (regexp_like, regexp_match, regexp_replace), and the usual string \
-functions. Quote identifiers with double quotes (e.g. \"timestamp\"); string \
-literals use single quotes.
+Function quick-reference (exact DataFusion names so the model doesn't have to \
+guess):
+- aggregates: count, count(distinct ...), sum, avg, min, max, stddev, median, \
+approx_distinct, approx_percentile_cont, array_agg, string_agg
+- date/time: now(), date_trunc('day'|'hour'|'minute'|..., ts), date_part('year'|..., \
+ts), date_bin(interval, ts, origin), to_char(ts, fmt), to_timestamp(text), \
+extract(field FROM ts), age(t1, t2)
+- intervals: `INTERVAL '7 days'`, `INTERVAL '1 hour'` (single-quoted, postgres-style)
+- string: length, lower, upper, substr, position, split_part, regexp_like, \
+regexp_match, regexp_replace, like, ilike, starts_with, ends_with, concat, \
+concat_ws
+- numeric: round, floor, ceil, abs, sign, log, exp, power, sqrt
+- conditional: CASE WHEN ... THEN ... ELSE ..., coalesce, nullif, greatest, least
+- cast: CAST(x AS TYPE) or x::TYPE (e.g. variant_data::text)
+Quote identifiers with double quotes when they collide with keywords (e.g. \
+\"timestamp\"); string literals use single quotes.
 
-Output: by default a row-capped rendered table (set `limit`, default 100). For the \
-full result set set output=parquet or output=ndjson - pond writes the file and \
-returns a `pond-sql-export://<id>` resource link; read it via MCP resources/read \
-(on a local/stdio install the response also names the on-disk path so you can open \
-it directly with duckdb/polars).";
+EXPLAIN is allowed: `EXPLAIN <query>` or `EXPLAIN ANALYZE <query>` returns the \
+DataFusion plan (and per-operator timings for ANALYZE) so you can self-diagnose \
+slow queries without leaving SQL.
+
+Output modes (the `output` arg):
+- table (default): a row-capped rendered ASCII table with a header showing \
+`{total_rows} in {elapsed_ms} ms; showing {shown}` and, on truncation, a \
+keyset-pagination hint.
+- json: same row-capped payload as `table` but delivered as a JSON object \
+{total_rows, shown_rows, truncated, elapsed_ms, columns, rows: [{col: val, ...}]}. \
+Spec-compliant dual delivery: the structured JSON rides MCP's `structuredContent` \
+field; clients that don't surface that channel get the same JSON as a text block. \
+Empirically validated on Claude Code 2.1.165 - the agent reads the structured form.
+- parquet | ndjson: write the FULL result set to a file and return a \
+`pond-sql-export://<id>` resource link; read it via MCP resources/read. On a \
+local/stdio install the response also names the on-disk path so you can open it \
+directly with duckdb/polars.
+
+Pagination - keyset (preferred):
+Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking. \
+The agent owns the cursor (the last sort value it saw); no server-side state.
+
+  -- page 1: most recent 100 messages in pond
+  SELECT id, timestamp, role, project
+  FROM messages
+  WHERE project LIKE '%pond%'
+  ORDER BY timestamp DESC, id DESC
+  LIMIT 100;
+
+  -- page 2: pass back the last (timestamp, id) the agent saw
+  SELECT id, timestamp, role, project
+  FROM messages
+  WHERE project LIKE '%pond%'
+    AND (timestamp, id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
+  ORDER BY timestamp DESC, id DESC
+  LIMIT 100;
+
+Keyset stays stable across concurrent ingest (older rows don't shift) and uses \
+the btree on `timestamp`/`id` directly. For known-bounded full results, skip \
+pagination entirely: output=parquet writes everything in one call. OFFSET works \
+but scans-and-discards prior rows and shifts pages under writes - prefer keyset.
+
+Drilling from aggregates to content (instead of N round-trips of pond_get):
+JOIN to messages/parts directly. Example - top 10 longest sessions with first \
+user message:
+
+  WITH top_sessions AS (
+    SELECT session_id, COUNT(*) AS msgs
+    FROM messages
+    GROUP BY session_id
+    ORDER BY msgs DESC
+    LIMIT 10
+  )
+  SELECT ts.session_id, ts.msgs, s.project, s.source_agent,
+         m.content AS first_user_msg
+  FROM top_sessions ts
+  JOIN sessions s ON s.id = ts.session_id
+  LEFT JOIN messages m
+    ON m.session_id = ts.session_id
+   AND m.role = 'user'
+   AND m.timestamp = (
+     SELECT MIN(timestamp) FROM messages
+     WHERE session_id = ts.session_id AND role = 'user'
+   );
+
+One call, agent picks exactly which columns to hydrate. When you want the \
+pond_get-style rendered transcript (tool-call lines, subagent footer), call \
+pond_get with the session_id - that's its job.
+
+Examples (3 patterns the agent should recognize):
+
+  -- 1. Activity by project this week
+  SELECT project, COUNT(*) AS msgs, COUNT(DISTINCT session_id) AS sessions
+  FROM messages
+  WHERE timestamp >= now() - INTERVAL '7 days'
+  GROUP BY project
+  ORDER BY msgs DESC
+  LIMIT 20;
+
+  -- 2. Subagent breakdown
+  SELECT source_agent, COUNT(*) AS n
+  FROM sessions
+  WHERE source_agent LIKE '%/%'
+  GROUP BY source_agent
+  ORDER BY n DESC;
+
+  -- 3. BM25 search in SQL, joined with metadata
+  SELECT m.session_id, m.timestamp, m.project, m.content
+  FROM fts('messages', \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"race condition\"}}') f
+  JOIN messages m ON m.id = f.id
+  WHERE m.project LIKE '%pond%'
+  ORDER BY m.timestamp DESC
+  LIMIT 50;";
 
     /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -385,19 +487,21 @@ it directly with duckdb/polars).";
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSqlParams {
         /// One read-only SQL statement (DataFusion / PostgreSQL-compatible)
-        /// over tables `sessions`, `messages`, `parts`. SELECT/WITH only;
-        /// writes and side-effecting statements are rejected. See the
-        /// `schema://pond-sql` resource for columns, joins, indexed filter
-        /// columns, JSON/FTS functions, and examples.
+        /// over tables `sessions`, `messages`, `parts`. SELECT/WITH only
+        /// (or EXPLAIN of one); writes and side-effecting statements are
+        /// rejected. See the `schema://pond-sql` resource for columns, joins,
+        /// indexed filter columns, JSON/FTS functions, the function quick-
+        /// reference, pagination + drilling patterns, and examples.
         sql: String,
-        /// Output format: "table" (default; rendered, row-capped inline),
-        /// "parquet", or "ndjson". For parquet/ndjson the full result set is
-        /// written to a file and a `pond-sql-export://` resource link is
-        /// returned (no truncation).
+        /// Output format: "table" (default; rendered ASCII table with metrics
+        /// footer), "json" (same row-capped data as a structured JSON object,
+        /// delivered via MCP structuredContent), "parquet", or "ndjson". For
+        /// parquet/ndjson the full result set is written to a file and a
+        /// `pond-sql-export://` resource link is returned (no truncation).
         #[serde(default)]
         output: Option<String>,
-        /// Inline row cap for "table" output. Default 100, max 1000. Ignored
-        /// for parquet/ndjson exports (which return every row).
+        /// Inline row cap for "table" / "json" output. Default 100, max 1000.
+        /// Ignored for parquet/ndjson exports (which return every row).
         #[serde(default)]
         limit: Option<usize>,
     }
@@ -550,14 +654,23 @@ it directly with duckdb/polars).";
                            over the stored corpus as three tables: sessions, messages, parts. \
                            For filtering, joins, and aggregation (counts, group-by, time \
                            buckets) - the analytic complement to pond_search's semantic \
-                           recall. SELECT/WITH only; writes and side-effecting statements are \
-                           rejected. BM25 search-in-SQL via fts('messages', '{...json...}'); \
-                           JSON columns queryable with json_get_string / json_extract. The \
-                           embedding `vector` column is never returned. Output defaults to a \
-                           row-capped table (set `limit`); set output=parquet|ndjson to write \
-                           the full result to a file returned as a pond-sql-export:// resource. \
-                           Read resource schema://pond-sql for the column list, join keys, \
-                           indexed columns, functions, and examples.",
+                           recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
+                           effecting statements are rejected. BM25 search-in-SQL via \
+                           fts('messages', '{...json...}'); JSON columns queryable with \
+                           json_get_string / json_extract. The embedding `vector` column is \
+                           never returned (explicit projection is rejected; filtering in \
+                           WHERE is fine). Output defaults to a row-capped rendered table; \
+                           set output=json for a structured JSON payload (delivered via MCP \
+                           structuredContent), or output=parquet|ndjson to write the full \
+                           result to a file returned as a pond-sql-export:// resource. Three \
+                           starter patterns: (a) GROUP BY for activity counts - SELECT \
+                           project, COUNT(*) FROM messages WHERE timestamp >= now() - \
+                           INTERVAL '7 days' GROUP BY project; (b) keyset pagination - ORDER \
+                           BY timestamp DESC, id DESC then WHERE (timestamp, id) < (...) for \
+                           the next page; (c) JOIN messages/sessions/parts to hydrate \
+                           aggregates instead of N pond_get calls. Read resource \
+                           schema://pond-sql for the full column list, indexed columns, \
+                           function quick-reference, pagination + drilling examples.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_sql_query(
@@ -566,11 +679,13 @@ it directly with duckdb/polars).";
         ) -> Result<CallToolResult, ErrorData> {
             let mode = match params.output.as_deref() {
                 None | Some("table") => sql::Mode::Inline,
+                Some("json") => sql::Mode::InlineJson,
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
                 Some("ndjson") => sql::Mode::Export(sql::Format::Ndjson),
                 Some(other) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "unknown output {other:?}; use \"table\", \"parquet\", or \"ndjson\""
+                        "unknown output {other:?}; use \"table\", \"json\", \"parquet\", \
+                         or \"ndjson\""
                     ))]));
                 }
             };
@@ -602,6 +717,7 @@ it directly with duckdb/polars).";
 
             match sql::run(&tables, &params.sql, mode, inline_rows).await {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
+                Ok(sql::Outcome::InlineJson(value)) => Ok(CallToolResult::structured(value)),
                 Ok(sql::Outcome::Export {
                     bytes,
                     format,

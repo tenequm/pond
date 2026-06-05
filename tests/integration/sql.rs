@@ -297,6 +297,110 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         .await;
     assert!(missing.is_err(), "invalid export id is rejected");
 
+    // 7. output=json: spec-compliant dual delivery - text fallback (stringified
+    // JSON) AND structuredContent carrying the typed payload. The metrics
+    // footer fields (total_rows, shown_rows, elapsed_ms, columns, rows) are
+    // present.
+    let result = call(json!({
+        "sql": "SELECT role, count(*) AS n FROM messages GROUP BY role ORDER BY role",
+        "output": "json"
+    }))
+    .await?;
+    assert_ne!(result.is_error, Some(true), "json output should succeed");
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("output=json sets structured_content");
+    assert_eq!(
+        structured.get("total_rows").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        structured.get("shown_rows").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        structured.get("truncated").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert!(
+        structured
+            .get("elapsed_ms")
+            .and_then(|v| v.as_u64())
+            .is_some(),
+        "elapsed_ms present: {structured:?}"
+    );
+    let columns = structured
+        .get("columns")
+        .and_then(|v| v.as_array())
+        .expect("columns array");
+    assert!(columns.iter().any(|c| c == "role"));
+    assert!(columns.iter().any(|c| c == "n"));
+    let rows = structured
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .expect("rows array");
+    assert_eq!(rows.len(), 2);
+    // The spec-compliant text fallback is the stringified structured payload
+    // (per `CallToolResult::structured`) - clients that don't render the
+    // structured channel still see the data.
+    let text = first_text(&result).expect("text fallback present");
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("text fallback is the same JSON");
+    assert_eq!(&parsed, structured, "text fallback matches structured");
+
+    // 8. EXPLAIN passes the read-only gate and returns a plan.
+    let result = call(json!({ "sql": "EXPLAIN SELECT role FROM messages" })).await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "EXPLAIN should succeed: {result:?}"
+    );
+    let text = first_text(&result).expect("EXPLAIN renders inline");
+    assert!(
+        text.to_ascii_lowercase().contains("plan"),
+        "EXPLAIN output mentions a plan: {text}"
+    );
+
+    // 9. Explicit projection of the `vector` column is a loud tool error,
+    // not the prior silent-empty result.
+    let result = call(json!({ "sql": "SELECT vector FROM messages" })).await?;
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "SELECT vector must be an isError tool result"
+    );
+    let text = first_text(&result).expect("error carries a message");
+    assert!(
+        text.contains("pond_search"),
+        "error redirects to pond_search: {text}"
+    );
+
+    // 10. Inline truncation now points the agent at keyset pagination.
+    // Force truncation with a 1-row limit on a 4-row corpus.
+    let result = call(json!({
+        "sql": "SELECT id, timestamp FROM messages ORDER BY timestamp",
+        "limit": 1
+    }))
+    .await?;
+    let text = first_text(&result).expect("inline result");
+    assert!(
+        text.contains("keyset"),
+        "truncation hint mentions keyset pagination: {text}"
+    );
+    assert!(
+        text.contains("schema://pond-sql"),
+        "truncation hint points at the schema doc: {text}"
+    );
+
+    // 11. Inline metrics footer reports elapsed time.
+    let result = call(json!({ "sql": "SELECT 1" })).await?;
+    let text = first_text(&result).expect("inline result");
+    assert!(
+        text.contains(" ms"),
+        "metrics footer carries elapsed ms: {text}"
+    );
+
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())
