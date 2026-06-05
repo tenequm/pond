@@ -49,7 +49,7 @@ pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
 
 static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Seed the process-wide index-lag threshold from `[search].index_lag_threshold`.
+/// Seed the process-wide index-lag threshold from `[maintenance].index_lag_threshold`.
 /// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
 pub fn init_index_lag_threshold(value: usize) {
     INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
@@ -60,6 +60,79 @@ pub fn index_lag_threshold() -> usize {
         .get()
         .copied()
         .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
+}
+
+/// Compaction runs only past this many sub-target fragments, so the 5-min sync
+/// stops re-Rewriting the trailing fragment every pass (spec.md#lance-index-maintenance).
+/// 0 disables the gate.
+pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
+
+/// Default manifest-retention window for the safe cleanup pass. Matches
+/// LanceDB's recommended OSS-operator practice (lancedb docs: performance.mdx,
+/// tables/update.mdx). With `delete_unverified=false`, Lance's 7-day
+/// in-progress guard still protects unverified files regardless of this value
+/// (`UNVERIFIED_THRESHOLD_DAYS` in lance/dataset/cleanup.rs).
+pub fn default_cleanup_older_than() -> chrono::Duration {
+    chrono::Duration::days(1)
+}
+
+/// Resolved per-call inputs to the storage-maintenance pass. Built from
+/// `[maintenance]` (and any per-invocation CLI override) at the entry point;
+/// threaded down to `optimize_table_compact` so the substrate never re-reads
+/// `Config` itself.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenancePolicy {
+    /// Compaction gate: see [`DEFAULT_COMPACTION_FRAGMENT_CAP`]. `0` always
+    /// compacts (preserves the pre-gate test behavior).
+    pub compaction_fragment_cap: usize,
+    /// Manifest-retention window handed to `cleanup_old_versions`.
+    pub cleanup_older_than: chrono::Duration,
+}
+
+impl MaintenancePolicy {
+    /// Preserves the pre-gate compaction-always behavior that the existing
+    /// optimize tests assume.
+    pub fn always_compact() -> Self {
+        Self {
+            compaction_fragment_cap: 0,
+            cleanup_older_than: default_cleanup_older_than(),
+        }
+    }
+}
+
+/// Compact when the largest mergeable run of sub-target fragments can fill a
+/// whole target fragment (consolidation that freezes a fragment) or the
+/// sub-target count has piled past `cap`. `cap == 0` always compacts.
+fn should_compact(
+    mergeable_run_rows: usize,
+    candidate_count: usize,
+    target_rows: usize,
+    cap: usize,
+) -> bool {
+    mergeable_run_rows >= target_rows || candidate_count >= cap
+}
+
+/// Largest contiguous below-target run (rows) and total below-target count over
+/// fragments in dataset order. The run approximates Lance's biggest mergeable
+/// bin, so a fragment stranded between at-target fragments (which Lance won't
+/// merge) never inflates the total and never triggers perpetual re-compaction.
+fn compaction_candidates(
+    physical_rows: impl IntoIterator<Item = usize>,
+    target: usize,
+) -> (usize, usize) {
+    let mut count = 0;
+    let mut run = 0;
+    let mut max_run = 0;
+    for rows in physical_rows {
+        if rows < target {
+            count += 1;
+            run += rows;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    (max_run, count)
 }
 
 /// Declarative description of one index pond keeps on a table. Created when
@@ -881,10 +954,10 @@ impl Handle {
         table: Table,
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
-        cleanup: crate::sessions::CleanupConfig,
+        policy: &MaintenancePolicy,
     ) -> TableOptimizeOutcome {
         let compaction = self
-            .run_optimize_compact_phase(table, progress, cleanup)
+            .run_optimize_compact_phase(table, progress, policy)
             .await;
         let indices = self
             .run_optimize_indices_phase(table, intents, progress)
@@ -940,13 +1013,13 @@ impl Handle {
         &self,
         table: Table,
         progress: Option<&OptimizeProgressFn>,
-        cleanup: crate::sessions::CleanupConfig,
+        policy: &MaintenancePolicy,
     ) -> PhaseOutcome {
         let result = self
             .retry_lance(table.label(), || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
-                optimize_table_compact(&mut dataset, table, progress, cleanup).await?;
+                optimize_table_compact(&mut dataset, table, progress, policy).await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(())
             })
@@ -1254,32 +1327,61 @@ async fn optimize_table_compact(
     dataset: &mut Dataset,
     table: Table,
     progress: Option<&OptimizeProgressFn>,
-    cleanup: crate::sessions::CleanupConfig,
+    policy: &MaintenancePolicy,
 ) -> Result<()> {
     let compaction = CompactionOptions {
         defer_index_remap: false,
         ..CompactionOptions::default()
     };
 
-    emit(
-        progress,
-        OptimizeEvent::PhaseStart {
-            table,
-            phase: OptimizePhase::Compact,
-            detail: None,
-        },
+    // Candidacy mirrors Lance's planner: a fragment is compactable iff it holds
+    // fewer than target_rows_per_fragment rows (optimize.rs).
+    let target = compaction.target_rows_per_fragment;
+    let fragments = dataset.get_fragments();
+    let (mergeable_run_rows, candidate_count) = compaction_candidates(
+        fragments
+            .iter()
+            .map(|fragment| fragment.metadata().physical_rows.unwrap_or(0)),
+        target,
     );
-    let started = Instant::now();
-    compact_files(dataset, compaction, None).await?;
-    emit(
-        progress,
-        OptimizeEvent::PhaseDone {
-            table,
-            phase: OptimizePhase::Compact,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-    );
+    if should_compact(
+        mergeable_run_rows,
+        candidate_count,
+        target,
+        policy.compaction_fragment_cap,
+    ) {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::Compact,
+                detail: None,
+            },
+        );
+        let started = Instant::now();
+        compact_files(dataset, compaction, None).await?;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::Compact,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    } else {
+        tracing::debug!(
+            target: "pond::perf",
+            table = table.as_str(),
+            mergeable_run_rows,
+            candidate_count,
+            cap = policy.compaction_fragment_cap,
+            "compaction skipped: sub-target fragments under threshold",
+        );
+    }
 
+    // Safe GC only. delete_unverified=false keeps Lance's 7-day in-progress
+    // guard, so this never races a concurrent writer (spec.md#concurrency); GC
+    // runs outside OCC, so the guard is what makes it safe on any backend.
     emit(
         progress,
         OptimizeEvent::PhaseStart {
@@ -1289,16 +1391,8 @@ async fn optimize_table_compact(
         },
     );
     let started = Instant::now();
-    // delete_unverified=true is the operator opt-in via `--cleanup-older-than`
-    // / `--vacuum` that bypasses Lance's 7-day in-progress safety guard
-    // (UNVERIFIED_THRESHOLD_DAYS in lance/dataset/cleanup.rs). Required to
-    // reclaim files younger than 7 days; unsafe under concurrent writers.
     dataset
-        .cleanup_old_versions(
-            cleanup.older_than,
-            Some(cleanup.delete_unverified),
-            Some(false),
-        )
+        .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
         .await
         .context("cleanup_old_versions failed during index optimize")?;
     emit(
@@ -1379,7 +1473,7 @@ async fn optimize_table_indices(
         }
         // Lag guard: let fragments accumulate behind the brute-force fallback
         // rather than firing a commit per tiny append. Threshold is operator-
-        // tunable via `[search].index_lag_threshold`.
+        // tunable via `[maintenance].index_lag_threshold`.
         if unindexed.len() < index_lag_threshold() {
             continue;
         }
@@ -1747,6 +1841,33 @@ fn like_contains(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn compaction_gate_skips_subtarget_trickle_compacts_on_progress() {
+        let target = 1_048_576;
+        // Bloat case: a large trailing fragment plus a tiny new one - under a
+        // full target fragment and under the cap -> skip (don't re-Rewrite).
+        assert!(!should_compact(510_000 + 30, 2, target, 64));
+        // A run that fills a whole target fragment -> compact (and freeze it).
+        assert!(should_compact(target, 3, target, 64));
+        // Many tiny fragments past the cap -> compact to bound fragment count.
+        assert!(should_compact(5_000, 64, target, 64));
+        // cap == 0 always compacts (preserves pre-gate behavior for tests).
+        assert!(should_compact(0, 0, target, 0));
+    }
+
+    #[test]
+    fn compaction_candidates_strands_isolated_subtarget_fragment() {
+        let target = 1_048_576;
+        // [at-target, isolated 256K, at-target, tail 510K, tiny 30]: the only
+        // mergeable run is tail+tiny; the 256K between at-target frags is stranded,
+        // so even though sub-target rows total 766K it never re-fires the gate.
+        let (run, count) =
+            compaction_candidates([1_048_576, 256_000, 1_048_576, 510_000, 30], target);
+        assert_eq!(count, 3);
+        assert_eq!(run, 510_030);
+        assert!(!should_compact(run, count, target, 64));
+    }
 
     #[test]
     fn namespace_error_code_walks_wrapped_chain() {

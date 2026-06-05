@@ -14,6 +14,7 @@ use pond::{
     handlers::pond_get,
     handlers::pond_search,
     sessions::{Store, embedding_dim},
+    substrate::MaintenancePolicy,
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, Role, SearchEnvelope,
@@ -67,7 +68,10 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedde
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
     let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn Embedder>);
     Ok((store, embedder))
 }

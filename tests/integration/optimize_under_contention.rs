@@ -17,8 +17,8 @@ use chrono::Utc;
 use pond::{
     config::parse_data_dir,
     handlers::ingest_events,
-    sessions::{CleanupConfig, IngestEvent, MessageWrite, OptimizeOutcome, Store},
-    substrate::PhaseOutcome,
+    sessions::{IngestEvent, MessageWrite, OptimizeOutcome, Store},
+    substrate::{MaintenancePolicy, PhaseOutcome},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
@@ -112,7 +112,9 @@ async fn optimize_returns_per_table_outcome_on_quiet_store() -> anyhow::Result<(
     }
     ingest_events(&store, events).await?;
 
-    let outcome = store.optimize_indices(None, None).await?;
+    let outcome = store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?;
     assert_eq!(outcome.tables.len(), 3);
     for table in &outcome.tables {
         assert!(
@@ -151,43 +153,6 @@ async fn build_indices_only_leaves_compaction_unattempted() -> anyhow::Result<()
         assert!(
             matches!(table.compaction, PhaseOutcome::NotAttempted),
             "compaction on {} must be NotAttempted under build_indices_only, got {:?}",
-            table.table.as_str(),
-            table.compaction,
-        );
-    }
-    Ok(())
-}
-
-/// `Store::optimize_indices` with `--vacuum`-equivalent config
-/// (`older_than=0s`, `delete_unverified=true`) doesn't error on a quiet store.
-/// Proves the aggressive-reclaim path is wired and doesn't trip the cleanup
-/// primitive at our pinned Lance version.
-#[tokio::test(flavor = "multi_thread")]
-async fn optimize_with_vacuum_config_runs_clean() -> anyhow::Result<()> {
-    let url = parse_data_dir("shared-memory://pond-test-optimize-vacuum/")?;
-    let store = Store::open(&url).await?;
-    let session = make_session("01HXYVACUUM00001");
-    let mut events = vec![IngestEvent::Session(session.clone())];
-    for idx in 0..16 {
-        events.push(IngestEvent::Message(make_message(&session.id, idx)));
-        events.push(IngestEvent::Part(make_part(
-            &session.id,
-            idx,
-            "vacuum body",
-        )));
-    }
-    ingest_events(&store, events).await?;
-
-    let cleanup = CleanupConfig {
-        older_than: chrono::Duration::zero(),
-        delete_unverified: true,
-    };
-    let outcome = store.optimize_indices(None, Some(cleanup)).await?;
-    assert_eq!(outcome.tables.len(), 3);
-    for table in &outcome.tables {
-        assert!(
-            !matches!(table.compaction, PhaseOutcome::Failed(_)),
-            "vacuum cleanup must not fail on {}: {:?}",
             table.table.as_str(),
             table.compaction,
         );
@@ -239,7 +204,9 @@ async fn optimize_under_contention_surfaces_skipped_not_err() -> anyhow::Result<
     // commit lane is actively contended.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let outcome: OptimizeOutcome = optimizer.optimize_indices(None, None).await?;
+    let outcome: OptimizeOutcome = optimizer
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = writer_task.await;
 

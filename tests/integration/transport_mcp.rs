@@ -11,6 +11,7 @@ use pond::{
     embed::{EmbedWorker, Embedder},
     handlers::{IngestEvent, pond_ingest},
     sessions::{Store, embedding_dim},
+    substrate::MaintenancePolicy,
     transport::{AppState, mcp::PondMcp},
     wire::{IngestEnvelope, IngestRequest},
     wire::{Message, Part, PartKind, Provenance, Session},
@@ -144,7 +145,10 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
     );
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
 
     Ok(AppState {
         store: Arc::new(store),
