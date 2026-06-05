@@ -23,6 +23,8 @@ mod s3_backend;
 mod search;
 #[path = "integration/session_scoped_pk.rs"]
 mod session_scoped_pk;
+#[path = "integration/sql.rs"]
+mod sql;
 #[path = "integration/store_concurrency.rs"]
 mod store_concurrency;
 #[path = "integration/transport_http.rs"]

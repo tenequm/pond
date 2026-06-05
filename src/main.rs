@@ -106,6 +106,15 @@ impl From<CliResponseMode> for ResponseMode {
     }
 }
 
+/// CLI surface for `pond sql --output`. Maps to `sql::Mode` / `sql::Format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliSqlOutput {
+    Table,
+    Json,
+    Ndjson,
+    Parquet,
+}
+
 /// CLI surface for `pond get --from`. Maps 1:1 to wire `SessionFrom`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliSessionFrom {
@@ -387,6 +396,32 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
+    },
+    /// Run ONE read-only SQL query over the stored corpus (sessions, messages,
+    /// parts). DataFusion / PostgreSQL-compatible. SELECT/WITH only; writes
+    /// and side-effecting statements are rejected. Same SQL surface as the
+    /// `pond_sql_query` MCP tool - see `schema://pond-sql` (via MCP) for the
+    /// full column list, indexed columns, pagination/drilling patterns, and
+    /// the function quick-reference.
+    Sql {
+        /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
+        sql: String,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Output format. table/json/ndjson go to stdout; parquet requires
+        /// `--output-file` (binary).
+        #[arg(long, value_enum, default_value_t = CliSqlOutput::Table)]
+        output: CliSqlOutput,
+        /// Inline row cap for table/json output. Default 100, max 1000.
+        /// Ignored for ndjson/parquet (which return every row).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Write the export bytes here instead of stdout (required for
+        /// `--output parquet`; optional for ndjson). Ignored for table/json.
+        #[arg(long, short = 'o')]
+        output_file: Option<PathBuf>,
     },
 }
 
@@ -845,6 +880,84 @@ async fn main() -> anyhow::Result<()> {
                 "{} run `pond sync --only update-indexes` to rebuild search indexes",
                 pond::output::paint("hint", pond::output::dim()),
             ))?;
+        }
+        Command::Sql {
+            sql,
+            data_dir,
+            config,
+            output: format,
+            limit,
+            output_file,
+        } => {
+            if matches!(format, CliSqlOutput::Parquet) && output_file.is_none() {
+                bail!(
+                    "--output parquet requires --output-file <path> (binary, can't go to stdout)"
+                );
+            }
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
+            let mode = match format {
+                CliSqlOutput::Table => pond::sql::Mode::Inline,
+                CliSqlOutput::Json => pond::sql::Mode::InlineJson,
+                CliSqlOutput::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
+                CliSqlOutput::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
+            };
+            let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            let (sessions, messages, parts) = tokio::try_join!(
+                store.dataset(pond::substrate::Table::Sessions),
+                store.dataset(pond::substrate::Table::Messages),
+                store.dataset(pond::substrate::Table::Parts),
+            )?;
+            let tables = pond::sql::Tables {
+                sessions,
+                messages,
+                parts,
+            };
+            match pond::sql::run(&tables, &sql, mode, inline_rows).await {
+                Ok(pond::sql::Outcome::Inline(text)) => {
+                    output(&text)?;
+                }
+                Ok(pond::sql::Outcome::InlineJson(value)) => {
+                    // Pretty-print for the CLI - the structured payload is for
+                    // agents over MCP; humans reading stdout want it readable.
+                    output(&serde_json::to_string_pretty(&value)?)?;
+                }
+                Ok(pond::sql::Outcome::Export {
+                    bytes,
+                    format: _,
+                    rows,
+                    columns: _,
+                }) => match output_file {
+                    Some(path) => {
+                        fs::write(&path, &bytes)
+                            .with_context(|| format!("write export to {}", path.display()))?;
+                        output_err(&format!(
+                            "{} {} row(s), {} bytes -> {}",
+                            pond::output::paint("export:", pond::output::dim()),
+                            rows,
+                            bytes.len(),
+                            path.display()
+                        ))?;
+                    }
+                    None => {
+                        use std::io::Write;
+                        io::stdout().write_all(&bytes)?;
+                    }
+                },
+                Err(pond::sql::SqlError::Query(message)) => {
+                    output_err(&format!(
+                        "{} {message}",
+                        pond::output::paint("sql error:", pond::output::dim())
+                    ))?;
+                    std::process::exit(2);
+                }
+                Err(pond::sql::SqlError::Infra(error)) => {
+                    return Err(error);
+                }
+            }
         }
     }
 

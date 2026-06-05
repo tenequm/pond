@@ -1098,6 +1098,28 @@ impl Store {
         self.handle.row_counts().await
     }
 
+    /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
+    /// DataFusion `LanceTableProvider` in `pond_sql_query`. Goes through the
+    /// handle's freshness gate, so each query sees a current snapshot.
+    pub async fn dataset(&self, table: Table) -> Result<Arc<Dataset>> {
+        Ok(Arc::new(self.handle.dataset(table).await?))
+    }
+
+    /// Write a `pond_sql_query` export artifact.
+    pub async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.handle.export_write(name, bytes).await
+    }
+
+    /// Read a `pond_sql_query` export artifact back.
+    pub async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
+        self.handle.export_read(name).await
+    }
+
+    /// Local filesystem path of an export artifact on `file://` installs.
+    pub fn export_local_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.handle.export_local_path(name)
+    }
+
     /// Compute the per-adapter / per-project rollup that drives
     /// `pond status`. One scan over `messages` projecting the three
     /// columns the rollup keys on (`source_agent`, `project`, `session_id`),
