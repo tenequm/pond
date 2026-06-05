@@ -18,7 +18,7 @@ use pond::{
     config::parse_data_dir,
     handlers::ingest_events,
     sessions::{IngestEvent, MessageWrite, OptimizeOutcome, Store},
-    substrate::PhaseOutcome,
+    substrate::{MaintenancePolicy, PhaseOutcome},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
@@ -112,7 +112,9 @@ async fn optimize_returns_per_table_outcome_on_quiet_store() -> anyhow::Result<(
     }
     ingest_events(&store, events).await?;
 
-    let outcome = store.optimize_indices(None, 0).await?;
+    let outcome = store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?;
     assert_eq!(outcome.tables.len(), 3);
     for table in &outcome.tables {
         assert!(
@@ -202,7 +204,9 @@ async fn optimize_under_contention_surfaces_skipped_not_err() -> anyhow::Result<
     // commit lane is actively contended.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let outcome: OptimizeOutcome = optimizer.optimize_indices(None, 0).await?;
+    let outcome: OptimizeOutcome = optimizer
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = writer_task.await;
 

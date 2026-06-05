@@ -205,13 +205,27 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Search tuning. Leave unset for Lance defaults; set when tuning IVF_PQ recall
 # against a corpus.
 #
-# `index_lag_threshold` is the minimum unindexed-fragment count before a
-# per-intent append/rebuild runs in `pond index optimize`; the brute-force
-# fallback keeps queries correct while fragments accumulate. Defaults to 4.
-#
 # [search]
 # nprobes = 16
 # refine_factor = 2
+
+# Storage maintenance. Tunes the compaction + cleanup pass that runs inside
+# `pond sync` and `pond index optimize`.
+#
+# - `compaction_fragment_cap` is the sub-target fragment count past which the
+#   compaction phase runs (it also runs once those fragments hold a whole target
+#   fragment's worth of rows). Default 64 stops the automated sync re-compacting
+#   the trailing fragment every pass; 0 compacts every pass.
+# - `cleanup_older_than` is the manifest-retention window for the safe cleanup
+#   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`). Versions older than
+#   this are reclaimed by Lance's OCC-coordinated GC.
+# - `index_lag_threshold` is the minimum unindexed-fragment count before a
+#   per-intent append/rebuild runs in `pond index optimize`; the brute-force
+#   fallback keeps queries correct while fragments accumulate. Default 4.
+#
+# [maintenance]
+# compaction_fragment_cap = 64
+# cleanup_older_than = \"1d\"
 # index_lag_threshold = 4
 
 # Long-running process caps. Both accept either a plain byte count or a
@@ -257,6 +271,8 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub maintenance: MaintenanceConfig,
+    #[serde(default)]
     pub runtime: RuntimeConfig,
     /// `[sources.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
@@ -299,6 +315,27 @@ pub struct SearchConfig {
     pub nprobes: Option<usize>,
     #[serde(default)]
     pub refine_factor: Option<u32>,
+}
+
+/// `[maintenance]`: storage-maintenance knobs shared by `pond sync` and
+/// `pond index optimize`. All optional - omit and pond falls back to the
+/// in-process defaults in `pond::substrate` (`DEFAULT_COMPACTION_FRAGMENT_CAP`,
+/// `default_cleanup_older_than`, and the `index_lag_threshold` initializer).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Sub-target fragment count past which the compaction phase runs (it also
+    /// runs once those fragments hold a whole target fragment's worth of rows).
+    /// Default 64 stops the automated sync re-compacting the trailing fragment
+    /// every pass; 0 compacts every pass.
+    #[serde(default)]
+    pub compaction_fragment_cap: Option<usize>,
+    /// Manifest-retention window for the safe cleanup pass. Accepts
+    /// `Ns`/`Nm`/`Nh`/`Nd` (default `1d`). Versions older than this are
+    /// reclaimed by Lance's OCC-coordinated GC (`delete_unverified=false`),
+    /// which never races a concurrent writer on any backend.
+    #[serde(default)]
+    pub cleanup_older_than: Option<String>,
     /// Minimum unindexed-fragment count below which `optimize_table_indices`
     /// skips the per-intent append/rebuild path; the brute-force fallback
     /// keeps queries correct while fragments accumulate. Default 4 trades a
@@ -306,12 +343,6 @@ pub struct SearchConfig {
     /// commits during high-rate ingest.
     #[serde(default)]
     pub index_lag_threshold: Option<usize>,
-    /// Sub-target fragment count past which the compaction phase runs (it also
-    /// runs once those fragments hold a whole target fragment's worth of rows).
-    /// Default 64 stops the automated sync re-compacting the trailing fragment
-    /// every pass; 0 compacts every pass.
-    #[serde(default)]
-    pub compaction_fragment_cap: Option<usize>,
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master
@@ -398,7 +429,7 @@ impl Config {
         };
         config.embeddings.validate()?;
         config.embeddings.install_runtime();
-        if let Some(threshold) = config.search.index_lag_threshold {
+        if let Some(threshold) = config.maintenance.index_lag_threshold {
             crate::substrate::init_index_lag_threshold(threshold);
         }
         // Tilde expansion is per-adapter (inside each factory's `open()`):

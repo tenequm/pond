@@ -26,8 +26,8 @@ use pond::{
         Store,
     },
     substrate::{
-        IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableSizes,
-        index_lag_threshold,
+        IndexStatus, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn, PhaseOutcome,
+        TableSizes, default_cleanup_older_than, index_lag_threshold,
     },
     transport::{self, AppState},
     wire::{
@@ -396,10 +396,41 @@ enum IndexCommand {
     Optimize {
         #[arg(long)]
         wait: bool,
+        /// Override the manifest-retention window for this run. Accepts
+        /// `Ns`/`Nm`/`Nh`/`Nd` (default: the configured `[maintenance]
+        /// .cleanup_older_than`, or `1d`). The cleanup pass stays safe
+        /// (`delete_unverified=false`), so this is OCC-coordinated and
+        /// safe to run while the cron is active; `0s` reclaims every
+        /// verified dead version up to the latest committed manifest.
+        #[arg(long, value_parser = parse_retention)]
+        cleanup_older_than: Option<chrono::Duration>,
     },
     Rebuild {
         intent: Option<String>,
     },
+}
+
+fn parse_retention(raw: &str) -> Result<chrono::Duration, String> {
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let amount: i64 = number
+        .parse()
+        .map_err(|_| format!("retention {raw:?}: leading number is not an integer"))?;
+    if amount < 0 {
+        return Err(format!("retention {raw:?} must be non-negative"));
+    }
+    match unit {
+        "s" => Ok(chrono::Duration::seconds(amount)),
+        "m" => Ok(chrono::Duration::minutes(amount)),
+        "h" => Ok(chrono::Duration::hours(amount)),
+        "d" => Ok(chrono::Duration::days(amount)),
+        other => Err(format!(
+            "retention {raw:?}: unit {other:?} not recognized (use s/m/h/d)"
+        )),
+    }
 }
 
 /// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
@@ -531,7 +562,8 @@ async fn main() -> anyhow::Result<()> {
                 run_embed_stage(&store, force_embed).await?;
             }
             if stages.update_indexes {
-                run_update_indexes_stage(&store, configured_compaction_cap(&loaded)).await?;
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                run_update_indexes_stage(&store, &policy).await?;
             }
             render_sync_summary(&store, &summary).await?;
         }
@@ -548,8 +580,8 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
             if !summary.cancelled && summary.messages > 0 {
-                let outcome =
-                    run_update_indexes_stage(&store, configured_compaction_cap(&config)).await?;
+                let policy = configured_maintenance_policy(&config, None)?;
+                let outcome = run_update_indexes_stage(&store, &policy).await?;
                 if outcome.any_indices_failed() {
                     std::process::exit(1);
                 }
@@ -671,11 +703,13 @@ async fn main() -> anyhow::Result<()> {
                     let statuses = store.index_status().await?;
                     render_index_status(&statuses)?;
                 }
-                IndexCommand::Optimize { wait } => {
+                IndexCommand::Optimize {
+                    wait,
+                    cleanup_older_than,
+                } => {
+                    let policy = configured_maintenance_policy(&loaded, cleanup_older_than)?;
                     let (progress, bar) = optimize_progress_bar();
-                    let outcome = store
-                        .optimize_indices(Some(progress), configured_compaction_cap(&loaded))
-                        .await?;
+                    let outcome = store.optimize_indices(Some(progress), &policy).await?;
                     bar.finish_and_clear();
                     render_optimize_outcome(&outcome)?;
                     if wait {
@@ -1202,22 +1236,39 @@ async fn run_embed_stage_with_limit(
     Ok(summary)
 }
 
-/// Compaction fragment cap from `[search].compaction_fragment_cap`, or the default.
-fn configured_compaction_cap(config: &Config) -> usize {
-    config
-        .search
+/// Resolve the `MaintenancePolicy` for one optimize/sync invocation: start
+/// from `[maintenance]` (or the in-process defaults), then apply the CLI
+/// `--cleanup-older-than` override when present.
+fn configured_maintenance_policy(
+    config: &Config,
+    cleanup_override: Option<chrono::Duration>,
+) -> anyhow::Result<MaintenancePolicy> {
+    let compaction_fragment_cap = config
+        .maintenance
         .compaction_fragment_cap
-        .unwrap_or(pond::substrate::DEFAULT_COMPACTION_FRAGMENT_CAP)
+        .unwrap_or(pond::substrate::DEFAULT_COMPACTION_FRAGMENT_CAP);
+    let configured_cleanup = config
+        .maintenance
+        .cleanup_older_than
+        .as_deref()
+        .map(parse_retention)
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("invalid [maintenance].cleanup_older_than: {err}"))?;
+    let cleanup_older_than = cleanup_override
+        .or(configured_cleanup)
+        .unwrap_or_else(default_cleanup_older_than);
+    Ok(MaintenancePolicy {
+        compaction_fragment_cap,
+        cleanup_older_than,
+    })
 }
 
 async fn run_update_indexes_stage(
     store: &Store,
-    compaction_cap: usize,
+    policy: &MaintenancePolicy,
 ) -> anyhow::Result<OptimizeOutcome> {
     let (progress, bar) = optimize_progress_bar();
-    let outcome = store
-        .optimize_indices(Some(progress), compaction_cap)
-        .await?;
+    let outcome = store.optimize_indices(Some(progress), policy).await?;
     bar.finish_and_clear();
     // No `index:` recap line: the `render_sync_summary` (or `pond status`)
     // `indexes  text + semantic ready` line is the single source of truth

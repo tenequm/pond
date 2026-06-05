@@ -24,9 +24,9 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     config, embed,
     substrate::{
-        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, OptimizeProgressFn,
-        PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
-        VECTOR_INDEX_ACTIVATION_ROWS,
+        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
+        OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
+        TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{
         FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session,
@@ -162,16 +162,6 @@ impl OptimizeOutcome {
         }
         Ok(self)
     }
-}
-
-/// Default manifest-retention window for `pond index optimize`'s explicit
-/// cleanup pass. Matches LanceDB's recommended OSS-operator practice
-/// (lancedb docs: performance.mdx, tables/update.mdx). Note: with
-/// `delete_unverified=false` (default), Lance protects files newer than
-/// 7 days regardless of this value (`UNVERIFIED_THRESHOLD_DAYS` in
-/// lance/dataset/cleanup.rs).
-pub fn default_cleanup_older_than() -> chrono::Duration {
-    chrono::Duration::days(1)
 }
 
 /// What `pond status` reports: where the data lives, total rows per table,
@@ -1580,14 +1570,14 @@ impl Store {
     pub async fn optimize_indices(
         &self,
         progress: Option<OptimizeProgressFn>,
-        compaction_cap: usize,
+        maintenance: &MaintenancePolicy,
     ) -> Result<OptimizeOutcome> {
-        let policy = pond_index_intents();
+        let intents = pond_index_intents();
         let mut tables = Vec::with_capacity(3);
-        for (table, intents) in policy.all() {
+        for (table, intents) in intents.all() {
             let outcome = self
                 .handle
-                .optimize_table(table, intents, progress.as_ref(), compaction_cap)
+                .optimize_table(table, intents, progress.as_ref(), maintenance)
                 .await;
             tables.push(outcome);
         }
@@ -1624,10 +1614,14 @@ impl Store {
         &self,
         vector_threshold: usize,
     ) -> Result<OptimizeOutcome> {
-        let policy = pond_index_intents_with_vector_threshold(vector_threshold);
+        let intents = pond_index_intents_with_vector_threshold(vector_threshold);
+        let policy = MaintenancePolicy::always_compact();
         let mut tables = Vec::with_capacity(3);
-        for (table, intents) in policy.all() {
-            let outcome = self.handle.optimize_table(table, intents, None, 0).await;
+        for (table, intents) in intents.all() {
+            let outcome = self
+                .handle
+                .optimize_table(table, intents, None, &policy)
+                .await;
             tables.push(outcome);
         }
         Ok(OptimizeOutcome { tables })
@@ -4226,7 +4220,10 @@ mod tests {
         ];
         store.upsert_parts(&batch_b).await?;
 
-        store.optimize_indices(None, 0).await?.into_result()?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
 
         Ok(())
     }
@@ -4617,7 +4614,10 @@ mod tests {
         // emits `ScalarIndexQuery` whenever the index exists.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
-        store.optimize_indices(None, 0).await?.into_result()?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store

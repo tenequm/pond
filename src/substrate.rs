@@ -49,7 +49,7 @@ pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
 
 static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Seed the process-wide index-lag threshold from `[search].index_lag_threshold`.
+/// Seed the process-wide index-lag threshold from `[maintenance].index_lag_threshold`.
 /// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
 pub fn init_index_lag_threshold(value: usize) {
     INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
@@ -66,6 +66,39 @@ pub fn index_lag_threshold() -> usize {
 /// stops re-Rewriting the trailing fragment every pass (spec.md#lance-index-maintenance).
 /// 0 disables the gate.
 pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
+
+/// Default manifest-retention window for the safe cleanup pass. Matches
+/// LanceDB's recommended OSS-operator practice (lancedb docs: performance.mdx,
+/// tables/update.mdx). With `delete_unverified=false`, Lance's 7-day
+/// in-progress guard still protects unverified files regardless of this value
+/// (`UNVERIFIED_THRESHOLD_DAYS` in lance/dataset/cleanup.rs).
+pub fn default_cleanup_older_than() -> chrono::Duration {
+    chrono::Duration::days(1)
+}
+
+/// Resolved per-call inputs to the storage-maintenance pass. Built from
+/// `[maintenance]` (and any per-invocation CLI override) at the entry point;
+/// threaded down to `optimize_table_compact` so the substrate never re-reads
+/// `Config` itself.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenancePolicy {
+    /// Compaction gate: see [`DEFAULT_COMPACTION_FRAGMENT_CAP`]. `0` always
+    /// compacts (preserves the pre-gate test behavior).
+    pub compaction_fragment_cap: usize,
+    /// Manifest-retention window handed to `cleanup_old_versions`.
+    pub cleanup_older_than: chrono::Duration,
+}
+
+impl MaintenancePolicy {
+    /// Preserves the pre-gate compaction-always behavior that the existing
+    /// optimize tests assume.
+    pub fn always_compact() -> Self {
+        Self {
+            compaction_fragment_cap: 0,
+            cleanup_older_than: default_cleanup_older_than(),
+        }
+    }
+}
 
 /// Compact when the largest mergeable run of sub-target fragments can fill a
 /// whole target fragment (consolidation that freezes a fragment) or the
@@ -851,10 +884,10 @@ impl Handle {
         table: Table,
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
-        compaction_cap: usize,
+        policy: &MaintenancePolicy,
     ) -> TableOptimizeOutcome {
         let compaction = self
-            .run_optimize_compact_phase(table, progress, compaction_cap)
+            .run_optimize_compact_phase(table, progress, policy)
             .await;
         let indices = self
             .run_optimize_indices_phase(table, intents, progress)
@@ -910,13 +943,13 @@ impl Handle {
         &self,
         table: Table,
         progress: Option<&OptimizeProgressFn>,
-        compaction_cap: usize,
+        policy: &MaintenancePolicy,
     ) -> PhaseOutcome {
         let result = self
             .retry_lance(table.label(), || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
-                optimize_table_compact(&mut dataset, table, progress, compaction_cap).await?;
+                optimize_table_compact(&mut dataset, table, progress, policy).await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(())
             })
@@ -1231,7 +1264,7 @@ async fn optimize_table_compact(
     dataset: &mut Dataset,
     table: Table,
     progress: Option<&OptimizeProgressFn>,
-    compaction_cap: usize,
+    policy: &MaintenancePolicy,
 ) -> Result<()> {
     let compaction = CompactionOptions {
         defer_index_remap: false,
@@ -1248,7 +1281,12 @@ async fn optimize_table_compact(
             .map(|fragment| fragment.metadata().physical_rows.unwrap_or(0)),
         target,
     );
-    if should_compact(mergeable_run_rows, candidate_count, target, compaction_cap) {
+    if should_compact(
+        mergeable_run_rows,
+        candidate_count,
+        target,
+        policy.compaction_fragment_cap,
+    ) {
         emit(
             progress,
             OptimizeEvent::PhaseStart {
@@ -1273,7 +1311,7 @@ async fn optimize_table_compact(
             table = table.as_str(),
             mergeable_run_rows,
             candidate_count,
-            cap = compaction_cap,
+            cap = policy.compaction_fragment_cap,
             "compaction skipped: sub-target fragments under threshold",
         );
     }
@@ -1291,11 +1329,7 @@ async fn optimize_table_compact(
     );
     let started = Instant::now();
     dataset
-        .cleanup_old_versions(
-            crate::sessions::default_cleanup_older_than(),
-            Some(false),
-            Some(false),
-        )
+        .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
         .await
         .context("cleanup_old_versions failed during index optimize")?;
     emit(
@@ -1376,7 +1410,7 @@ async fn optimize_table_indices(
         }
         // Lag guard: let fragments accumulate behind the brute-force fallback
         // rather than firing a commit per tiny append. Threshold is operator-
-        // tunable via `[search].index_lag_threshold`.
+        // tunable via `[maintenance].index_lag_threshold`.
         if unindexed.len() < index_lag_threshold() {
             continue;
         }
