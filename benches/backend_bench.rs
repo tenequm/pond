@@ -22,6 +22,7 @@ use pond::{
     embed::{EmbedWorker, Embedder, LazyEmbedder},
     handlers::pond_search,
     sessions::{MessageWrite, Store, embedding_dim},
+    substrate::MaintenancePolicy,
     wire::{
         Message, Part, PartKind, Provenance, ProviderOptions, SearchEnvelope, SearchFilters,
         SearchModeWire, SearchRequest, Session,
@@ -224,7 +225,10 @@ async fn run_bench(label: String, store: &Store, args: &Args, open_ms: u128) -> 
         embed_ms = Some(t.elapsed().as_millis());
 
         let t = Instant::now();
-        store.optimize_indices(None, None).await?.into_result()?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
         index_ms = Some(t.elapsed().as_millis());
 
         let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn Embedder>);

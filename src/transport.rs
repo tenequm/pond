@@ -3,8 +3,8 @@
 //! per-transport behavior divergence.
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get`, and `POST /v1/ingest`. MCP
-//! exposes only `pond_search` / `pond_get` (the kb-parity surface); ingest
-//! stays HTTP-only and CLI-only.
+//! exposes `pond_search` / `pond_get` (the kb-parity surface) plus
+//! `pond_sql_query` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
 use std::sync::Arc;
 
@@ -167,11 +167,14 @@ pub mod http {
 }
 
 pub mod mcp {
-    //! The rmcp MCP layer: `pond_search` / `pond_get` tools and `schema://pond`
-    //! / `stats://pond` resources, transport-agnostic. Mounted on stdio (via
-    //! `pond mcp`) and on the `/mcp` HTTP route (via `pond serve`).
+    //! The rmcp MCP layer: `pond_search` / `pond_get` / `pond_sql_query` tools
+    //! and `schema://pond` / `schema://pond-sql` / `stats://pond` (plus
+    //! `pond-sql-export://` export artifacts) resources, transport-agnostic.
+    //! Mounted on stdio (via `pond mcp`) and on the `/mcp` HTTP route (via
+    //! `pond serve`).
 
     use anyhow::Context;
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use rmcp::{
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -187,17 +190,20 @@ pub mod mcp {
         transport::stdio,
     };
     use serde::Deserialize;
+    use uuid::Uuid;
 
     use super::AppState;
     use crate::{
         PROTOCOL_VERSION,
         handlers::pond_get as run_get,
         handlers::pond_search as run_search,
+        sql,
+        substrate::Table,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse,
             GetResult, MessageView, PartKind, PartSummary, ProjectFilter, ResponseMode,
             ResponsePart, SearchEnvelope, SearchFilters, SearchRequest, SearchResponse,
-            default_namespace,
+            SessionFrom, default_namespace,
         },
     };
 
@@ -238,6 +244,214 @@ back to page. A whole-session response also lists the session's subagents (each 
 stored as its own session) in a footer; pass a listed id back as session_id to \
 open it. Not for bulk export - use `pond export`.";
 
+    /// Static documentation served as the `schema://pond-sql` resource: the
+    /// table/column schema, dialect, function set, output modes, pagination
+    /// pattern, drilling pattern, and worked examples for `pond_sql_query`.
+    /// Loaded on demand so the tool description stays tight.
+    const SQL_SCHEMA_DOC: &str = "\
+pond_sql_query runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
+over three registered tables. Read-only is hard-enforced: anything other than a \
+single SELECT/WITH (or EXPLAIN of one) is rejected (no INSERT/UPDATE/DELETE/\
+CREATE/DROP/COPY/SET).
+
+Routing - pick the right surface before writing SQL:
+- counts, group-by, time buckets, joins over metadata -> this tool, on \
+messages/sessions.
+- which tools ran / failed, tool params -> this tool, on parts (type = \
+'tool_call' / 'tool_result'); worked example below.
+- find text in conversations -> fts('messages', ...) below, or pond_search for \
+meaning-based recall. Never LIKE over parts - tool bodies are JSON, and the \
+conversational text is messages.search_text.
+- read a transcript (a session, a message with context) -> pond_get, not SQL.
+
+Tables and columns:
+- messages(session_id text, id text, timestamp timestamp(us, UTC), role text \
+{user|assistant|system|tool}, source_agent text, project text, content text NULL \
+[system-role messages only], search_text text NULL [the conversational text - \
+null for system/tool messages], embedding_model text NULL, options json). The \
+embedding `vector` column exists but is never returned (omitted from results) and \
+explicit projection of it is rejected; you may still filter on it in WHERE, e.g. \
+`vector IS NOT NULL`. For semantic search, use pond_search.
+- sessions(id text, parent_session_id text NULL, parent_message_id text NULL, \
+source_agent text, created_at timestamp(us, UTC), project text, options json).
+- parts(session_id text, message_id text, id text, ordinal int, type text \
+{text|reasoning|file|tool_call|tool_result|tool_approval_request|\
+tool_approval_response - exact strings, underscores not hyphens}, provenance \
+text {conversational|injected}, variant_data json, options json). The verbatim \
+part body lives in `variant_data`; its fields follow the part type, e.g. \
+tool_call carries {call_id, name, params}, tool_result carries {call_id, name, \
+is_failure, result}, text/reasoning carry {text}. FilePart binary payloads are \
+not exposed in SQL.
+Enum literals matter: a wrong value (e.g. 'tool-call') is valid SQL and silently \
+returns zero rows. Discovery from SQL works too: SELECT table_name, column_name, \
+data_type FROM information_schema.columns.
+
+Join keys: messages.session_id = sessions.id; parts.session_id = messages.session_id \
+AND parts.message_id = messages.id. Subagents are sessions whose source_agent \
+matches '%/%' (e.g. 'claude-code/general-purpose').
+
+Indexed (fast) filter columns: messages.project / session_id / timestamp / role / \
+source_agent; parts.session_id / message_id; sessions.id. Prefer equality/range \
+predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
+on bitmap-indexed columns (messages.source_agent, messages.role) with \"LIKE \
+prefix queries are not supported for bitmap indexes\". Workarounds: equality, \
+split_part(source_agent, '/', 1) = 'claude-code', or an infix pattern \
+(LIKE '%/%' is fine - leading-wildcard patterns are not pushed to the index).
+
+JSON columns (options, variant_data) are binary JSONB. Rules:
+- NEVER CAST a JSON column (`variant_data::text` fails on the binary encoding). \
+Stringify with json_extract(col, '$').
+- json_extract(col, '$.a.b') takes a full JSONPath and returns JSON text of ANY \
+value (objects/arrays serialize) - the right call for nested or mixed-type \
+fields, e.g. json_extract(variant_data, '$.params.command').
+- json_get_string|json_get_int|json_get_float|json_get_bool(col, 'key') take ONE \
+key (not a path). json_get_string serializes non-string values; the typed \
+getters return NULL on a non-coercible value.
+- json_get(col, 'key') returns JSONB for chaining: \
+json_get_string(json_get(variant_data, 'params'), 'command').
+- Also: json_array_contains(col, 'key', value), json_array_length(col, 'key').
+
+Worked example - tool usage and failure rates over the last week:
+
+  SELECT json_get_string(c.variant_data, 'name') AS tool,
+         COUNT(*) AS calls,
+         SUM(CASE WHEN json_get_bool(r.variant_data, 'is_failure') THEN 1 \
+ELSE 0 END) AS failures
+  FROM parts c
+  JOIN messages m ON m.session_id = c.session_id AND m.id = c.message_id
+  LEFT JOIN parts r ON r.session_id = c.session_id
+   AND r.type = 'tool_result'
+   AND json_get_string(r.variant_data, 'call_id') = \
+json_get_string(c.variant_data, 'call_id')
+  WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
+  GROUP BY tool ORDER BY calls DESC;
+
+Full-text (BM25) search in SQL via the fts() table function: SELECT id, _score, \
+search_text FROM fts('messages', \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') ORDER BY _score DESC - \
+compose with WHERE/JOIN/GROUP BY around it; `_score` is the BM25 relevance and is a \
+regular projectable column. The right tool for exact strings, identifiers, and error \
+messages; unlike pond_search it covers subagent sessions (filter them out with WHERE \
+NOT (source_agent LIKE '%/%') if unwanted). AND semantics: \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"a b\",\"operator\":\"And\"}}'; \
+\"boolean\" queries (must/should/must_not over match clauses) also work. \"phrase\" \
+queries are unavailable (index built without positions) - use match + operator And, \
+optionally with LIKE post-filters, for exact substrings. \
+Vector/semantic search is NOT available in SQL; use pond_search for that.
+
+Function quick-reference (exact DataFusion names so the model doesn't have to \
+guess):
+- aggregates: count, count(distinct ...), sum, avg, min, max, stddev, median, \
+approx_distinct, approx_percentile_cont, array_agg, string_agg
+- date/time: now(), date_trunc('day'|'hour'|'minute'|..., ts), date_part('year'|..., \
+ts), date_bin(interval, ts, origin), to_char(ts, fmt), to_timestamp(text), \
+extract(field FROM ts), age(t1, t2)
+- intervals: `INTERVAL '7 days'`, `INTERVAL '1 hour'` (single-quoted, postgres-style)
+- string: length, lower, upper, substr, position, split_part, regexp_like, \
+regexp_match, regexp_replace, like, ilike, starts_with, ends_with, concat, \
+concat_ws
+- numeric: round, floor, ceil, abs, sign, log, exp, power, sqrt
+- conditional: CASE WHEN ... THEN ... ELSE ..., coalesce, nullif, greatest, least
+- cast: CAST(x AS TYPE) or x::TYPE - but never on JSON columns (see the JSON \
+rules above)
+Quote identifiers with double quotes when they collide with keywords (e.g. \
+\"timestamp\"); string literals use single quotes.
+
+EXPLAIN is allowed: `EXPLAIN <query>` or `EXPLAIN ANALYZE <query>` returns the \
+DataFusion plan (and per-operator timings for ANALYZE) so you can self-diagnose \
+slow queries without leaving SQL.
+
+Output modes (the `output` arg):
+- table (default): a row-capped rendered ASCII table with a header showing \
+`{total_rows} in {elapsed_ms} ms; showing {shown}` and, on truncation, a \
+keyset-pagination hint.
+- json: same row-capped payload as `table` but delivered as a JSON object \
+{total_rows, shown_rows, truncated, elapsed_ms, columns, rows: [{col: val, ...}]}. \
+Spec-compliant dual delivery: the structured JSON rides MCP's `structuredContent` \
+field; clients that don't surface that channel get the same JSON as a text block. \
+Empirically validated on Claude Code 2.1.165 - the agent reads the structured form.
+- parquet | ndjson: write the FULL result set to a file and return a \
+`pond-sql-export://<id>` resource link; read it via MCP resources/read. On a \
+local/stdio install the response also names the on-disk path so you can open it \
+directly with duckdb/polars.
+
+Pagination - keyset (preferred):
+Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking. \
+The agent owns the cursor (the last sort value it saw); no server-side state.
+
+  -- page 1: most recent 100 messages in pond
+  SELECT id, timestamp, role, project
+  FROM messages
+  WHERE project LIKE '%pond%'
+  ORDER BY timestamp DESC, id DESC
+  LIMIT 100;
+
+  -- page 2: pass back the last (timestamp, id) the agent saw
+  SELECT id, timestamp, role, project
+  FROM messages
+  WHERE project LIKE '%pond%'
+    AND (timestamp, id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
+  ORDER BY timestamp DESC, id DESC
+  LIMIT 100;
+
+Keyset stays stable across concurrent ingest (older rows don't shift) and uses \
+the btree on `timestamp`/`id` directly. For known-bounded full results, skip \
+pagination entirely: output=parquet writes everything in one call. OFFSET works \
+but scans-and-discards prior rows and shifts pages under writes - prefer keyset.
+
+Drilling from aggregates to content (instead of N round-trips of pond_get):
+JOIN to messages/parts directly. Example - top 10 longest sessions with first \
+user message:
+
+  WITH top_sessions AS (
+    SELECT session_id, COUNT(*) AS msgs
+    FROM messages
+    GROUP BY session_id
+    ORDER BY msgs DESC
+    LIMIT 10
+  )
+  SELECT ts.session_id, ts.msgs, s.project, s.source_agent,
+         m.search_text AS first_user_msg
+  FROM top_sessions ts
+  JOIN sessions s ON s.id = ts.session_id
+  LEFT JOIN messages m
+    ON m.session_id = ts.session_id
+   AND m.role = 'user'
+   AND m.timestamp = (
+     SELECT MIN(timestamp) FROM messages
+     WHERE session_id = ts.session_id AND role = 'user'
+   );
+
+One call, agent picks exactly which columns to hydrate. When you want the \
+pond_get-style rendered transcript (tool-call lines, subagent footer), call \
+pond_get with the session_id - that's its job.
+
+Examples (3 patterns the agent should recognize):
+
+  -- 1. Activity by project this week
+  SELECT project, COUNT(*) AS msgs, COUNT(DISTINCT session_id) AS sessions
+  FROM messages
+  WHERE timestamp >= now() - INTERVAL '7 days'
+  GROUP BY project
+  ORDER BY msgs DESC
+  LIMIT 20;
+
+  -- 2. Subagent breakdown
+  SELECT source_agent, COUNT(*) AS n
+  FROM sessions
+  WHERE source_agent LIKE '%/%'
+  GROUP BY source_agent
+  ORDER BY n DESC;
+
+  -- 3. BM25 search in SQL, joined with metadata, relevance-ranked
+  SELECT m.session_id, m.timestamp, m.project, f._score, m.search_text
+  FROM fts('messages', \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"race condition\"}}') f
+  JOIN messages m ON m.id = f.id
+  WHERE m.project LIKE '%pond%'
+  ORDER BY f._score DESC
+  LIMIT 50;";
+
     /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSearchParams {
@@ -261,6 +475,11 @@ open it. Not for bulk export - use `pond export`.";
         /// "claude-code/general-purpose" (a subagent).
         #[serde(default)]
         source_agent: Option<String>,
+        /// Include subagent / sub-task sessions. Default false: search targets
+        /// the main sessions where the human and agent talked. Set true to
+        /// include subagent sessions (source_agent like "claude-code/<name>").
+        #[serde(default)]
+        include_subagents: Option<bool>,
         /// Filter by message role: "user" or "assistant".
         #[serde(default)]
         role: Option<String>,
@@ -287,7 +506,8 @@ open it. Not for bulk export - use `pond export`.";
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpGetParams {
         /// Retrieve this message: its full parts plus `context_depth` sibling
-        /// messages each side. `response_mode` is ignored in this mode.
+        /// messages each side (conversational siblings by default; set
+        /// response_mode to widen).
         #[serde(default)]
         message_id: Option<String>,
         /// Retrieve this whole session (mutually exclusive with message_id).
@@ -300,16 +520,62 @@ open it. Not for bulk export - use `pond export`.";
         /// Default 20, max 1000.
         #[serde(default)]
         limit: Option<usize>,
-        /// Session-mode depth: "conversational" (default; human/model text
-        /// only, with part summaries), "complete" (all messages incl. carriers,
+        /// Depth: "conversational" (default; human/model text only, with part
+        /// summaries), "complete" (all messages incl. system/tool carriers,
         /// with part summaries), or "verbatim" (all messages with full parts
-        /// inline). Ignored in message mode.
+        /// inline; session mode only for the parts). In message mode it
+        /// selects which siblings fill the context window.
         #[serde(default)]
         response_mode: Option<String>,
+        /// Session mode only: which end to read `limit` messages from -
+        /// "start" (oldest, default) or "end" (most recent, e.g. to recover
+        /// recent context after compaction). Results stay chronological;
+        /// ignored in message mode.
+        #[serde(default)]
+        session_from: Option<String>,
         /// Exclusive continuation anchor from a prior response: the last
         /// `message_id` (session mode) or last `part_id` (message mode).
         #[serde(default)]
         after_id: Option<String>,
+    }
+
+    /// `pond_sql_query` MCP tool parameters.
+    #[derive(Debug, Deserialize, schemars::JsonSchema)]
+    struct McpSqlParams {
+        /// One read-only SQL statement (DataFusion / PostgreSQL-compatible).
+        /// SELECT/WITH only (or EXPLAIN of one); writes and side-effecting
+        /// statements are rejected. Exact columns - messages(session_id, id,
+        /// timestamp, role, source_agent, project, content [system-role
+        /// only], search_text [the conversational text], embedding_model,
+        /// options) | sessions(id, parent_session_id, parent_message_id,
+        /// source_agent, created_at, project, options) | parts(session_id,
+        /// message_id, id, ordinal, type, provenance, variant_data, options).
+        /// parts.type enums use underscores: 'tool_call', 'tool_result',
+        /// 'text', 'reasoning', 'file'. JSON columns (variant_data, options)
+        /// are JSONB: read fields with json_extract(col, '$.a.b') or
+        /// json_get_string(col, 'key'), never CAST them. See the
+        /// `schema://pond-sql` resource for joins, JSON/FTS functions,
+        /// pagination + drilling patterns, and worked examples.
+        #[serde(alias = "query")]
+        sql: String,
+        /// Output format: "table" (default; rendered ASCII table with metrics
+        /// footer), "json" (same row-capped data as a structured JSON object,
+        /// delivered via MCP structuredContent), "parquet", or "ndjson". For
+        /// parquet/ndjson the full result set is written to a file and a
+        /// `pond-sql-export://` resource link is returned (no truncation).
+        #[serde(default)]
+        output: Option<String>,
+        /// Inline row cap for "table" / "json" output. Default 100, max 1000.
+        /// Ignored for parquet/ndjson exports (which return every row).
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+
+    fn parse_session_from(value: Option<String>) -> SessionFrom {
+        match value.as_deref() {
+            Some("end") => SessionFrom::End,
+            _ => SessionFrom::Start,
+        }
     }
 
     fn parse_response_mode(value: Option<String>) -> ResponseMode {
@@ -340,16 +606,22 @@ open it. Not for bulk export - use `pond export`.";
         #[tool(
             description = "Hybrid (vector + BM25) search over stored conversation history. \
                            Returns a readable transcript: a leading `key:` line explains the \
-                           format and the first line states totals, then results are grouped by \
-                           session, ordered by each session's best hit. Each hit is a `--- [n] \
-                           score | role | time | message_id | project | agent | session ---` \
-                           delimiter rule followed by the matched text. Pass a returned \
+                           format and the first line states totals plus how many searchable \
+                           messages the filters left in scope (the absence signal - search only \
+                           sees conversational text, never tool calls/results), then results are \
+                           grouped by session, ordered by each session's best hit. Each hit is a \
+                           `--- [n] score | role | time | message_id | project | agent | session \
+                           ---` delimiter rule followed by the matched text. Pass a returned \
                            `message_id` to `pond_get` for full text. Common args: \
                            query (semantic - concepts, not project names), then project / \
                            from_date / to_date to scope. Advanced: source_agent (e.g. \
                            \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
-                           similar_to (vector-only neighbors of a message_id), cursor (paging). \
-                           Scores are relative within one response; there is no min_score.",
+                           similar_to (vector-only neighbors of a message_id), cursor (paging), \
+                           include_subagents (subagent sessions are excluded by default). \
+                           Scores are relative within one response; there is no min_score. For \
+                           exact strings, identifiers, or error messages, pond_sql_query's \
+                           fts('messages', ...) BM25 search is the sharper tool - and it sees \
+                           subagent sessions too.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
@@ -372,6 +644,7 @@ open it. Not for bulk export - use `pond export`.";
                     // footgun for agent callers. CLI / HTTP still exposes it
                     // for the bench harness.
                     min_score: 0.0,
+                    include_subagents: params.include_subagents.unwrap_or(false),
                 },
                 limit: params.limit.unwrap_or(10),
                 cursor: params.cursor,
@@ -401,7 +674,10 @@ open it. Not for bulk export - use `pond export`.";
                            marked `>`, plus context_depth sibling messages each side, with \
                            its tool/file parts in full). A session_id response lists the \
                            session's subagents in a footer so you can open each. Advanced: \
-                           limit (cap), after_id (paging - pass the value the footer shows). \
+                           limit (cap), after_id (paging - pass the value the footer shows), \
+                           session_from (\"start\"|\"end\"; \"end\" returns the most recent \
+                           messages, \
+                           e.g. to recover context after compaction). \
                            Tool/result lines render as `-> name [call_id]` / `<- name \
                            [call_id] (ok|failed)`. Not for bulk export - use `pond export`.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -418,6 +694,7 @@ open it. Not for bulk export - use `pond export`.";
                 context_depth: params.context_depth.unwrap_or(0),
                 limit: params.limit.unwrap_or(20),
                 response_mode: parse_response_mode(params.response_mode),
+                session_from: parse_session_from(params.session_from),
                 after_id: params.after_id,
             };
             match run_get(&self.state.store, request.clone()).await {
@@ -439,6 +716,109 @@ open it. Not for bulk export - use `pond export`.";
                     Ok(tool_result(transcript))
                 }
                 GetEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
+            }
+        }
+
+        #[tool(
+            description = "Run ONE read-only SQL query (DataFusion / PostgreSQL-compatible) \
+                           over the stored corpus as three tables: sessions, messages, parts. \
+                           For filtering, joins, and aggregation (counts, group-by, time \
+                           buckets) - the analytic complement to pond_search's semantic \
+                           recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
+                           effecting statements are rejected. The exact column lists are in \
+                           the `sql` parameter description - use those names, do not guess \
+                           (column discovery also works: SELECT column_name FROM \
+                           information_schema.columns WHERE table_name = 'messages'). \
+                           Routing: metadata analytics -> SQL on messages/sessions; tool-call \
+                           analytics -> parts WHERE type = 'tool_call' with \
+                           json_get_string(variant_data, 'name'); text search -> \
+                           fts('messages', '{...json...}') BM25 over search_text, or \
+                           pond_search for semantic recall; reading a transcript -> pond_get, \
+                           not SQL. The embedding `vector` column is never returned (explicit \
+                           projection is rejected; filtering in WHERE is fine). Output \
+                           defaults to a row-capped rendered table; set output=json for a \
+                           structured JSON payload (delivered via MCP structuredContent), or \
+                           output=parquet|ndjson to write the full result to a file returned \
+                           as a pond-sql-export:// resource. Read resource schema://pond-sql \
+                           for joins, indexed columns, JSON access rules, the function \
+                           quick-reference, pagination + drilling patterns, and worked \
+                           examples.",
+            annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+        )]
+        async fn pond_sql_query(
+            &self,
+            Parameters(params): Parameters<McpSqlParams>,
+        ) -> Result<CallToolResult, ErrorData> {
+            let mode = match params.output.as_deref() {
+                None | Some("table") => sql::Mode::Inline,
+                Some("json") => sql::Mode::InlineJson,
+                Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
+                Some("ndjson") => sql::Mode::Export(sql::Format::Ndjson),
+                Some(other) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "unknown output {other:?}; use \"table\", \"json\", \"parquet\", \
+                         or \"ndjson\""
+                    ))]));
+                }
+            };
+            let inline_rows = params
+                .limit
+                .unwrap_or(sql::DEFAULT_INLINE_ROWS)
+                .min(sql::MAX_INLINE_ROWS);
+
+            // The three tables are independent (per-table caches/mutexes), so
+            // overlap their freshness/manifest fetches rather than serialize.
+            let store = &self.state.store;
+            let tables = match tokio::try_join!(
+                store.dataset(Table::Sessions),
+                store.dataset(Table::Messages),
+                store.dataset(Table::Parts),
+            ) {
+                Ok((sessions, messages, parts)) => sql::Tables {
+                    sessions,
+                    messages,
+                    parts,
+                },
+                Err(_) => {
+                    return Err(ErrorData::internal_error(
+                        "sql datasets unavailable".to_owned(),
+                        None,
+                    ));
+                }
+            };
+
+            match sql::run(&tables, &params.sql, mode, inline_rows).await {
+                Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
+                Ok(sql::Outcome::InlineJson(value)) => Ok(CallToolResult::structured(value)),
+                Ok(sql::Outcome::Export {
+                    bytes,
+                    format,
+                    rows,
+                    columns,
+                }) => {
+                    let name = format!("{}.{}", Uuid::now_v7(), format.ext());
+                    match store.export_write(&name, &bytes).await {
+                        Ok(_) => Ok(export_result(
+                            store,
+                            &name,
+                            format,
+                            rows,
+                            &columns,
+                            bytes.len(),
+                        )),
+                        Err(error) => Err(ErrorData::internal_error(
+                            format!("export write failed: {error}"),
+                            None,
+                        )),
+                    }
+                }
+                Err(sql::SqlError::Query(message)) => {
+                    Ok(CallToolResult::error(vec![Content::text(message)]))
+                }
+                Err(sql::SqlError::Infra(error)) => Err(ErrorData::internal_error(
+                    format!("sql execution failed: {error}"),
+                    None,
+                )),
             }
         }
     }
@@ -465,9 +845,20 @@ open it. Not for bulk export - use `pond export`.";
                  keep query semantic (concepts, not project names). Scores are relative \
                  within one response; there is no min_score. Subagents are stored as their \
                  own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
-                 on a parent session lists them in a footer so you can open each. Deeper \
+                 on a parent session lists them in a footer so you can open each. Recover \
+                 context lost to compaction: find this session via pond_search (a distinctive \
+                 recent topic + project + from_date=today), then pond_get(session_id, \
+                 session_from=\"end\") for the recent pre-compaction turns. Deeper \
                  reference on demand: resource schema://pond (all filters + response format), \
-                 stats://pond (corpus + embedding stats).",
+                 stats://pond (corpus + embedding stats). For structured/analytic queries \
+                 (filtering, joins, counts, group-by) use pond_sql_query: read-only SQL \
+                 (SELECT only) over the sessions/messages/parts tables, with optional \
+                 parquet/ndjson export; see resource schema://pond-sql. Search only indexes \
+                 conversational text (tool calls/results are invisible to it), and a \
+                 zero/weak result is not proof of absence - for exact strings, \
+                 identifiers, or error messages run pond_sql_query with fts('messages', \
+                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') (AND semantics: \
+                 add \"operator\":\"And\"), which also covers subagent sessions.",
             )
         }
 
@@ -479,6 +870,7 @@ open it. Not for bulk export - use `pond export`.";
             Ok(ListResourcesResult {
                 resources: vec![
                     RawResource::new("schema://pond", "pond search schema").no_annotation(),
+                    RawResource::new("schema://pond-sql", "pond SQL table schema").no_annotation(),
                     RawResource::new("stats://pond", "pond corpus stats").no_annotation(),
                 ],
                 next_cursor: None,
@@ -496,6 +888,36 @@ open it. Not for bulk export - use `pond export`.";
                     SCHEMA_DOC,
                     request.uri,
                 )])),
+                "schema://pond-sql" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    SQL_SCHEMA_DOC,
+                    request.uri,
+                )])),
+                // `pond_sql_query` export artifacts: read the file pond wrote
+                // (parquet -> base64 blob, ndjson -> text). The filename is
+                // validated to a minted `<uuid>.<ext>` so the URI can't traverse.
+                uri if uri.starts_with("pond-sql-export://") => {
+                    let name = uri.trim_start_matches("pond-sql-export://").to_owned();
+                    if !valid_export_name(&name) {
+                        return Err(ErrorData::resource_not_found(
+                            format!("invalid export id: {name}"),
+                            None,
+                        ));
+                    }
+                    let bytes = self.state.store.export_read(&name).await.map_err(|error| {
+                        ErrorData::resource_not_found(format!("export not found: {error}"), None)
+                    })?;
+                    let contents = if name.ends_with(".ndjson") {
+                        ResourceContents::text(
+                            String::from_utf8_lossy(&bytes).into_owned(),
+                            request.uri,
+                        )
+                        .with_mime_type("application/x-ndjson")
+                    } else {
+                        ResourceContents::blob(STANDARD.encode(&bytes), request.uri)
+                            .with_mime_type("application/vnd.apache.parquet")
+                    };
+                    Ok(ReadResourceResult::new(vec![contents]))
+                }
                 "stats://pond" => {
                     let store = &self.state.store;
                     let map_err = |error: anyhow::Error| {
@@ -579,6 +1001,7 @@ open it. Not for bulk export - use `pond export`.";
             let chars = match tool.name.as_ref() {
                 "pond_search" => 80_000,
                 "pond_get" => 200_000,
+                "pond_sql_query" => 80_000,
                 _ => continue,
             };
             let mut meta = serde_json::Map::new();
@@ -609,6 +1032,56 @@ open it. Not for bulk export - use `pond export`.";
     /// structured wire shape use the HTTP `/v1/*` JSON API instead.
     fn tool_result(transcript: String) -> CallToolResult {
         CallToolResult::success(vec![Content::text(transcript)])
+    }
+
+    /// Build the `pond_sql_query` export result: a text summary plus a
+    /// `resource_link` to the artifact (the spec-canonical way to hand back a
+    /// tool-produced file - the bytes ride `resources/read`, not the tool
+    /// result, so they don't load into context unless the host fetches them).
+    /// On a `file://` install the summary also names the on-disk path so a
+    /// co-located agent can read it directly.
+    fn export_result(
+        store: &crate::sessions::Store,
+        name: &str,
+        format: sql::Format,
+        rows: usize,
+        columns: &[String],
+        bytes: usize,
+    ) -> CallToolResult {
+        let uri = format!("pond-sql-export://{name}");
+        let column_list = if columns.is_empty() {
+            "(none)".to_owned()
+        } else {
+            columns.join(", ")
+        };
+        let mut summary = format!(
+            "Exported {rows} row(s), {bytes} bytes ({}). Columns: {column_list}.\n\
+             Fetch via MCP resources/read on {uri}.",
+            format.ext()
+        );
+        if let Some(path) = store.export_local_path(name) {
+            summary.push_str(&format!(
+                "\nLocal file: {} - on this (stdio) install you can read it directly \
+                 (e.g. duckdb, polars).",
+                path.display()
+            ));
+        }
+        let link = RawResource::new(uri, name.to_owned())
+            .with_description(format!("pond SQL export ({}, {rows} rows)", format.ext()))
+            .with_mime_type(format.mime().to_owned())
+            .with_size(u32::try_from(bytes).unwrap_or(u32::MAX));
+        CallToolResult::success(vec![Content::text(summary), Content::resource_link(link)])
+    }
+
+    /// Accept only the export filenames pond mints (`<uuid>.parquet|ndjson`),
+    /// guarding the `pond-sql-export://` resource against path traversal.
+    fn valid_export_name(name: &str) -> bool {
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            return false;
+        };
+        matches!(ext, "parquet" | "ndjson")
+            && !stem.is_empty()
+            && stem.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
     }
 
     /// Footer for a `pond_get` session response listing the session's spawn-only
@@ -653,10 +1126,42 @@ open it. Not for bulk export - use `pond export`.";
 
     fn render_search_transcript(response: &SearchResponse, request: &SearchRequest) -> String {
         use std::fmt::Write;
+        // Must mirror build_filter's default-exclusion condition, else the note lies.
+        let subagent_note = if !request.filters.include_subagents
+            && request.filters.session_id.is_none()
+            && request.filters.source_agent.is_none()
+        {
+            " Subagent sessions excluded; pass include_subagents=true to include them."
+        } else {
+            ""
+        };
         if response.sessions.is_empty() {
+            // spec.md#search-absence-honesty: name the scope size and the
+            // recovery path - a zero-hit response must distinguish "nothing
+            // relevant exists" from "the filters excluded everything".
+            if response.searchable_in_scope == 0 {
+                return format!(
+                    "pond_search: 0 searchable messages in scope - the filters exclude \
+                     everything before retrieval. Widen or drop project/date/role filters.\
+                     {subagent_note}\n"
+                );
+            }
+            let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT id, \
+                            session_id, search_text FROM fts('messages', \
+                            '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}').";
             return match request.similar_to.as_deref() {
-                Some(id) => format!("pond_search: no matches similar to {id}.\n"),
-                None => format!("pond_search: no matches for {:?}.\n", request.query),
+                Some(id) => format!(
+                    "pond_search: no matches similar to {id} across {} searchable messages in \
+                     scope.{subagent_note}\n",
+                    response.searchable_in_scope
+                ),
+                None => {
+                    format!(
+                        "pond_search: no matches for {:?} across {} searchable messages in \
+                         scope.{subagent_note}{fts_hint}\n",
+                        request.query, response.searchable_in_scope
+                    )
+                }
             };
         }
         let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
@@ -668,11 +1173,14 @@ open it. Not for bulk export - use `pond export`.";
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "pond_search: {} matching messages, showing {} hits from {} sessions{}.",
+            "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
+             sessions{}.{}",
             response.matched_total,
+            response.searchable_in_scope,
             shown,
             response.sessions.len(),
             sim,
+            subagent_note,
         );
         let _ = writeln!(
             out,
@@ -776,11 +1284,24 @@ open it. Not for bulk export - use `pond export`.";
                 if *messages_remaining > 0
                     && let Some(last) = messages.last()
                 {
-                    let _ = writeln!(
-                        out,
-                        "... {} more messages; pass after_id={} to pond_get to continue",
-                        messages_remaining, last.id,
-                    );
+                    match request.session_from {
+                        SessionFrom::Start => {
+                            let _ = writeln!(
+                                out,
+                                "... {} more messages; pass after_id={} to pond_get to continue",
+                                messages_remaining, last.id,
+                            );
+                        }
+                        // Tail page: the remaining messages are *earlier*, before this
+                        // page. after_id only pages forward, so it can't reach them -
+                        // point back to the start instead of a cursor that dead-ends.
+                        SessionFrom::End => {
+                            let _ = writeln!(
+                                out,
+                                "... {messages_remaining} earlier messages precede this tail; call pond_get with session_from=\"start\" to read from the beginning",
+                            );
+                        }
+                    }
                 }
             }
             GetResult::Message {
@@ -1176,6 +1697,7 @@ open it. Not for bulk export - use `pond export`.";
                 context_depth: 0,
                 limit: 20,
                 response_mode: ResponseMode::default(),
+                session_from: SessionFrom::default(),
                 after_id: None,
             };
 
@@ -1206,6 +1728,7 @@ open it. Not for bulk export - use `pond export`.";
                     }],
                 }],
                 matched_total: 1,
+                searchable_in_scope: 2,
                 has_more: false,
                 next_cursor: None,
             };
@@ -1221,11 +1744,10 @@ open it. Not for bulk export - use `pond export`.";
             };
 
             let transcript = render_search_transcript(&response, &request);
-            assert!(
-                transcript.starts_with(
-                    "pond_search: 1 matching messages, showing 1 hits from 1 sessions."
-                )
-            );
+            assert!(transcript.starts_with(
+                "pond_search: 1 matching messages (2 searchable in scope), showing 1 hits from 1 \
+                 sessions."
+            ));
             assert!(
                 transcript
                     .contains("key: session rules group hits by session, ordered by best hit")

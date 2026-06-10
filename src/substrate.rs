@@ -7,7 +7,8 @@ use crate::{
 use anyhow::{Context, Result};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::index::DatasetIndexRemapperOptions;
+use lance::dataset::optimize::{CompactionOptions, commit_compaction, plan_compaction};
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
@@ -49,7 +50,7 @@ pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
 
 static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Seed the process-wide index-lag threshold from `[search].index_lag_threshold`.
+/// Seed the process-wide index-lag threshold from `[maintenance].index_lag_threshold`.
 /// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
 pub fn init_index_lag_threshold(value: usize) {
     INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
@@ -60,6 +61,124 @@ pub fn index_lag_threshold() -> usize {
         .get()
         .copied()
         .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
+}
+
+/// Per-task fragment-count backstop: tasks this wide always run, bounding
+/// manifest growth even when the amplification veto would skip them. As
+/// policy cap, 0 disables the veto (tests).
+pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
+
+/// Fragments are sized by bytes, not Lance's 1M-row default: kilobyte-average
+/// rows make a row target tolerate multi-GiB fragments that compaction
+/// re-rewrites wholesale to absorb tiny appends (~190 GiB/day of churn).
+pub const TARGET_FRAGMENT_BYTES: u64 = 256 * 1024 * 1024;
+
+const MIN_TARGET_ROWS_PER_FRAGMENT: u64 = 50_000;
+/// Ceiling = Lance's own default.
+const MAX_TARGET_ROWS_PER_FRAGMENT: u64 = 1024 * 1024;
+
+/// Keep a task only when the merged-in remainder is >= largest/this:
+/// size-tiered amortization, O(log n) lifetime rewrites per row.
+pub const COMPACTION_ABSORB_FACTOR: u64 = 4;
+
+/// Default manifest-retention window for the safe cleanup pass. Matches
+/// LanceDB's recommended OSS-operator practice (lancedb docs: performance.mdx,
+/// tables/update.mdx). With `delete_unverified=false`, Lance's 7-day
+/// in-progress guard still protects unverified files regardless of this value
+/// (`UNVERIFIED_THRESHOLD_DAYS` in lance/dataset/cleanup.rs).
+pub fn default_cleanup_older_than() -> chrono::Duration {
+    chrono::Duration::days(1)
+}
+
+/// Resolved per-call inputs to the storage-maintenance pass. Built from
+/// `[maintenance]` (and any per-invocation CLI override) at the entry point;
+/// threaded down to `optimize_table_compact` so the substrate never re-reads
+/// `Config` itself.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenancePolicy {
+    /// See [`DEFAULT_COMPACTION_FRAGMENT_CAP`]; `0` disables the veto.
+    pub compaction_fragment_cap: usize,
+    /// Manifest-retention window handed to `cleanup_old_versions`.
+    pub cleanup_older_than: chrono::Duration,
+}
+
+impl MaintenancePolicy {
+    /// Veto off: run every task Lance plans (the optimize tests assume this).
+    pub fn always_compact() -> Self {
+        Self {
+            compaction_fragment_cap: 0,
+            cleanup_older_than: default_cleanup_older_than(),
+        }
+    }
+}
+
+struct FragmentStat {
+    /// `None` when the manifest lacks any file's size.
+    bytes: Option<u64>,
+    rows: u64,
+    deleted_rows: u64,
+}
+
+/// Data-file bytes of one fragment; `None` (poisoning) when any size is
+/// missing from the manifest.
+fn fragment_bytes(fragment: &lance::table::format::Fragment) -> Option<u64> {
+    fragment.files.iter().try_fold(0u64, |total, file| {
+        Some(total + file.file_size_bytes.get()?.get())
+    })
+}
+
+fn fragment_stat(fragment: &lance::table::format::Fragment) -> FragmentStat {
+    FragmentStat {
+        bytes: fragment_bytes(fragment),
+        rows: fragment.physical_rows.unwrap_or(0) as u64,
+        deleted_rows: fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletions| deletions.num_deleted_rows)
+            .unwrap_or(0) as u64,
+    }
+}
+
+/// Rows per [`TARGET_FRAGMENT_BYTES`] at the table's average row size.
+fn derived_target_rows(stats: &[FragmentStat]) -> usize {
+    let (mut bytes, mut rows) = (0u64, 0u64);
+    for stat in stats {
+        if let Some(fragment_bytes) = stat.bytes
+            && stat.rows > 0
+        {
+            bytes += fragment_bytes;
+            rows += stat.rows;
+        }
+    }
+    if bytes == 0 || rows == 0 {
+        return MAX_TARGET_ROWS_PER_FRAGMENT as usize;
+    }
+    let avg_row_bytes = (bytes / rows).max(1);
+    (TARGET_FRAGMENT_BYTES / avg_row_bytes)
+        .clamp(MIN_TARGET_ROWS_PER_FRAGMENT, MAX_TARGET_ROWS_PER_FRAGMENT) as usize
+}
+
+/// Amplification veto: skip tasks that mostly rewrite one big fragment to
+/// absorb fresh appends. Deletion-materialization tasks always pass (vetoing
+/// them would leave tombstones unreclaimed forever); compared in bytes when
+/// every file size is known, rows otherwise.
+fn keep_task(stats: &[FragmentStat], cap: usize, deletion_threshold: f32) -> bool {
+    if stats.iter().any(|stat| {
+        stat.rows > 0 && (stat.deleted_rows as f32 / stat.rows as f32) > deletion_threshold
+    }) {
+        return true;
+    }
+    if stats.len() >= cap {
+        return true;
+    }
+    let weights: Vec<u64> = if stats.iter().all(|stat| stat.bytes.is_some()) {
+        stats.iter().filter_map(|stat| stat.bytes).collect()
+    } else {
+        stats.iter().map(|stat| stat.rows).collect()
+    };
+    let total: u64 = weights.iter().sum();
+    let largest = weights.iter().copied().max().unwrap_or(0);
+    (total - largest) * COMPACTION_ABSORB_FACTOR >= largest
 }
 
 /// Declarative description of one index pond keeps on a table. Created when
@@ -175,6 +294,7 @@ pub struct IndexStatus {
     pub table: Table,
     pub intent_name: String,
     pub fragments_covered: usize,
+    pub unindexed_fragments: usize,
     pub unindexed_rows: usize,
     pub exists: bool,
 }
@@ -308,6 +428,24 @@ pub struct TableSizes {
     pub messages: u64,
     pub parts: u64,
     pub other: u64,
+    pub sessions_data: DataLiveness,
+    pub messages_data: DataLiveness,
+    pub parts_data: DataLiveness,
+}
+
+/// `data/` bytes on disk vs bytes the latest manifest references; the gap is
+/// superseded versions awaiting the cleanup retention window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DataLiveness {
+    pub on_disk: u64,
+    /// `None` when the manifest lacks any referenced file's size.
+    pub live: Option<u64>,
+}
+
+impl DataLiveness {
+    pub fn dead(&self) -> Option<u64> {
+        self.live.map(|live| self.on_disk.saturating_sub(live))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +486,7 @@ pub enum Predicate {
     Lte(&'static str, ScalarValue),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
+    Not(Box<Predicate>),
 }
 impl Predicate {
     pub fn to_lance(&self) -> String {
@@ -391,6 +530,14 @@ impl Predicate {
                     String::new()
                 } else {
                     format!("({body})")
+                }
+            }
+            Self::Not(inner) => {
+                let body = inner.to_lance();
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!("NOT ({body})")
                 }
             }
         }
@@ -686,6 +833,76 @@ impl Handle {
         &self.storage_options
     }
 
+    /// Object-store URI for a `pond_sql_query` export artifact:
+    /// `<location>/exports/<name>`. A sibling of the `*.lance` table dirs;
+    /// the Directory namespace tracks tables in its `__manifest` table rather
+    /// than by listing prefixes, so this prefix is never seen as a table
+    /// (lance-namespace-impls dir/manifest.rs). Never `register_table`'d.
+    fn export_uri(&self, name: &str) -> String {
+        format!(
+            "{}/exports/{name}",
+            self.location.as_str().trim_end_matches('/')
+        )
+    }
+
+    /// `ObjectStoreParams` carrying the handle's `storage_options` so raw
+    /// object-store opens (export I/O, `table_sizes` listing) inherit the same
+    /// credentials/region as the dataset opens. Empty options -> no accessor.
+    fn object_store_params(&self) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
+                Arc::new(StorageOptionsAccessor::with_static_options(
+                    self.storage_options.clone(),
+                ))
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Write a `pond_sql_query` export artifact, reusing the handle's
+    /// storage_options so S3 installs inherit the same credentials.
+    pub(crate) async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let uri = self.export_uri(name);
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &self.object_store_params())
+                .await
+                .with_context(|| format!("failed to open object store for {uri}"))?;
+        store
+            .put(&path, bytes)
+            .await
+            .with_context(|| format!("failed to write export {uri}"))?;
+        Ok(())
+    }
+
+    /// Read a `pond_sql_query` export artifact back (for the
+    /// `pond-sql-export://` MCP resource).
+    pub(crate) async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
+        let uri = self.export_uri(name);
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &self.object_store_params())
+                .await
+                .with_context(|| format!("failed to open object store for {uri}"))?;
+        let bytes = store
+            .read_one_all(&path)
+            .await
+            .with_context(|| format!("failed to read export {uri}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Local filesystem path of an export artifact, when the data dir is
+    /// `file://`. The stdio MCP client shares this filesystem, so it can read
+    /// the file directly (e.g. duckdb/polars) instead of pulling base64 via
+    /// `resources/read`. `None` on object-store installs.
+    pub(crate) fn export_local_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        if self.location.scheme() != "file" {
+            return None;
+        }
+        let dir = self.location.to_file_path().ok()?;
+        Some(dir.join("exports").join(name))
+    }
+
     pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
         Ok((
             self.count_rows(Table::Sessions).await?,
@@ -801,10 +1018,10 @@ impl Handle {
         table: Table,
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
-        cleanup: crate::sessions::CleanupConfig,
+        policy: &MaintenancePolicy,
     ) -> TableOptimizeOutcome {
         let compaction = self
-            .run_optimize_compact_phase(table, progress, cleanup)
+            .run_optimize_compact_phase(table, progress, policy)
             .await;
         let indices = self
             .run_optimize_indices_phase(table, intents, progress)
@@ -860,13 +1077,13 @@ impl Handle {
         &self,
         table: Table,
         progress: Option<&OptimizeProgressFn>,
-        cleanup: crate::sessions::CleanupConfig,
+        policy: &MaintenancePolicy,
     ) -> PhaseOutcome {
         let result = self
             .retry_lance(table.label(), || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
-                optimize_table_compact(&mut dataset, table, progress, cleanup).await?;
+                optimize_table_compact(&mut dataset, table, progress, policy).await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(())
             })
@@ -1014,14 +1231,7 @@ impl Handle {
     /// (spec.md#lance-chokepoints-storage), identical for `file://` and `s3://`.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         let registry = Arc::new(ObjectStoreRegistry::default());
-        let params = ObjectStoreParams {
-            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
-                Arc::new(StorageOptionsAccessor::with_static_options(
-                    self.storage_options.clone(),
-                ))
-            }),
-            ..Default::default()
-        };
+        let params = self.object_store_params();
 
         let sessions = self
             .listed_size(
@@ -1050,12 +1260,44 @@ impl Handle {
             .listed_size(&registry, &params, self.location.as_str())
             .await?;
         let other = root_total.saturating_sub(sessions + messages + parts);
+        let sessions_data = self
+            .data_liveness(&registry, &params, Table::Sessions, sessions::SESSIONS)
+            .await?;
+        let messages_data = self
+            .data_liveness(&registry, &params, Table::Messages, sessions::MESSAGES)
+            .await?;
+        let parts_data = self
+            .data_liveness(&registry, &params, Table::Parts, sessions::PARTS)
+            .await?;
         Ok(TableSizes {
             sessions,
             messages,
             parts,
             other,
+            sessions_data,
+            messages_data,
+            parts_data,
         })
+    }
+
+    async fn data_liveness(
+        &self,
+        registry: &Arc<ObjectStoreRegistry>,
+        params: &ObjectStoreParams,
+        table: Table,
+        table_name: &str,
+    ) -> Result<DataLiveness> {
+        let location = self.table_location(table_name).await?;
+        let data_dir = format!("{}/data", location.trim_end_matches('/'));
+        let on_disk = self.listed_size(registry, params, &data_dir).await?;
+        let dataset = self.dataset(table).await?;
+        let live = dataset
+            .get_fragments()
+            .iter()
+            .try_fold(0u64, |total, fragment| {
+                Some(total + fragment_bytes(fragment.metadata())?)
+            });
+        Ok(DataLiveness { on_disk, live })
     }
 
     /// Sum `ObjectMeta.size` for every object recursively under `uri`.
@@ -1163,9 +1405,15 @@ impl Handle {
         base.mul_f64(factor).min(self.retry.max_backoff)
     }
 }
-/// Compaction phase: `compact_files` + `cleanup_old_versions`, both inside one
-/// retry block. Distinct from the indices phase so a hot writer that loses the
-/// Rewrite race here does not abort index work the operator actually asked for.
+/// Compaction phase: plan + amplification veto + execute + `cleanup_old_versions`,
+/// one retry block, separate from the indices phase so a lost Rewrite race
+/// does not abort index work.
+///
+/// Vetoes Lance-planned tasks instead of pre-gating on pond fragment math:
+/// Lance bins split at index-coverage boundaries, so pond predictions diverge
+/// from what Lance actually rewrites (the old run-sum gate latched open and
+/// rewrote a 665 MiB tail fragment every 5-min sync). Only whole planned
+/// tasks are filtered, so OCC and conflict semantics are untouched.
 ///
 /// spec.md#lance-index-maintenance mandates FRI on by default, but at
 /// v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
@@ -1181,32 +1429,80 @@ async fn optimize_table_compact(
     dataset: &mut Dataset,
     table: Table,
     progress: Option<&OptimizeProgressFn>,
-    cleanup: crate::sessions::CleanupConfig,
+    policy: &MaintenancePolicy,
 ) -> Result<()> {
+    let stats: Vec<FragmentStat> = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment_stat(fragment.metadata()))
+        .collect();
     let compaction = CompactionOptions {
+        target_rows_per_fragment: derived_target_rows(&stats),
+        max_bytes_per_file: Some(TARGET_FRAGMENT_BYTES as usize),
         defer_index_remap: false,
         ..CompactionOptions::default()
     };
 
-    emit(
-        progress,
-        OptimizeEvent::PhaseStart {
-            table,
-            phase: OptimizePhase::Compact,
-            detail: None,
-        },
-    );
-    let started = Instant::now();
-    compact_files(dataset, compaction, None).await?;
-    emit(
-        progress,
-        OptimizeEvent::PhaseDone {
-            table,
-            phase: OptimizePhase::Compact,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-    );
+    let mut plan = plan_compaction(dataset, &compaction).await?;
+    if policy.compaction_fragment_cap > 0 {
+        plan.tasks.retain(|task| {
+            let task_stats: Vec<FragmentStat> = task.fragments.iter().map(fragment_stat).collect();
+            let keep = keep_task(
+                &task_stats,
+                policy.compaction_fragment_cap,
+                compaction.materialize_deletions_threshold,
+            );
+            if !keep {
+                tracing::debug!(
+                    target: "pond::perf",
+                    table = table.as_str(),
+                    fragments = task_stats.len(),
+                    "compaction task vetoed: merge dominated by one large fragment",
+                );
+            }
+            keep
+        });
+    }
+    if plan.tasks.is_empty() {
+        tracing::debug!(
+            target: "pond::perf",
+            table = table.as_str(),
+            "compaction skipped: no task to run",
+        );
+    } else {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::Compact,
+                detail: None,
+            },
+        );
+        let started = Instant::now();
+        let mut completed = Vec::with_capacity(plan.tasks.len());
+        for task in plan.compaction_tasks() {
+            completed.push(task.execute(dataset).await?);
+        }
+        commit_compaction(
+            dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &compaction,
+        )
+        .await?;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::Compact,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
 
+    // Safe GC only. delete_unverified=false keeps Lance's 7-day in-progress
+    // guard, so this never races a concurrent writer (spec.md#concurrency); GC
+    // runs outside OCC, so the guard is what makes it safe on any backend.
     emit(
         progress,
         OptimizeEvent::PhaseStart {
@@ -1216,16 +1512,8 @@ async fn optimize_table_compact(
         },
     );
     let started = Instant::now();
-    // delete_unverified=true is the operator opt-in via `--cleanup-older-than`
-    // / `--vacuum` that bypasses Lance's 7-day in-progress safety guard
-    // (UNVERIFIED_THRESHOLD_DAYS in lance/dataset/cleanup.rs). Required to
-    // reclaim files younger than 7 days; unsafe under concurrent writers.
     dataset
-        .cleanup_old_versions(
-            cleanup.older_than,
-            Some(cleanup.delete_unverified),
-            Some(false),
-        )
+        .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
         .await
         .context("cleanup_old_versions failed during index optimize")?;
     emit(
@@ -1306,7 +1594,7 @@ async fn optimize_table_indices(
         }
         // Lag guard: let fragments accumulate behind the brute-force fallback
         // rather than firing a commit per tiny append. Threshold is operator-
-        // tunable via `[search].index_lag_threshold`.
+        // tunable via `[maintenance].index_lag_threshold`.
         if unindexed.len() < index_lag_threshold() {
             continue;
         }
@@ -1458,6 +1746,7 @@ async fn index_status(
                 table,
                 intent_name: intent.name.to_owned(),
                 fragments_covered: 0,
+                unindexed_fragments: total_fragments,
                 unindexed_rows: total_rows,
                 exists,
             });
@@ -1467,6 +1756,7 @@ async fn index_status(
             .unindexed_fragments(intent.name)
             .await
             .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
+        let unindexed_fragments = unindexed.len();
         let unindexed_rows = unindexed
             .iter()
             .map(|fragment| fragment.num_rows().unwrap_or(0))
@@ -1474,7 +1764,8 @@ async fn index_status(
         statuses.push(IndexStatus {
             table,
             intent_name: intent.name.to_owned(),
-            fragments_covered: total_fragments.saturating_sub(unindexed.len()),
+            fragments_covered: total_fragments.saturating_sub(unindexed_fragments),
+            unindexed_fragments,
             unindexed_rows,
             exists,
         });
@@ -1671,6 +1962,92 @@ fn like_contains(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn stat(bytes: u64) -> FragmentStat {
+        FragmentStat {
+            bytes: Some(bytes),
+            rows: bytes / 1_000,
+            deleted_rows: 0,
+        }
+    }
+
+    #[test]
+    fn compaction_veto_blocks_absorb_keeps_peers() {
+        // One 665 MiB tail fragment + tiny appends -> vetoed.
+        let absorb = [stat(665_000_000), stat(1_000_000), stat(2_000_000)];
+        assert!(!keep_task(&absorb, 64, 0.1));
+        // Peer-sized merge halves fragment count -> kept.
+        let peers = [stat(300_000_000), stat(300_000_000)];
+        assert!(keep_task(&peers, 64, 0.1));
+        // Remainder reaches largest / COMPACTION_ABSORB_FACTOR -> kept.
+        let tiered = [stat(400_000), stat(60_000), stat(40_000)];
+        assert!(keep_task(&tiered, 64, 0.1));
+    }
+
+    #[test]
+    fn compaction_veto_passes_deletions_and_cap() {
+        let mut deleting = stat(665_000_000);
+        deleting.deleted_rows = deleting.rows / 5;
+        assert!(keep_task(&[deleting, stat(1_000)], 64, 0.1));
+
+        let wide: Vec<FragmentStat> = std::iter::once(stat(665_000_000))
+            .chain(std::iter::repeat_with(|| stat(1_000)).take(63))
+            .collect();
+        assert!(keep_task(&wide, 64, 0.1));
+    }
+
+    #[test]
+    fn compaction_veto_falls_back_to_rows_on_unknown_sizes() {
+        let mut unknown = stat(665_000_000);
+        unknown.bytes = None;
+        // Rows comparison: 665k vs 3k -> still vetoed.
+        assert!(!keep_task(
+            &[unknown, stat(1_000_000), stat(2_000_000)],
+            64,
+            0.1
+        ));
+    }
+
+    #[test]
+    fn derived_target_rows_tracks_row_size_and_clamps() {
+        // ~1.3 KiB rows -> ~200k-row target.
+        let parts_like = [FragmentStat {
+            bytes: Some(665_000_000),
+            rows: 511_000,
+            deleted_rows: 0,
+        }];
+        let target = derived_target_rows(&parts_like);
+        assert!((150_000..300_000).contains(&target), "{target}");
+        // No usable sizes -> Lance default.
+        let unknown = [FragmentStat {
+            bytes: None,
+            rows: 511_000,
+            deleted_rows: 0,
+        }];
+        assert_eq!(
+            derived_target_rows(&unknown),
+            MAX_TARGET_ROWS_PER_FRAGMENT as usize
+        );
+        // Tiny rows clamp at the ceiling, huge rows at the floor.
+        let tiny = [FragmentStat {
+            bytes: Some(1_000_000),
+            rows: 100_000,
+            deleted_rows: 0,
+        }];
+        assert_eq!(
+            derived_target_rows(&tiny),
+            MAX_TARGET_ROWS_PER_FRAGMENT as usize
+        );
+        let huge = [FragmentStat {
+            bytes: Some(1_000_000_000),
+            rows: 100,
+            deleted_rows: 0,
+        }];
+        assert_eq!(
+            derived_target_rows(&huge),
+            MIN_TARGET_ROWS_PER_FRAGMENT as usize
+        );
+    }
 
     #[test]
     fn namespace_error_code_walks_wrapped_chain() {

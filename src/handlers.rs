@@ -110,7 +110,7 @@ mod ingest_handler {
         Partial {
             dropped_events: usize,
             /// First drop's error message; subsequent drops counted, not
-            /// retained. Full detail at `POND_LOG=pond=debug`.
+            /// retained. Full detail at `-vv` (debug) verbosity.
             first_drop_reason: Option<String>,
         },
         Skipped {
@@ -210,8 +210,8 @@ mod ingest_handler {
         // order against `validator.flush()`'s outcome stream.
         let mut pending_dones: std::collections::VecDeque<PendingDone> =
             std::collections::VecDeque::new();
-        // Perf probe accumulators. Logged once at the end of the run under
-        // `POND_LOG=pond=info` so a single sync emits one tidy summary plus
+        // Perf probe accumulators. Logged once at the end of the run at `-v`
+        // (info) verbosity so a single sync emits one tidy summary plus
         // per-merge_insert lines from substrate. Visible only at INFO; never
         // affects normal output.
         let mut decode_total = std::time::Duration::ZERO;
@@ -243,6 +243,10 @@ mod ingest_handler {
                         SkipReason::Empty => {
                             summary.skipped_empty += 1;
                             SyncStatus::Empty
+                        }
+                        SkipReason::Unsupported(reason) => {
+                            summary.skipped_files += 1;
+                            SyncStatus::Skipped { reason }
                         }
                     };
                     on_event(SyncEvent::SessionDone(SessionOutcome {
@@ -320,10 +324,14 @@ mod ingest_handler {
                     // commit them in one parallel 3-table merge_insert.
                     if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH {
                         let flush_start = std::time::Instant::now();
-                        let flush_outcomes = validator.flush(store).await?;
+                        let (flush_outcomes, flush_counts) = validator.flush(store).await?;
                         validator_total += flush_start.elapsed();
                         validator_count += 1;
-                        summary.add_outcomes(&flush_outcomes);
+                        // Counts come from the pre-existence sweep inside the
+                        // flush, not from per-row outcomes (which would
+                        // double-count if we also called `add_outcomes`).
+                        summary.add_outcomes_errors_only(&flush_outcomes);
+                        summary.add_batch(&flush_counts);
                         drain_pending_dones(&mut pending_dones, &flush_outcomes, &mut on_event);
                     }
                 }
@@ -379,10 +387,11 @@ mod ingest_handler {
             });
         }
         let validator_start = std::time::Instant::now();
-        let final_outcomes = validator.finish(store).await?;
+        let (final_outcomes, final_counts) = validator.finish(store).await?;
         validator_total += validator_start.elapsed();
         validator_count += 1;
-        summary.add_outcomes(&final_outcomes);
+        summary.add_outcomes_errors_only(&final_outcomes);
+        summary.add_batch(&final_counts);
         drain_pending_dones(&mut pending_dones, &final_outcomes, &mut on_event);
 
         summary.truncated_values = crate::adapter::extract::truncated_values_count()
@@ -534,7 +543,9 @@ mod ingest_handler {
             let mut chunk = validator.push(store, index, event).await?;
             outcomes.append(&mut chunk);
         }
-        let mut tail = validator.finish(store).await?;
+        // HTTP wire path keeps using per-row outcomes for `IngestResult`;
+        // the batch counts are CLI-only.
+        let (mut tail, _counts) = validator.finish(store).await?;
         outcomes.append(&mut tail);
         outcomes.sort_by_key(|outcome| outcome.index);
         Ok(outcomes)
@@ -810,6 +821,7 @@ mod get_handler {
             after_id: request.after_id.as_deref(),
             limit: request.limit,
             budget_bytes: BUDGET_BYTES,
+            session_from: request.session_from,
         };
         let view = match store
             .session_view(session_id, params)
@@ -847,6 +859,7 @@ mod get_handler {
     ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
         let params = MessageViewParams {
             context_depth: request.context_depth,
+            mode: request.response_mode,
             after_id: request.after_id.as_deref(),
             limit: request.limit,
             budget_bytes: BUDGET_BYTES,
@@ -960,14 +973,17 @@ mod search_handler {
     const SCORE_DENOMINATOR: f64 = FTS_FUSION_WEIGHT + VECTOR_FUSION_WEIGHT;
 
     // Score-normalized hybrid fusion weights (spec.md#search). Per-arm
-    // base_score is min-max normalized within the arm's pool, then the two
-    // arms are combined as w_fts * norm_fts + w_vec * norm_vec. The 0.135:1
-    // ratio was identified by `scripts/search-benchmarks/simulate_fusion.py` on the
-    // 111-query paraphrase set: a wide plateau at w_fts in [0.09, 0.14]
-    // (S@3 = 0.640-0.649), centroid 0.135. Symmetric across arms - no
-    // per-query routing; cross-lingual queries are an agent-layer concern
-    // (see the `pond_search` MCP description).
-    const FTS_FUSION_WEIGHT: f64 = 0.135;
+    // base_score (raw BM25 / raw cosine similarity) is min-max normalized
+    // within the arm's pool, then the two arms are combined as
+    // w_fts * norm_fts + w_vec * norm_vec. The 0.3:1 ratio comes from the
+    // 2026-06-10 re-sweep (scripts/search-benchmarks/bench.py) after the
+    // vector arm switched from rank-norm to raw cosine: w_fts 0.2-0.3 ties
+    // the old 0.135 rank-norm config on the 111-query paraphrase set
+    // (S@3 67/111, sign test p=0.727) and beats it on the 12-query
+    // false-negative regression set (S@3 10/12 vs 9/12). Symmetric across
+    // arms - no per-query routing; cross-lingual queries are an agent-layer
+    // concern (see the `pond_search` MCP description).
+    const FTS_FUSION_WEIGHT: f64 = 0.3;
     const VECTOR_FUSION_WEIGHT: f64 = 1.0;
 
     fn encode_search_cursor(cursor: &SearchCursor) -> String {
@@ -1070,130 +1086,131 @@ mod search_handler {
             plan.mode = resolve_effective_mode(store, override_mode).await?;
         }
 
-        let candidates = match plan.mode {
-            SearchMode::Fts => {
-                let hits = store
-                    .fts_search(&plan.query, plan.pool, &plan.filter)
-                    .await
-                    .map_err(map_storage)?;
-                normalize_fts(hits)
-            }
-            SearchMode::Hybrid => {
-                let backend = load_embedder(embedder).await?;
-                let vector = embed_query(backend.as_ref(), &plan.query)?;
-                // The two retrievers hit disjoint datasets (and disjoint mutexes),
-                // so run them concurrently rather than back-to-back.
-                let fts_fut = async {
-                    store
-                        .fts_search(&plan.query, plan.pool, &plan.filter)
-                        .await
-                        .map_err(map_storage)
-                };
-                let vector_fut = async {
-                    store
-                        .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
-                        .await
-                        .map_err(map_storage)
-                };
-                let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
-                // Per-arm score shaping before fusion:
-                //   - FTS: max-normalize raw BM25 (`score / max`) so the
-                //     unbounded BM25 head doesn't dominate fusion when the
-                //     query has one term that hits a rare phrase very hard.
-                //   - Vector: rank-normalize the cosine-distance-ordered
-                //     output (`1 - idx/n`); this is what the bench harness
-                //     `simulate_fusion.py` was tuned against and what the
-                //     vector-only path already emits as `base_score`.
-                // Fusion (`fuse_arms`) min-max normalizes again over the
-                // arm's full pool and weights the two arms by
-                // FTS_FUSION_WEIGHT and VECTOR_FUSION_WEIGHT.
-                let fts_max = fts.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
-                let fts_entries: Vec<(MessageKey, f64)> = fts
-                    .into_iter()
-                    .map(|(key, score)| {
-                        let normed = if fts_max > 0.0 {
-                            f64::from(score / fts_max)
-                        } else {
-                            0.0
-                        };
-                        (key, normed)
-                    })
-                    .collect();
-                let vec_n = vector_raw.len() as f64;
-                let vector_entries: Vec<(MessageKey, f64)> = vector_raw
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, (key, _))| {
-                        let normed = if vec_n > 0.0 {
-                            1.0 - (idx as f64 / vec_n)
-                        } else {
-                            0.0
-                        };
-                        (key, normed)
-                    })
-                    .collect();
-                // FTS first: when both arms picked different messages from the
-                // same session_root, the fuser keeps FTS's representative
-                // (better for hit display since BM25 highlights the lexical
-                // match).
-                let lists = [
-                    RankedList {
-                        retriever: RetrieverKind::Fts,
-                        entries: fts_entries,
-                        weight: FTS_FUSION_WEIGHT,
-                    },
-                    RankedList {
-                        retriever: RetrieverKind::Vector,
-                        entries: vector_entries,
-                        weight: VECTOR_FUSION_WEIGHT,
-                    },
-                ];
-                fuse_arms(&lists)
-                    .into_iter()
-                    .map(|hit| Candidate {
-                        session_id: hit.key.session_id,
-                        message_id: hit.key.message_id,
-                        base_score: hit.score,
-                    })
-                    .collect()
-            }
-            // Vector-only branch. Reached two ways:
-            //   - caller pinned `similar_to`: pond fetches the stored vector
-            //     for that message_id and uses it directly as the query (no
-            //     embedder load, no query-side text formatting).
-            //   - caller set `mode_override = Vector` (operator tooling /
-            //     benchmark harness): embed `plan.query` and run kNN.
-            SearchMode::Vector => {
-                let vector = if let Some(similar_id) = &plan.similar_to {
-                    let stored = store
-                        .message_vector_by_id(similar_id)
-                        .await
-                        .map_err(map_storage)?;
-                    let Some(vector) = stored else {
-                        return Err(map_error(crate::Error::not_found(
-                            "message",
-                            serde_json::json!(similar_id),
-                            format!(
-                                "no embedded message with id {similar_id} (the message may not \
-                                 exist, or it exists but is not yet embedded - run `pond embed`)"
-                            ),
-                        )));
-                    };
-                    vector
-                } else {
-                    let backend = load_embedder(embedder).await?;
-                    embed_query(backend.as_ref(), &plan.query)?
-                };
-                let vector_raw = store
-                    .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
-                    .await
-                    .map_err(map_storage)?;
-                normalize_vector(vector_raw)
-            }
+        // A session_id filter pins one conversation, so root-keyed fusion
+        // would collapse the whole response to a single hit. Key fusion by
+        // message there and let the one session carry up to `limit` hits.
+        let single_session = plan.filters.session_id.is_some();
+        let fusion_key = if single_session {
+            FusionKey::Message
+        } else {
+            FusionKey::SessionRoot
         };
 
+        // The scope count (spec.md#search-absence-honesty: how many searchable
+        // messages the filters left in scope, so "no relevant hits" is
+        // distinguishable from "my filters excluded everything") overlaps
+        // retrieval instead of preceding it - serialized, its count_rows
+        // round-trip would be pure added latency on every search, and round
+        // trips are what object-store backends pay for.
+        let candidates_fut = async {
+            match plan.mode {
+                SearchMode::Fts => {
+                    let hits = store
+                        .fts_search(&plan.query, plan.pool, &plan.filter)
+                        .await
+                        .map_err(map_storage)?;
+                    Ok(normalize_fts(hits))
+                }
+                SearchMode::Hybrid => {
+                    let backend = load_embedder(embedder).await?;
+                    let vector = embed_query(backend.as_ref(), &plan.query)?;
+                    // The two retrievers hit disjoint datasets (and disjoint mutexes),
+                    // so run them concurrently rather than back-to-back.
+                    let fts_fut = async {
+                        store
+                            .fts_search(&plan.query, plan.pool, &plan.filter)
+                            .await
+                            .map_err(map_storage)
+                    };
+                    let vector_fut = async {
+                        store
+                            .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
+                            .await
+                            .map_err(map_storage)
+                    };
+                    let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
+                    // Per-arm scores carry raw magnitude into fusion: BM25 for
+                    // FTS, cosine similarity (`1 - distance`) for the vector arm.
+                    // Fusion (`fuse_arms`) min-max normalizes each arm over its
+                    // full pool and weights the arms by FTS_FUSION_WEIGHT and
+                    // VECTOR_FUSION_WEIGHT. Magnitude (not rank position) is the
+                    // load-bearing signal: rank-norm made a hit's score depend on
+                    // pool size - and pools scale with `limit` - while raw cosine
+                    // is stable across pool sizes (2026-06-10 benchmark).
+                    let fts_entries: Vec<(MessageKey, f64)> = fts
+                        .into_iter()
+                        .map(|(key, score)| (key, f64::from(score)))
+                        .collect();
+                    let vector_entries: Vec<(MessageKey, f64)> = vector_raw
+                        .into_iter()
+                        .map(|(key, distance)| (key, 1.0 - f64::from(distance)))
+                        .collect();
+                    let lists = [
+                        RankedList {
+                            retriever: RetrieverKind::Fts,
+                            entries: fts_entries,
+                            weight: FTS_FUSION_WEIGHT,
+                        },
+                        RankedList {
+                            retriever: RetrieverKind::Vector,
+                            entries: vector_entries,
+                            weight: VECTOR_FUSION_WEIGHT,
+                        },
+                    ];
+                    Ok(fuse_arms(&lists, fusion_key)
+                        .into_iter()
+                        .map(|hit| Candidate {
+                            session_id: hit.key.session_id,
+                            message_id: hit.key.message_id,
+                            base_score: hit.score,
+                        })
+                        .collect())
+                }
+                // Vector-only branch. Reached two ways:
+                //   - caller pinned `similar_to`: pond fetches the stored vector
+                //     for that message_id and uses it directly as the query (no
+                //     embedder load, no query-side text formatting).
+                //   - caller set `mode_override = Vector` (operator tooling /
+                //     benchmark harness): embed `plan.query` and run kNN.
+                SearchMode::Vector => {
+                    let vector = if let Some(similar_id) = &plan.similar_to {
+                        let stored = store
+                            .message_vector_by_id(similar_id)
+                            .await
+                            .map_err(map_storage)?;
+                        let Some(vector) = stored else {
+                            return Err(map_error(crate::Error::not_found(
+                                "message",
+                                serde_json::json!(similar_id),
+                                format!(
+                                    "no embedded message with id {similar_id} (the message may not \
+                                 exist, or it exists but is not yet embedded - run `pond embed`)"
+                                ),
+                            )));
+                        };
+                        vector
+                    } else {
+                        let backend = load_embedder(embedder).await?;
+                        embed_query(backend.as_ref(), &plan.query)?
+                    };
+                    let vector_raw = store
+                        .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
+                        .await
+                        .map_err(map_storage)?;
+                    Ok(normalize_vector(vector_raw))
+                }
+            }
+        };
+        let scope_fut = async {
+            store
+                .searchable_in_scope(&plan.filter)
+                .await
+                .map_err(map_storage)
+        };
+        let (candidates, searchable_in_scope) = tokio::try_join!(candidates_fut, scope_fut)?;
+
         if candidates.is_empty() {
-            return Ok(empty_response());
+            return Ok(empty_response(searchable_in_scope));
         }
 
         // Hydrate hit metadata (timestamp, role, project, preview source) from
@@ -1240,8 +1257,16 @@ mod search_handler {
         });
 
         let matched_total = scored.len();
-        let sessions = build_sessions(store, &scored, &plan.query).await?;
-        page_sessions(sessions, matched_total, &plan)
+        // Session-scoped searches return one session; the per-session match
+        // cap would silently discard most of what the caller asked for, so
+        // it widens to the requested limit there.
+        let matches_cap = if single_session {
+            plan.limit
+        } else {
+            MAX_MATCHES_PER_SESSION
+        };
+        let sessions = build_sessions(store, &scored, &plan.query, matches_cap).await?;
+        page_sessions(sessions, matched_total, searchable_in_scope, &plan)
     }
 
     /// Pick the retrieval mode. An explicit caller override (operator tooling
@@ -1394,43 +1419,62 @@ mod search_handler {
         }
     }
 
-    /// Score-normalized hybrid fusion keyed on the conversation root: for
-    /// each arm, the surviving (post intra-arm dedup-by-root) raw `base_score`
-    /// values are min-max normalized to [0, 1] across that arm's pool, then
-    /// summed across arms weighted by `RankedList.weight`. The representative
-    /// message_id is the first one each arm picked for the root; when both
-    /// arms picked different messages from the same root, the first arm in
-    /// the `lists` argument wins the representative (callers should list FTS
-    /// first when FTS-side provenance is preferred for the displayed hit).
-    /// Ties break on the representative key for determinism
-    /// (spec.md#search).
+    /// How fusion groups candidates. `SessionRoot` is the default: cross-arm
+    /// agreement is credited at the conversation level, one fused hit per
+    /// root. `Message` is for session-scoped searches (a `session_id`
+    /// filter): every candidate shares the root there, so root keying would
+    /// collapse the whole response to exactly one hit (spec.md#search).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FusionKey {
+        SessionRoot,
+        Message,
+    }
+
+    /// Score-normalized hybrid fusion: for each arm, the surviving (post
+    /// intra-arm dedup-by-key) raw `base_score` values are min-max normalized
+    /// to [0, 1] across that arm's pool, then summed across arms weighted by
+    /// `RankedList.weight`. The representative message for a fused group is
+    /// the one with the highest single weighted contribution - the message
+    /// the strongest arm actually matched - so the displayed snippet reflects
+    /// why the group ranked where it did. Ties break on the representative
+    /// key for determinism (spec.md#search).
     ///
-    /// Why session-root keying instead of `(session_id, message_id)`: a long
-    /// session whose best FTS message and best vector message differ would
-    /// otherwise appear as two separate fused hits, neither getting the
-    /// cross-arm validation bonus. Keying on the root credits cross-arm
-    /// agreement at the conversation level - which is what the user sees.
+    /// Why session-root keying by default instead of `(session_id,
+    /// message_id)`: a long session whose best FTS message and best vector
+    /// message differ would otherwise appear as two separate fused hits,
+    /// neither getting the cross-arm validation bonus. Keying on the root
+    /// credits cross-arm agreement at the conversation level - which is what
+    /// the user sees.
     ///
     /// Why per-arm score normalization instead of RRF: RRF discards score
     /// magnitude (rank 1 contributes the same whether the vector cosine is
     /// 0.85 or 0.55), and on paraphrase queries that magnitude is the load-
-    /// bearing signal. See `scripts/search-benchmarks/simulate_fusion.py` and
-    /// `docs/researches/embeddings/`.
-    pub fn fuse_arms(lists: &[RankedList]) -> Vec<FusedHit> {
-        let mut merged: std::collections::HashMap<String, (f64, Vec<String>, MessageKey)> =
-            std::collections::HashMap::new();
+    /// bearing signal. See `scripts/search-benchmarks/bench.py` and
+    /// `docs/researches/embeddings.md`.
+    pub fn fuse_arms(lists: &[RankedList], key_by: FusionKey) -> Vec<FusedHit> {
+        struct Group {
+            score: f64,
+            matched_via: Vec<String>,
+            rep: MessageKey,
+            rep_contribution: f64,
+        }
+        let group_key = |key: &MessageKey| match key_by {
+            FusionKey::SessionRoot => session_root(&key.session_id).to_owned(),
+            FusionKey::Message => format!("{}\u{0}{}", key.session_id, key.message_id),
+        };
+        let mut merged: std::collections::HashMap<String, Group> = std::collections::HashMap::new();
         for list in lists {
             if list.entries.is_empty() {
                 continue;
             }
             // Min-max normalize across the FULL arm pool BEFORE dedup. The
-            // benchmark simulator (scripts/search-benchmarks/simulate_fusion.py) and
-            // the production code MUST agree on the normalization basis;
+            // benchmark replay (scripts/search-benchmarks/) and the
+            // production code MUST agree on the normalization basis;
             // dedupping first would narrow [lo, hi] to only the surviving
-            // session-roots' scores and skew the normalized signal away
-            // from what the benchmark reports. A degenerate arm where every
-            // hit ties on raw score collapses to zero contribution; the
-            // other arm then decides the order.
+            // groups' scores and skew the normalized signal away from what
+            // the benchmark reports. A degenerate arm where every hit ties
+            // on raw score collapses to zero contribution; the other arm
+            // then decides the order.
             let mut lo = f64::INFINITY;
             let mut hi = f64::NEG_INFINITY;
             for (_, raw) in &list.entries {
@@ -1442,32 +1486,40 @@ mod search_handler {
                 }
             }
             let range = hi - lo;
-            // Intra-arm dedup-by-root keeps the highest-scoring message
-            // each arm returned for a given conversation: without it a long
-            // session whose top-N hits all share a root would crowd out
-            // cross-arm signal from other sessions.
+            // Intra-arm dedup keeps the highest-scoring message each arm
+            // returned for a given group: without it a long session whose
+            // top-N hits all share a root would crowd out cross-arm signal
+            // from other sessions. (Under Message keying every entry is its
+            // own group, so this is a no-op there.)
             let mut seen_in_arm: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (key, raw) in &list.entries {
-                let root = session_root(&key.session_id).to_owned();
-                if !seen_in_arm.insert(root.clone()) {
+                let group = group_key(key);
+                if !seen_in_arm.insert(group.clone()) {
                     continue;
                 }
                 let norm = if range > 0.0 { (raw - lo) / range } else { 0.0 };
                 let contribution = list.weight * norm;
-                let entry = merged
-                    .entry(root)
-                    .or_insert_with(|| (0.0, Vec::new(), key.clone()));
-                entry.0 += contribution;
-                entry.1.push(list.retriever.as_wire().to_owned());
+                let entry = merged.entry(group).or_insert_with(|| Group {
+                    score: 0.0,
+                    matched_via: Vec::new(),
+                    rep: key.clone(),
+                    rep_contribution: f64::NEG_INFINITY,
+                });
+                entry.score += contribution;
+                entry.matched_via.push(list.retriever.as_wire().to_owned());
+                if contribution > entry.rep_contribution {
+                    entry.rep = key.clone();
+                    entry.rep_contribution = contribution;
+                }
             }
         }
         let mut hits = merged
             .into_values()
-            .map(|(score, matched_via, key)| FusedHit {
-                key,
-                score,
-                matched_via,
+            .map(|group| FusedHit {
+                key: group.rep,
+                score: group.score,
+                matched_via: group.matched_via,
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
@@ -1625,14 +1677,15 @@ mod search_handler {
             .collect()
     }
 
+    // Cosine similarity (`1 - distance`), matching the hybrid arm: the score
+    // carries magnitude and is stable across pool sizes, instead of the old
+    // rank-norm `1 - idx/n` whose value shifted whenever `limit` changed.
     fn normalize_vector(hits: Vec<(MessageKey, f32)>) -> Vec<Candidate> {
-        let n = hits.len() as f64;
         hits.into_iter()
-            .enumerate()
-            .map(|(idx, (key, _))| Candidate {
+            .map(|(key, distance)| Candidate {
                 session_id: key.session_id,
                 message_id: key.message_id,
-                base_score: if n > 0.0 { 1.0 - (idx as f64 / n) } else { 0.0 },
+                base_score: 1.0 - f64::from(distance),
             })
             .collect()
     }
@@ -1659,6 +1712,7 @@ mod search_handler {
         store: &Store,
         scored: &[ScoredHit],
         query: &str,
+        matches_cap: usize,
     ) -> Result<Vec<SearchSession>, ErrorEnvelope> {
         use std::collections::BTreeMap;
 
@@ -1726,7 +1780,7 @@ mod search_handler {
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| left.message_id.cmp(&right.message_id))
                 });
-                acc.matches.truncate(MAX_MATCHES_PER_SESSION);
+                acc.matches.truncate(matches_cap);
                 SearchSession {
                     session_messages_count: counts.get(&session_id).copied().unwrap_or_default(),
                     session_id,
@@ -1759,12 +1813,14 @@ mod search_handler {
     fn page_sessions(
         sessions: Vec<SearchSession>,
         matched_total: usize,
+        searchable_in_scope: usize,
         plan: &SearchPlan,
     ) -> Result<SearchResponse, ErrorEnvelope> {
         if plan.offset >= sessions.len() {
             return Ok(SearchResponse {
                 sessions: Vec::new(),
                 matched_total,
+                searchable_in_scope,
                 has_more: false,
                 next_cursor: None,
             });
@@ -1804,6 +1860,7 @@ mod search_handler {
         Ok(SearchResponse {
             sessions: emitted,
             matched_total,
+            searchable_in_scope,
             has_more,
             next_cursor,
         })
@@ -1857,6 +1914,19 @@ mod search_handler {
             ));
         }
 
+        // spec.md#search: subagent sessions (`source_agent` with a "/") are
+        // excluded by default; an explicit session_id/source_agent filter means
+        // the caller is already scoping, so the exclusion would only fight it.
+        if !filters.include_subagents
+            && filters.session_id.is_none()
+            && filters.source_agent.is_none()
+        {
+            clauses.push(Predicate::Not(Box::new(Predicate::LikeContains(
+                "source_agent",
+                "/".to_owned(),
+            ))));
+        }
+
         Ok(Predicate::And(clauses))
     }
 
@@ -1875,10 +1945,11 @@ mod search_handler {
         Ok(format!("timestamp '{date} {time}'"))
     }
 
-    fn empty_response() -> SearchResponse {
+    fn empty_response(searchable_in_scope: usize) -> SearchResponse {
         SearchResponse {
             sessions: Vec::new(),
             matched_total: 0,
+            searchable_in_scope,
             has_more: false,
             next_cursor: None,
         }
@@ -1933,7 +2004,7 @@ mod search_handler {
                 ],
                 weight: 1.0,
             };
-            let merged = fuse_arms(&[fts, vec_arm]);
+            let merged = fuse_arms(&[fts, vec_arm], FusionKey::SessionRoot);
             // Output: one row per session_root after intra-arm dedup.
             assert_eq!(merged.len(), 2);
             // Per-arm min-max over the FULL pool BEFORE dedup:
@@ -1943,13 +2014,50 @@ mod search_handler {
             // session-A: 0.135 * 1.0 + 1.0 * 0.0 = 0.135.
             // session-B: 0.135 * 0.2 + 1.0 * 1.0 = 1.027. B wins.
             assert_eq!(merged[0].key.session_id, "session-B");
-            // FTS was listed first, so FTS's pick (msg-3) wins the
-            // representative over Vector's pick (msg-7) for session-B.
-            assert_eq!(merged[0].key.message_id, "msg-3");
+            // Representative = highest single weighted contribution: Vector's
+            // msg-7 (1.0 * 1.0) beats FTS's msg-3 (0.135 * 0.2) for B.
+            assert_eq!(merged[0].key.message_id, "msg-7");
             assert_eq!(merged[0].matched_via, vec!["fts", "vector"]);
             assert_eq!(merged[1].key.session_id, "session-A");
+            // For A the FTS contribution (0.135 * 1.0) beats Vector's
+            // (1.0 * 0.0), so FTS's msg-1 is the representative.
             assert_eq!(merged[1].key.message_id, "msg-1");
             assert_eq!(merged[1].matched_via, vec!["fts", "vector"]);
+        }
+
+        #[test]
+        fn fuse_arms_message_key_keeps_per_message_hits_within_one_session() {
+            // Session-scoped searches (session_id filter) fuse per message:
+            // root keying would collapse everything below to one hit.
+            let mk = |sid: &str, mid: &str| crate::sessions::MessageKey {
+                session_id: sid.to_owned(),
+                message_id: mid.to_owned(),
+            };
+            let fts = RankedList {
+                retriever: RetrieverKind::Fts,
+                entries: vec![
+                    (mk("session-A", "msg-1"), 10.0),
+                    (mk("session-A", "msg-2"), 6.0),
+                ],
+                weight: 0.3,
+            };
+            let vec_arm = RankedList {
+                retriever: RetrieverKind::Vector,
+                entries: vec![
+                    (mk("session-A", "msg-2"), 0.9),
+                    (mk("session-A", "msg-3"), 0.6),
+                ],
+                weight: 1.0,
+            };
+            let merged = fuse_arms(&[fts, vec_arm], FusionKey::Message);
+            assert_eq!(merged.len(), 3, "one fused hit per message, not per root");
+            // FTS pool [10, 6]: msg-1 -> 1.0, msg-2 -> 0.0. Vector pool
+            // [0.9, 0.6]: msg-2 -> 1.0, msg-3 -> 0.0. So msg-2 = 1.0 (both
+            // arms), msg-1 = 0.3 (FTS only), msg-3 = 0.0 (vector only).
+            assert_eq!(merged[0].key.message_id, "msg-2");
+            assert_eq!(merged[0].matched_via, vec!["fts", "vector"]);
+            assert_eq!(merged[1].key.message_id, "msg-1");
+            assert_eq!(merged[1].matched_via, vec!["fts"]);
         }
 
         #[test]
@@ -1973,7 +2081,7 @@ mod search_handler {
                 entries: vec![(mk("session-A", "a"), 0.9), (mk("session-B", "b"), 0.3)],
                 weight: 1.0,
             };
-            let merged = fuse_arms(&[fts, vec_arm]);
+            let merged = fuse_arms(&[fts, vec_arm], FusionKey::SessionRoot);
             // Vector arm alone decides: A's normalized 1.0 beats B's 0.0.
             assert_eq!(merged[0].key.session_id, "session-A");
             assert!((merged[0].score - 1.0).abs() < 1e-9);
@@ -1983,8 +2091,8 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    FusedHit, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter, explain_search_plan,
-    fuse_arms, hit_payload, plan_search, pond_search,
+    FusedHit, FusionKey, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter,
+    explain_search_plan, fuse_arms, hit_payload, plan_search, pond_search,
 };
 
 #[cfg(test)]
@@ -2041,7 +2149,7 @@ mod tests {
                 weight: 0.135,
             },
         ];
-        let merged = fuse_arms(&lists);
+        let merged = fuse_arms(&lists, FusionKey::SessionRoot);
 
         // Vector normalized: a=1.0, b=0.5, c=0.0.
         // FTS normalized:    b=1.0, a=2/3, d=0.0.
@@ -2156,6 +2264,7 @@ mod tests {
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
             min_score: 0.0,
+            include_subagents: false,
         };
         let sql = build_filter(&filters).unwrap().to_lance();
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
@@ -2164,10 +2273,20 @@ mod tests {
         assert!(sql.contains("role = 'assistant'"));
         assert!(sql.contains("timestamp >="));
         assert!(sql.contains("timestamp <="));
+        // session_id/source_agent set => default subagent exclusion is skipped.
+        assert!(!sql.contains("NOT ("));
 
-        // Empty filters produce no predicate.
         assert_eq!(
             build_filter(&SearchFilters::default()).unwrap().to_lance(),
+            "NOT (source_agent LIKE '%/%' ESCAPE '\\')",
+        );
+        assert_eq!(
+            build_filter(&SearchFilters {
+                include_subagents: true,
+                ..SearchFilters::default()
+            })
+            .unwrap()
+            .to_lance(),
             "",
         );
     }

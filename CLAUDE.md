@@ -11,6 +11,7 @@
 ## Tests
 
 - Layout: unit tests live in `#[cfg(test)] mod tests` next to the code they test (`src/...`). All integration tests are bundled into one binary at `tests/integration.rs`, with each suite as a module under `tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
+- Adapter-specific integration tests go in `tests/integration/adapter/<adapter>.rs` (mirroring `src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `tests/integration/adapter/mod.rs`, the seam analog of `src/adapter/mod.rs`.
 - Run everything: `cargo test`.
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
@@ -41,6 +42,7 @@
 
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
 - Don't add or maintain changelog entries; pond has no changelog and doesn't need one.
+- pond is a pre-1.0 release-plz-managed crate. Mark breaking commits with `<type>!:` (or a `BREAKING CHANGE:` footer) so release-plz bumps `0.X.0` instead of patch. When squash-merging a breaking PR, pass the subject via `gh pr merge --squash -t "feat(scope)!: ..."` so the `!` survives the squash.
 
 ## Minimalism
 

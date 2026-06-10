@@ -1,0 +1,263 @@
+[
+  {
+    "uuid": "11111111-1111-1111-1111-111111111111",
+    "name": "Hello World Test",
+    "summary": "A simple greeting exchange to test basic text blocks.",
+    "created_at": "2026-01-15T10:00:00.000000Z",
+    "updated_at": "2026-01-15T10:01:00.000000Z",
+    "account": { "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    "chat_messages": [
+      {
+        "uuid": "msg-001-user-001",
+        "text": "Hello, Claude!",
+        "sender": "human",
+        "created_at": "2026-01-15T10:00:00.000000Z",
+        "updated_at": "2026-01-15T10:00:00.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello, Claude!",
+            "start_timestamp": "2026-01-15T10:00:00.000000Z",
+            "stop_timestamp": "2026-01-15T10:00:00.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-001-asst-001",
+        "text": "Hello! How can I help you today?",
+        "sender": "assistant",
+        "created_at": "2026-01-15T10:00:30.000000Z",
+        "updated_at": "2026-01-15T10:00:30.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello! How can I help you today?",
+            "start_timestamp": "2026-01-15T10:00:30.000000Z",
+            "stop_timestamp": "2026-01-15T10:00:30.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      }
+    ]
+  },
+  {
+    "uuid": "22222222-2222-2222-2222-222222222222",
+    "name": "Thinking Example",
+    "summary": "Claude demonstrates internal reasoning before responding.",
+    "created_at": "2026-01-15T11:00:00.000000Z",
+    "updated_at": "2026-01-15T11:00:45.000000Z",
+    "account": { "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    "chat_messages": [
+      {
+        "uuid": "msg-002-user-001",
+        "text": "What is 15 + 27?",
+        "sender": "human",
+        "created_at": "2026-01-15T11:00:00.000000Z",
+        "updated_at": "2026-01-15T11:00:00.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is 15 + 27?",
+            "start_timestamp": "2026-01-15T11:00:00.000000Z",
+            "stop_timestamp": "2026-01-15T11:00:00.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-002-asst-001",
+        "text": "The answer is 42.",
+        "sender": "assistant",
+        "created_at": "2026-01-15T11:00:15.000000Z",
+        "updated_at": "2026-01-15T11:00:15.000000Z",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "The user is asking me to add 15 and 27. 15 + 27 = 42.",
+            "start_timestamp": "2026-01-15T11:00:12.000000Z",
+            "stop_timestamp": "2026-01-15T11:00:14.000000Z",
+            "summaries": [{ "summary": "Calculating the sum of two numbers" }],
+            "cut_off": false
+          },
+          {
+            "type": "text",
+            "text": "The answer is 42.",
+            "start_timestamp": "2026-01-15T11:00:15.000000Z",
+            "stop_timestamp": "2026-01-15T11:00:15.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      }
+    ]
+  },
+  {
+    "uuid": "33333333-3333-3333-3333-333333333333",
+    "name": "Tool Use Test",
+    "summary": "Tests tool_use and tool_result content blocks with a web search.",
+    "created_at": "2026-01-15T12:00:00.000000Z",
+    "updated_at": "2026-01-15T12:00:45.000000Z",
+    "account": { "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    "chat_messages": [
+      {
+        "uuid": "msg-003-user-001",
+        "text": "What is the capital of France?",
+        "sender": "human",
+        "created_at": "2026-01-15T12:00:00.000000Z",
+        "updated_at": "2026-01-15T12:00:00.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is the capital of France?",
+            "start_timestamp": "2026-01-15T12:00:00.000000Z",
+            "stop_timestamp": "2026-01-15T12:00:00.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-003-asst-001",
+        "text": "Let me search for the current information.",
+        "sender": "assistant",
+        "created_at": "2026-01-15T12:00:15.000000Z",
+        "updated_at": "2026-01-15T12:00:15.000000Z",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_003_search_001",
+            "name": "web_search",
+            "input": { "query": "capital of France" },
+            "message": "Searching the web",
+            "start_timestamp": "2026-01-15T12:00:15.000000Z",
+            "stop_timestamp": "2026-01-15T12:00:15.500000Z",
+            "integration_name": null,
+            "integration_icon_url": null,
+            "context": null,
+            "display_content": { "type": "table", "table": [["query", "capital of France"]] },
+            "approval_options": null,
+            "approval_key": null
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-003-user-002",
+        "text": "",
+        "sender": "human",
+        "created_at": "2026-01-15T12:00:20.000000Z",
+        "updated_at": "2026-01-15T12:00:20.000000Z",
+        "content": [
+          {
+            "type": "tool_result",
+            "name": "web_search",
+            "start_timestamp": null,
+            "stop_timestamp": null,
+            "content": [
+              {
+                "type": "knowledge",
+                "title": "Capital of France",
+                "url": "https://example.com/france-capital",
+                "metadata": {
+                  "type": "webpage_metadata",
+                  "site_domain": "example.com",
+                  "site_name": "Example"
+                },
+                "is_missing": false,
+                "text": "Paris is the capital and largest city of France.",
+                "is_citable": true
+              }
+            ],
+            "is_error": false,
+            "message": null
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-003-asst-002",
+        "text": "The capital of France is Paris.",
+        "sender": "assistant",
+        "created_at": "2026-01-15T12:00:25.000000Z",
+        "updated_at": "2026-01-15T12:00:25.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "The capital of France is Paris.",
+            "start_timestamp": "2026-01-15T12:00:25.000000Z",
+            "stop_timestamp": "2026-01-15T12:00:25.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      }
+    ]
+  },
+  {
+    "uuid": "44444444-4444-4444-4444-444444444444",
+    "name": "",
+    "summary": "A conversation with an empty title to test edge case handling.",
+    "created_at": "2026-01-15T13:00:00.000000Z",
+    "updated_at": "2026-01-15T13:00:30.000000Z",
+    "account": { "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    "chat_messages": [
+      {
+        "uuid": "msg-004-user-001",
+        "text": "Hi there",
+        "sender": "human",
+        "created_at": "2026-01-15T13:00:00.000000Z",
+        "updated_at": "2026-01-15T13:00:00.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hi there",
+            "start_timestamp": "2026-01-15T13:00:00.000000Z",
+            "stop_timestamp": "2026-01-15T13:00:00.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      },
+      {
+        "uuid": "msg-004-asst-001",
+        "text": "Hello!",
+        "sender": "assistant",
+        "created_at": "2026-01-15T13:00:10.000000Z",
+        "updated_at": "2026-01-15T13:00:10.000000Z",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello!",
+            "start_timestamp": "2026-01-15T13:00:10.000000Z",
+            "stop_timestamp": "2026-01-15T13:00:10.000000Z",
+            "citations": []
+          }
+        ],
+        "attachments": [],
+        "files": []
+      }
+    ]
+  },
+  {
+    "uuid": "55555555-5555-5555-5555-555555555555",
+    "name": "Empty Conversation",
+    "summary": "A conversation with no messages (edge case).",
+    "created_at": "2026-01-15T14:00:00.000000Z",
+    "updated_at": "2026-01-15T14:00:00.000000Z",
+    "account": { "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    "chat_messages": []
+  }
+]

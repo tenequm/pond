@@ -47,6 +47,8 @@ skills-lock.json
 /scripts/search-benchmarks/results/
 /scripts/search-benchmarks/queries-paraphrased*.tsv
 /scripts/search-benchmarks/queries-real-use*.tsv
+/scripts/search-benchmarks/queries-false-negatives*.tsv
+/scripts/search-benchmarks/arms*.json
 /scripts/search-benchmarks/__pycache__/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate

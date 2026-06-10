@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/tenequm/pond/compare/v0.5.2...v0.6.0) - 2026-06-10
+
+### Added
+
+- *(ingest)* stamp host provenance on inserted message rows ([#40](https://github.com/tenequm/pond/pull/40))
+- *(search)* [**breaking**] per-message session fusion, raw-magnitude scoring, absence honesty
+
+## [0.5.2](https://github.com/tenequm/pond/compare/v0.5.1...v0.5.2) - 2026-06-10
+
+### Other
+
+- *(maintenance)* veto absorb-heavy compaction tasks and derive byte-based fragment targets
+
+## [0.5.1](https://github.com/tenequm/pond/compare/v0.5.0...v0.5.1) - 2026-06-10
+
+### Added
+
+- *(sql)* harden pond_sql_query and add error-guided recovery
+
+## [0.5.0](https://github.com/tenequm/pond/compare/v0.4.0...v0.5.0) - 2026-06-05
+
+### Added
+
+- *(mcp)* [**breaking**] add pond_sql_query read-only SQL tool (table/json/ndjson/parquet) + pond sql CLI
+
+## [0.4.0](https://github.com/tenequm/pond/compare/v0.3.2...v0.4.0) - 2026-06-05
+
+### Other
+
+- *(maintenance)* [**breaking**] gate compaction, drop unsafe vacuum, carve out [maintenance] config
+
+## [0.3.2](https://github.com/tenequm/pond/compare/v0.3.1...v0.3.2) - 2026-06-04
+
+### Added
+
+- *(adapter)* add claude-desktop-app and claude-ai-export adapters
+
+## [0.3.1](https://github.com/tenequm/pond/compare/v0.3.0...v0.3.1) - 2026-06-04
+
+### Fixed
+
+- *(adapter)* recognize nested workflow-subagent transcripts
+
+## [0.3.0](https://github.com/tenequm/pond/compare/v0.2.8...v0.3.0) - 2026-06-03
+
+### Added
+
+- *(cli)* redesign sync/status output and gate sources behind enabled ([#26](https://github.com/tenequm/pond/pull/26))
+- *(adapter)* add pi and opencode source adapters
+
+### Fixed
+
+- *(substrate)* handle wrapped namespace table-not-found errors
+- *(adapter)* apply polish-review fixes across opencode, pi, seam, and writer
+- *(adapter)* harden pi and opencode adapters per review
+
+### Other
+
+- *(substrate)* collapse namespace error-chain walker
+- rename pi adapter to pi-coding-agent
+
 ## [0.2.8](https://github.com/tenequm/pond/compare/v0.2.7...v0.2.8) - 2026-06-03
 
 ### Added

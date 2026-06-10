@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.2.8"
+version = "0.6.0"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.95"
@@ -59,13 +59,21 @@ path = "src/main.rs"
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
+# ndjson export writer for `pond_sql_query` (already in the tree via the arrow
+# stack; named directly here for the `LineDelimitedWriter`).
+arrow-json = "58.3"
 async-stream = "0.3.6"
+# Already in the tree via datafusion; named directly for the vendored fts()
+# TableProvider in `src/sql.rs` (datafusion's TableProvider trait needs it).
+async-trait = "0.1"
 axum = "0.8.9"
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
 comfy-table = "7"
 dialoguer = { version = "0.12", default-features = false }
+human-panic = { version = "2", default-features = false }
 # Embedding stack for `intfloat/multilingual-e5-small`: candle XLM-RoBERTa
 # FP16 on Metal (macOS) / CUDA (`--features cuda`) / CPU. `LazyEmbedder`
 # (`src/embed.rs`) idle-evicts the loaded backend after
@@ -80,13 +88,27 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
 lance = { version = "7.0.0", features = ["protoc"] }
 lance-arrow = "7.0.0"
+# `pond_sql_query` registers lance's JSON / contains_tokens UDFs on the SQL
+# SessionContext via `lance_datafusion::udf::register_functions`. Already in
+# the tree transitively; named here to reach that one function.
+lance-datafusion = "7.0.0"
 half = { version = "2.1", default-features = false }
+# JSONB decode for the lenient json_get_* UDF shadows in `src/sql.rs` (lance's
+# strict versions abort a whole scan when one row's field is non-scalar).
+# Already in the tree via lance-datafusion; default-features OFF is load-bearing:
+# jsonb's defaults enable serde_json/preserve_order + arbitrary_precision, which
+# flip serde_json behavior crate-wide and change restore output key order.
+jsonb = { version = "0.5", default-features = false, features = ["databend"] }
 lance-file = "7.0.0"
 lance-index = "7.0.0"
 lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
+# Parquet export writer for `pond_sql_query`. The only genuinely new compiled
+# crate the SQL tool adds (lance reads/writes its own format, not parquet).
+# `arrow` feature only; results are written uncompressed via `ArrowWriter`.
+parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -106,6 +128,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 walkdir = "2.5"
+# Ingest host provenance stamp (`options.pond`, src/sessions.rs). Already in
+# the tree transitively via hf-hub's xet stack; named directly for the
+# fallible username/hostname/devicename lookups.
+whoami = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

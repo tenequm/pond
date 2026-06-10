@@ -27,7 +27,9 @@ use crate::{
     wire::ProviderOptions,
 };
 
+mod claude_ai_export;
 mod claude_code;
+mod claude_desktop_app;
 mod codex_cli;
 mod discovery;
 pub mod extract;
@@ -35,9 +37,14 @@ mod jsonl;
 mod opencode;
 mod pi_coding_agent;
 
+pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
+pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
-pub use discovery::{Candidate, discover, prompt_and_persist};
+pub use discovery::{
+    Candidate, PromptOutcome, discover, persist_accept, persist_decline, probe_unconfigured,
+    prompt_and_persist, prompt_each,
+};
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
@@ -182,13 +189,19 @@ pub enum AdapterYield {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     Fresh,
     /// File produced no importable session (empty `.jsonl`, sidecar-only rows,
     /// or an unextractable header). Benign: counted, never an error or a
-    /// per-event drop. The underlying cause is logged at `POND_LOG=debug`.
+    /// per-event drop. The underlying cause is logged at `-vv` (debug) verbosity.
     Empty,
+    /// File is structurally a known sidecar whose specific shape this adapter
+    /// version can't ingest. Surfaced as a visible, counted failure - NOT a
+    /// benign skip - so the gap is actionable and the file is never folded into
+    /// another session under a borrowed id. The payload is the user-facing
+    /// reason naming the file and the fix.
+    Unsupported(String),
 }
 
 pub type AdapterYieldStream<'a> =
@@ -358,6 +371,8 @@ impl std::error::Error for AdapterError {
 pub fn registry() -> &'static [&'static dyn AdapterFactory] {
     &[
         &ClaudeCodeFactory,
+        &ClaudeDesktopAppFactory,
+        &ClaudeAiExportFactory,
         &CodexCliFactory,
         &OpencodeFactory,
         &PiCodingAgentFactory,

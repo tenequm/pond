@@ -24,11 +24,14 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     config, embed,
     substrate::{
-        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, OptimizeProgressFn,
-        PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table, TableOptimizeOutcome, TableSizes,
-        VECTOR_INDEX_ACTIVATION_ROWS,
+        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
+        OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
+        TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session},
+    wire::{
+        FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session,
+        SessionFrom,
+    },
 };
 use url::Url;
 
@@ -158,35 +161,6 @@ impl OptimizeOutcome {
             }
         }
         Ok(self)
-    }
-}
-
-/// Default manifest-retention window for `pond index optimize`'s explicit
-/// cleanup pass. Matches LanceDB's recommended OSS-operator practice
-/// (lancedb docs: performance.mdx, tables/update.mdx). Note: with
-/// `delete_unverified=false` (default), Lance protects files newer than
-/// 7 days regardless of this value (`UNVERIFIED_THRESHOLD_DAYS` in
-/// lance/dataset/cleanup.rs).
-pub fn default_cleanup_older_than() -> chrono::Duration {
-    chrono::Duration::days(1)
-}
-
-/// Cleanup parameters for the compaction phase of `pond index optimize`.
-/// `delete_unverified=true` overrides Lance's 7-day in-progress safety
-/// guard - required to reclaim files younger than 7 days, unsafe under
-/// concurrent writers.
-#[derive(Debug, Clone, Copy)]
-pub struct CleanupConfig {
-    pub older_than: chrono::Duration,
-    pub delete_unverified: bool,
-}
-
-impl Default for CleanupConfig {
-    fn default() -> Self {
-        Self {
-            older_than: default_cleanup_older_than(),
-            delete_unverified: false,
-        }
     }
 }
 
@@ -464,12 +438,13 @@ impl Store {
     async fn upsert_session_batch(
         &self,
         substreams: Vec<CompletedSubstream>,
-    ) -> Result<Vec<RowOutcome>> {
+    ) -> Result<(Vec<RowOutcome>, BatchCounts)> {
         if substreams.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), BatchCounts::default()));
         }
 
         let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(substreams.len());
+        let mut counts = BatchCounts::default();
 
         // In-batch dedup. First occurrence of each session_id wins; later
         // occurrences either merge or get rejected. Iteration order preserves
@@ -542,10 +517,77 @@ impl Store {
             merged.push(substream);
         }
 
+        // Pre-existence sweep: one scan per table keyed on the batch's
+        // session_ids, capped at the substream count. Replaces the prior
+        // N-sequential `find_session` calls and gives us honest per-row
+        // Inserted/Matched attribution downstream (spec.md#adapter-integrity-additive-sync).
+        let session_id_values: Vec<ScalarValue> = merged
+            .iter()
+            .map(|substream| ScalarValue::String(substream.session.id.clone()))
+            .collect();
+        let existing_sessions: std::collections::HashMap<String, Session> =
+            if session_id_values.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let batch = self
+                    .handle
+                    .scan_batch(
+                        Table::Sessions,
+                        Some(&Predicate::In("id", session_id_values.clone())),
+                        &[],
+                    )
+                    .await?;
+                let mut map = std::collections::HashMap::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    let session = session_from_batch(&batch, row)?;
+                    map.insert(session.id.clone(), session);
+                }
+                map
+            };
+        let existing_message_pks: HashSet<(String, String)> = if session_id_values.is_empty() {
+            HashSet::new()
+        } else {
+            let batch = self
+                .handle
+                .scan_batch(
+                    Table::Messages,
+                    Some(&Predicate::In("session_id", session_id_values.clone())),
+                    &["session_id", "id"],
+                )
+                .await?;
+            let mut set = HashSet::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+                let mid = string(&batch, "id", row)?.context("message id is null")?;
+                set.insert((sid, mid));
+            }
+            set
+        };
+        let existing_part_pks: HashSet<(String, String, String)> = if session_id_values.is_empty() {
+            HashSet::new()
+        } else {
+            let batch = self
+                .handle
+                .scan_batch(
+                    Table::Parts,
+                    Some(&Predicate::In("session_id", session_id_values)),
+                    &["session_id", "message_id", "id"],
+                )
+                .await?;
+            let mut set = HashSet::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+                let mid = string(&batch, "message_id", row)?.context("message_id is null")?;
+                let pid = string(&batch, "id", row)?.context("part id is null")?;
+                set.insert((sid, mid, pid));
+            }
+            set
+        };
+
         let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
         for substream in merged {
-            if let Some(existing) = self.find_session(&substream.session.id).await?
-                && let Err(failure) = ensure_immutable_match(&existing, &substream.session)
+            if let Some(existing) = existing_sessions.get(&substream.session.id)
+                && let Err(failure) = ensure_immutable_match(existing, &substream.session)
             {
                 let field = match &failure {
                     IngestError::ImmutableField { field, .. } => Some(*field),
@@ -570,7 +612,7 @@ impl Store {
 
         if writeable.is_empty() {
             outcomes.sort_by_key(|outcome| outcome.index);
-            return Ok(outcomes);
+            return Ok((outcomes, counts));
         }
 
         let sessions_owned: Vec<Session> = writeable
@@ -604,44 +646,33 @@ impl Store {
         let message_batches = messages_batches(&message_rows)?;
         let part_batches = parts_batches(&part_rows)?;
 
-        let sessions_count = sessions_owned.len();
-
-        let (sessions_inserted, messages_inserted, parts_inserted) = tokio::try_join!(
+        // Merge_insert returns a batch-level inserted count which we cross-
+        // check against our pre-existence sets, but for per-row truth we
+        // attribute through the sets themselves (next loop). Under
+        // single-writer the two agree exactly; under a hostile concurrent
+        // writer the sets are authoritative for THIS request's wire shape -
+        // matched-no-op (spec.md#adapter-integrity-additive-sync) makes the
+        // distinction informational, not behavioral.
+        let (_sessions_inserted, _messages_inserted, _parts_inserted) = tokio::try_join!(
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches),
             merge_insert_chunks(&self.handle, Table::Messages, message_batches),
             merge_insert_chunks(&self.handle, Table::Parts, part_batches),
         )?;
-        // Per-session success outcomes: each substream's own status row plus
-        // per-message and per-part rows. The Lance `merge_insert` returns a
-        // single batch-level "inserted vs matched" count, not per-row; we
-        // can't tell which row matched which, so for the batched path each
-        // session/message/part is marked `Inserted` if the batch had any
-        // inserts, else `Matched`. This is the same semantic the
-        // single-session path used (see `statuses_from_inserted`).
-        let sessions_status = if sessions_inserted == sessions_count as u64 {
-            UpsertStatus::Inserted
-        } else if sessions_inserted == 0 {
-            UpsertStatus::Matched
-        } else {
-            // Mixed - mark per index by re-checking? Cheaper to just count
-            // all as Inserted; the operator can read the precise insert
-            // count from the `IngestSummary`.
-            UpsertStatus::Inserted
-        };
-        let _ = messages_inserted; // counted via summary, not per-row here
-        let _ = parts_inserted;
 
         for substream in &writeable {
             outcomes.extend(success_outcomes_for_substream(
                 substream.session_index,
                 &substream.session,
                 &substream.messages,
-                sessions_status,
+                &existing_sessions,
+                &existing_message_pks,
+                &existing_part_pks,
+                &mut counts,
             ));
         }
 
         outcomes.sort_by_key(|outcome| outcome.index);
-        Ok(outcomes)
+        Ok((outcomes, counts))
     }
 
     pub async fn upsert_messages(
@@ -828,11 +859,33 @@ impl Store {
             None => 0,
         };
         let remaining = rows.get(start_at..).unwrap_or(&[]);
-        let emitted_count = page_by(remaining, params.limit, params.budget_bytes, |row| {
-            row.text.as_deref().map_or(0, str::len)
-        });
-        let emitted = &remaining[..emitted_count];
-        let messages_remaining = remaining.len() - emitted_count;
+        let (emitted, messages_remaining) = match params.session_from {
+            SessionFrom::Start => {
+                let n = page_by(remaining, params.limit, params.budget_bytes, |row| {
+                    row.text.as_deref().map_or(0, str::len)
+                });
+                (&remaining[..n], remaining.len() - n)
+            }
+            // Tail: the newest messages that fit `limit` and the byte budget,
+            // dropping oldest first; the newest is always kept and the page
+            // stays chronological so the agent reads the flow forward.
+            SessionFrom::End => {
+                let mut bytes = 0usize;
+                let mut start = remaining.len();
+                for row in remaining.iter().rev() {
+                    if remaining.len() - start >= params.limit {
+                        break;
+                    }
+                    let size = row.text.as_deref().map_or(0, str::len);
+                    if start < remaining.len() && bytes + size > params.budget_bytes {
+                        break;
+                    }
+                    bytes += size;
+                    start -= 1;
+                }
+                (&remaining[start..], start)
+            }
+        };
         let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
 
         // Conversational/Complete only summarize parts; Verbatim inlines every
@@ -881,6 +934,14 @@ impl Store {
             return Ok(GetLookup::NotFound);
         };
         let mut rows = self.scan_all_messages(&session_id).await?;
+        // spec.md#protocol: context siblings follow the response mode, and the
+        // default is the conversational view - in carrier-heavy sessions the
+        // system/tool rows would otherwise fill the whole +-depth window and
+        // push the actual conversation out of it. The target stays regardless
+        // of its own role: the caller asked for that message.
+        if matches!(params.mode, ResponseMode::Conversational) {
+            rows.retain(|row| row.text.is_some() || row.id == message_id);
+        }
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         let Some(target_pos) = rows.iter().position(|row| row.id == message_id) else {
             return Ok(GetLookup::NotFound);
@@ -1043,6 +1104,28 @@ impl Store {
 
     pub async fn row_counts(&self) -> Result<(usize, usize, usize)> {
         self.handle.row_counts().await
+    }
+
+    /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
+    /// DataFusion `LanceTableProvider` in `pond_sql_query`. Goes through the
+    /// handle's freshness gate, so each query sees a current snapshot.
+    pub async fn dataset(&self, table: Table) -> Result<Arc<Dataset>> {
+        Ok(Arc::new(self.handle.dataset(table).await?))
+    }
+
+    /// Write a `pond_sql_query` export artifact.
+    pub async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.handle.export_write(name, bytes).await
+    }
+
+    /// Read a `pond_sql_query` export artifact back.
+    pub async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
+        self.handle.export_read(name).await
+    }
+
+    /// Local filesystem path of an export artifact on `file://` installs.
+    pub fn export_local_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.handle.export_local_path(name)
     }
 
     /// Compute the per-adapter / per-project rollup that drives
@@ -1251,6 +1334,21 @@ impl Store {
                 .then_with(|| left.0.message_id.cmp(&right.0.message_id))
         });
         Ok(hits)
+    }
+
+    /// Count of searchable messages (non-null `search_text`) inside the
+    /// caller's filter scope - the universe a search actually ran over.
+    /// Powers the response's absence honesty (spec.md#search): "no relevant
+    /// hits" only means something relative to how many messages were
+    /// searchable at all, and 0 tells the caller their filters excluded
+    /// everything before retrieval even started.
+    pub async fn searchable_in_scope(&self, filter: &Predicate) -> Result<usize> {
+        let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        dataset
+            .count_rows(Some(scope.to_lance()))
+            .await
+            .map_err(Into::into)
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
@@ -1517,15 +1615,14 @@ impl Store {
     pub async fn optimize_indices(
         &self,
         progress: Option<OptimizeProgressFn>,
-        cleanup: Option<CleanupConfig>,
+        maintenance: &MaintenancePolicy,
     ) -> Result<OptimizeOutcome> {
-        let cleanup = cleanup.unwrap_or_default();
-        let policy = pond_index_intents();
+        let intents = pond_index_intents();
         let mut tables = Vec::with_capacity(3);
-        for (table, intents) in policy.all() {
+        for (table, intents) in intents.all() {
             let outcome = self
                 .handle
-                .optimize_table(table, intents, progress.as_ref(), cleanup)
+                .optimize_table(table, intents, progress.as_ref(), maintenance)
                 .await;
             tables.push(outcome);
         }
@@ -1562,13 +1659,13 @@ impl Store {
         &self,
         vector_threshold: usize,
     ) -> Result<OptimizeOutcome> {
-        let cleanup = CleanupConfig::default();
-        let policy = pond_index_intents_with_vector_threshold(vector_threshold);
+        let intents = pond_index_intents_with_vector_threshold(vector_threshold);
+        let policy = MaintenancePolicy::always_compact();
         let mut tables = Vec::with_capacity(3);
-        for (table, intents) in policy.all() {
+        for (table, intents) in intents.all() {
             let outcome = self
                 .handle
-                .optimize_table(table, intents, None, cleanup)
+                .optimize_table(table, intents, None, &policy)
                 .await;
             tables.push(outcome);
         }
@@ -1628,53 +1725,6 @@ impl Store {
     /// (spec.md#lance-chokepoints-storage) so `pond status` works on any backend.
     pub async fn table_sizes(&self) -> Result<TableSizes> {
         self.handle.table_sizes().await
-    }
-
-    /// Histogram of Unicode script classes in `messages.search_text`, computed
-    /// from a sample of up to `max_messages` non-null rows. Returned classes
-    /// are sorted descending by character count. Lets `pond status` tell an
-    /// agent whether the corpus is monolingual or mixed - the agent then knows
-    /// whether bilingual querying is worth attempting (cross-lingual recall is
-    /// a caller-layer concern; pond does not translate internally).
-    pub async fn text_script_histogram(&self, max_messages: usize) -> Result<Vec<(String, usize)>> {
-        use std::collections::HashMap;
-        let filter = Predicate::IsNotNull("search_text");
-        let projection: &[&str] = &["search_text"];
-        let scanner = self
-            .handle
-            .scan(
-                Table::Messages,
-                ScanOpts::with_predicate_and_projection(&filter, projection),
-            )
-            .await?;
-        let mut batches = scanner
-            .try_into_stream()
-            .await
-            .context("failed to open messages stream for script histogram")?;
-        let mut counts: HashMap<&'static str, usize> = HashMap::new();
-        let mut sampled = 0usize;
-        'outer: while let Some(batch) = batches.next().await {
-            let batch = batch?;
-            for row in 0..batch.num_rows() {
-                if sampled >= max_messages {
-                    break 'outer;
-                }
-                if let Some(text) = string(&batch, "search_text", row)? {
-                    for ch in text.chars() {
-                        if let Some(class) = classify_script(ch) {
-                            *counts.entry(class).or_default() += 1;
-                        }
-                    }
-                    sampled += 1;
-                }
-            }
-        }
-        let mut histogram: Vec<(String, usize)> = counts
-            .into_iter()
-            .map(|(name, count)| (name.to_owned(), count))
-            .collect();
-        histogram.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        Ok(histogram)
     }
 
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
@@ -1895,10 +1945,31 @@ pub enum IngestEvent {
 /// The shape is set by spec.md#adapter-integrity-event-ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
-    /// Rows actually written to Lance.
+    /// Rows actually written to Lance, summed across all three tables.
+    /// Use the per-table fields below for user-facing counts; this stays
+    /// for `accepted()` and existing wire callers.
     pub inserted: usize,
     /// Rows that already existed (merge_insert no-op match).
     pub matched: usize,
+    /// Session rows inserted this pass.
+    pub sessions_inserted: usize,
+    /// Message rows inserted this pass (total - includes tool calls,
+    /// tool results, and other non-searchable messages).
+    pub messages_inserted_total: usize,
+    /// Subset of `messages_inserted_total` whose `search_text` is non-null
+    /// (eligible for FTS + semantic indexing). The user-facing "messages"
+    /// count in `pond sync` / `pond status` reads this field.
+    pub messages_inserted_searchable: usize,
+    /// Part rows inserted this pass.
+    pub parts_inserted: usize,
+    /// Session rows already-present (merge_insert matched).
+    pub sessions_matched: usize,
+    /// Message rows already-present (merge_insert matched), total.
+    pub messages_matched_total: usize,
+    /// Subset of `messages_matched_total` with `search_text`.
+    pub messages_matched_searchable: usize,
+    /// Part rows already-present.
+    pub parts_matched: usize,
     /// Events the validator dropped under per-event-drop policy (ordering
     /// violation, orphan part, mismatched parent, adapter parse failure,
     /// duplicate-id collision, ...). Counted by event, not by session: a
@@ -1920,7 +1991,7 @@ pub struct IngestSummary {
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
-    /// the underlying cause is logged at `POND_LOG=debug`.
+    /// the underlying cause is logged at `-vv` (debug) verbosity.
     pub skipped_empty: usize,
     /// Sessions short-circuited via the per-session staleness skip
     /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
@@ -1958,16 +2029,128 @@ pub const DROP_REASON_IMMUTABLE_PROJECT: &str = "immutable_project";
 pub const DROP_REASON_IMMUTABLE_SOURCE_AGENT: &str = "immutable_source_agent";
 pub const DROP_REASON_UNCATEGORIZED: &str = "uncategorized";
 
+/// Honest per-table outcome of one batched flush. Built from `merge_insert`'s
+/// returned counts together with the pre-existence sets captured by
+/// `upsert_session_batch`. Folded into a per-sync summary via
+/// [`IngestSummary::add_batch`]. spec.md#adapter-integrity-additive-sync: matched
+/// is a no-op write, so the inserted/matched split is informational - we still
+/// surface it because both `pond sync` and `pond_ingest` clients reconcile
+/// against "which rows landed this call."
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchCounts {
+    pub sessions_inserted: usize,
+    pub sessions_matched: usize,
+    pub messages_inserted_total: usize,
+    pub messages_inserted_searchable: usize,
+    pub messages_matched_total: usize,
+    pub messages_matched_searchable: usize,
+    pub parts_inserted: usize,
+    pub parts_matched: usize,
+}
+
 impl IngestSummary {
     pub fn accepted(&self) -> usize {
         self.inserted + self.matched
     }
 
+    /// Sole writer of the per-table counters on the CLI batched flush path.
+    /// The wire single-row path keeps using [`Self::add_outcomes`]; emitting
+    /// both for the same rows would double-count.
+    pub fn add_batch(&mut self, counts: &BatchCounts) {
+        self.sessions_inserted += counts.sessions_inserted;
+        self.sessions_matched += counts.sessions_matched;
+        self.messages_inserted_total += counts.messages_inserted_total;
+        self.messages_inserted_searchable += counts.messages_inserted_searchable;
+        self.messages_matched_total += counts.messages_matched_total;
+        self.messages_matched_searchable += counts.messages_matched_searchable;
+        self.parts_inserted += counts.parts_inserted;
+        self.parts_matched += counts.parts_matched;
+        self.inserted +=
+            counts.sessions_inserted + counts.messages_inserted_total + counts.parts_inserted;
+        self.matched +=
+            counts.sessions_matched + counts.messages_matched_total + counts.parts_matched;
+    }
+
+    /// Sum every counter from `other` into `self`. Used by the multi-source
+    /// `pond sync` loop so adding a new field to this struct doesn't silently
+    /// drop on aggregation - the prior hand-rolled `+=` block grew bugs.
+    pub fn merge(&mut self, other: &Self) {
+        self.inserted += other.inserted;
+        self.matched += other.matched;
+        self.sessions_inserted += other.sessions_inserted;
+        self.messages_inserted_total += other.messages_inserted_total;
+        self.messages_inserted_searchable += other.messages_inserted_searchable;
+        self.parts_inserted += other.parts_inserted;
+        self.sessions_matched += other.sessions_matched;
+        self.messages_matched_total += other.messages_matched_total;
+        self.messages_matched_searchable += other.messages_matched_searchable;
+        self.parts_matched += other.parts_matched;
+        self.dropped_events += other.dropped_events;
+        self.dropped_sessions += other.dropped_sessions;
+        self.skipped_files += other.skipped_files;
+        self.skipped_empty += other.skipped_empty;
+        self.skipped_fresh += other.skipped_fresh;
+        self.storage_errors += other.storage_errors;
+        self.truncated_values += other.truncated_values;
+        for (key, value) in &other.drop_reasons {
+            *self.drop_reasons.entry(key).or_insert(0) += value;
+        }
+    }
+
+    /// Same dispatch as [`Self::add_outcomes`] but ignores
+    /// `Inserted`/`Matched` rows. The CLI batched path drives those counters
+    /// via [`Self::add_batch`] and uses this method to attribute per-row
+    /// `Error` outcomes from the same flush.
+    pub fn add_outcomes_errors_only(&mut self, outcomes: &[RowOutcome]) {
+        for outcome in outcomes {
+            if !matches!(outcome.status, OutcomeStatus::Error) {
+                continue;
+            }
+            if outcome.kind == "session" {
+                self.dropped_sessions += 1;
+            } else {
+                self.dropped_events += 1;
+            }
+            let reason = outcome
+                .error
+                .as_ref()
+                .and_then(|error| error.reason_key)
+                .unwrap_or(DROP_REASON_UNCATEGORIZED);
+            *self.drop_reasons.entry(reason).or_insert(0) += 1;
+        }
+    }
+
     pub fn add_outcomes(&mut self, outcomes: &[RowOutcome]) {
         for outcome in outcomes {
             match outcome.status {
-                OutcomeStatus::Inserted => self.inserted += 1,
-                OutcomeStatus::Matched => self.matched += 1,
+                OutcomeStatus::Inserted => {
+                    self.inserted += 1;
+                    match outcome.kind {
+                        "session" => self.sessions_inserted += 1,
+                        "message" => {
+                            self.messages_inserted_total += 1;
+                            if outcome.searchable {
+                                self.messages_inserted_searchable += 1;
+                            }
+                        }
+                        "part" => self.parts_inserted += 1,
+                        _ => {}
+                    }
+                }
+                OutcomeStatus::Matched => {
+                    self.matched += 1;
+                    match outcome.kind {
+                        "session" => self.sessions_matched += 1,
+                        "message" => {
+                            self.messages_matched_total += 1;
+                            if outcome.searchable {
+                                self.messages_matched_searchable += 1;
+                            }
+                        }
+                        "part" => self.parts_matched += 1,
+                        _ => {}
+                    }
+                }
                 OutcomeStatus::Error => {
                     // Session-level rejection: exactly one session-kind Error
                     // outcome (see `error_outcomes_for_substream`). Per-event
@@ -2002,6 +2185,11 @@ pub struct RowOutcome {
     pub pk: Value,
     pub status: OutcomeStatus,
     pub error: Option<RowError>,
+    /// True iff `kind == "message"` AND the underlying row carries
+    /// `search_text`. Drives `IngestSummary::messages_inserted_searchable`
+    /// so the CLI can show "searchable" message deltas distinct from raw
+    /// inserts. Always false for session/part rows.
+    pub searchable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2091,6 +2279,29 @@ struct CompletedSubstream {
     messages: Vec<BufferedMessage>,
 }
 
+/// Ingest host provenance (`options.pond`, spec.md#model-pond-options),
+/// computed once per process. An audit fact - "the process that inserted this
+/// row" - not identity. Fallible lookups are omitted, never synthesized as
+/// placeholders.
+fn ingest_host_stamp() -> Option<&'static Value> {
+    static STAMP: std::sync::OnceLock<Option<Value>> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            let mut host = serde_json::Map::new();
+            if let Ok(username) = whoami::username() {
+                host.insert("username".to_owned(), username.into());
+            }
+            if let Ok(hostname) = whoami::hostname() {
+                host.insert("hostname".to_owned(), hostname.into());
+            }
+            if let Ok(devicename) = whoami::devicename() {
+                host.insert("device_name".to_owned(), devicename.into());
+            }
+            (!host.is_empty()).then(|| serde_json::json!({ "ingest": { "host": host } }))
+        })
+        .as_ref()
+}
+
 impl IngestValidator {
     /// Drive one input event through the validator. Returns the per-row
     /// outcomes the event triggered: empty when the event is just buffered,
@@ -2111,8 +2322,10 @@ impl IngestValidator {
     }
 
     /// Final flush at end-of-batch. Closes the in-flight substream and
-    /// drains the pending-flush buffer.
-    pub async fn finish(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
+    /// drains the pending-flush buffer. Returns the per-row outcomes (for
+    /// the wire layer) alongside the honest per-table counts (for
+    /// `IngestSummary::add_batch`).
+    pub async fn finish(&mut self, store: &Store) -> Result<(Vec<RowOutcome>, BatchCounts)> {
         self.close_current_substream();
         self.flush(store).await
     }
@@ -2123,9 +2336,9 @@ impl IngestValidator {
     /// happens via the BATCH_SIZE check in `ingest_adapter`. The current
     /// in-flight substream stays buffered - close it explicitly via
     /// [`Self::finish`] or by feeding the next Session event.
-    pub async fn flush(&mut self, store: &Store) -> Result<Vec<RowOutcome>> {
+    pub async fn flush(&mut self, store: &Store) -> Result<(Vec<RowOutcome>, BatchCounts)> {
         if self.completed.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), BatchCounts::default()));
         }
         let completed = std::mem::take(&mut self.completed);
         store.upsert_session_batch(completed).await
@@ -2165,6 +2378,7 @@ impl IngestValidator {
                     reason: None,
                     reason_key: Some(DROP_REASON_EMPTY_SOURCE_AGENT),
                 }),
+                searchable: false,
             }]);
         }
         if trimmed.len() != session.source_agent.len() {
@@ -2186,6 +2400,7 @@ impl IngestValidator {
                     reason: None,
                     reason_key: Some(DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION),
                 }),
+                searchable: false,
             }]);
         }
 
@@ -2214,7 +2429,7 @@ impl IngestValidator {
         });
     }
 
-    fn push_message(&mut self, index: usize, message: Message) -> Vec<RowOutcome> {
+    fn push_message(&mut self, index: usize, mut message: Message) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(message.session_id().to_owned()),
             Value::String(message.id().to_owned()),
@@ -2258,6 +2473,20 @@ impl IngestValidator {
                 None,
                 DROP_REASON_DUPLICATE_MESSAGE_ID,
             )];
+        }
+        // `options.pond` is core-owned (spec.md#model-pond-options): stripped
+        // and restamped at ingest so neither adapters nor wire clients can
+        // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
+        // never restamps stored rows.
+        match ingest_host_stamp() {
+            Some(stamp) => {
+                message
+                    .options_mut()
+                    .insert("pond".to_owned(), stamp.clone());
+            }
+            None => {
+                message.options_mut().remove("pond");
+            }
         }
         self.flush_current_message();
         self.current_message = Some(BufferedMessage {
@@ -2370,6 +2599,7 @@ fn error_outcome(
             reason: None,
             reason_key: Some(reason_key),
         }),
+        searchable: false,
     }
 }
 
@@ -2397,38 +2627,93 @@ fn error_outcomes_for_substream(
             reason,
             reason_key: Some(reason_key),
         }),
+        searchable: false,
     }]
 }
 
-/// Batched-path success helper: every row in a substream takes the same
-/// status (the batch-level `Inserted` vs `Matched` decision from
-/// `merge_insert.num_inserted_rows`).
+/// Batched-path success helper. Each row's Inserted/Matched status is read
+/// from the pre-existence sets captured by `upsert_session_batch` before its
+/// `merge_insert` calls, so the per-row outcome is honest (spec.md#adapter-integrity-additive-sync).
+/// Also accumulates the per-table totals into `counts` so the CLI summary
+/// gets the same truth without re-walking the outcomes.
 fn success_outcomes_for_substream(
     session_index: usize,
     session: &Session,
     messages: &[BufferedMessage],
-    status: UpsertStatus,
+    existing_sessions: &std::collections::HashMap<String, Session>,
+    existing_message_pks: &HashSet<(String, String)>,
+    existing_part_pks: &HashSet<(String, String, String)>,
+    counts: &mut BatchCounts,
 ) -> Vec<RowOutcome> {
+    let session_was_present = existing_sessions.contains_key(&session.id);
+    let session_status = if session_was_present {
+        counts.sessions_matched += 1;
+        UpsertStatus::Matched
+    } else {
+        counts.sessions_inserted += 1;
+        UpsertStatus::Inserted
+    };
+
     let mut outcomes = Vec::with_capacity(1 + messages.len());
     outcomes.push(success_outcome(
         session_index,
         "session",
         Value::String(session.id.clone()),
-        status,
+        session_status,
+        false,
     ));
     for buffered in messages {
-        let pk = Value::Array(vec![
-            Value::String(buffered.message.session_id().to_owned()),
-            Value::String(buffered.message.id().to_owned()),
-        ]);
-        outcomes.push(success_outcome(buffered.index, "message", pk, status));
+        let key = (
+            buffered.message.session_id().to_owned(),
+            buffered.message.id().to_owned(),
+        );
+        let searchable = buffered.search_text.is_some();
+        let message_status = if existing_message_pks.contains(&key) {
+            counts.messages_matched_total += 1;
+            if searchable {
+                counts.messages_matched_searchable += 1;
+            }
+            UpsertStatus::Matched
+        } else {
+            counts.messages_inserted_total += 1;
+            if searchable {
+                counts.messages_inserted_searchable += 1;
+            }
+            UpsertStatus::Inserted
+        };
+        let pk = Value::Array(vec![Value::String(key.0), Value::String(key.1)]);
+        outcomes.push(success_outcome(
+            buffered.index,
+            "message",
+            pk,
+            message_status,
+            searchable,
+        ));
         for part in &buffered.parts {
+            let part_key = (
+                part.part.session_id.clone(),
+                part.part.message_id.clone(),
+                part.part.id.clone(),
+            );
+            let part_status = if existing_part_pks.contains(&part_key) {
+                counts.parts_matched += 1;
+                UpsertStatus::Matched
+            } else {
+                counts.parts_inserted += 1;
+                UpsertStatus::Inserted
+            };
             let part_pk = Value::Array(vec![
-                Value::String(part.part.session_id.clone()),
-                Value::String(part.part.message_id.clone()),
-                Value::String(part.part.id.clone()),
+                Value::String(part_key.0),
+                Value::String(part_key.1),
+                Value::String(part_key.2),
             ]);
-            outcomes.push(success_outcome(part.index, "part", part_pk, status));
+            outcomes.push(success_outcome(
+                part.index,
+                "part",
+                part_pk,
+                part_status,
+                false,
+            ));
         }
     }
     outcomes
@@ -2439,6 +2724,7 @@ fn success_outcome(
     kind: &'static str,
     pk: Value,
     status: UpsertStatus,
+    searchable: bool,
 ) -> RowOutcome {
     let status = match status {
         UpsertStatus::Inserted => OutcomeStatus::Inserted,
@@ -2450,6 +2736,7 @@ fn success_outcome(
         pk,
         status,
         error: None,
+        searchable,
     }
 }
 
@@ -2611,11 +2898,16 @@ pub struct SessionViewParams<'a> {
     pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
+    pub session_from: SessionFrom,
 }
 
 #[derive(Debug, Clone)]
 pub struct MessageViewParams<'a> {
     pub context_depth: usize,
+    /// Which siblings fill the context window: conversational (default)
+    /// keeps the window on the human/model exchange; complete/verbatim
+    /// include system/tool carriers.
+    pub mode: ResponseMode,
     pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
@@ -2798,11 +3090,11 @@ pub(crate) const PARTS: &str = "parts";
 
 /// FTS index name on `messages.search_text`. Stable so status and index
 /// creation name the same index.
-pub(crate) const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
+pub const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// IVF_PQ index name on `messages.vector` (spec.md#search). Stable so the
 /// activation check and index creation name the same index.
-pub(crate) const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
+pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 
 /// IVF_PQ tuning constants (spec.md#search):
 /// - num_bits = 8 (256 centroids per PQ subspace; needs >= 256 vectors)
@@ -3558,33 +3850,6 @@ fn uint64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
         .with_context(|| format!("column {name} is not UInt64"))
 }
 
-/// Map a character to its Unicode script class name, or `None` for
-/// non-alphabetic characters (digits, punctuation, whitespace). Used by
-/// `Store::text_script_histogram` to surface corpus language mix in
-/// `pond status`. The ranges cover the scripts most likely to appear in
-/// agent-session transcripts; everything else collapses to `"Other"` so the
-/// histogram stays bounded.
-fn classify_script(ch: char) -> Option<&'static str> {
-    if !ch.is_alphabetic() {
-        return None;
-    }
-    let code = ch as u32;
-    match code {
-        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some("Latin"),
-        0x0370..=0x03FF => Some("Greek"),
-        0x0400..=0x052F => Some("Cyrillic"),
-        0x0590..=0x05FF => Some("Hebrew"),
-        0x0600..=0x06FF | 0x0750..=0x077F => Some("Arabic"),
-        0x0900..=0x097F => Some("Devanagari"),
-        0x0E00..=0x0E7F => Some("Thai"),
-        0x3040..=0x309F => Some("Hiragana"),
-        0x30A0..=0x30FF => Some("Katakana"),
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF => Some("Han"),
-        0xAC00..=0xD7AF | 0x1100..=0x11FF => Some("Hangul"),
-        _ => Some("Other"),
-    }
-}
-
 pub(crate) fn string(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>> {
     let array = batch
         .column_by_name(name)
@@ -3973,6 +4238,85 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ingest_stamps_host_provenance_on_messages_and_strips_spoofed_pond_key()
+    -> anyhow::Result<()> {
+        // spec.md#model-pond-options: `options.pond` is core-owned. A stored
+        // message carries the process's host stamp (when resolvable) and never
+        // a client-supplied value; session and part options stay untouched.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("host-provenance");
+        let mut spoofed = ProviderOptions::new();
+        spoofed.insert("pond".to_owned(), json!({"ingest": {"host": "spoofed"}}));
+        let message = Message::User {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: spoofed,
+        };
+        let part = Part {
+            session_id: session.id.clone(),
+            id: "part-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value("hello".to_owned())),
+            },
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message))
+            .await?;
+        validator.push(&store, 2, IngestEvent::Part(part)).await?;
+        validator.finish(&store).await?;
+
+        let stored = store
+            .get_session(&session.id)
+            .await?
+            .expect("ingested session is readable");
+        assert!(
+            !stored.session.options.contains_key("pond"),
+            "session rows are not stamped (attribution derives from messages)"
+        );
+        let stored_message = &stored.messages[0].message;
+        match ingest_host_stamp() {
+            Some(stamp) => {
+                assert_eq!(
+                    stored_message.options().get("pond"),
+                    Some(stamp),
+                    "stored message carries the real stamp, never the spoof"
+                );
+                let host = stamp
+                    .pointer("/ingest/host")
+                    .and_then(Value::as_object)
+                    .expect("stamp shape is {ingest: {host: {..}}}");
+                assert!(!host.is_empty(), "an all-empty stamp must be None instead");
+                assert!(
+                    host.values()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+                    "stamp fields are omitted when unavailable, never empty: {host:?}"
+                );
+            }
+            None => assert!(
+                stored_message.options().get("pond").is_none(),
+                "with no resolvable stamp the spoofed key is still stripped"
+            ),
+        }
+        assert!(
+            !stored.messages[0].parts[0].options.contains_key("pond"),
+            "part rows are not stamped (covered by their message's stamp)"
+        );
+
+        Ok(())
+    }
+
     /// Regression: compact_files on `parts` with the blob column tripped a
     /// Lance v7.0.0-beta.16 dispatch bug under `lance.blob.v2`. Two upsert
     /// batches give compact fragments to merge; every `FileData` variant
@@ -4041,7 +4385,10 @@ mod tests {
         ];
         store.upsert_parts(&batch_b).await?;
 
-        store.optimize_indices(None, None).await?.into_result()?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
 
         Ok(())
     }
@@ -4208,6 +4555,116 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batched_flush_attributes_new_messages_on_existing_session() -> anyhow::Result<()> {
+        // Regression guard: re-ingesting an existing session with NEW
+        // messages must surface as sessions_inserted=0, messages_inserted_*>0
+        // on `BatchCounts`, and per-row outcomes must mark the new message
+        // rows `Inserted` while the session row is `Matched`. The prior
+        // implementation derived all per-row statuses from the batch-level
+        // session inserted count, which silently flipped the new messages
+        // into `Matched` (visible as "up to date" in the CLI bar tail).
+        use crate::wire::Provenance;
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = base_session();
+
+        let text_part = |part_id: &str, message_id: &str, body: &str| Part {
+            session_id: session.id.clone(),
+            id: part_id.to_owned(),
+            message_id: message_id.to_owned(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value(body.to_owned())),
+            },
+        };
+        let user_message = |id: &str| Message::User {
+            id: id.to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+
+        // First pass: 2 messages land fresh.
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(user_message("m1")))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Part(text_part("p1", "m1", "alpha")))
+            .await?;
+        validator
+            .push(&store, 3, IngestEvent::Message(user_message("m2")))
+            .await?;
+        validator
+            .push(&store, 4, IngestEvent::Part(text_part("p2", "m2", "beta")))
+            .await?;
+        let (_first_outcomes, first_counts) = validator.finish(&store).await?;
+        assert_eq!(first_counts.sessions_inserted, 1);
+        assert_eq!(first_counts.messages_inserted_total, 2);
+        assert_eq!(first_counts.messages_inserted_searchable, 2);
+
+        // Second pass: same session id, 3 NEW messages.
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        for (idx, mid) in ["m3", "m4", "m5"].iter().enumerate() {
+            let pid = format!("p{}", idx + 3);
+            validator
+                .push(&store, idx * 2 + 1, IngestEvent::Message(user_message(mid)))
+                .await?;
+            validator
+                .push(
+                    &store,
+                    idx * 2 + 2,
+                    IngestEvent::Part(text_part(&pid, mid, "gamma")),
+                )
+                .await?;
+        }
+        let (second_outcomes, second_counts) = validator.finish(&store).await?;
+
+        assert_eq!(
+            second_counts.sessions_inserted, 0,
+            "existing session row must report as Matched, not Inserted",
+        );
+        assert_eq!(second_counts.sessions_matched, 1);
+        assert_eq!(
+            second_counts.messages_inserted_total, 3,
+            "the three NEW messages must register as Inserted in BatchCounts",
+        );
+        assert_eq!(
+            second_counts.messages_inserted_searchable, 3,
+            "all three new messages carry conversational text -> searchable",
+        );
+        assert_eq!(second_counts.messages_matched_total, 0);
+        assert_eq!(second_counts.parts_inserted, 3);
+        assert_eq!(second_counts.parts_matched, 0);
+
+        // Per-row outcomes mirror the BatchCounts shape: the session row is
+        // Matched, every new message + part row is Inserted.
+        let session_outcome = second_outcomes
+            .iter()
+            .find(|outcome| outcome.kind == "session")
+            .expect("session-row outcome present");
+        assert_eq!(session_outcome.status, OutcomeStatus::Matched);
+        for outcome in &second_outcomes {
+            if outcome.kind == "message" || outcome.kind == "part" {
+                assert_eq!(
+                    outcome.status,
+                    OutcomeStatus::Inserted,
+                    "new row must be Inserted, got: {outcome:?}",
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Ingest `count` synthetic messages spread across a handful of sessions
     /// and projects, each with conversational `search_text`. Returns the store
     /// and the message keys in `msg-{i}` order; every `vector` starts null.
@@ -4322,7 +4779,10 @@ mod tests {
         // emits `ScalarIndexQuery` whenever the index exists.
         let (store, keys) = store_with_messages(&temp, 4).await?;
         store.write_embeddings(&embedded(&keys)).await?;
-        store.optimize_indices(None, None).await?.into_result()?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
 
         let query = vec![0.01_f32; embedding_dim()];
         let plan = store

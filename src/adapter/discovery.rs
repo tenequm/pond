@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use dialoguer::{MultiSelect, theme::ColorfulTheme};
+use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -20,6 +20,29 @@ pub struct Candidate {
     pub name: String,
     pub hint: String,
     pub config: Value,
+}
+
+/// Probe every registered factory whose name is NOT already a key in
+/// `configured`. Used by `pond sync` to spot freshly-detectable adapters
+/// without re-prompting the operator about ones they already opted in or
+/// out of. Returns `Candidate`s in registry order.
+pub fn probe_unconfigured(
+    configured: &std::collections::BTreeMap<String, Value>,
+) -> Vec<Candidate> {
+    let Some(env) = Env::from_env() else {
+        return Vec::new();
+    };
+    super::registry()
+        .iter()
+        .filter(|factory| !configured.contains_key(factory.name()))
+        .filter_map(|factory| {
+            factory.probe_default(&env).map(|config| Candidate {
+                name: factory.name().to_owned(),
+                hint: hint_for(&config),
+                config,
+            })
+        })
+        .collect()
 }
 
 /// Probe every registered factory (or just the one named in `focus`) under
@@ -109,14 +132,106 @@ pub fn prompt_and_persist(
         .into_iter()
         .filter_map(|index| candidates.get(index).cloned())
         .collect();
-    persist(config_path, &picks)?;
+    persist_accept(config_path, &picks)?;
     Ok(picks)
 }
 
 /// Write the picked sources back to `config.toml` under `[sources.<name>]`,
 /// preserving any existing user comments/formatting via `toml_edit`. Each
-/// pick's `config` JSON object is unpacked into TOML key/value pairs.
-fn persist(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
+/// pick's `config` JSON object is unpacked into TOML key/value pairs and
+/// `enabled = true` is inserted as the first field so `resolve_sources`
+/// picks it up.
+pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
+    let mut doc = open_or_init(config_path)?;
+    let sources = sources_table_mut(&mut doc)?;
+    for pick in picks {
+        let mut entry = json_to_toml_table(&pick.config).with_context(|| {
+            format!(
+                "pick for {:?} did not produce a TOML-shaped table",
+                pick.name
+            )
+        })?;
+        prepend_enabled(&mut entry, true);
+        sources.insert(&pick.name, Item::Table(entry));
+    }
+    std::fs::write(config_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+/// Outcome of a per-adapter `Confirm` prompt during `pond sync`. `enable`
+/// is the answer to "should this adapter be enabled?"; `sync_now` is the
+/// follow-up "should we sync it this run?" (only meaningful when
+/// `enable == true`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptOutcome {
+    pub candidate: Candidate,
+    pub enable: bool,
+    pub sync_now: bool,
+}
+
+/// Prompt the operator about each freshly-detected unconfigured adapter:
+/// "Enable X?" and, on accept, "Sync X now?". When `auto_accept` is true
+/// (the operator passed `--yes`) every prompt is skipped and answered
+/// yes/yes. Returns the per-adapter outcomes.
+pub fn prompt_each(
+    candidates: &[Candidate],
+    auto_accept: bool,
+) -> anyhow::Result<Vec<PromptOutcome>> {
+    let mut out = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let label = if candidate.hint.is_empty() {
+            candidate.name.clone()
+        } else {
+            format!("{} ({})", candidate.name, candidate.hint)
+        };
+        let (enable, sync_now) = if auto_accept {
+            (true, true)
+        } else {
+            let enable = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("Enable {label}?"))
+                .default(true)
+                .interact()
+                .context("enable prompt failed")?;
+            let sync_now = if enable {
+                Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!("Sync {} now?", candidate.name))
+                    .default(true)
+                    .interact()
+                    .context("sync-now prompt failed")?
+            } else {
+                false
+            };
+            (enable, sync_now)
+        };
+        out.push(PromptOutcome {
+            candidate: candidate.clone(),
+            enable,
+            sync_now,
+        });
+    }
+    Ok(out)
+}
+
+/// Persist `[sources.<name>] enabled = false` for adapters the operator
+/// declined during a probe prompt. Keeps the decline sticky across runs.
+pub fn persist_decline(config_path: &Path, names: &[&str]) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut doc = open_or_init(config_path)?;
+    let sources = sources_table_mut(&mut doc)?;
+    for name in names {
+        let mut entry = Table::new();
+        prepend_enabled(&mut entry, false);
+        sources.insert(name, Item::Table(entry));
+    }
+    std::fs::write(config_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn open_or_init(config_path: &Path) -> anyhow::Result<DocumentMut> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config dir {}", parent.display()))?;
@@ -130,28 +245,41 @@ fn persist(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
     let mut doc: DocumentMut = existing
         .parse()
         .with_context(|| format!("failed to parse {} as TOML", config_path.display()))?;
-
     if !doc.contains_key("sources") {
         let mut table = Table::new();
         table.set_implicit(true);
         doc.insert("sources", Item::Table(table));
     }
-    let Some(sources) = doc["sources"].as_table_mut() else {
-        bail!("config.toml has a `sources` value that is not a table");
-    };
-    for pick in picks {
-        let entry = json_to_toml_table(&pick.config).with_context(|| {
-            format!(
-                "pick for {:?} did not produce a TOML-shaped table",
-                pick.name
-            )
-        })?;
-        sources.insert(&pick.name, Item::Table(entry));
-    }
+    Ok(doc)
+}
 
-    std::fs::write(config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
+fn sources_table_mut(doc: &mut DocumentMut) -> anyhow::Result<&mut Table> {
+    doc["sources"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config.toml has a `sources` value that is not a table"))
+}
+
+fn prepend_enabled(table: &mut Table, value: bool) {
+    use toml_edit::value as tv;
+    let implicit = table.is_implicit();
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+    let mut existing: Vec<(String, Item)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        if key == "enabled" {
+            continue;
+        }
+        if let Some(item) = table.remove(&key) {
+            existing.push((key, item));
+        }
+    }
+    table.remove("enabled");
+    let mut fresh = Table::new();
+    fresh.set_implicit(implicit);
+    fresh.insert("enabled", tv(value));
+    for (key, item) in existing {
+        fresh.insert(&key, item);
+    }
+    *table = fresh;
 }
 
 /// Convert a JSON object into a `toml_edit::Table`. Factories produce JSON
@@ -233,6 +361,32 @@ mod tests {
         assert!(
             msg.contains("not a terminal"),
             "error should mention the non-tty branch: {msg}",
+        );
+    }
+
+    #[test]
+    fn persist_accept_and_decline_write_enabled_first() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let accept = Candidate {
+            name: "claude-code".to_owned(),
+            hint: "/tmp/cc".to_owned(),
+            config: json!({ "path": "/tmp/cc" }),
+        };
+        persist_accept(&config_path, &[accept]).unwrap();
+        persist_decline(&config_path, &["opencode"]).unwrap();
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        // Accepted entry: discriminator on top, then the blob.
+        assert!(
+            body.contains("[sources.claude-code]")
+                && body.contains("enabled = true")
+                && body.contains("path = \"/tmp/cc\""),
+            "expected accepted entry; got: {body}",
+        );
+        // Declined entry: discriminator only, no path leak.
+        assert!(
+            body.contains("[sources.opencode]") && body.contains("enabled = false"),
+            "expected declined entry; got: {body}",
         );
     }
 }

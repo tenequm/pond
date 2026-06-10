@@ -115,6 +115,15 @@ impl Message {
         }
     }
 
+    pub fn options_mut(&mut self) -> &mut ProviderOptions {
+        match self {
+            Self::System { options, .. }
+            | Self::User { options, .. }
+            | Self::Assistant { options, .. }
+            | Self::Tool { options, .. } => options,
+        }
+    }
+
     pub fn system_content(&self) -> Option<&str> {
         match self {
             // Two layers of `as_deref`: the outer `Option<Extracted<String>>`
@@ -328,8 +337,10 @@ pub struct GetRequest {
     pub context_depth: usize,
     #[serde(default = "default_get_limit")]
     pub limit: usize,
-    /// Ignored in `message_id` mode (that mode always returns the target with
-    /// its full parts, paginated).
+    /// Session mode: how much of each message to materialize. Message mode:
+    /// which siblings fill the context window (conversational by default;
+    /// complete/verbatim include system/tool carriers). The target message
+    /// always returns its full parts regardless.
     #[serde(default)]
     pub response_mode: ResponseMode,
     /// Exclusive continuation anchor: last `message_id` in session mode, last
@@ -337,6 +348,11 @@ pub struct GetRequest {
     /// enough state - no opaque cursor.
     #[serde(default)]
     pub after_id: Option<String>,
+    /// Session mode only: which end to read `limit` messages from - `start`
+    /// (oldest, default) or `end` (most recent). Results stay chronological;
+    /// ignored in message mode.
+    #[serde(default)]
+    pub session_from: SessionFrom,
 }
 
 /// How much of each message `pond_get` materializes (spec.md#protocol).
@@ -351,6 +367,17 @@ pub enum ResponseMode {
     Complete,
     /// All messages + full parts inline (heaviest mode).
     Verbatim,
+}
+
+/// Which end of a session `pond_get` reads its page from (spec.md#protocol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionFrom {
+    /// Oldest messages first (the session's start).
+    #[default]
+    Start,
+    /// Most recent messages (the session's tail), still chronological.
+    End,
 }
 
 /// The session header is always present; `result` carries the mode-specific
@@ -599,15 +626,27 @@ pub struct SearchFilters {
     pub to_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Score floor; hits below it are dropped. Not an absence signal: present
+    /// and absent content score in overlapping bands (see
+    /// `docs/researches/embeddings.md`), so the default stays 0 and the
+    /// response's `searchable_in_scope` carries the honesty instead.
     // Skip the default 0.0 so an unfiltered cursor/request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
+    /// Include subagent sessions (`source_agent` like `claude-code/<name>`).
+    /// Default false: a search targets the human-facing main sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_subagents: bool,
 }
 
 impl SearchFilters {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero_f64(value: &f64) -> bool {
@@ -618,6 +657,12 @@ fn is_zero_f64(value: &f64) -> bool {
 pub struct SearchResponse {
     pub sessions: Vec<SearchSession>,
     pub matched_total: usize,
+    /// How many messages with conversational text the caller's filters left
+    /// in scope - the universe the search actually ran over. The absence
+    /// signal: 0 means the filters excluded everything before retrieval, and
+    /// a small value warns that "no relevant hits" covers a thin slice.
+    #[serde(default)]
+    pub searchable_in_scope: usize,
     pub has_more: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,

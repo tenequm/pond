@@ -21,18 +21,20 @@ use pond::{
     embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
-        AdapterStats, CleanupConfig, CorpusStats, EmbeddingProgress, LanceArchiveCounts,
-        LanceArchiveExport, LanceArchiveImport, OptimizeOutcome, RowTotals, Store,
+        AdapterStats, CorpusStats, EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport,
+        LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals,
+        Store,
     },
     substrate::{
-        IndexStatus, OptimizeEvent, OptimizeProgressFn, PhaseOutcome, TableOptimizeOutcome,
-        TableSizes,
+        IndexStatus, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn, PhaseOutcome,
+        TableSizes, default_cleanup_older_than, index_lag_threshold,
     },
     transport::{self, AppState},
     wire::{
         self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
         PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
         SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
+        SessionFrom,
     },
 };
 
@@ -103,6 +105,31 @@ impl From<CliResponseMode> for ResponseMode {
         }
     }
 }
+
+/// CLI surface for `pond sql --output`. Maps to `sql::Mode` / `sql::Format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliSqlOutput {
+    Table,
+    Json,
+    Ndjson,
+    Parquet,
+}
+
+/// CLI surface for `pond get --from`. Maps 1:1 to wire `SessionFrom`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSessionFrom {
+    Start,
+    End,
+}
+
+impl From<CliSessionFrom> for SessionFrom {
+    fn from(value: CliSessionFrom) -> Self {
+        match value {
+            CliSessionFrom::Start => SessionFrom::Start,
+            CliSessionFrom::End => SessionFrom::End,
+        }
+    }
+}
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -137,6 +164,11 @@ fn parse_data_dir(input: &str) -> anyhow::Result<Url> {
 #[derive(Debug, Parser)]
 #[command(name = "pond", version, about = "Session storage and retrieval")]
 struct Cli {
+    /// `-v` / `-vv` / `-vvv` raise the tracing log level; `-q` / `-qq` lower
+    /// it. The display layout itself is independent of this knob - see
+    /// per-command flags like `pond status --adapters` for that.
+    #[command(flatten)]
+    verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::WarnLevel>,
     #[command(subcommand)]
     command: Command,
 }
@@ -149,9 +181,11 @@ enum Command {
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Include detailed per-index and per-project rows.
+        /// Show one section per adapter, including the per-project tables
+        /// and per-intent index detail. Implies `--include-subagents` so the
+        /// rollup reconciles with the data-dir row counts above.
         #[arg(long)]
-        verbose: bool,
+        adapters: bool,
         /// Show one section per `source_agent` (including sub-agents like
         /// `claude-code/general-purpose`). Default rolls sessions up to the
         /// main agent only.
@@ -178,6 +212,10 @@ enum Command {
         /// Re-embed stale rows after an embedding model change.
         #[arg(long)]
         force_embed: bool,
+        /// Auto-accept every probe prompt; non-interactive runs use this to
+        /// enable freshly-detected adapters without a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
         #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
         data_dir: Option<Url>,
         #[arg(long, env = "POND_CONFIG")]
@@ -258,6 +296,9 @@ enum Command {
         session_id: Option<String>,
         #[arg(long)]
         source_agent: Option<String>,
+        /// Include subagent sessions (excluded by default).
+        #[arg(long)]
+        include_subagents: bool,
         /// ISO date (YYYY-MM-DD) lower bound, inclusive.
         #[arg(long)]
         from_date: Option<String>,
@@ -267,7 +308,10 @@ enum Command {
         /// Restrict to a single role (`user` | `assistant` | `system` | `tool`).
         #[arg(long)]
         role: Option<String>,
-        /// Server-side score threshold; hits below this are dropped.
+        /// Server-side score threshold; hits below this are dropped. Not an
+        /// absence signal: present and absent content score in overlapping
+        /// bands (docs/researches/embeddings.md), so leave at 0 unless
+        /// trimming an over-long tail.
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
         /// Print Lance query plans instead of search results.
@@ -310,16 +354,25 @@ enum Command {
         /// Cap on returned messages (session mode) or parts (message mode).
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Session-mode depth: conversational (text + part summaries), complete
-        /// (all messages + summaries), or verbatim (full parts inline). Ignored
-        /// with `--message-id`.
+        /// Depth: conversational (text + part summaries), complete (all
+        /// messages + summaries), or verbatim (full parts inline). With
+        /// `--message-id` it selects which siblings fill the context window
+        /// (conversational by default).
         #[arg(
             long,
             value_enum,
             default_value_t = CliResponseMode::Conversational,
-            conflicts_with = "message_id"
         )]
         response_mode: CliResponseMode,
+        /// Session mode only: which end to read from - start (oldest, default)
+        /// or end (most recent, e.g. to recover context after compaction).
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliSessionFrom::Start,
+            conflicts_with = "message_id"
+        )]
+        session_from: CliSessionFrom,
         /// Continuation anchor from a prior response: last message id (session)
         /// or last part id (message). Exclusive lower bound.
         #[arg(long, value_name = "ID")]
@@ -347,6 +400,32 @@ enum Command {
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
+    /// Run ONE read-only SQL query over the stored corpus (sessions, messages,
+    /// parts). DataFusion / PostgreSQL-compatible. SELECT/WITH only; writes
+    /// and side-effecting statements are rejected. Same SQL surface as the
+    /// `pond_sql_query` MCP tool - see `schema://pond-sql` (via MCP) for the
+    /// full column list, indexed columns, pagination/drilling patterns, and
+    /// the function quick-reference.
+    Sql {
+        /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
+        sql: String,
+        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
+        data_dir: Option<Url>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+        /// Output format. table/json/ndjson go to stdout; parquet requires
+        /// `--output-file` (binary).
+        #[arg(long, value_enum, default_value_t = CliSqlOutput::Table)]
+        output: CliSqlOutput,
+        /// Inline row cap for table/json output. Default 100, max 1000.
+        /// Ignored for ndjson/parquet (which return every row).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Write the export bytes here instead of stdout (required for
+        /// `--output parquet`; optional for ndjson). Ignored for table/json.
+        #[arg(long, short = 'o')]
+        output_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -355,114 +434,41 @@ enum IndexCommand {
     Optimize {
         #[arg(long)]
         wait: bool,
-        /// Override the manifest-retention window for this run.
-        /// Accepts Ns/Nm/Nh/Nd (default: 1d). Implies aggressive deletion
-        /// (delete_unverified=true): reclaims files Lance's 7-day in-progress
-        /// guard would otherwise protect. Unsafe under concurrent writers;
-        /// see --vacuum for a one-shot full reclaim.
-        #[arg(long, value_parser = parse_retention_arg)]
+        /// Override the manifest-retention window for this run. Accepts
+        /// `Ns`/`Nm`/`Nh`/`Nd` (default: the configured `[maintenance]
+        /// .cleanup_older_than`, or `1d`). The cleanup pass stays safe
+        /// (`delete_unverified=false`), so this is OCC-coordinated and
+        /// safe to run while the cron is active; `0s` reclaims every
+        /// verified dead version up to the latest committed manifest.
+        #[arg(long, value_parser = parse_retention)]
         cleanup_older_than: Option<chrono::Duration>,
-        /// Reclaim every orphan immediately. Sugar for
-        /// `--cleanup-older-than 0s`. Same safety caveat applies.
-        #[arg(long, conflicts_with = "cleanup_older_than")]
-        vacuum: bool,
-        /// Skip the confirmation prompt when aggressive cleanup is enabled.
-        /// Required for non-interactive use of --vacuum / --cleanup-older-than.
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
     Rebuild {
         intent: Option<String>,
     },
 }
 
-/// `clap` value-parser for `--cleanup-older-than`. Accepts `Ns`/`Nm`/`Nh`/`Nd`
-/// (or bare `N` interpreted as seconds). Mirrors LanceDB's docs without taking
-/// a humantime dependency.
-fn parse_retention_arg(input: &str) -> Result<chrono::Duration, String> {
-    let trimmed = input.trim();
-    let split_at = trimmed
+fn parse_retention(raw: &str) -> Result<chrono::Duration, String> {
+    let trimmed = raw.trim();
+    let split = trimmed
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(trimmed.len());
-    let (num, unit) = trimmed.split_at(split_at);
-    let n: i64 = num
+    let (number, unit) = trimmed.split_at(split);
+    let amount: i64 = number
         .parse()
-        .map_err(|_| format!("invalid duration {input:?} (expected like `1h`, `30m`, `0s`)"))?;
+        .map_err(|_| format!("retention {raw:?}: leading number is not an integer"))?;
+    if amount < 0 {
+        return Err(format!("retention {raw:?} must be non-negative"));
+    }
     match unit {
-        "s" | "" => Ok(chrono::Duration::seconds(n)),
-        "m" => Ok(chrono::Duration::minutes(n)),
-        "h" => Ok(chrono::Duration::hours(n)),
-        "d" => Ok(chrono::Duration::days(n)),
-        _ => Err(format!(
-            "unknown duration unit {unit:?} in {input:?} (use s/m/h/d)"
+        "s" => Ok(chrono::Duration::seconds(amount)),
+        "m" => Ok(chrono::Duration::minutes(amount)),
+        "h" => Ok(chrono::Duration::hours(amount)),
+        "d" => Ok(chrono::Duration::days(amount)),
+        other => Err(format!(
+            "retention {raw:?}: unit {other:?} not recognized (use s/m/h/d)"
         )),
     }
-}
-
-fn format_retention(d: chrono::Duration) -> String {
-    let s = d.num_seconds();
-    if s == 0 {
-        return "0s".into();
-    }
-    if s.rem_euclid(86_400) == 0 {
-        return format!("{}d", s / 86_400);
-    }
-    if s.rem_euclid(3_600) == 0 {
-        return format!("{}h", s / 3_600);
-    }
-    if s.rem_euclid(60) == 0 {
-        return format!("{}m", s / 60);
-    }
-    format!("{s}s")
-}
-
-/// Resolve `--cleanup-older-than` / `--vacuum` / `--yes` into a `CleanupConfig`
-/// override (or `None` to use pond's safe default). Any explicit retention flag
-/// implies `delete_unverified=true` to bypass Lance's 7-day in-progress guard;
-/// that bypass is unsafe under concurrent writers, so a confirmation prompt
-/// fires unless `--yes` is set (non-interactive callers must pass `--yes`).
-fn resolve_cleanup_config(
-    cleanup_older_than: Option<chrono::Duration>,
-    vacuum: bool,
-    yes: bool,
-) -> anyhow::Result<Option<CleanupConfig>> {
-    let aggressive = vacuum || cleanup_older_than.is_some();
-    if !aggressive {
-        return Ok(None);
-    }
-    let older_than = if vacuum {
-        chrono::Duration::zero()
-    } else {
-        cleanup_older_than.unwrap_or_else(chrono::Duration::zero)
-    };
-    let cfg = CleanupConfig {
-        older_than,
-        delete_unverified: true,
-    };
-    let warning = format!(
-        "warning: cleanup_older_than={} with delete_unverified=true.\n\
-         warning: this deletes orphan files newer than Lance's 7-day in-progress guard.\n\
-         warning: ensure no other pond writer (serve, sync, embed) is active on this data dir.",
-        format_retention(cfg.older_than),
-    );
-    eprintln!("{}", pond::output::paint(&warning, pond::output::yellow()));
-    if yes {
-        return Ok(Some(cfg));
-    }
-    if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "refusing to run aggressive cleanup non-interactively; pass --yes to confirm"
-        );
-    }
-    let proceed = dialoguer::Confirm::new()
-        .with_prompt("Continue?")
-        .default(false)
-        .interact()
-        .context("failed to read confirmation")?;
-    if !proceed {
-        anyhow::bail!("aborted by operator");
-    }
-    Ok(Some(cfg))
 }
 
 /// Parse `--project <value>` into a `ProjectFilter`. `re:<pattern>` selects
@@ -490,36 +496,46 @@ enum OutputFormat {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    human_panic::setup_panic!();
 
     let cli = Cli::parse();
+    init_tracing(cli.verbose.tracing_level_filter());
+
     match cli.command {
         Command::Status {
             data_dir,
             config,
-            verbose,
+            adapters,
             include_subagents,
         } => {
+            // --adapters needs sub-agents broken out so the per-adapter
+            // rollup reconciles with the data-dir row counts above.
+            let include_subagents = include_subagents || adapters;
             let data_dir = resolve_data_dir(data_dir)?;
             let loaded = Config::load(config_path(config, &data_dir))?;
             let store =
                 Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
                     .await?;
-            let sizes = store.table_sizes().await?;
-            render_status_header(&data_dir, &sizes)?;
-            output(&format!(
-                "{} checking corpus, embeddings, indexes...",
-                pond::output::paint("status:", pond::output::dim()),
-            ))?;
-            // Sample is bounded so this remains O(sample) and `pond status`
-            // stays sub-second on a million-message corpus.
-            let (stats, index_status, embedding, scripts) = tokio::try_join!(
+            let (sizes, stats, index_status, embedding) = tokio::try_join!(
+                store.table_sizes(),
                 store.corpus_stats(include_subagents),
                 store.index_status(),
                 store.embedding_progress(),
-                store.text_script_histogram(2000),
             )?;
-            render_status_checks(&stats, &index_status, embedding, &scripts, verbose)?;
+            render_status_header(&data_dir, &sizes, &stats.totals)?;
+            render_status_checks(&stats, &index_status, embedding, adapters)?;
+            let probes = adapter::probe_unconfigured(&loaded.sources);
+            if !probes.is_empty() {
+                let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
+                output_err(&pond::output::paint(
+                    &format!(
+                        "hint     {} unconfigured adapter(s): {} - run `pond sync` to enable",
+                        probes.len(),
+                        names.join(", "),
+                    ),
+                    pond::output::dim(),
+                ))?;
+            }
         }
         Command::Sync {
             adapter,
@@ -528,12 +544,13 @@ async fn main() -> anyhow::Result<()> {
             only,
             skip,
             force_embed,
+            yes,
             data_dir,
             config,
         } => {
             let data_dir = resolve_data_dir(data_dir)?;
             let config_file = config_path(config, &data_dir);
-            let loaded = Config::load(&config_file)?;
+            let mut loaded = Config::load(&config_file)?;
             let store =
                 open_store_with_spinner(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
                     .await?;
@@ -544,23 +561,49 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let mut summary = SyncRunSummary::default();
+            let did_archive_import = import_from.is_some();
+            // `--source-dir` is an explicit one-off bypass of `[sources.<name>]`
+            // (resolve_sync_sources honors it directly), so skip the config-based
+            // re-enable - otherwise a probe-less adapter with no config entry
+            // (e.g. claude-ai-export) errors before the override is applied.
+            if stages.import
+                && !did_archive_import
+                && source_dir.is_none()
+                && let Some(name) = adapter.as_deref()
+            {
+                maybe_reenable_positional(&mut loaded, &config_file, name, yes).await?;
+            }
             if stages.import {
                 if let Some(path) = import_from {
                     summary.archive_import = Some(import_pond_archive(&store, &path).await?);
                 } else {
                     summary.ingest = Some(
-                        run_import_stage(&store, &loaded, &config_file, adapter, source_dir)
-                            .await?,
+                        run_import_stage(
+                            &store,
+                            &loaded,
+                            &config_file,
+                            adapter.clone(),
+                            source_dir,
+                        )
+                        .await?,
                     );
+                }
+            }
+            if stages.import && adapter.is_none() && !did_archive_import {
+                let extra = handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
+                match summary.ingest.as_mut() {
+                    Some(existing) => existing.merge(&extra),
+                    None => summary.ingest = Some(extra),
                 }
             }
             if stages.embed {
                 run_embed_stage(&store, force_embed).await?;
             }
             if stages.update_indexes {
-                run_update_indexes_stage(&store).await?;
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                run_update_indexes_stage(&store, &policy).await?;
             }
-            render_sync_summary(&summary)?;
+            render_sync_summary(&store, &summary).await?;
         }
         Command::Embed {
             data_dir,
@@ -575,7 +618,8 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
             if !summary.cancelled && summary.messages > 0 {
-                let outcome = run_update_indexes_stage(&store).await?;
+                let policy = configured_maintenance_policy(&config, None)?;
+                let outcome = run_update_indexes_stage(&store, &policy).await?;
                 if outcome.any_indices_failed() {
                     std::process::exit(1);
                 }
@@ -639,6 +683,7 @@ async fn main() -> anyhow::Result<()> {
             project,
             session_id,
             source_agent,
+            include_subagents,
             from_date,
             to_date,
             role,
@@ -666,6 +711,7 @@ async fn main() -> anyhow::Result<()> {
                     to_date,
                     role,
                     min_score,
+                    include_subagents,
                 },
                 limit,
                 cursor: None,
@@ -698,24 +744,10 @@ async fn main() -> anyhow::Result<()> {
                 IndexCommand::Optimize {
                     wait,
                     cleanup_older_than,
-                    vacuum,
-                    yes,
                 } => {
-                    let cleanup = resolve_cleanup_config(cleanup_older_than, vacuum, yes)?;
-                    if let Some(c) = cleanup {
-                        output(&format!(
-                            "{}  cleanup_older_than={}{}",
-                            pond::output::paint("optimize:", pond::output::dim()),
-                            format_retention(c.older_than),
-                            if c.delete_unverified {
-                                " (aggressive)"
-                            } else {
-                                ""
-                            },
-                        ))?;
-                    }
+                    let policy = configured_maintenance_policy(&loaded, cleanup_older_than)?;
                     let (progress, bar) = optimize_progress_bar();
-                    let outcome = store.optimize_indices(Some(progress), cleanup).await?;
+                    let outcome = store.optimize_indices(Some(progress), &policy).await?;
                     bar.finish_and_clear();
                     render_optimize_outcome(&outcome)?;
                     if wait {
@@ -743,6 +775,7 @@ async fn main() -> anyhow::Result<()> {
             context_depth,
             limit,
             response_mode,
+            session_from,
             after_id,
             format,
         } => {
@@ -759,10 +792,12 @@ async fn main() -> anyhow::Result<()> {
                 context_depth,
                 limit,
                 response_mode: ResponseMode::from(response_mode),
+                session_from: SessionFrom::from(session_from),
                 after_id,
             };
+            let view_from = request.session_from;
             let envelope = handlers::pond_get(&store, request).await;
-            if !render_get_envelope(format, &envelope)? {
+            if !render_get_envelope(format, &envelope, view_from)? {
                 std::process::exit(1);
             }
         }
@@ -849,27 +884,223 @@ async fn main() -> anyhow::Result<()> {
                 pond::output::paint("hint", pond::output::dim()),
             ))?;
         }
+        Command::Sql {
+            sql,
+            data_dir,
+            config,
+            output: format,
+            limit,
+            output_file,
+        } => {
+            if matches!(format, CliSqlOutput::Parquet) && output_file.is_none() {
+                bail!(
+                    "--output parquet requires --output-file <path> (binary, can't go to stdout)"
+                );
+            }
+            let data_dir = resolve_data_dir(data_dir)?;
+            let loaded = Config::load(config_path(config, &data_dir))?;
+            let store =
+                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
+                    .await?;
+            let mode = match format {
+                CliSqlOutput::Table => pond::sql::Mode::Inline,
+                CliSqlOutput::Json => pond::sql::Mode::InlineJson,
+                CliSqlOutput::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
+                CliSqlOutput::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
+            };
+            let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            let (sessions, messages, parts) = tokio::try_join!(
+                store.dataset(pond::substrate::Table::Sessions),
+                store.dataset(pond::substrate::Table::Messages),
+                store.dataset(pond::substrate::Table::Parts),
+            )?;
+            let tables = pond::sql::Tables {
+                sessions,
+                messages,
+                parts,
+            };
+            match pond::sql::run(&tables, &sql, mode, inline_rows).await {
+                Ok(pond::sql::Outcome::Inline(text)) => {
+                    output(&text)?;
+                }
+                Ok(pond::sql::Outcome::InlineJson(value)) => {
+                    // Pretty-print for the CLI - the structured payload is for
+                    // agents over MCP; humans reading stdout want it readable.
+                    output(&serde_json::to_string_pretty(&value)?)?;
+                }
+                Ok(pond::sql::Outcome::Export {
+                    bytes,
+                    format: _,
+                    rows,
+                    columns: _,
+                }) => match output_file {
+                    Some(path) => {
+                        fs::write(&path, &bytes)
+                            .with_context(|| format!("write export to {}", path.display()))?;
+                        output_err(&format!(
+                            "{} {} row(s), {} bytes -> {}",
+                            pond::output::paint("export:", pond::output::dim()),
+                            rows,
+                            bytes.len(),
+                            path.display()
+                        ))?;
+                    }
+                    None => {
+                        use std::io::Write;
+                        io::stdout().write_all(&bytes)?;
+                    }
+                },
+                Err(pond::sql::SqlError::Query(message)) => {
+                    output_err(&format!(
+                        "{} {message}",
+                        pond::output::paint("sql error:", pond::output::dim())
+                    ))?;
+                    std::process::exit(2);
+                }
+                Err(pond::sql::SqlError::Infra(error)) => {
+                    return Err(error);
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
     // Lance's IVF_PQ builder warns once per empty centroid during merge
     // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
     // It already handles the case - records a zero-sized partition and continues -
     // so the warning is benign log noise during index maintenance.
-    // POND_LOG / RUST_LOG still override this default.
-    let filter = EnvFilter::try_from_env("POND_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("warn,lance::index::vector::builder=error"));
-
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("{cli_level},lance::index::vector::builder=error"))
+    });
     fmt().with_env_filter(filter).with_writer(io::stderr).init();
 }
 
 #[allow(clippy::print_stdout)]
 fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
+}
+
+fn output_err(message: &str) -> anyhow::Result<()> {
+    pond::output::line_err(message)
+}
+
+/// Partition `outcomes` into accepts/declines, persist both, and refresh
+/// `loaded` from disk. Shared between the post-import probe sweep and the
+/// positional re-enable path.
+fn apply_outcomes(
+    loaded: &mut Config,
+    config_file: &Path,
+    outcomes: &[adapter::PromptOutcome],
+) -> anyhow::Result<usize> {
+    let accepts: Vec<adapter::Candidate> = outcomes
+        .iter()
+        .filter(|o| o.enable)
+        .map(|o| o.candidate.clone())
+        .collect();
+    let declines: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.enable)
+        .map(|o| o.candidate.name.as_str())
+        .collect();
+    if !accepts.is_empty() {
+        adapter::persist_accept(config_file, &accepts)?;
+    }
+    if !declines.is_empty() {
+        adapter::persist_decline(config_file, &declines)?;
+    }
+    if !accepts.is_empty() || !declines.is_empty() {
+        *loaded = Config::load(config_file)?;
+    }
+    Ok(accepts.len())
+}
+
+/// `pond sync <name>` positional override. When `<name>` is currently
+/// absent or `enabled = false`, re-probe just that one adapter and prompt
+/// (or auto-accept on `--yes`). Used to re-enable a previously-declined
+/// adapter without editing `config.toml` by hand.
+async fn maybe_reenable_positional(
+    loaded: &mut Config,
+    config_file: &Path,
+    name: &str,
+    auto_accept: bool,
+) -> anyhow::Result<()> {
+    use serde_json::Value;
+    use std::io::IsTerminal;
+    let present = loaded.sources.get(name);
+    let is_enabled = present
+        .and_then(|b| b.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if is_enabled {
+        return Ok(());
+    }
+    let candidates = adapter::discover(Some(name));
+    if candidates.is_empty() {
+        bail!("no `[sources.{name}]` and probe returned nothing; add the entry manually");
+    }
+    if !auto_accept && !std::io::stdin().is_terminal() {
+        bail!(
+            "source [{name}] is disabled and stdin is not a terminal; pass --yes or re-run on a TTY"
+        );
+    }
+    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
+    let accepted = apply_outcomes(loaded, config_file, &outcomes)?;
+    if accepted == 0 {
+        bail!("declined; nothing to sync");
+    }
+    Ok(())
+}
+
+/// After `pond sync`'s import stage, prompt the operator about any
+/// freshly-detectable adapter that has no `[sources.<name>]` section yet.
+/// `enabled = true`/`enabled = false` is persisted either way so the
+/// decision sticks; only the positional `pond sync <name>` re-prompts a
+/// previously-declined adapter. Non-TTY runs (and `--yes` runs without a
+/// TTY) emit a one-line stderr hint and continue without writing - the
+/// operator can re-run on a TTY to opt in/out.
+async fn handle_probe_prompt(
+    store: &Store,
+    loaded: &mut Config,
+    config_file: &Path,
+    auto_accept: bool,
+) -> anyhow::Result<IngestSummary> {
+    use std::io::IsTerminal;
+    let mut accumulated = IngestSummary::default();
+    let candidates = adapter::probe_unconfigured(&loaded.sources);
+    if candidates.is_empty() {
+        return Ok(accumulated);
+    }
+    let interactive = std::io::stdin().is_terminal();
+    if !interactive && !auto_accept {
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        output_err(&pond::output::paint(
+            &format!(
+                "hint     {} unconfigured adapter(s): {} - run `pond sync` on a TTY to enable",
+                candidates.len(),
+                names.join(", "),
+            ),
+            pond::output::dim(),
+        ))?;
+        return Ok(accumulated);
+    }
+    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
+    apply_outcomes(loaded, config_file, &outcomes)?;
+    for outcome in &outcomes {
+        if outcome.enable && outcome.sync_now {
+            let summary = run_import_stage(
+                store,
+                loaded,
+                config_file,
+                Some(outcome.candidate.name.clone()),
+                None,
+            )
+            .await?;
+            accumulated.merge(&summary);
+        }
+    }
+    Ok(accumulated)
 }
 
 /// Open the store with an indicatif spinner ticking while
@@ -994,28 +1225,28 @@ async fn run_import_stage(
 ) -> anyhow::Result<IngestSummary> {
     let sources = resolve_sync_sources(loaded, config_file, adapter.as_deref(), source_dir)?;
     if sources.is_empty() {
-        output(&format!(
-            "{} no sources configured or discovered",
-            pond::output::paint("import:", pond::output::dim()),
-        ))?;
+        let disabled = loaded.disabled_source_names();
+        let label = pond::output::paint("import:", pond::output::dim());
+        if disabled.is_empty() {
+            output(&format!(
+                "{label} no sources configured. Run `pond sync` on a TTY to detect adapters, or add `[sources.<name>]` blocks to {}.",
+                config_file.display(),
+            ))?;
+        } else {
+            output(&format!(
+                "{label} no enabled sources. Found {} disabled: {}. Add `enabled = true` to the section in {}, or re-enable interactively with `pond sync <name>`.",
+                disabled.len(),
+                disabled.join(", "),
+                config_file.display(),
+            ))?;
+        }
         return Ok(IngestSummary::default());
     }
     let watermarks = StoredWatermarks::new(store.session_last_ingested_at().await?);
     let mut total = IngestSummary::default();
     for (name, blob) in sources {
         let summary = sync_with_progress(store, &name, blob, &watermarks).await?;
-        total.inserted += summary.inserted;
-        total.matched += summary.matched;
-        total.dropped_events += summary.dropped_events;
-        total.dropped_sessions += summary.dropped_sessions;
-        total.skipped_files += summary.skipped_files;
-        total.skipped_fresh += summary.skipped_fresh;
-        total.skipped_empty += summary.skipped_empty;
-        total.storage_errors += summary.storage_errors;
-        total.truncated_values += summary.truncated_values;
-        for (reason, count) in summary.drop_reasons {
-            *total.drop_reasons.entry(reason).or_insert(0) += count;
-        }
+        total.merge(&summary);
     }
     Ok(total)
 }
@@ -1057,23 +1288,20 @@ async fn run_embed_stage_with_limit(
         None => backlog,
     };
     if bar_total == 0 && stale == 0 {
-        // Nothing to embed: one line, no bar, no device (embedder not loaded).
-        output(&format!(
-            "{}  0 new \u{b7} {}/{} \u{b7} {}",
-            pond::output::paint("embed:", pond::output::dim()),
-            format_thousands(progress.embedded as u64),
-            format_thousands(progress.total as u64),
-            short_model(progress.model),
-        ))?;
+        // No backlog and no stale rows: stage is silent. The summary's
+        // `indexes` line will confirm "semantic ready" downstream.
         return Ok(EmbedSummary::default());
     }
 
     let embedder = CandleEmbedder::load()?;
     let device = embedder.device().to_owned();
-    let bar = ProgressBar::new(bar_total as u64);
+    let bar = ProgressBar::with_draw_target(
+        Some(bar_total as u64),
+        indicatif::ProgressDrawTarget::stderr_with_hz(8),
+    );
     bar.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} embed [{elapsed_precise}] [{bar:24}] {pos}/{len} ({percent}%) {per_sec} eta {eta}",
+            "semantic embedding [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -1090,11 +1318,15 @@ async fn run_embed_stage_with_limit(
             std::process::exit(130);
         });
     }
+    let started = std::time::Instant::now();
     let bar_for_callback = bar.clone();
     let mut worker = EmbedWorker::new(store, &embedder)
         .with_cancel(cancel)
         .with_progress(move |progress: BatchProgress| {
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            let rate = progress.total_messages as f64 / secs;
             bar_for_callback.set_position(progress.total_messages as u64);
+            bar_for_callback.set_message(format!("{rate:.0} msgs/s"));
         });
     if force {
         worker = worker.include_stale();
@@ -1104,87 +1336,131 @@ async fn run_embed_stage_with_limit(
     }
     let summary = worker.run().await?;
     bar.finish_and_clear();
-    let covered = progress.embedded + summary.messages;
-    output(&format!(
-        "{}  {} new \u{b7} {}/{} \u{b7} {} ({}){}",
-        pond::output::paint("embed:", pond::output::dim()),
-        format_thousands(summary.messages as u64),
-        format_thousands(covered as u64),
-        format_thousands(progress.total as u64),
-        short_model(progress.model),
-        device,
-        if summary.cancelled {
-            " (interrupted)"
+    if summary.messages > 0 {
+        let label = if summary.cancelled {
+            "semantic embedding (interrupted)"
         } else {
-            ""
-        },
-    ))?;
+            "semantic embedding"
+        };
+        output(&format!(
+            "{}  +{} messages  ({})",
+            pond::output::paint(label, pond::output::dim()),
+            format_thousands(summary.messages as u64),
+            device,
+        ))?;
+    }
     Ok(summary)
 }
 
-async fn run_update_indexes_stage(store: &Store) -> anyhow::Result<OptimizeOutcome> {
+/// Resolve the `MaintenancePolicy` for one optimize/sync invocation: start
+/// from `[maintenance]` (or the in-process defaults), then apply the CLI
+/// `--cleanup-older-than` override when present.
+fn configured_maintenance_policy(
+    config: &Config,
+    cleanup_override: Option<chrono::Duration>,
+) -> anyhow::Result<MaintenancePolicy> {
+    let compaction_fragment_cap = config
+        .maintenance
+        .compaction_fragment_cap
+        .unwrap_or(pond::substrate::DEFAULT_COMPACTION_FRAGMENT_CAP);
+    let configured_cleanup = config
+        .maintenance
+        .cleanup_older_than
+        .as_deref()
+        .map(parse_retention)
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("invalid [maintenance].cleanup_older_than: {err}"))?;
+    let cleanup_older_than = cleanup_override
+        .or(configured_cleanup)
+        .unwrap_or_else(default_cleanup_older_than);
+    // Readers pin a manifest version per request; cleanup reclaiming a pinned
+    // version's files breaks in-flight reads on object-store backends.
+    if cleanup_older_than < chrono::Duration::hours(1) {
+        anyhow::bail!(
+            "cleanup retention below the 1h floor; set [maintenance].cleanup_older_than \
+             (or --cleanup-older-than) to 1h or longer"
+        );
+    }
+    Ok(MaintenancePolicy {
+        compaction_fragment_cap,
+        cleanup_older_than,
+    })
+}
+
+async fn run_update_indexes_stage(
+    store: &Store,
+    policy: &MaintenancePolicy,
+) -> anyhow::Result<OptimizeOutcome> {
     let (progress, bar) = optimize_progress_bar();
-    let outcome = store.optimize_indices(Some(progress), None).await?;
+    let outcome = store.optimize_indices(Some(progress), policy).await?;
     bar.finish_and_clear();
-    let per_table = outcome
-        .tables
-        .iter()
-        .map(|entry| format!("{} {}", entry.table.as_str(), index_entry_status(entry)))
-        .collect::<Vec<_>>()
-        .join(" \u{b7} ");
-    output(&format!(
-        "{}  {}",
-        pond::output::paint("index:", pond::output::dim()),
-        per_table,
-    ))?;
+    // No `index:` recap line: the `render_sync_summary` (or `pond status`)
+    // `indexes  text + semantic ready` line is the single source of truth
+    // for index health. Hints below still fire on real conflicts / failures.
     render_optimize_hints(&outcome)?;
     Ok(outcome)
 }
 
-/// Final one-line import recap. Embed and index each print their own concise
-/// line during their stage, so this is import-only: `sync: N new . M unchanged
-/// . K empty . D dropped`, with `errors` appended only when nonzero.
-fn render_sync_summary(summary: &SyncRunSummary) -> anyhow::Result<()> {
+/// Final recap of a `pond sync` run. Three-line shape:
+///
+/// ```text
+///
+/// indexes   text + semantic ready
+/// added     +44 sessions, +2,337 messages
+/// stored    8,460 sessions, 172,710 messages
+///
+/// (messages = searchable text rows; use -v for full counts)
+/// ```
+///
+/// `added` is suppressed when both deltas are zero (a no-op sync still
+/// always prints the `stored` line so an operator can confirm corpus
+/// state without re-running `pond status`). The trailing disclaimer
+/// goes to stderr per the rust-cli/book result-vs-meta discipline.
+async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
-    let line = if let Some(ingest) = &summary.ingest {
-        let unchanged = ingest.matched + ingest.skipped_fresh;
-        let dropped = ingest.dropped_events + ingest.dropped_sessions;
-        let errors = ingest.skipped_files + ingest.storage_errors;
-        let mut line = format!(
-            "{} new \u{b7} {} unchanged \u{b7} {} empty \u{b7} {} dropped",
-            format_thousands(ingest.inserted as u64),
-            format_thousands(unchanged as u64),
-            format_thousands(ingest.skipped_empty as u64),
-            format_thousands(dropped as u64),
-        );
-        if errors > 0 {
-            line.push_str(&format!(
-                " \u{b7} {} errors",
-                format_thousands(errors as u64)
-            ));
-        }
-        Some(line)
+    let (sessions_added, messages_added) = if let Some(ingest) = &summary.ingest {
+        (
+            ingest.sessions_inserted as u64,
+            ingest.messages_inserted_searchable as u64,
+        )
+    } else if let Some(imported) = &summary.archive_import {
+        (
+            imported.inserted.sessions as u64,
+            imported.inserted.messages as u64,
+        )
     } else {
-        summary.archive_import.as_ref().map(|imported| {
-            format!(
-                "{} rows imported from archive \u{b7} {} new",
-                format_thousands(
-                    (imported.rows.sessions + imported.rows.messages + imported.rows.parts) as u64,
-                ),
-                format_thousands(
-                    (imported.inserted.sessions
-                        + imported.inserted.messages
-                        + imported.inserted.parts) as u64,
-                ),
-            )
-        })
+        (0, 0)
     };
-    // No import stage ran (e.g. `--only embed`): the embed/index stages already
-    // printed their own lines, so there's nothing left to recap.
-    if let Some(line) = line {
-        output(&format!("{}  {line}", paint("sync:", dim())))?;
+
+    let (index_status, embedding, stats) = tokio::try_join!(
+        store.index_status(),
+        store.embedding_progress(),
+        store.corpus_stats(false),
+    )?;
+    let health = classify_index_health(&index_status, index_lag_threshold(), &embedding);
+
+    output("")?;
+    output(&render_indexes_line(&health))?;
+    if sessions_added + messages_added > 0 {
+        output(&format!(
+            "{}     +{} sessions, +{} messages",
+            paint("added", dim()),
+            format_thousands(sessions_added),
+            format_thousands(messages_added),
+        ))?;
     }
+    output(&format!(
+        "{}    {} sessions, {} messages",
+        paint("stored", dim()),
+        format_thousands(stats.totals.sessions),
+        format_thousands(embedding.total as u64),
+    ))?;
+    output_err("")?;
+    output_err(&paint(
+        "(messages = searchable text rows; use -v for full counts)",
+        dim(),
+    ))?;
     Ok(())
 }
 
@@ -1399,7 +1675,7 @@ async fn sync_with_progress(
         ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
     bar.set_style(
         ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} \u{b7} {wide_msg}",
+            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} sessions  {wide_msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("##-"),
@@ -1411,7 +1687,6 @@ async fn sync_with_progress(
     let mut messages: u64 = 0;
     let mut errors: u64 = 0;
     let mut drops: u64 = 0;
-    let mut skipped_empty: u64 = 0;
     let started = std::time::Instant::now();
     let bar_ref = &bar;
 
@@ -1467,7 +1742,10 @@ async fn sync_with_progress(
                     optional_reason = None;
                 }
                 SyncStatus::Empty => {
-                    skipped_empty += 1;
+                    // Sidecar/metadata files shrink the denominator so the
+                    // bar lands at `N/N sessions` instead of leaving a gap.
+                    let len = bar_ref.length().unwrap_or(0);
+                    bar_ref.set_length(len.saturating_sub(1));
                     status_label = "empty";
                     dropped_count = 0;
                     optional_reason = None;
@@ -1477,7 +1755,7 @@ async fn sync_with_progress(
             // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
             // the bulk are routine successes already counted by the bar's
             // pos/len/msg counters. `pond::sync` at INFO still carries the
-            // full per-session detail for `POND_LOG=pond::sync=info` runs.
+            // full per-session detail at `-v` verbosity.
             if !matches!(
                 outcome.status,
                 SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
@@ -1507,7 +1785,10 @@ async fn sync_with_progress(
                     "session done"
                 ),
             }
-            bar_ref.inc(1);
+            if !matches!(outcome.status, SyncStatus::Empty) {
+                // Empty already shrunk `len`; ticking `pos` would over-count.
+                bar_ref.inc(1);
+            }
             bar_ref.set_message(format_bar_message(
                 messages,
                 drops,
@@ -1518,22 +1799,35 @@ async fn sync_with_progress(
     })
     .await?;
 
-    let mut tail = format!("{} msgs", format_thousands(messages));
-    if skipped_empty > 0 {
-        tail.push_str(&format!(
-            " \u{b7} {} empty",
-            format_thousands(skipped_empty)
-        ));
-    }
-    if drops > 0 {
-        tail.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
-    }
-    if errors > 0 {
-        tail.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
-    }
-    tail.push_str("   done");
+    let tail = format_sync_outcome(&summary, drops, errors);
     bar.finish_with_message(tail);
     Ok(summary)
+}
+
+/// Frozen per-adapter bar tail after `sync_with_progress` finishes. Replaces
+/// the in-flight throughput display (`N msgs / X msgs/s`) with the outcome
+/// counts so scroll-back tells the story of what landed, not what was
+/// decoded. Empty/sidecar files are intentionally not surfaced here -
+/// per design they are part of normal operation, not a signal to the user.
+fn format_sync_outcome(summary: &IngestSummary, drops: u64, errors: u64) -> String {
+    let new_sessions = summary.sessions_inserted as u64;
+    let new_messages = summary.messages_inserted_searchable as u64;
+    let mut tail = if new_sessions == 0 && new_messages == 0 {
+        "up to date".to_owned()
+    } else {
+        format!(
+            "+{} sessions (+{} messages)",
+            format_thousands(new_sessions),
+            format_thousands(new_messages),
+        )
+    };
+    if drops > 0 {
+        tail.push_str(&format!("  {} dropped", format_thousands(drops)));
+    }
+    if errors > 0 {
+        tail.push_str(&format!("  {} err", format_thousands(errors)));
+    }
+    tail
 }
 
 /// One greppable per-session log line. Examples:
@@ -1575,26 +1869,19 @@ fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration)
     let secs = elapsed.as_secs_f64().max(0.001);
     let msg_per_sec = (messages as f64) / secs;
     let mut out = format!(
-        "{} msgs \u{b7} {:.0} msg/s",
+        "{} msgs  {:.0} msgs/s",
         format_thousands(messages),
         msg_per_sec,
     );
     // Only surface the trouble counters once they're nonzero; a clean run
     // stays short enough to fit the bar without truncation.
     if drops > 0 {
-        out.push_str(&format!(" \u{b7} {} dropped", format_thousands(drops)));
+        out.push_str(&format!("  {} dropped", format_thousands(drops)));
     }
     if errors > 0 {
-        out.push_str(&format!(" \u{b7} {} err", format_thousands(errors)));
+        out.push_str(&format!("  {} err", format_thousands(errors)));
     }
     out
-}
-
-/// Display form of an embedding model id: the segment after the last `/`, so
-/// `intfloat/multilingual-e5-small` -> `multilingual-e5-small`. Org prefixes
-/// add width without information for the human-facing sync lines.
-fn short_model(id: &str) -> &str {
-    id.rsplit('/').next().unwrap_or(id)
 }
 
 /// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
@@ -1660,8 +1947,8 @@ async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
 
 /// Build the spinner + progress callback pair for index maintenance.
 /// `PhaseStart` updates the spinner so the operator sees what's running live;
-/// per-phase timing lands at `POND_LOG=pond=debug` rather than the default
-/// output, which carries one `index:` summary line instead.
+/// per-phase timing lands at `-vv` (debug) verbosity rather than the default
+/// output, which carries one `indexes` line in the sync/status footer instead.
 fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
     let bar = ProgressBar::new_spinner();
     bar.set_style(
@@ -1746,21 +2033,6 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One table's combined status for the `pond sync` summary line: the worst of
-/// its two phases, painted. `ok` covers Ok/Noop/NotAttempted.
-fn index_entry_status(entry: &TableOptimizeOutcome) -> String {
-    use pond::output::{paint, red, yellow};
-    if entry.indices.is_failed() || entry.compaction.is_failed() {
-        paint("failed", red())
-    } else if matches!(entry.indices, PhaseOutcome::SkippedConflict)
-        || matches!(entry.compaction, PhaseOutcome::SkippedConflict)
-    {
-        paint("deferred", yellow())
-    } else {
-        "ok".to_owned()
-    }
-}
-
 fn phase_cell(outcome: &PhaseOutcome, _phase: &str) -> Cell {
     use pond::output::{dim, paint, red, yellow};
     match outcome {
@@ -1808,30 +2080,61 @@ fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_status_header(data_url: &Url, sizes: &TableSizes) -> anyhow::Result<()> {
+fn render_status_header(
+    data_url: &Url,
+    sizes: &TableSizes,
+    totals: &RowTotals,
+) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&paint("pond status", bold()))?;
     output(&format!("{}  {}", paint("data-dir", dim()), data_url))?;
 
     let mut table = new_table();
-    let total = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
-    for (label, bytes) in [
-        ("sessions", sizes.sessions),
-        ("messages", sizes.messages),
-        ("parts", sizes.parts),
-        ("other", sizes.other),
-    ] {
+    let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
+    let rows = [
+        (
+            "sessions",
+            sizes.sessions,
+            Some(totals.sessions),
+            sizes.sessions_data,
+        ),
+        (
+            "messages",
+            sizes.messages,
+            Some(totals.messages),
+            sizes.messages_data,
+        ),
+        ("parts", sizes.parts, Some(totals.parts), sizes.parts_data),
+        ("other", sizes.other, None, Default::default()),
+    ];
+    for (label, bytes, rows_opt, data) in rows {
+        // Surface superseded data versions only when they matter: the gap
+        // self-heals once manifests age past the cleanup retention window.
+        let dead_note = data
+            .dead()
+            .filter(|dead| *dead > 64 * 1024 * 1024 && *dead * 10 > data.on_disk)
+            .map(|dead| format!("{} pending cleanup", format_bytes(dead)))
+            .unwrap_or_default();
         table.add_row(vec![
             Cell::new(format!("  {label}")),
             Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
+            Cell::new(
+                rows_opt
+                    .map(|n| format!("{} rows", format_thousands(n)))
+                    .unwrap_or_default(),
+            )
+            .set_alignment(CellAlignment::Right),
+            Cell::new(dead_note).set_alignment(CellAlignment::Right),
         ]);
     }
     table.add_row(vec![
         Cell::new("  total").add_attribute(Attribute::Bold),
-        Cell::new(format_bytes(total))
+        Cell::new(format_bytes(total_bytes))
             .set_alignment(CellAlignment::Right)
             .add_attribute(Attribute::Bold),
+        Cell::new(""),
+        Cell::new(""),
     ]);
     output(&table.to_string())?;
     Ok(())
@@ -1843,87 +2146,20 @@ fn render_status_checks(
     stats: &CorpusStats,
     index_status: &[IndexStatus],
     embedding: EmbeddingProgress,
-    scripts: &[(String, usize)],
-    verbose: bool,
+    adapters: bool,
 ) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint, yellow};
+    use pond::output::{dim, paint, yellow};
 
-    let RowTotals {
-        sessions,
-        messages,
-        parts,
-    } = stats.totals;
     output("")?;
+    let health = classify_index_health(index_status, index_lag_threshold(), &embedding);
+    output(&render_indexes_line(&health))?;
     output(&format!(
-        "{}  {} sessions  {} messages  {} parts",
-        paint("totals", dim()),
-        paint(&format_thousands(sessions), bold()),
-        paint(&format_thousands(messages), bold()),
-        paint(&format_thousands(parts), bold()),
+        "{}    {} sessions, {} messages",
+        paint("stored", dim()),
+        format_thousands(stats.totals.sessions),
+        format_thousands(embedding.total as u64),
     ))?;
-    let pending = embedding.total.saturating_sub(embedding.embedded);
-    if embedding.total == 0 {
-        output(&format!(
-            "{}  no embeddable messages (model={})",
-            paint("embeddings", dim()),
-            embedding.model,
-        ))?;
-    } else if pending == 0 {
-        output(&format!(
-            "{}  {}/{} messages  model={}",
-            paint("embeddings", dim()),
-            paint(&format_thousands(embedding.embedded as u64), bold()),
-            paint(&format_thousands(embedding.total as u64), bold()),
-            embedding.model,
-        ))?;
-    } else {
-        output(&paint(
-            &format!(
-                "embeddings  {}/{} messages  model={} - run `pond sync --only embed` to fill the {} backlog",
-                format_thousands(embedding.embedded as u64),
-                format_thousands(embedding.total as u64),
-                embedding.model,
-                format_thousands(pending as u64),
-            ),
-            yellow(),
-        ))?;
-    }
-    let index_backlog: usize = index_status
-        .iter()
-        .map(|status| status.unindexed_rows)
-        .sum();
-    let existing_indices = index_status.iter().filter(|status| status.exists).count();
-    if index_status.is_empty() {
-        output(&format!(
-            "{}  no configured indexes",
-            paint("indexes", dim())
-        ))?;
-    } else if index_backlog == 0 && existing_indices == index_status.len() {
-        output(&format!(
-            "{}  {}/{} ready",
-            paint("indexes", dim()),
-            existing_indices,
-            index_status.len(),
-        ))?;
-    } else if index_backlog == 0 {
-        output(&format!(
-            "{}  {}/{} built; no unindexed rows",
-            paint("indexes", dim()),
-            existing_indices,
-            index_status.len(),
-        ))?;
-    } else {
-        output(&paint(
-            &format!(
-                "indexes  {}/{} built - {} unindexed row(s), run `pond sync --only update-indexes`",
-                existing_indices,
-                index_status.len(),
-                format_thousands(index_backlog as u64),
-            ),
-            yellow(),
-        ))?;
-    }
-    if verbose {
+    if adapters {
         output("")?;
         output(&paint("index detail", dim()))?;
         for status in index_status {
@@ -1942,60 +2178,119 @@ fn render_status_checks(
             }
         }
     }
-    // Surfaces the corpus's language mix so an agent can decide whether
-    // bilingual querying is worth attempting (cross-lingual recall is a
-    // caller-layer concern; pond does not translate internally - see the
-    // `pond_search` MCP description). Sample is bounded; total = sum of
-    // alphabetic characters in the sampled `search_text`.
-    if !scripts.is_empty() {
-        let total: usize = scripts.iter().map(|(_, count)| *count).sum();
-        if total > 0 {
-            let parts = scripts
-                .iter()
-                .filter(|(_, count)| *count > 0)
-                .map(|(name, count)| {
-                    let pct = (*count as f64 / total as f64) * 100.0;
-                    format!("{name} {pct:.0}%")
-                })
-                .collect::<Vec<_>>()
-                .join("  ");
-            output(&format!("{}  {parts}", paint("scripts", dim())))?;
-        }
-    }
-    if !stats.include_subagents && verbose {
-        output(&paint(
-            "  note: totals above include sub-agent sessions; the rollup below shows main-agent only. Pass `--include-subagents` for the per-agent breakdown.",
-            dim(),
-        ))?;
-    }
 
-    if !verbose {
+    if !adapters {
         output(&format!(
-            "{}  {} adapter(s), top projects hidden; pass `--verbose` for project tables",
+            "{}    {} adapter(s); pass `--adapters` for project tables",
             paint("sources", dim()),
             stats.adapters.len(),
         ))?;
-        return Ok(());
-    }
-
-    // Render adapters in registry order so the layout matches the discovery
-    // picker; adapters present in the data but not in the registry append at
-    // the bottom (defensive: catches deleted adapters whose data is still on
-    // disk).
-    let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
-        .adapters
-        .iter()
-        .map(|stat| (stat.adapter.as_str(), stat))
-        .collect();
-    for factory in adapter::registry() {
-        if let Some(stat) = by_name.remove(factory.name()) {
+    } else {
+        // Render adapters in registry order so the layout matches the discovery
+        // picker; adapters present in the data but not in the registry append at
+        // the bottom (defensive: catches deleted adapters whose data is still on
+        // disk).
+        let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
+            .adapters
+            .iter()
+            .map(|stat| (stat.adapter.as_str(), stat))
+            .collect();
+        for factory in adapter::registry() {
+            if let Some(stat) = by_name.remove(factory.name()) {
+                render_adapter_block(stat)?;
+            }
+        }
+        for stat in by_name.values() {
             render_adapter_block(stat)?;
         }
     }
-    for stat in by_name.values() {
-        render_adapter_block(stat)?;
-    }
+    output_err("")?;
+    output_err(&paint(
+        "(messages = searchable text rows; use -v for full counts)",
+        dim(),
+    ))?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum IndexHealthState {
+    NotBuilt,
+    Ready,
+    Pending(u64),
+}
+
+#[derive(Debug, Clone)]
+struct IndexHealth {
+    text: IndexHealthState,
+    semantic: IndexHealthState,
+}
+
+/// `Ready` means the substrate's lag guard is intentionally batching; queries
+/// fall through to the brute-force scan over a small remainder. `Pending(N)`
+/// means the trailing fragment count crossed the threshold and a fold is owed.
+fn classify_index_health(
+    statuses: &[IndexStatus],
+    lag_threshold: usize,
+    embedding: &EmbeddingProgress,
+) -> IndexHealth {
+    use IndexHealthState::*;
+
+    fn classify_one(status: &IndexStatus, lag_threshold: usize) -> IndexHealthState {
+        if !status.exists {
+            return NotBuilt;
+        }
+        if status.unindexed_rows == 0 || status.unindexed_fragments < lag_threshold {
+            Ready
+        } else {
+            Pending(status.unindexed_rows as u64)
+        }
+    }
+
+    let mut text = NotBuilt;
+    let mut semantic = NotBuilt;
+    for status in statuses {
+        match status.intent_name.as_str() {
+            MESSAGES_FTS_INDEX => text = classify_one(status, lag_threshold),
+            MESSAGES_VECTOR_INDEX => semantic = classify_one(status, lag_threshold),
+            _ => {}
+        }
+    }
+    // Semantic search misses unembedded rows even when IVF_PQ's own
+    // unindexed-fragments check passes.
+    let embed_backlog = embedding.total.saturating_sub(embedding.embedded);
+    if embed_backlog > 0 && matches!(semantic, Ready) {
+        semantic = Pending(embed_backlog as u64);
+    }
+    IndexHealth { text, semantic }
+}
+
+fn render_indexes_line(health: &IndexHealth) -> String {
+    use IndexHealthState::*;
+    use pond::output::{dim, paint, yellow};
+
+    let body = match (&health.text, &health.semantic) {
+        (Ready, Ready) => "text + semantic ready".to_owned(),
+        _ => {
+            let text_part = match &health.text {
+                Ready => "text ready".to_owned(),
+                Pending(n) => format!("text {} pending", format_thousands(*n)),
+                NotBuilt => "text not built".to_owned(),
+            };
+            let semantic_part = match &health.semantic {
+                Ready => "semantic ready".to_owned(),
+                Pending(n) => format!("semantic {} pending", format_thousands(*n)),
+                NotBuilt => "semantic below activation threshold".to_owned(),
+            };
+            format!("{text_part} . {semantic_part}")
+        }
+    };
+    let any_pending = matches!(health.text, Pending(_)) || matches!(health.semantic, Pending(_));
+    let label = if any_pending {
+        paint("indexes", yellow())
+    } else {
+        paint("indexes", dim())
+    };
+    format!("{label}   {body}")
 }
 
 fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
@@ -2084,7 +2379,11 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
     }
 }
 
-fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::Result<bool> {
+fn render_get_envelope(
+    format: OutputFormat,
+    envelope: &GetEnvelope,
+    session_from: SessionFrom,
+) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
             output(
@@ -2095,7 +2394,7 @@ fn render_get_envelope(format: OutputFormat, envelope: &GetEnvelope) -> anyhow::
         }
         OutputFormat::Pretty => match envelope {
             GetEnvelope::Success(response) => {
-                render_get_pretty(response)?;
+                render_get_pretty(response, session_from)?;
                 Ok(true)
             }
             GetEnvelope::Error(error) => {
@@ -2110,7 +2409,7 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&format!(
-        "{} {} matched {}  {} returned {}",
+        "{} {} matched {}  {} returned {}  {} {} searchable in scope",
         paint("search:", dim()),
         paint(&format_thousands(response.matched_total as u64), bold()),
         if response.matched_total == 1 {
@@ -2124,8 +2423,21 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
         } else {
             "sessions"
         },
+        paint("of", dim()),
+        paint(
+            &format_thousands(response.searchable_in_scope as u64),
+            bold()
+        ),
     ))?;
     if response.sessions.is_empty() {
+        // spec.md#search-absence-honesty: name the recovery when the scope
+        // itself is empty - the filters, not the query, produced the zero.
+        if response.searchable_in_scope == 0 {
+            output(
+                "scope is empty: the filters exclude every searchable message; widen or drop \
+                 project/date/role filters",
+            )?;
+        }
         return Ok(());
     }
     for (idx, session) in response.sessions.iter().enumerate() {
@@ -2216,7 +2528,7 @@ fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()>
     ))
 }
 
-fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
+fn render_get_pretty(response: &GetResponse, session_from: SessionFrom) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     render_session_header(&response.session)?;
@@ -2231,6 +2543,10 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
                 render_message_view(idx + 1, message, parts, false)?;
             }
             output("")?;
+            // Tail page: the remaining messages are *earlier*, before this page;
+            // after_id only pages forward, so label them "earlier" and omit the
+            // dead-end cursor (the start path keeps the forward after-id cursor).
+            let tail = matches!(session_from, SessionFrom::End);
             let mut footer = format!(
                 "{} {} messages",
                 paint("(total:", dim()),
@@ -2238,17 +2554,22 @@ fn render_get_pretty(response: &GetResponse) -> anyhow::Result<()> {
             );
             if *messages_remaining > 0 {
                 footer.push_str(&format!(
-                    " {} remaining {}",
+                    " {} {}",
                     paint(&format_thousands(*messages_remaining as u64), bold()),
-                    paint("[more]", dim()),
+                    paint(if tail { "earlier" } else { "remaining [more]" }, dim()),
                 ));
             }
             footer.push_str(&paint(")", dim()));
             output(&footer)?;
-            if *messages_remaining > 0
-                && let Some(last) = messages.last()
-            {
-                output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+            if *messages_remaining > 0 {
+                if tail {
+                    output(&paint(
+                        "session-from: start to read from the beginning",
+                        dim(),
+                    ))?;
+                } else if let Some(last) = messages.last() {
+                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
+                }
             }
         }
         GetResult::Message {

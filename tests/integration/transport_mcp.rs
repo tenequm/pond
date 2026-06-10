@@ -11,6 +11,7 @@ use pond::{
     embed::{EmbedWorker, Embedder},
     handlers::{IngestEvent, pond_ingest},
     sessions::{Store, embedding_dim},
+    substrate::MaintenancePolicy,
     transport::{AppState, mcp::PondMcp},
     wire::{IngestEnvelope, IngestRequest},
     wire::{Message, Part, PartKind, Provenance, Session},
@@ -144,7 +145,10 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
     );
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
 
     Ok(AppState {
         store: Arc::new(store),
@@ -203,7 +207,10 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         .await?;
     let search = tool_text(&result);
     assert!(
-        search.starts_with("pond_search: 1 matching messages, showing 1 hits from 1 sessions."),
+        search.starts_with(
+            "pond_search: 1 matching messages (1 searchable in scope), showing 1 hits from 1 \
+             sessions."
+        ),
         "search transcript header states the totals: {search}"
     );
     assert!(

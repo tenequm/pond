@@ -14,6 +14,7 @@ use pond::{
     handlers::pond_get,
     handlers::pond_search,
     sessions::{Store, embedding_dim},
+    substrate::MaintenancePolicy,
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, Role, SearchEnvelope,
@@ -67,7 +68,10 @@ async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedde
 
     let backend = FakeBackend;
     EmbedWorker::new(&store, &backend).run().await?;
-    store.optimize_indices(None, None).await?.into_result()?;
+    store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
     let embedder = LazyEmbedder::from_loaded(Arc::new(backend) as Arc<dyn Embedder>);
     Ok((store, embedder))
 }
@@ -98,6 +102,7 @@ fn get_request(session_id: &str) -> GetRequest {
         context_depth: 0,
         limit: 1000,
         response_mode: ResponseMode::Verbatim,
+        session_from: Default::default(),
         after_id: None,
     }
 }
@@ -163,6 +168,7 @@ fn get_request_text_only(session_id: &str) -> GetRequest {
         context_depth: 0,
         limit: 1000,
         response_mode: ResponseMode::Conversational,
+        session_from: Default::default(),
         after_id: None,
     }
 }
@@ -272,6 +278,58 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
             .all(|hit| hit.project.contains(project.as_str())),
     );
 
+    Ok(())
+}
+
+/// spec.md#search: a session-scoped hybrid search fuses per message, not per
+/// session root - root keying would collapse the response to exactly one hit
+/// no matter how many messages in the session match (the production
+/// false-negative pattern this guards against).
+#[tokio::test(flavor = "multi_thread")]
+async fn session_scoped_search_returns_per_message_hits() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
+    let phrase = corpus_phrase(&store).await?;
+
+    // Pick the session with the most searchable (embedded) hits in an
+    // unscoped search - it has at least two matchable messages.
+    let SearchEnvelope::Success(unscoped) =
+        pond_search(&store, &embedder, search_request(&phrase), &search_config()).await
+    else {
+        panic!("unscoped search must succeed");
+    };
+    let target = unscoped
+        .sessions
+        .iter()
+        .max_by_key(|s| s.session_messages_count)
+        .expect("unscoped search returns sessions")
+        .session_id
+        .clone();
+
+    let mut request = search_request(&phrase);
+    request.filters.session_id = Some(target.clone());
+    let SearchEnvelope::Success(response) =
+        pond_search(&store, &embedder, request, &search_config()).await
+    else {
+        panic!("session-scoped search must succeed");
+    };
+
+    assert_eq!(response.sessions.len(), 1, "one session in scope");
+    let session = &response.sessions[0];
+    assert_eq!(session.session_id, target);
+    assert!(
+        response.matched_total > 1,
+        "per-message fusion must surface more than the single root-collapsed hit; got {}",
+        response.matched_total
+    );
+    assert!(
+        session.matches.len() > 1,
+        "the session-scoped match cap widens to the requested limit; got {} matches",
+        session.matches.len()
+    );
+    // spec.md#search-absence-honesty: the scope count reflects the session's
+    // searchable messages, not the whole corpus.
+    assert!(response.searchable_in_scope >= response.matched_total);
     Ok(())
 }
 
@@ -479,6 +537,7 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             context_depth: 0,
             limit: 1000,
             response_mode: ResponseMode::Conversational,
+            session_from: Default::default(),
             after_id: None,
         },
     )
@@ -514,6 +573,7 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             context_depth: 0,
             limit: 1000,
             response_mode: ResponseMode::Conversational,
+            session_from: Default::default(),
             after_id: Some(after_id),
         },
     )
@@ -539,6 +599,193 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
             .iter()
             .all(|m| !first_ids.contains(m.id.as_str())),
         "after_id pages must be disjoint"
+    );
+
+    Ok(())
+}
+
+/// spec.md#protocol: message-mode context siblings follow `response_mode` -
+/// conversational by default, so system/tool carriers don't crowd the
+/// conversation out of the +-depth window; `complete` opts back in.
+#[tokio::test(flavor = "multi_thread")]
+async fn message_context_siblings_default_to_conversational() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, _embedder) = searchable_corpus(&temp).await?;
+
+    // Find a conversational target within reach of a carrier message.
+    let mut target_id = None;
+    'sessions: for session_id in store.session_ids().await? {
+        let mut request = get_request(&session_id);
+        request.response_mode = ResponseMode::Complete;
+        let GetEnvelope::Success(response) = pond_get(&store, request).await else {
+            continue;
+        };
+        let GetResult::Session { messages, .. } = response.result else {
+            continue;
+        };
+        for (idx, message) in messages.iter().enumerate() {
+            if message.text.is_none() {
+                continue; // carrier; need a conversational target
+            }
+            let lo = idx.saturating_sub(5);
+            let hi = (idx + 6).min(messages.len());
+            if messages[lo..hi].iter().any(|m| m.text.is_none()) {
+                target_id = Some(message.id.clone());
+                break 'sessions;
+            }
+        }
+    }
+    let target_id = target_id.expect("fixtures contain a carrier near a conversational message");
+
+    let message_request = |response_mode: ResponseMode| GetRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        session_id: None,
+        message_id: Some(target_id.clone()),
+        context_depth: 5,
+        limit: 1000,
+        response_mode,
+        session_from: Default::default(),
+        after_id: None,
+    };
+
+    let GetEnvelope::Success(default_response) =
+        pond_get(&store, message_request(ResponseMode::Conversational)).await
+    else {
+        panic!("message-mode get must succeed");
+    };
+    let GetResult::Message { siblings, .. } = default_response.result else {
+        panic!("message-mode result expected");
+    };
+    assert!(
+        siblings.iter().all(|m| m.text.is_some()),
+        "default context window must hold only conversational siblings"
+    );
+
+    let GetEnvelope::Success(complete_response) =
+        pond_get(&store, message_request(ResponseMode::Complete)).await
+    else {
+        panic!("complete-mode get must succeed");
+    };
+    let GetResult::Message { siblings, .. } = complete_response.result else {
+        panic!("message-mode result expected");
+    };
+    assert!(
+        siblings.iter().any(|m| m.text.is_none()),
+        "complete mode opts carriers back into the window"
+    );
+    Ok(())
+}
+
+/// `pond_get(session_from = "end")` returns the newest `limit` messages of a
+/// session in chronological order (the compaction-recovery path); `start`
+/// returns the oldest. The two are disjoint ends of the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn pond_get_session_from_end_returns_the_recent_tail() -> anyhow::Result<()> {
+    use chrono::{TimeZone, Utc};
+    use pond::wire::{
+        GetResult as WireGetResult, IngestRequest, Message, Provenance, ProviderOptions, Session,
+        SessionFrom,
+    };
+    use pond::{adapter, handlers};
+
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+
+    let session_id = "tail-session".to_owned();
+    let session = Session {
+        id: session_id.clone(),
+        parent_session_id: None,
+        parent_message_id: None,
+        source_agent: "claude-code".to_owned(),
+        created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        project: adapter::extract_str(&serde_json::json!({"x": "pond-tail"}), "x").unwrap(),
+        options: ProviderOptions::new(),
+    };
+    let mut events: Vec<pond::handlers::IngestEvent> =
+        vec![pond::handlers::IngestEvent::Session(session)];
+    for index in 0..5u32 {
+        let message_id = format!("tail-msg-{index}");
+        events.push(pond::handlers::IngestEvent::Message(Message::User {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, index + 1, 0).unwrap(),
+            options: ProviderOptions::new(),
+        }));
+        events.push(pond::handlers::IngestEvent::Part(pond::wire::Part {
+            session_id: session_id.clone(),
+            id: format!("tail-part-{index}"),
+            message_id,
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: pond::wire::PartKind::Text {
+                text: adapter::extract_str(
+                    &serde_json::json!({ "x": format!("message {index}") }),
+                    "x",
+                ),
+            },
+        }));
+    }
+    let envelope = handlers::pond_ingest(
+        &store,
+        IngestRequest {
+            protocol_version: pond::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            events,
+        },
+    )
+    .await;
+    assert!(
+        matches!(envelope, pond::wire::IngestEnvelope::Success(_)),
+        "ingest should succeed: {envelope:?}"
+    );
+
+    let request = |from: SessionFrom| GetRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        session_id: Some(session_id.clone()),
+        message_id: None,
+        context_depth: 0,
+        limit: 2,
+        response_mode: ResponseMode::Conversational,
+        session_from: from,
+        after_id: None,
+    };
+    let page = |envelope: GetEnvelope| -> (Vec<String>, usize) {
+        let GetEnvelope::Success(response) = envelope else {
+            panic!("get must succeed");
+        };
+        let WireGetResult::Session {
+            messages,
+            messages_remaining,
+            ..
+        } = response.result
+        else {
+            panic!("session-scope result expected");
+        };
+        (
+            messages.into_iter().map(|m| m.id).collect(),
+            messages_remaining,
+        )
+    };
+
+    let (end_ids, end_remaining) = page(pond_get(&store, request(SessionFrom::End)).await);
+    assert_eq!(
+        end_ids,
+        ["tail-msg-3", "tail-msg-4"],
+        "end returns the newest two, in chronological order"
+    );
+    assert_eq!(
+        end_remaining, 3,
+        "three older messages remain before the tail"
+    );
+
+    let (start_ids, _) = page(pond_get(&store, request(SessionFrom::Start)).await);
+    assert_eq!(
+        start_ids,
+        ["tail-msg-0", "tail-msg-1"],
+        "start returns the oldest two"
     );
 
     Ok(())
