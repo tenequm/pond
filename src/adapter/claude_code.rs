@@ -1171,7 +1171,12 @@ mod tests {
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
 
-    const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
+    // Manifest-dir anchored: unit tests must not depend on the process cwd
+    // (figment::Jail chdirs the whole test process while config tests run).
+    const FIXTURE_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/claude_code/projects"
+    );
 
     #[test]
     fn probe_default_finds_claude_projects_under_home() -> anyhow::Result<()> {

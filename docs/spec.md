@@ -185,6 +185,20 @@ b. **no-subsecond-freshness** {#lance-forward-compat-no-subsecond-freshness} - N
 
 c. **no-cross-shard-atomic-write** {#lance-forward-compat-no-cross-shard-atomic-write} - No write batch MAY span more than one primary-key family atomically; each batch is keyed on a single family. A sharded writer assigns each PK family to one shard, so cross-shard atomicity is structurally unavailable under sharding.
 
+### 3.9 Storage addresses and credentials
+
+Addresses are URLs; credentials are URL-scoped sets. There is no named-storage registry and no "active storage" process state - that design was considered and rejected: an address is a static infrastructure fact, not per-invocation state.
+
+**`storage-url-grammar`** {#storage-url-grammar} - A storage destination is one URL: a local path (`/abs`, `~/`, `file://`), `s3://bucket/prefix`, `s3+https://host/bucket/prefix` / `s3+http://host:port/bucket/prefix` (S3-compatible endpoints; TLS and `allow_http` are scheme-derived, never config), `gs://bucket/prefix`, `az://account/container/prefix`, or the test-only `memory://` / `shared-memory://`. The `s3+` form carries the endpoint inside the URL so it can never desync from the bucket - the out-of-band-endpoint failure class litestream patched three times. Embedded userinfo MUST be rejected at parse: argv, history, and logs are one leak class. Recognized query params (`creds`, `region`, `virtual_hosted_style_request`) are stripped before the URL reaches Lance and beat the matched set's same-named fields; an unrecognized param is a hard error.
+
+**`creds-scope-match`** {#creds-scope-match} - A credential set binds to a URL by match, never by activation: `?creds=<name>` pointer (missing set = error) > longest matching `scope` prefix > the single scope-less catch-all > none. Scopes compare canonicalized (scheme/host lowercased, default ports stripped), match only at `/` segment boundaries (`.../pond` does not match `.../pond-2`), and never across schemes; duplicate canonical scopes are a parse error, so ties cannot exist. A set matching no URL in a remote-touching invocation is named in a warning - misbinding must never be silent. Why match-not-activate: the git `[credential "url"]` / DuckDB scoped-secrets model gives multi-storage commands zero extra syntax and keeps rotation out of argv (pond's primary callers are cron and MCP, where the invocation is frozen).
+
+**`storage-configless`** {#storage-configless} - Every command MUST work with no config file: URLs plus env vars are a complete configuration. A URL that resolves to no set is passed with no credential options, so the ambient cloud SDK chain (instance profiles, task roles, OIDC, `aws sso login`) applies. Why: the disaster-recovery posture - restore and migrate must run on a machine where the file never existed - and the zero-config container/CI path.
+
+**`storage-env-mirror`** {#storage-env-mirror} - The env mirror is mechanical: `storage.path` <-> `POND_STORAGE_PATH`, `creds.<name>.<field>` <-> `POND_CREDS_<NAME>_<FIELD>`; env sets merge field-by-field over same-named file sets; `extra` has no env form. Set names MUST match `[a-z][a-z0-9]{0,15}` - field names contain underscores, so the name charset is what keeps the env grammar splittable. One precedence ladder everywhere: CLI flag > `POND_*` env > config file > ambient chain > built-in defaults.
+
+**`storage-redaction`** {#storage-redaction} - Secrets MUST NOT appear in URLs or CLI flags; they travel via config file, env, `<field>_file`, or `<field>_command` only (command output cached per process, one trailing newline stripped). Introspection redacts any field whose name contains `key` / `secret` / `token` / `password` (including `extra` keys); the `_file` / `_command` variants print literally - the path or command is the safe part.
+
 ---
 
 ## 4. Canonical model {#model}
@@ -549,6 +563,8 @@ The same handlers back a set of command-line verbs:
 - `pond mcp` - alias for `pond serve --transport stdio`.
 - `pond export` - write a compact `.pond` archive containing clean index-free Lance datasets plus a manifest. Embeddings remain data columns and are preserved.
 - `pond import <archive.pond>` - restore a compact archive into the current corpus. Existing rows are deduped through the same merge-insert path as adapter import.
+- `pond config show|path|check|schema` - introspection for Section 3.9: `show` prints the resolved config with redacted values (`storage-redaction`), per-field source attribution along the precedence ladder, and the active URL's creds binding; `check` probes a destination end-to-end (parse, creds resolution, the conditional-put OCC primitive, write/read/delete) with a distinct exit code per failure class.
+- `pond migrate --from <URL> --to <URL>` - copy canonical data between storages over the export+import path. Idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, valid onto a populated destination, never deletes the source. Destination indexes catch up via the normal update-indexes stage.
 
 ### 7.9 Versioning
 

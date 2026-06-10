@@ -26,8 +26,9 @@ use pond::{
         Store,
     },
     substrate::{
-        IndexStatus, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn, PhaseOutcome,
-        TableSizes, default_cleanup_older_than, index_lag_threshold,
+        CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
+        OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
+        default_cleanup_older_than, index_lag_threshold,
     },
     transport::{self, AppState},
     wire::{
@@ -152,13 +153,11 @@ impl pond::adapter::SkipOracle for StoredWatermarks {
     }
 }
 
-/// Adapter clap can call to parse `--data-dir` / `POND_DATA_DIR`. clap's
-/// default value parser uses `FromStr`, which `Url` does provide - but
-/// `Url::from_str("/srv/pond")` rejects bare paths. This indirection runs
-/// every input through Lance's `uri_to_url` (which converts bare paths to
-/// `file://...`) so pond accepts both forms transparently.
-fn parse_data_dir(input: &str) -> anyhow::Result<Url> {
-    config::parse_data_dir(input)
+/// Adapter clap can call to parse `--storage-path` / `POND_STORAGE_PATH`:
+/// bare paths, `~/...`, `file://`, and the remote URL grammar
+/// (spec.md#storage-url-grammar) including the fat `s3+https://` form.
+fn parse_storage_path(input: &str) -> anyhow::Result<StorageUrl> {
+    StorageUrl::parse(input)
 }
 
 #[derive(Debug, Parser)]
@@ -177,13 +176,13 @@ struct Cli {
 enum Command {
     /// Show pond health, data, and source status.
     Status {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Show one section per adapter, including the per-project tables
         /// and per-intent index detail. Implies `--include-subagents` so the
-        /// rollup reconciles with the data-dir row counts above.
+        /// rollup reconciles with the storage row counts above.
         #[arg(long)]
         adapters: bool,
         /// Show one section per `source_agent` (including sub-agents like
@@ -216,8 +215,8 @@ enum Command {
         /// enable freshly-detected adapters without a TTY.
         #[arg(long, short = 'y')]
         yes: bool,
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
@@ -228,8 +227,8 @@ enum Command {
     /// drops the IVF_PQ before the new vectors land.
     #[command(hide = true)]
     Embed {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Optional cap on messages embedded this run (mostly for benchmarks).
@@ -249,32 +248,42 @@ enum Command {
         host: String,
         #[arg(long, env = "POND_PORT", default_value_t = 9797)]
         port: u16,
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
     /// Alias for `pond serve --transport stdio`.
     Mcp {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
-    /// Inspect configuration.
-    #[command(hide = true)]
+    /// Inspect and probe configuration.
     Config {
-        /// Print the fully-annotated config.toml schema.
-        #[arg(long)]
-        print_schema: bool,
+        #[command(subcommand)]
+        command: ConfigCmd,
+    },
+    /// Copy canonical data between storages. Idempotent union merge: re-runnable,
+    /// resumable, valid onto a populated destination. Never deletes the source.
+    Migrate {
+        /// Source storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        from: StorageUrl,
+        /// Destination storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        to: StorageUrl,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
     },
     /// Search stored messages.
     Search {
         /// Free-text query. Semantic concepts work best; project names belong
         /// in `--project`.
         query: String,
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long, default_value = "local")]
@@ -323,8 +332,8 @@ enum Command {
     /// Inspect and maintain Lance indexes.
     #[command(hide = true)]
     Index {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[command(subcommand)]
@@ -335,8 +344,8 @@ enum Command {
         .required(true)
         .args(["session_id", "message_id"])))]
     Get {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         #[arg(long, default_value = "local")]
@@ -382,8 +391,8 @@ enum Command {
     },
     /// Export a compact restorable `.pond` archive.
     Export {
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Output path. Default: `pond-export.pond` for archive format, stdout for JSONL.
@@ -395,8 +404,8 @@ enum Command {
     /// Restore a `.pond` archive.
     Import {
         archive: PathBuf,
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
     },
@@ -409,8 +418,8 @@ enum Command {
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
-        #[arg(long, env = "POND_DATA_DIR", value_parser = parse_data_dir)]
-        data_dir: Option<Url>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
         /// Output format. table/json/ndjson go to stdout; parquet requires
@@ -426,6 +435,36 @@ enum Command {
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Show the resolved configuration: redacted values, per-field source
+    /// (cli/env/file/default), and the active URL's creds binding.
+    Show {
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+    },
+    /// Print the path of the config file pond loads.
+    Path {
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+    },
+    /// Probe a storage destination end-to-end: parse, creds resolution,
+    /// conditional-put (the OCC primitive), write/read/delete. Exit codes:
+    /// 0 ok, 2 parse error, 3 no creds, 4 auth failed, 5 OCC unsupported.
+    Check {
+        /// Destination URL. Defaults to the configured storage path.
+        url: Option<String>,
+        #[arg(long, env = "POND_STORAGE_PATH", value_parser = parse_storage_path)]
+        storage_path: Option<StorageUrl>,
+        #[arg(long, env = "POND_CONFIG")]
+        config: Option<PathBuf>,
+    },
+    /// Print the fully-annotated config.toml template.
+    Schema,
 }
 
 #[derive(Debug, Subcommand)]
@@ -503,26 +542,23 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Status {
-            data_dir,
+            storage_path,
             config,
             adapters,
             include_subagents,
         } => {
             // --adapters needs sub-agents broken out so the per-adapter
-            // rollup reconciles with the data-dir row counts above.
+            // rollup reconciles with the storage row counts above.
             let include_subagents = include_subagents || adapters;
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (resolved, store) = open_store(storage_path, &loaded, false).await?;
             let (sizes, stats, index_status, embedding) = tokio::try_join!(
                 store.table_sizes(),
                 store.corpus_stats(include_subagents),
                 store.index_status(),
                 store.embedding_progress(),
             )?;
-            render_status_header(&data_dir, &sizes, &stats.totals)?;
+            render_status_header(&resolved, &sizes, &stats.totals)?;
             render_status_checks(&stats, &index_status, embedding, adapters)?;
             let probes = adapter::probe_unconfigured(&loaded.sources);
             if !probes.is_empty() {
@@ -545,15 +581,12 @@ async fn main() -> anyhow::Result<()> {
             skip,
             force_embed,
             yes,
-            data_dir,
+            storage_path,
             config,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config_file = config_path(config, &data_dir);
+            let config_file = config_path(config);
             let mut loaded = Config::load(&config_file)?;
-            let store =
-                open_store_with_spinner(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let (_, store) = open_store(storage_path, &loaded, true).await?;
             let stages = SyncStages::resolve(only, &skip)?;
             if import_from.is_some() && !stages.import {
                 bail!(
@@ -606,16 +639,13 @@ async fn main() -> anyhow::Result<()> {
             render_sync_summary(&store, &summary).await?;
         }
         Command::Embed {
-            data_dir,
+            storage_path,
             config,
             limit,
             force,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config = Config::load(config_path(config, &data_dir))?;
-            let store =
-                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
-                    .await?;
+            let config = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &config, true).await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
             if !summary.cancelled && summary.messages > 0 {
                 let policy = configured_maintenance_policy(&config, None)?;
@@ -629,15 +659,11 @@ async fn main() -> anyhow::Result<()> {
             transport,
             host,
             port,
-            data_dir,
+            storage_path,
             config,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(
-                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
-                    .await?,
-            );
+            let config = Config::load(config_path(config))?;
+            let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             let embedder = Arc::new(LazyEmbedder::candle());
             let state = AppState {
                 store,
@@ -655,13 +681,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Mcp { data_dir, config } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let config = Config::load(config_path(config, &data_dir))?;
-            let store = Arc::new(
-                open_store_with_spinner(&data_dir, storage_map(&config), runtime_caps(&config))
-                    .await?,
-            );
+        Command::Mcp {
+            storage_path,
+            config,
+        } => {
+            let config = Config::load(config_path(config))?;
+            let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
@@ -675,7 +700,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Search {
             query,
-            data_dir,
+            storage_path,
             config,
             namespace,
             limit,
@@ -691,11 +716,8 @@ async fn main() -> anyhow::Result<()> {
             explain,
             format,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             let embedder = LazyEmbedder::candle();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -727,15 +749,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Index {
-            data_dir,
+            storage_path,
             config,
             command,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             match command {
                 IndexCommand::Status => {
                     let statuses = store.index_status().await?;
@@ -767,7 +786,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Get {
-            data_dir,
+            storage_path,
             config,
             namespace,
             session_id,
@@ -779,11 +798,8 @@ async fn main() -> anyhow::Result<()> {
             after_id,
             format,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -801,24 +817,64 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Config { print_schema } => {
-            if print_schema {
-                output(DEFAULT_CONFIG_TOML.trim_end())?;
-            } else {
-                output("usage: pond config --print-schema")?;
-            }
+        Command::Config { command } => run_config_command(command).await?,
+        Command::Migrate { from, to, config } => {
+            let loaded = Config::load(config_path(config))?;
+            let from_resolved = from.resolve(&loaded.creds)?;
+            let to_resolved = to.resolve(&loaded.creds)?;
+            warn_unmatched_sets(&[&from_resolved, &to_resolved], &loaded)?;
+            // Per-URL binding lines before any work: a wrong scope match must
+            // be visible immediately, not after an auth error.
+            let dim = pond::output::dim();
+            output(&format!(
+                "{} {}  {}",
+                pond::output::paint("from:", dim),
+                from_resolved.display(),
+                pond::output::paint(&format!("[{}]", from_resolved.binding.describe()), dim),
+            ))?;
+            output(&format!(
+                "{}   {}  {}",
+                pond::output::paint("to:", dim),
+                to_resolved.display(),
+                pond::output::paint(&format!("[{}]", to_resolved.binding.describe()), dim),
+            ))?;
+            let from_store = Store::open_with_options(
+                from_resolved.lance_url(),
+                from_resolved.options.clone(),
+                runtime_caps(&loaded),
+            )
+            .await?;
+            let to_store = Store::open_with_options(
+                to_resolved.lance_url(),
+                to_resolved.options.clone(),
+                runtime_caps(&loaded),
+            )
+            .await?;
+            let imported = migrate_between_stores(&from_store, &to_store).await?;
+            output(&format!(
+                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
+                pond::output::paint("migrate:", dim),
+                imported.rows.sessions,
+                imported.rows.messages,
+                imported.rows.parts,
+                imported.inserted.sessions,
+                imported.inserted.messages,
+                imported.inserted.parts,
+            ))?;
+            output(&format!(
+                "{} the source was not modified; run `pond sync --only update-indexes --storage-path {}` to build destination indexes",
+                pond::output::paint("hint", dim),
+                to_resolved.display(),
+            ))?;
         }
         Command::Export {
-            data_dir,
+            storage_path,
             config,
             out,
             format,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             match format {
                 ExportFormat::Pond => {
                     let path = out.unwrap_or_else(|| PathBuf::from("pond-export.pond"));
@@ -860,14 +916,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Import {
             archive,
-            data_dir,
+            storage_path,
             config,
         } => {
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             let summary = import_pond_archive(&store, &archive).await?;
             output(&format!(
                 "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
@@ -886,7 +939,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Sql {
             sql,
-            data_dir,
+            storage_path,
             config,
             output: format,
             limit,
@@ -897,11 +950,8 @@ async fn main() -> anyhow::Result<()> {
                     "--output parquet requires --output-file <path> (binary, can't go to stdout)"
                 );
             }
-            let data_dir = resolve_data_dir(data_dir)?;
-            let loaded = Config::load(config_path(config, &data_dir))?;
-            let store =
-                Store::open_with_options(&data_dir, storage_map(&loaded), runtime_caps(&loaded))
-                    .await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false).await?;
             let mode = match format {
                 CliSqlOutput::Table => pond::sql::Mode::Inline,
                 CliSqlOutput::Json => pond::sql::Mode::InlineJson,
@@ -1122,17 +1172,6 @@ async fn open_store_with_spinner(
     result
 }
 
-/// Materialize `Config.storage` (a sorted `BTreeMap` for round-tripping) into
-/// the `HashMap<String, String>` Lance accepts. Empty by default; populated
-/// from `config.toml [storage]` on installs that need S3/GCS/Azure creds.
-fn storage_map(config: &Config) -> std::collections::HashMap<String, String> {
-    config
-        .storage
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 /// Resolve `[runtime]` into the substrate's typed caps struct. A standalone
 /// helper to keep every call site terse and to make sure no surface forgets
 /// the caps.
@@ -1140,22 +1179,73 @@ fn runtime_caps(config: &Config) -> pond::substrate::RuntimeCaps {
     pond::substrate::RuntimeCaps::from_config(&config.runtime)
 }
 
-/// Resolve the data dir from the CLI/env argument, falling back to the XDG
-/// location (see [`pond::config::resolve_data_dir`]).
-fn resolve_data_dir(explicit: Option<Url>) -> anyhow::Result<Url> {
-    pond::config::resolve_data_dir(
-        explicit,
+/// Resolve the storage destination: `--storage-path` / `POND_STORAGE_PATH`
+/// (folded together by clap) > `[storage].path` > the platform-local default.
+fn resolve_storage_location(
+    explicit: Option<StorageUrl>,
+    loaded: &Config,
+) -> anyhow::Result<StorageUrl> {
+    if let Some(storage) = explicit {
+        return Ok(storage);
+    }
+    if let Some(path) = &loaded.storage.path {
+        return StorageUrl::parse(path).context("invalid [storage].path in config");
+    }
+    let url = pond::config::default_storage_path(
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
-    )
+    )?;
+    StorageUrl::parse(url.as_str())
+}
+
+/// Resolve creds for the destination and open the store. One chokepoint so
+/// every command resolves identically and no surface forgets the
+/// unmatched-set warning (misbinding must never be silent).
+async fn open_store(
+    explicit: Option<StorageUrl>,
+    loaded: &Config,
+    spinner: bool,
+) -> anyhow::Result<(ResolvedStorage, Store)> {
+    let storage = resolve_storage_location(explicit, loaded)?;
+    let resolved = storage.resolve(&loaded.creds)?;
+    warn_unmatched_sets(&[&resolved], loaded)?;
+    let store = if spinner {
+        open_store_with_spinner(
+            resolved.lance_url(),
+            resolved.options.clone(),
+            runtime_caps(loaded),
+        )
+        .await?
+    } else {
+        Store::open_with_options(
+            resolved.lance_url(),
+            resolved.options.clone(),
+            runtime_caps(loaded),
+        )
+        .await?
+    };
+    Ok((resolved, store))
+}
+
+/// spec.md#creds-scope-match: a defined set that bound to none of this
+/// invocation's URLs gets named on stderr - a wrong scope must surface
+/// before the auth error it causes.
+fn warn_unmatched_sets(resolved: &[&ResolvedStorage], loaded: &Config) -> anyhow::Result<()> {
+    for name in pond::substrate::unmatched_creds_sets(resolved, &loaded.creds) {
+        output_err(&pond::output::paint(
+            &format!("hint     creds set [{name}] matched no storage URL in this invocation"),
+            pond::output::dim(),
+        ))?;
+    }
+    Ok(())
 }
 
 /// The config path: an explicit `--config` (or `POND_CONFIG`) wins; otherwise
 /// `$XDG_CONFIG_HOME/pond/config.toml` (default `~/.config/pond/config.toml`),
-/// regardless of where the data dir lives. Config and data are different XDG
-/// categories - they always live in different directories, even when both are
-/// local.
-fn config_path(explicit: Option<PathBuf>, _data_dir: &Url) -> PathBuf {
+/// regardless of where the storage path points. Config and data are different
+/// XDG categories - they always live in different directories, even when both
+/// are local.
+fn config_path(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
@@ -1163,6 +1253,203 @@ fn config_path(explicit: Option<PathBuf>, _data_dir: &Url) -> PathBuf {
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     )
+}
+
+async fn run_config_command(command: ConfigCmd) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    match command {
+        ConfigCmd::Schema => output(DEFAULT_CONFIG_TOML.trim_end()),
+        ConfigCmd::Path { config } => output(&config_path(config).display().to_string()),
+        ConfigCmd::Show {
+            storage_path,
+            config,
+        } => {
+            let path = config_path(config);
+            let (loaded, figment) = Config::load_with_provenance(&path)?;
+            output(&format!(
+                "{}  {}{}",
+                paint("config ", dim()),
+                path.display(),
+                if path.exists() {
+                    ""
+                } else {
+                    "  (absent - defaults + env)"
+                },
+            ))?;
+
+            // The active destination, its provenance, and its creds binding -
+            // the line that makes a wrong scope match visible.
+            let storage = resolve_storage_location(storage_path.clone(), &loaded)?;
+            let resolved = storage.resolve(&loaded.creds)?;
+            let storage_source = match &storage_path {
+                // clap folds the env var into the flag; tell them apart so
+                // the source column never lies about where the URL came from.
+                Some(flag) => match std::env::var("POND_STORAGE_PATH") {
+                    Ok(env) if StorageUrl::parse(&env).is_ok_and(|url| &url == flag) => "env",
+                    _ => "cli",
+                },
+                None if loaded.storage.path.is_some() => classify_source(&figment, "storage.path"),
+                None => "default",
+            };
+            output(&format!(
+                "{}  {}  ({})  -> {}",
+                paint("storage", dim()),
+                resolved.display(),
+                storage_source,
+                describe_binding_with_source(&resolved.binding, &figment),
+            ))?;
+            // The one precedence ladder (spec.md#storage-env-mirror), shown
+            // wherever sources are attributed.
+            output(&paint(
+                "ladder   cli flag > POND_* env > config file > ambient cloud chain > built-in defaults",
+                dim(),
+            ))?;
+            output("")?;
+
+            let mut table = new_table();
+            table.set_header(
+                ["setting", "value", "source"]
+                    .map(|h| Cell::new(h).add_attributes(vec![Attribute::Dim, Attribute::Bold])),
+            );
+            let value = serde_json::to_value(&loaded).context("serialize config for display")?;
+            let mut rows = Vec::new();
+            flatten_config(String::new(), &value, &mut rows);
+            for (key, raw) in rows {
+                let source = classify_source(&figment, &key);
+                table.add_row([
+                    key.clone(),
+                    redact_config_value(&key, &raw),
+                    source.to_owned(),
+                ]);
+            }
+            output(&table.to_string())?;
+            warn_unmatched_sets(&[&resolved], &loaded)?;
+            Ok(())
+        }
+        ConfigCmd::Check {
+            url,
+            storage_path,
+            config,
+        } => {
+            let loaded = Config::load(config_path(config))?;
+            let storage = match url {
+                Some(raw) => match StorageUrl::parse(&raw) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        output_err(&format!("check: parse error: {error:#}"))?;
+                        std::process::exit(2);
+                    }
+                },
+                None => resolve_storage_location(storage_path, &loaded)?,
+            };
+            let resolved = storage.resolve(&loaded.creds)?;
+            output(&format!(
+                "{}  {}",
+                resolved.display(),
+                paint(&format!("[{}]", resolved.binding.describe()), dim()),
+            ))?;
+            warn_unmatched_sets(&[&resolved], &loaded)?;
+            match pond::substrate::storage_check(&resolved).await {
+                Ok(()) => {
+                    output("check: ok - conditional put (OCC), read-back, and delete all succeeded")
+                }
+                Err(failure) => {
+                    // Distinct exit codes (documented in --help) so cron and
+                    // CI can branch on the failure class.
+                    let code = match &failure {
+                        CheckFailure::NoCreds { .. } => 3,
+                        CheckFailure::Auth { .. } => 4,
+                        CheckFailure::OccUnsupported { .. } => 5,
+                        CheckFailure::Io { .. } => 1,
+                    };
+                    output_err(&format!("check: {failure:#}"))?;
+                    std::process::exit(code);
+                }
+            }
+        }
+    }
+}
+
+/// Map a figment provenance lookup onto the source column vocabulary.
+fn classify_source(figment: &figment::Figment, key: &str) -> &'static str {
+    match figment.find_metadata(key) {
+        Some(md) if md.name.contains("POND_") => "env",
+        Some(_) => "file",
+        None => "default",
+    }
+}
+
+/// Binding line for `pond config show`: the set name, how it matched, and
+/// which layer defined it ("creds work (scope match, file)").
+fn describe_binding_with_source(binding: &CredsBinding, figment: &figment::Figment) -> String {
+    match binding {
+        CredsBinding::Set { name, .. } => {
+            let source = classify_source(figment, &format!("creds.{name}"));
+            let base = binding.describe();
+            format!("{}, {source})", base.trim_end_matches(')'))
+        }
+        other => other.describe(),
+    }
+}
+
+/// Flatten the serialized config into dotted (key, value) leaf rows,
+/// skipping `null`s (unset optionals) and empty containers.
+fn flatten_config(prefix: String, value: &Value, rows: &mut Vec<(String, String)>) {
+    match value {
+        Value::Null => {}
+        Value::Object(map) => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_config(path, child, rows);
+            }
+        }
+        Value::String(text) => rows.push((prefix, text.clone())),
+        other => rows.push((prefix, other.to_string())),
+    }
+}
+
+/// spec.md#storage-redaction: any field whose name contains key / secret /
+/// token / password prints `********` regardless of length - including keys
+/// inside `extra`. The `_file` / `_command` variants print their literal
+/// value: the path or command IS the safe part.
+fn redact_config_value(key: &str, value: &str) -> String {
+    let field = key.rsplit('.').next().unwrap_or(key).to_ascii_lowercase();
+    if field.ends_with("_file") || field.ends_with("_command") {
+        return value.to_owned();
+    }
+    let sensitive = ["key", "secret", "token", "password"];
+    if sensitive.iter().any(|needle| field.contains(needle)) {
+        return "********".to_owned();
+    }
+    value.to_owned()
+}
+
+/// `pond migrate` core: export the source's clean datasets into local
+/// staging, then merge-import into the destination. Idempotency comes from
+/// `lance-deterministic-pk` + merge-insert: a rerun inserts nothing, and a
+/// populated destination unions rather than clobbers.
+async fn migrate_between_stores(from: &Store, to: &Store) -> anyhow::Result<LanceArchiveImport> {
+    let staging = tempfile::Builder::new()
+        .prefix("pond-migrate-")
+        .tempdir()
+        .context("failed to create migrate staging dir")?;
+    let data_dir = staging.path().join("data");
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    spinner.set_message("migrate: copying from source...");
+    let _exported = from.export_clean_lance_datasets(&data_dir).await?;
+    spinner.set_message("migrate: merging into destination...");
+    let imported = to.import_clean_lance_datasets(&data_dir).await;
+    spinner.finish_and_clear();
+    imported
 }
 
 #[derive(Debug, Default)]
@@ -2081,14 +2368,19 @@ fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
 }
 
 fn render_status_header(
-    data_url: &Url,
+    resolved: &ResolvedStorage,
     sizes: &TableSizes,
     totals: &RowTotals,
 ) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&paint("pond status", bold()))?;
-    output(&format!("{}  {}", paint("data-dir", dim()), data_url))?;
+    output(&format!(
+        "{}  {}  {}",
+        paint("storage", dim()),
+        resolved.display(),
+        paint(&format!("[{}]", resolved.binding.describe()), dim()),
+    ))?;
 
     let mut table = new_table();
     let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
@@ -2807,4 +3099,72 @@ fn paint_role(role: &str) -> String {
         _ => dim(),
     };
     paint(role, style)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn redaction_masks_secret_fields_but_spares_file_and_command_variants() {
+        // spec.md#storage-redaction: name-based masking, including `extra`.
+        assert_eq!(
+            redact_config_value("creds.work.access_key_id", "AKIA"),
+            "********"
+        );
+        assert_eq!(
+            redact_config_value("creds.work.secret_access_key", "s"),
+            "********"
+        );
+        assert_eq!(
+            redact_config_value("creds.work.extra.sas_token", "t"),
+            "********"
+        );
+        assert_eq!(
+            redact_config_value("creds.work.extra.request_timeout", "60s"),
+            "60s"
+        );
+        // The path / command IS the safe part.
+        assert_eq!(
+            redact_config_value("creds.work.access_key_id_file", "/k"),
+            "/k"
+        );
+        assert_eq!(
+            redact_config_value("creds.work.secret_access_key_command", "op read x"),
+            "op read x"
+        );
+        assert_eq!(redact_config_value("creds.work.region", "fsn1"), "fsn1");
+    }
+
+    #[test]
+    fn flatten_config_emits_dotted_leaves_and_skips_nulls() {
+        let value = serde_json::json!({
+            "storage": {"path": "/p"},
+            "search": {"nprobes": null},
+            "creds": {"work": {"region": "r", "extra": {"a": "b"}}},
+        });
+        let mut rows = Vec::new();
+        flatten_config(String::new(), &value, &mut rows);
+        assert!(rows.contains(&("storage.path".to_owned(), "/p".to_owned())));
+        assert!(rows.contains(&("creds.work.extra.a".to_owned(), "b".to_owned())));
+        assert!(rows.iter().all(|(key, _)| key != "search.nprobes"));
+    }
+
+    #[test]
+    fn storage_location_resolves_flag_then_config_then_default() {
+        let mut loaded = Config::default();
+        // Built-in default: the platform-local dir.
+        let resolved = resolve_storage_location(None, &loaded).unwrap();
+        assert!(resolved.is_local());
+        // `[storage].path` beats the default.
+        loaded.storage.path = Some("s3://from-config/p".to_owned());
+        let resolved = resolve_storage_location(None, &loaded).unwrap();
+        assert_eq!(resolved.lance_url().as_str(), "s3://from-config/p");
+        // The CLI/env flag (folded by clap) beats the file.
+        let flag = StorageUrl::parse("s3://from-flag/p").unwrap();
+        let resolved = resolve_storage_location(Some(flag), &loaded).unwrap();
+        assert_eq!(resolved.lance_url().as_str(), "s3://from-flag/p");
+    }
 }

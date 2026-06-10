@@ -88,6 +88,46 @@ fn make_session(id: usize) -> Session {
     }
 }
 
+/// `pond config check` probe against the real S3 wire: the fat-URL grammar
+/// folds the fixture endpoint in, a scoped creds set resolves, and the
+/// conditional-put pair proves the If-None-Match -> 412 path. Then the same
+/// probe with a wrong secret must classify as the auth failure naming the
+/// set (403 -> `PermissionDenied` in object_store).
+#[tokio::test(flavor = "multi_thread")]
+async fn config_check_probe_passes_and_classifies_auth_failure() -> anyhow::Result<()> {
+    use pond::config::CredsSet;
+    use pond::substrate::{CheckFailure, StorageUrl, storage_check};
+    use std::collections::BTreeMap;
+
+    let fx = spawn_s3s_fs("pond-check").await?;
+    let endpoint_host = fx.endpoint.trim_start_matches("http://");
+    let url = StorageUrl::parse(&format!("s3+http://{endpoint_host}/pond-check/data"))?;
+    let mut creds = BTreeMap::new();
+    creds.insert(
+        "test".to_owned(),
+        CredsSet {
+            access_key_id: Some(ACCESS_KEY.to_owned()),
+            secret_access_key: Some(SECRET_KEY.to_owned()),
+            region: Some("us-east-1".to_owned()),
+            // s3s-fs serves path-style only.
+            virtual_hosted_style_request: Some(false),
+            ..CredsSet::default()
+        },
+    );
+    let resolved = url.resolve(&creds)?;
+    storage_check(&resolved)
+        .await
+        .expect("probe must pass against the s3s fixture");
+
+    creds.get_mut("test").expect("set exists").secret_access_key = Some("wrong-secret".to_owned());
+    let resolved = url.resolve(&creds)?;
+    match storage_check(&resolved).await {
+        Err(CheckFailure::Auth { set, .. }) => assert_eq!(set, "test"),
+        other => panic!("wrong secret must classify as Auth, got: {other:?}"),
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn s3s_fs_in_process_round_trips_a_session() -> anyhow::Result<()> {
     let fx = spawn_s3s_fs("pond").await?;

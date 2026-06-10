@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use pond::{
-    config::parse_data_dir,
     handlers::ingest_events,
     sessions::{IngestEvent, MessageWrite, OptimizeOutcome, Store},
     substrate::{MaintenancePolicy, PhaseOutcome},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
+use url::Url;
 
 fn make_session(id: &str) -> Session {
     Session {
@@ -66,7 +66,7 @@ fn make_part(session_id: &str, idx: usize, text: &str) -> Part {
 /// shared-memory pool delivers the same `Arc<InMemory>` to both registries.
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_memory_two_stores_share_state() -> anyhow::Result<()> {
-    let url = parse_data_dir("shared-memory://pond-test-shared-smoke/")?;
+    let url = Url::parse("shared-memory://pond-test-shared-smoke/")?;
     let writer = Store::open(&url).await?;
 
     let session = make_session("01HXYSHARED0001");
@@ -97,7 +97,7 @@ async fn shared_memory_two_stores_share_state() -> anyhow::Result<()> {
 /// is wired and the outcome shape carries the right per-table result.
 #[tokio::test(flavor = "multi_thread")]
 async fn optimize_returns_per_table_outcome_on_quiet_store() -> anyhow::Result<()> {
-    let url = parse_data_dir("shared-memory://pond-test-optimize-quiet/")?;
+    let url = Url::parse("shared-memory://pond-test-optimize-quiet/")?;
     let store = Store::open(&url).await?;
 
     let session = make_session("01HXYQUIET00001");
@@ -137,7 +137,7 @@ async fn optimize_returns_per_table_outcome_on_quiet_store() -> anyhow::Result<(
 /// back `NotAttempted` even on a quiet store.
 #[tokio::test(flavor = "multi_thread")]
 async fn build_indices_only_leaves_compaction_unattempted() -> anyhow::Result<()> {
-    let url = parse_data_dir("shared-memory://pond-test-build-only/")?;
+    let url = Url::parse("shared-memory://pond-test-build-only/")?;
     let store = Store::open(&url).await?;
     let session = make_session("01HXYBUILD00001");
     let mut events = vec![IngestEvent::Session(session.clone())];
@@ -166,7 +166,7 @@ async fn build_indices_only_leaves_compaction_unattempted() -> anyhow::Result<()
 /// the call never propagates an `Err` for OCC contention alone. spec.md#3.7.
 #[tokio::test(flavor = "multi_thread")]
 async fn optimize_under_contention_surfaces_skipped_not_err() -> anyhow::Result<()> {
-    let url = parse_data_dir("shared-memory://pond-test-optimize-contend/")?;
+    let url = Url::parse("shared-memory://pond-test-optimize-contend/")?;
     let writer = Arc::new(Store::open(&url).await?);
     let optimizer = Store::open(&url).await?;
 

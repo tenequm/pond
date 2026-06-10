@@ -1029,7 +1029,12 @@ mod tests {
     use crate::{handlers::ingest_adapter, sessions::Store};
     use tempfile::TempDir;
 
-    const FIXTURES: &str = "tests/fixtures/adapter/claude_desktop_app/local-agent-mode-sessions";
+    // Manifest-dir anchored: unit tests must not depend on the process cwd
+    // (figment::Jail chdirs the whole test process while config tests run).
+    const FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/claude_desktop_app/local-agent-mode-sessions"
+    );
     /// The inner Claude Code loop transcript nested under one session's
     /// `.claude/projects/`; the adapter must never surface it as a session.
     const INNER_LOOP_ID: &str = "a9985b0b-2f5e-4125-b105-7f62376f5509";

@@ -11,7 +11,7 @@
 //!   cargo bench --bench backend_bench -- --skip-search           # write-only smoke
 //!   cargo bench --bench backend_bench -- --skip-remote           # local only
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -29,13 +29,14 @@ use pond::{
     },
 };
 use tempfile::TempDir;
-use url::Url;
 
 #[derive(Parser)]
 #[command(about = "pond backend benchmark: local FS vs object-store URL")]
 struct Args {
+    /// Remote storage URL (spec.md#storage-url-grammar); creds resolve from
+    /// the user config's [creds.*] sets like any pond command.
     #[arg(long, value_name = "URL")]
-    s3_url: Option<Url>,
+    s3_url: Option<String>,
     #[arg(long, default_value_t = 100)]
     sessions: usize,
     #[arg(long, default_value_t = 3)]
@@ -369,11 +370,6 @@ async fn main() -> Result<()> {
         std::env::var_os("HOME").map(PathBuf::from),
     );
     let cfg = Config::load(&config_path)?;
-    let storage_opts: HashMap<String, String> = cfg
-        .storage
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
 
     let mut rows: Vec<BenchRow> = Vec::new();
 
@@ -396,22 +392,32 @@ async fn main() -> Result<()> {
 
     if !args.skip_remote {
         match args.s3_url.clone() {
-            Some(url) => {
-                if storage_opts.is_empty() {
+            Some(raw) => {
+                let storage = pond::substrate::StorageUrl::parse(&raw)?;
+                let resolved = storage.resolve(&cfg.creds)?;
+                if resolved.options.is_empty() {
                     eprintln!(
-                        "warning: [storage] is empty in {} - remote arm will use env-only credentials",
+                        "warning: no [creds.*] set matched in {} - remote arm will use ambient credentials",
                         config_path.display()
                     );
                 }
                 let t = Instant::now();
                 let store = Store::open_with_options(
-                    &url,
-                    storage_opts,
+                    resolved.lance_url(),
+                    resolved.options.clone(),
                     pond::substrate::RuntimeCaps::default(),
                 )
                 .await?;
                 let open_ms = t.elapsed().as_millis();
-                rows.push(run_bench(format!("remote {url}"), &store, &args, open_ms).await?);
+                rows.push(
+                    run_bench(
+                        format!("remote {}", resolved.display()),
+                        &store,
+                        &args,
+                        open_ms,
+                    )
+                    .await?,
+                );
             }
             None => {
                 eprintln!("skip remote: pass --s3-url s3://bucket/path to bench an object store");

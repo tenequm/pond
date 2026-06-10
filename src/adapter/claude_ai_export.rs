@@ -541,7 +541,12 @@ mod tests {
     use crate::{handlers::ingest_adapter, sessions::Store};
     use tempfile::TempDir;
 
-    const FIXTURE_DIR: &str = "tests/fixtures/adapter/claude_ai_export";
+    // Manifest-dir anchored: unit tests must not depend on the process cwd
+    // (figment::Jail chdirs the whole test process while config tests run).
+    const FIXTURE_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/claude_ai_export"
+    );
     const ACCOUNT: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
     const TOOL_CONV: &str = "33333333-3333-3333-3333-333333333333";
     const EMPTY_NAME_CONV: &str = "44444444-4444-4444-4444-444444444444";

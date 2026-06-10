@@ -12,7 +12,6 @@
 
 use chrono::Utc;
 use pond::{
-    config::parse_data_dir,
     handlers::ingest_events,
     sessions::{IngestEvent, OutcomeStatus, Store},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
@@ -29,7 +28,7 @@ fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
 }
 
 fn memory_url() -> Url {
-    parse_data_dir("memory:///pond-remote-test").expect("memory uri parses")
+    Url::parse("memory:///pond-remote-test").expect("memory uri parses")
 }
 
 #[tokio::test(flavor = "multi_thread")]

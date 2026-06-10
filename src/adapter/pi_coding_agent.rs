@@ -678,7 +678,12 @@ mod tests {
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
     use tempfile::TempDir;
 
-    const FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
+    // Manifest-dir anchored: unit tests must not depend on the process cwd
+    // (figment::Jail chdirs the whole test process while config tests run).
+    const FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/pi-coding-agent/sessions"
+    );
 
     #[test]
     fn probe_default_finds_pi_sessions_under_home() -> anyhow::Result<()> {
@@ -905,8 +910,10 @@ mod tests {
     async fn foreign_serialization_reparses_as_pi_coding_agent() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
-        let origin =
-            crate::adapter::OpencodeAdapter::new("tests/fixtures/adapter/opencode/storage");
+        let origin = crate::adapter::OpencodeAdapter::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/adapter/opencode/storage"
+        ));
         ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
         let session_id = origin_store
             .session_ids()

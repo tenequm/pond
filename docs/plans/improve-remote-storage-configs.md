@@ -1,6 +1,6 @@
 # Improve remote storage configs
 
-Status: planned (not started)
+Status: implemented (phases 1-3 land with this PR)
 
 ## Summary
 

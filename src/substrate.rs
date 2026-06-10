@@ -1,10 +1,10 @@
 use crate::{
     RetryPolicy,
-    config::{self},
+    config::{self, CredsSet},
     handlers::NamespaceIdent,
     sessions::{self},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::index::DatasetIndexRemapperOptions;
@@ -20,7 +20,7 @@ use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor, uri_to_url,
 };
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
@@ -28,7 +28,7 @@ use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -61,6 +61,648 @@ pub fn index_lag_threshold() -> usize {
         .get()
         .copied()
         .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
+}
+
+// ---------------------------------------------------------------------------
+// Storage addresses (spec.md#storage-url-grammar)
+// ---------------------------------------------------------------------------
+
+/// A parsed pond storage address. The fat-URL grammar
+/// (`s3+https://host/bucket/prefix`) folds the endpoint into the address so
+/// it can never desync from the bucket (the litestream out-of-band-endpoint
+/// failure class); parsing splits it back into the URL Lance opens plus the
+/// `object_store` options the endpoint implies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageUrl {
+    /// The address as written, canonicalized (scheme/host lowercased by
+    /// `url`, default port stripped, recognized query params removed). Scope
+    /// matching (spec.md#creds-scope-match) and display use this form.
+    canonical: Url,
+    /// The URL handed to Lance.
+    lance: Url,
+    /// Options implied by the scheme - lowest precedence in assembly.
+    scheme_options: Vec<(&'static str, String)>,
+    /// Recognized `?key=value` params - highest precedence.
+    query_options: Vec<(&'static str, String)>,
+    /// `?creds=<name>`: explicit set binding, beats scope matching.
+    creds_pointer: Option<String>,
+}
+
+/// Query params pond recognizes (and strips before the URL reaches Lance).
+/// Anything else is a hard error - a typoed param must not silently reach
+/// the object store as part of the path.
+const RECOGNIZED_QUERY_PARAMS: [&str; 3] = ["creds", "region", "virtual_hosted_style_request"];
+
+impl StorageUrl {
+    /// Parse a storage address (spec.md#storage-url-grammar): bare/`~` paths,
+    /// `file://`, `s3://`, `s3+https://` / `s3+http://`, `gs://`, `az://`,
+    /// and the test-only `memory://` / `shared-memory://`.
+    pub fn parse(input: &str) -> Result<Self> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            bail!("storage path is empty");
+        }
+        // Bare paths, `~/...`, and `file://` go through Lance's own
+        // `uri_to_url` so pond accepts exactly what Lance accepts.
+        if !trimmed.contains("://") || trimmed.starts_with("file://") {
+            let url =
+                uri_to_url(trimmed).with_context(|| format!("invalid storage path {trimmed:?}"))?;
+            return Ok(Self::plain(url));
+        }
+        let url =
+            Url::parse(trimmed).with_context(|| format!("invalid storage URL {trimmed:?}"))?;
+        // RFC 3986 deprecates userinfo; argv/history/ps/logs leak it. Never.
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!(
+                "storage URL {trimmed:?} embeds credentials; put them in [creds.*] (or POND_CREDS_*) instead"
+            );
+        }
+        match url.scheme() {
+            "memory" | "shared-memory" => Ok(Self::plain(url)),
+            "s3" | "gs" => {
+                let (canonical, query_options, creds_pointer) = strip_query(url)?;
+                let mut lance = canonical.clone();
+                lance.set_query(None);
+                Ok(Self {
+                    canonical,
+                    lance,
+                    scheme_options: Vec::new(),
+                    query_options,
+                    creds_pointer,
+                })
+            }
+            "s3+https" | "s3+http" => {
+                let (mut canonical, query_options, creds_pointer) = strip_query(url)?;
+                let tls = canonical.scheme() == "s3+https";
+                // `url` treats non-special schemes' default ports as
+                // explicit; strip them so scope matching can't split on
+                // `:443` vs nothing.
+                if canonical.port() == Some(if tls { 443 } else { 80 }) {
+                    let _ = canonical.set_port(None);
+                }
+                let host = canonical
+                    .host_str()
+                    .ok_or_else(|| anyhow!("storage URL {trimmed:?} has no endpoint host"))?;
+                let endpoint_authority = match canonical.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_owned(),
+                };
+                let mut segments = canonical.path().trim_start_matches('/').splitn(2, '/');
+                let bucket = segments.next().unwrap_or_default();
+                if bucket.is_empty() {
+                    bail!(
+                        "storage URL {trimmed:?} is missing the bucket: the form is {}://host/bucket/prefix",
+                        canonical.scheme(),
+                    );
+                }
+                let prefix = segments.next().unwrap_or_default();
+                let lance = Url::parse(&format!("s3://{bucket}/{prefix}")).with_context(|| {
+                    format!("storage URL {trimmed:?}: bucket/prefix do not form a valid s3:// URL")
+                })?;
+                let scheme = if tls { "https" } else { "http" };
+                let scheme_options = vec![
+                    ("endpoint", format!("{scheme}://{endpoint_authority}")),
+                    ("allow_http", (!tls).to_string()),
+                    // Hetzner / R2 / B2 default; MinIO and Garage users
+                    // override via `?virtual_hosted_style_request=false` or
+                    // the creds-set field.
+                    ("virtual_hosted_style_request", "true".to_owned()),
+                ];
+                Ok(Self {
+                    canonical,
+                    lance,
+                    scheme_options,
+                    query_options,
+                    creds_pointer,
+                })
+            }
+            "az" => {
+                let (canonical, query_options, creds_pointer) = strip_query(url)?;
+                let account = canonical
+                    .host_str()
+                    .ok_or_else(|| anyhow!("storage URL {trimmed:?} has no account: the form is az://account/container/prefix"))?
+                    .to_owned();
+                let mut segments = canonical.path().trim_start_matches('/').splitn(2, '/');
+                let container = segments.next().unwrap_or_default();
+                if container.is_empty() {
+                    bail!(
+                        "storage URL {trimmed:?} is missing the container: the form is az://account/container/prefix"
+                    );
+                }
+                let prefix = segments.next().unwrap_or_default();
+                let lance = Url::parse(&format!("az://{container}/{prefix}"))
+                    .with_context(|| format!("storage URL {trimmed:?}: container/prefix do not form a valid az:// URL"))?;
+                Ok(Self {
+                    canonical,
+                    lance,
+                    scheme_options: vec![("account_name", account)],
+                    query_options,
+                    creds_pointer,
+                })
+            }
+            other => bail!(
+                "storage URL scheme {other:?} not recognized; use a local path, s3://, s3+https://, s3+http://, gs://, or az://"
+            ),
+        }
+    }
+
+    /// A scheme with no creds machinery: canonical == lance, no options.
+    fn plain(url: Url) -> Self {
+        Self {
+            canonical: url.clone(),
+            lance: url,
+            scheme_options: Vec::new(),
+            query_options: Vec::new(),
+            creds_pointer: None,
+        }
+    }
+
+    /// The URL Lance opens (endpoint folded into options, not the URL).
+    pub fn lance_url(&self) -> &Url {
+        &self.lance
+    }
+
+    /// The canonical as-written address - what scope matching compares
+    /// against and what display surfaces show (it carries the endpoint).
+    pub fn canonical(&self) -> &Url {
+        &self.canonical
+    }
+
+    pub fn is_local(&self) -> bool {
+        config::is_local(&self.canonical)
+    }
+
+    /// Render for human output: local URLs as plain paths, remote verbatim.
+    pub fn display(&self) -> String {
+        config::display(&self.canonical)
+    }
+
+    /// Whether this scheme authenticates at all. `file`, `memory`, and
+    /// `shared-memory` take no credentials; resolution skips them entirely.
+    fn takes_credentials(&self) -> bool {
+        !matches!(
+            self.canonical.scheme(),
+            "file" | "file+uring" | "memory" | "shared-memory"
+        )
+    }
+
+    /// Resolve this address against the configured creds sets
+    /// (spec.md#creds-scope-match): `?creds=` pointer > longest scoped
+    /// prefix match > the scope-less catch-all > none (object_store's
+    /// ambient SDK chain). Option assembly, later wins: scheme-derived ->
+    /// matched set (non-secret fields + `extra`, then materialized secrets)
+    /// -> URL query params.
+    pub fn resolve(&self, creds: &BTreeMap<String, CredsSet>) -> Result<ResolvedStorage> {
+        if !self.takes_credentials() {
+            return Ok(ResolvedStorage {
+                storage: self.clone(),
+                options: HashMap::new(),
+                binding: CredsBinding::NotApplicable,
+            });
+        }
+        let matched: Option<(&String, &CredsSet, BindVia)> = match &self.creds_pointer {
+            Some(name) => {
+                let set = creds.get(name).ok_or_else(|| {
+                    anyhow!(
+                        "URL names ?creds={name} but no [creds.{name}] set is configured; define it or drop the pointer"
+                    )
+                })?;
+                Some((name, set, BindVia::Pointer))
+            }
+            None => {
+                let mut best: Option<(&String, &CredsSet, String)> = None;
+                for (name, set) in creds {
+                    let Some(scope) = &set.scope else { continue };
+                    let scope_url = parse_scope(scope).with_context(|| {
+                        format!("[creds.{name}] scope {scope:?} is not a valid URL prefix")
+                    })?;
+                    if scope_matches(&scope_url, &self.canonical)
+                        && best
+                            .as_ref()
+                            .is_none_or(|(_, _, len)| scope_url.as_str().len() > len.len())
+                    {
+                        best = Some((name, set, scope_url.as_str().to_owned()));
+                    }
+                }
+                match best {
+                    Some((name, set, _)) => Some((name, set, BindVia::Scope)),
+                    None => creds
+                        .iter()
+                        .find(|(_, set)| set.scope.is_none())
+                        .map(|(name, set)| (name, set, BindVia::CatchAll)),
+                }
+            }
+        };
+        let mut options: HashMap<String, String> = self
+            .scheme_options
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect();
+        let binding = match matched {
+            None => CredsBinding::Ambient,
+            Some((name, set, via)) => {
+                if let Some(region) = &set.region {
+                    options.insert("region".to_owned(), region.clone());
+                }
+                if let Some(virtual_hosted) = set.virtual_hosted_style_request {
+                    options.insert(
+                        "virtual_hosted_style_request".to_owned(),
+                        virtual_hosted.to_string(),
+                    );
+                }
+                for (key, value) in &set.extra {
+                    options.insert(key.clone(), value.clone());
+                }
+                if let Some(value) = materialize_secret(
+                    name,
+                    "access_key_id",
+                    set.access_key_id.as_deref(),
+                    set.access_key_id_file.as_deref(),
+                    None,
+                )? {
+                    options.insert("access_key_id".to_owned(), value);
+                }
+                if let Some(value) = materialize_secret(
+                    name,
+                    "secret_access_key",
+                    set.secret_access_key.as_deref(),
+                    set.secret_access_key_file.as_deref(),
+                    set.secret_access_key_command.as_deref(),
+                )? {
+                    options.insert("secret_access_key".to_owned(), value);
+                }
+                CredsBinding::Set {
+                    name: name.clone(),
+                    via,
+                }
+            }
+        };
+        for (key, value) in &self.query_options {
+            options.insert((*key).to_owned(), value.clone());
+        }
+        Ok(ResolvedStorage {
+            storage: self.clone(),
+            options,
+            binding,
+        })
+    }
+}
+
+/// (canonical URL, recognized query options, `?creds=` pointer).
+type StrippedQuery = (Url, Vec<(&'static str, String)>, Option<String>);
+
+/// Pull recognized query params off the URL; reject unrecognized ones.
+fn strip_query(url: Url) -> Result<StrippedQuery> {
+    let mut query_options = Vec::new();
+    let mut creds_pointer = None;
+    for (key, value) in url.query_pairs() {
+        match RECOGNIZED_QUERY_PARAMS
+            .iter()
+            .find(|known| **known == key.as_ref())
+        {
+            Some(&"creds") => creds_pointer = Some(value.into_owned()),
+            Some(known) => query_options.push((*known, value.into_owned())),
+            None => bail!(
+                "storage URL query param {key:?} not recognized (known: {})",
+                RECOGNIZED_QUERY_PARAMS.join(", "),
+            ),
+        }
+    }
+    let mut canonical = url;
+    canonical.set_query(None);
+    Ok((canonical, query_options, creds_pointer))
+}
+
+/// Parse a `[creds.*] scope` URL prefix into the same canonical form
+/// `StorageUrl::parse` produces, so comparison is exact.
+pub(crate) fn parse_scope(scope: &str) -> Result<Url> {
+    let mut url = Url::parse(scope.trim())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("scope embeds credentials");
+    }
+    if url.query().is_some() {
+        bail!("scope carries query params; scopes are plain URL prefixes");
+    }
+    match (url.scheme(), url.port()) {
+        ("s3+https", Some(443)) | ("s3+http", Some(80)) => {
+            let _ = url.set_port(None);
+        }
+        _ => {}
+    }
+    Ok(url)
+}
+
+/// spec.md#creds-scope-match: scheme, host, and port equal; path matches at
+/// `/` segment boundaries only (`.../pond` does not match `.../pond-2`). No
+/// cross-scheme normalization: a `s3+https://host/bucket/` scope does not
+/// match a `s3://bucket/` URL.
+fn scope_matches(scope: &Url, address: &Url) -> bool {
+    if scope.scheme() != address.scheme()
+        || scope.host_str() != address.host_str()
+        || scope.port() != address.port()
+    {
+        return false;
+    }
+    let scope_path = scope.path().trim_end_matches('/');
+    let address_path = address.path().trim_end_matches('/');
+    address_path == scope_path
+        || address_path
+            .strip_prefix(scope_path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// How a creds set got bound to a URL - surfaced in binding lines so a wrong
+/// match is visible before any auth error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindVia {
+    /// `?creds=<name>` pointer on the URL.
+    Pointer,
+    /// Longest-prefix `scope` match.
+    Scope,
+    /// The scope-less catch-all set.
+    CatchAll,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CredsBinding {
+    /// A `[creds.<name>]` set bound to this URL.
+    Set { name: String, via: BindVia },
+    /// No set matched; object_store's ambient SDK chain applies (AWS_* env,
+    /// shared credentials file, IMDS/container metadata). A documented
+    /// invariant, not an accident - instance profiles and OIDC work with
+    /// zero pond config.
+    Ambient,
+    /// Local / in-memory scheme; credentials don't apply.
+    NotApplicable,
+}
+
+impl CredsBinding {
+    /// One-line human rendering for binding lines and `pond config show`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Set { name, via } => {
+                let via = match via {
+                    BindVia::Pointer => "?creds",
+                    BindVia::Scope => "scope match",
+                    BindVia::CatchAll => "catch-all",
+                };
+                format!("creds {name} ({via})")
+            }
+            Self::Ambient => "ambient chain".to_owned(),
+            Self::NotApplicable => "local (no credentials)".to_owned(),
+        }
+    }
+}
+
+/// A storage address with its options assembled and secrets materialized -
+/// everything `Store::open_with_options` needs, plus the binding for
+/// display.
+#[derive(Debug, Clone)]
+pub struct ResolvedStorage {
+    storage: StorageUrl,
+    pub options: HashMap<String, String>,
+    pub binding: CredsBinding,
+}
+
+impl ResolvedStorage {
+    pub fn lance_url(&self) -> &Url {
+        self.storage.lance_url()
+    }
+
+    pub fn display(&self) -> String {
+        self.storage.display()
+    }
+}
+
+/// Names of defined creds sets that bound to none of this invocation's URLs
+/// (spec.md#creds-scope-match: misbinding must never be silent). Empty when
+/// the invocation touched no credential-taking URL - a local-only command
+/// must not nag about sets kept for remote work.
+pub fn unmatched_creds_sets<'c>(
+    resolved: &[&ResolvedStorage],
+    creds: &'c BTreeMap<String, CredsSet>,
+) -> Vec<&'c str> {
+    if resolved
+        .iter()
+        .all(|entry| matches!(entry.binding, CredsBinding::NotApplicable))
+    {
+        return Vec::new();
+    }
+    creds
+        .keys()
+        .filter(|name| {
+            !resolved.iter().any(|entry| {
+                matches!(&entry.binding, CredsBinding::Set { name: bound, .. } if bound == *name)
+            })
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// Materialize one logical secret from its inline / `_file` / `_command`
+/// variant (validation guarantees at most one is set).
+fn materialize_secret(
+    set: &str,
+    field: &str,
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+    command: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(value) = inline {
+        return Ok(Some(value.to_owned()));
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "[creds.{set}] {field}_file: failed to read {}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(strip_one_newline(text)));
+    }
+    if let Some(command) = command {
+        return Ok(Some(run_secret_command(set, field, command)?));
+    }
+    Ok(None)
+}
+
+/// Run a `*_command` secret source. Output is cached per command text per
+/// process, so N URLs resolving through one set cost one subprocess.
+fn run_secret_command(set: &str, field: &str, command: &str) -> Result<String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(command)
+    {
+        return Ok(hit.clone());
+    }
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?;
+    if !output.status.success() {
+        bail!(
+            "[creds.{set}] {field}_command exited {}: {command}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        );
+    }
+    let value = strip_one_newline(
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("[creds.{set}] {field}_command output is not UTF-8"))?,
+    );
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(command.to_owned(), value.clone());
+    Ok(value)
+}
+
+/// Strip exactly one trailing newline (the one `echo` / `op read` append);
+/// anything beyond that is part of the secret.
+fn strip_one_newline(mut text: String) -> String {
+    if text.ends_with('\n') {
+        text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+    }
+    text
+}
+
+/// `pond config check` failure classes, each with its own exit code at the
+/// CLI so cron and CI can branch on them.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckFailure {
+    #[error(
+        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials: {source}"
+    )]
+    NoCreds { source: anyhow::Error },
+    #[error("authentication failed using creds set {set:?}; check its keys and scope: {source}")]
+    Auth { set: String, source: anyhow::Error },
+    #[error(
+        "backend does not enforce conditional writes (If-None-Match); concurrent pond writers would corrupt each other - {detail}"
+    )]
+    OccUnsupported { detail: String },
+    #[error("storage probe failed: {source}")]
+    Io { source: anyhow::Error },
+}
+
+/// Probe a resolved storage destination end-to-end (spec.md#substrate): a
+/// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
+/// primitive Lance's commit handler relies on, then read-back and delete of
+/// the synthetic key.
+pub async fn storage_check(resolved: &ResolvedStorage) -> std::result::Result<(), CheckFailure> {
+    use object_store::{Error as OsError, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+
+    let classify =
+        |error: OsError, step: &str| classify_check_error(error, &resolved.binding, step);
+
+    let probe_uri = format!(
+        "{}/_config-check/{}",
+        resolved.lance_url().as_str().trim_end_matches('/'),
+        uuid::Uuid::now_v7(),
+    );
+    let params = ObjectStoreParams {
+        storage_options_accessor: (!resolved.options.is_empty()).then(|| {
+            Arc::new(StorageOptionsAccessor::with_static_options(
+                resolved.options.clone(),
+            ))
+        }),
+        ..Default::default()
+    };
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let (store, path) = ObjectStore::from_uri_and_params(registry, &probe_uri, &params)
+        .await
+        .map_err(|error| CheckFailure::Io {
+            source: anyhow!(error).context(format!("failed to open object store for {probe_uri}")),
+        })?;
+
+    let body: &[u8] = b"pond config check";
+    let create = PutOptions::from(PutMode::Create);
+    store
+        .inner
+        .put_opts(&path, PutPayload::from_static(body), create.clone())
+        .await
+        .map_err(|error| classify(error, "initial conditional put"))?;
+    // The probe key exists from here on: run the remaining steps, then
+    // best-effort delete it whatever they returned - a failed probe must
+    // not leave litter behind.
+    let outcome = async {
+        // The second create MUST lose: this is the `If-None-Match: *` -> 412
+        // primitive multi-writer OCC stands on. A backend that lets it
+        // through (or rejects the header) silently overwrites concurrent
+        // commits.
+        match store
+            .inner
+            .put_opts(&path, PutPayload::from_static(body), create)
+            .await
+        {
+            Err(OsError::AlreadyExists { .. }) => {}
+            Ok(_) => {
+                return Err(CheckFailure::OccUnsupported {
+                    detail: "a second create over an existing key succeeded".to_owned(),
+                });
+            }
+            Err(OsError::NotImplemented { .. }) => {
+                return Err(CheckFailure::OccUnsupported {
+                    detail: "the backend rejects conditional puts as unimplemented".to_owned(),
+                });
+            }
+            Err(error) => return Err(classify(error, "conditional-put probe")),
+        }
+        let read_back = store
+            .inner
+            .get(&path)
+            .await
+            .map_err(|error| classify(error, "read-back"))?
+            .bytes()
+            .await
+            .map_err(|error| classify(error, "read-back body"))?;
+        if read_back.as_ref() != body {
+            return Err(CheckFailure::Io {
+                source: anyhow!("read-back returned different bytes than written"),
+            });
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = store.inner.delete(&path).await;
+    outcome?;
+    cleanup.map_err(|error| classify(error, "cleanup delete"))?;
+    Ok(())
+}
+
+/// Map an `object_store` error onto the check's failure classes: an auth
+/// error is attributed to the bound creds set when one matched, and to the
+/// (empty) ambient chain when none did; everything else is I/O.
+fn classify_check_error(
+    error: object_store::Error,
+    binding: &CredsBinding,
+    step: &str,
+) -> CheckFailure {
+    use object_store::Error as OsError;
+    match (&error, binding) {
+        (
+            OsError::Unauthenticated { .. } | OsError::PermissionDenied { .. },
+            CredsBinding::Set { name, .. },
+        ) => CheckFailure::Auth {
+            set: name.clone(),
+            source: anyhow!(error).context(step.to_owned()),
+        },
+        (OsError::Unauthenticated { .. } | OsError::PermissionDenied { .. }, _) => {
+            CheckFailure::NoCreds {
+                source: anyhow!(error).context(step.to_owned()),
+            }
+        }
+        _ => CheckFailure::Io {
+            source: anyhow!(error).context(step.to_owned()),
+        },
+    }
 }
 
 /// Per-task fragment-count backstop: tasks this wide always run, bounding
@@ -1960,8 +2602,351 @@ fn like_contains(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
     use super::*;
     use tempfile::TempDir;
+
+    fn set(scope: Option<&str>) -> CredsSet {
+        CredsSet {
+            scope: scope.map(str::to_owned),
+            access_key_id: Some("AKIA".to_owned()),
+            secret_access_key: Some("shh".to_owned()),
+            ..CredsSet::default()
+        }
+    }
+
+    fn opts(resolved: &ResolvedStorage, key: &str) -> Option<String> {
+        resolved.options.get(key).cloned()
+    }
+
+    #[test]
+    fn storage_url_translation_table() {
+        // file (Lance's `uri_to_url` appends the trailing slash; `child_uri`
+        // trims it downstream)
+        let local = StorageUrl::parse("/srv/pond").unwrap();
+        assert_eq!(local.lance_url().as_str(), "file:///srv/pond/");
+        assert!(local.is_local());
+        assert!(local.scheme_options.is_empty());
+        // s3 passthrough
+        let aws = StorageUrl::parse("s3://bucket/prefix").unwrap();
+        assert_eq!(aws.lance_url().as_str(), "s3://bucket/prefix");
+        assert!(aws.scheme_options.is_empty());
+        // s3+https: endpoint folds out, TLS stays on, virtual-hosted defaults on
+        let fat = StorageUrl::parse("s3+https://nbg1.example.com/my-pond/sub").unwrap();
+        assert_eq!(fat.lance_url().as_str(), "s3://my-pond/sub");
+        assert_eq!(
+            fat.scheme_options,
+            vec![
+                ("endpoint", "https://nbg1.example.com".to_owned()),
+                ("allow_http", "false".to_owned()),
+                ("virtual_hosted_style_request", "true".to_owned()),
+            ],
+        );
+        // s3+http: port survives into the endpoint, allow_http flips
+        let plain = StorageUrl::parse("s3+http://127.0.0.1:9000/pond").unwrap();
+        assert_eq!(plain.lance_url().as_str(), "s3://pond/");
+        assert_eq!(
+            plain.scheme_options[0],
+            ("endpoint", "http://127.0.0.1:9000".to_owned()),
+        );
+        assert_eq!(plain.scheme_options[1], ("allow_http", "true".to_owned()));
+        // gs passthrough
+        let gcs = StorageUrl::parse("gs://bucket/p").unwrap();
+        assert_eq!(gcs.lance_url().as_str(), "gs://bucket/p");
+        // az: account folds into options
+        let azure = StorageUrl::parse("az://acct/container/p").unwrap();
+        assert_eq!(azure.lance_url().as_str(), "az://container/p");
+        assert_eq!(
+            azure.scheme_options,
+            vec![("account_name", "acct".to_owned())]
+        );
+        // tests-only schemes pass through untouched
+        let shared = StorageUrl::parse("shared-memory://pond-test-x/").unwrap();
+        assert_eq!(shared.lance_url().as_str(), "shared-memory://pond-test-x/");
+    }
+
+    #[test]
+    fn storage_url_rejects_bad_shapes() {
+        // RFC 3986 userinfo is a leak class, never accepted.
+        let err = StorageUrl::parse("s3+https://user:pass@host/bucket")
+            .expect_err("userinfo must be rejected")
+            .to_string();
+        assert!(
+            err.contains("creds"),
+            "error must name the alternative: {err}"
+        );
+        // Missing bucket.
+        assert!(StorageUrl::parse("s3+https://host").is_err());
+        assert!(StorageUrl::parse("az://acct").is_err());
+        // Unknown scheme names the grammar.
+        let err = StorageUrl::parse("ftp://host/x")
+            .expect_err("ftp")
+            .to_string();
+        assert!(err.contains("s3+https"), "got: {err}");
+        // Unrecognized query params die loudly.
+        let err = StorageUrl::parse("s3://b/p?regoin=x")
+            .expect_err("typo")
+            .to_string();
+        assert!(err.contains("regoin"), "got: {err}");
+    }
+
+    #[test]
+    fn storage_url_canonicalizes_ports_and_keeps_percent_encoding() {
+        // Default port strips so scope matching can't split on `:443`.
+        let with_port = StorageUrl::parse("s3+https://host:443/bucket/p").unwrap();
+        let without = StorageUrl::parse("s3+https://host/bucket/p").unwrap();
+        assert_eq!(with_port.canonical(), without.canonical());
+        // Non-default port survives.
+        let odd = StorageUrl::parse("s3+https://host:8443/bucket").unwrap();
+        assert_eq!(odd.scheme_options[0].1, "https://host:8443");
+        // Percent-encoded prefix passes through to the Lance URL verbatim.
+        let encoded = StorageUrl::parse("s3+https://host/bucket/pre%20fix").unwrap();
+        assert_eq!(encoded.lance_url().as_str(), "s3://bucket/pre%20fix");
+    }
+
+    #[test]
+    fn query_params_strip_and_apply_over_set_fields() {
+        let mut creds = BTreeMap::new();
+        creds.insert(
+            "default".to_owned(),
+            CredsSet {
+                region: Some("from-set".to_owned()),
+                virtual_hosted_style_request: Some(false),
+                ..set(None)
+            },
+        );
+        let url = StorageUrl::parse(
+            "s3+https://host/bucket/p?region=from-query&virtual_hosted_style_request=true",
+        )
+        .unwrap();
+        // Stripped before Lance sees the URL.
+        assert_eq!(url.lance_url().as_str(), "s3://bucket/p");
+        assert!(url.canonical().query().is_none());
+        let resolved = url.resolve(&creds).unwrap();
+        // Assembly precedence: scheme < set < query.
+        assert_eq!(opts(&resolved, "region").as_deref(), Some("from-query"));
+        assert_eq!(
+            opts(&resolved, "virtual_hosted_style_request").as_deref(),
+            Some("true"),
+        );
+        assert_eq!(opts(&resolved, "endpoint").as_deref(), Some("https://host"));
+    }
+
+    #[test]
+    fn scope_matching_binds_by_longest_prefix_at_segment_boundaries() {
+        let mut creds = BTreeMap::new();
+        creds.insert("all".to_owned(), set(None));
+        creds.insert("bucket".to_owned(), set(Some("s3+https://host/pond/")));
+        creds.insert("deep".to_owned(), set(Some("s3+https://host/pond/sub")));
+
+        let bind = |input: &str| {
+            StorageUrl::parse(input)
+                .unwrap()
+                .resolve(&creds)
+                .unwrap()
+                .binding
+        };
+        // Longest match wins.
+        assert_eq!(
+            bind("s3+https://host/pond/sub/x"),
+            CredsBinding::Set {
+                name: "deep".to_owned(),
+                via: BindVia::Scope
+            },
+        );
+        assert_eq!(
+            bind("s3+https://host/pond/other"),
+            CredsBinding::Set {
+                name: "bucket".to_owned(),
+                via: BindVia::Scope
+            },
+        );
+        // Segment boundary: `/pond` does not match `/pond-2`.
+        assert_eq!(
+            bind("s3+https://host/pond-2"),
+            CredsBinding::Set {
+                name: "all".to_owned(),
+                via: BindVia::CatchAll
+            },
+        );
+        // No cross-scheme normalization: the scoped sets don't match s3://.
+        assert_eq!(
+            bind("s3://pond/sub"),
+            CredsBinding::Set {
+                name: "all".to_owned(),
+                via: BindVia::CatchAll
+            },
+        );
+        // Default-port spelling matches the portless scope.
+        assert_eq!(
+            bind("s3+https://host:443/pond/x"),
+            CredsBinding::Set {
+                name: "bucket".to_owned(),
+                via: BindVia::Scope
+            },
+        );
+        // `?creds=` pointer beats every scope...
+        assert_eq!(
+            bind("s3+https://host/pond/sub/x?creds=all"),
+            CredsBinding::Set {
+                name: "all".to_owned(),
+                via: BindVia::Pointer
+            },
+        );
+        // ...and a pointer to a missing set is an error, not a fallback.
+        let err = StorageUrl::parse("s3://b/p?creds=nope")
+            .unwrap()
+            .resolve(&creds)
+            .expect_err("missing set")
+            .to_string();
+        assert!(err.contains("creds=nope"), "got: {err}");
+
+        // No sets at all -> ambient chain; local URLs skip resolution.
+        let empty = BTreeMap::new();
+        assert_eq!(
+            StorageUrl::parse("s3://b/p")
+                .unwrap()
+                .resolve(&empty)
+                .unwrap()
+                .binding,
+            CredsBinding::Ambient,
+        );
+        assert_eq!(
+            StorageUrl::parse("/srv/pond")
+                .unwrap()
+                .resolve(&creds)
+                .unwrap()
+                .binding,
+            CredsBinding::NotApplicable,
+        );
+    }
+
+    #[test]
+    fn unmatched_sets_are_reported_only_on_remote_invocations() {
+        let mut creds = BTreeMap::new();
+        creds.insert("used".to_owned(), set(Some("s3://bucket/")));
+        creds.insert("idle".to_owned(), set(Some("s3://other/")));
+
+        let remote = StorageUrl::parse("s3://bucket/p")
+            .unwrap()
+            .resolve(&creds)
+            .unwrap();
+        assert_eq!(unmatched_creds_sets(&[&remote], &creds), vec!["idle"]);
+
+        // A purely local invocation must not nag about remote-only sets.
+        let local = StorageUrl::parse("/srv/pond")
+            .unwrap()
+            .resolve(&creds)
+            .unwrap();
+        assert!(unmatched_creds_sets(&[&local], &creds).is_empty());
+    }
+
+    #[test]
+    fn secrets_materialize_from_file_and_command() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("key");
+        std::fs::write(&key_path, "from-file\n").unwrap();
+        let mut creds = BTreeMap::new();
+        creds.insert(
+            "default".to_owned(),
+            CredsSet {
+                access_key_id_file: Some(key_path),
+                // Two trailing newlines: exactly one is stripped.
+                secret_access_key_command: Some("printf 'from-command\\n\\n'".to_owned()),
+                ..CredsSet::default()
+            },
+        );
+        let url = StorageUrl::parse("s3://bucket/p").unwrap();
+        let resolved = url.resolve(&creds).unwrap();
+        assert_eq!(
+            opts(&resolved, "access_key_id").as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(
+            opts(&resolved, "secret_access_key").as_deref(),
+            Some("from-command\n"),
+        );
+
+        // A failing command surfaces its text and exit status.
+        let mut failing = BTreeMap::new();
+        failing.insert(
+            "default".to_owned(),
+            CredsSet {
+                secret_access_key_command: Some("exit 3".to_owned()),
+                ..CredsSet::default()
+            },
+        );
+        let err = url
+            .resolve(&failing)
+            .expect_err("command must fail")
+            .to_string();
+        assert!(err.contains("exit 3"), "got: {err}");
+
+        // The command cache: one subprocess per command text per process.
+        let marker = dir.path().join("runs");
+        let command = format!("echo run >> {} && echo secret", marker.display());
+        let mut counted = BTreeMap::new();
+        counted.insert(
+            "default".to_owned(),
+            CredsSet {
+                secret_access_key_command: Some(command),
+                ..CredsSet::default()
+            },
+        );
+        url.resolve(&counted).unwrap();
+        url.resolve(&counted).unwrap();
+        let runs = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(runs.lines().count(), 1, "command must run exactly once");
+    }
+
+    #[test]
+    fn check_errors_classify_by_kind_and_binding() {
+        let auth_error = || object_store::Error::Unauthenticated {
+            path: "k".to_owned(),
+            source: "denied".into(),
+        };
+        let bound = CredsBinding::Set {
+            name: "work".to_owned(),
+            via: BindVia::Scope,
+        };
+        // Auth-class error with a bound set names the set...
+        match classify_check_error(auth_error(), &bound, "put") {
+            CheckFailure::Auth { set, .. } => assert_eq!(set, "work"),
+            other => panic!("want Auth, got {other:?}"),
+        }
+        // ...and without one, points at the (empty) ambient chain.
+        assert!(matches!(
+            classify_check_error(auth_error(), &CredsBinding::Ambient, "put"),
+            CheckFailure::NoCreds { .. },
+        ));
+        let denied = object_store::Error::PermissionDenied {
+            path: "k".to_owned(),
+            source: "403".into(),
+        };
+        assert!(matches!(
+            classify_check_error(denied, &bound, "put"),
+            CheckFailure::Auth { .. },
+        ));
+        // Anything else is I/O, set or no set.
+        let missing = object_store::Error::NotFound {
+            path: "k".to_owned(),
+            source: "404".into(),
+        };
+        assert!(matches!(
+            classify_check_error(missing, &bound, "get"),
+            CheckFailure::Io { .. },
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_check_passes_on_memory_backend() {
+        let resolved = StorageUrl::parse("memory://check/probe")
+            .unwrap()
+            .resolve(&BTreeMap::new())
+            .unwrap();
+        storage_check(&resolved).await.expect("memory probe passes");
+    }
 
     fn stat(bytes: u64) -> FragmentStat {
         FragmentStat {

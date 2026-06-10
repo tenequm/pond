@@ -11,6 +11,8 @@ mod adapter;
 mod embed;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
+#[path = "integration/migrate.rs"]
+mod migrate;
 #[path = "integration/optimize_under_contention.rs"]
 mod optimize_under_contention;
 #[path = "integration/recovery.rs"]

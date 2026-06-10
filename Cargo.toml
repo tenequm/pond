@@ -84,6 +84,10 @@ candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
 fastrand = "2"
+# Layered config (file -> env) with per-field provenance for `pond config
+# show`. The published 0.10.x has zero default features; `toml` + `env` gate
+# the two providers pond composes.
+figment = { version = "0.10.19", features = ["toml", "env"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
 lance = { version = "7.0.0", features = ["protoc"] }
@@ -105,6 +109,10 @@ lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
+# Already in the tree via lance-io; named directly so `pond config check` can
+# drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
+# classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
+object_store = { version = "0.13", default-features = false }
 # Parquet export writer for `pond_sql_query`. The only genuinely new compiled
 # crate the SQL tool adds (lance reads/writes its own format, not parquet).
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
@@ -143,6 +151,9 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
+# `Jail` for env-mirror tests: sandboxed env vars + cwd without `unsafe`
+# `std::env::set_var` in pond's own code (the crate denies unsafe).
+figment = { version = "0.10.19", features = ["test"] }
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
 lance-linalg = "7.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
