@@ -108,6 +108,36 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
             text: s("the answer is forty-two"),
         },
     };
+    let tool_call = Part {
+        session_id: SESSION_ID.to_owned(),
+        id: "p-call".to_owned(),
+        message_id: "m-asst".to_owned(),
+        ordinal: 1,
+        provenance: Provenance::Conversational,
+        options: Default::default(),
+        kind: PartKind::ToolCall {
+            call_id: s("call-1"),
+            name: s("Bash"),
+            params: json!({ "command": "echo hi" }),
+            provider_executed: false,
+        },
+    };
+    let tool_result = Part {
+        session_id: SESSION_ID.to_owned(),
+        id: "p-result".to_owned(),
+        message_id: "m-asst".to_owned(),
+        ordinal: 2,
+        provenance: Provenance::Conversational,
+        options: Default::default(),
+        kind: PartKind::ToolResult {
+            call_id: s("call-1"),
+            name: s("Bash"),
+            is_failure: false,
+            // Array-valued result: the lenient json_get_string must serialize
+            // it instead of aborting the scan (strict jsonb to_str fails).
+            result: json!([{ "type": "text", "text": "hi there" }]),
+        },
+    };
 
     let envelope = pond_ingest(
         &store,
@@ -120,6 +150,8 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
                 IngestEvent::Message(assistant),
                 IngestEvent::Part(user_text),
                 IngestEvent::Part(asst_text),
+                IngestEvent::Part(tool_call),
+                IngestEvent::Part(tool_result),
             ],
         },
     )
@@ -400,6 +432,81 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         text.contains(" ms"),
         "metrics footer carries elapsed ms: {text}"
     );
+
+    // 12. The `query` param name is accepted as an alias for `sql` (agents
+    // guess it; previously a hard -32602 deserialization error).
+    let result = call(json!({ "query": "SELECT count(*) AS n FROM parts" })).await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "query alias should work: {result:?}"
+    );
+
+    // 13. information_schema self-discovery works.
+    let result = call(json!({
+        "sql": "SELECT column_name FROM information_schema.columns \
+                WHERE table_name = 'messages' ORDER BY column_name"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "information_schema should be enabled: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("search_text"), "lists columns: {text}");
+
+    // 14. The parts `data` blob column is hidden from the SQL schema, and the
+    // error teaches the fix (variant_data + schema doc).
+    let result = call(json!({ "sql": "SELECT data FROM parts" })).await?;
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "parts.data is not selectable: {result:?}"
+    );
+    let text = first_text(&result).expect("error carries a message");
+    assert!(text.contains("hint:"), "error carries a hint: {text}");
+    assert!(
+        text.contains("variant_data"),
+        "hint redirects to variant_data: {text}"
+    );
+    let result = call(json!({
+        "sql": "SELECT count(*) AS n FROM information_schema.columns \
+                WHERE table_name = 'parts' AND column_name = 'data'"
+    }))
+    .await?;
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("| 0 |"), "data absent from schema: {text}");
+
+    // 15. Tool analytics: json_get_string drills the tool name out of
+    // variant_data.
+    let result = call(json!({
+        "sql": "SELECT json_get_string(variant_data, 'name') AS tool, count(*) AS n \
+                FROM parts WHERE type = 'tool_call' GROUP BY tool"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "tool analytics should work: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("Bash"), "extracts the tool name: {text}");
+
+    // 16. Lenient json_get_string: an array-valued field serializes to JSON
+    // text instead of aborting the scan with InvalidCast.
+    let result = call(json!({
+        "sql": "SELECT json_get_string(variant_data, 'result') AS r \
+                FROM parts WHERE type = 'tool_result'"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "lenient json_get_string should serialize non-strings: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("hi there"), "serialized array result: {text}");
 
     client.cancel().await?;
     let _ = server_handle.await;

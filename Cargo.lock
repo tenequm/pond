@@ -6372,6 +6372,7 @@ dependencies = [
  "hyper-util",
  "indicatif",
  "insta",
+ "jsonb",
  "lance",
  "lance-arrow",
  "lance-datafusion",

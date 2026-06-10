@@ -15,12 +15,20 @@ use arrow_json::LineDelimitedWriter;
 use lance::Dataset;
 use lance::datafusion::LanceTableProvider;
 use lance::dataset::udtf::FtsQueryUDTFBuilder;
-use lance::deps::arrow_array::RecordBatch;
+use lance::deps::arrow_array::builder::{
+    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+};
+use lance::deps::arrow_array::{Array, LargeBinaryArray, RecordBatch, StringArray};
 use lance::deps::arrow_schema::{ArrowError, DataType};
 use lance::deps::datafusion::arrow::util::pretty::pretty_format_batches;
+use lance::deps::datafusion::datasource::{ViewTable, provider_as_source};
+use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::execution::SessionStateBuilder;
 use lance::deps::datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use lance::deps::datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
+use lance::deps::datafusion::logical_expr::{
+    ColumnarValue, LogicalPlanBuilder, ScalarUDF, Volatility, create_udf,
+};
+use lance::deps::datafusion::prelude::{SQLOptions, SessionConfig, SessionContext, col};
 use lance::deps::datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use lance::deps::datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
 use lance_datafusion::udf::register_functions;
@@ -159,7 +167,7 @@ pub async fn run(
     let df = ctx
         .sql_with_options(sql, options)
         .await
-        .map_err(|error| SqlError::Query(format!("SQL error: {error}")))?;
+        .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
 
     // Captured before `collect()` consumes `df`, so an empty result still
     // renders its column headers.
@@ -173,7 +181,7 @@ pub async fn run(
                 QUERY_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(|error| SqlError::Query(format!("SQL error: {error}")))?;
+        .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
     let elapsed = started.elapsed();
 
     let display: Vec<RecordBatch> = if collected.is_empty() {
@@ -339,8 +347,10 @@ fn build_context() -> Result<SessionContext, SqlError> {
         .with_memory_limit(MEM_LIMIT_BYTES, 1.0)
         .build_arc()
         .map_err(|error| SqlError::Infra(anyhow!("datafusion runtime init failed: {error}")))?;
+    // information_schema is the standard self-discovery path (SELECT ... FROM
+    // information_schema.columns); agents reach for it before any doc.
     let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new())
+        .with_config(SessionConfig::new().with_information_schema(true))
         .with_runtime_env(runtime)
         .with_default_features()
         .build();
@@ -351,7 +361,6 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     for (name, dataset) in [
         ("sessions", &tables.sessions),
         ("messages", &tables.messages),
-        ("parts", &tables.parts),
     ] {
         // LanceTableProvider (not the bare Dataset impl) so WHERE/projection/
         // limit push into Lance's indexed scan; (false, false) hides _rowid /
@@ -360,6 +369,25 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         ctx.register_table(name, Arc::new(provider))
             .map_err(|error| SqlError::Infra(anyhow!("register table {name}: {error}")))?;
     }
+    // `parts` hides the `data` blob column behind a projecting view: blob
+    // columns scan as `{position, size}` descriptor structs, so any SQL touch
+    // dies in the planner with an opaque CAST error. The view inlines at plan
+    // time - filters still push into the Lance scan underneath.
+    let provider = LanceTableProvider::new(tables.parts.clone(), false, false);
+    let keep: Vec<_> = tables
+        .parts
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| field.name != "data")
+        .map(|field| col(field.name.as_str()))
+        .collect();
+    let plan = LogicalPlanBuilder::scan("parts", provider_as_source(Arc::new(provider)), None)
+        .and_then(|builder| builder.project(keep))
+        .and_then(LogicalPlanBuilder::build)
+        .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
+    ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
+        .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
     // `fts('messages', '{...}')` BM25 search-in-SQL, and lance's JSON /
     // contains_tokens UDFs for filtering inside the JSON columns.
     let fts = FtsQueryUDTFBuilder::builder()
@@ -369,7 +397,182 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         .build();
     ctx.register_udtf("fts", Arc::new(fts));
     register_functions(ctx);
+    // Shadow lance's strict json_get_* by name: the strict versions abort the
+    // whole scan when any row's field is non-scalar (e.g. tool_result `result`
+    // arrays), turning one polymorphic value into a dead query.
+    for udf in lenient_json_udfs() {
+        ctx.register_udf(udf);
+    }
     Ok(())
+}
+
+/// The four scalar shapes the lenient JSON getters produce.
+enum JsonGet {
+    Text,
+    Int,
+    Float,
+    Bool,
+}
+
+/// Lenient replacements for lance's `json_get_string` / `_int` / `_float` /
+/// `_bool`. The strict originals call jsonb's exact converters and turn one
+/// non-scalar field value into a query-wide abort ("Failed to convert to
+/// string: InvalidCast"). Lenient semantics: a string getter serializes
+/// objects/arrays to JSON text; the typed getters return NULL on a
+/// non-coercible value. Same signatures, registered after
+/// `register_functions` so they shadow by name.
+fn lenient_json_udfs() -> [ScalarUDF; 4] {
+    let make = |name: &str, kind: JsonGet, return_type: DataType| {
+        create_udf(
+            name,
+            vec![DataType::LargeBinary, DataType::Utf8],
+            return_type,
+            Volatility::Immutable,
+            Arc::new(move |args: &[ColumnarValue]| json_get_lenient(args, &kind)),
+        )
+    };
+    [
+        make("json_get_string", JsonGet::Text, DataType::Utf8),
+        make("json_get_int", JsonGet::Int, DataType::Int64),
+        make("json_get_float", JsonGet::Float, DataType::Float64),
+        make("json_get_bool", JsonGet::Bool, DataType::Boolean),
+    ]
+}
+
+fn json_get_lenient(
+    args: &[ColumnarValue],
+    kind: &JsonGet,
+) -> Result<ColumnarValue, DataFusionError> {
+    let arrays = ColumnarValue::values_to_arrays(args)?;
+    let [jsonb_arg, key_arg] = arrays.as_slice() else {
+        return Err(DataFusionError::Execution(
+            "json_get_* takes exactly (json_column, 'key')".to_owned(),
+        ));
+    };
+    let jsonb_array = jsonb_arg
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(
+                "json_get_* argument 1 must be a JSON column (variant_data, options)".to_owned(),
+            )
+        })?;
+    let key_array = key_arg
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::Execution("json_get_* argument 2 must be a string key".to_owned())
+        })?;
+
+    let field = |row: usize| -> Option<jsonb::OwnedJsonb> {
+        if jsonb_array.is_null(row) || key_array.is_null(row) {
+            return None;
+        }
+        let raw = jsonb::RawJsonb::new(jsonb_array.value(row));
+        let key = key_array.value(row);
+        let value = if raw.is_object().unwrap_or(false) {
+            raw.get_by_name(key, false).ok().flatten()
+        } else if raw.is_array().unwrap_or(false) {
+            key.parse::<usize>()
+                .ok()
+                .and_then(|index| raw.get_by_index(index).ok().flatten())
+        } else {
+            None
+        };
+        value.filter(|value| !value.as_raw().is_null().unwrap_or(false))
+    };
+
+    let rows = jsonb_array.len();
+    let array: Arc<dyn Array> = match kind {
+        JsonGet::Text => {
+            let mut builder = StringBuilder::with_capacity(rows, 1024);
+            for row in 0..rows {
+                match field(row) {
+                    // Scalar strings come back unquoted; objects/arrays/
+                    // numbers serialize to JSON text instead of erroring.
+                    Some(value) => match value.as_raw().to_str() {
+                        Ok(text) => builder.append_value(text),
+                        Err(_) => builder.append_value(value.to_string()),
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        JsonGet::Int => {
+            let mut builder = Int64Builder::with_capacity(rows);
+            for row in 0..rows {
+                builder.append_option(field(row).and_then(|value| value.as_raw().to_i64().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+        JsonGet::Float => {
+            let mut builder = Float64Builder::with_capacity(rows);
+            for row in 0..rows {
+                builder.append_option(field(row).and_then(|value| value.as_raw().to_f64().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+        JsonGet::Bool => {
+            let mut builder = BooleanBuilder::with_capacity(rows);
+            for row in 0..rows {
+                builder.append_option(field(row).and_then(|value| value.as_raw().to_bool().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+    };
+    Ok(ColumnarValue::Array(array))
+}
+
+/// Failures name the fix: append a recovery hint to the DataFusion error
+/// classes agents actually hit, so a failed call teaches the correct next
+/// query instead of starting a guessing loop. First match wins.
+fn enrich(message: &str) -> String {
+    const HINTS: &[(&str, &str)] = &[
+        (
+            "No field named",
+            "columns are messages(session_id, id, timestamp, role, source_agent, project, \
+             content [system-role only], search_text [the conversational text], \
+             embedding_model, options) | sessions(id, parent_session_id, parent_message_id, \
+             source_agent, created_at, project, options) | parts(session_id, message_id, id, \
+             ordinal, type, provenance, variant_data, options). Part bodies (tool params/\
+             results, text) live in parts.variant_data - read them with \
+             json_extract(variant_data, '$.field'). For text search use fts('messages', \
+             ...); to read a transcript use pond_get. Full doc: resource schema://pond-sql.",
+        ),
+        (
+            "Encountered non UTF-8 data",
+            "JSON columns (variant_data, options) are binary JSONB - CAST / ::text does not \
+             work on them. Stringify the whole value with json_extract(col, '$'), or fetch \
+             one field with json_extract(col, '$.field').",
+        ),
+        (
+            "LIKE prefix queries are not supported for bitmap indexes",
+            "prefix LIKE ('x%') and starts_with() fail on bitmap-indexed columns \
+             (messages.source_agent, messages.role). Use equality, \
+             split_part(source_agent, '/', 1) = '...', or an infix pattern (LIKE '%x%').",
+        ),
+        (
+            "call to 'json_",
+            "JSON function signatures: json_get_string|json_get_int|json_get_float|\
+             json_get_bool(col, 'key') - one key, not a path; json_get(col, 'key') returns \
+             JSONB for chaining; json_extract(col, '$.a.b') takes a JSONPath and returns \
+             JSON text of any value (the right tool for nested or mixed-type fields).",
+        ),
+        (
+            "Invalid function 'json",
+            "available JSON functions: json_get_string, json_get_int, json_get_float, \
+             json_get_bool (col, 'key'); json_get(col, 'key') -> JSONB for chaining; \
+             json_extract(col, '$.a.b') -> JSON text; json_array_contains; \
+             json_array_length. See resource schema://pond-sql.",
+        ),
+    ];
+    for (pattern, hint) in HINTS {
+        if message.contains(pattern) {
+            return format!("{message}\nhint: {hint}");
+        }
+    }
+    message.to_owned()
 }
 
 /// Decode lance JSONB columns to JSON text, then drop columns that don't render
@@ -666,6 +869,47 @@ mod tests {
         assert!(mentions_vector("SELECT m.vector FROM messages m"));
         assert!(mentions_vector("SELECT array_length(vector) FROM messages"));
         assert!(mentions_vector("EXPLAIN SELECT vector FROM messages"));
+    }
+
+    #[test]
+    fn enrich_appends_recovery_hints() {
+        // One literal error string per class, captured from real failed calls.
+        let cases = [
+            (
+                "SQL error: Schema error: No field named created_at.",
+                "schema://pond-sql",
+            ),
+            (
+                "SQL error: External error: Arrow error: Invalid argument error: \
+                 Encountered non UTF-8 data",
+                "json_extract",
+            ),
+            (
+                "SQL error: External error: Not supported: LIKE prefix queries are not \
+                 supported for bitmap indexes",
+                "split_part",
+            ),
+            (
+                "SQL error: Error during planning: Failed to coerce arguments to satisfy \
+                 a call to 'json_get_string' function",
+                "JSONPath",
+            ),
+            (
+                "SQL error: Error during planning: Invalid function 'json_get_json'.",
+                "json_extract",
+            ),
+        ];
+        for (raw, marker) in cases {
+            let enriched = enrich(raw);
+            assert!(enriched.starts_with(raw), "original kept: {enriched}");
+            assert!(enriched.contains("hint:"), "hint appended: {enriched}");
+            assert!(enriched.contains(marker), "hint names the fix: {enriched}");
+        }
+        // Unrecognized errors pass through untouched.
+        assert_eq!(
+            enrich("SQL error: division by zero"),
+            "SQL error: division by zero"
+        );
     }
 
     #[test]

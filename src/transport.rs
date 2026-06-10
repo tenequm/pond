@@ -252,22 +252,39 @@ open it. Not for bulk export - use `pond export`.";
 pond_sql_query runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
 over three registered tables. Read-only is hard-enforced: anything other than a \
 single SELECT/WITH (or EXPLAIN of one) is rejected (no INSERT/UPDATE/DELETE/\
-CREATE/DROP/COPY/SET). It complements pond_search (semantic recall) - use it for \
-filtering, joins, and aggregation over metadata; use pond_search for meaning-based \
-search.
+CREATE/DROP/COPY/SET).
+
+Routing - pick the right surface before writing SQL:
+- counts, group-by, time buckets, joins over metadata -> this tool, on \
+messages/sessions.
+- which tools ran / failed, tool params -> this tool, on parts (type = \
+'tool_call' / 'tool_result'); worked example below.
+- find text in conversations -> fts('messages', ...) below, or pond_search for \
+meaning-based recall. Never LIKE over parts - tool bodies are JSON, and the \
+conversational text is messages.search_text.
+- read a transcript (a session, a message with context) -> pond_get, not SQL.
 
 Tables and columns:
 - messages(session_id text, id text, timestamp timestamp(us, UTC), role text \
-{user|assistant|system|tool}, source_agent text, project text, content text NULL, \
-search_text text NULL, embedding_model text NULL, options json). The embedding \
-`vector` column exists but is never returned (omitted from results) and explicit \
-projection of it is rejected; you may still filter on it in WHERE, e.g. `vector \
-IS NOT NULL`. For semantic search, use pond_search.
+{user|assistant|system|tool}, source_agent text, project text, content text NULL \
+[system-role messages only], search_text text NULL [the conversational text - \
+null for system/tool messages], embedding_model text NULL, options json). The \
+embedding `vector` column exists but is never returned (omitted from results) and \
+explicit projection of it is rejected; you may still filter on it in WHERE, e.g. \
+`vector IS NOT NULL`. For semantic search, use pond_search.
 - sessions(id text, parent_session_id text NULL, parent_message_id text NULL, \
 source_agent text, created_at timestamp(us, UTC), project text, options json).
-- parts(session_id text, message_id text, id text, ordinal int, type text, \
-provenance text {conversational|injected}, variant_data json, options json). The \
-verbatim message body lives here in `variant_data`.
+- parts(session_id text, message_id text, id text, ordinal int, type text \
+{text|reasoning|file|tool_call|tool_result|tool_approval_request|\
+tool_approval_response - exact strings, underscores not hyphens}, provenance \
+text {conversational|injected}, variant_data json, options json). The verbatim \
+part body lives in `variant_data`; its fields follow the part type, e.g. \
+tool_call carries {call_id, name, params}, tool_result carries {call_id, name, \
+is_failure, result}, text/reasoning carry {text}. FilePart binary payloads are \
+not exposed in SQL.
+Enum literals matter: a wrong value (e.g. 'tool-call') is valid SQL and silently \
+returns zero rows. Discovery from SQL works too: SELECT table_name, column_name, \
+data_type FROM information_schema.columns.
 
 Join keys: messages.session_id = sessions.id; parts.session_id = messages.session_id \
 AND parts.message_id = messages.id. Subagents are sessions whose source_agent \
@@ -275,11 +292,39 @@ matches '%/%' (e.g. 'claude-code/general-purpose').
 
 Indexed (fast) filter columns: messages.project / session_id / timestamp / role / \
 source_agent; parts.session_id / message_id; sessions.id. Prefer equality/range \
-predicates on these.
+predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
+on bitmap-indexed columns (messages.source_agent, messages.role) with \"LIKE \
+prefix queries are not supported for bitmap indexes\". Workarounds: equality, \
+split_part(source_agent, '/', 1) = 'claude-code', or an infix pattern \
+(LIKE '%/%' is fine - leading-wildcard patterns are not pushed to the index).
 
-JSON columns (options, variant_data) are returned as decoded JSON text. To filter \
-inside them use lance's JSON UDFs (filter-only): json_get_string(col,'path'), \
-json_get_int, json_get_bool, json_extract(col,'$.a.b'), json_array_contains.
+JSON columns (options, variant_data) are binary JSONB. Rules:
+- NEVER CAST a JSON column (`variant_data::text` fails on the binary encoding). \
+Stringify with json_extract(col, '$').
+- json_extract(col, '$.a.b') takes a full JSONPath and returns JSON text of ANY \
+value (objects/arrays serialize) - the right call for nested or mixed-type \
+fields, e.g. json_extract(variant_data, '$.params.command').
+- json_get_string|json_get_int|json_get_float|json_get_bool(col, 'key') take ONE \
+key (not a path). json_get_string serializes non-string values; the typed \
+getters return NULL on a non-coercible value.
+- json_get(col, 'key') returns JSONB for chaining: \
+json_get_string(json_get(variant_data, 'params'), 'command').
+- Also: json_array_contains(col, 'key', value), json_array_length(col, 'key').
+
+Worked example - tool usage and failure rates over the last week:
+
+  SELECT json_get_string(c.variant_data, 'name') AS tool,
+         COUNT(*) AS calls,
+         SUM(CASE WHEN json_get_bool(r.variant_data, 'is_failure') THEN 1 \
+ELSE 0 END) AS failures
+  FROM parts c
+  JOIN messages m ON m.session_id = c.session_id AND m.id = c.message_id
+  LEFT JOIN parts r ON r.session_id = c.session_id
+   AND r.type = 'tool_result'
+   AND json_get_string(r.variant_data, 'call_id') = \
+json_get_string(c.variant_data, 'call_id')
+  WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
+  GROUP BY tool ORDER BY calls DESC;
 
 Full-text (BM25) search in SQL via the fts() table function: SELECT * FROM \
 fts('messages', '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') - \
@@ -299,7 +344,8 @@ regexp_match, regexp_replace, like, ilike, starts_with, ends_with, concat, \
 concat_ws
 - numeric: round, floor, ceil, abs, sign, log, exp, power, sqrt
 - conditional: CASE WHEN ... THEN ... ELSE ..., coalesce, nullif, greatest, least
-- cast: CAST(x AS TYPE) or x::TYPE (e.g. variant_data::text)
+- cast: CAST(x AS TYPE) or x::TYPE - but never on JSON columns (see the JSON \
+rules above)
 Quote identifiers with double quotes when they collide with keywords (e.g. \
 \"timestamp\"); string literals use single quotes.
 
@@ -357,7 +403,7 @@ user message:
     LIMIT 10
   )
   SELECT ts.session_id, ts.msgs, s.project, s.source_agent,
-         m.content AS first_user_msg
+         m.search_text AS first_user_msg
   FROM top_sessions ts
   JOIN sessions s ON s.id = ts.session_id
   LEFT JOIN messages m
@@ -390,7 +436,7 @@ Examples (3 patterns the agent should recognize):
   ORDER BY n DESC;
 
   -- 3. BM25 search in SQL, joined with metadata
-  SELECT m.session_id, m.timestamp, m.project, m.content
+  SELECT m.session_id, m.timestamp, m.project, m.search_text
   FROM fts('messages', \
 '{\"match\":{\"column\":\"search_text\",\"terms\":\"race condition\"}}') f
   JOIN messages m ON m.id = f.id
@@ -486,12 +532,21 @@ Examples (3 patterns the agent should recognize):
     /// `pond_sql_query` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSqlParams {
-        /// One read-only SQL statement (DataFusion / PostgreSQL-compatible)
-        /// over tables `sessions`, `messages`, `parts`. SELECT/WITH only
-        /// (or EXPLAIN of one); writes and side-effecting statements are
-        /// rejected. See the `schema://pond-sql` resource for columns, joins,
-        /// indexed filter columns, JSON/FTS functions, the function quick-
-        /// reference, pagination + drilling patterns, and examples.
+        /// One read-only SQL statement (DataFusion / PostgreSQL-compatible).
+        /// SELECT/WITH only (or EXPLAIN of one); writes and side-effecting
+        /// statements are rejected. Exact columns - messages(session_id, id,
+        /// timestamp, role, source_agent, project, content [system-role
+        /// only], search_text [the conversational text], embedding_model,
+        /// options) | sessions(id, parent_session_id, parent_message_id,
+        /// source_agent, created_at, project, options) | parts(session_id,
+        /// message_id, id, ordinal, type, provenance, variant_data, options).
+        /// parts.type enums use underscores: 'tool_call', 'tool_result',
+        /// 'text', 'reasoning', 'file'. JSON columns (variant_data, options)
+        /// are JSONB: read fields with json_extract(col, '$.a.b') or
+        /// json_get_string(col, 'key'), never CAST them. See the
+        /// `schema://pond-sql` resource for joins, JSON/FTS functions,
+        /// pagination + drilling patterns, and worked examples.
+        #[serde(alias = "query")]
         sql: String,
         /// Output format: "table" (default; rendered ASCII table with metrics
         /// footer), "json" (same row-capped data as a structured JSON object,
@@ -655,22 +710,24 @@ Examples (3 patterns the agent should recognize):
                            For filtering, joins, and aggregation (counts, group-by, time \
                            buckets) - the analytic complement to pond_search's semantic \
                            recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
-                           effecting statements are rejected. BM25 search-in-SQL via \
-                           fts('messages', '{...json...}'); JSON columns queryable with \
-                           json_get_string / json_extract. The embedding `vector` column is \
-                           never returned (explicit projection is rejected; filtering in \
-                           WHERE is fine). Output defaults to a row-capped rendered table; \
-                           set output=json for a structured JSON payload (delivered via MCP \
-                           structuredContent), or output=parquet|ndjson to write the full \
-                           result to a file returned as a pond-sql-export:// resource. Three \
-                           starter patterns: (a) GROUP BY for activity counts - SELECT \
-                           project, COUNT(*) FROM messages WHERE timestamp >= now() - \
-                           INTERVAL '7 days' GROUP BY project; (b) keyset pagination - ORDER \
-                           BY timestamp DESC, id DESC then WHERE (timestamp, id) < (...) for \
-                           the next page; (c) JOIN messages/sessions/parts to hydrate \
-                           aggregates instead of N pond_get calls. Read resource \
-                           schema://pond-sql for the full column list, indexed columns, \
-                           function quick-reference, pagination + drilling examples.",
+                           effecting statements are rejected. The exact column lists are in \
+                           the `sql` parameter description - use those names, do not guess \
+                           (column discovery also works: SELECT column_name FROM \
+                           information_schema.columns WHERE table_name = 'messages'). \
+                           Routing: metadata analytics -> SQL on messages/sessions; tool-call \
+                           analytics -> parts WHERE type = 'tool_call' with \
+                           json_get_string(variant_data, 'name'); text search -> \
+                           fts('messages', '{...json...}') BM25 over search_text, or \
+                           pond_search for semantic recall; reading a transcript -> pond_get, \
+                           not SQL. The embedding `vector` column is never returned (explicit \
+                           projection is rejected; filtering in WHERE is fine). Output \
+                           defaults to a row-capped rendered table; set output=json for a \
+                           structured JSON payload (delivered via MCP structuredContent), or \
+                           output=parquet|ndjson to write the full result to a file returned \
+                           as a pond-sql-export:// resource. Read resource schema://pond-sql \
+                           for joins, indexed columns, JSON access rules, the function \
+                           quick-reference, pagination + drilling patterns, and worked \
+                           examples.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_sql_query(
