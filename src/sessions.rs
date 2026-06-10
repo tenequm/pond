@@ -341,8 +341,13 @@ impl Store {
         let dataset = self.handle.dataset(table).await?;
         let source_version = dataset.version_id();
         let schema = export_schema(table);
-        let mut stream = dataset
-            .scan()
+        let mut scan = dataset.scan();
+        // The default scan projects blob columns as descriptor structs
+        // (position/size into the source's blob storage) - meaningless in an
+        // archive and unwritable at V2_1. `AllBinary` materializes the bytes
+        // so the rewritten table is self-contained.
+        scan.blob_handling(lance::datatypes::BlobHandling::AllBinary);
+        let mut stream = scan
             .try_into_stream()
             .await
             .with_context(|| format!("failed to scan {} for archive export", table.as_str()))?;
@@ -380,8 +385,15 @@ impl Store {
     }
 
     async fn import_clean_table(&self, table: Table, dataset: Dataset) -> Result<(usize, usize)> {
-        let mut stream = dataset
-            .scan()
+        // Force the destination table into existence up front: an empty
+        // archive table yields zero batches, so merge_insert alone would
+        // leave a lazily-created table (parts) missing on the destination.
+        let _ = self.handle.dataset(table).await?;
+        let mut scan = dataset.scan();
+        // Mirror of the export side: materialize blob bytes, not descriptor
+        // structs - merge_insert writes them into the destination's schema.
+        scan.blob_handling(lance::datatypes::BlobHandling::AllBinary);
+        let mut stream = scan
             .try_into_stream()
             .await
             .with_context(|| format!("failed to scan {} archive table", table.as_str()))?;
