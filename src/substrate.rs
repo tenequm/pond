@@ -86,6 +86,19 @@ pub struct StorageUrl {
     query_options: Vec<(&'static str, String)>,
     /// `?creds=<name>`: explicit set binding, beats scope matching.
     creds_pointer: Option<String>,
+    /// Endpoint pieces for the `s3+` schemes. The final endpoint URL depends
+    /// on the resolved `virtual_hosted_style_request` value (object_store
+    /// wants the bucket inside the endpoint host under virtual-hosted
+    /// addressing), so it is assembled at resolve time, not parse time.
+    endpoint: Option<S3Endpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct S3Endpoint {
+    scheme: &'static str,
+    /// host[:port]
+    authority: String,
+    bucket: String,
 }
 
 /// Query params pond recognizes (and strips before the URL reaches Lance).
@@ -129,6 +142,7 @@ impl StorageUrl {
                     scheme_options: Vec::new(),
                     query_options,
                     creds_pointer,
+                    endpoint: None,
                 })
             }
             "s3+https" | "s3+http" => {
@@ -148,25 +162,31 @@ impl StorageUrl {
                     None => host.to_owned(),
                 };
                 let mut segments = canonical.path().trim_start_matches('/').splitn(2, '/');
-                let bucket = segments.next().unwrap_or_default();
+                let bucket = segments.next().unwrap_or_default().to_owned();
+                let prefix = segments.next().unwrap_or_default().to_owned();
                 if bucket.is_empty() {
                     bail!(
                         "storage URL {trimmed:?} is missing the bucket: the form is {}://host/bucket/prefix",
                         canonical.scheme(),
                     );
                 }
-                let prefix = segments.next().unwrap_or_default();
                 let lance = Url::parse(&format!("s3://{bucket}/{prefix}")).with_context(|| {
                     format!("storage URL {trimmed:?}: bucket/prefix do not form a valid s3:// URL")
                 })?;
                 let scheme = if tls { "https" } else { "http" };
+                // Virtual-hosted is the Hetzner / R2 / B2 default, but an IP
+                // host can't carry a bucket subdomain (`bucket.127.0.0.1`
+                // does not resolve), so MinIO-style IP endpoints flip to
+                // path-style. Override either way via the creds-set field or
+                // `?virtual_hosted_style_request=`. Note: `url` keeps IPv4
+                // hosts as `Host::Domain` on non-special schemes, hence the
+                // explicit IpAddr parse; IPv6 brackets still need the Host
+                // match.
+                let virtual_hosted = host.parse::<std::net::IpAddr>().is_err()
+                    && !matches!(canonical.host(), Some(url::Host::Ipv6(_)));
                 let scheme_options = vec![
-                    ("endpoint", format!("{scheme}://{endpoint_authority}")),
                     ("allow_http", (!tls).to_string()),
-                    // Hetzner / R2 / B2 default; MinIO and Garage users
-                    // override via `?virtual_hosted_style_request=false` or
-                    // the creds-set field.
-                    ("virtual_hosted_style_request", "true".to_owned()),
+                    ("virtual_hosted_style_request", virtual_hosted.to_string()),
                     // S3-compatible stores ignore the SigV4 region, so a
                     // deterministic default (the DuckDB / litestream
                     // convention) beats Lance's env-chain fallback, where a
@@ -181,6 +201,11 @@ impl StorageUrl {
                     scheme_options,
                     query_options,
                     creds_pointer,
+                    endpoint: Some(S3Endpoint {
+                        scheme,
+                        authority: endpoint_authority,
+                        bucket,
+                    }),
                 })
             }
             "az" => {
@@ -205,6 +230,7 @@ impl StorageUrl {
                     scheme_options: vec![("account_name", account)],
                     query_options,
                     creds_pointer,
+                    endpoint: None,
                 })
             }
             other => bail!(
@@ -221,6 +247,7 @@ impl StorageUrl {
             scheme_options: Vec::new(),
             query_options: Vec::new(),
             creds_pointer: None,
+            endpoint: None,
         }
     }
 
@@ -346,6 +373,28 @@ impl StorageUrl {
         };
         for (key, value) in &self.query_options {
             options.insert((*key).to_owned(), value.clone());
+        }
+        // The endpoint is assembled last: under virtual-hosted addressing
+        // object_store expects the bucket inside the endpoint host, so the
+        // URL depends on the final virtual_hosted_style_request value. An
+        // explicit endpoint in `extra` wins (the escape hatch).
+        if let Some(endpoint) = &self.endpoint
+            && !options.keys().any(|key| {
+                key.eq_ignore_ascii_case("endpoint") || key.eq_ignore_ascii_case("aws_endpoint")
+            })
+        {
+            let virtual_hosted = options
+                .get("virtual_hosted_style_request")
+                .is_some_and(|value| value == "true");
+            let url = if virtual_hosted {
+                format!(
+                    "{}://{}.{}",
+                    endpoint.scheme, endpoint.bucket, endpoint.authority
+                )
+            } else {
+                format!("{}://{}", endpoint.scheme, endpoint.authority)
+            };
+            options.insert("endpoint".to_owned(), url);
         }
         Ok(ResolvedStorage {
             storage: self.clone(),
@@ -586,16 +635,16 @@ fn strip_one_newline(mut text: String) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     #[error(
-        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials: {source}"
+        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials: {source:#}"
     )]
     NoCreds { source: anyhow::Error },
-    #[error("authentication failed using creds set {set:?}; check its keys and scope: {source}")]
+    #[error("authentication failed using creds set {set:?}; check its keys and scope: {source:#}")]
     Auth { set: String, source: anyhow::Error },
     #[error(
         "backend does not enforce conditional writes (If-None-Match); concurrent pond writers would corrupt each other - {detail}"
     )]
     OccUnsupported { detail: String },
-    #[error("storage probe failed: {source}")]
+    #[error("storage probe failed: {source:#}")]
     Io { source: anyhow::Error },
 }
 
@@ -2639,26 +2688,59 @@ mod tests {
         let aws = StorageUrl::parse("s3://bucket/prefix").unwrap();
         assert_eq!(aws.lance_url().as_str(), "s3://bucket/prefix");
         assert!(aws.scheme_options.is_empty());
-        // s3+https: endpoint folds out, TLS stays on, virtual-hosted defaults on
+        // s3+https: TLS stays on, virtual-hosted defaults on for domain
+        // hosts, region defaults deterministically. The endpoint is
+        // assembled at resolve time with the bucket folded into the host
+        // (object_store's virtual-hosted convention).
         let fat = StorageUrl::parse("s3+https://nbg1.example.com/my-pond/sub").unwrap();
         assert_eq!(fat.lance_url().as_str(), "s3://my-pond/sub");
         assert_eq!(
             fat.scheme_options,
             vec![
-                ("endpoint", "https://nbg1.example.com".to_owned()),
                 ("allow_http", "false".to_owned()),
                 ("virtual_hosted_style_request", "true".to_owned()),
                 ("region", "us-east-1".to_owned()),
             ],
         );
-        // s3+http: port survives into the endpoint, allow_http flips
+        let resolved = fat.resolve(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            opts(&resolved, "endpoint").as_deref(),
+            Some("https://my-pond.nbg1.example.com"),
+        );
+        assert_eq!(opts(&resolved, "region").as_deref(), Some("us-east-1"));
+        // s3+http on an IP host: allow_http flips, path-style auto-selected
+        // (a bucket subdomain on an IP can't resolve), port survives.
         let plain = StorageUrl::parse("s3+http://127.0.0.1:9000/pond").unwrap();
         assert_eq!(plain.lance_url().as_str(), "s3://pond/");
+        assert_eq!(plain.scheme_options[0], ("allow_http", "true".to_owned()));
         assert_eq!(
-            plain.scheme_options[0],
-            ("endpoint", "http://127.0.0.1:9000".to_owned()),
+            plain.scheme_options[1],
+            ("virtual_hosted_style_request", "false".to_owned()),
         );
-        assert_eq!(plain.scheme_options[1], ("allow_http", "true".to_owned()));
+        let resolved = plain.resolve(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            opts(&resolved, "endpoint").as_deref(),
+            Some("http://127.0.0.1:9000"),
+        );
+        // An explicit endpoint in `extra` is the escape hatch and wins.
+        let mut pinned = BTreeMap::new();
+        pinned.insert(
+            "default".to_owned(),
+            CredsSet {
+                extra: [(
+                    "endpoint".to_owned(),
+                    "https://pinned.example.com".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..CredsSet::default()
+            },
+        );
+        let resolved = fat.resolve(&pinned).unwrap();
+        assert_eq!(
+            opts(&resolved, "endpoint").as_deref(),
+            Some("https://pinned.example.com"),
+        );
         // gs passthrough
         let gcs = StorageUrl::parse("gs://bucket/p").unwrap();
         assert_eq!(gcs.lance_url().as_str(), "gs://bucket/p");
@@ -2705,9 +2787,13 @@ mod tests {
         let with_port = StorageUrl::parse("s3+https://host:443/bucket/p").unwrap();
         let without = StorageUrl::parse("s3+https://host/bucket/p").unwrap();
         assert_eq!(with_port.canonical(), without.canonical());
-        // Non-default port survives.
+        // Non-default port survives into the assembled endpoint.
         let odd = StorageUrl::parse("s3+https://host:8443/bucket").unwrap();
-        assert_eq!(odd.scheme_options[0].1, "https://host:8443");
+        let resolved = odd.resolve(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            resolved.options.get("endpoint").map(String::as_str),
+            Some("https://bucket.host:8443"),
+        );
         // Percent-encoded prefix passes through to the Lance URL verbatim.
         let encoded = StorageUrl::parse("s3+https://host/bucket/pre%20fix").unwrap();
         assert_eq!(encoded.lance_url().as_str(), "s3://bucket/pre%20fix");
@@ -2738,7 +2824,11 @@ mod tests {
             opts(&resolved, "virtual_hosted_style_request").as_deref(),
             Some("true"),
         );
-        assert_eq!(opts(&resolved, "endpoint").as_deref(), Some("https://host"));
+        // virtual_hosted=true (query) -> the bucket rides in the endpoint host.
+        assert_eq!(
+            opts(&resolved, "endpoint").as_deref(),
+            Some("https://bucket.host"),
+        );
     }
 
     #[test]
