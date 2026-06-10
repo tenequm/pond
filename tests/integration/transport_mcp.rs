@@ -207,7 +207,10 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         .await?;
     let search = tool_text(&result);
     assert!(
-        search.starts_with("pond_search: 1 matching messages, showing 1 hits from 1 sessions."),
+        search.starts_with(
+            "pond_search: 1 matching messages (1 searchable in scope), showing 1 hits from 1 \
+             sessions."
+        ),
         "search transcript header states the totals: {search}"
     );
     assert!(

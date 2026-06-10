@@ -934,6 +934,14 @@ impl Store {
             return Ok(GetLookup::NotFound);
         };
         let mut rows = self.scan_all_messages(&session_id).await?;
+        // spec.md#protocol: context siblings follow the response mode, and the
+        // default is the conversational view - in carrier-heavy sessions the
+        // system/tool rows would otherwise fill the whole +-depth window and
+        // push the actual conversation out of it. The target stays regardless
+        // of its own role: the caller asked for that message.
+        if matches!(params.mode, ResponseMode::Conversational) {
+            rows.retain(|row| row.text.is_some() || row.id == message_id);
+        }
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         let Some(target_pos) = rows.iter().position(|row| row.id == message_id) else {
             return Ok(GetLookup::NotFound);
@@ -1326,6 +1334,21 @@ impl Store {
                 .then_with(|| left.0.message_id.cmp(&right.0.message_id))
         });
         Ok(hits)
+    }
+
+    /// Count of searchable messages (non-null `search_text`) inside the
+    /// caller's filter scope - the universe a search actually ran over.
+    /// Powers the response's absence honesty (spec.md#search): "no relevant
+    /// hits" only means something relative to how many messages were
+    /// searchable at all, and 0 tells the caller their filters excluded
+    /// everything before retrieval even started.
+    pub async fn searchable_in_scope(&self, filter: &Predicate) -> Result<usize> {
+        let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        dataset
+            .count_rows(Some(scope.to_lance()))
+            .await
+            .map_err(Into::into)
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
@@ -2844,6 +2867,10 @@ pub struct SessionViewParams<'a> {
 #[derive(Debug, Clone)]
 pub struct MessageViewParams<'a> {
     pub context_depth: usize,
+    /// Which siblings fill the context window: conversational (default)
+    /// keeps the window on the human/model exchange; complete/verbatim
+    /// include system/tool carriers.
+    pub mode: ResponseMode,
     pub after_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,

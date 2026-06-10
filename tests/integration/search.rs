@@ -281,6 +281,58 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// spec.md#search: a session-scoped hybrid search fuses per message, not per
+/// session root - root keying would collapse the response to exactly one hit
+/// no matter how many messages in the session match (the production
+/// false-negative pattern this guards against).
+#[tokio::test(flavor = "multi_thread")]
+async fn session_scoped_search_returns_per_message_hits() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
+    let phrase = corpus_phrase(&store).await?;
+
+    // Pick the session with the most searchable (embedded) hits in an
+    // unscoped search - it has at least two matchable messages.
+    let SearchEnvelope::Success(unscoped) =
+        pond_search(&store, &embedder, search_request(&phrase), &search_config()).await
+    else {
+        panic!("unscoped search must succeed");
+    };
+    let target = unscoped
+        .sessions
+        .iter()
+        .max_by_key(|s| s.session_messages_count)
+        .expect("unscoped search returns sessions")
+        .session_id
+        .clone();
+
+    let mut request = search_request(&phrase);
+    request.filters.session_id = Some(target.clone());
+    let SearchEnvelope::Success(response) =
+        pond_search(&store, &embedder, request, &search_config()).await
+    else {
+        panic!("session-scoped search must succeed");
+    };
+
+    assert_eq!(response.sessions.len(), 1, "one session in scope");
+    let session = &response.sessions[0];
+    assert_eq!(session.session_id, target);
+    assert!(
+        response.matched_total > 1,
+        "per-message fusion must surface more than the single root-collapsed hit; got {}",
+        response.matched_total
+    );
+    assert!(
+        session.matches.len() > 1,
+        "the session-scoped match cap widens to the requested limit; got {} matches",
+        session.matches.len()
+    );
+    // spec.md#search-absence-honesty: the scope count reflects the session's
+    // searchable messages, not the whole corpus.
+    assert!(response.searchable_in_scope >= response.matched_total);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_returns_one_session_row_with_top_matches_per_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -549,6 +601,79 @@ async fn pond_get_paginates_over_the_byte_budget_via_after_id() -> anyhow::Resul
         "after_id pages must be disjoint"
     );
 
+    Ok(())
+}
+
+/// spec.md#protocol: message-mode context siblings follow `response_mode` -
+/// conversational by default, so system/tool carriers don't crowd the
+/// conversation out of the +-depth window; `complete` opts back in.
+#[tokio::test(flavor = "multi_thread")]
+async fn message_context_siblings_default_to_conversational() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, _embedder) = searchable_corpus(&temp).await?;
+
+    // Find a conversational target within reach of a carrier message.
+    let mut target_id = None;
+    'sessions: for session_id in store.session_ids().await? {
+        let mut request = get_request(&session_id);
+        request.response_mode = ResponseMode::Complete;
+        let GetEnvelope::Success(response) = pond_get(&store, request).await else {
+            continue;
+        };
+        let GetResult::Session { messages, .. } = response.result else {
+            continue;
+        };
+        for (idx, message) in messages.iter().enumerate() {
+            if message.text.is_none() {
+                continue; // carrier; need a conversational target
+            }
+            let lo = idx.saturating_sub(5);
+            let hi = (idx + 6).min(messages.len());
+            if messages[lo..hi].iter().any(|m| m.text.is_none()) {
+                target_id = Some(message.id.clone());
+                break 'sessions;
+            }
+        }
+    }
+    let target_id = target_id.expect("fixtures contain a carrier near a conversational message");
+
+    let message_request = |response_mode: ResponseMode| GetRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        session_id: None,
+        message_id: Some(target_id.clone()),
+        context_depth: 5,
+        limit: 1000,
+        response_mode,
+        session_from: Default::default(),
+        after_id: None,
+    };
+
+    let GetEnvelope::Success(default_response) =
+        pond_get(&store, message_request(ResponseMode::Conversational)).await
+    else {
+        panic!("message-mode get must succeed");
+    };
+    let GetResult::Message { siblings, .. } = default_response.result else {
+        panic!("message-mode result expected");
+    };
+    assert!(
+        siblings.iter().all(|m| m.text.is_some()),
+        "default context window must hold only conversational siblings"
+    );
+
+    let GetEnvelope::Success(complete_response) =
+        pond_get(&store, message_request(ResponseMode::Complete)).await
+    else {
+        panic!("complete-mode get must succeed");
+    };
+    let GetResult::Message { siblings, .. } = complete_response.result else {
+        panic!("message-mode result expected");
+    };
+    assert!(
+        siblings.iter().any(|m| m.text.is_none()),
+        "complete mode opts carriers back into the window"
+    );
     Ok(())
 }
 

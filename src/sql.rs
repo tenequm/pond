@@ -7,6 +7,7 @@
 //! Results render inline (row-capped) or export to a parquet/ndjson file the
 //! caller fetches via the `pond-sql-export://` resource (`src/transport.rs`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,13 +15,14 @@ use anyhow::anyhow;
 use arrow_json::LineDelimitedWriter;
 use lance::Dataset;
 use lance::datafusion::LanceTableProvider;
-use lance::dataset::udtf::FtsQueryUDTFBuilder;
 use lance::deps::arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
 };
 use lance::deps::arrow_array::{Array, LargeBinaryArray, RecordBatch, StringArray};
-use lance::deps::arrow_schema::{ArrowError, DataType};
+use lance::deps::arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use lance::deps::datafusion::arrow::util::pretty::pretty_format_batches;
+use lance::deps::datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
+use lance::deps::datafusion::common::ScalarValue;
 use lance::deps::datafusion::datasource::{ViewTable, provider_as_source};
 use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::execution::SessionStateBuilder;
@@ -28,10 +30,15 @@ use lance::deps::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use lance::deps::datafusion::logical_expr::{
     ColumnarValue, LogicalPlanBuilder, ScalarUDF, Volatility, create_udf,
 };
+use lance::deps::datafusion::logical_expr::{Expr, TableType};
+use lance::deps::datafusion::physical_plan::ExecutionPlan;
 use lance::deps::datafusion::prelude::{SQLOptions, SessionConfig, SessionContext, col};
 use lance::deps::datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use lance::deps::datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
+use lance_arrow::SchemaExt;
 use lance_datafusion::udf::register_functions;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::parser::from_json;
 use parquet::arrow::ArrowWriter;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -388,13 +395,16 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
     ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
         .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
-    // `fts('messages', '{...}')` BM25 search-in-SQL, and lance's JSON /
+    // `fts('messages', '{...}')` BM25 search-in-SQL (vendored provider with a
+    // declared `_score` column - see `ScoredFtsUdtf`), and lance's JSON /
     // contains_tokens UDFs for filtering inside the JSON columns.
-    let fts = FtsQueryUDTFBuilder::builder()
-        .register_table("sessions", tables.sessions.clone())
-        .register_table("messages", tables.messages.clone())
-        .register_table("parts", tables.parts.clone())
-        .build();
+    let fts = ScoredFtsUdtf {
+        datasets: HashMap::from([
+            ("sessions".to_owned(), tables.sessions.clone()),
+            ("messages".to_owned(), tables.messages.clone()),
+            ("parts".to_owned(), tables.parts.clone()),
+        ]),
+    };
     ctx.register_udtf("fts", Arc::new(fts));
     register_functions(ctx);
     // Shadow lance's strict json_get_* by name: the strict versions abort the
@@ -404,6 +414,126 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         ctx.register_udf(udf);
     }
     Ok(())
+}
+
+/// Vendored replacement for lance's `FtsQueryUDTF` (lance-7.0.0
+/// src/dataset/udtf.rs). The upstream provider omits `_score` from its
+/// declared schema while leaving the scanner's scoring autoprojection on, so
+/// `_score` is physically appended but logically unknown: naming it in SQL
+/// fails ("No field named _score") and any aggregate over fts() dies on
+/// DataFusion's physical-vs-logical schema check (COUNT plans 0 columns,
+/// receives 1). This provider declares `_score` as a regular nullable Float32
+/// column, projects it explicitly, and disables the autoprojection - which is
+/// also lance's documented intended end state for score columns
+/// (scanner.rs "_score/_distance should become regular output columns").
+/// Delete once fixed upstream.
+#[derive(Debug)]
+struct ScoredFtsUdtf {
+    datasets: HashMap<String, Arc<Dataset>>,
+}
+
+impl TableFunctionImpl for ScoredFtsUdtf {
+    fn call(
+        &self,
+        expr: &[Expr],
+    ) -> Result<Arc<dyn TableProvider>, lance::deps::datafusion::error::DataFusionError> {
+        let [table_expr, query_expr] = expr else {
+            return Err(DataFusionError::Execution(
+                "fts() takes (table_name, fts_query_json)".to_owned(),
+            ));
+        };
+        let Expr::Literal(ScalarValue::Utf8(Some(table_name)), _) = table_expr else {
+            return Err(DataFusionError::Execution(
+                "fts() first argument must be a table name string".to_owned(),
+            ));
+        };
+        let Expr::Literal(ScalarValue::Utf8(Some(fts_query)), _) = query_expr else {
+            return Err(DataFusionError::Execution(
+                "fts() second argument must be the fts query as a JSON string".to_owned(),
+            ));
+        };
+        let dataset = self.datasets.get(table_name).ok_or_else(|| {
+            DataFusionError::Execution(format!("fts(): table {table_name} not found"))
+        })?;
+        let mut full_schema = Schema::from(dataset.schema());
+        full_schema = full_schema
+            .try_with_column(Field::new(SCORE_COLUMN, DataType::Float32, true))
+            .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+        Ok(Arc::new(ScoredFtsProvider {
+            dataset: dataset.clone(),
+            fts_query: FullTextSearchQuery::new_query(from_json(fts_query)?),
+            full_schema: Arc::new(full_schema),
+        }))
+    }
+}
+
+const SCORE_COLUMN: &str = "_score";
+
+#[derive(Debug)]
+struct ScoredFtsProvider {
+    dataset: Arc<Dataset>,
+    fts_query: FullTextSearchQuery,
+    full_schema: SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for ScoredFtsProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.full_schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, lance::deps::datafusion::error::DataFusionError> {
+        let mut scan = self.dataset.scan();
+        scan.full_text_search(self.fts_query.clone())?;
+        // `_score` is a declared column projected explicitly below; with the
+        // autoprojection off, the physical batch always matches the logical
+        // plan (the mismatch is what breaks aggregates upstream).
+        scan.disable_scoring_autoprojection();
+        match projection {
+            Some(projection) if projection.is_empty() => {
+                scan.empty_project()?;
+            }
+            Some(projection) => {
+                let columns: Vec<&str> = projection
+                    .iter()
+                    .map(|idx| self.full_schema.field(*idx).name().as_str())
+                    .collect();
+                scan.project(&columns)?;
+            }
+            None => {
+                let columns: Vec<&str> = self
+                    .full_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                scan.project(&columns)?;
+            }
+        }
+        if let Some(combined) = filters
+            .iter()
+            .cloned()
+            .reduce(|left, right| left.and(right))
+        {
+            scan.filter_expr(combined);
+        }
+        scan.limit(limit.map(|l| l as i64), None)?;
+        scan.create_plan().await.map_err(DataFusionError::from)
+    }
 }
 
 /// The four scalar shapes the lenient JSON getters produce.
@@ -565,6 +695,23 @@ fn enrich(message: &str) -> String {
              json_get_bool (col, 'key'); json_get(col, 'key') -> JSONB for chaining; \
              json_extract(col, '$.a.b') -> JSON text; json_array_contains; \
              json_array_length. See resource schema://pond-sql.",
+        ),
+        (
+            // Defensive: lance's fts `boolean` query can plan a CollectLeft
+            // HashJoin over multi-partition match arms, which the optimizer
+            // does not always repair (works through pond's vendored fts()
+            // provider; kept for any path that still trips it).
+            "does not satisfy distribution requirements",
+            "this fts query shape planned an unexecutable join. For AND semantics use a \
+             single match query with operator And: fts('messages', \
+             '{\"match\":{\"column\":\"search_text\",\"terms\":\"a b\",\"operator\":\"And\"}}'), \
+             optionally with LIKE post-filters in WHERE.",
+        ),
+        (
+            "position is not found but required for phrase queries",
+            "the full-text index is built without positions, so \"phrase\" queries are \
+             unavailable. Use a match query with operator And plus LIKE post-filters for \
+             exact-substring matching.",
         ),
     ];
     for (pattern, hint) in HINTS {

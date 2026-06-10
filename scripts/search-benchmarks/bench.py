@@ -164,12 +164,11 @@ def check_binary() -> None:
         sys.exit(69)
 
 
-def run_search(query: str, mode: str, limit: int, grouped: bool = False) -> dict:
-    """Run `pond search` once; return the parsed JSON envelope (`{hits: [...]}`
-    on success, `{hits: [], error: <msg>}` on subprocess or parse failure)."""
+def run_search(query: str, mode: str, limit: int) -> dict:
+    """Run `pond search` once; return the parsed JSON envelope (a `sessions`
+    grouping on pond 0.5.x+ - see normalize_hits) or `{hits: [], error: <msg>}`
+    on subprocess or parse failure."""
     cmd = [str(BIN_PATH), "search", "--mode", mode, "--limit", str(limit), "--format", "json"]
-    if grouped:
-        cmd.append("--group-by-conversation")
     # `--` so a query starting with `-` (real user prompts often do) isn't
     # mistaken for a flag by clap.
     cmd.extend(["--", query])
@@ -250,15 +249,25 @@ class KbMcpClient:
 
 def normalize_hits(payload: dict) -> list[dict]:
     """Coerce one of three envelope shapes into [{session_id, message_id, text}]:
-    pond `hits` (default), pond `groups` (--group-by-conversation), or kb's
-    nested `result.results` (cross-tool comparison runs)."""
+    pond `sessions` (0.5.x+: session groups ordered by best hit, each with up
+    to a few `matches`; flattened session-major so list order mirrors what an
+    agent reads), legacy pond `hits`, or kb's nested `result.results`
+    (cross-tool comparison runs). NOTE: the `sessions` envelope caps matches
+    per session, so CLI captures are NOT full arm pools - use capture_arms.py
+    when capturing fixtures for `sweep`/`variant`."""
+    if (sessions := payload.get("sessions")) is not None:
+        return [
+            {
+                "session_id": session.get("session_id", ""),
+                "message_id": match.get("message_id", ""),
+                "text": match.get("text", ""),
+                "score": match.get("score"),
+            }
+            for session in sessions
+            for match in session.get("matches", [])
+        ]
     if (hits := payload.get("hits")) is not None:
         return hits
-    if (groups := payload.get("groups")) is not None:
-        return [
-            {"session_id": g.get("session_id", ""), "message_id": "", "text": g.get("text", "")}
-            for g in groups
-        ]
     result = payload.get("result")
     if isinstance(result, dict) and (kb := result.get("results")):
         return [
@@ -295,7 +304,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         for row in iter_queries(Path(args.queries)):
             qid = row["id"]
             if backend == "pond":
-                envelope = run_search(row["query"], args.mode, args.limit, args.grouped)
+                envelope = run_search(row["query"], args.mode, args.limit)
             else:
                 envelope = kb_client.search(row["query"], args.limit, args.kb_min_score)
             if "error" in envelope:
@@ -309,10 +318,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         if kb_client is not None:
             kb_client.close()
 
-    suffix = " grouped" if args.grouped else ""
     mode_label = args.mode if backend == "pond" else f"kb-mcp(min_score={args.kb_min_score})"
     print(
-        f"done: ran {count} queries in {mode_label} mode{suffix} "
+        f"done: ran {count} queries in {mode_label} mode "
         f"(limit={args.limit}); {errors} errors"
     )
     return 0 if errors == 0 else 1
@@ -325,10 +333,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for row in iter_queries(Path(args.queries)):
         total += 1
         kind, tokens = parse_ground_truth(row["ground_truth"])
-        fts = run_search(row["query"], "fts", args.limit).get("hits") or []
+        fts = normalize_hits(run_search(row["query"], "fts", args.limit))
         if find_match_rank(fts, kind, tokens) > 0:
             continue
-        vec = run_search(row["query"], "vector", args.limit).get("hits") or []
+        vec = normalize_hits(run_search(row["query"], "vector", args.limit))
         if find_match_rank(vec, kind, tokens) > 0:
             continue
         missing.append((row["id"], kind, row["query"], row["ground_truth"]))
@@ -774,7 +782,6 @@ def main() -> int:
                        help="kb_search min_score (default 0.0 for apples-to-apples vs pond default)")
     p_run.add_argument("--out", required=True, help="Output dir for per-query JSON envelopes")
     p_run.add_argument("--limit", type=int, default=20, help="pond search --limit (default 20)")
-    p_run.add_argument("--grouped", action="store_true", help="Pass --group-by-conversation")
     p_run.set_defaults(func=cmd_run)
 
     p_verify = sub.add_parser("verify", help="Check every query's ground truth is reachable")

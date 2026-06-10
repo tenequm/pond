@@ -328,8 +328,10 @@ pub struct GetRequest {
     pub context_depth: usize,
     #[serde(default = "default_get_limit")]
     pub limit: usize,
-    /// Ignored in `message_id` mode (that mode always returns the target with
-    /// its full parts, paginated).
+    /// Session mode: how much of each message to materialize. Message mode:
+    /// which siblings fill the context window (conversational by default;
+    /// complete/verbatim include system/tool carriers). The target message
+    /// always returns its full parts regardless.
     #[serde(default)]
     pub response_mode: ResponseMode,
     /// Exclusive continuation anchor: last `message_id` in session mode, last
@@ -615,6 +617,10 @@ pub struct SearchFilters {
     pub to_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Score floor; hits below it are dropped. Not an absence signal: present
+    /// and absent content score in overlapping bands (see
+    /// `docs/researches/embeddings.md`), so the default stays 0 and the
+    /// response's `searchable_in_scope` carries the honesty instead.
     // Skip the default 0.0 so an unfiltered cursor/request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
@@ -642,6 +648,12 @@ fn is_zero_f64(value: &f64) -> bool {
 pub struct SearchResponse {
     pub sessions: Vec<SearchSession>,
     pub matched_total: usize,
+    /// How many messages with conversational text the caller's filters left
+    /// in scope - the universe the search actually ran over. The absence
+    /// signal: 0 means the filters excluded everything before retrieval, and
+    /// a small value warns that "no relevant hits" covers a thin slice.
+    #[serde(default)]
+    pub searchable_in_scope: usize,
     pub has_more: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,

@@ -63,6 +63,9 @@ anyhow = "1.0.102"
 # stack; named directly here for the `LineDelimitedWriter`).
 arrow-json = "58.3"
 async-stream = "0.3.6"
+# Already in the tree via datafusion; named directly for the vendored fts()
+# TableProvider in `src/sql.rs` (datafusion's TableProvider trait needs it).
+async-trait = "0.1"
 axum = "0.8.9"
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }

@@ -308,7 +308,10 @@ enum Command {
         /// Restrict to a single role (`user` | `assistant` | `system` | `tool`).
         #[arg(long)]
         role: Option<String>,
-        /// Server-side score threshold; hits below this are dropped.
+        /// Server-side score threshold; hits below this are dropped. Not an
+        /// absence signal: present and absent content score in overlapping
+        /// bands (docs/researches/embeddings.md), so leave at 0 unless
+        /// trimming an over-long tail.
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
         /// Print Lance query plans instead of search results.
@@ -351,14 +354,14 @@ enum Command {
         /// Cap on returned messages (session mode) or parts (message mode).
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Session-mode depth: conversational (text + part summaries), complete
-        /// (all messages + summaries), or verbatim (full parts inline). Ignored
-        /// with `--message-id`.
+        /// Depth: conversational (text + part summaries), complete (all
+        /// messages + summaries), or verbatim (full parts inline). With
+        /// `--message-id` it selects which siblings fill the context window
+        /// (conversational by default).
         #[arg(
             long,
             value_enum,
             default_value_t = CliResponseMode::Conversational,
-            conflicts_with = "message_id"
         )]
         response_mode: CliResponseMode,
         /// Session mode only: which end to read from - start (oldest, default)
@@ -2406,7 +2409,7 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
     output(&format!(
-        "{} {} matched {}  {} returned {}",
+        "{} {} matched {}  {} returned {}  {} {} searchable in scope",
         paint("search:", dim()),
         paint(&format_thousands(response.matched_total as u64), bold()),
         if response.matched_total == 1 {
@@ -2420,8 +2423,21 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
         } else {
             "sessions"
         },
+        paint("of", dim()),
+        paint(
+            &format_thousands(response.searchable_in_scope as u64),
+            bold()
+        ),
     ))?;
     if response.sessions.is_empty() {
+        // spec.md#search-absence-honesty: name the recovery when the scope
+        // itself is empty - the filters, not the query, produced the zero.
+        if response.searchable_in_scope == 0 {
+            output(
+                "scope is empty: the filters exclude every searchable message; widen or drop \
+                 project/date/role filters",
+            )?;
+        }
         return Ok(());
     }
     for (idx, session) in response.sessions.iter().enumerate() {

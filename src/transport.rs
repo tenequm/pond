@@ -326,10 +326,18 @@ json_get_string(c.variant_data, 'call_id')
   WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
   GROUP BY tool ORDER BY calls DESC;
 
-Full-text (BM25) search in SQL via the fts() table function: SELECT * FROM \
-fts('messages', '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') - \
-compose with WHERE/JOIN/GROUP BY around it. Vector/semantic search is NOT available \
-in SQL; use pond_search for that.
+Full-text (BM25) search in SQL via the fts() table function: SELECT id, _score, \
+search_text FROM fts('messages', \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') ORDER BY _score DESC - \
+compose with WHERE/JOIN/GROUP BY around it; `_score` is the BM25 relevance and is a \
+regular projectable column. The right tool for exact strings, identifiers, and error \
+messages; unlike pond_search it covers subagent sessions (filter them out with WHERE \
+NOT (source_agent LIKE '%/%') if unwanted). AND semantics: \
+'{\"match\":{\"column\":\"search_text\",\"terms\":\"a b\",\"operator\":\"And\"}}'; \
+\"boolean\" queries (must/should/must_not over match clauses) also work. \"phrase\" \
+queries are unavailable (index built without positions) - use match + operator And, \
+optionally with LIKE post-filters, for exact substrings. \
+Vector/semantic search is NOT available in SQL; use pond_search for that.
 
 Function quick-reference (exact DataFusion names so the model doesn't have to \
 guess):
@@ -435,13 +443,13 @@ Examples (3 patterns the agent should recognize):
   GROUP BY source_agent
   ORDER BY n DESC;
 
-  -- 3. BM25 search in SQL, joined with metadata
-  SELECT m.session_id, m.timestamp, m.project, m.search_text
+  -- 3. BM25 search in SQL, joined with metadata, relevance-ranked
+  SELECT m.session_id, m.timestamp, m.project, f._score, m.search_text
   FROM fts('messages', \
 '{\"match\":{\"column\":\"search_text\",\"terms\":\"race condition\"}}') f
   JOIN messages m ON m.id = f.id
   WHERE m.project LIKE '%pond%'
-  ORDER BY m.timestamp DESC
+  ORDER BY f._score DESC
   LIMIT 50;";
 
     /// `pond_search` MCP tool parameters.
@@ -498,7 +506,8 @@ Examples (3 patterns the agent should recognize):
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpGetParams {
         /// Retrieve this message: its full parts plus `context_depth` sibling
-        /// messages each side. `response_mode` is ignored in this mode.
+        /// messages each side (conversational siblings by default; set
+        /// response_mode to widen).
         #[serde(default)]
         message_id: Option<String>,
         /// Retrieve this whole session (mutually exclusive with message_id).
@@ -511,10 +520,11 @@ Examples (3 patterns the agent should recognize):
         /// Default 20, max 1000.
         #[serde(default)]
         limit: Option<usize>,
-        /// Session-mode depth: "conversational" (default; human/model text
-        /// only, with part summaries), "complete" (all messages incl. carriers,
+        /// Depth: "conversational" (default; human/model text only, with part
+        /// summaries), "complete" (all messages incl. system/tool carriers,
         /// with part summaries), or "verbatim" (all messages with full parts
-        /// inline). Ignored in message mode.
+        /// inline; session mode only for the parts). In message mode it
+        /// selects which siblings fill the context window.
         #[serde(default)]
         response_mode: Option<String>,
         /// Session mode only: which end to read `limit` messages from -
@@ -596,17 +606,22 @@ Examples (3 patterns the agent should recognize):
         #[tool(
             description = "Hybrid (vector + BM25) search over stored conversation history. \
                            Returns a readable transcript: a leading `key:` line explains the \
-                           format and the first line states totals, then results are grouped by \
-                           session, ordered by each session's best hit. Each hit is a `--- [n] \
-                           score | role | time | message_id | project | agent | session ---` \
-                           delimiter rule followed by the matched text. Pass a returned \
+                           format and the first line states totals plus how many searchable \
+                           messages the filters left in scope (the absence signal - search only \
+                           sees conversational text, never tool calls/results), then results are \
+                           grouped by session, ordered by each session's best hit. Each hit is a \
+                           `--- [n] score | role | time | message_id | project | agent | session \
+                           ---` delimiter rule followed by the matched text. Pass a returned \
                            `message_id` to `pond_get` for full text. Common args: \
                            query (semantic - concepts, not project names), then project / \
                            from_date / to_date to scope. Advanced: source_agent (e.g. \
                            \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
                            similar_to (vector-only neighbors of a message_id), cursor (paging), \
                            include_subagents (subagent sessions are excluded by default). \
-                           Scores are relative within one response; there is no min_score.",
+                           Scores are relative within one response; there is no min_score. For \
+                           exact strings, identifiers, or error messages, pond_sql_query's \
+                           fts('messages', ...) BM25 search is the sharper tool - and it sees \
+                           subagent sessions too.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
@@ -838,7 +853,12 @@ Examples (3 patterns the agent should recognize):
                  stats://pond (corpus + embedding stats). For structured/analytic queries \
                  (filtering, joins, counts, group-by) use pond_sql_query: read-only SQL \
                  (SELECT only) over the sessions/messages/parts tables, with optional \
-                 parquet/ndjson export; see resource schema://pond-sql.",
+                 parquet/ndjson export; see resource schema://pond-sql. Search only indexes \
+                 conversational text (tool calls/results are invisible to it), and a \
+                 zero/weak result is not proof of absence - for exact strings, \
+                 identifiers, or error messages run pond_sql_query with fts('messages', \
+                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') (AND semantics: \
+                 add \"operator\":\"And\"), which also covers subagent sessions.",
             )
         }
 
@@ -1116,12 +1136,30 @@ Examples (3 patterns the agent should recognize):
             ""
         };
         if response.sessions.is_empty() {
+            // spec.md#search-absence-honesty: name the scope size and the
+            // recovery path - a zero-hit response must distinguish "nothing
+            // relevant exists" from "the filters excluded everything".
+            if response.searchable_in_scope == 0 {
+                return format!(
+                    "pond_search: 0 searchable messages in scope - the filters exclude \
+                     everything before retrieval. Widen or drop project/date/role filters.\
+                     {subagent_note}\n"
+                );
+            }
+            let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT id, \
+                            session_id, search_text FROM fts('messages', \
+                            '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}').";
             return match request.similar_to.as_deref() {
-                Some(id) => format!("pond_search: no matches similar to {id}.{subagent_note}\n"),
+                Some(id) => format!(
+                    "pond_search: no matches similar to {id} across {} searchable messages in \
+                     scope.{subagent_note}\n",
+                    response.searchable_in_scope
+                ),
                 None => {
                     format!(
-                        "pond_search: no matches for {:?}.{subagent_note}\n",
-                        request.query
+                        "pond_search: no matches for {:?} across {} searchable messages in \
+                         scope.{subagent_note}{fts_hint}\n",
+                        request.query, response.searchable_in_scope
                     )
                 }
             };
@@ -1135,8 +1173,10 @@ Examples (3 patterns the agent should recognize):
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "pond_search: {} matching messages, showing {} hits from {} sessions{}.{}",
+            "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
+             sessions{}.{}",
             response.matched_total,
+            response.searchable_in_scope,
             shown,
             response.sessions.len(),
             sim,
@@ -1688,6 +1728,7 @@ Examples (3 patterns the agent should recognize):
                     }],
                 }],
                 matched_total: 1,
+                searchable_in_scope: 2,
                 has_more: false,
                 next_cursor: None,
             };
@@ -1703,11 +1744,10 @@ Examples (3 patterns the agent should recognize):
             };
 
             let transcript = render_search_transcript(&response, &request);
-            assert!(
-                transcript.starts_with(
-                    "pond_search: 1 matching messages, showing 1 hits from 1 sessions."
-                )
-            );
+            assert!(transcript.starts_with(
+                "pond_search: 1 matching messages (2 searchable in scope), showing 1 hits from 1 \
+                 sessions."
+            ));
             assert!(
                 transcript
                     .contains("key: session rules group hits by session, ordered by best hit")
