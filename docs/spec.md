@@ -138,7 +138,7 @@ Every interaction with Lance funnels through one of four chokepoints, each a sin
 
 ### 3.4 Dataset parameters
 
-Every table is created with the current stable Lance file format, constant-time latest-manifest lookup, and a short manifest-retention window. v1 recovery beyond the window is via `pond export` snapshots; deferred named-snapshot preservation via Lance tags is in Section 9.
+Every table is created with the current stable Lance file format, constant-time latest-manifest lookup, and a short manifest-retention window. v1 recovery beyond the window is via `pond export` snapshots; deferred named-snapshot preservation via Lance tags is in Section 9. The retention window MUST stay above the longest single read (floor: one hour): a reader pins the manifest version it opened only for that request's duration, and version cleanup that reclaims a pinned version's files breaks the in-flight read on object-store backends.
 
 **`lance-table-creation`** {#lance-table-creation} - Every table MUST be created with:
 

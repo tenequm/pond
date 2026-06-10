@@ -1370,6 +1370,14 @@ fn configured_maintenance_policy(
     let cleanup_older_than = cleanup_override
         .or(configured_cleanup)
         .unwrap_or_else(default_cleanup_older_than);
+    // Readers pin a manifest version per request; cleanup reclaiming a pinned
+    // version's files breaks in-flight reads on object-store backends.
+    if cleanup_older_than < chrono::Duration::hours(1) {
+        anyhow::bail!(
+            "cleanup retention below the 1h floor; set [maintenance].cleanup_older_than \
+             (or --cleanup-older-than) to 1h or longer"
+        );
+    }
     Ok(MaintenancePolicy {
         compaction_fragment_cap,
         cleanup_older_than,
@@ -2082,12 +2090,29 @@ fn render_status_header(
     let mut table = new_table();
     let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
     let rows = [
-        ("sessions", sizes.sessions, Some(totals.sessions)),
-        ("messages", sizes.messages, Some(totals.messages)),
-        ("parts", sizes.parts, Some(totals.parts)),
-        ("other", sizes.other, None),
+        (
+            "sessions",
+            sizes.sessions,
+            Some(totals.sessions),
+            sizes.sessions_data,
+        ),
+        (
+            "messages",
+            sizes.messages,
+            Some(totals.messages),
+            sizes.messages_data,
+        ),
+        ("parts", sizes.parts, Some(totals.parts), sizes.parts_data),
+        ("other", sizes.other, None, Default::default()),
     ];
-    for (label, bytes, rows_opt) in rows {
+    for (label, bytes, rows_opt, data) in rows {
+        // Surface superseded data versions only when they matter: the gap
+        // self-heals once manifests age past the cleanup retention window.
+        let dead_note = data
+            .dead()
+            .filter(|dead| *dead > 64 * 1024 * 1024 && *dead * 10 > data.on_disk)
+            .map(|dead| format!("{} pending cleanup", format_bytes(dead)))
+            .unwrap_or_default();
         table.add_row(vec![
             Cell::new(format!("  {label}")),
             Cell::new(format_bytes(bytes)).set_alignment(CellAlignment::Right),
@@ -2097,6 +2122,7 @@ fn render_status_header(
                     .unwrap_or_default(),
             )
             .set_alignment(CellAlignment::Right),
+            Cell::new(dead_note).set_alignment(CellAlignment::Right),
         ]);
     }
     table.add_row(vec![
@@ -2104,6 +2130,7 @@ fn render_status_header(
         Cell::new(format_bytes(total_bytes))
             .set_alignment(CellAlignment::Right)
             .add_attribute(Attribute::Bold),
+        Cell::new(""),
         Cell::new(""),
     ]);
     output(&table.to_string())?;

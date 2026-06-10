@@ -212,13 +212,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Storage maintenance. Tunes the compaction + cleanup pass that runs inside
 # `pond sync` and `pond index optimize`.
 #
-# - `compaction_fragment_cap` is the sub-target fragment count past which the
-#   compaction phase runs (it also runs once those fragments hold a whole target
-#   fragment's worth of rows). Default 64 stops the automated sync re-compacting
-#   the trailing fragment every pass; 0 compacts every pass.
+# - `compaction_fragment_cap` is the per-task fragment-count backstop: a
+#   planned compaction task touching at least this many fragments always runs
+#   even when the write-amplification veto would skip it. Default 64; 0
+#   disables the veto and runs every task Lance plans.
 # - `cleanup_older_than` is the manifest-retention window for the safe cleanup
-#   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`). Versions older than
-#   this are reclaimed by Lance's OCC-coordinated GC.
+#   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
+#   what protects in-flight readers). Versions older than this are reclaimed
+#   by Lance's OCC-coordinated GC.
 # - `index_lag_threshold` is the minimum unindexed-fragment count before a
 #   per-intent append/rebuild runs in `pond index optimize`; the brute-force
 #   fallback keeps queries correct while fragments accumulate. Default 4.
