@@ -694,11 +694,8 @@ fn detect_legacy_storage(path: &Path) -> Option<String> {
         "secret_access_key = \"{}\"\n",
         get(&["aws_secret_access_key", "secret_access_key"]).unwrap_or_else(|| "...".into()),
     ));
-    if let Some(region) = get(&["aws_region", "region"]) {
-        recipe.push_str(&format!("region            = \"{region}\"\n"));
-    }
     recipe.push_str(
-        "\n(the endpoint and bucket fold into the URL; allow_http is scheme-derived; virtual-hosted addressing defaults on. `pond config check` verifies the result end-to-end)",
+        "\n(the endpoint and bucket fold into the URL; allow_http is scheme-derived; virtual-hosted addressing defaults on; the region is autodetected - append ?region=<x> to the URL only if your store insists. `pond config check` verifies the result end-to-end)",
     );
     Some(recipe)
 }
@@ -1055,7 +1052,11 @@ aws_virtual_hosted_style_request = "true"
                 err.contains("access_key_id     = \"AKIA123\""),
                 "got: {err}"
             );
-            assert!(err.contains("region            = \"nbg1\""), "got: {err}");
+            // Region is autodetected (AWS) or defaulted (S3-compatible
+            // endpoints ignore it): the recipe must not carry AWS_REGION
+            // forward, only name the ?region= override.
+            assert!(!err.contains("region            ="), "got: {err}");
+            assert!(err.contains("?region="), "got: {err}");
             assert!(err.contains("pond config check"), "got: {err}");
             Ok(())
         });

@@ -105,10 +105,11 @@ async fn config_check_probe_passes_and_classifies_auth_failure() -> anyhow::Resu
     let mut creds = BTreeMap::new();
     creds.insert(
         "test".to_owned(),
+        // No region: the s3+ scheme default must carry the probe (the set
+        // field / ?region= exist only for stores that insist on a value).
         CredsSet {
             access_key_id: Some(ACCESS_KEY.to_owned()),
             secret_access_key: Some(SECRET_KEY.to_owned()),
-            region: Some("us-east-1".to_owned()),
             // s3s-fs serves path-style only.
             virtual_hosted_style_request: Some(false),
             ..CredsSet::default()

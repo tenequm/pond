@@ -83,7 +83,7 @@ Translation table (parser output -> Lance call):
 | `gs://bucket/prefix`                 | `gs://bucket/prefix`    | none                                                                  |
 | `az://account/container/prefix`      | `az://container/prefix` | `account_name=account`                                                |
 
-`virtual_hosted_style_request` defaults to `true` for `s3+https`/`s3+http` (Hetzner, R2, B2); MinIO/Garage users override via query param or creds-set field. `allow_http` is scheme-derived, never a config field.
+`virtual_hosted_style_request` defaults to `true` for `s3+https`/`s3+http` (Hetzner, R2, B2); MinIO/Garage users override via query param or creds-set field. `allow_http` is scheme-derived, never a config field. The region is autodetected: AWS buckets resolve it inside Lance; `s3+` endpoints default to `us-east-1` (S3-compatible stores ignore the SigV4 region - the DuckDB/litestream convention), overridable via the set field or `?region=`.
 
 ### Per-URL resolution
 
@@ -206,7 +206,7 @@ secret_access_key = "..."
 ```
 
 1. `--data-dir <URL>` -> `--storage-path <URL>`; `POND_DATA_DIR` -> `POND_STORAGE_PATH`.
-2. `AWS_ENDPOINT` + bucket fold into the `s3+https://` path; `AWS_REGION` -> `region` field or `?region=`; `allow_http` is gone (scheme-derived); `aws_virtual_hosted_style_request` -> `virtual_hosted_style_request` (defaults true).
+2. `AWS_ENDPOINT` + bucket fold into the `s3+https://` path; `AWS_REGION` is dropped entirely (autodetected/defaulted; `?region=` or the set field exist for stores that insist); `allow_http` is gone (scheme-derived); `aws_virtual_hosted_style_request` -> `virtual_hosted_style_request` (defaults true).
 3. Release notes carry the same recipe the legacy-detection error prints.
 
 ## Out of scope

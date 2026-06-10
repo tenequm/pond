@@ -167,6 +167,13 @@ impl StorageUrl {
                     // override via `?virtual_hosted_style_request=false` or
                     // the creds-set field.
                     ("virtual_hosted_style_request", "true".to_owned()),
+                    // S3-compatible stores ignore the SigV4 region, so a
+                    // deterministic default (the DuckDB / litestream
+                    // convention) beats Lance's env-chain fallback, where a
+                    // stray AWS_REGION changes behavior. Real AWS (`s3://`,
+                    // no endpoint) auto-resolves the bucket region inside
+                    // Lance instead. Override: creds-set field or ?region=.
+                    ("region", "us-east-1".to_owned()),
                 ];
                 Ok(Self {
                     canonical,
@@ -2641,6 +2648,7 @@ mod tests {
                 ("endpoint", "https://nbg1.example.com".to_owned()),
                 ("allow_http", "false".to_owned()),
                 ("virtual_hosted_style_request", "true".to_owned()),
+                ("region", "us-east-1".to_owned()),
             ],
         );
         // s3+http: port survives into the endpoint, allow_http flips
