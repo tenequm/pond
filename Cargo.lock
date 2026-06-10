@@ -6404,6 +6404,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "whoami",
  "zip 8.6.0",
 ]
 

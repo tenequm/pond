@@ -128,6 +128,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
 walkdir = "2.5"
+# Ingest host provenance stamp (`options.pond`, src/sessions.rs). Already in
+# the tree transitively via hf-hub's xet stack; named directly for the
+# fallible username/hostname/devicename lookups.
+whoami = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

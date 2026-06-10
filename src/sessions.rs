@@ -2279,6 +2279,29 @@ struct CompletedSubstream {
     messages: Vec<BufferedMessage>,
 }
 
+/// Ingest host provenance (`options.pond`, spec.md#model-pond-options),
+/// computed once per process. An audit fact - "the process that inserted this
+/// row" - not identity. Fallible lookups are omitted, never synthesized as
+/// placeholders.
+fn ingest_host_stamp() -> Option<&'static Value> {
+    static STAMP: std::sync::OnceLock<Option<Value>> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            let mut host = serde_json::Map::new();
+            if let Ok(username) = whoami::username() {
+                host.insert("username".to_owned(), username.into());
+            }
+            if let Ok(hostname) = whoami::hostname() {
+                host.insert("hostname".to_owned(), hostname.into());
+            }
+            if let Ok(devicename) = whoami::devicename() {
+                host.insert("device_name".to_owned(), devicename.into());
+            }
+            (!host.is_empty()).then(|| serde_json::json!({ "ingest": { "host": host } }))
+        })
+        .as_ref()
+}
+
 impl IngestValidator {
     /// Drive one input event through the validator. Returns the per-row
     /// outcomes the event triggered: empty when the event is just buffered,
@@ -2406,7 +2429,7 @@ impl IngestValidator {
         });
     }
 
-    fn push_message(&mut self, index: usize, message: Message) -> Vec<RowOutcome> {
+    fn push_message(&mut self, index: usize, mut message: Message) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(message.session_id().to_owned()),
             Value::String(message.id().to_owned()),
@@ -2450,6 +2473,20 @@ impl IngestValidator {
                 None,
                 DROP_REASON_DUPLICATE_MESSAGE_ID,
             )];
+        }
+        // `options.pond` is core-owned (spec.md#model-pond-options): stripped
+        // and restamped at ingest so neither adapters nor wire clients can
+        // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
+        // never restamps stored rows.
+        match ingest_host_stamp() {
+            Some(stamp) => {
+                message
+                    .options_mut()
+                    .insert("pond".to_owned(), stamp.clone());
+            }
+            None => {
+                message.options_mut().remove("pond");
+            }
         }
         self.flush_current_message();
         self.current_message = Some(BufferedMessage {
@@ -4197,6 +4234,85 @@ mod tests {
         let (sessions, messages, _) = store.row_counts().await?;
         assert_eq!(sessions, 1, "session committed");
         assert_eq!(messages, 1, "only the first message committed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_stamps_host_provenance_on_messages_and_strips_spoofed_pond_key()
+    -> anyhow::Result<()> {
+        // spec.md#model-pond-options: `options.pond` is core-owned. A stored
+        // message carries the process's host stamp (when resolvable) and never
+        // a client-supplied value; session and part options stay untouched.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("host-provenance");
+        let mut spoofed = ProviderOptions::new();
+        spoofed.insert("pond".to_owned(), json!({"ingest": {"host": "spoofed"}}));
+        let message = Message::User {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: spoofed,
+        };
+        let part = Part {
+            session_id: session.id.clone(),
+            id: "part-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value("hello".to_owned())),
+            },
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message))
+            .await?;
+        validator.push(&store, 2, IngestEvent::Part(part)).await?;
+        validator.finish(&store).await?;
+
+        let stored = store
+            .get_session(&session.id)
+            .await?
+            .expect("ingested session is readable");
+        assert!(
+            !stored.session.options.contains_key("pond"),
+            "session rows are not stamped (attribution derives from messages)"
+        );
+        let stored_message = &stored.messages[0].message;
+        match ingest_host_stamp() {
+            Some(stamp) => {
+                assert_eq!(
+                    stored_message.options().get("pond"),
+                    Some(stamp),
+                    "stored message carries the real stamp, never the spoof"
+                );
+                let host = stamp
+                    .pointer("/ingest/host")
+                    .and_then(Value::as_object)
+                    .expect("stamp shape is {ingest: {host: {..}}}");
+                assert!(!host.is_empty(), "an all-empty stamp must be None instead");
+                assert!(
+                    host.values()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+                    "stamp fields are omitted when unavailable, never empty: {host:?}"
+                );
+            }
+            None => assert!(
+                stored_message.options().get("pond").is_none(),
+                "with no resolvable stamp the spoofed key is still stripped"
+            ),
+        }
+        assert!(
+            !stored.messages[0].parts[0].options.contains_key("pond"),
+            "part rows are not stamped (covered by their message's stamp)"
+        );
 
         Ok(())
     }

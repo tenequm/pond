@@ -115,6 +115,15 @@ impl Message {
         }
     }
 
+    pub fn options_mut(&mut self) -> &mut ProviderOptions {
+        match self {
+            Self::System { options, .. }
+            | Self::User { options, .. }
+            | Self::Assistant { options, .. }
+            | Self::Tool { options, .. } => options,
+        }
+    }
+
     pub fn system_content(&self) -> Option<&str> {
         match self {
             // Two layers of `as_deref`: the outer `Option<Extracted<String>>`
