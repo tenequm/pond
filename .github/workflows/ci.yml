@@ -116,6 +116,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+      # Assemble pond's own (private) release first: it is the source of truth the
+      # homebrew/nix mirrors copy their notes from, so it must be complete before
+      # any mirror runs - and a later mirror failure must never starve it.
+      - name: Mirror binaries to pond release
+        if: ${{ steps.release-plz.outputs.releases_created }}
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
+
       - name: Release binaries to homebrew-tap
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
@@ -266,9 +274,3 @@ jobs:
             --target "$(git -C pond-nix rev-parse HEAD)" --title "pond v$V" --notes "$notes" \
           || { gh release upload "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix --clobber; \
                gh release edit "pond-v$V" --repo tenequm/pond-nix --title "pond v$V" --notes "$notes"; }
-
-      # Mirror the binaries onto pond's own (private) release.
-      - name: Mirror binaries to pond release
-        if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
-        run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
