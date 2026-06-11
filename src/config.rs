@@ -1,9 +1,11 @@
-//! Configuration loading: the `[embeddings]`, `[sources]`, and `[storage]`
-//! blocks.
+//! Configuration loading: the `[embeddings]`, `[sources]`, `[storage]`, and
+//! `[creds.*]` blocks.
 //!
 //! pond ships built-in defaults, so an instance with no `config.toml` still
-//! works. `pond config --print-schema` emits [`DEFAULT_CONFIG_TOML`], the
-//! fully-annotated example.
+//! works. `pond config schema` emits [`DEFAULT_CONFIG_TOML`], the
+//! fully-annotated example. Loading layers `config.toml` under the `POND_*`
+//! env mirror via figment, so every command also works with no config file
+//! at all (spec.md#storage-configless) - URLs + env vars are sufficient.
 
 use std::{
     collections::BTreeMap,
@@ -11,7 +13,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use lance_io::object_store::uri_to_url;
+use figment::{
+    Figment,
+    providers::{Env, Format, Toml},
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use url::Url;
@@ -58,6 +63,31 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
     Ok(bytes as usize)
 }
 
+/// Accept string / integer / float / bool and stringify. The env mirror
+/// parses values TOML-ishly, so `POND_CREDS_X_SECRET_ACCESS_KEY=12345`
+/// arrives as a number; these fields are strings no matter how they scan.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Int(i64),
+        Float(f64),
+        Bool(bool),
+    }
+    Ok(
+        Option::<Repr>::deserialize(deserializer)?.map(|repr| match repr {
+            Repr::Text(value) => value,
+            Repr::Int(value) => value.to_string(),
+            Repr::Float(value) => value.to_string(),
+            Repr::Bool(value) => value.to_string(),
+        }),
+    )
+}
+
 fn deserialize_byte_size_opt<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
@@ -74,20 +104,6 @@ where
         Some(Repr::Bytes(value)) => usize::try_from(value).map(Some).map_err(de::Error::custom),
         Some(Repr::Text(value)) => parse_byte_size(&value).map(Some).map_err(de::Error::custom),
     }
-}
-
-/// Parse a CLI / env `--data-dir` argument into a `Url`. Delegates to Lance's
-/// own `uri_to_url`, which handles every form pond cares about:
-/// - bare paths like `/srv/pond` -> `file:///srv/pond`
-/// - explicit `file://...` URIs
-/// - object-store URIs (`s3://`, `gs://`, `az://`, ...)
-/// - tilde expansion (`~/...`)
-/// - Windows drive letters (we don't ship Windows, but the parser handles it)
-///
-/// Using Lance's parser keeps pond's CLI parse path identical to what Lance
-/// uses internally - no risk of pond accepting a string Lance later rejects.
-pub fn parse_data_dir(input: &str) -> Result<Url> {
-    uri_to_url(input).with_context(|| format!("invalid --data-dir {input:?}"))
 }
 
 /// True when the URL is on the local filesystem. Mirrors Lance's
@@ -132,7 +148,7 @@ pub fn display(url: &Url) -> String {
 }
 
 /// Build a `Url` from a filesystem path. Convenience for tests and for
-/// `resolve_data_dir` callers that hold a `PathBuf` already. The path must be
+/// callers that hold a `PathBuf` already. The path must be
 /// absolute (`url::Url::from_file_path` is a hard requirement on Unix); a
 /// relative path gets canonicalized via `std::path::absolute` first.
 pub fn url_for_path(path: impl AsRef<Path>) -> Result<Url> {
@@ -151,7 +167,7 @@ pub fn url_for_path(path: impl AsRef<Path>) -> Result<Url> {
     })
 }
 
-/// Default `config.toml` body emitted by `pond config --print-schema`. Every
+/// Default `config.toml` body emitted by `pond config schema`. Every
 /// line is commented: pond ships built-in defaults, so the file is purely a
 /// discoverable template and pond still works with no `config.toml` on disk.
 pub const DEFAULT_CONFIG_TOML: &str = "\
@@ -242,25 +258,43 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # index_cache_bytes    = \"256 MiB\"
 # metadata_cache_bytes = \"128 MiB\"
 
-# Object-store credentials and tuning, passed verbatim to Lance's
-# `DatasetBuilder::with_storage_options`. Required only when `--data-dir` is
-# an `s3://` / `gs://` / `az://` URI that needs auth or a non-default region.
-# Keys follow the `object_store` crate's standard names. Environment
-# variables of the same name are read by `object_store` automatically;
-# values in this block override them. pond does not parse these.
+# Storage address and credentials (spec.md#storage-url-grammar).
 #
-# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[storage]` is
-# flat here on the assumption of one bucket per pond. When multi-namespace
-# pond lands and tenants need separate buckets/regions, this becomes
-# `[namespaces.<ns>.storage]`. Pre-v1 the schema is breakable; the rename is
-# operationally free until a real second tenant exists.
+# `path` is the default destination used when `--storage-path` (env
+# `POND_STORAGE_PATH`) is not passed. Absent = the platform-local data dir.
+# Addresses are URLs; the `s3+https` form carries the endpoint, bucket, and
+# prefix in one token:
+#
+#   /abs/path or ~/path                  local filesystem
+#   s3://bucket/prefix                   AWS S3 (ambient credential chain)
+#   s3+https://host/bucket/prefix        S3-compatible endpoint (Hetzner, R2, B2, MinIO)
+#   gs://bucket/prefix                   Google Cloud Storage
+#   az://account/container/prefix        Azure Blob
+#
+# Credentials live in `[creds.<name>]` sets and bind to URLs by `scope`
+# prefix - longest match wins (spec.md#creds-scope-match); a set without
+# `scope` matches any URL. With no matching set, the standard cloud SDK
+# chain applies (AWS_* env, shared credentials file, instance metadata).
+# Secrets never go in URLs or CLI flags; besides inline values,
+# `access_key_id_file` / `secret_access_key_file` read a file and
+# `secret_access_key_command` runs a command (e.g. `op read ...`). `extra`
+# holds verbatim `object_store` options pond has not typed.
+#
+# Every field mirrors to env: `POND_STORAGE_PATH`, `POND_CREDS_<NAME>_<FIELD>`
+# (set names are lowercase alphanumeric, so the env grammar is unambiguous).
+# Precedence: CLI flag > POND_* env > this file > ambient cloud chain.
+# Probe a destination end-to-end with `pond config check`.
+#
+# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution);
+# `[storage]` is flat here on the assumption of one bucket per pond. When
+# multi-namespace pond lands this becomes `[namespaces.<ns>.storage]`.
 #
 # [storage]
-# AWS_ACCESS_KEY_ID = \"...\"
-# AWS_SECRET_ACCESS_KEY = \"...\"
-# AWS_REGION = \"us-east-1\"
-# AWS_ENDPOINT = \"https://minio.example.com\"  # for self-hosted MinIO
-# allow_http = \"true\"                          # only for non-TLS endpoints
+# path = \"s3+https://nbg1.your-objectstorage.com/my-pond\"
+#
+# [creds.default]
+# access_key_id     = \"...\"
+# secret_access_key = \"...\"
 ";
 
 /// Top-level `config.toml` shape.
@@ -282,17 +316,56 @@ pub struct Config {
     /// default; `pond sync` runs discovery into this map on first use.
     #[serde(default)]
     pub sources: BTreeMap<String, Value>,
-    /// `[storage]` key=value pairs handed verbatim to Lance's
-    /// `DatasetBuilder::with_storage_options` and `WriteParams.store_params`.
-    /// Keys are the standard `object_store` config names
-    /// (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT`, etc.); see Lance's
-    /// `DatasetBuilder::with_storage_options` doc for the per-scheme variants
-    /// (S3 / GCS / Azure). pond does not parse or validate these; Lance does.
-    /// Empty by default; required only when `--data-dir` is an object-store
-    /// URI that needs credentials or a non-default region/endpoint. Values
-    /// here override any matching environment variables.
+    /// `[storage]`: the default destination URL (spec.md#storage-url-grammar).
+    /// `None` = the platform-local data dir.
     #[serde(default)]
-    pub storage: BTreeMap<String, String>,
+    pub storage: StorageConfig,
+    /// `[creds.<name>]`: URL-scoped credential sets. Every storage URL
+    /// resolves its own set by longest-prefix `scope` match
+    /// (spec.md#creds-scope-match); the resolver lives in `pond::substrate`.
+    #[serde(default)]
+    pub creds: BTreeMap<String, CredsSet>,
+}
+
+/// `[storage]`: the single default destination. Typed so the legacy
+/// passthrough map (ENV-style `object_store` keys) fails loudly with the
+/// rewrite recipe instead of silently changing meaning.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// One `[creds.<name>]` set. All fields optional; validation enforces at most
+/// one variant per logical secret. `extra` carries verbatim `object_store`
+/// options pond has not typed (redaction in `pond config show` still applies
+/// to its keys by name).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredsSet {
+    /// URL prefix this set binds to. `None` = the catch-all set (at most one).
+    #[serde(default)]
+    pub scope: Option<String>,
+    // Key / region fields are `lenient_string`: the env mirror parses values
+    // TOML-ishly, so an all-digit key or region arrives as a number and must
+    // still land in these String fields.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub access_key_id_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub secret_access_key: Option<String>,
+    #[serde(default)]
+    pub secret_access_key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub secret_access_key_command: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub virtual_hosted_style_request: Option<bool>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
 }
 
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
@@ -375,19 +448,12 @@ impl Default for EmbeddingsConfig {
     }
 }
 
-/// Resolve pond's data directory. An explicit `--data-dir` / `POND_DATA_DIR`
-/// wins (and may carry an `s3://` / `gs://` / `az://` URI); otherwise the
-/// XDG-local fallback (`$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`,
-/// then `.pond`). `xdg_data_home` is honored only if absolute, per the XDG
-/// base-directory spec.
-pub fn resolve_data_dir(
-    explicit: Option<Url>,
-    xdg_data_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Result<Url> {
-    if let Some(location) = explicit {
-        return Ok(location);
-    }
+/// The platform-local default storage path, used when neither
+/// `--storage-path` / `POND_STORAGE_PATH` nor `[storage].path` is set:
+/// `$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`, then `.pond`.
+/// `xdg_data_home` is honored only if absolute, per the XDG base-directory
+/// spec.
+pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<Url> {
     if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
         return url_for_path(xdg.join("pond"));
     }
@@ -413,22 +479,35 @@ pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBu
 }
 
 impl Config {
-    /// Load `config.toml` from `path` if it exists and validate it. A missing
-    /// file yields the built-in defaults. On success the resolved embedding
-    /// model id + dim are installed into the process (`OnceLock`-backed; only
-    /// the first call per process sticks), so all downstream code paths see a
+    /// Load `config.toml` from `path` (if it exists) layered under the
+    /// `POND_*` env mirror, and validate. A missing file yields the built-in
+    /// defaults - env vars alone are a complete config
+    /// (spec.md#storage-configless). On success the resolved embedding model
+    /// id + dim are installed into the process (`OnceLock`-backed; only the
+    /// first call per process sticks), so all downstream code paths see a
     /// consistent pair without per-handler plumbing.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::load_with_provenance(path)?.0)
+    }
+
+    /// [`Config::load`] that also returns the figment, so `pond config show`
+    /// can attribute each value to its source layer (file / env / default).
+    pub fn load_with_provenance(path: impl AsRef<Path>) -> Result<(Self, Figment)> {
         let path = path.as_ref();
-        let config = if path.exists() {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read config {}", path.display()))?;
-            toml::from_str::<Self>(&text)
-                .with_context(|| format!("failed to parse config {}", path.display()))?
-        } else {
-            Self::default()
-        };
+        let figment = Figment::new().merge(Toml::file(path)).merge(env_mirror());
+        // `extract_lossy`, not `extract`: env values parse TOML-ishly, so an
+        // all-digit secret would arrive as a number and fail the String field;
+        // lossy stringifies scalars instead.
+        let config: Self = figment.extract_lossy().map_err(|error| {
+            if let Some(recipe) = detect_legacy_storage(path) {
+                return anyhow!("{recipe}");
+            }
+            // Inline figment's message (it already names the failing key and
+            // source layer) so single-line error surfaces keep the detail.
+            anyhow!("failed to load config {}: {error}", path.display())
+        })?;
         config.embeddings.validate()?;
+        config.validate_creds()?;
         config.embeddings.install_runtime();
         if let Some(threshold) = config.maintenance.index_lag_threshold {
             crate::substrate::init_index_lag_threshold(threshold);
@@ -436,7 +515,74 @@ impl Config {
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
-        Ok(config)
+        Ok((config, figment))
+    }
+
+    /// `[creds.*]` structural rules (spec.md#creds-scope-match): set-name
+    /// charset, at most one variant per logical secret, at most one
+    /// scope-less set, no duplicate scopes. All parse-time so a misbinding
+    /// dies before any URL resolves against it.
+    fn validate_creds(&self) -> Result<()> {
+        let mut scopeless: Option<&str> = None;
+        let mut scopes: BTreeMap<String, &str> = BTreeMap::new();
+        for (name, set) in &self.creds {
+            // Lowercase alphanumeric only - load-bearing for the env mirror:
+            // it makes `POND_CREDS_<NAME>_<FIELD>` splittable at the first
+            // `_` after the name (field names contain underscores).
+            let mut chars = name.chars();
+            let head_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+            if !head_ok
+                || name.len() > 16
+                || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            {
+                bail!(
+                    "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
+                );
+            }
+            if set.access_key_id.is_some() && set.access_key_id_file.is_some() {
+                bail!("[creds.{name}] sets both access_key_id and access_key_id_file; pick one");
+            }
+            let secret_variants = [
+                set.secret_access_key.is_some(),
+                set.secret_access_key_file.is_some(),
+                set.secret_access_key_command.is_some(),
+            ]
+            .iter()
+            .filter(|present| **present)
+            .count();
+            if secret_variants > 1 {
+                bail!(
+                    "[creds.{name}] sets more than one of secret_access_key / secret_access_key_file / secret_access_key_command; pick one"
+                );
+            }
+            match set.scope.as_deref() {
+                None => {
+                    if let Some(other) = scopeless {
+                        bail!(
+                            "[creds.{other}] and [creds.{name}] are both scope-less; at most one catch-all set is allowed - add a `scope` to one"
+                        );
+                    }
+                    scopeless = Some(name);
+                }
+                Some(scope) => {
+                    // Duplicates are checked on the canonical form (incl.
+                    // trailing-slash trim, matching scope-match semantics),
+                    // so two spellings of one prefix can never tie at
+                    // resolve time.
+                    let canonical = crate::substrate::parse_scope(scope)
+                        .map(|url| url.as_str().trim_end_matches('/').to_owned())
+                        .with_context(|| {
+                            format!("[creds.{name}] scope {scope:?} is not a valid URL prefix")
+                        })?;
+                    if let Some(other) = scopes.insert(canonical, name) {
+                        bail!(
+                            "[creds.{other}] and [creds.{name}] declare the same scope {scope:?}; merge them or narrow one"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. Only
@@ -484,6 +630,74 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// The `POND_*` env mirror (spec.md#storage-env-mirror): `POND_STORAGE_PATH`
+/// -> `storage.path`, `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`.
+/// Filtered to exactly those two shapes - clap owns its own `POND_*` vars
+/// (`POND_CONFIG`, `POND_HOST`, ...) and an unfiltered prefix would turn each
+/// of them into an unknown-field error here.
+fn env_mirror() -> Env {
+    // Keys reach these closures pre-lowercasing (`CREDS_...`), so compare on
+    // an ascii-lowered copy; `str::starts_with` is case-sensitive.
+    Env::prefixed("POND_")
+        .filter(|key| {
+            let key = key.as_str().to_ascii_lowercase();
+            // `extra` has no env form (spec.md#storage-env-mirror): the env
+            // grammar stays flat strings; structured options belong in the
+            // file (or URL query params).
+            key == "storage_path" || (key.starts_with("creds_") && !key.ends_with("_extra"))
+        })
+        .map(|key| {
+            // Set names are lowercase alphanumeric (validate_creds), so the
+            // first `_` after `creds` and the one after the name are the only
+            // separators; field names keep their underscores.
+            let key = key.as_str().to_ascii_lowercase();
+            let dots = if key.starts_with("creds_") { 2 } else { 1 };
+            key.replacen('_', ".", dots).into()
+        })
+}
+
+/// Recognize the pre-redesign `[storage]` passthrough map (ENV-style
+/// `object_store` keys) and return the exact rewrite onto `[storage].path` +
+/// `[creds.default]`. An error with a recipe, not a shim: old configs do not
+/// keep working.
+fn detect_legacy_storage(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let storage = value.get("storage")?.as_table()?;
+    if storage.is_empty() || storage.keys().all(|key| key == "path") {
+        return None;
+    }
+    let get = |names: &[&str]| {
+        storage.iter().find_map(|(key, value)| {
+            names
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+                .then(|| value.as_str().unwrap_or_default().to_owned())
+        })
+    };
+    let endpoint = get(&["aws_endpoint", "endpoint"]);
+    let host = endpoint
+        .as_deref()
+        .and_then(|e| e.split("://").nth(1))
+        .unwrap_or("<endpoint-host>");
+    let mut recipe = format!(
+        "config {} uses the old [storage] passthrough map; rewrite it as:\n\n[storage]\npath = \"s3+https://{host}/<bucket>/<prefix>\"\n\n[creds.default]\n",
+        path.display(),
+    );
+    recipe.push_str(&format!(
+        "access_key_id     = \"{}\"\n",
+        get(&["aws_access_key_id", "access_key_id"]).unwrap_or_else(|| "...".into()),
+    ));
+    recipe.push_str(&format!(
+        "secret_access_key = \"{}\"\n",
+        get(&["aws_secret_access_key", "secret_access_key"]).unwrap_or_else(|| "...".into()),
+    ));
+    recipe.push_str(
+        "\n(the endpoint and bucket fold into the URL; allow_http is scheme-derived; virtual-hosted addressing defaults on; the region is autodetected - append ?region=<x> to the URL only if your store insists. `pond config check` verifies the result end-to-end)",
+    );
+    Some(recipe)
 }
 
 /// Inner helper: return `Some((name, blob))` when the source section is
@@ -551,7 +765,9 @@ impl EmbeddingsConfig {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    // `result_large_err`: `figment::Jail` closures return `figment::Error`
+    // by contract; the size is figment's, not ours.
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::result_large_err)]
 
     use super::*;
     use serde_json::Value;
@@ -604,32 +820,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_data_dir_follows_explicit_then_xdg_then_home() {
-        // An explicit `--data-dir` / `POND_DATA_DIR` wins over everything. The
-        // explicit value can carry any URI form Lance accepts; here we test the
-        // local-path form (parsing is delegated to Lance's `uri_to_url`).
-        let explicit = parse_data_dir("/explicit").unwrap();
-        let resolved = resolve_data_dir(
-            Some(explicit.clone()),
-            Some(PathBuf::from("/xdg")),
-            Some(PathBuf::from("/home")),
-        )
-        .unwrap();
-        assert_eq!(resolved, explicit);
-
-        // An absolute XDG_DATA_HOME is used next.
-        let resolved = resolve_data_dir(
-            None,
-            Some(PathBuf::from("/xdg")),
-            Some(PathBuf::from("/home")),
-        )
-        .unwrap();
+    fn default_storage_path_follows_xdg_then_home() {
+        // An absolute XDG_DATA_HOME wins.
+        let resolved =
+            default_storage_path(Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home")))
+                .unwrap();
         assert!(is_local(&resolved));
         assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
 
         // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
-        let resolved = resolve_data_dir(
-            None,
+        let resolved = default_storage_path(
             Some(PathBuf::from("relative")),
             Some(PathBuf::from("/home")),
         )
@@ -642,7 +842,7 @@ mod tests {
         // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
         // The result is absolute (Lance's URL conversion requires it), so we
         // just check that the URL ends with the relative path's components.
-        let resolved = resolve_data_dir(None, None, None).unwrap();
+        let resolved = default_storage_path(None, None).unwrap();
         assert!(is_local(&resolved));
         assert!(
             local_path(&resolved).unwrap().ends_with(".pond"),
@@ -729,7 +929,7 @@ enabled = false
 
     #[test]
     fn memory_uri_is_classified_as_remote() {
-        let url = parse_data_dir("memory:///pond-remote-test").expect("memory uri parses");
+        let url = Url::parse("memory:///pond-remote-test").expect("memory uri parses");
         assert!(
             !is_local(&url),
             "memory:// is not a local-filesystem URL: {url}",
@@ -738,5 +938,161 @@ enabled = false
             local_path(&url).is_none(),
             "local_path must return None for non-file schemes",
         );
+    }
+
+    // The storage/creds tests run inside `figment::Jail` even when they set
+    // no env vars: the Jail-based env-mirror test mutates process-global env
+    // mid-flight, and the Jail lock is what serializes them against it.
+
+    #[test]
+    fn storage_and_creds_round_trip() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+path = "s3+https://nbg1.example.com/my-pond"
+
+[creds.default]
+access_key_id     = "AKIA123"
+secret_access_key = "shh"
+
+[creds.work]
+scope             = "s3+https://fsn1.example.com/work-pond/"
+access_key_id     = "AKIA456"
+secret_access_key_command = "op read op://vault/pond/secret"
+region            = "fsn1"
+virtual_hosted_style_request = false
+extra = { request_timeout = "60 seconds" }
+"#,
+            )?;
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(
+                config.storage.path.as_deref(),
+                Some("s3+https://nbg1.example.com/my-pond"),
+            );
+            assert_eq!(config.creds.len(), 2);
+            let work = &config.creds["work"];
+            assert_eq!(
+                work.secret_access_key_command.as_deref(),
+                Some("op read op://vault/pond/secret"),
+            );
+            assert_eq!(work.virtual_hosted_style_request, Some(false));
+            assert_eq!(work.extra["request_timeout"], "60 seconds");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn creds_validators_reject_bad_shapes() {
+        let cases: &[(&str, &str)] = &[
+            // Unknown key dies loudly (typos must not silently no-op).
+            ("[creds.a]\nacces_key_id = \"x\"\n", "acces_key_id"),
+            // Name charset: separators break the env-mirror grammar.
+            ("[creds.my_set]\naccess_key_id = \"x\"\n", "[a-z][a-z0-9]"),
+            ("[creds.A1]\naccess_key_id = \"x\"\n", "[a-z][a-z0-9]"),
+            // One variant per logical secret.
+            (
+                "[creds.a]\nsecret_access_key = \"x\"\nsecret_access_key_command = \"cat\"\n",
+                "more than one",
+            ),
+            (
+                "[creds.a]\naccess_key_id = \"x\"\naccess_key_id_file = \"/k\"\n",
+                "pick one",
+            ),
+            // At most one scope-less set.
+            (
+                "[creds.a]\naccess_key_id = \"x\"\n[creds.b]\naccess_key_id = \"y\"\n",
+                "scope-less",
+            ),
+            // Duplicate scopes can never tie-break - checked canonicalized,
+            // so two spellings of one prefix still collide.
+            (
+                "[creds.a]\nscope = \"s3+https://h:443/b/\"\naccess_key_id = \"x\"\n[creds.b]\nscope = \"s3+https://h/b\"\naccess_key_id = \"y\"\n",
+                "same scope",
+            ),
+        ];
+        figment::Jail::expect_with(|jail| {
+            for (body, needle) in cases {
+                jail.create_file("config.toml", body)?;
+                let err = Config::load("config.toml").expect_err(body).to_string();
+                assert!(
+                    err.contains(needle),
+                    "want {needle:?} in error for {body:?}, got: {err}",
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_storage_map_errors_with_the_rewrite_recipe() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+AWS_ACCESS_KEY_ID = "AKIA123"
+AWS_SECRET_ACCESS_KEY = "shh"
+AWS_REGION = "nbg1"
+AWS_ENDPOINT = "https://ttq.nbg1.your-objectstorage.com"
+aws_virtual_hosted_style_request = "true"
+"#,
+            )?;
+            let err = Config::load("config.toml")
+                .expect_err("legacy map must error")
+                .to_string();
+            // The error IS the migration: old keys mapped onto the new shape.
+            assert!(err.contains("old [storage] passthrough map"), "got: {err}");
+            assert!(
+                err.contains("s3+https://ttq.nbg1.your-objectstorage.com/"),
+                "endpoint host must fold into the URL recipe, got: {err}",
+            );
+            assert!(
+                err.contains("access_key_id     = \"AKIA123\""),
+                "got: {err}"
+            );
+            // Region is autodetected (AWS) or defaulted (S3-compatible
+            // endpoints ignore it): the recipe must not carry AWS_REGION
+            // forward, only name the ?region= override.
+            assert!(!err.contains("region            ="), "got: {err}");
+            assert!(err.contains("?region="), "got: {err}");
+            assert!(err.contains("pond config check"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn env_mirror_layers_over_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+path = "/from-file"
+
+[creds.work]
+scope         = "s3://file-bucket/"
+access_key_id = "from-file"
+region        = "file-region"
+"#,
+            )?;
+            // Env beats file per field; untouched fields survive the merge.
+            jail.set_env("POND_STORAGE_PATH", "/from-env");
+            jail.set_env("POND_CREDS_WORK_ACCESS_KEY_ID", "from-env");
+            // A purely-numeric env secret must stay a string (extract_lossy).
+            jail.set_env("POND_CREDS_WORK_SECRET_ACCESS_KEY", "12345");
+            // A set defined only in env is discovered by the prefix scan.
+            jail.set_env("POND_CREDS_CI_ACCESS_KEY_ID", "ci-key");
+            let config = Config::load("config.toml").expect("env+file config loads");
+            assert_eq!(config.storage.path.as_deref(), Some("/from-env"));
+            let work = &config.creds["work"];
+            assert_eq!(work.access_key_id.as_deref(), Some("from-env"));
+            assert_eq!(work.secret_access_key.as_deref(), Some("12345"));
+            assert_eq!(work.region.as_deref(), Some("file-region"));
+            assert_eq!(work.scope.as_deref(), Some("s3://file-bucket/"));
+            assert_eq!(config.creds["ci"].access_key_id.as_deref(), Some("ci-key"));
+            Ok(())
+        });
     }
 }
