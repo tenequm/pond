@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.7.0](https://github.com/tenequm/pond/compare/v0.6.0...v0.7.0) - 2026-06-11
+
+### <!-- 0 -->🛠 Breaking Changes
+- **mcp:** [**breaking**] minimize pond_search/pond_sql_query param surface
+
+### <!-- 2 -->🐛 Bug Fixes
+- **sql:** make pond_sql_query first-try-correct for agents
+
+### <!-- 6 -->🧹 Chores
+- lance-style release notes and point nix install at pond-nix
 
 ## [0.6.0](https://github.com/tenequm/pond/compare/v0.5.2...v0.6.0) - 2026-06-10
 
