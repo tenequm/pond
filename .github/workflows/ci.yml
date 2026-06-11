@@ -147,6 +147,7 @@ jobs:
           cat > tap/Formula/pond.rb <<EOF
           # typed: false
           # frozen_string_literal: true
+
           class Pond < Formula
             desc "Lossless storage and hybrid search for sessions from any AI agent client"
             homepage "https://pond.cascade.fyi/"
@@ -154,39 +155,31 @@ jobs:
             license "Apache-2.0"
 
             livecheck do
-              url "https://github.com/tenequm/homebrew-tap"
+              url :stable
               strategy :github_releases
               regex(/^pond[._-]v?(\d+(?:\.\d+)+)\$/i)
             end
 
             on_macos do
-              if Hardware::CPU.arm?
+              on_arm do
                 url "$base/pond-aarch64-apple-darwin.tar.xz"
                 sha256 "$(sha aarch64-apple-darwin)"
-
-                def install
-                  bin.install "pond"
-                end
               end
             end
 
             on_linux do
-              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+              on_intel do
                 url "$base/pond-x86_64-unknown-linux-gnu.tar.xz"
                 sha256 "$(sha x86_64-unknown-linux-gnu)"
-
-                def install
-                  bin.install "pond"
-                end
               end
-              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+              on_arm do
                 url "$base/pond-aarch64-unknown-linux-gnu.tar.xz"
                 sha256 "$(sha aarch64-unknown-linux-gnu)"
-
-                def install
-                  bin.install "pond"
-                end
               end
+            end
+
+            def install
+              bin.install "pond"
             end
 
             test do
@@ -198,17 +191,18 @@ jobs:
           git -C tap add Formula/pond.rb
           git -C tap diff --quiet --staged || git -C tap -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
           git -C tap push
-      - name: Publish NUR package
+      - name: Publish pond-nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: |
           set -euo pipefail
-          base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
+          # pond-nix hosts its own binaries; the flake fetches from this repo's releases.
+          base="https://github.com/tenequm/pond-nix/releases/download/pond-v$V"
           nix32() { nix-hash --type sha256 --to-base32 "$(sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1)"; }
-          rm -rf nur
-          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/nur-packages" nur
-          mkdir -p nur/pkgs/pond
-          cat > nur/pkgs/pond/default.nix <<EOF
+          rm -rf pond-nix
+          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" pond-nix
+          mkdir -p pond-nix/pkgs/pond
+          cat > pond-nix/pkgs/pond/default.nix <<EOF
           { lib, fetchurl, stdenv, autoPatchelfHook, zlib }:
           let
             inherit (stdenv) hostPlatform;
@@ -253,7 +247,7 @@ jobs:
             meta = {
               description = "Lossless storage and hybrid search for sessions from any AI agent client";
               homepage = "https://pond.cascade.fyi/";
-              changelog = "https://github.com/tenequm/pond/blob/v\${version}/CHANGELOG.md";
+              changelog = "https://github.com/tenequm/pond-nix/releases/tag/pond-v\${version}";
               license = lib.licenses.asl20;
               mainProgram = "pond";
               sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
@@ -262,15 +256,16 @@ jobs:
             };
           }
           EOF
-          git -C nur add pkgs/pond/default.nix
-          git -C nur diff --quiet --staged || git -C nur -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
-          git -C nur push
-          # nur consumes default.nix off the branch; the release is a tagged,
-          # changelog-bearing marker per version. Tag the commit we just pushed.
+          git -C pond-nix add pkgs/pond/default.nix
+          git -C pond-nix diff --quiet --staged || git -C pond-nix -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
+          git -C pond-nix push
+          # The flake fetches binaries from this release; attach the tarballs +
+          # the changelog notes, and target the default.nix commit we just pushed.
           notes=$(gh release view "v$V" -R tenequm/pond --json body -q .body)
-          gh release create "pond-v$V" --repo tenequm/nur-packages --target "$(git -C nur rev-parse HEAD)" \
-            --title "pond v$V" --notes "$notes" \
-          || gh release edit "pond-v$V" --repo tenequm/nur-packages --title "pond v$V" --notes "$notes"
+          gh release create "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix \
+            --target "$(git -C pond-nix rev-parse HEAD)" --title "pond v$V" --notes "$notes" \
+          || { gh release upload "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix --clobber; \
+               gh release edit "pond-v$V" --repo tenequm/pond-nix --title "pond v$V" --notes "$notes"; }
 
       # Mirror the binaries onto pond's own (private) release.
       - name: Mirror binaries to pond release
