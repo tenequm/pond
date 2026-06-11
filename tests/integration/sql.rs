@@ -94,7 +94,9 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         provenance: Provenance::Conversational,
         options: Default::default(),
         kind: PartKind::Text {
-            text: s("what is the answer"),
+            // Embedded newline: the inline table must collapse it to a
+            // literal `\n` so the row renders as one physical line.
+            text: s("what is the answer\nreally"),
         },
     };
     let asst_text = Part {
@@ -144,11 +146,13 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         IngestRequest {
             protocol_version: PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
+            // Stream order matters: parts attach to the current message, so
+            // each message's parts must follow it before the next message.
             events: vec![
                 IngestEvent::Session(session),
                 IngestEvent::Message(user),
-                IngestEvent::Message(assistant),
                 IngestEvent::Part(user_text),
+                IngestEvent::Message(assistant),
                 IngestEvent::Part(asst_text),
                 IngestEvent::Part(tool_call),
                 IngestEvent::Part(tool_result),
@@ -255,15 +259,20 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         "shows canonical columns: {text}"
     );
     assert!(
+        text.contains("message_id"),
+        "the messages key is the renamed message_id: {text}"
+    );
+    assert!(
         text.contains("embedding_model"),
         "keeps text columns: {text}"
     );
     assert!(!text.contains("vector"), "omits the vector column: {text}");
 
     // 4. BM25 search-in-SQL via the fts() table function executes and composes
-    // with ordinary SQL (projection / LIMIT) around it.
+    // with ordinary SQL (projection / LIMIT) around it - and exposes the
+    // renamed message_id key like the messages view does.
     let result = call(json!({
-        "sql": "SELECT id FROM fts('messages', \
+        "sql": "SELECT message_id FROM fts('messages', \
                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"answer\"}}') LIMIT 5"
     }))
     .await?;
@@ -411,7 +420,7 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     // 10. Inline truncation now points the agent at keyset pagination.
     // Force truncation with a 1-row limit on a 4-row corpus.
     let result = call(json!({
-        "sql": "SELECT id, timestamp FROM messages ORDER BY timestamp",
+        "sql": "SELECT message_id, timestamp FROM messages ORDER BY timestamp",
         "limit": 1
     }))
     .await?;
@@ -507,6 +516,122 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     );
     let text = first_text(&result).expect("inline result");
     assert!(text.contains("hi there"), "serialized array result: {text}");
+
+    // 17. Renamed keys: messages.message_id and sessions.session_id filter
+    // and join under their self-describing names (the view inlines, so the
+    // equality predicate still reaches the Lance scan).
+    let result = call(json!({
+        "sql": "SELECT m.message_id, s.session_id \
+                FROM messages m JOIN sessions s ON m.session_id = s.session_id \
+                WHERE m.message_id = 'm-user'"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "renamed keys should join and filter: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("m-user"), "filters by message_id: {text}");
+    assert!(text.contains(SESSION_ID), "joins by session_id: {text}");
+
+    // 18. contains_tokens as a WHERE predicate: the natural filter-form of
+    // full-text search (all words must match).
+    let result = call(json!({
+        "sql": "SELECT message_id FROM messages \
+                WHERE contains_tokens(search_text, 'forty two')"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "contains_tokens should filter: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(
+        text.contains("m-asst"),
+        "matches the assistant message: {text}"
+    );
+
+    // 19. fts() in WHERE is the classic predicate-form misuse: it must fail
+    // at plan time with a redirect to contains_tokens, not DataFusion's
+    // "Invalid function 'fts'. Did you mean 'cos'?".
+    let result = call(json!({
+        "sql": "SELECT message_id FROM messages WHERE \
+                fts('messages', '{\"match\":{}}')"
+    }))
+    .await?;
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "WHERE fts(...) must be a tool error: {result:?}"
+    );
+    let text = first_text(&result).expect("error carries a message");
+    assert!(
+        text.contains("contains_tokens"),
+        "error redirects to contains_tokens: {text}"
+    );
+
+    // 20. any_value aggregates (Postgres 16 / DuckDB name agents reach for).
+    let result = call(json!({
+        "sql": "SELECT session_id, any_value(project) AS project \
+                FROM messages GROUP BY session_id"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "any_value should aggregate: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains(PROJECT), "any_value picks a value: {text}");
+
+    // 21. Variadic json_get_*: a key path walks nested objects (the
+    // datafusion-functions-json convention).
+    let result = call(json!({
+        "sql": "SELECT json_get_string(variant_data, 'params', 'command') AS cmd \
+                FROM parts WHERE type = 'tool_call'"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "variadic json_get_string should walk the path: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    assert!(text.contains("echo hi"), "walks params.command: {text}");
+
+    // 22. CAST / `::` on JSONB columns is rejected at plan time with the fix
+    // (runtime behavior is data-dependent and can silently return garbage).
+    for sql in [
+        "SELECT CAST(variant_data AS VARCHAR) FROM parts",
+        "SELECT variant_data::text FROM parts",
+    ] {
+        let result = call(json!({ "sql": sql })).await?;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "JSONB cast must be a tool error: {sql}"
+        );
+        let text = first_text(&result).expect("error carries a message");
+        assert!(text.contains("json_extract"), "error names the fix: {text}");
+    }
+
+    // 23. Embedded newlines in cell values collapse to a literal `\n` so each
+    // row renders as one physical line.
+    let result = call(json!({
+        "sql": "SELECT search_text FROM messages WHERE role = 'user'"
+    }))
+    .await?;
+    let text = first_text(&result).expect("inline result");
+    assert!(
+        text.contains("answer\\nreally"),
+        "newline collapses to literal backslash-n: {text}"
+    );
+    assert!(
+        !text.contains("answer\nreally"),
+        "no raw newline inside a row: {text}"
+    );
 
     client.cancel().await?;
     let _ = server_handle.await;

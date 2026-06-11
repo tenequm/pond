@@ -1,6 +1,7 @@
 //! `pond_sql_query`: read-only DataFusion SQL over the three Lance tables
-//! (`sessions` / `messages` / `parts`), registered as `LanceTableProvider`s on
-//! a fresh per-call `SessionContext`. Read-only is enforced in two layers - a
+//! (`sessions` / `messages` / `parts`), registered as `LanceTableProvider`s
+//! (behind plan-time views that rename `id` to `message_id` / `session_id`)
+//! on a fresh per-call `SessionContext`. Read-only is enforced in two layers - a
 //! single-`SELECT` pre-parse and `sql_with_options` with DDL/DML/statements all
 //! disabled - so no statement that mutates the corpus or touches the filesystem
 //! (INSERT/UPDATE/DELETE/CREATE/DROP/COPY/CREATE EXTERNAL TABLE/SET) can run.
@@ -18,7 +19,10 @@ use lance::datafusion::LanceTableProvider;
 use lance::deps::arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
 };
-use lance::deps::arrow_array::{Array, LargeBinaryArray, RecordBatch, StringArray};
+use lance::deps::arrow_array::{
+    Array, ArrayRef, GenericStringArray, LargeBinaryArray, OffsetSizeTrait, RecordBatch,
+    StringArray, StringViewArray,
+};
 use lance::deps::arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use lance::deps::datafusion::arrow::util::pretty::pretty_format_batches;
 use lance::deps::datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -28,7 +32,8 @@ use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::execution::SessionStateBuilder;
 use lance::deps::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use lance::deps::datafusion::logical_expr::{
-    ColumnarValue, LogicalPlanBuilder, ScalarUDF, Volatility, create_udf,
+    ColumnarValue, LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use lance::deps::datafusion::logical_expr::{Expr, TableType};
 use lance::deps::datafusion::physical_plan::ExecutionPlan;
@@ -159,6 +164,27 @@ pub async fn run(
                 .to_owned(),
         ));
     }
+    if jsonb_cast_misuse(sql) {
+        return Err(SqlError::Query(
+            "CAST / `::` does not work on the binary JSONB columns (variant_data, options) - \
+             when the bytes happen to be valid text it can even silently return garbage. \
+             Stringify the whole value with json_extract(col, '$') or read one field with \
+             json_extract(col, '$.field')."
+                .to_owned(),
+        ));
+    }
+    if jsonb_fulldoc_like_scan(sql) {
+        return Err(SqlError::Query(
+            "a leading-wildcard LIKE over the whole JSONB document - \
+             json_extract(variant_data, '$') LIKE '%...%' - stringifies and scans every row, \
+             so over parts it will not finish within the time limit. There is no substring \
+             index on tool bodies yet (TODO #47: lance v8 FM-Index). Instead match a single \
+             field with json_extract(variant_data, '$.field') LIKE '...', scope to one session \
+             with session_id = '<id>' and read it with pond_get, or search conversational text \
+             with contains_tokens(search_text, '...')."
+                .to_owned(),
+        ));
+    }
     let ctx = build_context()?;
     register(&ctx, tables)?;
 
@@ -180,11 +206,20 @@ pub async fn run(
     // renders its column headers.
     let result_schema = Arc::new(df.schema().as_arrow().clone());
     let started = Instant::now();
+    // TODO(#47): substring hunts inside parts.variant_data (json_extract +
+    // LIKE full scans) are the dominant real-world cause of this timeout. The
+    // planned fix is lance v8's FM-Index on variant_data (raw-byte substring
+    // search via `contains(variant_data, 'needle')`); until it lands, the
+    // message steers agents to predicates the current indexes can serve.
     let collected = tokio::time::timeout(QUERY_TIMEOUT, df.collect())
         .await
         .map_err(|_| {
             SqlError::Query(format!(
-                "query exceeded the {}s limit; add a narrower WHERE or a LIMIT",
+                "query exceeded the {}s limit; add a narrower WHERE or a LIMIT. If you were \
+                 substring-scanning variant_data (json_extract + LIKE), there is no \
+                 substring index on tool bodies yet: filter parts by type and \
+                 json_get_string(variant_data, 'name') first, or search conversational \
+                 text with contains_tokens(search_text, '...') instead.",
                 QUERY_TIMEOUT.as_secs()
             ))
         })?
@@ -349,6 +384,141 @@ fn mentions_vector_token(text: &str) -> bool {
         .any(|token| token == "vector")
 }
 
+/// Plan-time gate for CAST / `::` on the binary JSONB columns. The runtime
+/// failure is data-dependent (CAST only errors when a non-UTF8 byte is hit;
+/// JSONB header bytes are often valid ASCII, so it can silently "succeed" and
+/// return binary garbage), so reject before scanning. Token-scan heuristic in
+/// the spirit of `projection_mentions_vector`; an aliased column that slips
+/// through still hits the `enrich` runtime hint.
+fn jsonb_cast_misuse(sql: &str) -> bool {
+    const JSONB_COLUMNS: [&str; 2] = ["variant_data", "options"];
+    let lowered = sql.to_ascii_lowercase();
+    let bytes = lowered.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    // `<col> :: <type>`
+    for column in JSONB_COLUMNS {
+        let mut start = 0;
+        while let Some(pos) = lowered[start..].find(column) {
+            let begin = start + pos;
+            let end = begin + column.len();
+            start = end;
+            let bounded = (begin == 0 || !is_ident(bytes[begin - 1]))
+                && (end == bytes.len() || !is_ident(bytes[end]));
+            if bounded && lowered[end..].trim_start().starts_with("::") {
+                return true;
+            }
+        }
+    }
+
+    // `CAST(<qualifier.>col AS <type>`
+    let mut start = 0;
+    while let Some(pos) = lowered[start..].find("cast") {
+        let begin = start + pos;
+        start = begin + 4;
+        if begin > 0 && is_ident(bytes[begin - 1]) {
+            continue;
+        }
+        let Some(open) = lowered[begin + 4..].trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let mut operand = open.trim_start();
+        if let Some(dot) = operand.find('.')
+            && dot > 0
+            && operand.as_bytes()[..dot].iter().all(|b| is_ident(*b))
+        {
+            operand = &operand[dot + 1..];
+        }
+        for column in JSONB_COLUMNS {
+            if let Some(after) = operand.strip_prefix(column)
+                && !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                && after
+                    .trim_start()
+                    .strip_prefix("as")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Plan-time gate for the one substring shape that reliably exhausts the
+/// wall-clock cap: a leading-wildcard LIKE/ILIKE over the *whole-document*
+/// stringify of a binary JSONB column - `json_extract(variant_data|options,
+/// '$') LIKE '%...%'`. That materializes every row's entire JSONB blob just to
+/// substring-scan it, and the leading `%` defeats every index; over parts
+/// (>1M rows) it does not finish, even scoped to a day. A single-field extract
+/// (`'$.name'`) or any non-leading pattern is left to run - only the
+/// whole-document murder shape is rejected, so the agent gets the indexed path
+/// in milliseconds instead of a timeout. Token-scan heuristic in the spirit of
+/// `jsonb_cast_misuse`; the timeout message remains the backstop for anything
+/// that slips through.
+/// TODO(#47): lance v8's FM-Index gives raw-byte substring search
+/// (`contains(variant_data, 'needle')`); retire this gate once it lands.
+fn jsonb_fulldoc_like_scan(sql: &str) -> bool {
+    const JSONB_COLUMNS: [&str; 2] = ["variant_data", "options"];
+    const NEEDLE: &str = "json_extract";
+    let lowered = sql.to_ascii_lowercase();
+    let bytes = lowered.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut start = 0;
+    while let Some(pos) = lowered[start..].find(NEEDLE) {
+        let begin = start + pos;
+        start = begin + NEEDLE.len();
+        if begin > 0 && is_ident(bytes[begin - 1]) {
+            continue;
+        }
+        let Some(rest) = lowered[start..].trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let mut operand = rest.trim_start();
+        // optional `qualifier.`
+        if let Some(dot) = operand.find('.')
+            && dot > 0
+            && operand.as_bytes()[..dot].iter().all(|b| is_ident(*b))
+        {
+            operand = &operand[dot + 1..];
+        }
+        let Some(col) = JSONB_COLUMNS.into_iter().find(|c| operand.starts_with(c)) else {
+            continue;
+        };
+        // Require the whole-document path `, '$' )` exactly - a single-field
+        // extract (`'$.name'`) is fine and must keep running.
+        let tail = operand[col.len()..].trim_start();
+        let Some(tail) = tail
+            .strip_prefix(',')
+            .map(str::trim_start)
+            .and_then(|t| t.strip_prefix("'$'"))
+            .map(str::trim_start)
+            .and_then(|t| t.strip_prefix(')'))
+        else {
+            continue;
+        };
+        // Step past any wrapper close-parens (`lower(...)`/`upper(...)`).
+        let mut tail = tail.trim_start();
+        while let Some(next) = tail.strip_prefix(')') {
+            tail = next.trim_start();
+        }
+        if let Some(next) = tail.strip_prefix("not")
+            && next.starts_with(char::is_whitespace)
+        {
+            tail = next.trim_start();
+        }
+        for op in ["like", "ilike"] {
+            if let Some(next) = tail.strip_prefix(op)
+                && next.starts_with(char::is_whitespace)
+                && next.trim_start().starts_with("'%")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn build_context() -> Result<SessionContext, SqlError> {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_limit(MEM_LIMIT_BYTES, 1.0)
@@ -364,6 +534,18 @@ fn build_context() -> Result<SessionContext, SqlError> {
     Ok(SessionContext::new_with_state(state))
 }
 
+/// Plan-time key renames: each table's storage `id` is exposed under a
+/// self-describing name so the same value never changes name between tables -
+/// agents copy column names across queries. One source drives both the
+/// registered views and fts() output so they cannot diverge.
+fn renamed_key(table: &str) -> Option<&'static str> {
+    match table {
+        "messages" => Some("message_id"),
+        "sessions" => Some("session_id"),
+        _ => None,
+    }
+}
+
 fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     for (name, dataset) in [
         ("sessions", &tables.sessions),
@@ -371,9 +553,13 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     ] {
         // LanceTableProvider (not the bare Dataset impl) so WHERE/projection/
         // limit push into Lance's indexed scan; (false, false) hides _rowid /
-        // _rowaddr from the SQL schema.
+        // _rowaddr from the SQL schema. The view applies `renamed_key`
+        // plan-time only; storage keeps `id`.
         let provider = LanceTableProvider::new(dataset.clone(), false, false);
-        ctx.register_table(name, Arc::new(provider))
+        let key = renamed_key(name).unwrap_or("id");
+        let view = renamed_view(name, Arc::new(provider), "id", key)
+            .map_err(|error| SqlError::Infra(anyhow!("build {name} view: {error}")))?;
+        ctx.register_table(name, Arc::new(view))
             .map_err(|error| SqlError::Infra(anyhow!("register table {name}: {error}")))?;
     }
     // `parts` hides the `data` blob column behind a projecting view: blob
@@ -413,7 +599,93 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     for udf in lenient_json_udfs() {
         ctx.register_udf(udf);
     }
+    // `any_value` (Postgres 16 / DuckDB / BigQuery - agents reach for it)
+    // doesn't exist in DataFusion 53; alias first_value, which satisfies the
+    // same contract (any_value promises no ordering, so first-encountered is
+    // a valid answer). register_udaf indexes aliases.
+    if let Some(first_value) = ctx.state().aggregate_functions().get("first_value") {
+        ctx.register_udaf(first_value.as_ref().clone().with_aliases(["any_value"]));
+    }
+    // `fts` as a *scalar* exists only to fail at plan time with the correction:
+    // agents pattern-match FTS into WHERE (MySQL MATCH / Postgres @@ priors)
+    // and DataFusion's stock error is "Did you mean 'cos'?". Scalar and
+    // table-function registries are separate namespaces, so the real fts()
+    // UDTF in FROM position is unaffected.
+    ctx.register_udf(ScalarUDF::new_from_impl(FtsMisuse::new()));
     Ok(())
+}
+
+/// Wrap `provider` in a view projecting every column, with `from` renamed to
+/// `to`. The view inlines at plan time, so filters and projections still push
+/// into the underlying Lance scan.
+fn renamed_view(
+    scan_name: &str,
+    provider: Arc<dyn TableProvider>,
+    from: &str,
+    to: &str,
+) -> Result<ViewTable, DataFusionError> {
+    let projection: Vec<_> = provider
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = col(field.name().as_str());
+            if field.name() == from {
+                column.alias(to)
+            } else {
+                column
+            }
+        })
+        .collect();
+    let plan = LogicalPlanBuilder::scan(scan_name, provider_as_source(provider), None)?
+        .project(projection)?
+        .build()?;
+    Ok(ViewTable::new(plan, None))
+}
+
+const FTS_MISUSE: &str = "fts is a table function and goes in FROM, not in WHERE or the \
+    projection. For filtering use WHERE contains_tokens(search_text, 'word1 word2') (all \
+    words must match; index-accelerated). For ranked results: SELECT m.message_id, f._score \
+    FROM fts('messages', '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') f \
+    JOIN messages m ON m.message_id = f.message_id ORDER BY f._score DESC.";
+
+/// See the registration comment: a plan-time teaching error for `WHERE fts(...)`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FtsMisuse {
+    signature: Signature,
+}
+
+impl FtsMisuse {
+    fn new() -> Self {
+        Self {
+            signature: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for FtsMisuse {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "fts"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        Err(DataFusionError::Plan(FTS_MISUSE.to_owned()))
+    }
+
+    fn invoke_with_args(
+        &self,
+        _args: ScalarFunctionArgs,
+    ) -> Result<ColumnarValue, DataFusionError> {
+        Err(DataFusionError::Plan(FTS_MISUSE.to_owned()))
+    }
 }
 
 /// Vendored replacement for lance's `FtsQueryUDTF` (lance-7.0.0
@@ -459,11 +731,17 @@ impl TableFunctionImpl for ScoredFtsUdtf {
         full_schema = full_schema
             .try_with_column(Field::new(SCORE_COLUMN, DataType::Float32, true))
             .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
-        Ok(Arc::new(ScoredFtsProvider {
+        let provider: Arc<dyn TableProvider> = Arc::new(ScoredFtsProvider {
             dataset: dataset.clone(),
             fts_query: FullTextSearchQuery::new_query(from_json(fts_query)?),
             full_schema: Arc::new(full_schema),
-        }))
+        });
+        // Same `renamed_key` as the registered views, so fts() output joins
+        // without a name switch.
+        match renamed_key(table_name) {
+            Some(key) => Ok(Arc::new(renamed_view("fts", provider, "id", key)?)),
+            None => Ok(provider),
+        }
     }
 }
 
@@ -537,6 +815,7 @@ impl TableProvider for ScoredFtsProvider {
 }
 
 /// The four scalar shapes the lenient JSON getters produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JsonGet {
     Text,
     Int,
@@ -544,22 +823,27 @@ enum JsonGet {
     Bool,
 }
 
+/// Deepest key path the lenient getters accept; deeper nesting is what
+/// json_extract's JSONPath is for.
+const MAX_JSON_KEYS: usize = 6;
+
 /// Lenient replacements for lance's `json_get_string` / `_int` / `_float` /
 /// `_bool`. The strict originals call jsonb's exact converters and turn one
 /// non-scalar field value into a query-wide abort ("Failed to convert to
 /// string: InvalidCast"). Lenient semantics: a string getter serializes
 /// objects/arrays to JSON text; the typed getters return NULL on a
-/// non-coercible value. Same signatures, registered after
-/// `register_functions` so they shadow by name.
+/// non-coercible value. Unlike lance's one-key originals they take a variadic
+/// key path - `json_get_string(col, 'a', 'b')` - the datafusion-functions-json
+/// convention agents reach for first. Registered after `register_functions`
+/// so they shadow by name.
 fn lenient_json_udfs() -> [ScalarUDF; 4] {
-    let make = |name: &str, kind: JsonGet, return_type: DataType| {
-        create_udf(
+    let make = |name: &'static str, kind: JsonGet, return_type: DataType| {
+        ScalarUDF::new_from_impl(LenientJsonGet {
             name,
-            vec![DataType::LargeBinary, DataType::Utf8],
+            kind,
             return_type,
-            Volatility::Immutable,
-            Arc::new(move |args: &[ColumnarValue]| json_get_lenient(args, &kind)),
-        )
+            signature: json_key_path_signature(),
+        })
     };
     [
         make("json_get_string", JsonGet::Text, DataType::Utf8),
@@ -569,14 +853,72 @@ fn lenient_json_udfs() -> [ScalarUDF; 4] {
     ]
 }
 
+/// `(LargeBinary, Utf8)` through `(LargeBinary, Utf8 x MAX_JSON_KEYS)`.
+fn json_key_path_signature() -> Signature {
+    let arities = (1..=MAX_JSON_KEYS)
+        .map(|keys| {
+            let mut types = vec![DataType::LargeBinary];
+            types.extend(std::iter::repeat_n(DataType::Utf8, keys));
+            TypeSignature::Exact(types)
+        })
+        .collect();
+    Signature::one_of(arities, Volatility::Immutable)
+}
+
+/// See [`lenient_json_udfs`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct LenientJsonGet {
+    name: &'static str,
+    kind: JsonGet,
+    return_type: DataType,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for LenientJsonGet {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        json_get_lenient(&args.args, &self.kind)
+    }
+}
+
+/// One step of the key walk: object member by name, array element by index.
+fn json_step(raw: jsonb::RawJsonb<'_>, key: &str) -> Option<jsonb::OwnedJsonb> {
+    let value = if raw.is_object().unwrap_or(false) {
+        raw.get_by_name(key, false).ok().flatten()
+    } else if raw.is_array().unwrap_or(false) {
+        key.parse::<usize>()
+            .ok()
+            .and_then(|index| raw.get_by_index(index).ok().flatten())
+    } else {
+        None
+    };
+    value.filter(|value| !value.as_raw().is_null().unwrap_or(false))
+}
+
 fn json_get_lenient(
     args: &[ColumnarValue],
     kind: &JsonGet,
 ) -> Result<ColumnarValue, DataFusionError> {
     let arrays = ColumnarValue::values_to_arrays(args)?;
-    let [jsonb_arg, key_arg] = arrays.as_slice() else {
+    let Some((jsonb_arg, key_args)) = arrays.split_first().filter(|(_, keys)| !keys.is_empty())
+    else {
         return Err(DataFusionError::Execution(
-            "json_get_* takes exactly (json_column, 'key')".to_owned(),
+            "json_get_* takes (json_column, 'key', ...) - at least one key".to_owned(),
         ));
     };
     let jsonb_array = jsonb_arg
@@ -587,29 +929,38 @@ fn json_get_lenient(
                 "json_get_* argument 1 must be a JSON column (variant_data, options)".to_owned(),
             )
         })?;
-    let key_array = key_arg
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            DataFusionError::Execution("json_get_* argument 2 must be a string key".to_owned())
-        })?;
+    let key_arrays: Vec<&StringArray> = key_args
+        .iter()
+        .map(|key_arg| {
+            key_arg
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("json_get_* keys must be string literals".to_owned())
+                })
+        })
+        .collect::<Result<_, _>>()?;
 
     let field = |row: usize| -> Option<jsonb::OwnedJsonb> {
-        if jsonb_array.is_null(row) || key_array.is_null(row) {
+        if jsonb_array.is_null(row) {
             return None;
         }
-        let raw = jsonb::RawJsonb::new(jsonb_array.value(row));
-        let key = key_array.value(row);
-        let value = if raw.is_object().unwrap_or(false) {
-            raw.get_by_name(key, false).ok().flatten()
-        } else if raw.is_array().unwrap_or(false) {
-            key.parse::<usize>()
-                .ok()
-                .and_then(|index| raw.get_by_index(index).ok().flatten())
-        } else {
-            None
-        };
-        value.filter(|value| !value.as_raw().is_null().unwrap_or(false))
+        let mut keys = key_arrays.iter();
+        let first = keys.next()?;
+        if first.is_null(row) {
+            return None;
+        }
+        let mut current = json_step(
+            jsonb::RawJsonb::new(jsonb_array.value(row)),
+            first.value(row),
+        )?;
+        for key_array in keys {
+            if key_array.is_null(row) {
+                return None;
+            }
+            current = json_step(current.as_raw(), key_array.value(row))?;
+        }
+        Some(current)
     };
 
     let rows = jsonb_array.len();
@@ -661,20 +1012,29 @@ fn enrich(message: &str) -> String {
     const HINTS: &[(&str, &str)] = &[
         (
             "No field named",
-            "columns are messages(session_id, id, timestamp, role, source_agent, project, \
-             content [system-role only], search_text [the conversational text], \
-             embedding_model, options) | sessions(id, parent_session_id, parent_message_id, \
-             source_agent, created_at, project, options) | parts(session_id, message_id, id, \
-             ordinal, type, provenance, variant_data, options). Part bodies (tool params/\
-             results, text) live in parts.variant_data - read them with \
-             json_extract(variant_data, '$.field'). For text search use fts('messages', \
-             ...); to read a transcript use pond_get. Full doc: resource schema://pond-sql.",
+            "columns are messages(session_id, message_id, timestamp, role, source_agent, \
+             project, content [system-role only], search_text [the conversational text], \
+             embedding_model, options) | sessions(session_id, parent_session_id, \
+             parent_message_id, source_agent, created_at, project, options) | \
+             parts(session_id, message_id, id, ordinal, type, provenance, variant_data, \
+             options). Part bodies (tool params/results, text) live in parts.variant_data - \
+             read them with json_extract(variant_data, '$.field'). For text search use \
+             contains_tokens(search_text, '...') in WHERE, or the fts('messages', ...) \
+             table function in FROM for ranked results; to read a transcript use pond_get. \
+             Full doc: resource schema://pond-sql.",
         ),
         (
             "Encountered non UTF-8 data",
             "JSON columns (variant_data, options) are binary JSONB - CAST / ::text does not \
              work on them. Stringify the whole value with json_extract(col, '$'), or fetch \
              one field with json_extract(col, '$.field').",
+        ),
+        (
+            "Resources exhausted",
+            "the query ran out of memory - usually from carrying whole JSON columns \
+             (variant_data, options) through a join or sort. Project narrow fields with \
+             json_extract(col, '$.field') instead of whole columns, filter before joining, \
+             or export the full set with output=parquet.",
         ),
         (
             "LIKE prefix queries are not supported for bitmap indexes",
@@ -685,14 +1045,15 @@ fn enrich(message: &str) -> String {
         (
             "call to 'json_",
             "JSON function signatures: json_get_string|json_get_int|json_get_float|\
-             json_get_bool(col, 'key') - one key, not a path; json_get(col, 'key') returns \
-             JSONB for chaining; json_extract(col, '$.a.b') takes a JSONPath and returns \
-             JSON text of any value (the right tool for nested or mixed-type fields).",
+             json_get_bool(col, 'key', ...) walk a key path (array steps by numeric \
+             index); json_get(col, 'key') returns JSONB for chaining; json_extract(col, \
+             '$.a.b') takes a JSONPath and returns JSON text of any value (the right tool \
+             for deeply nested or mixed-type fields).",
         ),
         (
             "Invalid function 'json",
             "available JSON functions: json_get_string, json_get_int, json_get_float, \
-             json_get_bool (col, 'key'); json_get(col, 'key') -> JSONB for chaining; \
+             json_get_bool (col, 'key', ...); json_get(col, 'key') -> JSONB for chaining; \
              json_extract(col, '$.a.b') -> JSON text; json_array_contains; \
              json_array_length. See resource schema://pond-sql.",
         ),
@@ -748,6 +1109,58 @@ fn is_displayable(data_type: &DataType) -> bool {
     )
 }
 
+/// One physical line per row: embedded newlines in cell values (markdown,
+/// multi-line commands) otherwise explode a row across many table lines that
+/// hard-wrap unreadably in narrow clients. The literal two-char `\n` matches
+/// the JSON escaping agents already read, and keeps row boundaries
+/// unambiguous. Inline table mode only - json and export modes keep raw data.
+fn collapse_newlines(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> {
+    fn escape<O: OffsetSizeTrait>(array: &GenericStringArray<O>) -> ArrayRef {
+        let escaped: GenericStringArray<O> =
+            array.iter().map(|value| value.map(escape_cell)).collect();
+        Arc::new(escaped)
+    }
+    fn escape_cell(text: &str) -> std::borrow::Cow<'_, str> {
+        if text.contains(['\n', '\r']) {
+            std::borrow::Cow::Owned(text.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n"))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        }
+    }
+    batches
+        .iter()
+        .map(|batch| {
+            let columns: Vec<ArrayRef> = batch
+                .columns()
+                .iter()
+                .map(|array| match array.data_type() {
+                    DataType::Utf8 => array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map_or_else(|| array.clone(), escape),
+                    DataType::LargeUtf8 => array
+                        .as_any()
+                        .downcast_ref::<GenericStringArray<i64>>()
+                        .map_or_else(|| array.clone(), escape),
+                    DataType::Utf8View => array
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .map_or_else(
+                            || array.clone(),
+                            |view| {
+                                let escaped: StringViewArray =
+                                    view.iter().map(|value| value.map(escape_cell)).collect();
+                                Arc::new(escaped)
+                            },
+                        ),
+                    _ => array.clone(),
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns)
+        })
+        .collect()
+}
+
 fn render_inline(
     display: &[RecordBatch],
     max_rows: usize,
@@ -762,19 +1175,23 @@ fn render_inline(
             pretty_format_batches(display)?
         ));
     }
+    let render = |shown: usize| -> Result<String, ArrowError> {
+        let limited = collapse_newlines(&limit_batches(display, shown))?;
+        Ok(pretty_format_batches(&limited)?.to_string())
+    };
     let mut shown = total.min(max_rows);
-    let mut table = pretty_format_batches(&limit_batches(display, shown))?.to_string();
+    let mut table = render(shown)?;
     while table.len() > INLINE_BUDGET_BYTES && shown > 1 {
         shown = (shown / 2).max(1);
-        table = pretty_format_batches(&limit_batches(display, shown))?.to_string();
+        table = render(shown)?;
     }
     let mut out = format!("{total} row(s) in {elapsed_ms} ms; showing {shown}.\n{table}");
     if shown < total {
         out.push_str(&format!(
             "\n... {} row(s) omitted. To page: ORDER BY <indexed col> (e.g. timestamp, \
-             id), then in the next call add `WHERE (col, id) < (<last_col>, <last_id>)` - \
-             keyset pagination, see schema://pond-sql. For the full set: output=parquet \
-             or output=ndjson.",
+             message_id), then in the next call add `WHERE (col, message_id) < \
+             (<last_col>, <last_message_id>)` - keyset pagination, see schema://pond-sql. \
+             For the full set: output=parquet or output=ndjson.",
             total - shown
         ));
     }
@@ -837,9 +1254,9 @@ fn render_inline_json(
         payload.insert(
             "next_steps".to_owned(),
             json!(format!(
-                "{} row(s) omitted; ORDER BY + keyset (`WHERE (col, id) < \
-                 (<last_col>, <last_id>)`) to page, or output=parquet|ndjson for the \
-                 full set. See schema://pond-sql.",
+                "{} row(s) omitted; ORDER BY + keyset (`WHERE (col, message_id) < \
+                 (<last_col>, <last_message_id>)`) to page, or output=parquet|ndjson for \
+                 the full set. See schema://pond-sql.",
                 total - shown
             )),
         );
@@ -930,6 +1347,8 @@ fn encode_ndjson(batches: &[RecordBatch]) -> Result<Vec<u8>, SqlError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     fn rejected(sql: &str) -> bool {
@@ -1045,6 +1464,11 @@ mod tests {
                 "SQL error: Error during planning: Invalid function 'json_get_json'.",
                 "json_extract",
             ),
+            (
+                "SQL error: Resources exhausted: Additional allocation failed for \
+                 HashJoinInput[0] with top memory consumers",
+                "json_extract",
+            ),
         ];
         for (raw, marker) in cases {
             let enriched = enrich(raw);
@@ -1065,7 +1489,94 @@ mod tests {
         assert!(!mentions_vector("SELECT * FROM messages"));
         // Filtering on `vector` is documented as legal (`vector IS NOT NULL`).
         assert!(!mentions_vector(
-            "SELECT id FROM messages WHERE vector IS NOT NULL"
+            "SELECT message_id FROM messages WHERE vector IS NOT NULL"
         ));
+    }
+
+    #[test]
+    fn jsonb_cast_misuse_detects_cast_and_coloncolon() {
+        for sql in [
+            "SELECT CAST(variant_data AS VARCHAR) FROM parts",
+            "SELECT cast(p.variant_data as text) FROM parts p",
+            "SELECT variant_data::text FROM parts",
+            "SELECT p.variant_data :: varchar FROM parts p",
+            "SELECT options::text FROM messages",
+            "SELECT lower(CAST(variant_data AS VARCHAR)) FROM parts",
+        ] {
+            assert!(jsonb_cast_misuse(sql), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn jsonb_cast_misuse_allows_legitimate_use() {
+        for sql in [
+            "SELECT json_extract(variant_data, '$') FROM parts",
+            "SELECT json_get_string(variant_data, 'name') FROM parts",
+            "SELECT CAST(ordinal AS BIGINT) FROM parts",
+            "SELECT timestamp::date FROM messages",
+            // `options` as part of a longer identifier is not the column.
+            "SELECT my_options::text FROM t",
+            "SELECT CAST(json_extract(variant_data, '$.x') AS BIGINT) FROM parts",
+        ] {
+            assert!(!jsonb_cast_misuse(sql), "should allow: {sql}");
+        }
+    }
+
+    #[test]
+    fn jsonb_fulldoc_like_scan_detects_whole_document_substring() {
+        for sql in [
+            "SELECT * FROM parts WHERE json_extract(variant_data, '$') LIKE '%needle%'",
+            "SELECT * FROM parts p WHERE lower(json_extract(p.variant_data, '$')) LIKE '%x%'",
+            "SELECT * FROM messages WHERE json_extract(options, '$') ILIKE '%y%'",
+            "SELECT * FROM parts WHERE json_extract(variant_data,'$') NOT LIKE '%z%'",
+            // The real timeout shape: day-scoped join still scans every part.
+            "SELECT p.message_id FROM parts p JOIN messages m ON p.message_id = m.message_id \
+             WHERE m.timestamp >= '2026-06-11' AND lower(json_extract(p.variant_data, '$')) \
+             LIKE '%weekly limit%'",
+        ] {
+            assert!(jsonb_fulldoc_like_scan(sql), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn jsonb_fulldoc_like_scan_allows_targeted_and_nonleading() {
+        for sql in [
+            // single-field extract, not the whole document
+            "SELECT * FROM parts WHERE json_extract(variant_data, '$.name') LIKE '%x%'",
+            // non-leading (prefix) pattern can be served without a full stringify
+            "SELECT * FROM parts WHERE json_extract(variant_data, '$') LIKE 'pre%'",
+            // plain text LIKE has no whole-document stringify
+            "SELECT * FROM messages WHERE search_text LIKE '%x%'",
+            // indexed predicate, the path agents should take
+            "SELECT * FROM messages WHERE contains_tokens(search_text, 'x')",
+            // projecting the stringified value is fine; no LIKE scan
+            "SELECT json_extract(variant_data, '$') FROM parts LIMIT 1",
+        ] {
+            assert!(!jsonb_fulldoc_like_scan(sql), "should allow: {sql}");
+        }
+    }
+
+    #[test]
+    fn render_inline_collapses_newlines_in_cells() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(
+                "line one\nline two\r\nline three",
+            )]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(
+            out.contains("line one\\nline two\\nline three"),
+            "newlines collapse to literal \\n: {out}"
+        );
+        // The data row renders as one physical line: header rule, header,
+        // rule, row, rule - the row itself never wraps.
+        let row_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("line one"))
+            .collect();
+        assert_eq!(row_lines.len(), 1, "one physical line per row: {out}");
     }
 }
