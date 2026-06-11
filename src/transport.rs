@@ -211,19 +211,20 @@ pub mod mcp {
     /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
-(returned sessions; default 10, max 200), project (path substring), session_id \
-(exact session match), source_agent, role (user|assistant|system|tool), \
-from_date / to_date (YYYY-MM-DD), cursor (opaque continuation token).
+(returned sessions; default 10, max 200 - also the want-more knob, there is \
+no pagination), project (path substring), session_id (exact session match - \
+semantic search within one session), source_agent, from_date / to_date \
+(YYYY-MM-DD), format (text|json).
 
-pond_search response: a transcript. The first line states totals \
-(`matched_total` is the message count before `limit` and byte-budget \
-truncation), then results are grouped by session, ordered by each session's \
-best hit. Each session lists up to 3 top-scoring hits, score-desc; each hit is \
-a `--- [n] score | role | time | message_id | project | agent | session ---` \
-rule followed by its matched text (a ~600-char indexed window). `score` is \
-normalized to [0.0, 1.0] within one response. When more remain, a `cursor:` \
-footer carries the token to pass back as `cursor`; rank may shift between \
-pages if the corpus changes.
+pond_search response: a transcript (or structured JSON when format=json). The \
+first line states totals (`matched_total` is the message count before `limit` \
+and byte-budget truncation), then results are grouped by session, ordered by \
+each session's best hit. Each session lists up to 3 top-scoring hits, \
+score-desc; each hit is a `--- [n] score | role | time | message_id | project \
+| agent | session ---` rule followed by its matched text (a ~600-char indexed \
+window). `score` is normalized to [0.0, 1.0] within one response. `has_more` \
+warns the ranked set was cut by `limit` or the byte budget - raise `limit` to \
+see the rest.
 
 pond_search multilingual: pond's embedder (multilingual-e5-small) is trained \
 for cross-lingual retrieval, so a query in language A can match indexed text \
@@ -385,11 +386,11 @@ EXPLAIN is allowed: `EXPLAIN <query>` or `EXPLAIN ANALYZE <query>` returns the \
 DataFusion plan (and per-operator timings for ANALYZE) so you can self-diagnose \
 slow queries without leaving SQL.
 
-Output modes (the `output` arg):
-- table (default): a row-capped rendered ASCII table with a header showing \
+Output modes (the `format` arg):
+- text (default): a row-capped rendered ASCII table with a header showing \
 `{total_rows} in {elapsed_ms} ms; showing {shown}` and, on truncation, a \
 keyset-pagination hint.
-- json: same row-capped payload as `table` but delivered as a JSON object \
+- json: same row-capped payload as `text` but delivered as a JSON object \
 {total_rows, shown_rows, truncated, elapsed_ms, columns, rows: [{col: val, ...}]}. \
 Spec-compliant dual delivery: the structured JSON rides MCP's `structuredContent` \
 field; clients that don't surface that channel get the same JSON as a text block. \
@@ -420,7 +421,7 @@ The agent owns the cursor (the last sort value it saw); no server-side state.
 
 Keyset stays stable across concurrent ingest (older rows don't shift) and uses \
 the btree on `timestamp`/`message_id` directly. For known-bounded full results, skip \
-pagination entirely: output=parquet writes everything in one call. OFFSET works \
+pagination entirely: format=parquet writes everything in one call. OFFSET works \
 but scans-and-discards prior rows and shifts pages under writes - prefer keyset.
 
 Drilling from aggregates to content (instead of N round-trips of pond_get):
@@ -489,18 +490,17 @@ Examples (4 patterns the agent should recognize):
     struct McpSearchParams {
         /// What to search for: concepts and keywords. Keep it semantic - do
         /// not put project names in the query, use the `project` filter
-        /// instead. Optional only when `similar_to` is set (vector-only mode
-        /// uses the stored vector and ignores the query text); required in
-        /// every other call.
-        #[serde(default)]
-        query: Option<String>,
-        /// Max sessions to return. Default 10, server-capped at 200.
+        /// instead.
+        query: String,
+        /// Max sessions to return. Default 10, server-capped at 200. This is
+        /// also the "want more results" knob - raise it; there is no pagination.
         #[serde(default)]
         limit: Option<usize>,
         /// Filter to projects whose path contains this substring.
         #[serde(default)]
         project: Option<String>,
-        /// Filter to one session (exact match).
+        /// Filter to one session (exact match) - semantic search within a
+        /// single, possibly long, session.
         #[serde(default)]
         session_id: Option<String>,
         /// Filter to one source agent, e.g. "claude-code" or
@@ -512,25 +512,16 @@ Examples (4 patterns the agent should recognize):
         /// include subagent sessions (source_agent like "claude-code/<name>").
         #[serde(default)]
         include_subagents: Option<bool>,
-        /// Filter by message role: "user" or "assistant".
-        #[serde(default)]
-        role: Option<String>,
         /// Only messages on or after this date (YYYY-MM-DD).
         #[serde(default)]
         from_date: Option<String>,
         /// Only messages on or before this date (YYYY-MM-DD).
         #[serde(default)]
         to_date: Option<String>,
-        /// "Find similar messages to this one." When set, pond uses the
-        /// stored vector for `similar_to` as the kNN query and ignores the
-        /// `query` text; vector-only, no embedder load. Compose with
-        /// `pond_search` -> read top hit -> `pond_search(similar_to=<that
-        /// message_id>)` to explore neighbors of any returned hit.
+        /// Output shape: "text" (default - a rendered transcript of the ranked
+        /// hits) or "json" (the same hits as structured data).
         #[serde(default)]
-        similar_to: Option<String>,
-        /// Opaque continuation token from a prior response's `next_cursor`.
-        #[serde(default)]
-        cursor: Option<String>,
+        format: Option<String>,
     }
 
     /// `pond_get` MCP tool parameters. Exactly one of `message_id` /
@@ -588,22 +579,20 @@ Examples (4 patterns the agent should recognize):
         /// fields with json_extract(col, '$.a.b') or json_get_string(col,
         /// 'key', ...), never CAST them. Text search: WHERE
         /// contains_tokens(search_text, 'words') to filter, FROM
-        /// fts('messages', '{...}') for BM25-ranked results. See the
-        /// `schema://pond-sql` resource for joins, JSON/FTS functions,
-        /// pagination + drilling patterns, and worked examples.
-        #[serde(alias = "query")]
-        sql: String,
-        /// Output format: "table" (default; rendered ASCII table with metrics
+        /// fts('messages', '{...}') for BM25-ranked results. Control row count
+        /// with SQL `LIMIT`; inline output is capped at 100 rows (use
+        /// format=parquet|ndjson to get every row). See the `schema://pond-sql`
+        /// resource for joins, JSON/FTS functions, pagination + drilling
+        /// patterns, and worked examples.
+        #[serde(alias = "sql")]
+        query: String,
+        /// Output format: "text" (default; rendered ASCII table with metrics
         /// footer), "json" (same row-capped data as a structured JSON object,
         /// delivered via MCP structuredContent), "parquet", or "ndjson". For
         /// parquet/ndjson the full result set is written to a file and a
         /// `pond-sql-export://` resource link is returned (no truncation).
         #[serde(default)]
-        output: Option<String>,
-        /// Inline row cap for "table" / "json" output. Default 100, max 1000.
-        /// Ignored for parquet/ndjson exports (which return every row).
-        #[serde(default)]
-        limit: Option<usize>,
+        format: Option<String>,
     }
 
     fn parse_session_from(value: Option<String>) -> SessionFrom {
@@ -649,10 +638,12 @@ Examples (4 patterns the agent should recognize):
                            ---` delimiter rule followed by the matched text. Pass a returned \
                            `message_id` to `pond_get` for full text. Common args: \
                            query (semantic - concepts, not project names), then project / \
-                           from_date / to_date to scope. Advanced: source_agent (e.g. \
-                           \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
-                           similar_to (vector-only neighbors of a message_id), cursor (paging), \
-                           include_subagents (subagent sessions are excluded by default). \
+                           from_date / to_date to scope, limit to widen (no pagination - raise \
+                           limit for more). Advanced: source_agent (e.g. \"claude-code\", or \
+                           \"claude-code/general-purpose\" for subagents), session_id (search \
+                           within one long session), include_subagents (subagent sessions are \
+                           excluded by default), format (\"text\" default, or \"json\" for \
+                           structured hits). \
                            Scores are relative within one response; there is no min_score. For \
                            exact strings, identifiers, or error messages, pond_sql_query is the \
                            sharper tool - WHERE contains_tokens(search_text, 'words') to \
@@ -664,17 +655,17 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let json = matches!(params.format.as_deref(), Some("json"));
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
-                query: params.query.unwrap_or_default(),
+                query: params.query,
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.session_id,
                     source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
-                    role: params.role,
                     // min_score is intentionally not on the MCP surface; scores
                     // are response-relative, so a server-side threshold is a
                     // footgun for agent callers. CLI / HTTP still exposes it
@@ -683,9 +674,7 @@ Examples (4 patterns the agent should recognize):
                     include_subagents: params.include_subagents.unwrap_or(false),
                 },
                 limit: params.limit.unwrap_or(10),
-                cursor: params.cursor,
                 mode_override: None,
-                similar_to: params.similar_to,
             };
             match run_search(
                 &self.state.store,
@@ -695,6 +684,18 @@ Examples (4 patterns the agent should recognize):
             )
             .await
             {
+                SearchEnvelope::Success(response) if json => {
+                    // `structured()` mirrors the same bytes into the text
+                    // content block, so shadowing clients still get the data.
+                    Ok(CallToolResult::structured(
+                        serde_json::to_value(&response).map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("failed to serialize search response: {error}"),
+                                None,
+                            )
+                        })?,
+                    ))
+                }
                 SearchEnvelope::Success(response) => {
                     Ok(tool_result(render_search_transcript(&response, &request)))
                 }
@@ -762,7 +763,7 @@ Examples (4 patterns the agent should recognize):
                            buckets) - the analytic complement to pond_search's semantic \
                            recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
                            effecting statements are rejected. The exact column lists are in \
-                           the `sql` parameter description - use those names, do not guess \
+                           the `query` parameter description - use those names, do not guess \
                            (column discovery also works: SELECT column_name FROM \
                            information_schema.columns WHERE table_name = 'messages'). \
                            Routing: metadata analytics -> SQL on messages/sessions; tool-call \
@@ -772,11 +773,13 @@ Examples (4 patterns the agent should recognize):
                            fts('messages', '{...json...}') for BM25-ranked results, or \
                            pond_search for semantic recall; reading a transcript -> pond_get, \
                            not SQL. The embedding `vector` column is never returned (explicit \
-                           projection is rejected; filtering in WHERE is fine). Output \
-                           defaults to a row-capped rendered table; set output=json for a \
-                           structured JSON payload (delivered via MCP structuredContent), or \
-                           output=parquet|ndjson to write the full result to a file returned \
-                           as a pond-sql-export:// resource. Read resource schema://pond-sql \
+                           projection is rejected; filtering in WHERE is fine). Control row \
+                           count with SQL `LIMIT`; inline output (format text|json) is capped \
+                           at 100 rows. format defaults to text (a row-capped rendered table); \
+                           set format=json for a structured JSON payload (delivered via MCP \
+                           structuredContent), or format=parquet|ndjson to write the full \
+                           result to a file returned as a pond-sql-export:// resource. Read \
+                           resource schema://pond-sql \
                            for joins, indexed columns, JSON access rules, the function \
                            quick-reference, pagination + drilling patterns, and worked \
                            examples.",
@@ -786,22 +789,19 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSqlParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let mode = match params.output.as_deref() {
-                None | Some("table") => sql::Mode::Inline,
+            let mode = match params.format.as_deref() {
+                None | Some("text") => sql::Mode::Inline,
                 Some("json") => sql::Mode::InlineJson,
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
                 Some("ndjson") => sql::Mode::Export(sql::Format::Ndjson),
                 Some(other) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "unknown output {other:?}; use \"table\", \"json\", \"parquet\", \
+                        "unknown format {other:?}; use \"text\", \"json\", \"parquet\", \
                          or \"ndjson\""
                     ))]));
                 }
             };
-            let inline_rows = params
-                .limit
-                .unwrap_or(sql::DEFAULT_INLINE_ROWS)
-                .min(sql::MAX_INLINE_ROWS);
+            let inline_rows = sql::DEFAULT_INLINE_ROWS;
 
             // The three tables are independent (per-table caches/mutexes), so
             // overlap their freshness/manifest fetches rather than serialize.
@@ -824,7 +824,7 @@ Examples (4 patterns the agent should recognize):
                 }
             };
 
-            match sql::run(&tables, &params.sql, mode, inline_rows).await {
+            match sql::run(&tables, &params.query, mode, inline_rows).await {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::InlineJson(value)) => Ok(CallToolResult::structured(value)),
                 Ok(sql::Outcome::Export {
@@ -878,7 +878,7 @@ Examples (4 patterns the agent should recognize):
                  Workflow: pond_search to find relevant messages, then pond_get to read \
                  full text by message_id or a whole session by session_id; both return \
                  readable transcripts, not JSON. Scope with filters, not the query: project \
-                 (path substring), session_id, source_agent, role, from_date / to_date - \
+                 (path substring), session_id, source_agent, from_date / to_date - \
                  keep query semantic (concepts, not project names). Scores are relative \
                  within one response; there is no min_score. Subagents are stored as their \
                  own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
@@ -1181,49 +1181,34 @@ Examples (4 patterns the agent should recognize):
             if response.searchable_in_scope == 0 {
                 return format!(
                     "pond_search: 0 searchable messages in scope - the filters exclude \
-                     everything before retrieval. Widen or drop project/date/role filters.\
+                     everything before retrieval. Widen or drop project/date filters.\
                      {subagent_note}\n"
                 );
             }
             let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT \
                             message_id, session_id, search_text FROM messages WHERE \
                             contains_tokens(search_text, '...').";
-            return match request.similar_to.as_deref() {
-                Some(id) => format!(
-                    "pond_search: no matches similar to {id} across {} searchable messages in \
-                     scope.{subagent_note}\n",
-                    response.searchable_in_scope
-                ),
-                None => {
-                    format!(
-                        "pond_search: no matches for {:?} across {} searchable messages in \
-                         scope.{subagent_note}{fts_hint}\n",
-                        request.query, response.searchable_in_scope
-                    )
-                }
-            };
+            return format!(
+                "pond_search: no matches for {:?} across {} searchable messages in \
+                 scope.{subagent_note}{fts_hint}\n",
+                request.query, response.searchable_in_scope
+            );
         }
         let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
-        let sim = request
-            .similar_to
-            .as_deref()
-            .map(|id| format!(" similar to {id}"))
-            .unwrap_or_default();
         let mut out = String::new();
         let _ = writeln!(
             out,
             "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
-             sessions{}.{}",
+             sessions.{}",
             response.matched_total,
             response.searchable_in_scope,
             shown,
             response.sessions.len(),
-            sim,
             subagent_note,
         );
         let _ = writeln!(
             out,
-            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; pass cursor to page."
+            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; raise limit for more (no pagination)."
         );
         let mut index = 0;
         for (session_index, session) in response.sessions.iter().enumerate() {
@@ -1266,10 +1251,6 @@ Examples (4 patterns the agent should recognize):
                 );
                 push_lines(&mut out, &hit.text, "");
             }
-        }
-        if let Some(cursor) = &response.next_cursor {
-            let _ = writeln!(out);
-            let _ = writeln!(out, "cursor: {cursor} (pass as `cursor` to page)");
         }
         out
     }
@@ -1769,17 +1750,14 @@ Examples (4 patterns the agent should recognize):
                 matched_total: 1,
                 searchable_in_scope: 2,
                 has_more: false,
-                next_cursor: None,
             };
             let request = SearchRequest {
                 protocol_version: crate::PROTOCOL_VERSION,
                 namespace: None,
                 query: "hi".to_owned(),
                 mode_override: None,
-                similar_to: None,
                 filters: SearchFilters::default(),
                 limit: 10,
-                cursor: None,
             };
 
             let transcript = render_search_transcript(&response, &request);

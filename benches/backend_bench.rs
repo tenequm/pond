@@ -163,10 +163,8 @@ fn search_request(query: &str, mode: Option<SearchModeWire>) -> SearchRequest {
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
         mode_override: mode,
-        similar_to: None,
         filters: SearchFilters::default(),
         limit: 10,
-        cursor: None,
     }
 }
 

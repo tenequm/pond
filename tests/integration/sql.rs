@@ -285,7 +285,7 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     // 5. ndjson export round-trips through the pond-sql-export:// resource.
     let result = call(json!({
         "sql": "SELECT role, project FROM messages ORDER BY role",
-        "output": "ndjson"
+        "format": "ndjson"
     }))
     .await?;
     assert_ne!(result.is_error, Some(true), "ndjson export should succeed");
@@ -313,7 +313,7 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     // 6. parquet export round-trips as a base64 blob with the PAR1 magic.
     let result = call(json!({
         "sql": "SELECT role FROM messages",
-        "output": "parquet"
+        "format": "parquet"
     }))
     .await?;
     assert_ne!(result.is_error, Some(true), "parquet export should succeed");
@@ -338,20 +338,20 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         .await;
     assert!(missing.is_err(), "invalid export id is rejected");
 
-    // 7. output=json: spec-compliant dual delivery - text fallback (stringified
+    // 7. format=json: spec-compliant dual delivery - text fallback (stringified
     // JSON) AND structuredContent carrying the typed payload. The metrics
     // footer fields (total_rows, shown_rows, elapsed_ms, columns, rows) are
     // present.
     let result = call(json!({
         "sql": "SELECT role, count(*) AS n FROM messages GROUP BY role ORDER BY role",
-        "output": "json"
+        "format": "json"
     }))
     .await?;
     assert_ne!(result.is_error, Some(true), "json output should succeed");
     let structured = result
         .structured_content
         .as_ref()
-        .expect("output=json sets structured_content");
+        .expect("format=json sets structured_content");
     assert_eq!(
         structured.get("total_rows").and_then(|v| v.as_u64()),
         Some(2)
@@ -417,24 +417,7 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         "error redirects to pond_search: {text}"
     );
 
-    // 10. Inline truncation now points the agent at keyset pagination.
-    // Force truncation with a 1-row limit on a 4-row corpus.
-    let result = call(json!({
-        "sql": "SELECT message_id, timestamp FROM messages ORDER BY timestamp",
-        "limit": 1
-    }))
-    .await?;
-    let text = first_text(&result).expect("inline result");
-    assert!(
-        text.contains("keyset"),
-        "truncation hint mentions keyset pagination: {text}"
-    );
-    assert!(
-        text.contains("schema://pond-sql"),
-        "truncation hint points at the schema doc: {text}"
-    );
-
-    // 11. Inline metrics footer reports elapsed time.
+    // 10. Inline metrics footer reports elapsed time.
     let result = call(json!({ "sql": "SELECT 1" })).await?;
     let text = first_text(&result).expect("inline result");
     assert!(

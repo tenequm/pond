@@ -151,7 +151,7 @@ pub async fn run(
     let parsed = parse_and_gate(sql)?;
     if matches!(parsed.kind, StatementKind::Explain) && matches!(mode, Mode::Export(_)) {
         return Err(SqlError::Query(
-            "EXPLAIN returns a plan, not a result set; use output=table (or json) to read it"
+            "EXPLAIN returns a plan, not a result set; use format=text (or json) to read it"
                 .to_owned(),
         ));
     }
@@ -1034,7 +1034,7 @@ fn enrich(message: &str) -> String {
             "the query ran out of memory - usually from carrying whole JSON columns \
              (variant_data, options) through a join or sort. Project narrow fields with \
              json_extract(col, '$.field') instead of whole columns, filter before joining, \
-             or export the full set with output=parquet.",
+             or export the full set with format=parquet.",
         ),
         (
             "LIKE prefix queries are not supported for bitmap indexes",
@@ -1191,7 +1191,7 @@ fn render_inline(
             "\n... {} row(s) omitted. To page: ORDER BY <indexed col> (e.g. timestamp, \
              message_id), then in the next call add `WHERE (col, message_id) < \
              (<last_col>, <last_message_id>)` - keyset pagination, see schema://pond-sql. \
-             For the full set: output=parquet or output=ndjson.",
+             For the full set: format=parquet or format=ndjson.",
             total - shown
         ));
     }
@@ -1255,7 +1255,7 @@ fn render_inline_json(
             "next_steps".to_owned(),
             json!(format!(
                 "{} row(s) omitted; ORDER BY + keyset (`WHERE (col, message_id) < \
-                 (<last_col>, <last_message_id>)`) to page, or output=parquet|ndjson for \
+                 (<last_col>, <last_message_id>)`) to page, or format=parquet|ndjson for \
                  the full set. See schema://pond-sql.",
                 total - shown
             )),

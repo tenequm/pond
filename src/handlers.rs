@@ -917,17 +917,14 @@ mod search_handler {
     //! granularity, with filter pushdown and session-grouped responses
     //! (spec.md#search).
 
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-
     use crate::{
         Clock, SystemClock,
         embed::{Embedder, LazyEmbedder, format_query},
         sessions::{MessageKey, MessageMeta, Store},
         substrate::{Predicate, ScalarValue},
         wire::{
-            ErrorEnvelope, PartSummary, ProjectFilter, Role, SearchCursor, SearchEnvelope,
-            SearchFilters, SearchRequest, SearchResponse, SearchResult, SearchSession,
-            validate_protocol,
+            ErrorEnvelope, PartSummary, ProjectFilter, Role, SearchEnvelope, SearchFilters,
+            SearchRequest, SearchResponse, SearchResult, SearchSession, validate_protocol,
         },
     };
     use chrono::NaiveDate;
@@ -950,16 +947,11 @@ mod search_handler {
     pub struct SearchPlan {
         pub mode: SearchMode,
         pub query: String,
-        /// When set, vector-only "find similar messages to this stored
-        /// message" mode: the stored vector for `similar_to` is the query;
-        /// `query` and FTS arm are ignored.
-        pub similar_to: Option<String>,
         pub filter: Predicate,
         pub filters: SearchFilters,
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
-        pub offset: usize,
         pub min_score: f64,
     }
 
@@ -985,31 +977,6 @@ mod search_handler {
     // concern (see the `pond_search` MCP description).
     const FTS_FUSION_WEIGHT: f64 = 0.3;
     const VECTOR_FUSION_WEIGHT: f64 = 1.0;
-
-    fn encode_search_cursor(cursor: &SearchCursor) -> String {
-        #[allow(clippy::expect_used)]
-        let bytes = serde_json::to_vec(cursor).expect("search cursor encodes as JSON");
-        URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    fn decode_search_cursor(raw: &str) -> Result<SearchCursor, ErrorEnvelope> {
-        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| {
-            map_error(crate::Error::validation_field(
-                "cursor is malformed (expected opaque value from a prior response)",
-                "cursor",
-                Some(serde_json::json!(raw)),
-                Some("opaque base64url".to_owned()),
-            ))
-        })?;
-        serde_json::from_slice(&bytes).map_err(|_| {
-            map_error(crate::Error::validation_field(
-                "cursor is malformed (decode failed)",
-                "cursor",
-                Some(serde_json::json!(raw)),
-                Some("opaque cursor from a prior response".to_owned()),
-            ))
-        })
-    }
 
     /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid
     /// when the store has any vectors, FTS-only otherwise. The embedder is
@@ -1074,17 +1041,10 @@ mod search_handler {
         let override_mode = request.mode_override.map(wire_mode_to_internal);
         let mut plan = plan_search(request, SearchMode::Fts)?;
 
-        // `similar_to` pins mode to Vector regardless of override or store
-        // state: we are running kNN over a stored vector, not embedding a
-        // query, so there is no FTS arm and no query-side embedder load.
-        if plan.similar_to.is_some() {
-            plan.mode = SearchMode::Vector;
-        } else {
-            // Mode is server-determined unless the caller passed an explicit
-            // override (operator tooling). `has_embeddings()` is the only
-            // gate: hybrid when the store has any vectors, FTS-only when empty.
-            plan.mode = resolve_effective_mode(store, override_mode).await?;
-        }
+        // Mode is server-determined unless the caller passed an explicit
+        // override (operator tooling). `has_embeddings()` is the only
+        // gate: hybrid when the store has any vectors, FTS-only when empty.
+        plan.mode = resolve_effective_mode(store, override_mode).await?;
 
         // A session_id filter pins one conversation, so root-keyed fusion
         // would collapse the whole response to a single hit. Key fusion by
@@ -1166,33 +1126,12 @@ mod search_handler {
                         })
                         .collect())
                 }
-                // Vector-only branch. Reached two ways:
-                //   - caller pinned `similar_to`: pond fetches the stored vector
-                //     for that message_id and uses it directly as the query (no
-                //     embedder load, no query-side text formatting).
-                //   - caller set `mode_override = Vector` (operator tooling /
-                //     benchmark harness): embed `plan.query` and run kNN.
+                // Vector-only branch. Reached when the caller set
+                // `mode_override = Vector` (operator tooling / benchmark
+                // harness): embed `plan.query` and run kNN.
                 SearchMode::Vector => {
-                    let vector = if let Some(similar_id) = &plan.similar_to {
-                        let stored = store
-                            .message_vector_by_id(similar_id)
-                            .await
-                            .map_err(map_storage)?;
-                        let Some(vector) = stored else {
-                            return Err(map_error(crate::Error::not_found(
-                                "message",
-                                serde_json::json!(similar_id),
-                                format!(
-                                    "no embedded message with id {similar_id} (the message may not \
-                                 exist, or it exists but is not yet embedded - run `pond embed`)"
-                                ),
-                            )));
-                        };
-                        vector
-                    } else {
-                        let backend = load_embedder(embedder).await?;
-                        embed_query(backend.as_ref(), &plan.query)?
-                    };
+                    let backend = load_embedder(embedder).await?;
+                    let vector = embed_query(backend.as_ref(), &plan.query)?;
                     let vector_raw = store
                         .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                         .await
@@ -1309,30 +1248,14 @@ mod search_handler {
 
         let _ns = super::resolve_namespace(request.namespace.as_deref())?;
 
-        let cursor = match request.cursor.as_deref() {
-            Some(raw) => Some(decode_search_cursor(raw)?),
-            None => None,
-        };
-        let (query_raw, similar_raw, filters, offset) = match cursor {
-            Some(cursor) => (
-                cursor.query,
-                cursor.similar_to,
-                cursor.filters,
-                cursor.offset,
-            ),
-            None => (request.query, request.similar_to, request.filters, 0),
-        };
-        let query = query_raw.trim().to_owned();
-        let similar_to = similar_raw
-            .as_ref()
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty());
-        if similar_to.is_none() && query.is_empty() {
+        let filters = request.filters;
+        let query = request.query.trim().to_owned();
+        if query.is_empty() {
             return Err(map_error(crate::Error::validation_field(
                 "query must be non-empty after trim",
                 "query",
-                Some(serde_json::json!(query_raw)),
-                Some("non-empty string after trim, or pass `similar_to`".to_owned()),
+                Some(serde_json::json!(request.query)),
+                Some("non-empty string after trim".to_owned()),
             )));
         }
         if request.limit == 0 {
@@ -1352,13 +1275,11 @@ mod search_handler {
         Ok(SearchPlan {
             mode,
             query,
-            similar_to,
             filter,
             filters,
             pool,
             vector_pool: pool.saturating_mul(2),
             limit,
-            offset,
             min_score,
         })
     }
@@ -1560,11 +1481,11 @@ mod search_handler {
     /// anchor degraded by short stop-word-like terms like "how", "the", "my").
     /// If every term is short, the filter is bypassed.
     ///
-    /// TODO(snippet-anchor): reassess for vector-only hits (e.g. similar_to,
-    /// paraphrase queries where no literal term matches): the fallback to
-    /// offset-0 is OK but not great. Possible upgrades: ngram match overlap,
-    /// or skip-window-around-most-distinctive-substring. See snippet audit
-    /// in tier-0 findings.
+    /// TODO(snippet-anchor): reassess for vector-only hits (paraphrase queries
+    /// where no literal term matches): the fallback to offset-0 is OK but not
+    /// great. Possible upgrades: ngram match overlap, or
+    /// skip-window-around-most-distinctive-substring. See snippet audit in
+    /// tier-0 findings.
     fn query_snippet(text: &str, query: &str) -> String {
         let lower_text = text.to_lowercase();
         let terms: Vec<String> = query
@@ -1816,19 +1737,9 @@ mod search_handler {
         searchable_in_scope: usize,
         plan: &SearchPlan,
     ) -> Result<SearchResponse, ErrorEnvelope> {
-        if plan.offset >= sessions.len() {
-            return Ok(SearchResponse {
-                sessions: Vec::new(),
-                matched_total,
-                searchable_in_scope,
-                has_more: false,
-                next_cursor: None,
-            });
-        }
-
         let mut emitted = Vec::new();
         let mut used_bytes = 0usize;
-        for session in sessions.iter().skip(plan.offset) {
+        for session in sessions.iter() {
             if emitted.len() >= plan.limit {
                 break;
             }
@@ -1846,23 +1757,17 @@ mod search_handler {
             emitted.push(session.clone());
         }
 
-        let next_offset = plan.offset + emitted.len();
-        let has_more = next_offset < sessions.len();
-        let next_cursor = has_more.then(|| {
-            encode_search_cursor(&SearchCursor {
-                query: plan.query.clone(),
-                similar_to: plan.similar_to.clone(),
-                filters: plan.filters.clone(),
-                offset: next_offset,
-            })
-        });
+        // `has_more` warns the caller that `limit` or the byte budget cut the
+        // ranked set short - raise `limit` (up to the cap) to see the rest.
+        // There is no pagination cursor: the result set is relevance-ranked and
+        // capped, so a wider `limit` dominates page-walking (spec.md#search).
+        let has_more = emitted.len() < sessions.len();
 
         Ok(SearchResponse {
             sessions: emitted,
             matched_total,
             searchable_in_scope,
             has_more,
-            next_cursor,
         })
     }
 
@@ -1887,19 +1792,6 @@ mod search_handler {
         }
         if let Some(source_agent) = &filters.source_agent {
             clauses.push(Predicate::Eq("source_agent", source_agent.clone().into()));
-        }
-        if let Some(role) = &filters.role {
-            if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool") {
-                return Err(map_error(crate::Error::validation_field(
-                    format!(
-                        "filters.role must be one of: user, assistant, system, tool; got {role}"
-                    ),
-                    "filters.role",
-                    Some(serde_json::json!(role)),
-                    Some("one of: user, assistant, system, tool".to_owned()),
-                )));
-            }
-            clauses.push(Predicate::Eq("role", role.clone().into()));
         }
         if let Some(from_date) = &filters.from_date {
             clauses.push(Predicate::Gte(
@@ -1951,7 +1843,6 @@ mod search_handler {
             matched_total: 0,
             searchable_in_scope,
             has_more: false,
-            next_cursor: None,
         }
     }
 
@@ -2109,10 +2000,8 @@ mod tests {
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
             mode_override: None,
-            similar_to: None,
             filters: SearchFilters::default(),
             limit: 20,
-            cursor: None,
         }
     }
 
@@ -2260,7 +2149,6 @@ mod tests {
             project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
             session_id: Some("01HXY".to_owned()),
             source_agent: Some("claude-code".to_owned()),
-            role: Some("assistant".to_owned()),
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
             min_score: 0.0,
@@ -2270,7 +2158,6 @@ mod tests {
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
         assert!(sql.contains("session_id = '01HXY'"));
         assert!(sql.contains("source_agent = 'claude-code'"));
-        assert!(sql.contains("role = 'assistant'"));
         assert!(sql.contains("timestamp >="));
         assert!(sql.contains("timestamp <="));
         // session_id/source_agent set => default subagent exclusion is skipped.
@@ -2292,13 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_rejects_bad_role_and_date() {
-        let bad_role = SearchFilters {
-            role: Some("wizard".to_owned()),
-            ..SearchFilters::default()
-        };
-        assert!(build_filter(&bad_role).is_err());
-
+    fn build_filter_rejects_bad_date() {
         let bad_date = SearchFilters {
             from_date: Some("01-01-2026".to_owned()),
             ..SearchFilters::default()
@@ -2350,11 +2231,11 @@ mod tests {
         // Case 3: filters get plumbed into the shared filter predicate.
         let mut request = search_request("filtered");
         request.filters.project = Some(ProjectFilter::Contains("/Users/me/pond".to_owned()));
-        request.filters.role = Some("assistant".to_owned());
+        request.filters.source_agent = Some("claude-code".to_owned());
         let plan = plan_search(request, SearchMode::Fts).unwrap();
         let sql = plan.filter.to_lance();
         assert!(sql.contains("project LIKE"));
-        assert!(sql.contains("role = 'assistant'"));
+        assert!(sql.contains("source_agent = 'claude-code'"));
     }
 
     #[test]

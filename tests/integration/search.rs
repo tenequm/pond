@@ -17,7 +17,7 @@ use pond::{
     substrate::MaintenancePolicy,
     wire::PartKind,
     wire::{
-        GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, Role, SearchEnvelope,
+        GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, SearchEnvelope,
         SearchFilters, SearchRequest,
     },
 };
@@ -86,10 +86,8 @@ fn search_request(query: &str) -> SearchRequest {
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
         mode_override: None,
-        similar_to: None,
         filters: SearchFilters::default(),
         limit: 20,
-        cursor: None,
     }
 }
 
@@ -110,7 +108,6 @@ fn get_request(session_id: &str) -> GetRequest {
 struct HitView {
     session_id: String,
     message_id: String,
-    role: Role,
     project: String,
     score: f64,
 }
@@ -127,7 +124,6 @@ fn hits_of(envelope: SearchEnvelope) -> Vec<HitView> {
                 session.matches.into_iter().map(move |hit| HitView {
                     session_id: session_id.clone(),
                     message_id: hit.message_id,
-                    role: hit.role,
                     project: project.clone(),
                     score: hit.score,
                 })
@@ -229,13 +225,6 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     let temp = TempDir::new()?;
     let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
-
-    // role: every hit carries the requested role.
-    let mut request = search_request(&phrase);
-    request.filters.role = Some("assistant".to_owned());
-    let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
-    assert!(!hits.is_empty(), "the corpus has assistant messages");
-    assert!(hits.iter().all(|hit| hit.role == Role::Assistant));
 
     // session_id: every hit belongs to the one requested session.
     let session_id = store
@@ -414,10 +403,8 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         namespace: Some("local".to_owned()),
         query: marker.to_owned(),
         mode_override: None,
-        similar_to: None,
         filters: SearchFilters::default(),
         limit: 50,
-        cursor: None,
     };
     let embedder = LazyEmbedder::candle();
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
