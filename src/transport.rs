@@ -211,19 +211,20 @@ pub mod mcp {
     /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
 pond_search filters: query (semantic - concepts, not project names), limit \
-(returned sessions; default 10, max 200), project (path substring), session_id \
-(exact session match), source_agent, role (user|assistant|system|tool), \
-from_date / to_date (YYYY-MM-DD), cursor (opaque continuation token).
+(returned sessions; default 10, max 200 - also the want-more knob, there is \
+no pagination), project (path substring), session_id (exact session match - \
+semantic search within one session), source_agent, from_date / to_date \
+(YYYY-MM-DD), format (text|json).
 
-pond_search response: a transcript. The first line states totals \
-(`matched_total` is the message count before `limit` and byte-budget \
-truncation), then results are grouped by session, ordered by each session's \
-best hit. Each session lists up to 3 top-scoring hits, score-desc; each hit is \
-a `--- [n] score | role | time | message_id | project | agent | session ---` \
-rule followed by its matched text (a ~600-char indexed window). `score` is \
-normalized to [0.0, 1.0] within one response. When more remain, a `cursor:` \
-footer carries the token to pass back as `cursor`; rank may shift between \
-pages if the corpus changes.
+pond_search response: a transcript (or structured JSON when format=json). The \
+first line states totals (`matched_total` is the message count before `limit` \
+and byte-budget truncation), then results are grouped by session, ordered by \
+each session's best hit. Each session lists up to 3 top-scoring hits, \
+score-desc; each hit is a `--- [n] score | role | time | message_id | project \
+| agent | session ---` rule followed by its matched text (a ~600-char indexed \
+window). `score` is normalized to [0.0, 1.0] within one response. `has_more` \
+warns the ranked set was cut by `limit` or the byte budget - raise `limit` to \
+see the rest.
 
 pond_search multilingual: pond's embedder (multilingual-e5-small) is trained \
 for cross-lingual retrieval, so a query in language A can match indexed text \
@@ -248,6 +249,12 @@ open it. Not for bulk export - use `pond export`.";
     /// table/column schema, dialect, function set, output modes, pagination
     /// pattern, drilling pattern, and worked examples for `pond_sql_query`.
     /// Loaded on demand so the tool description stays tight.
+    ///
+    /// TODO(#47): when the lance v8 FM-Index on parts.variant_data lands,
+    /// tool-body substring search becomes `contains(variant_data, 'needle')`;
+    /// update the routing guidance below (drop the "Never LIKE over parts ...
+    /// no substring index (yet)" framing) and the timeout message in
+    /// src/sql.rs.
     const SQL_SCHEMA_DOC: &str = "\
 pond_sql_query runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
 over three registered tables. Read-only is hard-enforced: anything other than a \
@@ -259,21 +266,22 @@ Routing - pick the right surface before writing SQL:
 messages/sessions.
 - which tools ran / failed, tool params -> this tool, on parts (type = \
 'tool_call' / 'tool_result'); worked example below.
-- find text in conversations -> fts('messages', ...) below, or pond_search for \
-meaning-based recall. Never LIKE over parts - tool bodies are JSON, and the \
-conversational text is messages.search_text.
+- find text in conversations -> WHERE contains_tokens(search_text, '...') to \
+filter, FROM fts('messages', ...) to rank (both below), or pond_search for \
+meaning-based recall. Never LIKE over parts - tool bodies are JSON with no \
+substring index (yet), and the conversational text is messages.search_text.
 - read a transcript (a session, a message with context) -> pond_get, not SQL.
 
 Tables and columns:
-- messages(session_id text, id text, timestamp timestamp(us, UTC), role text \
-{user|assistant|system|tool}, source_agent text, project text, content text NULL \
-[system-role messages only], search_text text NULL [the conversational text - \
+- messages(session_id text, message_id text, timestamp timestamp(us, UTC), role \
+text {user|assistant|system|tool}, source_agent text, project text, content text \
+NULL [system-role messages only], search_text text NULL [the conversational text - \
 null for system/tool messages], embedding_model text NULL, options json). The \
 embedding `vector` column exists but is never returned (omitted from results) and \
 explicit projection of it is rejected; you may still filter on it in WHERE, e.g. \
 `vector IS NOT NULL`. For semantic search, use pond_search.
-- sessions(id text, parent_session_id text NULL, parent_message_id text NULL, \
-source_agent text, created_at timestamp(us, UTC), project text, options json).
+- sessions(session_id text, parent_session_id text NULL, parent_message_id text \
+NULL, source_agent text, created_at timestamp(us, UTC), project text, options json).
 - parts(session_id text, message_id text, id text, ordinal int, type text \
 {text|reasoning|file|tool_call|tool_result|tool_approval_request|\
 tool_approval_response - exact strings, underscores not hyphens}, provenance \
@@ -286,27 +294,35 @@ Enum literals matter: a wrong value (e.g. 'tool-call') is valid SQL and silently
 returns zero rows. Discovery from SQL works too: SELECT table_name, column_name, \
 data_type FROM information_schema.columns.
 
-Join keys: messages.session_id = sessions.id; parts.session_id = messages.session_id \
-AND parts.message_id = messages.id. Subagents are sessions whose source_agent \
-matches '%/%' (e.g. 'claude-code/general-purpose').
+Join keys: messages.session_id = sessions.session_id; parts.session_id = \
+messages.session_id AND parts.message_id = messages.message_id. Subagents are \
+sessions whose source_agent matches '%/%' (e.g. 'claude-code/general-purpose').
 
 Indexed (fast) filter columns: messages.project / session_id / timestamp / role / \
-source_agent; parts.session_id / message_id; sessions.id. Prefer equality/range \
-predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
+source_agent / message_id; parts.session_id / message_id; sessions.session_id. \
+Prefer equality/range predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
 on bitmap-indexed columns (messages.source_agent, messages.role) with \"LIKE \
 prefix queries are not supported for bitmap indexes\". Workarounds: equality, \
 split_part(source_agent, '/', 1) = 'claude-code', or an infix pattern \
 (LIKE '%/%' is fine - leading-wildcard patterns are not pushed to the index).
 
 JSON columns (options, variant_data) are binary JSONB. Rules:
-- NEVER CAST a JSON column (`variant_data::text` fails on the binary encoding). \
-Stringify with json_extract(col, '$').
+- NEVER CAST a JSON column (`variant_data::text` is rejected at plan time - the \
+binary encoding can otherwise silently render as garbage). Stringify with \
+json_extract(col, '$').
+- A leading-wildcard LIKE over the whole document \
+(`json_extract(variant_data, '$') LIKE '%...%'`) is rejected at plan time: it \
+stringifies and scans every row and never finishes over parts. Match a single \
+field (`json_extract(variant_data, '$.field') LIKE '...'`), scope to one session, \
+or use contains_tokens for conversational text. (Substring search over tool \
+bodies arrives with the FM-Index, #47.)
 - json_extract(col, '$.a.b') takes a full JSONPath and returns JSON text of ANY \
-value (objects/arrays serialize) - the right call for nested or mixed-type \
+value (objects/arrays serialize) - the right call for deeply nested or mixed-type \
 fields, e.g. json_extract(variant_data, '$.params.command').
-- json_get_string|json_get_int|json_get_float|json_get_bool(col, 'key') take ONE \
-key (not a path). json_get_string serializes non-string values; the typed \
-getters return NULL on a non-coercible value.
+- json_get_string|json_get_int|json_get_float|json_get_bool(col, 'key', ...) walk \
+a key path - json_get_string(options, 'anthropic', 'model') - array steps by \
+numeric index. json_get_string serializes non-string values; the typed getters \
+return NULL on a non-coercible value.
 - json_get(col, 'key') returns JSONB for chaining: \
 json_get_string(json_get(variant_data, 'params'), 'command').
 - Also: json_array_contains(col, 'key', value), json_array_length(col, 'key').
@@ -318,7 +334,7 @@ Worked example - tool usage and failure rates over the last week:
          SUM(CASE WHEN json_get_bool(r.variant_data, 'is_failure') THEN 1 \
 ELSE 0 END) AS failures
   FROM parts c
-  JOIN messages m ON m.session_id = c.session_id AND m.id = c.message_id
+  JOIN messages m ON m.session_id = c.session_id AND m.message_id = c.message_id
   LEFT JOIN parts r ON r.session_id = c.session_id
    AND r.type = 'tool_result'
    AND json_get_string(r.variant_data, 'call_id') = \
@@ -326,23 +342,30 @@ json_get_string(c.variant_data, 'call_id')
   WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
   GROUP BY tool ORDER BY calls DESC;
 
-Full-text (BM25) search in SQL via the fts() table function: SELECT id, _score, \
-search_text FROM fts('messages', \
-'{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') ORDER BY _score DESC - \
-compose with WHERE/JOIN/GROUP BY around it; `_score` is the BM25 relevance and is a \
-regular projectable column. The right tool for exact strings, identifiers, and error \
-messages; unlike pond_search it covers subagent sessions (filter them out with WHERE \
-NOT (source_agent LIKE '%/%') if unwanted). AND semantics: \
-'{\"match\":{\"column\":\"search_text\",\"terms\":\"a b\",\"operator\":\"And\"}}'; \
-\"boolean\" queries (must/should/must_not over match clauses) also work. \"phrase\" \
-queries are unavailable (index built without positions) - use match + operator And, \
-optionally with LIKE post-filters, for exact substrings. \
-Vector/semantic search is NOT available in SQL; use pond_search for that.
+Full-text search in SQL is a pair - filter form and ranked form:
+- Filtering (WHERE): contains_tokens(search_text, 'word1 word2') - true when the \
+text contains ALL the words (split on punctuation/whitespace, case-sensitive \
+tokens); accelerated by the FTS index. The right tool for exact strings, \
+identifiers, and error messages - compose freely with other predicates: \
+SELECT message_id FROM messages WHERE contains_tokens(search_text, 'OCC retry') \
+AND project LIKE '%pond%'.
+- Ranking (FROM): the fts() table function returns matches plus `_score` (BM25 \
+relevance, a regular projectable column): SELECT message_id, _score, search_text \
+FROM fts('messages', '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') \
+ORDER BY _score DESC - compose with WHERE/JOIN/GROUP BY around it. AND semantics: \
+add \"operator\":\"And\" to the match; \"boolean\" queries (must/should/must_not \
+over match clauses) also work. \"phrase\" queries are unavailable (index built \
+without positions) - use contains_tokens or match + operator And, optionally with \
+LIKE post-filters, for exact substrings.
+fts() in WHERE is a plan-time error that points back here. Unlike pond_search, \
+both forms cover subagent sessions (filter them out with WHERE NOT (source_agent \
+LIKE '%/%') if unwanted). Vector/semantic search is NOT available in SQL; use \
+pond_search for that.
 
 Function quick-reference (exact DataFusion names so the model doesn't have to \
 guess):
-- aggregates: count, count(distinct ...), sum, avg, min, max, stddev, median, \
-approx_distinct, approx_percentile_cont, array_agg, string_agg
+- aggregates: count, count(distinct ...), sum, avg, min, max, any_value, stddev, \
+median, approx_distinct, approx_percentile_cont, array_agg, string_agg
 - date/time: now(), date_trunc('day'|'hour'|'minute'|..., ts), date_part('year'|..., \
 ts), date_bin(interval, ts, origin), to_char(ts, fmt), to_timestamp(text), \
 extract(field FROM ts), age(t1, t2)
@@ -350,6 +373,8 @@ extract(field FROM ts), age(t1, t2)
 - string: length, lower, upper, substr, position, split_part, regexp_like, \
 regexp_match, regexp_replace, like, ilike, starts_with, ends_with, concat, \
 concat_ws
+- text search: contains_tokens(col, 'words') in WHERE; fts(table, query_json) in \
+FROM (see above)
 - numeric: round, floor, ceil, abs, sign, log, exp, power, sqrt
 - conditional: CASE WHEN ... THEN ... ELSE ..., coalesce, nullif, greatest, least
 - cast: CAST(x AS TYPE) or x::TYPE - but never on JSON columns (see the JSON \
@@ -361,11 +386,11 @@ EXPLAIN is allowed: `EXPLAIN <query>` or `EXPLAIN ANALYZE <query>` returns the \
 DataFusion plan (and per-operator timings for ANALYZE) so you can self-diagnose \
 slow queries without leaving SQL.
 
-Output modes (the `output` arg):
-- table (default): a row-capped rendered ASCII table with a header showing \
+Output modes (the `format` arg):
+- text (default): a row-capped rendered ASCII table with a header showing \
 `{total_rows} in {elapsed_ms} ms; showing {shown}` and, on truncation, a \
 keyset-pagination hint.
-- json: same row-capped payload as `table` but delivered as a JSON object \
+- json: same row-capped payload as `text` but delivered as a JSON object \
 {total_rows, shown_rows, truncated, elapsed_ms, columns, rows: [{col: val, ...}]}. \
 Spec-compliant dual delivery: the structured JSON rides MCP's `structuredContent` \
 field; clients that don't surface that channel get the same JSON as a text block. \
@@ -380,23 +405,23 @@ Use ORDER BY on indexed columns plus a composite seek key for stable tie-breakin
 The agent owns the cursor (the last sort value it saw); no server-side state.
 
   -- page 1: most recent 100 messages in pond
-  SELECT id, timestamp, role, project
+  SELECT message_id, timestamp, role, project
   FROM messages
   WHERE project LIKE '%pond%'
-  ORDER BY timestamp DESC, id DESC
+  ORDER BY timestamp DESC, message_id DESC
   LIMIT 100;
 
-  -- page 2: pass back the last (timestamp, id) the agent saw
-  SELECT id, timestamp, role, project
+  -- page 2: pass back the last (timestamp, message_id) the agent saw
+  SELECT message_id, timestamp, role, project
   FROM messages
   WHERE project LIKE '%pond%'
-    AND (timestamp, id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
-  ORDER BY timestamp DESC, id DESC
+    AND (timestamp, message_id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
+  ORDER BY timestamp DESC, message_id DESC
   LIMIT 100;
 
 Keyset stays stable across concurrent ingest (older rows don't shift) and uses \
-the btree on `timestamp`/`id` directly. For known-bounded full results, skip \
-pagination entirely: output=parquet writes everything in one call. OFFSET works \
+the btree on `timestamp`/`message_id` directly. For known-bounded full results, skip \
+pagination entirely: format=parquet writes everything in one call. OFFSET works \
 but scans-and-discards prior rows and shifts pages under writes - prefer keyset.
 
 Drilling from aggregates to content (instead of N round-trips of pond_get):
@@ -413,7 +438,7 @@ user message:
   SELECT ts.session_id, ts.msgs, s.project, s.source_agent,
          m.search_text AS first_user_msg
   FROM top_sessions ts
-  JOIN sessions s ON s.id = ts.session_id
+  JOIN sessions s ON s.session_id = ts.session_id
   LEFT JOIN messages m
     ON m.session_id = ts.session_id
    AND m.role = 'user'
@@ -426,7 +451,7 @@ One call, agent picks exactly which columns to hydrate. When you want the \
 pond_get-style rendered transcript (tool-call lines, subagent footer), call \
 pond_get with the session_id - that's its job.
 
-Examples (3 patterns the agent should recognize):
+Examples (4 patterns the agent should recognize):
 
   -- 1. Activity by project this week
   SELECT project, COUNT(*) AS msgs, COUNT(DISTINCT session_id) AS sessions
@@ -443,11 +468,19 @@ Examples (3 patterns the agent should recognize):
   GROUP BY source_agent
   ORDER BY n DESC;
 
-  -- 3. BM25 search in SQL, joined with metadata, relevance-ranked
+  -- 3. Text filter in WHERE (all words must appear), composed with metadata
+  SELECT message_id, timestamp, project, substr(search_text, 1, 120) AS preview
+  FROM messages
+  WHERE contains_tokens(search_text, 'race condition')
+    AND timestamp >= now() - INTERVAL '30 days'
+  ORDER BY timestamp DESC
+  LIMIT 50;
+
+  -- 4. BM25 search in FROM, joined with metadata, relevance-ranked
   SELECT m.session_id, m.timestamp, m.project, f._score, m.search_text
   FROM fts('messages', \
 '{\"match\":{\"column\":\"search_text\",\"terms\":\"race condition\"}}') f
-  JOIN messages m ON m.id = f.id
+  JOIN messages m ON m.message_id = f.message_id
   WHERE m.project LIKE '%pond%'
   ORDER BY f._score DESC
   LIMIT 50;";
@@ -457,18 +490,17 @@ Examples (3 patterns the agent should recognize):
     struct McpSearchParams {
         /// What to search for: concepts and keywords. Keep it semantic - do
         /// not put project names in the query, use the `project` filter
-        /// instead. Optional only when `similar_to` is set (vector-only mode
-        /// uses the stored vector and ignores the query text); required in
-        /// every other call.
-        #[serde(default)]
-        query: Option<String>,
-        /// Max sessions to return. Default 10, server-capped at 200.
+        /// instead.
+        query: String,
+        /// Max sessions to return. Default 10, server-capped at 200. This is
+        /// also the "want more results" knob - raise it; there is no pagination.
         #[serde(default)]
         limit: Option<usize>,
         /// Filter to projects whose path contains this substring.
         #[serde(default)]
         project: Option<String>,
-        /// Filter to one session (exact match).
+        /// Filter to one session (exact match) - semantic search within a
+        /// single, possibly long, session.
         #[serde(default)]
         session_id: Option<String>,
         /// Filter to one source agent, e.g. "claude-code" or
@@ -480,25 +512,16 @@ Examples (3 patterns the agent should recognize):
         /// include subagent sessions (source_agent like "claude-code/<name>").
         #[serde(default)]
         include_subagents: Option<bool>,
-        /// Filter by message role: "user" or "assistant".
-        #[serde(default)]
-        role: Option<String>,
         /// Only messages on or after this date (YYYY-MM-DD).
         #[serde(default)]
         from_date: Option<String>,
         /// Only messages on or before this date (YYYY-MM-DD).
         #[serde(default)]
         to_date: Option<String>,
-        /// "Find similar messages to this one." When set, pond uses the
-        /// stored vector for `similar_to` as the kNN query and ignores the
-        /// `query` text; vector-only, no embedder load. Compose with
-        /// `pond_search` -> read top hit -> `pond_search(similar_to=<that
-        /// message_id>)` to explore neighbors of any returned hit.
+        /// Output shape: "text" (default - a rendered transcript of the ranked
+        /// hits) or "json" (the same hits as structured data).
         #[serde(default)]
-        similar_to: Option<String>,
-        /// Opaque continuation token from a prior response's `next_cursor`.
-        #[serde(default)]
-        cursor: Option<String>,
+        format: Option<String>,
     }
 
     /// `pond_get` MCP tool parameters. Exactly one of `message_id` /
@@ -544,31 +567,32 @@ Examples (3 patterns the agent should recognize):
     struct McpSqlParams {
         /// One read-only SQL statement (DataFusion / PostgreSQL-compatible).
         /// SELECT/WITH only (or EXPLAIN of one); writes and side-effecting
-        /// statements are rejected. Exact columns - messages(session_id, id,
-        /// timestamp, role, source_agent, project, content [system-role
-        /// only], search_text [the conversational text], embedding_model,
-        /// options) | sessions(id, parent_session_id, parent_message_id,
-        /// source_agent, created_at, project, options) | parts(session_id,
-        /// message_id, id, ordinal, type, provenance, variant_data, options).
-        /// parts.type enums use underscores: 'tool_call', 'tool_result',
-        /// 'text', 'reasoning', 'file'. JSON columns (variant_data, options)
-        /// are JSONB: read fields with json_extract(col, '$.a.b') or
-        /// json_get_string(col, 'key'), never CAST them. See the
-        /// `schema://pond-sql` resource for joins, JSON/FTS functions,
-        /// pagination + drilling patterns, and worked examples.
-        #[serde(alias = "query")]
-        sql: String,
-        /// Output format: "table" (default; rendered ASCII table with metrics
+        /// statements are rejected. Exact columns - messages(session_id,
+        /// message_id, timestamp, role, source_agent, project, content
+        /// [system-role only], search_text [the conversational text],
+        /// embedding_model, options) | sessions(session_id,
+        /// parent_session_id, parent_message_id, source_agent, created_at,
+        /// project, options) | parts(session_id, message_id, id, ordinal,
+        /// type, provenance, variant_data, options). parts.type enums use
+        /// underscores: 'tool_call', 'tool_result', 'text', 'reasoning',
+        /// 'file'. JSON columns (variant_data, options) are JSONB: read
+        /// fields with json_extract(col, '$.a.b') or json_get_string(col,
+        /// 'key', ...), never CAST them. Text search: WHERE
+        /// contains_tokens(search_text, 'words') to filter, FROM
+        /// fts('messages', '{...}') for BM25-ranked results. Control row count
+        /// with SQL `LIMIT`; inline output is capped at 100 rows (use
+        /// format=parquet|ndjson to get every row). See the `schema://pond-sql`
+        /// resource for joins, JSON/FTS functions, pagination + drilling
+        /// patterns, and worked examples.
+        #[serde(alias = "sql")]
+        query: String,
+        /// Output format: "text" (default; rendered ASCII table with metrics
         /// footer), "json" (same row-capped data as a structured JSON object,
         /// delivered via MCP structuredContent), "parquet", or "ndjson". For
         /// parquet/ndjson the full result set is written to a file and a
         /// `pond-sql-export://` resource link is returned (no truncation).
         #[serde(default)]
-        output: Option<String>,
-        /// Inline row cap for "table" / "json" output. Default 100, max 1000.
-        /// Ignored for parquet/ndjson exports (which return every row).
-        #[serde(default)]
-        limit: Option<usize>,
+        format: Option<String>,
     }
 
     fn parse_session_from(value: Option<String>) -> SessionFrom {
@@ -614,13 +638,16 @@ Examples (3 patterns the agent should recognize):
                            ---` delimiter rule followed by the matched text. Pass a returned \
                            `message_id` to `pond_get` for full text. Common args: \
                            query (semantic - concepts, not project names), then project / \
-                           from_date / to_date to scope. Advanced: source_agent (e.g. \
-                           \"claude-code\", or \"claude-code/general-purpose\" for subagents), \
-                           similar_to (vector-only neighbors of a message_id), cursor (paging), \
-                           include_subagents (subagent sessions are excluded by default). \
+                           from_date / to_date to scope, limit to widen (no pagination - raise \
+                           limit for more). Advanced: source_agent (e.g. \"claude-code\", or \
+                           \"claude-code/general-purpose\" for subagents), session_id (search \
+                           within one long session), include_subagents (subagent sessions are \
+                           excluded by default), format (\"text\" default, or \"json\" for \
+                           structured hits). \
                            Scores are relative within one response; there is no min_score. For \
-                           exact strings, identifiers, or error messages, pond_sql_query's \
-                           fts('messages', ...) BM25 search is the sharper tool - and it sees \
+                           exact strings, identifiers, or error messages, pond_sql_query is the \
+                           sharper tool - WHERE contains_tokens(search_text, 'words') to \
+                           filter, FROM fts('messages', ...) for BM25 ranking - and it sees \
                            subagent sessions too.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
@@ -628,17 +655,17 @@ Examples (3 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let json = matches!(params.format.as_deref(), Some("json"));
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
-                query: params.query.unwrap_or_default(),
+                query: params.query,
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.session_id,
                     source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
-                    role: params.role,
                     // min_score is intentionally not on the MCP surface; scores
                     // are response-relative, so a server-side threshold is a
                     // footgun for agent callers. CLI / HTTP still exposes it
@@ -647,9 +674,7 @@ Examples (3 patterns the agent should recognize):
                     include_subagents: params.include_subagents.unwrap_or(false),
                 },
                 limit: params.limit.unwrap_or(10),
-                cursor: params.cursor,
                 mode_override: None,
-                similar_to: params.similar_to,
             };
             match run_search(
                 &self.state.store,
@@ -659,6 +684,18 @@ Examples (3 patterns the agent should recognize):
             )
             .await
             {
+                SearchEnvelope::Success(response) if json => {
+                    // `structured()` mirrors the same bytes into the text
+                    // content block, so shadowing clients still get the data.
+                    Ok(CallToolResult::structured(
+                        serde_json::to_value(&response).map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("failed to serialize search response: {error}"),
+                                None,
+                            )
+                        })?,
+                    ))
+                }
                 SearchEnvelope::Success(response) => {
                     Ok(tool_result(render_search_transcript(&response, &request)))
                 }
@@ -726,20 +763,23 @@ Examples (3 patterns the agent should recognize):
                            buckets) - the analytic complement to pond_search's semantic \
                            recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
                            effecting statements are rejected. The exact column lists are in \
-                           the `sql` parameter description - use those names, do not guess \
+                           the `query` parameter description - use those names, do not guess \
                            (column discovery also works: SELECT column_name FROM \
                            information_schema.columns WHERE table_name = 'messages'). \
                            Routing: metadata analytics -> SQL on messages/sessions; tool-call \
                            analytics -> parts WHERE type = 'tool_call' with \
-                           json_get_string(variant_data, 'name'); text search -> \
-                           fts('messages', '{...json...}') BM25 over search_text, or \
+                           json_get_string(variant_data, 'name'); text search -> WHERE \
+                           contains_tokens(search_text, 'words') to filter or FROM \
+                           fts('messages', '{...json...}') for BM25-ranked results, or \
                            pond_search for semantic recall; reading a transcript -> pond_get, \
                            not SQL. The embedding `vector` column is never returned (explicit \
-                           projection is rejected; filtering in WHERE is fine). Output \
-                           defaults to a row-capped rendered table; set output=json for a \
-                           structured JSON payload (delivered via MCP structuredContent), or \
-                           output=parquet|ndjson to write the full result to a file returned \
-                           as a pond-sql-export:// resource. Read resource schema://pond-sql \
+                           projection is rejected; filtering in WHERE is fine). Control row \
+                           count with SQL `LIMIT`; inline output (format text|json) is capped \
+                           at 100 rows. format defaults to text (a row-capped rendered table); \
+                           set format=json for a structured JSON payload (delivered via MCP \
+                           structuredContent), or format=parquet|ndjson to write the full \
+                           result to a file returned as a pond-sql-export:// resource. Read \
+                           resource schema://pond-sql \
                            for joins, indexed columns, JSON access rules, the function \
                            quick-reference, pagination + drilling patterns, and worked \
                            examples.",
@@ -749,22 +789,19 @@ Examples (3 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSqlParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let mode = match params.output.as_deref() {
-                None | Some("table") => sql::Mode::Inline,
+            let mode = match params.format.as_deref() {
+                None | Some("text") => sql::Mode::Inline,
                 Some("json") => sql::Mode::InlineJson,
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
                 Some("ndjson") => sql::Mode::Export(sql::Format::Ndjson),
                 Some(other) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "unknown output {other:?}; use \"table\", \"json\", \"parquet\", \
+                        "unknown format {other:?}; use \"text\", \"json\", \"parquet\", \
                          or \"ndjson\""
                     ))]));
                 }
             };
-            let inline_rows = params
-                .limit
-                .unwrap_or(sql::DEFAULT_INLINE_ROWS)
-                .min(sql::MAX_INLINE_ROWS);
+            let inline_rows = sql::DEFAULT_INLINE_ROWS;
 
             // The three tables are independent (per-table caches/mutexes), so
             // overlap their freshness/manifest fetches rather than serialize.
@@ -787,7 +824,7 @@ Examples (3 patterns the agent should recognize):
                 }
             };
 
-            match sql::run(&tables, &params.sql, mode, inline_rows).await {
+            match sql::run(&tables, &params.query, mode, inline_rows).await {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::InlineJson(value)) => Ok(CallToolResult::structured(value)),
                 Ok(sql::Outcome::Export {
@@ -841,7 +878,7 @@ Examples (3 patterns the agent should recognize):
                  Workflow: pond_search to find relevant messages, then pond_get to read \
                  full text by message_id or a whole session by session_id; both return \
                  readable transcripts, not JSON. Scope with filters, not the query: project \
-                 (path substring), session_id, source_agent, role, from_date / to_date - \
+                 (path substring), session_id, source_agent, from_date / to_date - \
                  keep query semantic (concepts, not project names). Scores are relative \
                  within one response; there is no min_score. Subagents are stored as their \
                  own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
@@ -856,9 +893,11 @@ Examples (3 patterns the agent should recognize):
                  parquet/ndjson export; see resource schema://pond-sql. Search only indexes \
                  conversational text (tool calls/results are invisible to it), and a \
                  zero/weak result is not proof of absence - for exact strings, \
-                 identifiers, or error messages run pond_sql_query with fts('messages', \
-                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') (AND semantics: \
-                 add \"operator\":\"And\"), which also covers subagent sessions.",
+                 identifiers, or error messages run pond_sql_query with WHERE \
+                 contains_tokens(search_text, 'words') (all words must match; \
+                 index-accelerated), or FROM fts('messages', \
+                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') for \
+                 BM25-ranked results; both cover subagent sessions too.",
             )
         }
 
@@ -1142,49 +1181,34 @@ Examples (3 patterns the agent should recognize):
             if response.searchable_in_scope == 0 {
                 return format!(
                     "pond_search: 0 searchable messages in scope - the filters exclude \
-                     everything before retrieval. Widen or drop project/date/role filters.\
+                     everything before retrieval. Widen or drop project/date filters.\
                      {subagent_note}\n"
                 );
             }
-            let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT id, \
-                            session_id, search_text FROM fts('messages', \
-                            '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}').";
-            return match request.similar_to.as_deref() {
-                Some(id) => format!(
-                    "pond_search: no matches similar to {id} across {} searchable messages in \
-                     scope.{subagent_note}\n",
-                    response.searchable_in_scope
-                ),
-                None => {
-                    format!(
-                        "pond_search: no matches for {:?} across {} searchable messages in \
-                         scope.{subagent_note}{fts_hint}\n",
-                        request.query, response.searchable_in_scope
-                    )
-                }
-            };
+            let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT \
+                            message_id, session_id, search_text FROM messages WHERE \
+                            contains_tokens(search_text, '...').";
+            return format!(
+                "pond_search: no matches for {:?} across {} searchable messages in \
+                 scope.{subagent_note}{fts_hint}\n",
+                request.query, response.searchable_in_scope
+            );
         }
         let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
-        let sim = request
-            .similar_to
-            .as_deref()
-            .map(|id| format!(" similar to {id}"))
-            .unwrap_or_default();
         let mut out = String::new();
         let _ = writeln!(
             out,
             "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
-             sessions{}.{}",
+             sessions.{}",
             response.matched_total,
             response.searchable_in_scope,
             shown,
             response.sessions.len(),
-            sim,
             subagent_note,
         );
         let _ = writeln!(
             out,
-            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; pass cursor to page."
+            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; raise limit for more (no pagination)."
         );
         let mut index = 0;
         for (session_index, session) in response.sessions.iter().enumerate() {
@@ -1227,10 +1251,6 @@ Examples (3 patterns the agent should recognize):
                 );
                 push_lines(&mut out, &hit.text, "");
             }
-        }
-        if let Some(cursor) = &response.next_cursor {
-            let _ = writeln!(out);
-            let _ = writeln!(out, "cursor: {cursor} (pass as `cursor` to page)");
         }
         out
     }
@@ -1730,17 +1750,14 @@ Examples (3 patterns the agent should recognize):
                 matched_total: 1,
                 searchable_in_scope: 2,
                 has_more: false,
-                next_cursor: None,
             };
             let request = SearchRequest {
                 protocol_version: crate::PROTOCOL_VERSION,
                 namespace: None,
                 query: "hi".to_owned(),
                 mode_override: None,
-                similar_to: None,
                 filters: SearchFilters::default(),
                 limit: 10,
-                cursor: None,
             };
 
             let transcript = render_search_transcript(&response, &request);

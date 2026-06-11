@@ -107,10 +107,11 @@ impl From<CliResponseMode> for ResponseMode {
     }
 }
 
-/// CLI surface for `pond sql --output`. Maps to `sql::Mode` / `sql::Format`.
+/// CLI surface for `pond sql --format`. Maps to `sql::Mode` / `sql::Format`.
+/// Mirrors the MCP `pond_sql_query` `format` arg (text|json|parquet|ndjson).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliSqlOutput {
-    Table,
+enum CliSqlFormat {
+    Text,
     Json,
     Ndjson,
     Parquet,
@@ -314,9 +315,6 @@ enum Command {
         /// ISO date (YYYY-MM-DD) upper bound, inclusive.
         #[arg(long)]
         to_date: Option<String>,
-        /// Restrict to a single role (`user` | `assistant` | `system` | `tool`).
-        #[arg(long)]
-        role: Option<String>,
         /// Server-side score threshold; hits below this are dropped. Not an
         /// absence signal: present and absent content score in overlapping
         /// bands (docs/researches/embeddings.md), so leave at 0 unless
@@ -422,16 +420,16 @@ enum Command {
         storage_path: Option<StorageUrl>,
         #[arg(long, env = "POND_CONFIG")]
         config: Option<PathBuf>,
-        /// Output format. table/json/ndjson go to stdout; parquet requires
+        /// Output format. text/json/ndjson go to stdout; parquet requires
         /// `--output-file` (binary).
-        #[arg(long, value_enum, default_value_t = CliSqlOutput::Table)]
-        output: CliSqlOutput,
-        /// Inline row cap for table/json output. Default 100, max 1000.
+        #[arg(long, value_enum, default_value_t = CliSqlFormat::Text)]
+        format: CliSqlFormat,
+        /// Inline row cap for text/json output. Default 100, max 1000.
         /// Ignored for ndjson/parquet (which return every row).
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Write the export bytes here instead of stdout (required for
-        /// `--output parquet`; optional for ndjson). Ignored for table/json.
+        /// `--format parquet`; optional for ndjson). Ignored for text/json.
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
     },
@@ -711,7 +709,6 @@ async fn main() -> anyhow::Result<()> {
             include_subagents,
             from_date,
             to_date,
-            role,
             min_score,
             explain,
             format,
@@ -724,19 +721,16 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 query,
                 mode_override: mode.map(SearchModeWire::from),
-                similar_to: None,
                 filters: SearchFilters {
                     project,
                     session_id,
                     source_agent,
                     from_date,
                     to_date,
-                    role,
                     min_score,
                     include_subagents,
                 },
                 limit,
-                cursor: None,
             };
             if explain {
                 let plans = explain_search(&store, &embedder, &request, &loaded.search).await?;
@@ -941,22 +935,22 @@ async fn main() -> anyhow::Result<()> {
             sql,
             storage_path,
             config,
-            output: format,
+            format,
             limit,
             output_file,
         } => {
-            if matches!(format, CliSqlOutput::Parquet) && output_file.is_none() {
+            if matches!(format, CliSqlFormat::Parquet) && output_file.is_none() {
                 bail!(
-                    "--output parquet requires --output-file <path> (binary, can't go to stdout)"
+                    "--format parquet requires --output-file <path> (binary, can't go to stdout)"
                 );
             }
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             let mode = match format {
-                CliSqlOutput::Table => pond::sql::Mode::Inline,
-                CliSqlOutput::Json => pond::sql::Mode::InlineJson,
-                CliSqlOutput::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
-                CliSqlOutput::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
+                CliSqlFormat::Text => pond::sql::Mode::Inline,
+                CliSqlFormat::Json => pond::sql::Mode::InlineJson,
+                CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
+                CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
             let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
             let (sessions, messages, parts) = tokio::try_join!(
@@ -2727,7 +2721,7 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
         if response.searchable_in_scope == 0 {
             output(
                 "scope is empty: the filters exclude every searchable message; widen or drop \
-                 project/date/role filters",
+                 project/date filters",
             )?;
         }
         return Ok(());
@@ -2735,10 +2729,6 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
     for (idx, session) in response.sessions.iter().enumerate() {
         output("")?;
         render_search_session(idx + 1, session)?;
-    }
-    if let Some(cursor) = response.next_cursor.as_deref() {
-        output("")?;
-        output(&format!("{} {}", paint("next-cursor:", dim()), cursor))?;
     }
     Ok(())
 }

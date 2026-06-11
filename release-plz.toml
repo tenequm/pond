@@ -14,3 +14,39 @@ release_always = true
 # semver-checks guards library consumers we don't have, so skip it - it otherwise
 # adds a multi-minute cold rustdoc build of the heavy dep tree to every release.
 semver_check = false
+
+# Lance-style release notes: emoji-grouped sections, scope-bolded entries, PR
+# links, breaking markers, and a per-version compare link. release-plz strips the
+# `## [version]` heading line when posting the GitHub release body (GitHub shows
+# the tag as the title already), so the compare link also lives in a `**Full
+# Changelog**` footer that survives into the release body - the heading link is
+# only for CHANGELOG.md structure. The `<!-- N -->` prefixes order the sections
+# (group_by sorts alphabetically; GitHub renders the HTML comments invisibly).
+[changelog]
+body = """
+## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
+{% endfor %}{% endfor %}{% if release_link %}
+**Full Changelog**: {{ release_link }}
+{% endif %}"""
+trim = true
+protect_breaking_commits = true
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tenequm/pond/pull/${1}))" },
+]
+commit_parsers = [
+  { message = "^chore: release", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->🛠 Breaking Changes" },
+  { body = "^BREAKING CHANGE", group = "<!-- 0 -->🛠 Breaking Changes" },
+  { message = "^feat", group = "<!-- 1 -->🎉 New Features" },
+  { message = "^fix", group = "<!-- 2 -->🐛 Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->🚀 Performance" },
+  { message = "^refactor", group = "<!-- 4 -->🚜 Refactor" },
+  { message = "^docs", group = "<!-- 5 -->📚 Documentation" },
+  { message = "^chore|^ci|^build|^test", group = "<!-- 6 -->🧹 Chores" },
+  { message = "^.*", group = "<!-- 7 -->🔧 Other" },
+]

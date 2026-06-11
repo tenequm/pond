@@ -583,20 +583,10 @@ pub struct SearchRequest {
     // harness. Production callers (MCP, HTTP agents) should leave it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_override: Option<SearchModeWire>,
-    /// When set, retrieve messages similar to this stored message - pond uses
-    /// the message's stored `vector` directly as the query, runs vector-only
-    /// kNN, and ignores `query` and the FTS arm. The stored vector was
-    /// derived from `search_text` (`spec.md#session-embed-from-canonical`), so the
-    /// signal is already filtered of harness-injected parts. Filters and
-    /// `limit` still apply.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub similar_to: Option<String>,
     #[serde(default)]
     pub filters: SearchFilters,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
 }
 
 /// Wire-level retrieval mode override (spec.md#search). Not normally set on
@@ -624,25 +614,17 @@ pub struct SearchFilters {
     pub from_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     /// Score floor; hits below it are dropped. Not an absence signal: present
     /// and absent content score in overlapping bands (see
     /// `docs/researches/embeddings.md`), so the default stays 0 and the
     /// response's `searchable_in_scope` carries the honesty instead.
-    // Skip the default 0.0 so an unfiltered cursor/request stays compact.
+    // Skip the default 0.0 so an unfiltered request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
     /// Include subagent sessions (`source_agent` like `claude-code/<name>`).
     /// Default false: a search targets the human-facing main sessions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_subagents: bool,
-}
-
-impl SearchFilters {
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -664,8 +646,6 @@ pub struct SearchResponse {
     #[serde(default)]
     pub searchable_in_scope: usize,
     pub has_more: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -689,16 +669,6 @@ pub struct SearchResult {
     /// from one carrying file attachments or multi-part scaffolding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts_summary: Vec<PartSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SearchCursor {
-    pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub similar_to: Option<String>,
-    #[serde(default, skip_serializing_if = "SearchFilters::is_default")]
-    pub filters: SearchFilters,
-    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
