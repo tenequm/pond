@@ -1276,12 +1276,18 @@ async fn run_config_command(command: ConfigCmd) -> anyhow::Result<()> {
             let storage = resolve_storage_location(storage_path.clone(), &loaded)?;
             let resolved = storage.resolve(&loaded.creds)?;
             let storage_source = match &storage_path {
-                // clap folds the env var into the flag; tell them apart so
-                // the source column never lies about where the URL came from.
-                Some(flag) => match std::env::var("POND_STORAGE_PATH") {
-                    Ok(env) if StorageUrl::parse(&env).is_ok_and(|url| &url == flag) => "env",
-                    _ => "cli",
-                },
+                // clap folds the env var into the flag; argv tells them apart
+                // (value comparison can't - flag and env may carry the same
+                // URL, and the flag wins per the precedence ladder).
+                Some(_) => {
+                    if std::env::args()
+                        .any(|arg| arg == "--storage-path" || arg.starts_with("--storage-path="))
+                    {
+                        "cli"
+                    } else {
+                        "env"
+                    }
+                }
                 None if loaded.storage.path.is_some() => classify_source(&figment, "storage.path"),
                 None => "default",
             };

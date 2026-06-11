@@ -120,6 +120,13 @@ impl StorageUrl {
         if !trimmed.contains("://") || trimmed.starts_with("file://") {
             let url =
                 uri_to_url(trimmed).with_context(|| format!("invalid storage path {trimmed:?}"))?;
+            // Bare paths percent-encode `?` (a legal filename character), so
+            // only an explicit `file://...?x=y` parses a query here. No local
+            // scheme takes one; reject like the remote schemes do instead of
+            // silently carrying it into the path Lance opens.
+            if url.query().is_some() {
+                bail!("storage URL {trimmed:?} carries query params; local URLs take none");
+            }
             return Ok(Self::plain(url));
         }
         let url =
@@ -131,7 +138,15 @@ impl StorageUrl {
             );
         }
         match url.scheme() {
-            "memory" | "shared-memory" => Ok(Self::plain(url)),
+            "memory" | "shared-memory" => {
+                if url.query().is_some() {
+                    bail!(
+                        "storage URL {trimmed:?} carries query params; {}:// URLs take none",
+                        url.scheme(),
+                    );
+                }
+                Ok(Self::plain(url))
+            }
             "s3" | "gs" => {
                 let (canonical, query_options, creds_pointer) = strip_query(url)?;
                 let mut lance = canonical.clone();
@@ -2779,6 +2794,18 @@ mod tests {
             .expect_err("typo")
             .to_string();
         assert!(err.contains("regoin"), "got: {err}");
+        // Query params on local / in-memory schemes die just as loudly -
+        // no silent carry into the URL Lance opens.
+        let err = StorageUrl::parse("memory://x?creds=y")
+            .expect_err("memory query")
+            .to_string();
+        assert!(err.contains("query params"), "got: {err}");
+        let err = StorageUrl::parse("file:///x?creds=y")
+            .expect_err("file query")
+            .to_string();
+        assert!(err.contains("query params"), "got: {err}");
+        // `?` in a bare path is a filename character, not a query.
+        assert!(StorageUrl::parse("/tmp/a?b").is_ok());
     }
 
     #[test]
