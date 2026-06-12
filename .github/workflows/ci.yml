@@ -34,6 +34,23 @@ jobs:
       - run: moon run pond:lint
       - run: moon run pond:test
 
+  # Enforced backstop for the local pre-commit hook (.githooks/pre-commit):
+  # scan the FULL history so a secret can never reach a public clone. Rules +
+  # verified-false-positive allowlist live in .gitleaks.toml (auto-discovered).
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+      - run: gitleaks git --no-banner --redact --exit-code 1 .
+
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
   # whose tag already exists". (dry-run can't report this: in dry-run release-plz

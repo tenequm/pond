@@ -1,6 +1,6 @@
 # Hybrid search tuning
 
-Research record for pond's hybrid retrieval. `docs/spec.md#search` is the source of truth for behavior; this file explains the tuning behind the spec-allowed defaults and the experiments that produced them. The harness lives at `scripts/search-benchmarks/`.
+Research record for pond's hybrid retrieval. `docs/spec.md#search` is the source of truth for behavior; this file explains the tuning behind the spec-allowed defaults and the experiments that produced them. The harness lives at `ops/search-benchmarks/`.
 
 ## What is measured and how
 
@@ -19,7 +19,7 @@ Together they identify whether fusion is a genuine improvement over both compone
 
 ### Query strata
 
-Two seed sets ship in `scripts/search-benchmarks/`:
+Two seed sets ship in `ops/search-benchmarks/`:
 
 - `queries-en.tsv` (21 English entries) and `queries-uk-translated.tsv` (21 Ukrainian-translated entries against the same English-language session-id targets). Strata cover natural-language, conceptual, symbol-lookup, error-message, bare-keyword. The UK twin isolates "is the retriever cross-lingual?" from "does the corpus contain this conversation?".
 
@@ -85,8 +85,8 @@ Query expansion is also explicitly a caller-layer concern. Lexical expansion is 
 
 ## Files
 
-- `scripts/search-benchmarks/bench.py` - the harness; subcommands `run` / `verify` / `score` / `pair` (end-to-end) and `sweep` / `variant` (fixture replay through fusion variants).
-- `scripts/search-benchmarks/queries-en.tsv`, `queries-uk-translated.tsv` - the shipped seed sets.
+- `ops/search-benchmarks/bench.py` - the harness; subcommands `run` / `verify` / `score` / `pair` (end-to-end) and `sweep` / `variant` (fixture replay through fusion variants).
+- `ops/search-benchmarks/queries-en.tsv`, `queries-uk-translated.tsv` - the shipped seed sets.
 - `src/handlers.rs::fuse_arms` - the production fusion.
 - `src/handlers.rs::FTS_FUSION_WEIGHT`, `VECTOR_FUSION_WEIGHT` - the constants.
 

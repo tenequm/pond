@@ -274,9 +274,9 @@ impl LazyEmbedder {
 /// Default embedding model pond ships a loader for (spec.md#search). Used when
 /// `[embeddings].model` is absent. `pond embed` stamps the runtime model id
 /// (see [`model_id`]) into `messages.embedding_model` with every vector.
-/// e5-small (384-dim) is the default; scripts/search-benchmarks/queries-paraphrased.tsv
-/// showed no statistically-significant quality loss vs e5-base while halving
-/// vector storage and ~halving model RSS.
+/// e5-small (384-dim) is the default; the paraphrase benchmark set showed no
+/// statistically-significant quality loss vs e5-base while halving vector
+/// storage and ~halving model RSS.
 pub const DEFAULT_MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
 /// Process-wide model id, seeded once at startup from `[embeddings].model` via

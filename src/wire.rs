@@ -579,8 +579,8 @@ pub struct SearchRequest {
     pub query: String,
     // Server normally decides between hybrid and FTS-only from the embedder +
     // embeddings-coverage state (spec.md#search); `mode_override` is the
-    // operator-tooling escape hatch consumed by the `scripts/search-benchmarks/`
-    // harness. Production callers (MCP, HTTP agents) should leave it `None`.
+    // operator-tooling escape hatch. Production callers (MCP, HTTP agents)
+    // should leave it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_override: Option<SearchModeWire>,
     #[serde(default)]

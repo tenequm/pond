@@ -935,7 +935,7 @@ mod search_handler {
     /// Internal branching enum for the retrieval mode. Production callers
     /// never pick: the server decides hybrid-vs-FTS from embedder availability.
     /// `Vector` exists for operator tooling - selected via `pond search --mode`
-    /// or the `mode_override` wire field consumed by `scripts/search-benchmarks/`.
+    /// or the `mode_override` wire field.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Hybrid,
@@ -968,7 +968,7 @@ mod search_handler {
     // base_score (raw BM25 / raw cosine similarity) is min-max normalized
     // within the arm's pool, then the two arms are combined as
     // w_fts * norm_fts + w_vec * norm_vec. The 0.3:1 ratio comes from the
-    // 2026-06-10 re-sweep (scripts/search-benchmarks/bench.py) after the
+    // 2026-06-10 re-sweep (ops/search-benchmarks/bench.py) after the
     // vector arm switched from rank-norm to raw cosine: w_fts 0.2-0.3 ties
     // the old 0.135 rank-norm config on the 111-query paraphrase set
     // (S@3 67/111, sign test p=0.727) and beats it on the 12-query
@@ -1370,7 +1370,7 @@ mod search_handler {
     /// Why per-arm score normalization instead of RRF: RRF discards score
     /// magnitude (rank 1 contributes the same whether the vector cosine is
     /// 0.85 or 0.55), and on paraphrase queries that magnitude is the load-
-    /// bearing signal. See `scripts/search-benchmarks/bench.py` and
+    /// bearing signal. See `ops/search-benchmarks/bench.py` and
     /// `docs/researches/embeddings.md`.
     pub fn fuse_arms(lists: &[RankedList], key_by: FusionKey) -> Vec<FusedHit> {
         struct Group {
@@ -1389,7 +1389,7 @@ mod search_handler {
                 continue;
             }
             // Min-max normalize across the FULL arm pool BEFORE dedup. The
-            // benchmark replay (scripts/search-benchmarks/) and the
+            // benchmark replay (ops/search-benchmarks/) and the
             // production code MUST agree on the normalization basis;
             // dedupping first would narrow [lo, hi] to only the surviving
             // groups' scores and skew the normalized signal away from what

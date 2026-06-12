@@ -21,7 +21,6 @@ categories = ["command-line-utilities", "database", "artificial-intelligence"]
 exclude = [
     "tests/",
     "docs/",
-    "scripts/",
     "ops/",
     ".github/",
     ".moon/",

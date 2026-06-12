@@ -29,6 +29,10 @@ tmp/
 skills-lock.json
 /benches/corpus/
 
+# AGENTS.md is the canonical, tracked instructions file; CLAUDE.md is a local
+# symlink to it for Claude Code (which reads CLAUDE.md). Keep the symlink local.
+/CLAUDE.md
+
 # Release pipeline artifacts created in the working tree. The self-hosted runner
 # uses clean:false, so these persist between runs and would otherwise dirty the
 # tree and make `cargo publish` refuse to release.
@@ -43,13 +47,13 @@ skills-lock.json
 # paraphrased query set is also derivative - even after paraphrasing the
 # topics and project names leak. Regenerate locally via `bench.py`. Never
 # commit these.
-/scripts/search-benchmarks/fixtures/
-/scripts/search-benchmarks/results/
-/scripts/search-benchmarks/queries-paraphrased*.tsv
-/scripts/search-benchmarks/queries-real-use*.tsv
-/scripts/search-benchmarks/queries-false-negatives*.tsv
-/scripts/search-benchmarks/arms*.json
-/scripts/search-benchmarks/__pycache__/
+/ops/search-benchmarks/fixtures/
+/ops/search-benchmarks/results/
+/ops/search-benchmarks/queries-paraphrased*.tsv
+/ops/search-benchmarks/queries-real-use*.tsv
+/ops/search-benchmarks/queries-false-negatives*.tsv
+/ops/search-benchmarks/arms*.json
+/ops/search-benchmarks/__pycache__/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate
 # stats appear inline in the benchmark report. Regenerate via `pond status`.

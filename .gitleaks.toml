@@ -1,0 +1,21 @@
+title = "pond gitleaks config"
+
+# Start from gitleaks' bundled rules; the allowlists below only carve out
+# verified false positives so a real future leak is never buried under noise.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "CI env-var references are not secret values: buildx --secret env= directives and ${VAR} interpolation name where to read a secret, they don't contain one."
+regexTarget = "line"
+regexes = [
+  '''(id=[a-z0-9_]+,)?env=[A-Z][A-Z0-9_]+''',
+  '''(secret_access_key|access_key_id)=\$\{[A-Z][A-Z0-9_]+\}''',
+]
+
+[[allowlists]]
+description = "MCP tool-permission entries in claude_desktop_app session fixtures are server:tool-name-<hash> identifiers, not API keys."
+regexTarget = "line"
+regexes = [
+  '''"local:[^"]+-[0-9a-f]{32}":\s*(true|false)''',
+]
