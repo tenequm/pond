@@ -414,14 +414,17 @@ impl Store {
         Ok((rows, inserted))
     }
 
-    pub async fn upsert_sessions(&self, sessions: &[Session]) -> Result<Vec<UpsertStatus>> {
+    /// Flat write path. Per-row insert/match truth is not synthesized here -
+    /// honest outcomes come from the pre-existence scan on
+    /// [`Self::upsert_session_batch`]; the CLI sync and wire ingest paths use
+    /// that, so these helpers only need to surface write failure.
+    pub async fn upsert_sessions(&self, sessions: &[Session]) -> Result<()> {
         if sessions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let batches = sessions_batches(sessions)?;
-        let inserted = merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
-        // Per-row outcomes; no fold here (see `pond index optimize`).
-        Ok(statuses_from_inserted(sessions.len(), inserted))
+        merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
+        Ok(())
     }
 
     /// Batched write path used by the adapter ingest loop and by the wire
@@ -691,9 +694,9 @@ impl Store {
         &self,
         session: &Session,
         messages: &[MessageWrite<'_>],
-    ) -> Result<Vec<UpsertStatus>> {
+    ) -> Result<()> {
         if messages.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let rows = messages
@@ -706,17 +709,17 @@ impl Store {
             })
             .collect::<Vec<_>>();
         let batches = messages_batches(&rows)?;
-        let inserted = merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
-        Ok(statuses_from_inserted(messages.len(), inserted))
+        merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
+        Ok(())
     }
 
-    pub async fn upsert_parts(&self, parts: &[Part]) -> Result<Vec<UpsertStatus>> {
+    pub async fn upsert_parts(&self, parts: &[Part]) -> Result<()> {
         if parts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let batches = parts_batches(parts)?;
-        let inserted = merge_insert_chunks(&self.handle, Table::Parts, batches).await?;
-        Ok(statuses_from_inserted(parts.len(), inserted))
+        merge_insert_chunks(&self.handle, Table::Parts, batches).await?;
+        Ok(())
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionWithMessages>> {
@@ -3044,19 +3047,6 @@ fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
 /// the configured model" - no per-row `embedding_model` filter needed.
 fn embedded_scope(filter: &Predicate) -> Predicate {
     Predicate::And(vec![Predicate::IsNotNull("vector"), filter.clone()])
-}
-
-fn statuses_from_inserted(total: usize, inserted_rows: u64) -> Vec<UpsertStatus> {
-    let inserted = usize::try_from(inserted_rows)
-        .unwrap_or(usize::MAX)
-        .min(total);
-    let mut statuses = Vec::with_capacity(total);
-    statuses.extend(std::iter::repeat_n(UpsertStatus::Inserted, inserted));
-    statuses.extend(std::iter::repeat_n(
-        UpsertStatus::Matched,
-        total.saturating_sub(inserted),
-    ));
-    statuses
 }
 
 // Bare logical table names: the lance-namespace Directory impl owns the
