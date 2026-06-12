@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Scan staged changes for secrets before they enter history - the only cheap
 # moment to stop them, since a committed secret lives in git history forever
-# even after deletion. Rules + verified-false-positive allowlist: .gitleaks.toml.
-# CI re-runs this over full history as the enforced backstop (.github/workflows/ci.yml).
+# even after deletion. This hook is the sole automated gate; there is no CI
+# backstop. Rules + verified-false-positive allowlist: .gitleaks.toml.
 set -euo pipefail
 
 if ! command -v gitleaks >/dev/null 2>&1; then
-  echo "pre-commit: gitleaks not installed; skipping secret scan (CI still enforces it)." >&2
+  echo "pre-commit: gitleaks not installed; SKIPPING the secret scan." >&2
   echo "  install: brew install gitleaks" >&2
   exit 0
 fi

@@ -37,8 +37,6 @@ skills-lock.json
 # uses clean:false, so these persist between runs and would otherwise dirty the
 # tree and make `cargo publish` refuse to release.
 /dist/
-/tap/
-/nur/
 /minisign*
 
 # Benchmark fixtures/results and any query set derived from the operator's

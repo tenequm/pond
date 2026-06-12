@@ -1,3 +1,6 @@
+//! The session datasets (spec.md#datasets): the three Lance tables, the
+//! `Store` facade, ingest validation, and `search_text` extraction.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,

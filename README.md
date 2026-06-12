@@ -1,6 +1,8 @@
 # pond
 
+[![CI](https://img.shields.io/github/actions/workflow/status/tenequm/pond/ci.yml?branch=main&style=flat-square)](https://github.com/tenequm/pond/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/pond-db.svg?style=flat-square)](https://crates.io/crates/pond-db)
+[![docs](https://img.shields.io/badge/docs-pond.cascade.fyi-blue?style=flat-square)](https://pond.cascade.fyi/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
 Lossless storage and hybrid search for AI agent sessions, across every agentic client.
@@ -16,9 +18,7 @@ claude mcp add -s user pond -- pond mcp   # Claude Code
 codex mcp add pond -- pond mcp            # Codex
 ```
 
-Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool. Your history, your search, your sessions - independent of the agent vendor that made them.
-
-One Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No SQL, no extra database, no wrapper around Lance.
+Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool - your history, your search, your sessions, independent of the agent vendor that made them. It is one Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No extra database, no wrapper around Lance.
 
 Current automatically synced agent clients:
 - Claude Code CLI
@@ -26,17 +26,7 @@ Current automatically synced agent clients:
 - opencode CLI
 - pi-coding-agent CLI
 
-Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. See [`docs/spec.md`](docs/spec.md).
-
-## Table of Contents
-
-- [Background](#background)
-- [Install](#install)
-- [Usage](#usage)
-- [Design](#design)
-- [References](#references)
-- [Contributing](#contributing)
-- [License](#license)
+Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.cascade.fyi](https://pond.cascade.fyi/); the contract is [`docs/spec.md`](docs/spec.md).
 
 ## Background
 
@@ -105,6 +95,12 @@ pond export -o snapshot.pond
 pond import snapshot.pond
 ```
 
+Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):
+
+```sh
+pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DESC"
+```
+
 Stages can be run independently when needed:
 
 ```sh
@@ -146,14 +142,14 @@ Root-level `-v` / `-vv` / `-vvv` raise the tracing level (info / debug / trace);
 
 The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 
-- **Lance direct, no wrapper.** The `lance-format/lance` crates are the only storage and search engine. No `lancedb`, no SQL, no parallel abstraction. Storage, indexing, OCC, schema evolution, blob columns, versioning, and time-travel are all Lance.
+- **Lance direct, no wrapper.** The `lance-format/lance` crates are the only storage and search engine. No `lancedb`, no parallel abstraction. Storage, indexing, OCC, schema evolution, blob columns, versioning, and time-travel are all Lance. The read-only `pond sql` surface is DataFusion planning over the same Lance datasets - a query escape hatch, not a second engine.
 - **Canonical Session / Message / Part interlingua.** Owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This schema is pond's product; everything else is machinery around it.
 - **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
 - **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `model-no-synthesis`, `model-schema-honesty`, and `adapter-provenance-required` are structural, not review rules.
 - **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. `pond sync` runs index maintenance by default, and `pond sync --only update-indexes` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
 - **Score-normalized hybrid fusion.** Per-arm shaping (max-norm BM25 for FTS, rank-norm for vector), min-max to [0, 1], then weighted sum. Session-root-keyed dedup so cross-arm agreement compounds at the conversation level.
 - **Language-neutral full-text.** Character `ngram` tokenizer (3-5), no monolingual stemmer - pond indexes sessions in any language alike.
-- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`, `pond_session_events`. MCP also exposes `schema://pond` and `stats://pond` resources.
+- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql_query` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
 - **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.
 
@@ -168,7 +164,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 | [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `tests/fixtures/adapter/` | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as adapter test fixtures. |
+| `tests/fixtures/adapter/` | Real session captures for nine source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, nanoclaw, openclaw, opencode, pi-coding-agent). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

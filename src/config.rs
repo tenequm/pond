@@ -432,11 +432,11 @@ pub struct MaintenanceConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct EmbeddingsConfig {
     /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
-    /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-base`.
+    /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-small`.
     pub model: String,
     /// Output dimension of `model`. Must equal the model's `hidden_size` and
     /// be divisible by 8 (the IVF_PQ subspace stride; see `embed::index_params`).
-    /// Defaults to 768 (e5-base). Set to 384 for e5-small, 1024 for e5-large.
+    /// Defaults to 384 (e5-small). Set to 768 for e5-base, 1024 for e5-large.
     pub dim: usize,
 }
 

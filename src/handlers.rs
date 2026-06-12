@@ -1,3 +1,6 @@
+//! Transport-agnostic wire handlers (spec.md#protocol), one inner module per
+//! operation.
+
 fn map_error(error: crate::Error) -> crate::wire::ErrorEnvelope {
     error.into()
 }

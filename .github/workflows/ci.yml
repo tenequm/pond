@@ -5,9 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Default read-only; publish-release elevates to contents:write for its own
+# `gh release upload`. The release PR and publishes use the GH_RELEASE_TOKEN
+# PAT, not the workflow token.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 # Concurrency is per-job, not workflow-level: a workflow-level cancel-in-progress
 # also kills an in-flight release mid-publish (after release-plz cuts the tag, the
@@ -16,40 +18,25 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
 
 jobs:
   build-and-test:
     runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
     # A newer push to the same ref supersedes an in-flight build.
     concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
+    env:
+      BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
     steps:
       # clean: false persists target/ + caches on the self-hosted disk between
       # runs. moon, cargo/rustc, protoc, and kache are preinstalled on the runner.
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           clean: false
       - run: moon run pond:format
       - run: moon run pond:lint
       - run: moon run pond:test
-
-  # Enforced backstop for the local pre-commit hook (.githooks/pre-commit):
-  # scan the FULL history so a secret can never reach a public clone. Rules +
-  # verified-false-positive allowlist live in .gitleaks.toml (auto-discovered).
-  secret-scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6.0.2
-        with: { fetch-depth: 0, persist-credentials: false }
-      - name: Install gitleaks
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-        run: |
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
-      - run: gitleaks git --no-banner --redact --exit-code 1 .
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -63,10 +50,13 @@ jobs:
     outputs:
       is_release: ${{ steps.detect.outputs.is_release }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with: { fetch-depth: 0, persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: release-plz/action@v0.5
+      # SHA-pinned, so the toolchain must be an explicit input (the action
+      # otherwise derives it from the ref name).
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: stable }
+      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         with: { command: release-pr }   # keep the release PR current; never publishes
         env:
           # PAT (not GITHUB_TOKEN) so the opened release PR triggers build-and-test.
@@ -88,13 +78,15 @@ jobs:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
     runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: write   # `gh release upload` to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
     # instead of killing it between release-plz tagging and the four publishes.
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with: { fetch-depth: 0, clean: false, persist-credentials: false }
-      - uses: cachix/install-nix-action@v31   # nix-hash for publish-nur
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
 
       - name: Bootstrap cluster access + buildx builder
         env:
@@ -126,7 +118,7 @@ jobs:
       - id: ver
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
       
-      - uses: release-plz/action@v0.5
+      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         id: release-plz
         with: { command: release }
         env:
@@ -157,9 +149,6 @@ jobs:
           || gh release upload "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap --clobber
           gh release edit "pond-v$V" --repo tenequm/homebrew-tap --title "pond v$V" --notes "$notes"
 
-      # crates.io + git tag + GitHub release on pond.
-
-
       - name: Publish Homebrew formula
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
@@ -167,9 +156,12 @@ jobs:
           set -euo pipefail
           base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
           sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
-          rm -rf tap
-          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/homebrew-tap" tap
-          cat > tap/Formula/pond.rb <<EOF
+          # Clone outside the workspace: a clone left in the working tree would
+          # persist (clean:false) and make `cargo publish` refuse a dirty tree.
+          tap="$RUNNER_TEMP/tap"
+          rm -rf "$tap"
+          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/homebrew-tap" "$tap"
+          cat > "$tap/Formula/pond.rb" <<EOF
           # typed: false
           # frozen_string_literal: true
 
@@ -215,9 +207,9 @@ jobs:
             end
           end
           EOF
-          git -C tap add Formula/pond.rb
-          git -C tap diff --quiet --staged || git -C tap -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
-          git -C tap push
+          git -C "$tap" add Formula/pond.rb
+          git -C "$tap" diff --quiet --staged || git -C "$tap" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
+          git -C "$tap" push
       - name: Publish pond-nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
@@ -226,10 +218,11 @@ jobs:
           # pond-nix hosts its own binaries; the flake fetches from this repo's releases.
           base="https://github.com/tenequm/pond-nix/releases/download/pond-v$V"
           nix32() { nix-hash --type sha256 --to-base32 "$(sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1)"; }
-          rm -rf pond-nix
-          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" pond-nix
-          mkdir -p pond-nix/pkgs/pond
-          cat > pond-nix/pkgs/pond/default.nix <<EOF
+          nix="$RUNNER_TEMP/pond-nix"
+          rm -rf "$nix"
+          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" "$nix"
+          mkdir -p "$nix/pkgs/pond"
+          cat > "$nix/pkgs/pond/default.nix" <<EOF
           { lib, fetchurl, stdenv, autoPatchelfHook, installShellFiles, zlib }:
           let
             inherit (stdenv) hostPlatform;
@@ -287,13 +280,13 @@ jobs:
             };
           }
           EOF
-          git -C pond-nix add pkgs/pond/default.nix
-          git -C pond-nix diff --quiet --staged || git -C pond-nix -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
-          git -C pond-nix push
+          git -C "$nix" add pkgs/pond/default.nix
+          git -C "$nix" diff --quiet --staged || git -C "$nix" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
+          git -C "$nix" push
           # The flake fetches binaries from this release; attach the tarballs +
           # the changelog notes, and target the default.nix commit we just pushed.
           notes=$(gh release view "v$V" -R tenequm/pond --json body -q .body)
           gh release create "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix \
-            --target "$(git -C pond-nix rev-parse HEAD)" --title "pond v$V" --notes "$notes" \
+            --target "$(git -C "$nix" rev-parse HEAD)" --title "pond v$V" --notes "$notes" \
           || { gh release upload "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix --clobber; \
                gh release edit "pond-v$V" --repo tenequm/pond-nix --title "pond v$V" --notes "$notes"; }

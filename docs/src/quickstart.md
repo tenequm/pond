@@ -65,7 +65,7 @@ secret_access_key = "..."
 The `s3+https://host/bucket/prefix` form carries the endpoint, bucket, and prefix in one URL - it works for any S3-compatible store (Hetzner, R2, B2, MinIO). Plain `s3://`, `gs://`, and `az://` URLs work too, using the standard cloud SDK credential chain when no `[creds.*]` set matches. Probe a destination before relying on it:
 
 ```sh
-pond config check    # parse, creds binding, conditional-put (OCC), write/read/delete
+pond storage check   # parse, creds binding, conditional-put (OCC), write/read/delete
 pond config show     # resolved config: redacted values, where each came from
 ```
 
@@ -74,7 +74,7 @@ Everything also works with no config file at all - `POND_STORAGE_PATH` plus `PON
 Several machines can share one bucket: give each the same `config.toml` and run `pond sync` from cron on each. Concurrent writers are safe - Lance's optimistic concurrency control serializes commits through the object store's conditional writes. To move an existing local pond into the bucket:
 
 ```sh
-pond migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
+pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
 Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes the source.

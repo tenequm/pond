@@ -112,7 +112,7 @@ lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
-# Already in the tree via lance-io; named directly so `pond config check` can
+# Already in the tree via lance-io; named directly so `pond storage check` can
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
 object_store = { version = "0.13", default-features = false }

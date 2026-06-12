@@ -100,7 +100,7 @@ These are stable positions. pond will not:
 - **Authenticate, authorize, or model identity or tenancy.** An integrator decides who may reach which namespace before any pond call; `namespace` on the wire is an opaque routing string pond does not interpret. On hosted deployments the object store's IAM is the storage boundary and the integrator's gateway is the application boundary.
 - **Encrypt at the application layer.** Encryption is bucket server-side encryption plus filesystem encryption; pond holds no keys and adds no cryptography of its own. pond is not a zero-knowledge store - an operator with bucket and key access can read everything.
 - **Act as a runtime.** pond does not execute tools, run an agent loop, compact context, render output, or emit telemetry. It stores what those systems produce.
-- **Offer a SQL surface, a UI, or a sidecar daemon.** The query surface is the search and filter API of Section 8, which compiles to Lance scalar predicates and search calls; there is no SQL. The only engine is embedded Lance.
+- **Become a SQL database, a UI, or a sidecar daemon.** The primary query surface is the search and filter API of Section 8, which compiles to Lance scalar predicates and search calls. Alongside it sits one read-only SQL escape hatch - the `pond_sql_query` tool (Section 7.7) and the `pond sql` verb (Section 7.8): a single SELECT planned by embedded DataFusion over the same Lance datasets, never a write path and never a second storage engine. The only engine is embedded Lance; there is no UI and no daemon beyond `pond serve`.
 
 ### 2.4 Platform
 
@@ -150,7 +150,7 @@ c. **`session_id` leading the primary key** {#lance-table-creation-session-scope
 
 All of a consumer's datasets share one Lance cache and one object-store client. Why: one pool, rather than one per table, avoids multiplying connections and credential refreshes on object-store backends.
 
-### 3.5 Concurrency
+### 3.5 Concurrency {#concurrency}
 
 pond processes are stateless workers. Several may write the same namespace at once; Lance optimistic concurrency control resolves append conflicts through manifest versioning. There is no external coordinator - object stores provide atomic conditional writes, the local filesystem uses Lance's commit lock - and no in-process write queue.
 
@@ -370,9 +370,9 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 |---|---|
 | `id` | primary key |
 | `parent_session_id`, `parent_message_id` | nullable fork pointers |
-| `source_agent` | scalar-indexed, low cardinality |
+| `source_agent` | low cardinality; the scalar-indexed copy is the denormalized `messages.source_agent` (5.3) |
 | `created_at` | source-recorded |
-| `project` | scalar-indexed; equality and prefix |
+| `project` | the scalar-indexed copy is the denormalized `messages.project` (5.3) |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
 `messages` - one row per Message:
@@ -382,7 +382,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `session_id`, `id` | composite primary key; clustered on `(session_id, timestamp)` |
 | `timestamp` | scalar-indexed; canonical ordering key |
 | `role` | scalar-indexed |
-| `source_agent`, `project` | denormalized; filter-pushdown surface |
+| `source_agent`, `project` | denormalized; the scalar-indexed filter-pushdown surface |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
 | `vector` | Float16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
@@ -395,7 +395,8 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 |---|---|
 | `session_id`, `message_id`, `id` | composite primary key; clustered on `(session_id, message_id)` |
 | `ordinal` | position within the message's content |
-| `type` | the Part discriminator; scalar-indexed |
+| `type` | the Part discriminator |
+| `provenance` | conversational vs injected (`model-part-provenance`, 4.8); search reads it to exclude injected scaffolding |
 | `variant_data` | JSON (Lance `pa.json_()`, stored as JSONB); the variant-specific fields |
 | `data` | Lance blob; FilePart payload only |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
@@ -513,7 +514,7 @@ Every request carries `protocol_version` (a positive integer; v1 is `1`) and an 
 
 **`wire-namespace-resolution`** {#wire-namespace-resolution} - Whether a request's namespace is acceptable, and which stored tables it maps to, MUST be decided in exactly one place. Why: hosted multi-tenancy turns one namespace into many; centralizing the decision makes that a single change, not an edit at every call site.
 
-### 7.4 The error model
+### 7.4 The error model {#error-model}
 
 Success and error are mutually exclusive at the body level. An error body is one shape:
 
@@ -531,7 +532,7 @@ The code set is closed:
 | `namespace_unknown` | a namespace string not provisioned | 403 | no |
 | `storage_unavailable` | a Lance or object-store failure after retry was exhausted | 503 | yes |
 | `conflict` | optimistic-concurrency retry exhausted on a write | 409 | yes |
-| `internal` | an unhandled fault | 500 | maybe once |
+| `internal` | an unhandled fault | 500 | no |
 
 Retryability is conveyed by the code; there is no separate field. `conflict` is the wire mapping of the substrate's conflict signal (Section 3).
 
@@ -541,7 +542,7 @@ Retryability is conveyed by the code; there is no separate field. `conflict` is 
 2. **`pond_get`** (`POST /v1/get`) - fetch a whole session, or one message with surrounding context. Session mode takes a `response_mode`: `conversational` (the default - human/model text, with a compact `parts_summary` per message), `complete` (all messages including system/tool carriers, with `parts_summary`), or `verbatim` (all messages with full Parts inline). Session mode also takes `session_from`: `start` (the default - oldest messages first) or `end` (the most recent messages, still in chronological order - e.g. recovering recent context after compaction). Message mode returns the target's full Parts (paginated) plus `context_depth` sibling messages each side; the siblings follow `response_mode` - conversational by default, so system/tool carriers do not crowd the conversation out of the window - while the target itself returns regardless of role. Pages are bounded by a size budget and never cut mid-message; when `messages_remaining` (session) or `target_parts_remaining` (message) is non-zero, the caller pages on by passing the last returned id as `after_id`. Not for bulk export - that is the restore/export path.
 3. **`pond_ingest`** (`POST /v1/ingest`) - accept a batch of canonical events. Always batched, bounded by an event count and a body-size cap. Events are grouped by session and applied per session; partial success across sessions is normal and reported per row.
 
-Two resources, `schema://pond` and `stats://pond`, expose the search-field documentation and dataset statistics.
+Three resources - `schema://pond`, `schema://pond-sql`, and `stats://pond` - expose the search-field documentation, the SQL surface's table schemas, and dataset statistics. The read-only SQL query surface is not an HTTP operation: it is exposed as the `pond_sql_query` MCP tool (7.7) and the `pond sql` verb (7.8).
 
 ### 7.6 Ingest events
 
@@ -559,6 +560,7 @@ The same handlers back a set of command-line verbs:
 - `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge.
 - `pond search [--explain]` - hybrid search from the command line. `--explain` returns Lance's `analyze_plan` output instead of results.
 - `pond get` - fetch a session, or one message with context, from the command line.
+- `pond sql` - one read-only SQL query over the corpus: a DataFusion-planned SELECT/WITH over the three session datasets, with the same two-layer read-only enforcement as the `pond_sql_query` tool (Section 7.7). Results render inline (row-capped) or export to parquet/ndjson.
 - `pond status` - row counts, dataset statistics, embedding coverage, index health, and the sync-schedule state. It prints the cheap storage summary first, then completes the longer checks.
 - `pond serve --transport http|stdio` - run HTTP by default, or MCP over stdio.
 - `pond mcp` - alias for `pond serve --transport stdio`.

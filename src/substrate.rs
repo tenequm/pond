@@ -1,3 +1,6 @@
+//! The storage substrate (spec.md#substrate): pond's one seam to Lance,
+//! generic over consumers.
+
 use crate::{
     RetryPolicy,
     config::{self, CredsSet},
