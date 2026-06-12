@@ -399,13 +399,29 @@ async fn pick_storage(
                 cliclack::log::warning(format!(
                     "{reason}\nCreds bind via [creds.default] in config or POND_CREDS_DEFAULT_* env (spec: creds scope match)."
                 ))?;
-                let keep = wiz(cliclack::confirm("Keep this destination anyway?")
-                    .initial_value(false)
+                let local = platform_default_storage();
+                let action = wiz(cliclack::select("What now?")
+                    .item(
+                        'l',
+                        format!("Store locally instead ({local})"),
+                        "safe default",
+                    )
+                    .item('e', "Edit the URL / fix creds and retry", "")
+                    .item(
+                        'k',
+                        "Keep this destination anyway",
+                        "writes a failing config",
+                    )
                     .interact())?;
-                if keep {
-                    return Ok(chosen);
+                match action {
+                    'l' => {
+                        return StorageUrl::parse(&local).with_context(|| {
+                            format!("platform default storage path {local:?} does not parse")
+                        });
+                    }
+                    'k' => return Ok(chosen),
+                    _ => current = text,
                 }
-                current = text;
             }
         }
     }
