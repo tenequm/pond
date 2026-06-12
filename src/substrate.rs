@@ -1509,9 +1509,12 @@ impl Handle {
         caps: RuntimeCaps,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
-            tokio::fs::create_dir_all(&path)
-                .await
-                .with_context(|| format!("failed to create data dir {}", path.display()))?;
+            tokio::fs::create_dir_all(&path).await.with_context(|| {
+                format!(
+                    "failed to create data dir {}; fix the storage destination ([storage].path in config) or re-run `pond init`",
+                    path.display()
+                )
+            })?;
         } else {
             apply_remote_storage_defaults(&mut storage_options);
         }

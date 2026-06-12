@@ -15,6 +15,8 @@ use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ScheduleEvery {
+    #[value(name = "5m")]
+    M5,
     #[value(name = "15m")]
     M15,
     #[value(name = "1h")]
@@ -28,6 +30,7 @@ pub(crate) enum ScheduleEvery {
 impl ScheduleEvery {
     fn secs(self) -> u32 {
         match self {
+            Self::M5 => 300,
             Self::M15 => 900,
             Self::H1 => 3_600,
             Self::H6 => 21_600,
@@ -37,6 +40,7 @@ impl ScheduleEvery {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::M5 => "5m",
             Self::M15 => "15m",
             Self::H1 => "1h",
             Self::H6 => "6h",
@@ -45,7 +49,7 @@ impl ScheduleEvery {
     }
 
     fn from_secs(secs: u32) -> Option<Self> {
-        [Self::M15, Self::H1, Self::H6, Self::D1]
+        [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
             .into_iter()
             .find(|every| every.secs() == secs)
     }
@@ -58,12 +62,12 @@ pub(crate) enum ScheduleCmd {
     /// Re-running with a different `--every` replaces the existing
     /// registration; re-running with the same one is a no-op.
     #[command(after_long_help = "Examples:
-  pond schedule start              every hour (the default)
-  pond schedule start --every 15m
+  pond schedule start              every 5 minutes (the default)
+  pond schedule start --every 1h
   pond schedule start --every 1d")]
     Start {
         /// How often to run `pond sync -q`.
-        #[arg(long, value_enum, default_value_t = ScheduleEvery::H1)]
+        #[arg(long, value_enum, default_value_t = ScheduleEvery::M5)]
         every: ScheduleEvery,
     },
     /// Remove the schedule.
@@ -636,6 +640,7 @@ mod unix {
     fn cron_entry(bin: &Path, every: ScheduleEvery, log: &Path, minute: u32) -> String {
         let command = format!("{} sync -q >> {} 2>&1", bin.display(), log.display());
         let schedule = match every {
+            ScheduleEvery::M5 => format!("{}-59/5 * * * *", minute % 5),
             ScheduleEvery::M15 => {
                 let m = minute % 15;
                 format!("{m},{},{},{} * * * *", m + 15, m + 30, m + 45)
@@ -654,11 +659,16 @@ mod unix {
         if fields.len() < 5 {
             return None;
         }
-        match (fields[0].contains(','), fields[1]) {
-            (true, "*") => Some(ScheduleEvery::M15),
-            (false, "*") => Some(ScheduleEvery::H1),
-            (false, "*/6") => Some(ScheduleEvery::H6),
-            (false, _) => Some(ScheduleEvery::D1),
+        match (fields[0], fields[1]) {
+            (minute, "*") if minute.contains('/') => Some(ScheduleEvery::M5),
+            (minute, "*") if minute.contains(',') => Some(ScheduleEvery::M15),
+            (_, "*") => Some(ScheduleEvery::H1),
+            (minute, "*/6") if !minute.contains(',') && !minute.contains('/') => {
+                Some(ScheduleEvery::H6)
+            }
+            (minute, _) if !minute.contains(',') && !minute.contains('/') => {
+                Some(ScheduleEvery::D1)
+            }
             _ => None,
         }
     }
@@ -772,6 +782,29 @@ mod unix {
         write_crontab(&strip_cron_fence(&existing))?;
         Ok(true)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cron_entries_reverse_map_to_their_cadence() {
+            let bin = Path::new("/usr/local/bin/pond");
+            let log = Path::new("/tmp/sync.log");
+            for every in [
+                ScheduleEvery::M5,
+                ScheduleEvery::M15,
+                ScheduleEvery::H1,
+                ScheduleEvery::H6,
+                ScheduleEvery::D1,
+            ] {
+                for minute in [0, 7, 59] {
+                    let entry = cron_entry(bin, every, log, minute);
+                    assert_eq!(cron_entry_interval(&entry), Some(every), "entry: {entry}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -783,6 +816,7 @@ mod tests {
     #[test]
     fn every_round_trips_through_secs_and_labels() {
         for every in [
+            ScheduleEvery::M5,
             ScheduleEvery::M15,
             ScheduleEvery::H1,
             ScheduleEvery::H6,

@@ -239,12 +239,15 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
                     .interact(),
             )?;
             if wanted {
+                // cliclack renders hints only on the focused item, so the
+                // recommendation rides in the label to stay visible.
                 Some(wiz(cliclack::select("How often?")
+                    .item(ScheduleEvery::M5, "every 5 minutes (recommended)", "")
                     .item(ScheduleEvery::M15, "every 15 minutes", "")
-                    .item(ScheduleEvery::H1, "every hour", "recommended")
+                    .item(ScheduleEvery::H1, "every hour", "")
                     .item(ScheduleEvery::H6, "every 6 hours", "")
                     .item(ScheduleEvery::D1, "daily", "")
-                    .initial_value(ScheduleEvery::H1)
+                    .initial_value(ScheduleEvery::M5)
                     .interact())?)
             } else {
                 None
@@ -339,9 +342,39 @@ fn platform_default_storage() -> String {
     .unwrap_or_else(|| "~/.local/share/pond".to_owned())
 }
 
-/// Resolve the storage section: flag > prompt (with inline end-to-end probe
-/// for remote URLs) > default. Remote destinations are probed BEFORE they
-/// can land in config; a failing one needs an explicit "keep anyway".
+/// Why a local destination can never become a data dir: the target (or its
+/// nearest existing ancestor) is a file. `None` for remote URLs and viable
+/// paths. The path is NOT required to exist - `create_dir_all` at first use
+/// handles that - and writability is not probed (there is no reliable check
+/// without side effects); this rejects only what is structurally impossible.
+fn structural_error(url: &StorageUrl) -> Option<String> {
+    // Re-collect components: `uri_to_url` leaves a trailing slash on the
+    // path, and `stat("/etc/hosts/")` is ENOTDIR (not "exists as a file").
+    let path: PathBuf = config::local_path(url.canonical())?.components().collect();
+    let mut probe = path.as_path();
+    loop {
+        if probe.exists() {
+            if probe.is_dir() {
+                return None;
+            }
+            let shown = config::contract_home(probe).display().to_string();
+            return Some(if probe == path {
+                format!("{shown} is an existing file, not a directory")
+            } else {
+                format!("{shown} is a file, so a data dir can't be created under it")
+            });
+        }
+        probe = probe.parent()?;
+    }
+}
+
+/// Resolve the storage section: flag > prompt > default. The interactive
+/// prompt is a select with the local default always one keypress away;
+/// free-text URL entry is the opt-in branch, not the first question. Remote
+/// destinations are probed BEFORE they can land in config (a failing one
+/// needs an explicit "keep anyway"); local ones get the structural check
+/// instead - a file collision is permanent, so it is a hard reject with no
+/// keep-anyway escape.
 async fn pick_storage(
     args: &InitArgs,
     doc: &DocumentMut,
@@ -354,6 +387,12 @@ async fn pick_storage(
         .map(|config| config.creds)
         .unwrap_or_default();
     if let Some(chosen) = args.storage_path.clone() {
+        if let Some(reason) = structural_error(&chosen) {
+            bail!(
+                "--storage-path {}: {reason}; pick a directory",
+                chosen.display()
+            );
+        }
         if !chosen.is_local()
             && let Err(reason) = probe_destination(&chosen, &creds).await
         {
@@ -367,6 +406,12 @@ async fn pick_storage(
     if !prompts {
         let chosen = StorageUrl::parse(default)
             .with_context(|| format!("existing storage path {default:?} does not parse"))?;
+        if let Some(reason) = structural_error(&chosen) {
+            bail!(
+                "configured storage {}: {reason}; re-run `pond init --storage-path <dir>` (or fix [storage].path in config)",
+                chosen.display(),
+            );
+        }
         if !chosen.is_local()
             && let Err(reason) = probe_destination(&chosen, &creds).await
         {
@@ -379,19 +424,66 @@ async fn pick_storage(
         }
         return Ok(chosen);
     }
-    let mut current = default.to_owned();
+    let local = platform_default_storage();
+    // "Keep current" earns its slot only when the carried-forward value is
+    // distinct from the local default and could actually work; a broken one
+    // stays reachable through the free-text branch, where the validator says
+    // why it is broken instead of silently re-offering it.
+    let keep = (default != local)
+        .then(|| StorageUrl::parse(default).ok())
+        .flatten()
+        .filter(|url| structural_error(url).is_none())
+        .map(|_| default.to_owned());
+    // An unparseable carry-forward (the bucketless legacy guess) skips the
+    // select and lands in the input, so "add the bucket and prefix to the
+    // URL below" points at an actual URL input.
+    let mut prefill =
+        (default != local && StorageUrl::parse(default).is_err()).then(|| default.to_owned());
     loop {
-        let text: String = wiz(cliclack::input("Where should pond store its data?")
-            .default_input(&current)
-            .validate(|input: &String| {
-                StorageUrl::parse(input)
-                    .map(|_| ())
-                    .map_err(|error| format!("{error:#}"))
-            })
-            .interact())?;
+        let text: String = match prefill.take() {
+            Some(value) => wiz(cliclack::input("Storage path or URL")
+                .default_input(&value)
+                .validate(|input: &String| match StorageUrl::parse(input) {
+                    Err(error) => Err(format!("{error:#}")),
+                    Ok(url) => structural_error(&url).map_or(Ok(()), Err),
+                })
+                .interact())?,
+            None => {
+                let mut select = cliclack::select("Where should pond store its data?");
+                // cliclack renders hints only on the focused item, so the
+                // recommendation rides in the label to stay visible.
+                select = match &keep {
+                    Some(current) => select
+                        .item('k', format!("Keep current ({current})"), "")
+                        .item('l', format!("Locally ({local})"), "")
+                        .initial_value('k'),
+                    None => select
+                        .item('l', format!("Locally ({local}) - recommended"), "")
+                        .initial_value('l'),
+                };
+                select = select.item('o', "Somewhere else (path or S3 URL)", "");
+                match wiz(select.interact())? {
+                    'l' => local.clone(),
+                    'k' => keep.clone().unwrap_or_else(|| local.clone()),
+                    _ => {
+                        prefill = Some(default.to_owned());
+                        continue;
+                    }
+                }
+            }
+        };
         let chosen = StorageUrl::parse(&text)?;
         if chosen.is_local() {
-            return Ok(chosen);
+            // Reachable for select-sourced values only; the free-text
+            // validator already ran the same check inline.
+            match structural_error(&chosen) {
+                None => return Ok(chosen),
+                Some(reason) => {
+                    cliclack::log::warning(reason)?;
+                    prefill = Some(text);
+                    continue;
+                }
+            }
         }
         match probe_destination(&chosen, &creds).await {
             Ok(()) => return Ok(chosen),
@@ -399,7 +491,6 @@ async fn pick_storage(
                 cliclack::log::warning(format!(
                     "{reason}\nCreds bind via [creds.default] in config or POND_CREDS_DEFAULT_* env (spec: creds scope match)."
                 ))?;
-                let local = platform_default_storage();
                 let action = wiz(cliclack::select("What now?")
                     .item(
                         'l',
@@ -420,7 +511,7 @@ async fn pick_storage(
                         });
                     }
                     'k' => return Ok(chosen),
-                    _ => current = text,
+                    _ => prefill = Some(text),
                 }
             }
         }
@@ -643,6 +734,9 @@ struct LegacyStorage {
     secret_access_key: Option<String>,
     endpoint: Option<String>,
     path: Option<String>,
+    /// The legacy addressing-style key. When true, the endpoint host carries
+    /// the bucket as its leading label, which makes the URL guess exact.
+    virtual_hosted: bool,
 }
 
 /// Recognize the pre-redesign `[storage]` passthrough map (the same shape
@@ -663,6 +757,15 @@ fn extract_legacy_storage(doc: &DocumentMut) -> Option<LegacyStorage> {
                 .then(|| item.as_str().unwrap_or_default().to_owned())
         })
     };
+    // The legacy map held string-typed env values, but accept a TOML bool too.
+    let truthy = |item: &Item| {
+        item.as_bool()
+            .or_else(|| {
+                item.as_str()
+                    .map(|text| text.eq_ignore_ascii_case("true") || text == "1")
+            })
+            .unwrap_or(false)
+    };
     Some(LegacyStorage {
         access_key_id: get(config::LEGACY_ACCESS_KEY_KEYS),
         secret_access_key: get(config::LEGACY_SECRET_KEY_KEYS),
@@ -671,6 +774,12 @@ fn extract_legacy_storage(doc: &DocumentMut) -> Option<LegacyStorage> {
             .get("path")
             .and_then(Item::as_str)
             .map(str::to_owned),
+        virtual_hosted: storage.iter().any(|(key, item)| {
+            config::LEGACY_VIRTUAL_HOSTED_KEYS
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+                && truthy(item)
+        }),
     })
 }
 
@@ -714,8 +823,8 @@ fn apply_legacy_rewrite(doc: &mut DocumentMut, legacy: &LegacyStorage) -> Option
 /// prompt. Pure (no mutation) so the caller can test the guess for usability
 /// before committing to the rewrite. The old format can't always say where the
 /// bucket ends and the host begins (virtual-hosted endpoints fold the bucket
-/// into the hostname), so the guess goes through the same validation +
-/// end-to-end probe as any hand-typed URL.
+/// into the hostname) - unless the addressing-style key pins it - so the guess
+/// goes through the same validation + end-to-end probe as any hand-typed URL.
 fn legacy_url_guess(legacy: &LegacyStorage) -> Option<String> {
     let host = legacy
         .endpoint
@@ -726,18 +835,32 @@ fn legacy_url_guess(legacy: &LegacyStorage) -> Option<String> {
         // Legacy `s3://bucket/prefix` + endpoint host: fold the host in. This
         // arm must come before the parse-wins arm below - a plain `s3://` URL
         // parses fine on its own but means "ambient AWS endpoint", which would
-        // silently drop the configured custom endpoint.
-        (Some(host), Some(path)) if path.starts_with("s3://") => Some(format!(
-            "s3+https://{host}/{}",
-            path.trim_start_matches("s3://"),
-        )),
+        // silently drop the configured custom endpoint. Under the declared
+        // virtual-hosted style the endpoint host already leads with the
+        // bucket; strip it or the new grammar (virtual-hosted by default)
+        // folds the bucket in twice.
+        (Some(host), Some(path)) if path.starts_with("s3://") => {
+            let rest = path.trim_start_matches("s3://");
+            let bucket = rest.split('/').next().unwrap_or_default();
+            let host = (legacy.virtual_hosted)
+                .then(|| host.strip_prefix(&format!("{bucket}.")))
+                .flatten()
+                .unwrap_or(host);
+            Some(format!("s3+https://{host}/{rest}"))
+        }
         // A path already carrying its own host (`s3+https://host/bucket/...`)
         // wins outright: the endpoint key is redundant once the URL has one.
         (_, Some(path)) if StorageUrl::parse(path).is_ok() => Some(path.to_owned()),
-        // Endpoint only: virtual-hosted addressing folds the bucket into the
-        // hostname, so this guess is bucketless - the caller flags it as needing
-        // the bucket/prefix appended before it will validate.
-        (Some(host), _) => Some(format!("s3+https://{host}/")),
+        // Endpoint only. With the virtual-hosted key declared, the bucket IS
+        // the leading host label - de-fold it and the guess is exact. Without
+        // it the guess is bucketless and fails to validate, which is the
+        // signal the wizard uses to ask for the bucket/prefix.
+        (Some(host), _) => match host.split_once('.') {
+            Some((bucket, rest)) if legacy.virtual_hosted && rest.contains('.') => {
+                Some(format!("s3+https://{rest}/{bucket}"))
+            }
+            _ => Some(format!("s3+https://{host}/")),
+        },
         (None, Some(path)) => Some(path.to_owned()),
         (None, None) => None,
     }
@@ -791,6 +914,7 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             secret_access_key: Some("shh".to_owned()),
             endpoint: Some("https://nbg1.example.com".to_owned()),
             path: Some("s3+https://nbg1.example.com/bucket/prefix".to_owned()),
+            virtual_hosted: false,
         };
         assert_eq!(
             legacy_url_guess(&legacy).as_deref(),
@@ -808,6 +932,7 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             secret_access_key: Some("shh".to_owned()),
             endpoint: Some("https://nbg1.example.com".to_owned()),
             path: Some("s3://mybucket/agent-sessions".to_owned()),
+            virtual_hosted: false,
         };
         assert_eq!(
             legacy_url_guess(&legacy).as_deref(),
@@ -822,18 +947,32 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             legacy_url_guess(&ambient).as_deref(),
             Some("s3://mybucket/agent-sessions"),
         );
+        // A virtual-hosted endpoint already leads with the bucket; folding the
+        // s3:// path in must not double it.
+        let folded = LegacyStorage {
+            endpoint: Some("https://mybucket.nbg1.example.com".to_owned()),
+            virtual_hosted: true,
+            ..ambient
+        };
+        assert_eq!(
+            legacy_url_guess(&folded).as_deref(),
+            Some("s3+https://nbg1.example.com/mybucket/agent-sessions"),
+        );
     }
 
     #[test]
-    fn legacy_url_guess_is_bucketless_for_a_virtual_hosted_endpoint() {
-        // Endpoint host carries the bucket as its leading label; the guess can't
-        // recover the split, so it comes out bucketless and fails to parse - the
-        // signal the wizard uses to ask for the bucket/prefix.
+    fn legacy_url_guess_defolds_a_declared_virtual_hosted_endpoint() {
+        // Endpoint host carries the bucket as its leading label. Without the
+        // addressing-style key the guess can't recover the split, so it comes
+        // out bucketless and fails to parse - the signal the wizard uses to
+        // ask for the bucket/prefix. With the key declared, the split is
+        // exact and the guess validates as-is.
         let legacy = LegacyStorage {
             access_key_id: Some("AKIA123".to_owned()),
             secret_access_key: Some("shh".to_owned()),
             endpoint: Some("https://ttq.nbg1.your-objectstorage.com".to_owned()),
             path: None,
+            virtual_hosted: false,
         };
         let guess = legacy_url_guess(&legacy).expect("a guess is produced");
         assert_eq!(guess, "s3+https://ttq.nbg1.your-objectstorage.com/");
@@ -841,6 +980,58 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             StorageUrl::parse(&guess).is_err(),
             "bucketless guess must not validate: {guess}"
         );
+        let declared = LegacyStorage {
+            virtual_hosted: true,
+            ..legacy
+        };
+        let guess = legacy_url_guess(&declared).expect("a guess is produced");
+        assert_eq!(guess, "s3+https://nbg1.your-objectstorage.com/ttq");
+        StorageUrl::parse(&guess).expect("de-folded guess validates");
+    }
+
+    #[test]
+    fn extract_legacy_storage_reads_the_virtual_hosted_key() {
+        // String-typed "true" (the env-style legacy form) and a TOML bool both
+        // count; absence means false.
+        for (line, want) in [
+            ("aws_virtual_hosted_style_request = \"true\"", true),
+            ("aws_virtual_hosted_style_request = true", true),
+            ("aws_virtual_hosted_style_request = \"false\"", false),
+            ("", false),
+        ] {
+            let doc: DocumentMut = format!(
+                "[storage]\nAWS_ACCESS_KEY_ID = \"AKIA123\"\nAWS_ENDPOINT = \"https://b.example.com\"\n{line}\n"
+            )
+            .parse()
+            .unwrap();
+            let legacy = extract_legacy_storage(&doc).expect("legacy map detected");
+            assert_eq!(legacy.virtual_hosted, want, "for line {line:?}");
+        }
+    }
+
+    #[test]
+    fn structural_error_rejects_file_collisions_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "x").unwrap();
+        let target_is_file = StorageUrl::parse(&file.display().to_string()).unwrap();
+        assert!(
+            structural_error(&target_is_file)
+                .expect("file target rejected")
+                .contains("existing file"),
+        );
+        let under_file = StorageUrl::parse(&file.join("data").display().to_string()).unwrap();
+        assert!(
+            structural_error(&under_file)
+                .expect("ancestor file rejected")
+                .contains("can't be created"),
+        );
+        // Not existing yet is fine (create_dir_all at first use), and remote
+        // URLs are out of scope.
+        let fresh = StorageUrl::parse(&dir.path().join("a/b/c").display().to_string()).unwrap();
+        assert_eq!(structural_error(&fresh), None);
+        let remote = StorageUrl::parse("s3+https://host.example.com/bucket/p").unwrap();
+        assert_eq!(structural_error(&remote), None);
     }
 
     #[test]

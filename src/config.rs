@@ -681,6 +681,10 @@ fn env_mirror() -> Env {
 pub const LEGACY_ENDPOINT_KEYS: &[&str] = &["aws_endpoint", "endpoint"];
 pub const LEGACY_ACCESS_KEY_KEYS: &[&str] = &["aws_access_key_id", "access_key_id"];
 pub const LEGACY_SECRET_KEY_KEYS: &[&str] = &["aws_secret_access_key", "secret_access_key"];
+pub const LEGACY_VIRTUAL_HOSTED_KEYS: &[&str] = &[
+    "aws_virtual_hosted_style_request",
+    "virtual_hosted_style_request",
+];
 
 /// Recognize the pre-redesign `[storage]` passthrough map (ENV-style
 /// `object_store` keys) and return the exact rewrite onto `[storage].path` +
@@ -706,10 +710,28 @@ fn detect_legacy_storage(path: &Path) -> Option<String> {
         .as_deref()
         .and_then(|e| e.split("://").nth(1))
         .unwrap_or("<endpoint-host>");
+    // Under the declared virtual-hosted style the endpoint host leads with
+    // the bucket; de-fold it, or following the recipe verbatim folds the
+    // bucket in twice (the new grammar re-applies virtual hosting).
+    let virtual_hosted = storage.iter().any(|(key, value)| {
+        LEGACY_VIRTUAL_HOSTED_KEYS
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+            && (value.as_bool().unwrap_or(false)
+                || value
+                    .as_str()
+                    .is_some_and(|text| text.eq_ignore_ascii_case("true") || text == "1"))
+    });
+    let path_recipe = match host.split_once('.') {
+        Some((bucket, rest)) if virtual_hosted && rest.contains('.') => {
+            format!("s3+https://{rest}/{bucket}/<prefix>")
+        }
+        _ => format!("s3+https://{host}/<bucket>/<prefix>"),
+    };
     // spec.md#storage-redaction: never echo credential values, even back to
     // their owner - stderr lands in logs, scrollback, and pasted bug reports.
     let mut recipe = format!(
-        "config {} uses the old [storage] passthrough map; rewrite it as:\n\n[storage]\npath = \"s3+https://{host}/<bucket>/<prefix>\"\n\n[creds.default]\n",
+        "config {} uses the old [storage] passthrough map; rewrite it as:\n\n[storage]\npath = \"{path_recipe}\"\n\n[creds.default]\n",
         path.display(),
     );
     recipe.push_str("access_key_id     = \"...\"  # copy from the old [storage] section\n");
@@ -1128,9 +1150,12 @@ aws_virtual_hosted_style_request = "true"
                 .to_string();
             // The error IS the migration: old keys mapped onto the new shape.
             assert!(err.contains("old [storage] passthrough map"), "got: {err}");
+            // The declared virtual-hosted style pins the bucket as the leading
+            // host label; the recipe must de-fold it, not repeat the folded
+            // host (which the new grammar would fold again).
             assert!(
-                err.contains("s3+https://ttq.nbg1.your-objectstorage.com/"),
-                "endpoint host must fold into the URL recipe, got: {err}",
+                err.contains("s3+https://nbg1.your-objectstorage.com/ttq/<prefix>"),
+                "recipe must de-fold the virtual-hosted endpoint, got: {err}",
             );
             // spec.md#storage-redaction: the recipe must NOT echo the real
             // key values - placeholders plus a "copy from" pointer only.
@@ -1143,6 +1168,23 @@ aws_virtual_hosted_style_request = "true"
             assert!(!err.contains("region            ="), "got: {err}");
             assert!(err.contains("?region="), "got: {err}");
             assert!(err.contains("pond storage check"), "got: {err}");
+            // Without the addressing-style key the split is unknowable; the
+            // recipe keeps the host verbatim with a <bucket> placeholder.
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+AWS_ACCESS_KEY_ID = "AKIA123"
+AWS_ENDPOINT = "https://ttq.nbg1.your-objectstorage.com"
+"#,
+            )?;
+            let err = Config::load("config.toml")
+                .expect_err("legacy map must error")
+                .to_string();
+            assert!(
+                err.contains("s3+https://ttq.nbg1.your-objectstorage.com/<bucket>/<prefix>"),
+                "got: {err}",
+            );
             Ok(())
         });
     }

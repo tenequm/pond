@@ -113,7 +113,7 @@ pond sync -y                       # auto-accept probe prompts (non-TTY runs)
 Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
 
 ```sh
-pond schedule start --every 1h
+pond schedule start                # every 5m by default (--every 15m|1h|6h|1d)
 pond schedule status
 pond schedule logs
 ```
