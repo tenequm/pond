@@ -13,4 +13,3 @@ docs/
 .DS_Store
 .env*
 .secrets*
-ops/ci/

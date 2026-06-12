@@ -7,7 +7,6 @@ on:
     branches: [main]
     paths:
       - "docs/**"
-      - "wrangler.jsonc"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -42,3 +41,4 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4"
+          workingDirectory: docs

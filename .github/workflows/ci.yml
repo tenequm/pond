@@ -116,7 +116,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # Assemble pond's own (private) release first: it is the source of truth the
+      # Assemble pond's own release first: it is the source of truth the
       # homebrew/nix mirrors copy their notes from, so it must be complete before
       # any mirror runs - and a later mirror failure must never starve it.
       - name: Mirror binaries to pond release
@@ -131,8 +131,8 @@ jobs:
         # carries stale goreleaser-era files (incl a 0-byte digests.txt that
         # GitHub rejects with "Bad Content-Length"). pond-* + checksums.txt is
         # exactly our archives, signatures, and checksums.
-        # Notes mirror pond's own release body (release-plz changelog). pond is
-        # private, so downstream tap users only see the changelog if we embed it.
+        # Notes mirror pond's own release body (release-plz changelog) so
+        # downstream tap users see the changelog without a second lookup.
         run: |
           notes=$(gh release view "v$V" -R tenequm/pond --json body -q .body)
           gh release create "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap \

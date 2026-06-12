@@ -16,7 +16,7 @@ readme = "README.md"
 keywords = ["agents", "mcp", "lance", "search", "session-logs"]
 categories = ["command-line-utilities", "database", "artificial-intelligence"]
 # Publish only what `cargo install` compiles. The repo's bulk is dev-only:
-# tests/fixtures (~10 MiB) and docs/references vendored trees + PDFs (~5 MiB).
+# tests/fixtures (~10 MiB) lives under tests/.
 # benches/ stays - the [[bench]] targets declare paths cargo resolves on build.
 exclude = [
     "tests/",
@@ -26,21 +26,17 @@ exclude = [
     ".github/",
     ".moon/",
     "moon.yml",
-    "Dockerfile",
-    ".dockerignore",
     "AGENTS.md",
     "CLAUDE.md",
-    "SECURITY.md",
     "SKILL.md",
-    "release-plz.toml",
-    "*.pdf",
+    ".release-plz.toml",
     "**/.DS_Store",
 ]
 
-# cargo-binstall: binaries live on the PUBLIC homebrew-tap release (pond is a
-# private repo), under tag `pond-vX.Y.Z` with `pond` at the archive root - so the
-# URL is fully custom; binstall's default `{ repo }` + `v{version}` tag would
-# 404. `{ bin }` resolves to `pond` (the [[bin]] name), not the crate `pond-db`.
+# cargo-binstall: binaries live on the homebrew-tap release under tag
+# `pond-vX.Y.Z` with `pond` at the archive root - so the URL is fully custom;
+# binstall's default `{ repo }` + `v{version}` tag would 404. `{ bin }` resolves
+# to `pond` (the [[bin]] name), not the crate `pond-db`.
 [package.metadata.binstall]
 pkg-url = "https://github.com/tenequm/homebrew-tap/releases/download/pond-v{ version }/pond-{ target }{ archive-suffix }"
 pkg-fmt = "txz"

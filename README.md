@@ -159,28 +159,26 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 
 ## References
 
-`docs/references/` holds frozen snapshots of upstream schemas; real session captures live under `tests/fixtures/adapter/`. Each subdirectory's README pins the source URL, the upstream commit, and the snapshot date.
+The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `tests/fixtures/adapter/`.
 
-| Path | Source | Why kept |
-|------|--------|----------|
-| `docs/references/effect/` | github.com/Effect-TS/effect | Effect v4 Prompt/Response Part unions. Pond's canonical types copy this shape. |
-| `docs/references/opencode/` | github.com/sst/opencode | Effect Schema canonical Part union; SDK types; storage schema. |
-| `docs/references/kilocode/` | github.com/kilo-org/kilocode | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
-| `docs/references/pi-coding-agent/` | github.com/badlogic/pi-mono | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
-| `docs/references/otel-genai-semconv.md` | github.com/open-telemetry/semantic-conventions-genai | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `docs/references/anthropic-managed-agents.pdf` | Anthropic | Session-as-event-log framing for managed agents. |
-| `docs/references/recursive-language-models-study-2512.24601v3.pdf` | arXiv 2512.24601 | Long context as a queryable environment; recursion as sub-agent spawning - corroborates the linked-Sessions branching model. |
-| `tests/fixtures/adapter/` | local captures | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as adapter test fixtures. |
+| Source | Why it matters |
+|--------|----------------|
+| [Effect-TS/effect](https://github.com/Effect-TS/effect) | Effect v4 Prompt/Response Part unions. Pond's canonical types copy this shape. |
+| [sst/opencode](https://github.com/sst/opencode) | Effect Schema canonical Part union; SDK types; storage schema. |
+| [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
+| [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
+| [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
+| `tests/fixtures/adapter/` | Real session captures for eight source harnesses (claude_code, claude_app, claude_managed_agents, codex_cli, opencode, openclaw, nanoclaw, pi). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 
 Issues and pull requests are welcome. The most useful contributions right now:
 
 - Spec feedback on [`docs/spec.md`](docs/spec.md).
-- Pointers to additional reference schemas or session samples worth snapshotting under `docs/references/`.
+- Pointers to additional reference schemas or session samples worth documenting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
 
-For larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](SECURITY.md).
+For larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](.github/SECURITY.md).
 
 ## License
 

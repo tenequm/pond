@@ -2672,8 +2672,8 @@ fn format_sync_outcome(summary: &IngestSummary, drops: u64, errors: u64) -> Stri
 /// One greppable per-session log line. Examples:
 ///
 /// ```text
-/// [00:04:32] claude-code ok    project=/Users/tenequm/Projects/pond  session=58a96901-4a4f-40be-a3c1-62419ec8c580  msgs=512
-/// [00:04:33] claude-code skip  /Users/tenequm/.../58a96901-....jsonl: empty jsonl session
+/// [00:04:32] claude-code ok    project=/Users/you/Projects/app  session=58a96901-4a4f-40be-a3c1-62419ec8c580  msgs=512
+/// [00:04:33] claude-code skip  /Users/you/.../58a96901-....jsonl: empty jsonl session
 /// ```
 fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str>) -> String {
     use pond::output::{dim, green, paint, red, yellow};

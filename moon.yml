@@ -50,7 +50,7 @@ tasks:
         --secret "id=kache_s3_access_key,env=KACHE_S3_ACCESS_KEY" \
         --secret "id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY" \
         --output "type=local,dest=target/dist" \
-        -f Dockerfile \
+        -f ops/ci-build-docker-image/Dockerfile \
         .
       ls -lh target/dist/
 
@@ -84,8 +84,8 @@ tasks:
     inputs:
       - '@group(sources)'
       - '@group(tests)'
-      - 'Dockerfile'
-      - '.dockerignore'
+      - 'ops/ci-build-docker-image/Dockerfile'
+      - 'ops/ci-build-docker-image/Dockerfile.dockerignore'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'
