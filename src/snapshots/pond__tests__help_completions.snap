@@ -1,0 +1,31 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Generate shell completions.
+
+Writes the completion script for the given shell to stdout.
+
+Usage: pond completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Install:
+  bash:  pond completions bash > ~/.local/share/bash-completion/completions/pond
+  zsh:   pond completions zsh > "${fpath[1]}/_pond"
+  fish:  pond completions fish > ~/.config/fish/completions/pond.fish
+
+Homebrew and nix packages ship these pre-installed.

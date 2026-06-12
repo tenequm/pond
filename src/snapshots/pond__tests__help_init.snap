@@ -1,0 +1,54 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Set up pond (idempotent: safe to re-run).
+
+Walks through storage, source adapters, MCP registration, and an optional sync schedule, then writes config.toml in one pass at the end. Re-running repairs or updates an existing setup; flags answer sections non-interactively.
+
+Usage: pond init [OPTIONS]
+
+Options:
+      --storage-path <URL>
+          Storage destination to write into config (skips the storage prompt).
+          
+          Unlike other commands, `POND_STORAGE_PATH` is not read here: init writes config, and folding the env var in would silently persist ephemeral state.
+
+      --adapters <NAMES>
+          Comma-separated adapter names to enable (skips the source picker)
+
+      --schedule <EVERY>
+          Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules
+          
+          [possible values: 15m, 1h, 6h, 1d]
+
+      --skip-mcp
+          Skip MCP registration
+
+  -y, --yes
+          Accept defaults for everything not covered by a flag (non-interactive)
+
+      --force
+          Ignore existing config values and start from built-in defaults
+
+      --config <PATH>
+          Config file to write (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond init                                   interactive setup (or repair)
+  pond init --yes                             accept defaults, no prompts
+  pond init --storage-path s3://bucket/pond   preset storage, prompt for the rest
+  pond init --adapters claude-code,codex-cli --yes
+  pond init --schedule 1h --yes               also register an hourly sync

@@ -645,22 +645,74 @@ fn strip_one_newline(mut text: String) -> String {
     text
 }
 
-/// `pond config check` failure classes, each with its own exit code at the
-/// CLI so cron and CI can branch on them.
+/// `pond storage check` failure classes, each with its own exit code at the
+/// CLI so cron and CI can branch on them. Display carries only the
+/// fix-naming lead; the underlying error is exposed separately through
+/// [`CheckFailure::concise_cause`] so surfaces stay one readable line
+/// instead of trailing the upstream chain (Lance flattens its inner errors
+/// into each level's Display, so the raw chain prints the same failure
+/// several times over).
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     #[error(
-        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials: {source:#}"
+        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials"
     )]
     NoCreds { source: anyhow::Error },
-    #[error("authentication failed using creds set {set:?}; check its keys and scope: {source:#}")]
+    #[error("authentication failed using creds set {set:?}; check its keys and scope")]
     Auth { set: String, source: anyhow::Error },
     #[error(
         "backend does not enforce conditional writes (If-None-Match); concurrent pond writers would corrupt each other - {detail}"
     )]
     OccUnsupported { detail: String },
-    #[error("storage probe failed: {source:#}")]
+    #[error("storage probe failed")]
     Io { source: anyhow::Error },
+}
+
+impl CheckFailure {
+    /// The root cause, condensed to one operator-readable line: the deepest
+    /// error in the chain with upstream noise stripped - Lance's bug-report
+    /// boilerplate, internal `<WORKSPACE>` source locations, and the repeated
+    /// wrapper text that follows them. `None` for `OccUnsupported`, whose
+    /// `detail` is already curated into its Display.
+    pub fn concise_cause(&self) -> Option<String> {
+        let source = match self {
+            Self::NoCreds { source } | Self::Auth { source, .. } | Self::Io { source } => source,
+            Self::OccUnsupported { .. } => return None,
+        };
+        Some(condense_error_chain(source))
+    }
+}
+
+/// One-line root cause for a probe error. Takes the deepest chain entry
+/// (each outer Lance/object_store layer re-prints its inner error, so the
+/// deepest is the least redundant), cuts at the first internal source
+/// location (everything after it is upstream re-printing), strips Lance's
+/// bug-report boilerplate, and middle-truncates - the tail is kept because
+/// wrapped transport errors put the root (DNS, connect) at the end.
+fn condense_error_chain(error: &anyhow::Error) -> String {
+    let mut text = error
+        .chain()
+        .last()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{error:#}"));
+    if let Some(pos) = text.find(", <WORKSPACE>") {
+        text.truncate(pos);
+    }
+    text = text.replace(
+        "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. ",
+        "",
+    );
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const HEAD: usize = 120;
+    const TAIL: usize = 120;
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() > HEAD + TAIL + 5 {
+        let head: String = chars[..HEAD].iter().collect();
+        let tail: String = chars[chars.len() - TAIL..].iter().collect();
+        format!("{head} ... {tail}")
+    } else {
+        line
+    }
 }
 
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
@@ -693,7 +745,7 @@ pub async fn storage_check(resolved: &ResolvedStorage) -> std::result::Result<()
             source: anyhow!(error).context(format!("failed to open object store for {probe_uri}")),
         })?;
 
-    let body: &[u8] = b"pond config check";
+    let body: &[u8] = b"pond storage check";
     let create = PutOptions::from(PutMode::Create);
     store
         .inner
@@ -757,20 +809,27 @@ fn classify_check_error(
     step: &str,
 ) -> CheckFailure {
     use object_store::Error as OsError;
-    match (&error, binding) {
-        (
-            OsError::Unauthenticated { .. } | OsError::PermissionDenied { .. },
-            CredsBinding::Set { name, .. },
-        ) => CheckFailure::Auth {
+    // Lance erases a missing-credentials failure into a `Generic` error - the
+    // typed `Unauthenticated` never surfaces for an empty provider chain - so
+    // also match the AWS SDK's rendered `CredentialsNotLoaded` signal. Both
+    // are auth-class: attributed to the bound set, else the empty ambient chain.
+    let auth_class = matches!(
+        error,
+        OsError::Unauthenticated { .. } | OsError::PermissionDenied { .. }
+    ) || {
+        let rendered = error.to_string();
+        rendered.contains("CredentialsNotLoaded")
+            || rendered.contains("no providers in chain provided credentials")
+    };
+    match (auth_class, binding) {
+        (true, CredsBinding::Set { name, .. }) => CheckFailure::Auth {
             set: name.clone(),
             source: anyhow!(error).context(step.to_owned()),
         },
-        (OsError::Unauthenticated { .. } | OsError::PermissionDenied { .. }, _) => {
-            CheckFailure::NoCreds {
-                source: anyhow!(error).context(step.to_owned()),
-            }
-        }
-        _ => CheckFailure::Io {
+        (true, _) => CheckFailure::NoCreds {
+            source: anyhow!(error).context(step.to_owned()),
+        },
+        (false, _) => CheckFailure::Io {
             source: anyhow!(error).context(step.to_owned()),
         },
     }
@@ -1939,6 +1998,25 @@ impl Handle {
             .with_context(|| format!("namespace returned no location for table {table_name}"))
     }
 
+    /// Whether the store holds synced data yet. `open` eagerly creates empty
+    /// `sessions`/`messages` datasets, but `parts` opens lazily on first write
+    /// (see `open_with_options`), so its presence is the "has been synced"
+    /// signal - letting read-only surfaces (`pond status`, `pond storage`)
+    /// render an empty state instead of erroring on the first `parts` describe.
+    pub async fn initialized(&self) -> Result<bool> {
+        let request = DescribeTableRequest {
+            id: Some(self.nm_ident.as_table_id(sessions::PARTS)),
+            ..Default::default()
+        };
+        match self.nm.describe_table(request).await {
+            Ok(_) => Ok(true),
+            Err(error) if is_namespace_error_code(&error, ErrorCode::TableNotFound) => Ok(false),
+            Err(error) => {
+                Err(anyhow::Error::from(error)).context("failed to probe table existence")
+            }
+        }
+    }
+
     /// On-disk byte totals for the three datasets plus the data-dir remainder.
     /// Every byte is sized by listing through Lance's object store
     /// (spec.md#lance-chokepoints-storage), identical for `file://` and `s3://`.
@@ -3062,6 +3140,59 @@ mod tests {
             classify_check_error(missing, &bound, "get"),
             CheckFailure::Io { .. },
         ));
+        // Lance wraps an empty-creds chain as a `Generic` error, never the
+        // typed `Unauthenticated`; the rendered `CredentialsNotLoaded` is the
+        // signal. Bound -> Auth (the set is wrong), unbound -> NoCreds.
+        let no_creds = || object_store::Error::Generic {
+            store: "S3",
+            source: "Failed to get AWS credentials: CredentialsNotLoaded".into(),
+        };
+        assert!(matches!(
+            classify_check_error(no_creds(), &bound, "put"),
+            CheckFailure::Auth { .. },
+        ));
+        assert!(matches!(
+            classify_check_error(no_creds(), &CredsBinding::Ambient, "put"),
+            CheckFailure::NoCreds { .. },
+        ));
+    }
+
+    #[test]
+    fn concise_cause_strips_upstream_noise_to_one_line() {
+        // The shape Lance actually produces: bug-report boilerplate, the real
+        // cause, an internal source location, then the same text re-printed.
+        let inner = "Encountered internal error. Please file a bug report at \
+                     https://github.com/lance-format/lance/issues. Failed to get AWS \
+                     credentials: CredentialsNotLoaded, <WORKSPACE>/src/object_store/providers/aws.rs:401:21: \
+                     Encountered internal error. Please file a bug report at \
+                     https://github.com/lance-format/lance/issues. Failed to get AWS \
+                     credentials: CredentialsNotLoaded";
+        let failure = CheckFailure::NoCreds {
+            source: anyhow!(inner.to_owned()).context("initial conditional put"),
+        };
+        let cause = failure.concise_cause().expect("auth-class carries a cause");
+        assert_eq!(cause, "Failed to get AWS credentials: CredentialsNotLoaded");
+        // Display carries only the fix-naming lead, no chain.
+        assert!(
+            !failure.to_string().contains("file a bug report"),
+            "lead must not trail the chain: {failure}"
+        );
+        // OccUnsupported's detail is already curated into Display.
+        let occ = CheckFailure::OccUnsupported {
+            detail: "put-if-none-match ignored".to_owned(),
+        };
+        assert!(occ.concise_cause().is_none());
+        // Oversized single-line causes middle-truncate, keeping the tail
+        // (wrapped transport errors put the root cause at the end).
+        let long = CheckFailure::Io {
+            source: anyhow!(format!("{} dns error: lookup failed", "x".repeat(500))),
+        };
+        let cause = long.concise_cause().expect("io carries a cause");
+        assert!(cause.contains(" ... "), "long causes truncate: {cause}");
+        assert!(
+            cause.ends_with("dns error: lookup failed"),
+            "the tail survives: {cause}"
+        );
     }
 
     #[tokio::test]

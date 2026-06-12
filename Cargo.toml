@@ -31,6 +31,7 @@ exclude = [
     "AGENTS.md",
     "CLAUDE.md",
     "SECURITY.md",
+    "SKILL.md",
     "release-plz.toml",
     "*.pdf",
     "**/.DS_Store",
@@ -71,8 +72,15 @@ base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
+clap_complete = "4.6"
+# Clack-style prompt stack for `pond init` and the sync source picker; built on
+# console + indicatif, both already in the tree.
+cliclack = "0.5"
 comfy-table = "7"
-dialoguer = { version = "0.12", default-features = false }
+# Ctrl-C-as-Esc for the init wizard: a no-op handler makes `term.read_key()`
+# fail inside cliclack prompts, so cancellation flows through the same
+# `outro_cancel` path as Esc instead of killing the process in raw mode.
+ctrlc = "3"
 human-panic = { version = "2", default-features = false }
 # Embedding stack for `intfloat/multilingual-e5-small`: candle XLM-RoBERTa
 # FP16 on Metal (macOS) / CUDA (`--features cuda`) / CPU. `LazyEmbedder`
@@ -120,6 +128,8 @@ parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# `~` + `$VAR` expansion for user-supplied paths in config values.
+shellexpand = "3.1"
 tempfile = "3.25"
 # Streaming JSON pull-parser for the adapter seam's oversized-line slow path:
 # records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays

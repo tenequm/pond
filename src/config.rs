@@ -138,10 +138,11 @@ pub fn child_uri(base: &Url, suffix: &str) -> String {
 }
 
 /// Render a `Url` for human-readable log/diagnostic output: local URLs come
-/// back as plain paths (no `file://` prefix); remote URLs stay verbatim.
+/// back as plain paths (no `file://` prefix, `$HOME` contracted to `~`);
+/// remote URLs stay verbatim.
 pub fn display(url: &Url) -> String {
     if let Some(path) = local_path(url) {
-        path.display().to_string()
+        contract_home(&path).display().to_string()
     } else {
         url.to_string()
     }
@@ -283,7 +284,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Every field mirrors to env: `POND_STORAGE_PATH`, `POND_CREDS_<NAME>_<FIELD>`
 # (set names are lowercase alphanumeric, so the env grammar is unambiguous).
 # Precedence: CLI flag > POND_* env > this file > ambient cloud chain.
-# Probe a destination end-to-end with `pond config check`.
+# Probe a destination end-to-end with `pond storage check`.
 #
 # Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution);
 # `[storage]` is flat here on the assumption of one bucket per pond. When
@@ -490,6 +491,20 @@ impl Config {
         Ok(Self::load_with_provenance(path)?.0)
     }
 
+    /// [`Config::load`] over an in-memory TOML body (still layered under the
+    /// `POND_*` env mirror). `pond init` uses this to validate and resolve
+    /// the config it is composing BEFORE anything touches disk - the wizard
+    /// writes exactly once, at the end.
+    pub fn load_str(body: &str) -> Result<Self> {
+        let figment = Figment::new().merge(Toml::string(body)).merge(env_mirror());
+        let config: Self = figment
+            .extract_lossy()
+            .map_err(|error| anyhow!("failed to load config: {error}"))?;
+        config.embeddings.validate()?;
+        config.validate_creds()?;
+        Ok(config)
+    }
+
     /// [`Config::load`] that also returns the figment, so `pond config show`
     /// can attribute each value to its source layer (file / env / default).
     pub fn load_with_provenance(path: impl AsRef<Path>) -> Result<(Self, Figment)> {
@@ -658,6 +673,15 @@ fn env_mirror() -> Env {
         })
 }
 
+/// The pre-redesign `[storage]` passthrough keys, by role (ENV-style
+/// `object_store` aliases). Both the load-time error recipe
+/// (`detect_legacy_storage`) and the `pond init` rewrite read these, so the
+/// legacy vocabulary lives in one place - a new alias must not require
+/// editing two detectors in lockstep.
+pub const LEGACY_ENDPOINT_KEYS: &[&str] = &["aws_endpoint", "endpoint"];
+pub const LEGACY_ACCESS_KEY_KEYS: &[&str] = &["aws_access_key_id", "access_key_id"];
+pub const LEGACY_SECRET_KEY_KEYS: &[&str] = &["aws_secret_access_key", "secret_access_key"];
+
 /// Recognize the pre-redesign `[storage]` passthrough map (ENV-style
 /// `object_store` keys) and return the exact rewrite onto `[storage].path` +
 /// `[creds.default]`. An error with a recipe, not a shim: old configs do not
@@ -677,25 +701,21 @@ fn detect_legacy_storage(path: &Path) -> Option<String> {
                 .then(|| value.as_str().unwrap_or_default().to_owned())
         })
     };
-    let endpoint = get(&["aws_endpoint", "endpoint"]);
+    let endpoint = get(LEGACY_ENDPOINT_KEYS);
     let host = endpoint
         .as_deref()
         .and_then(|e| e.split("://").nth(1))
         .unwrap_or("<endpoint-host>");
+    // spec.md#storage-redaction: never echo credential values, even back to
+    // their owner - stderr lands in logs, scrollback, and pasted bug reports.
     let mut recipe = format!(
         "config {} uses the old [storage] passthrough map; rewrite it as:\n\n[storage]\npath = \"s3+https://{host}/<bucket>/<prefix>\"\n\n[creds.default]\n",
         path.display(),
     );
-    recipe.push_str(&format!(
-        "access_key_id     = \"{}\"\n",
-        get(&["aws_access_key_id", "access_key_id"]).unwrap_or_else(|| "...".into()),
-    ));
-    recipe.push_str(&format!(
-        "secret_access_key = \"{}\"\n",
-        get(&["aws_secret_access_key", "secret_access_key"]).unwrap_or_else(|| "...".into()),
-    ));
+    recipe.push_str("access_key_id     = \"...\"  # copy from the old [storage] section\n");
+    recipe.push_str("secret_access_key = \"...\"  # copy from the old [storage] section\n");
     recipe.push_str(
-        "\n(the endpoint and bucket fold into the URL; allow_http is scheme-derived; virtual-hosted addressing defaults on; the region is autodetected - append ?region=<x> to the URL only if your store insists. `pond config check` verifies the result end-to-end)",
+        "\n(the endpoint and bucket fold into the URL; allow_http is scheme-derived; virtual-hosted addressing defaults on; the region is autodetected - append ?region=<x> to the URL only if your store insists. `pond storage check` verifies the result end-to-end, and `pond init` can apply this rewrite for you)",
     );
     Some(recipe)
 }
@@ -718,22 +738,45 @@ fn take_enabled(name: &str, blob: &Value) -> Option<(String, Value)> {
     Some((name.to_owned(), clean))
 }
 
-/// Tilde-expand `path` against an explicit `home`. Filesystem-shaped adapters
-/// call this from inside their factory's `open()`. Tests use it directly to
-/// exercise the rule without mutating the process-wide `HOME` env var
-/// (`std::env::set_var` is `unsafe` under edition 2024 and pond forbids
-/// unsafe code).
+/// Expand `~` and `$VAR`/`${VAR}` in `path` against an explicit `home`.
+/// Filesystem-shaped adapters call this from inside their factory's `open()`.
+/// Tests use it directly to exercise the rule without mutating the
+/// process-wide `HOME` env var (`std::env::set_var` is `unsafe` under
+/// edition 2024 and pond forbids unsafe code). Unset vars and `~user` forms
+/// pass through unchanged - never guess.
 pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
     let Some(text) = path.to_str() else {
         return path.to_path_buf();
     };
-    if text == "~" {
-        return home.to_path_buf();
+    let home_text = home.to_string_lossy();
+    let expanded = shellexpand::full_with_context_no_errors(
+        text,
+        || Some(home_text.clone()),
+        |var| std::env::var(var).ok(),
+    );
+    PathBuf::from(expanded.as_ref())
+}
+
+/// The inverse of [`expand_home_under`] for display and config writes:
+/// contract a `home` prefix back to `~` so user-facing surfaces (and the
+/// paths `pond init` persists) stay portable and readable. Non-home paths
+/// pass through unchanged.
+pub fn contract_home_under(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => PathBuf::from("~"),
+        Ok(rest) => Path::new("~").join(rest),
+        Err(_) => path.to_path_buf(),
     }
-    if let Some(rest) = text.strip_prefix("~/") {
-        return home.join(rest);
+}
+
+/// [`contract_home_under`] against the process `HOME`. Returns the input
+/// rendered for humans; machine surfaces (JSON output, the wire) keep
+/// absolute paths.
+pub fn contract_home(path: &Path) -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => contract_home_under(path, Path::new(&home)),
+        None => path.to_path_buf(),
     }
-    path.to_path_buf()
 }
 
 impl EmbeddingsConfig {
@@ -870,6 +913,47 @@ mod tests {
         assert_eq!(
             expand_home_under(Path::new("~user/elsewhere"), home),
             PathBuf::from("~user/elsewhere"),
+        );
+    }
+
+    #[test]
+    fn expand_home_under_handles_env_vars() {
+        // Jail serializes env mutation against the other env-touching tests.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("POND_TEST_EXPAND_DIR", "/srv/data");
+            let home = Path::new("/srv/me");
+            assert_eq!(
+                expand_home_under(Path::new("$POND_TEST_EXPAND_DIR/pond"), home),
+                PathBuf::from("/srv/data/pond"),
+            );
+            assert_eq!(
+                expand_home_under(Path::new("${POND_TEST_EXPAND_DIR}/pond"), home),
+                PathBuf::from("/srv/data/pond"),
+            );
+            // Unset vars pass through unchanged - never guess.
+            assert_eq!(
+                expand_home_under(Path::new("$POND_TEST_UNSET_VAR/x"), home),
+                PathBuf::from("$POND_TEST_UNSET_VAR/x"),
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn contract_home_under_inverts_expansion() {
+        let home = Path::new("/srv/me");
+        assert_eq!(
+            contract_home_under(Path::new("/srv/me/.local/share/pond"), home),
+            PathBuf::from("~/.local/share/pond"),
+        );
+        assert_eq!(
+            contract_home_under(Path::new("/srv/me"), home),
+            PathBuf::from("~")
+        );
+        // Non-home paths pass through unchanged.
+        assert_eq!(
+            contract_home_under(Path::new("/etc/passwd"), home),
+            PathBuf::from("/etc/passwd"),
         );
     }
 
@@ -1048,16 +1132,17 @@ aws_virtual_hosted_style_request = "true"
                 err.contains("s3+https://ttq.nbg1.your-objectstorage.com/"),
                 "endpoint host must fold into the URL recipe, got: {err}",
             );
-            assert!(
-                err.contains("access_key_id     = \"AKIA123\""),
-                "got: {err}"
-            );
+            // spec.md#storage-redaction: the recipe must NOT echo the real
+            // key values - placeholders plus a "copy from" pointer only.
+            assert!(!err.contains("AKIA123"), "got: {err}");
+            assert!(!err.contains("\"shh\""), "got: {err}");
+            assert!(err.contains("access_key_id     = \"...\""), "got: {err}");
             // Region is autodetected (AWS) or defaulted (S3-compatible
             // endpoints ignore it): the recipe must not carry AWS_REGION
             // forward, only name the ?region= override.
             assert!(!err.contains("region            ="), "got: {err}");
             assert!(err.contains("?region="), "got: {err}");
-            assert!(err.contains("pond config check"), "got: {err}");
+            assert!(err.contains("pond storage check"), "got: {err}");
             Ok(())
         });
     }

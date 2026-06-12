@@ -1,4 +1,4 @@
-//! `pond migrate` data path (spec.md#substrate): export the source's clean
+//! `pond storage migrate` data path (spec.md#substrate): export the source's clean
 //! datasets, merge-import into the destination. The properties under test
 //! are the plan's contract: round-trip, rerun-is-a-no-op, and union onto a
 //! populated destination - all consequences of `lance-deterministic-pk` +

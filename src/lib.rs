@@ -102,7 +102,13 @@ pub mod output {
     #[allow(clippy::print_stdout)]
     pub fn line(message: &str) -> anyhow::Result<()> {
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{message}").context("failed to write command output")
+        match writeln!(stdout, "{message}") {
+            // Downstream (`pond ... | head`) closed the pipe after reading
+            // what it wanted; the CLI convention is to stop quietly, not
+            // surface "Broken pipe" as an error.
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+            result => result.context("failed to write command output"),
+        }
     }
 
     /// Stderr counterpart to [`line`]. Per rust-cli/book stdout-vs-stderr
@@ -111,7 +117,10 @@ pub mod output {
     /// file or another command yields the machine-readable view alone.
     pub fn line_err(message: &str) -> anyhow::Result<()> {
         let mut stderr = io::stderr().lock();
-        writeln!(stderr, "{message}").context("failed to write command meta")
+        match writeln!(stderr, "{message}") {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+            result => result.context("failed to write command meta"),
+        }
     }
 }
 

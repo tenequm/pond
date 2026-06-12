@@ -1,0 +1,64 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Make pond current: import, embed, update indexes.
+
+The everyday command: pulls fresh sessions from every enabled `[sources.*]` entry (or one named adapter), embeds the backlog, and folds new rows into the search indexes. With no sources configured it probes the machine and offers to enable what it finds.
+
+Usage: pond sync [OPTIONS] [ADAPTER]
+
+Arguments:
+  [ADAPTER]
+          Adapter name (claude-code, codex-cli, ...); default: every enabled source
+
+Options:
+      --source-dir <DIR>
+          One-off source-path override (requires <ADAPTER>).
+          
+          Bypasses `[sources.<adapter>]` and does not modify config.toml.
+
+      --only <ONLY>
+          Run exactly one stage: import, embed, or update-indexes
+          
+          [possible values: import, embed, update-indexes]
+
+      --skip <SKIP>
+          Skip a stage. Can be passed multiple times
+          
+          [possible values: import, embed, update-indexes]
+
+      --force-embed
+          Re-embed stale rows after an embedding model change
+
+  -y, --yes
+          Auto-accept every probe prompt (for non-interactive runs)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond sync                                  sync every enabled source
+  pond sync claude-code                      sync one adapter (re-enables it if declined)
+  pond sync codex-cli --source-dir ~/backup  one-off path override, config untouched
+  pond sync --only embed                     run a single stage
+  pond sync -y                               auto-accept newly detected sources

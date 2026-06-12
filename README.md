@@ -76,7 +76,13 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
 ## Usage
 
-Import sessions from local sources, embed them, update indexes, and search:
+Set up storage, sources, MCP registration, and an optional sync schedule in one pass (idempotent - re-run it any time to repair or update):
+
+```sh
+pond init
+```
+
+Then import sessions from local sources, embed them, update indexes, and search:
 
 ```sh
 pond sync
@@ -105,15 +111,22 @@ Stages can be run independently when needed:
 pond sync --only import
 pond sync --only embed
 pond sync --only update-indexes
-pond sync --import-from snapshot.pond
 pond sync -y                       # auto-accept probe prompts (non-TTY runs)
+```
+
+Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
+
+```sh
+pond schedule start --every 1h
+pond schedule status
+pond schedule logs
 ```
 
 `pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + searchable messages), and `sources` (configured adapter count). Pass `--adapters` for per-project tables and per-intent index detail. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
 ### Configuration
 
-`pond` discovers sources interactively on first run and writes them to `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. Re-enable interactively with `pond sync <name>`.
+`pond init` walks through everything below interactively; `pond sync` also discovers sources on first run and writes them to `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. Re-enable interactively with `pond sync <name>`.
 
 ```toml
 [sources.claude-code]

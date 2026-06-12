@@ -1,0 +1,46 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Show pond health, data, and source status.
+
+Storage destination and size, row counts, index readiness, embedding backlog, configured sources, and the sync schedule. Anything off names its fix inline.
+
+Usage: pond status [OPTIONS]
+
+Options:
+      --adapters
+          Show one section per adapter, with project tables and index detail.
+          
+          Implies `--include-subagents` so the rollup reconciles with the storage row counts above.
+
+      --include-subagents
+          Break out sub-agent sessions (e.g. `claude-code/general-purpose`).
+          
+          Default rolls sessions up to the main agent only.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond status              the one-screen overview
+  pond status --adapters   per-adapter and per-project breakdown

@@ -186,6 +186,12 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     });
     let client = TestClient.serve(client_transport).await?;
 
+    // The server identifies as pond, not the rmcp crate (its build-env default).
+    let server_info = client
+        .peer_info()
+        .expect("server sent its initialize result");
+    assert_eq!(server_info.server_info.name, "pond");
+
     let tools = client.list_all_tools().await?;
     let meta_chars = |name: &str| -> Option<i64> {
         tools

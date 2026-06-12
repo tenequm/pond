@@ -43,6 +43,7 @@ tasks:
       docker buildx build \
         --progress=plain \
         --platform linux/amd64 \
+        --build-arg POND_BUILD_COMMIT="$(git rev-parse --short HEAD)" \
         --target output \
         --cache-from "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY}" \
         --cache-to   "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY},mode=max,ignore-error=true" \
@@ -53,6 +54,18 @@ tasks:
         .
       ls -lh target/dist/
 
+      # Completion scripts are target-independent, so one native run of the
+      # linux-amd64 binary (this runner's arch) generates them for every
+      # tarball. They must ship pre-generated: nix can't execute the binary
+      # in installPhase (autoPatchelfHook only fixes the interpreter later,
+      # in fixupPhase).
+      rm -rf completions
+      mkdir -p completions
+      chmod +x target/dist/pond-x86_64-unknown-linux-gnu
+      target/dist/pond-x86_64-unknown-linux-gnu completions bash > completions/pond.bash
+      target/dist/pond-x86_64-unknown-linux-gnu completions zsh  > completions/_pond
+      target/dist/pond-x86_64-unknown-linux-gnu completions fish > completions/pond.fish
+
       # Package into the archive names brew/nix reference, `pond` at the root.
       # rm first: the self-hosted runner persists dist/ across runs, so stale
       # files (e.g. goreleaser-era leftovers) must not accumulate.
@@ -60,11 +73,12 @@ tasks:
       mkdir -p dist
       for t in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         install -m755 "target/dist/pond-$t" pond
-        tar -cJf "dist/pond-$t.tar.xz" pond
+        tar -cJf "dist/pond-$t.tar.xz" pond completions
       done
       install -m755 target/dist/pond-x86_64-pc-windows-gnu.exe pond.exe
       zip -j "dist/pond-x86_64-pc-windows-gnu.zip" pond.exe
       rm -f pond pond.exe
+      rm -rf completions
       ( cd dist && sha256sum pond-* > checksums.txt )
       ls -lh dist/
     inputs:

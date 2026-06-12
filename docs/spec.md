@@ -555,16 +555,19 @@ The MCP transport exposes the read operations - `pond_search`, `pond_get`, and `
 
 The same handlers back a set of command-line verbs:
 
-- `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge. `--import-from <archive.pond>` feeds a compact archive into the import stage.
+- `pond init` - idempotent setup-and-repair wizard: storage destination (with an end-to-end probe for remote URLs), source adapter selection, MCP registration, and an opt-in sync schedule, written to `config.toml` in a single pass at the end. Every section is flag-answerable (`--storage-path`, `--adapters`, `--schedule`, `--skip-mcp`, `--yes`) for non-interactive use; `--yes` alone never schedules.
+- `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge.
 - `pond search [--explain]` - hybrid search from the command line. `--explain` returns Lance's `analyze_plan` output instead of results.
 - `pond get` - fetch a session, or one message with context, from the command line.
-- `pond status` - row counts, dataset statistics, embedding coverage, and index health. It prints the cheap storage summary first, then completes the longer checks.
+- `pond status` - row counts, dataset statistics, embedding coverage, index health, and the sync-schedule state. It prints the cheap storage summary first, then completes the longer checks.
 - `pond serve --transport http|stdio` - run HTTP by default, or MCP over stdio.
 - `pond mcp` - alias for `pond serve --transport stdio`.
+- `pond schedule start|stop|status|logs` - manage the automatic `pond sync -q` registration with the OS scheduler: launchd on macOS, systemd user timers (or a fenced crontab block) on Linux. The scheduled job never passes `--yes`, so an unattended run cannot auto-enable adapters.
 - `pond export` - write a compact `.pond` archive containing clean index-free Lance datasets plus a manifest. Embeddings remain data columns and are preserved.
-- `pond import <archive.pond>` - restore a compact archive into the current corpus. Existing rows are deduped through the same merge-insert path as adapter import.
-- `pond config show|path|check|schema` - introspection for Section 3.9: `show` prints the resolved config with redacted values (`storage-redaction`), per-field source attribution along the precedence ladder, and the active URL's creds binding; `check` probes a destination end-to-end (parse, creds resolution, the conditional-put OCC primitive, write/read/delete) with a distinct exit code per failure class.
-- `pond migrate --from <URL> --to <URL>` - copy canonical data between storages over the export+import path. Idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, valid onto a populated destination, never deletes the source. Destination indexes catch up via the normal update-indexes stage.
+- `pond import <archive.pond>` - restore a compact archive into the current corpus. Existing rows are deduped through the same merge-insert path as adapter import. (`pond import` is the only archive-restore path; the former `pond sync --import-from` alias is removed.)
+- `pond config show|path|schema` - introspection for Section 3.9: `show` prints the resolved config with redacted values (`storage-redaction`), per-field source attribution along the precedence ladder, and the active URL's creds binding.
+- `pond storage [check|use|migrate]` - the storage cluster. Bare `pond storage` shows the resolved destination, creds binding, and per-table sizes. `check <URL>` probes a destination end-to-end (parse, creds resolution, the conditional-put OCC primitive, write/read/delete) with a distinct exit code per failure class (formerly `pond config check`). `use <URL>` is the validate-then-activate switch: probe, optional copy of existing data, row-count verification, and only then the `[storage].path` flip. `migrate --from <URL> --to <URL>` copies canonical data between storages over the export+import path - idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, valid onto a populated destination, never deletes the source (formerly top-level `pond migrate`).
+- `pond completions <shell>` - emit shell completion scripts; release packages ship them pre-installed.
 
 ### 7.9 Versioning
 

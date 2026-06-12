@@ -179,7 +179,7 @@ pub mod mcp {
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
-            AnnotateAble, CallToolResult, Content, ErrorCode as JsonRpcErrorCode,
+            AnnotateAble, CallToolResult, Content, ErrorCode as JsonRpcErrorCode, Implementation,
             ListResourcesResult, ListToolsResult, Meta, PaginatedRequestParams, RawResource,
             ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
             ServerInfo,
@@ -872,6 +872,9 @@ Examples (4 patterns the agent should recognize):
                     .enable_resources()
                     .build(),
             )
+            // rmcp's default `from_build_env` reports the rmcp crate (name +
+            // version) - clients display the server's own identity, so set it.
+            .with_server_info(Implementation::new("pond", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "pond recalls past agent sessions (Claude Code and others) - prior work, \
                  decisions, and context across sessions, not the live conversation. \

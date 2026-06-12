@@ -112,6 +112,11 @@ ENV PROTOC=/usr/bin/protoc \
 
 COPY . .
 
+# Release-commit stamp for `pond --version` long output; empty in local
+# builds (the binary then omits the commit token).
+ARG POND_BUILD_COMMIT=
+ENV POND_BUILD_COMMIT=$POND_BUILD_COMMIT
+
 # Cargo unifies features across all targets in one invocation, leaking
 # cfg-gated deps across platforms. macOS and Windows each build alone: macOS pulls
 # candle's macOS-only `metal`, and the two linux targets enable xet-data's

@@ -1,0 +1,92 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Search stored messages.
+
+Hybrid retrieval (semantic + full-text) when embeddings exist, full-text otherwise. Keep the query about concepts; scope with `--project`, `--from-date`, and friends instead of putting names in the query.
+
+Usage: pond search [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>
+          Free-text query. Semantic concepts work best; project names belong in `--project`
+
+Options:
+      --namespace <NAMESPACE>
+          Tenant namespace. The personal pond has exactly one; leave at the default
+          
+          [default: local]
+
+      --limit <LIMIT>
+          Max sessions to return
+          
+          [default: 10]
+
+      --mode <MODE>
+          Operator-only retrieval mode override.
+          
+          Production callers should omit this and let the server pick (hybrid when embeddings exist, FTS-only otherwise); benchmark and ablation harnesses use it to force one arm against the same corpus.
+          
+          [possible values: fts, vector, hybrid]
+
+      --project <PROJECT>
+          Project filter: substring match by default.
+          
+          `--project pond` -> contains "pond". Prefix with `re:` for regex (`--project 're:^/Users/.*/x402'`); `lit:` escapes a literal value that would otherwise be parsed as a prefix.
+
+      --session-id <ID>
+          Filter to one session (exact match) - search within a single, possibly long, session
+
+      --source-agent <AGENT>
+          Filter to one source agent, e.g. `claude-code` (or `claude-code/general-purpose` for a subagent)
+
+      --include-subagents
+          Include subagent sessions (excluded by default)
+
+      --from-date <FROM_DATE>
+          ISO date (YYYY-MM-DD) lower bound, inclusive
+
+      --to-date <TO_DATE>
+          ISO date (YYYY-MM-DD) upper bound, inclusive
+
+      --min-score <MIN_SCORE>
+          Server-side score threshold; hits below this are dropped.
+          
+          Not an absence signal: present and absent content score in overlapping bands, so leave at 0 unless trimming an over-long tail.
+          
+          [default: 0]
+
+      --explain
+          Print Lance query plans instead of search results
+
+      --format <FORMAT>
+          [default: pretty]
+          [possible values: pretty, json]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond search "lance compaction tuning"
+  pond search "auth retry" --project pond --limit 5
+  pond search "migration plan" --from-date 2026-05-01 --format json

@@ -1,0 +1,46 @@
+---
+source: src/main.rs
+expression: root.render_long_help().to_string()
+---
+Lossless storage and hybrid search for sessions from any AI agent client
+
+Usage: pond [OPTIONS] <COMMAND>
+
+Commands:
+  init         Set up pond (idempotent: safe to re-run)
+  sync         Make pond current: import, embed, update indexes
+  status       Show pond health, data, and source status
+  search       Search stored messages
+  get          Fetch a session or message
+  sql          Run one read-only SQL query over the corpus
+  serve        Run the HTTP API server (or MCP over stdio with --transport stdio)
+  mcp          Serve the MCP tools over stdio (for agent clients)
+  schedule     Manage the automatic sync schedule
+  storage      Inspect, probe, and switch storage destinations
+  export       Export a compact restorable .pond archive
+  import       Restore a .pond archive
+  config       Inspect configuration
+  completions  Generate shell completions
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global options:
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Getting started:
+  pond init                                  set up storage, sources, MCP, and scheduling
+  pond sync                                  import new sessions, embed, update indexes
+  pond search "that auth refactor"           find past work
+  claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
+
+Every command documents itself: `pond <command> --help` carries examples.

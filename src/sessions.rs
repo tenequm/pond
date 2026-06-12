@@ -1739,6 +1739,10 @@ impl Store {
         self.handle.table_sizes().await
     }
 
+    pub async fn initialized(&self) -> Result<bool> {
+        self.handle.initialized().await
+    }
+
     async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
         let batch = self
             .handle
@@ -4159,6 +4163,51 @@ mod tests {
         assert_eq!(messages, 1, "valid message committed");
         assert_eq!(parts, 1, "valid part committed; the orphan was dropped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialized_flips_only_after_first_ingest() -> anyhow::Result<()> {
+        // `open` eagerly creates sessions/messages but `parts` is lazy, so a
+        // configured-but-never-synced store reports uninitialized - the signal
+        // `pond status`/`pond storage` use to render an empty state instead of
+        // erroring on the first parts describe.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        assert!(
+            !store.initialized().await?,
+            "fresh store has no parts table"
+        );
+
+        let session = synthetic_session("initialized-probe");
+        let message = Message::User {
+            id: "message-1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let part = Part {
+            session_id: session.id.clone(),
+            id: "part-1".to_owned(),
+            message_id: message.id().to_owned(),
+            ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: Some(Extracted::from_test_value("hello".to_owned())),
+            },
+        };
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message))
+            .await?;
+        validator.push(&store, 2, IngestEvent::Part(part)).await?;
+        validator.finish(&store).await?;
+
+        assert!(store.initialized().await?, "ingest creates the parts table");
         Ok(())
     }
 

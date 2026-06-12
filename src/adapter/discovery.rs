@@ -6,7 +6,6 @@
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -76,11 +75,14 @@ pub fn discover(focus: Option<&str>) -> Vec<Candidate> {
 }
 
 /// Best-effort label for the picker. For filesystem configs that's the
-/// `path`; for richer configs we fall back to a compact JSON dump so the
-/// operator at least sees what they're confirming.
+/// `path` (with `$HOME` contracted to `~` for readability); for richer
+/// configs we fall back to a compact JSON dump so the operator at least sees
+/// what they're confirming.
 fn hint_for(config: &Value) -> String {
     if let Some(path) = config.get("path").and_then(Value::as_str) {
-        return path.to_owned();
+        return crate::config::contract_home(Path::new(path))
+            .display()
+            .to_string();
     }
     if let Some(endpoint) = config.get("endpoint").and_then(Value::as_str) {
         return endpoint.to_owned();
@@ -108,52 +110,96 @@ pub fn prompt_and_persist(
     }
     if !stdin_is_tty {
         bail!(
-            "[sources] is empty and stdin is not a terminal; add a [sources.<adapter>] \
-             entry to {} (known adapters: {})",
+            "[sources] is empty and stdin is not a terminal; run `pond init --yes` to enable \
+             detected sources, or add a [sources.<adapter>] entry to {} (known adapters: {})",
             config_path.display(),
             known_names().join(", "),
         );
     }
-    let labels = candidates
-        .iter()
-        .map(|c| format!("{} ({})", c.name, c.hint))
-        .collect::<Vec<_>>();
-    let defaults = vec![true; candidates.len()];
-    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select sources to register (space toggles, enter confirms)")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()
-        .context("source picker prompt failed")?;
-    if selections.is_empty() {
+    let mut picker = cliclack::multiselect("Select sources to register")
+        .initial_values(candidates.iter().map(|c| c.name.clone()).collect());
+    for candidate in candidates {
+        picker = picker.item(candidate.name.clone(), &candidate.name, &candidate.hint);
+    }
+    let selected: Vec<String> = match picker.interact() {
+        Ok(picks) => picks,
+        // Esc / Ctrl-C in the picker means "register nothing", same outcome
+        // as an empty selection - not a failure.
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            bail!("no sources selected; nothing to sync");
+        }
+        Err(error) => return Err(error).context("source picker prompt failed"),
+    };
+    if selected.is_empty() {
         bail!("no sources selected; nothing to sync");
     }
-    let picks: Vec<Candidate> = selections
-        .into_iter()
-        .filter_map(|index| candidates.get(index).cloned())
+    let picks: Vec<Candidate> = candidates
+        .iter()
+        .filter(|candidate| selected.contains(&candidate.name))
+        .cloned()
         .collect();
     persist_accept(config_path, &picks)?;
     Ok(picks)
 }
 
-/// Write the picked sources back to `config.toml` under `[sources.<name>]`,
-/// preserving any existing user comments/formatting via `toml_edit`. Each
-/// pick's `config` JSON object is unpacked into TOML key/value pairs and
-/// `enabled = true` is inserted as the first field so `resolve_sources`
-/// picks it up.
-pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
-    let mut doc = open_or_init(config_path)?;
-    let sources = sources_table_mut(&mut doc)?;
-    for pick in picks {
+/// Shape accepted and declined sources into a `toml_edit` document:
+/// `[sources.<name>]` with `enabled` as the first key, the accept's config
+/// blob unpacked into TOML pairs (home-prefixed `path` values contracted to
+/// `~/...` so the file stays portable), declines as `enabled = false` stubs.
+/// The one table-shaping routine shared by the sync picker writes and the
+/// `pond init` wizard's single end-of-run write.
+pub fn apply_to_doc(
+    doc: &mut DocumentMut,
+    accepts: &[Candidate],
+    declines: &[&str],
+) -> anyhow::Result<()> {
+    if accepts.is_empty() && declines.is_empty() {
+        return Ok(());
+    }
+    if !doc.contains_key("sources") {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        doc.insert("sources", Item::Table(table));
+    }
+    let sources = sources_table_mut(doc)?;
+    for pick in accepts {
         let mut entry = json_to_toml_table(&pick.config).with_context(|| {
             format!(
                 "pick for {:?} did not produce a TOML-shaped table",
                 pick.name
             )
         })?;
+        contract_path_key(&mut entry);
         prepend_enabled(&mut entry, true);
         sources.insert(&pick.name, Item::Table(entry));
     }
+    for name in declines {
+        let mut entry = Table::new();
+        prepend_enabled(&mut entry, false);
+        sources.insert(name, Item::Table(entry));
+    }
+    Ok(())
+}
+
+/// Contract a home-prefixed `path` value to `~/...` before it lands in
+/// config.toml. Reads (`expand_home_under` inside each factory's `open()`)
+/// expand the same prefix back, so the round-trip is lossless.
+fn contract_path_key(table: &mut Table) {
+    if let Some(path) = table.get("path").and_then(Item::as_str) {
+        let contracted = crate::config::contract_home(Path::new(path))
+            .display()
+            .to_string();
+        if contracted != path {
+            table["path"] = toml_edit::value(contracted);
+        }
+    }
+}
+
+/// Write the picked sources back to `config.toml` under `[sources.<name>]`,
+/// preserving any existing user comments/formatting via `toml_edit`.
+pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
+    let mut doc = open_or_init(config_path)?;
+    apply_to_doc(&mut doc, picks, &[])?;
     std::fs::write(config_path, doc.to_string())
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(())
@@ -188,15 +234,13 @@ pub fn prompt_each(
         let (enable, sync_now) = if auto_accept {
             (true, true)
         } else {
-            let enable = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!("Enable {label}?"))
-                .default(true)
+            let enable = cliclack::confirm(format!("Enable {label}?"))
+                .initial_value(true)
                 .interact()
                 .context("enable prompt failed")?;
             let sync_now = if enable {
-                Confirm::with_theme(&ColorfulTheme::default())
-                    .with_prompt(format!("Sync {} now?", candidate.name))
-                    .default(true)
+                cliclack::confirm(format!("Sync {} now?", candidate.name))
+                    .initial_value(true)
                     .interact()
                     .context("sync-now prompt failed")?
             } else {
@@ -220,12 +264,7 @@ pub fn persist_decline(config_path: &Path, names: &[&str]) -> anyhow::Result<()>
         return Ok(());
     }
     let mut doc = open_or_init(config_path)?;
-    let sources = sources_table_mut(&mut doc)?;
-    for name in names {
-        let mut entry = Table::new();
-        prepend_enabled(&mut entry, false);
-        sources.insert(name, Item::Table(entry));
-    }
+    apply_to_doc(&mut doc, &[], names)?;
     std::fs::write(config_path, doc.to_string())
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(())

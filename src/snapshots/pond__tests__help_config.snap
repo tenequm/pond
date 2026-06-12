@@ -1,0 +1,50 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Inspect configuration.
+
+Resolved values with provenance (show), the config file location (path), and the fully-annotated template (schema).
+
+Usage: pond config show [OPTIONS]
+       pond config path [OPTIONS]
+       pond config schema [OPTIONS]
+       pond config help [COMMAND]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+pond config show:
+Show the resolved configuration
+  -h, --help
+          Print help (see a summary with '-h')
+
+pond config path:
+Print the path of the config file pond loads
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -h, --help
+          Print help
+
+pond config schema:
+Print the fully-annotated config.toml template
+  -h, --help
+          Print help
+
+pond config help:
+Print this message or the help of the given subcommand(s)
+
+Examples:
+  pond config show                 every setting, its value, and where it came from
+  pond config schema > ~/.config/pond/config.toml   start from the annotated template

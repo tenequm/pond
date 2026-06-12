@@ -188,11 +188,13 @@ jobs:
 
             def install
               bin.install "pond"
+              generate_completions_from_executable(bin/"pond", "completions")
             end
 
             test do
               assert_match "pond #{version}", shell_output("#{bin}/pond --version")
               system bin/"pond", "--help"
+              assert_match "_pond", shell_output("#{bin}/pond completions zsh")
             end
           end
           EOF
@@ -211,7 +213,7 @@ jobs:
           git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" pond-nix
           mkdir -p pond-nix/pkgs/pond
           cat > pond-nix/pkgs/pond/default.nix <<EOF
-          { lib, fetchurl, stdenv, autoPatchelfHook, zlib }:
+          { lib, fetchurl, stdenv, autoPatchelfHook, installShellFiles, zlib }:
           let
             inherit (stdenv) hostPlatform;
             inherit (hostPlatform) system;
@@ -240,15 +242,19 @@ jobs:
 
             # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
             # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
-            nativeBuildInputs = lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
+            nativeBuildInputs = [ installShellFiles ] ++ lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
 
             # The released Linux build is CPU-only candle + vendored onig + rustls,
             # so the sole dynamic deps beyond glibc are libgcc_s/libstdc++.
             buildInputs = lib.optionals hostPlatform.isLinux [ stdenv.cc.cc.lib zlib ];
 
+            # Completions ship pre-generated in the tarball: the binary can't
+            # run here (autoPatchelfHook rewrites the interpreter later, in
+            # fixupPhase).
             installPhase = ''
               runHook preInstall
               install -Dm755 pond \$out/bin/pond
+              installShellCompletion --bash completions/pond.bash --zsh completions/_pond --fish completions/pond.fish
               runHook postInstall
             '';
 

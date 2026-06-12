@@ -88,7 +88,7 @@ fn make_session(id: usize) -> Session {
     }
 }
 
-/// `pond config check` probe against the real S3 wire: the fat-URL grammar
+/// `pond storage check` probe against the real S3 wire: the fat-URL grammar
 /// folds the fixture endpoint in, a scoped creds set resolves, and the
 /// conditional-put pair proves the If-None-Match -> 412 path. Then the same
 /// probe with a wrong secret must classify as the auth failure naming the
