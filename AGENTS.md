@@ -17,6 +17,15 @@
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
 - Run one test by name: `cargo test <name>` (substring match across all binaries; add `-- --exact` to require a full match).
 
+## Testing interactive CLI flows
+
+The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dialoguer, which read raw keystrokes from a real TTY - they can't be exercised by piping stdin or by a `cargo test`. To verify them, drive the compiled binary under a pseudo-terminal:
+
+- Driver: Python stdlib `pty` (no `pexpect` install). `pid, fd = pty.fork()`; in the child `os.execve` the binary; in the parent loop on `select([fd], ...)`, accumulate `os.read`, and `os.write` keystrokes when an anchor substring appears. Strip ANSI (`\x1b\[[0-9;?]*[ -/]*[@-~]` plus `\r`) before matching - cliclack repaints on every frame. Keys: Enter `b'\r'`, down `b'\x1b[B'`, up `b'\x1b[A'`, Ctrl-C `b'\x03'`.
+- Sandbox every run: set `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` to temp dirs and `NO_COLOR=1`. An empty `HOME` makes source discovery find nothing, so the flow stays minimal. Seed `$XDG_CONFIG_HOME/pond/config.toml` to reproduce a starting state (legacy map, broken `storage.path`, etc.).
+- Stop cleanly with Ctrl-C: `wiz()` turns it into "Cancelled - nothing written" and exits. `pond init` writes nothing and runs no external side effect (MCP/scheduler registration) until after the "Write config?" gate, so cancelling before it is side-effect-free - assert the seeded config is byte-identical and the sandbox `state`/`data` dirs are empty to prove it.
+- Always set an overall deadline in the driver and send Ctrl-C on timeout, so a missed anchor can't hang the run.
+
 ## Source of truth
 
 - `docs/spec.md` is the spec (sections 1-10: overview, scope, storage substrate, canonical model, session datasets, adapters, protocol, search and embeddings, deferred, references). Read the relevant section before changing behavior.
