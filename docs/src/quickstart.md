@@ -34,7 +34,7 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
    pond init -y --adapters claude-code,codex-cli --schedule 5m   # non-interactive
    ```
 
-   `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)). init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
+   `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)) - when that destination is remote, init prompts for credentials inline, so a bucket is one command. init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
 
    ```sh
    claude mcp add -s user pond -- pond mcp   # Claude Code

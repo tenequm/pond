@@ -7,13 +7,17 @@
 
 Lossless storage and hybrid search for AI agent sessions, across every agentic client.
 
-**Quickstart.** Install, ingest your local sessions, and add pond as an MCP server in any app:
+**Quickstart.** Install, run guided setup, and ingest your local sessions:
 
 ```sh
 brew install tenequm/tap/pond
-pond sync
+pond init   # guided setup: storage, sources, MCP registration, optional schedule
+pond sync   # ingest, embed, update indexes - every enabled source
+```
 
-# add pond as an MCP server (pick your client):
+`pond init` registers pond as an MCP server for detected clients; to add it by hand:
+
+```sh
 claude mcp add -s user pond -- pond mcp   # Claude Code
 codex mcp add pond -- pond mcp            # Codex
 ```
@@ -22,9 +26,12 @@ Pond keeps every AI conversation you've ever had intact and searchable, and lets
 
 Current automatically synced agent clients:
 - Claude Code CLI
+- Claude desktop app (local agent mode)
 - Codex CLI
 - opencode CLI
 - pi-coding-agent CLI
+
+You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --source-dir <path>`.
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.cascade.fyi](https://pond.cascade.fyi/); the contract is [`docs/spec.md`](docs/spec.md).
 
@@ -107,7 +114,6 @@ Stages can be run independently when needed:
 pond sync --only import
 pond sync --only embed
 pond sync --only update-indexes
-pond sync -y                       # auto-accept probe prompts (non-TTY runs)
 ```
 
 Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
@@ -120,9 +126,21 @@ pond schedule logs
 
 `pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + searchable messages), and `sources` (configured adapter count). Pass `--adapters` for per-project tables and per-intent index detail. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
+### Remote storage
+
+By default pond stores data locally under `$XDG_DATA_HOME/pond`. To use an object store, add credentials and switch the destination:
+
+```sh
+pond storage creds add                                            # interactive: name, access key, hidden secret
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond   # probe end-to-end, then flip [storage].path
+pond storage check                                                # verify: parse, creds, conditional-put (OCC), write/read/delete
+```
+
+`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond storage migrate --from <local> --to <url>` carries existing local data into the bucket - idempotent, and it never deletes the source. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
+
 ### Configuration
 
-`pond init` walks through everything below interactively; `pond sync` also discovers sources on first run and writes them to `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. Re-enable interactively with `pond sync <name>`.
+`pond init` walks through everything below interactively and enables the sources it finds. `pond sync` only ingests already-enabled sources - enabling one is an explicit step (`pond sources enable` / `pond sources discover` / `pond init`), never a side effect of sync. Config lives under `$XDG_CONFIG_HOME/pond/`. Every `[sources.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped.
 
 ```toml
 [sources.claude-code]
