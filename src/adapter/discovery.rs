@@ -270,6 +270,21 @@ pub fn persist_decline(config_path: &Path, names: &[&str]) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Flip `[sources.<name>].enabled` on an already-configured source. Returns
+/// `false` (writing nothing) when the section is absent - the caller decides
+/// whether to discover it first. Backs `pond sources enable|disable`.
+pub fn set_source_enabled(config_path: &Path, name: &str, enabled: bool) -> anyhow::Result<bool> {
+    let mut doc = open_or_init(config_path)?;
+    let sources = sources_table_mut(&mut doc)?;
+    let Some(entry) = sources.get_mut(name).and_then(Item::as_table_mut) else {
+        return Ok(false);
+    };
+    entry.insert("enabled", toml_edit::value(enabled));
+    std::fs::write(config_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(true)
+}
+
 fn open_or_init(config_path: &Path) -> anyhow::Result<DocumentMut> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
@@ -426,6 +441,35 @@ mod tests {
         assert!(
             body.contains("[sources.opencode]") && body.contains("enabled = false"),
             "expected declined entry; got: {body}",
+        );
+    }
+
+    #[test]
+    fn set_source_enabled_flips_in_place_and_reports_absence() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let accept = Candidate {
+            name: "claude-code".to_owned(),
+            hint: "/tmp/cc".to_owned(),
+            config: json!({ "path": "/tmp/cc" }),
+        };
+        persist_accept(&config_path, &[accept]).unwrap();
+
+        // Absent source: writes nothing, reports false.
+        assert!(!set_source_enabled(&config_path, "opencode", false).unwrap());
+
+        // Present source: flips enabled, keeps the path.
+        assert!(set_source_enabled(&config_path, "claude-code", false).unwrap());
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            body.contains("enabled = false") && body.contains("path = \"/tmp/cc\""),
+            "flip must preserve the blob; got: {body}",
+        );
+        assert!(set_source_enabled(&config_path, "claude-code", true).unwrap());
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("enabled = true")
         );
     }
 }

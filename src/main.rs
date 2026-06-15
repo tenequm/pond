@@ -231,15 +231,18 @@ Every command documents itself: `pond <command> --help` carries examples."
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    // `global = true` on these args, so they resolve at the root
+    // (`pond --storage-path X status`) and after any subcommand alike.
+    #[command(flatten)]
+    store: StoreArgs,
     #[command(flatten)]
     #[command(next_help_heading = "Global options")]
     verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::WarnLevel>,
 }
 
-/// Storage and config selectors shared by every data-touching command.
-/// Flattened LAST in each variant: the struct-level `next_help_heading`
-/// applies to every arg declared after the flatten point, so trailing it
-/// keeps the per-command flags under the default heading.
+/// Storage and config selectors. Flattened once into the root `Cli` with
+/// `global = true` args, so every subcommand inherits them and they parse
+/// before or after the subcommand name.
 #[derive(Debug, clap::Args)]
 #[command(next_help_heading = "Global options")]
 struct StoreArgs {
@@ -291,14 +294,15 @@ enum Command {
     ///
     /// The everyday command: pulls fresh sessions from every enabled
     /// `[sources.*]` entry (or one named adapter), embeds the backlog, and
-    /// folds new rows into the search indexes. With no sources configured it
-    /// probes the machine and offers to enable what it finds.
+    /// folds new rows into the search indexes. It only ever syncs sources you
+    /// have already enabled - enabling one is an explicit step (`pond sources
+    /// enable` / `pond sources discover` / `pond init`), never a side effect
+    /// of sync.
     #[command(after_long_help = "Examples:
   pond sync                                  sync every enabled source
-  pond sync claude-code                      sync one adapter (re-enables it if declined)
+  pond sync claude-code                      sync one enabled adapter
   pond sync codex-cli --source-dir ~/backup  one-off path override, config untouched
-  pond sync --only embed                     run a single stage
-  pond sync -y                               auto-accept newly detected sources")]
+  pond sync --only embed                     run a single stage")]
     Sync {
         /// Adapter name (claude-code, codex-cli, ...); default: every enabled source.
         adapter: Option<String>,
@@ -316,11 +320,21 @@ enum Command {
         /// Re-embed stale rows after an embedding model change.
         #[arg(long)]
         force_embed: bool,
-        /// Auto-accept every probe prompt (for non-interactive runs).
-        #[arg(long, short = 'y')]
-        yes: bool,
-        #[command(flatten)]
-        store: StoreArgs,
+    },
+    /// Manage which adapters `pond sync` ingests (the `[sources.*]` entries).
+    ///
+    /// Enabling a source is the explicit owner of source state: `list` shows
+    /// what is configured and what was detected, `discover` probes and enables
+    /// interactively, `enable`/`disable` flip one by name. `pond sync` reads
+    /// these but never writes them.
+    #[command(after_long_help = "Examples:
+  pond sources list                          configured sources + detected adapters
+  pond sources discover                      probe this machine, pick what to enable
+  pond sources enable claude-code            enable one (discovers its path if needed)
+  pond sources disable opencode              stop syncing one, keep it on record")]
+    Sources {
+        #[command(subcommand)]
+        command: SourcesCmd,
     },
     /// Show pond health, data, and source status.
     ///
@@ -342,8 +356,6 @@ enum Command {
         /// Default rolls sessions up to the main agent only.
         #[arg(long)]
         include_subagents: bool,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Search stored messages.
     ///
@@ -408,8 +420,6 @@ enum Command {
         explain: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Fetch a session or message.
     ///
@@ -470,8 +480,6 @@ enum Command {
         after_id: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Run one read-only SQL query over the corpus.
     ///
@@ -499,8 +507,6 @@ enum Command {
         /// `--format parquet`; optional for ndjson). Ignored for text/json.
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Run the HTTP API server (or MCP over stdio with --transport stdio).
     ///
@@ -531,8 +537,6 @@ enum Command {
             default_value_t = 9797
         )]
         port: u16,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -542,10 +546,7 @@ enum Command {
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    Mcp {
-        #[command(flatten)]
-        store: StoreArgs,
-    },
+    Mcp {},
     /// Manage the automatic sync schedule.
     ///
     /// Registers `pond sync -q` with the OS scheduler: launchd on macOS,
@@ -574,8 +575,6 @@ enum Command {
     Storage {
         #[command(subcommand)]
         command: Option<StorageCmd>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Export a compact restorable .pond archive.
     ///
@@ -593,8 +592,6 @@ enum Command {
         /// Archive format: a compact .pond file, or the JSONL wire stream.
         #[arg(long, value_enum, default_value_t = ExportFormat::Pond)]
         format: ExportFormat,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Restore a .pond archive.
     ///
@@ -606,8 +603,6 @@ enum Command {
     Import {
         /// Path to the .pond archive to restore.
         archive: PathBuf,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Inspect configuration.
     ///
@@ -649,16 +644,12 @@ Homebrew and nix packages ship these pre-installed.")]
         /// run with a typed error so a model swap is never silent.
         #[arg(long)]
         force: bool,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Inspect and maintain Lance indexes.
     #[command(hide = true)]
     Index {
         #[command(subcommand)]
         command: IndexCommand,
-        #[command(flatten)]
-        store: StoreArgs,
     },
 }
 
@@ -747,6 +738,24 @@ enum CredsCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SourcesCmd {
+    /// List configured sources (enabled state, path) and detected-but-unconfigured adapters.
+    List,
+    /// Probe this machine for adapters and interactively enable the ones you pick.
+    Discover,
+    /// Enable a source, discovering its default path if it has no config entry yet.
+    Enable {
+        /// Adapter name (claude-code, codex-cli, ...).
+        name: String,
+    },
+    /// Disable a source so `pond sync` skips it (kept as `enabled = false`).
+    Disable {
+        /// Adapter name to disable.
+        name: String,
+    },
+}
+
 // Parsed once, matched once, immediately destructured - the size spread
 // between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
 #[allow(clippy::large_enum_variant)]
@@ -756,16 +765,9 @@ enum ConfigCmd {
     ///
     /// Redacted values, per-field source (cli/env/file/default), and the
     /// active URL's creds binding.
-    Show {
-        #[command(flatten)]
-        store: StoreArgs,
-    },
+    Show {},
     /// Print the path of the config file pond loads.
-    Path {
-        /// Config file to read (default: `~/.config/pond/config.toml`).
-        #[arg(long, env = "POND_CONFIG", hide_env_values = true, value_name = "PATH")]
-        config: Option<PathBuf>,
-    },
+    Path,
     /// Print the fully-annotated config.toml template.
     Schema,
 }
@@ -842,16 +844,18 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     init_tracing(cli.verbose.tracing_level_filter());
+    // Root-global selectors, bound once so every arm reads the same locals it
+    // did when each variant flattened its own copy.
+    let StoreArgs {
+        storage_path,
+        config,
+    } = cli.store;
 
     match cli.command {
-        Command::Init(args) => init::run(args).await?,
+        Command::Init(args) => init::run(args, storage_path, config).await?,
         Command::Status {
             adapters,
             include_subagents,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             // --adapters needs sub-agents broken out so the per-adapter
             // rollup reconciles with the storage row counts above.
@@ -890,39 +894,17 @@ async fn main() -> anyhow::Result<()> {
             only,
             skip,
             force_embed,
-            yes,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let config_file = config_path(config);
-            let mut loaded = Config::load(&config_file)?;
+            let loaded = Config::load(&config_file)?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
             let stages = SyncStages::resolve(only, &skip)?;
             let mut summary = SyncRunSummary::default();
-            // `--source-dir` is an explicit one-off bypass of `[sources.<name>]`
-            // (resolve_sync_sources honors it directly), so skip the config-based
-            // re-enable - otherwise a probe-less adapter with no config entry
-            // (e.g. claude-ai-export) errors before the override is applied.
-            if stages.import
-                && source_dir.is_none()
-                && let Some(name) = adapter.as_deref()
-            {
-                maybe_reenable_positional(&mut loaded, &config_file, name, yes).await?;
-            }
             if stages.import {
                 summary.ingest = Some(
                     run_import_stage(&store, &loaded, &config_file, adapter.clone(), source_dir)
                         .await?,
                 );
-            }
-            if stages.import && adapter.is_none() {
-                let extra = handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
-                match summary.ingest.as_mut() {
-                    Some(existing) => existing.merge(&extra),
-                    None => summary.ingest = Some(extra),
-                }
             }
             if stages.embed {
                 run_embed_stage(&store, force_embed).await?;
@@ -933,14 +915,12 @@ async fn main() -> anyhow::Result<()> {
             }
             render_sync_summary(&store, &summary).await?;
         }
-        Command::Embed {
-            limit,
-            force,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Sources { command } => {
+            let config_file = config_path(config);
+            let loaded = Config::load(&config_file)?;
+            run_sources(command, &config_file, &loaded)?;
+        }
+        Command::Embed { limit, force } => {
             let config = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &config, true).await?;
             let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
@@ -956,10 +936,6 @@ async fn main() -> anyhow::Result<()> {
             transport,
             host,
             port,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
@@ -980,12 +956,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Mcp {
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Mcp {} => {
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             // Lazy: idle `pond mcp` instances in every Claude Code session
@@ -1013,10 +984,6 @@ async fn main() -> anyhow::Result<()> {
             min_score,
             explain,
             format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
@@ -1047,13 +1014,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Index {
-            command,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Index { command } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             match command {
@@ -1096,10 +1057,6 @@ async fn main() -> anyhow::Result<()> {
             session_from,
             after_id,
             format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
@@ -1120,26 +1077,15 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Config { command } => run_config_command(command).await?,
+        Command::Config { command } => {
+            run_config_command(command, storage_path, config).await?;
+        }
         Command::Schedule { command } => schedule::run(command)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }
-        Command::Storage {
-            command,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => run_storage_command(command, storage_path, config).await?,
-        Command::Export {
-            out,
-            format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
+        Command::Export { out, format } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             match format {
@@ -1181,13 +1127,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Import {
-            archive,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Import { archive } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             let summary = import_pond_archive(&store, &archive).await?;
@@ -1211,10 +1151,6 @@ async fn main() -> anyhow::Result<()> {
             format,
             limit,
             output_file,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             if matches!(format, CliSqlFormat::Parquet) && output_file.is_none() {
                 bail!(
@@ -1316,122 +1252,6 @@ fn output(message: &str) -> anyhow::Result<()> {
 
 fn output_err(message: &str) -> anyhow::Result<()> {
     pond::output::line_err(message)
-}
-
-/// Partition `outcomes` into accepts/declines, persist both, and refresh
-/// `loaded` from disk. Shared between the post-import probe sweep and the
-/// positional re-enable path.
-fn apply_outcomes(
-    loaded: &mut Config,
-    config_file: &Path,
-    outcomes: &[adapter::PromptOutcome],
-) -> anyhow::Result<usize> {
-    let accepts: Vec<adapter::Candidate> = outcomes
-        .iter()
-        .filter(|o| o.enable)
-        .map(|o| o.candidate.clone())
-        .collect();
-    let declines: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| !o.enable)
-        .map(|o| o.candidate.name.as_str())
-        .collect();
-    if !accepts.is_empty() {
-        adapter::persist_accept(config_file, &accepts)?;
-    }
-    if !declines.is_empty() {
-        adapter::persist_decline(config_file, &declines)?;
-    }
-    if !accepts.is_empty() || !declines.is_empty() {
-        *loaded = Config::load(config_file)?;
-    }
-    Ok(accepts.len())
-}
-
-/// `pond sync <name>` positional override. When `<name>` is currently
-/// absent or `enabled = false`, re-probe just that one adapter and prompt
-/// (or auto-accept on `--yes`). Used to re-enable a previously-declined
-/// adapter without editing `config.toml` by hand.
-async fn maybe_reenable_positional(
-    loaded: &mut Config,
-    config_file: &Path,
-    name: &str,
-    auto_accept: bool,
-) -> anyhow::Result<()> {
-    use serde_json::Value;
-    use std::io::IsTerminal;
-    let present = loaded.sources.get(name);
-    let is_enabled = present
-        .and_then(|b| b.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(false);
-    if is_enabled {
-        return Ok(());
-    }
-    let candidates = adapter::discover(Some(name));
-    if candidates.is_empty() {
-        bail!("no `[sources.{name}]` and probe returned nothing; add the entry manually");
-    }
-    if !auto_accept && !std::io::stdin().is_terminal() {
-        bail!(
-            "source [{name}] is disabled and stdin is not a terminal; pass --yes or re-run on a TTY"
-        );
-    }
-    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
-    let accepted = apply_outcomes(loaded, config_file, &outcomes)?;
-    if accepted == 0 {
-        bail!("declined; nothing to sync");
-    }
-    Ok(())
-}
-
-/// After `pond sync`'s import stage, prompt the operator about any
-/// freshly-detectable adapter that has no `[sources.<name>]` section yet.
-/// `enabled = true`/`enabled = false` is persisted either way so the
-/// decision sticks; only the positional `pond sync <name>` re-prompts a
-/// previously-declined adapter. Non-TTY runs (and `--yes` runs without a
-/// TTY) emit a one-line stderr hint and continue without writing - the
-/// operator can re-run on a TTY to opt in/out.
-async fn handle_probe_prompt(
-    store: &Store,
-    loaded: &mut Config,
-    config_file: &Path,
-    auto_accept: bool,
-) -> anyhow::Result<IngestSummary> {
-    use std::io::IsTerminal;
-    let mut accumulated = IngestSummary::default();
-    let candidates = adapter::probe_unconfigured(&loaded.sources);
-    if candidates.is_empty() {
-        return Ok(accumulated);
-    }
-    let interactive = std::io::stdin().is_terminal();
-    if !interactive && !auto_accept {
-        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
-        output_err(&pond::output::paint(
-            &format!(
-                "hint     {} unconfigured adapter(s): {} - run `pond sync` on a TTY to enable",
-                candidates.len(),
-                names.join(", "),
-            ),
-            pond::output::dim(),
-        ))?;
-        return Ok(accumulated);
-    }
-    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
-    apply_outcomes(loaded, config_file, &outcomes)?;
-    for outcome in &outcomes {
-        if outcome.enable && outcome.sync_now {
-            let summary = run_import_stage(
-                store,
-                loaded,
-                config_file,
-                Some(outcome.candidate.name.clone()),
-                None,
-            )
-            .await?;
-            accumulated.merge(&summary);
-        }
-    }
-    Ok(accumulated)
 }
 
 /// Open the store with an indicatif spinner ticking while
@@ -1536,17 +1356,16 @@ fn config_path(explicit: Option<PathBuf>) -> PathBuf {
     )
 }
 
-async fn run_config_command(command: ConfigCmd) -> anyhow::Result<()> {
+async fn run_config_command(
+    command: ConfigCmd,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     match command {
         ConfigCmd::Schema => output(DEFAULT_CONFIG_TOML.trim_end()),
-        ConfigCmd::Path { config } => output(&config_path(config).display().to_string()),
-        ConfigCmd::Show {
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        ConfigCmd::Path => output(&config_path(config).display().to_string()),
+        ConfigCmd::Show {} => {
             let path = config_path(config);
             let (loaded, figment) = Config::load_with_provenance(&path)?;
             // Contracted like every other human-facing path (`pond config
@@ -2111,6 +1930,115 @@ fn set_creds_set(
     }
 }
 
+/// `pond sources {list,discover,enable,disable}`: the explicit owner of
+/// `[sources.*]` state. `pond sync` reads these entries but never writes them.
+fn run_sources(command: SourcesCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+    match command {
+        SourcesCmd::List => sources_list(loaded),
+        SourcesCmd::Discover => sources_discover(config_file),
+        SourcesCmd::Enable { name } => sources_enable(config_file, &name),
+        SourcesCmd::Disable { name } => sources_disable(config_file, &name),
+    }
+}
+
+fn sources_list(loaded: &Config) -> anyhow::Result<()> {
+    let detected = adapter::probe_unconfigured(&loaded.sources);
+    if loaded.sources.is_empty() && detected.is_empty() {
+        output(
+            "no sources configured and none detected - run `pond sources discover` (or `pond init`)",
+        )?;
+        return Ok(());
+    }
+    let mut table = new_table();
+    table.set_header(vec!["source", "enabled", "path"]);
+    for (name, blob) in &loaded.sources {
+        let enabled = blob
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let path = blob
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_owned();
+        let state = if enabled { "yes" } else { "no" }.to_owned();
+        table.add_row(vec![name.clone(), state, path]);
+    }
+    for candidate in &detected {
+        table.add_row(vec![
+            candidate.name.clone(),
+            "detected".to_owned(),
+            candidate.hint.clone(),
+        ]);
+    }
+    output(&table.to_string())?;
+    Ok(())
+}
+
+fn sources_discover(config_file: &Path) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let candidates = adapter::discover(None);
+    let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
+    let names: Vec<&str> = picks.iter().map(|c| c.name.as_str()).collect();
+    output(&format!(
+        "{} enabled {} source(s): {}",
+        paint("sources:", dim()),
+        picks.len(),
+        names.join(", "),
+    ))?;
+    Ok(())
+}
+
+fn sources_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let known = adapter::known_names();
+    if !known.contains(&name) {
+        bail!("unknown adapter {name:?}; known: {}", known.join(", "));
+    }
+    // Already configured: flip enabled = true in place, keeping its path/options.
+    if adapter::set_source_enabled(config_file, name, true)? {
+        output(&format!(
+            "{} [sources.{}] enabled = true",
+            paint("sources:", dim()),
+            name,
+        ))?;
+        return Ok(());
+    }
+    // Not configured: discover its default path, then persist enabled = true.
+    let candidate = adapter::discover(Some(name))
+        .into_iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "adapter {name:?} was not detected on this machine; add a [sources.{name}] entry with its path manually, or run `pond sync {name} --source-dir <path>` for a one-off"
+            )
+        })?;
+    adapter::persist_accept(config_file, &[candidate])?;
+    output(&format!(
+        "{} [sources.{}] enabled = true (discovered)",
+        paint("sources:", dim()),
+        name,
+    ))?;
+    Ok(())
+}
+
+fn sources_disable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    if adapter::set_source_enabled(config_file, name, false)? {
+        output(&format!(
+            "{} [sources.{}] enabled = false",
+            paint("sources:", dim()),
+            name,
+        ))?;
+        Ok(())
+    } else {
+        bail!(
+            "no [sources.{name}] entry to disable in {}",
+            config_file.display()
+        );
+    }
+}
+
 /// Map a figment provenance lookup onto the source column vocabulary.
 fn classify_source(figment: &figment::Figment, key: &str) -> &'static str {
     match figment.find_metadata(key) {
@@ -2250,18 +2178,18 @@ async fn run_import_stage(
     adapter: Option<String>,
     source_dir: Option<PathBuf>,
 ) -> anyhow::Result<IngestSummary> {
-    let sources = resolve_sync_sources(loaded, config_file, adapter.as_deref(), source_dir)?;
+    let sources = resolve_sync_sources(loaded, adapter.as_deref(), source_dir)?;
     if sources.is_empty() {
         let disabled = loaded.disabled_source_names();
         let label = pond::output::paint("import:", pond::output::dim());
         if disabled.is_empty() {
             output(&format!(
-                "{label} no sources configured. Run `pond sync` on a TTY to detect adapters, or add `[sources.<name>]` blocks to {}.",
+                "{label} no sources configured. Run `pond sources discover` (or `pond init`) to detect and enable adapters, or add `[sources.<name>]` blocks to {}.",
                 config_file.display(),
             ))?;
         } else {
             output(&format!(
-                "{label} no enabled sources. Found {} disabled: {}. Add `enabled = true` to the section in {}, or re-enable interactively with `pond sync <name>`.",
+                "{label} no enabled sources. Found {} disabled: {}. Enable one with `pond sources enable <name>` (or add `enabled = true` to its section in {}).",
                 disabled.len(),
                 disabled.join(", "),
                 config_file.display(),
@@ -2620,18 +2548,17 @@ fn unzip_archive(source: &Path, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
+/// Read-only over config - enabling a source is `pond sources` / `pond init`,
+/// never a side effect of sync (spec.md#cli-verbs).
 ///
 /// Precedence:
 /// 1. `--source-dir <path>` with `<adapter>` set: one-off run, no config writes.
-/// 2. `<adapter>` set, `[sources.<adapter>].path` present: use that.
-/// 3. `<adapter>` set, no config entry: run per-adapter discovery (one
-///    candidate), prompt to add it, persist, then use it.
-/// 4. No `<adapter>`, `[sources]` non-empty: sync every entry.
-/// 5. No `<adapter>`, empty `[sources]`: discover across every adapter,
-///    prompt, persist, then sync the picks.
+/// 2. `<adapter>` set, `[sources.<adapter>]` present: use that.
+/// 3. `<adapter>` set, no config entry: error pointing at `pond sources enable`.
+/// 4. No `<adapter>`, `[sources]` non-empty: sync every enabled entry.
+/// 5. No `<adapter>`, empty `[sources]`: error pointing at `pond sources discover`.
 fn resolve_sync_sources(
     config: &Config,
-    config_file: &Path,
     name: Option<&str>,
     source_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<(String, Value)>> {
@@ -2656,18 +2583,19 @@ fn resolve_sync_sources(
         if let Some(blob) = config.sources.get(name) {
             return Ok(vec![(name.to_owned(), blob.clone())]);
         }
-        let candidates = adapter::discover(Some(name));
-        let picks =
-            adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
-        return Ok(picks.into_iter().map(|c| (c.name, c.config)).collect());
+        // spec.md#cli-verbs: sync never enables. Enabling is the explicit job of
+        // `pond sources enable` / `pond init`.
+        bail!(
+            "adapter {name:?} has no [sources.{name}] entry; enable it with `pond sources enable {name}` (or `pond init`), then re-run `pond sync`"
+        );
     }
 
     if !config.sources.is_empty() {
         return config.resolve_sources(None);
     }
-    let candidates = adapter::discover(None);
-    let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
-    Ok(picks.into_iter().map(|c| (c.name, c.config)).collect())
+    bail!(
+        "no sources configured; run `pond sources discover` (or `pond init`) to detect and enable adapters, then re-run `pond sync`"
+    );
 }
 
 /// Run one adapter's ingest pass into `store` with a live progress bar and
@@ -3975,6 +3903,34 @@ mod tests {
             !body.contains("creds"),
             "emptied [creds] parent removed: {body:?}"
         );
+    }
+
+    #[test]
+    fn resolve_sync_sources_errors_point_at_the_sources_commands() {
+        // Empty config: sync names `pond sources discover`, never enables.
+        let empty = Config::load_str("").expect("empty config");
+        let err = resolve_sync_sources(&empty, None, None).expect_err("empty must error");
+        assert!(
+            err.to_string().contains("pond sources discover"),
+            "empty error should name discover: {err}"
+        );
+
+        // Named-but-unconfigured: sync names `pond sources enable <name>`.
+        let err = resolve_sync_sources(&empty, Some("claude-code"), None)
+            .expect_err("unconfigured named must error");
+        assert!(
+            err.to_string().contains("pond sources enable claude-code"),
+            "named error should name enable: {err}"
+        );
+
+        // Configured source resolves without touching config.
+        let configured =
+            Config::load_str("[sources.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
+                .expect("configured");
+        let resolved =
+            resolve_sync_sources(&configured, Some("claude-code"), None).expect("resolves");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "claude-code");
     }
 
     // Long-help snapshots for the root and every visible subcommand. The

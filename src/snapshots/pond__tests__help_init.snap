@@ -9,11 +9,6 @@ Walks through storage, source adapters, MCP registration, and an optional sync s
 Usage: pond init [OPTIONS]
 
 Options:
-      --storage-path <URL>
-          Storage destination to write into config (skips the storage prompt).
-          
-          Unlike other commands, `POND_STORAGE_PATH` is not read here: init writes config, and folding the env var in would silently persist ephemeral state.
-
       --adapters <NAMES>
           Comma-separated adapter names to enable (skips the source picker)
 
@@ -31,15 +26,22 @@ Options:
       --force
           Ignore existing config values and start from built-in defaults
 
-      --config <PATH>
-          Config file to write (default: `~/.config/pond/config.toml`)
-          
-          [env: POND_CONFIG]
-
   -h, --help
           Print help (see a summary with '-h')
 
 Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
   -v, --verbose...
           Increase logging verbosity
 

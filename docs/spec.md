@@ -552,19 +552,20 @@ A `pond_ingest` event is one canonical object - a Session, a Message, or a Part 
 
 The MCP transport exposes the read operations - `pond_search`, `pond_get`, and `pond_sql_query` - as tools, plus the resources. Ingest stays HTTP-and-CLI only. Why: MCP's role is read access for an agent; ingest is an operator action.
 
-### 7.8 CLI verbs
+### 7.8 CLI verbs {#cli-verbs}
 
-The same handlers back a set of command-line verbs:
+The same handlers back a set of command-line verbs. The storage destination and config file are `global = true` selectors (`--storage-path` / `POND_STORAGE_PATH`, `--config` / `POND_CONFIG`), resolved at the root or after any subcommand alike; `pond init` is the one exception - it ignores an env-sourced `--storage-path`, since writing ephemeral env state into config would be a silent surprise.
 
 - `pond init` - idempotent setup-and-repair wizard: storage destination (with an end-to-end probe for remote URLs), source adapter selection, MCP registration, and an opt-in sync schedule, written to `config.toml` in a single pass at the end. Every section is flag-answerable (`--storage-path`, `--adapters`, `--schedule`, `--skip-mcp`, `--yes`) for non-interactive use; `--yes` alone never schedules.
-- `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge.
+- `pond sync` - run the import, embed, and update-indexes stages in order. `--only <stage>` runs exactly one stage; `--skip <stage>` omits one. Stages are `import`, `embed`, and `update-indexes`. `--force-embed` re-embeds rows whose `embedding_model` differs from the current model via conditional merge. Sync ingests only already-enabled `[sources.*]`; it never discovers, enables, or writes source state - that is the explicit job of `pond sources` and `pond init`. With no enabled sources it does nothing but name the fix.
+- `pond sources list|discover|enable|disable` - manage which adapters `pond sync` ingests (the `[sources.*]` entries) and nothing else. `list` shows configured sources (enabled state, path) plus detected-but-unconfigured adapters; `discover` probes the machine and enables the interactive picks; `enable`/`disable` flip one by name, `enable` discovering its default path when it has no entry yet. Enabling a source is therefore always an explicit action - `pond sync` reads these entries but never writes them.
 - `pond search [--explain]` - hybrid search from the command line. `--explain` returns Lance's `analyze_plan` output instead of results.
 - `pond get` - fetch a session, or one message with context, from the command line.
 - `pond sql` - one read-only SQL query over the corpus: a DataFusion-planned SELECT/WITH over the three session datasets, with the same two-layer read-only enforcement as the `pond_sql_query` tool (Section 7.7). Results render inline (row-capped) or export to parquet/ndjson.
 - `pond status` - row counts, dataset statistics, embedding coverage, index health, and the sync-schedule state. It prints the cheap storage summary first, then completes the longer checks.
 - `pond serve --transport http|stdio` - run HTTP by default, or MCP over stdio.
 - `pond mcp` - alias for `pond serve --transport stdio`.
-- `pond schedule start|stop|status|logs` - manage the automatic `pond sync -q` registration with the OS scheduler: launchd on macOS, systemd user timers (or a fenced crontab block) on Linux. The scheduled job never passes `--yes`, so an unattended run cannot auto-enable adapters.
+- `pond schedule start|stop|status|logs` - manage the automatic `pond sync -q` registration with the OS scheduler: launchd on macOS, systemd user timers (or a fenced crontab block) on Linux. An unattended scheduled run can only ingest already-enabled sources: `pond sync` never enables an adapter (that is `pond sources` / `pond init`), so a background job can never grow the source set on its own.
 - `pond export` - write a compact `.pond` archive containing clean index-free Lance datasets plus a manifest. Embeddings remain data columns and are preserved.
 - `pond import <archive.pond>` - restore a compact archive into the current corpus. Existing rows are deduped through the same merge-insert path as adapter import. (`pond import` is the only archive-restore path; the former `pond sync --import-from` alias is removed.)
 - `pond config show|path|schema` - introspection for Section 3.9: `show` prints the resolved config with redacted values (`storage-redaction`), per-field source attribution along the precedence ladder, and the active URL's creds binding.

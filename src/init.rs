@@ -21,13 +21,6 @@ use crate::schedule::{self, ScheduleEvery};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InitArgs {
-    /// Storage destination to write into config (skips the storage prompt).
-    ///
-    /// Unlike other commands, `POND_STORAGE_PATH` is not read here: init
-    /// writes config, and folding the env var in would silently persist
-    /// ephemeral state.
-    #[arg(long, value_parser = crate::parse_storage_path, value_name = "URL")]
-    storage_path: Option<StorageUrl>,
     /// Comma-separated adapter names to enable (skips the source picker).
     #[arg(long, value_delimiter = ',', value_name = "NAMES")]
     adapters: Option<Vec<String>>,
@@ -43,9 +36,6 @@ pub(crate) struct InitArgs {
     /// Ignore existing config values and start from built-in defaults.
     #[arg(long)]
     force: bool,
-    /// Config file to write (default: `~/.config/pond/config.toml`).
-    #[arg(long, env = "POND_CONFIG", hide_env_values = true, value_name = "PATH")]
-    config: Option<PathBuf>,
 }
 
 /// The stock clack theme, except a cancelled prompt's footer renders as a
@@ -83,10 +73,20 @@ fn wiz<T>(result: std::io::Result<T>) -> Result<T> {
     }
 }
 
-pub(crate) async fn run(args: InitArgs) -> Result<()> {
-    let config_file = crate::config_path(args.config.clone());
+pub(crate) async fn run(
+    args: InitArgs,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> Result<()> {
+    let config_file = crate::config_path(config);
+    // init writes config, so an env-sourced storage path would silently persist
+    // ephemeral state. Honor `--storage-path` only when it came from argv, not
+    // from `POND_STORAGE_PATH` (the global flag's env mirror).
+    let storage_path = storage_path.filter(|_| {
+        std::env::args().any(|a| a == "--storage-path" || a.starts_with("--storage-path="))
+    });
     let interactive = std::io::stdin().is_terminal();
-    let any_flag = args.storage_path.is_some()
+    let any_flag = storage_path.is_some()
         || args.adapters.is_some()
         || args.schedule.is_some()
         || args.skip_mcp;
@@ -148,7 +148,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
                         "the old endpoint folds the bucket into the hostname; add the bucket and prefix to the URL below: s3+https://<host>/<bucket>/<prefix>",
                     )?;
                 }
-            } else if args.storage_path.is_none() && !usable {
+            } else if storage_path.is_none() && !usable {
                 // Non-interactive and the bucket can't be derived: bail with the
                 // fix instead of re-raising the recipe (which would point back at
                 // `pond init`, the command already running - a loop).
@@ -176,7 +176,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
             })
             .unwrap_or_else(platform_default_storage)
     };
-    let chosen = pick_storage(&args, &doc, &default_storage, prompts).await?;
+    let chosen = pick_storage(storage_path.as_ref(), &doc, &default_storage, prompts).await?;
     let chosen_display = crate::storage_config_value(&chosen);
     let current_path = doc
         .get("storage")
@@ -376,7 +376,7 @@ fn structural_error(url: &StorageUrl) -> Option<String> {
 /// instead - a file collision is permanent, so it is a hard reject with no
 /// keep-anyway escape.
 async fn pick_storage(
-    args: &InitArgs,
+    storage_path: Option<&StorageUrl>,
     doc: &DocumentMut,
     default: &str,
     prompts: bool,
@@ -386,7 +386,7 @@ async fn pick_storage(
     let creds = Config::load_str(&doc.to_string())
         .map(|config| config.creds)
         .unwrap_or_default();
-    if let Some(chosen) = args.storage_path.clone() {
+    if let Some(chosen) = storage_path.cloned() {
         if let Some(reason) = structural_error(&chosen) {
             bail!(
                 "--storage-path {}: {reason}; pick a directory",

@@ -43,7 +43,7 @@ pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
 pub use discovery::{
     Candidate, PromptOutcome, apply_to_doc, discover, persist_accept, persist_decline,
-    probe_unconfigured, prompt_and_persist, prompt_each,
+    probe_unconfigured, prompt_and_persist, prompt_each, set_source_enabled,
 };
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,

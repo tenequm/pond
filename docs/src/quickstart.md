@@ -44,11 +44,10 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 2. Import your sessions:
 
    ```sh
-   pond sync         # ingest, embed, update indexes
-   pond sync -y      # non-interactive (cron, CI, headless agents)
+   pond sync         # ingest, embed, update indexes - every enabled source
    ```
 
-   If you enabled a schedule in step 1, this runs automatically on that cadence too. Each enabled adapter is `[sources.<name>] enabled = true` in `config.toml` (under `$XDG_CONFIG_HOME/pond/`); re-enable one later with `pond sync <name>`.
+   `pond init` already enabled your adapters; `sync` only ever ingests already-enabled `[sources.*]` and never enables on its own. Manage the set explicitly with `pond sources list|discover|enable|disable` (e.g. `pond sources enable codex-cli`). If you set a schedule in step 1, `sync` also runs automatically on that cadence.
 
 3. Now just ask your agent - it searches your history through pond for you:
 
