@@ -25,14 +25,14 @@ You need three things: pond installed with local data, a bucket, and its S3 cred
 2. Create a bucket at your provider and get S3 credentials. Worked example for Hetzner:
    - Hetzner Cloud Console -> your project -> Object Storage -> create a bucket (pick a region, e.g. Nuremberg `nbg1`, Falkenstein `fsn1`, or Helsinki `hel1`). Note the bucket name, say `my-pond`.
    - Generate S3 credentials for it - the access key and secret are shown once; save both.
-   - Your destination URL is then `s3+https://<region>.your-objectstorage.com/<bucket>/<prefix>`, e.g. `s3+https://nbg1.your-objectstorage.com/my-pond/pond`.
+   - Your destination URL is then `s3+https://<region>.your-objectstorage.com/<bucket>`, e.g. `s3+https://nbg1.your-objectstorage.com/my-pond`.
 
-The `s3+https://host/bucket/prefix` form carries the endpoint, bucket, and prefix in one URL, so the endpoint can never desync from the bucket. The `prefix` is just a path inside the bucket where pond keeps its datasets (use `pond` if unsure). The region is auto-detected for real AWS buckets and defaulted for S3-compatible endpoints; you rarely need to set it - if a provider needs a specific one, override with `?region=<id>` on the URL or a `region` field on the credential set. Other schemes (`s3://`, `gs://`, `az://`) work too and fall back to the ambient cloud SDK credential chain when no credential set matches.
+The `s3+https://host/bucket` form carries the endpoint and bucket in one URL, so the endpoint can never desync from the bucket. pond writes its datasets at the bucket root; if you want them under a subpath instead (to share the bucket with other data), append one - `s3+https://host/bucket/some-prefix`. The region is auto-detected for real AWS buckets and defaulted for S3-compatible endpoints; you rarely need to set it - if a provider needs a specific one, override with `?region=<id>` on the URL or a `region` field on the credential set. Other schemes (`s3://`, `gs://`, `az://`) work too and fall back to the ambient cloud SDK credential chain when no credential set matches.
 
 Throughout this guide, set the destination once so the commands are copy-paste:
 
 ```sh
-DEST=s3+https://nbg1.your-objectstorage.com/my-pond/pond
+DEST=s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
 ## Step 1 - Add credentials
@@ -171,7 +171,7 @@ set -euo pipefail
 export POND_CREDS_DEFAULT_ACCESS_KEY_ID="<access-key>"
 export POND_CREDS_DEFAULT_SECRET_ACCESS_KEY="<secret-key>"
 SRC=~/.local/share/pond
-DEST=s3+https://nbg1.your-objectstorage.com/my-pond/pond
+DEST=s3+https://nbg1.your-objectstorage.com/my-pond
 counts="select (select count(*) from sessions) s,(select count(*) from messages) m,(select count(*) from parts) p"
 
 pond storage check "$DEST"                                   # gate: exit 0 required

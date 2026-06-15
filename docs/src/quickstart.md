@@ -65,21 +65,21 @@ By default pond stores its data locally (under `$XDG_DATA_HOME/pond`). To put it
 
 ```sh
 pond storage creds add        # interactive: set name (default), access key, hidden secret
-pond storage use s3+https://nbg1.your-objectstorage.com/my-pond/pond
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
 `creds add` writes a `[creds.<name>]` block to `config.toml`; `use` probes the destination end-to-end and flips `[storage].path` to it. The result is just config you could also write by hand:
 
 ```toml
 [storage]
-path = "s3+https://nbg1.your-objectstorage.com/my-pond/pond"
+path = "s3+https://nbg1.your-objectstorage.com/my-pond"
 
 [creds.default]
 access_key_id     = "..."
 secret_access_key = "..."
 ```
 
-The `s3+https://host/bucket/prefix` form carries the endpoint, bucket, and prefix in one URL - it works for any S3-compatible store (Hetzner, R2, B2, MinIO). Plain `s3://`, `gs://`, and `az://` URLs work too, using the standard cloud SDK credential chain when no `[creds.*]` set matches. Probe a destination before relying on it:
+The `s3+https://host/bucket` form carries the endpoint and bucket in one URL - it works for any S3-compatible store (Hetzner, R2, B2, MinIO); append a `/prefix` only if you want pond's data under a subpath rather than the bucket root. Plain `s3://`, `gs://`, and `az://` URLs work too, using the standard cloud SDK credential chain when no `[creds.*]` set matches. Probe a destination before relying on it:
 
 ```sh
 pond storage check   # parse, creds binding, conditional-put (OCC), write/read/delete
@@ -93,8 +93,8 @@ Several machines can share one bucket: give each the same `config.toml` and run 
 `use` only switches the pointer; it never moves data. To carry your existing local sessions into the bucket, copy them first, then switch:
 
 ```sh
-pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond/pond
-pond storage use s3+https://nbg1.your-objectstorage.com/my-pond/pond
+pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
 Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
