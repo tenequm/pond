@@ -12,7 +12,7 @@ The shape of the migration is four steps that each do exactly one thing: **add c
 
 ## Before you start
 
-You need three things: pond installed with local data, a bucket, and its S3 credentials.
+You need three things: pond installed with local data, a bucket, and its S3 credentials. The non-interactive `Agents / CI` snippets below also use [`jq`](https://jqlang.github.io/jq/) to read counts out of `pond sql` JSON, so install it on any machine that runs them.
 
 1. Confirm the local store has data:
 
@@ -27,7 +27,7 @@ You need three things: pond installed with local data, a bucket, and its S3 cred
    - Generate S3 credentials for it - the access key and secret are shown once; save both.
    - Your destination URL is then `s3+https://<region>.your-objectstorage.com/<bucket>/<prefix>`, e.g. `s3+https://nbg1.your-objectstorage.com/my-pond/pond`.
 
-The `s3+https://host/bucket/prefix` form carries the endpoint, bucket, and prefix in one URL, so the endpoint can never desync from the bucket. The `prefix` is just a path inside the bucket where pond keeps its datasets (use `pond` if unsure). The region is auto-detected for real AWS buckets and defaulted for S3-compatible endpoints; you rarely need to set it. Other schemes (`s3://`, `gs://`, `az://`) work too and fall back to the ambient cloud SDK credential chain when no credential set matches.
+The `s3+https://host/bucket/prefix` form carries the endpoint, bucket, and prefix in one URL, so the endpoint can never desync from the bucket. The `prefix` is just a path inside the bucket where pond keeps its datasets (use `pond` if unsure). The region is auto-detected for real AWS buckets and defaulted for S3-compatible endpoints; you rarely need to set it - if a provider needs a specific one, override with `?region=<id>` on the URL or a `region` field on the credential set. Other schemes (`s3://`, `gs://`, `az://`) work too and fall back to the ambient cloud SDK credential chain when no credential set matches.
 
 Throughout this guide, set the destination once so the commands are copy-paste:
 
@@ -60,7 +60,7 @@ This is a gate. Do not continue until it passes.
 pond storage check "$DEST"
 ```
 
-It parses the URL, resolves credentials, performs a conditional put (the optimistic-concurrency primitive pond relies on), reads the object back, and deletes it. Exit code `0` means the destination is fully usable.
+It parses the URL, resolves credentials, performs a conditional put (the optimistic-concurrency primitive pond relies on), reads the object back, and deletes it. Exit code `0` means the destination is fully usable. (`check` takes an optional URL; with no argument it probes your currently configured store instead.)
 
 > **Agents / CI:** branch on the exit code, do not parse the prose. `0` ok, `2` parse error, `3` no credentials matched, `4` auth failed, `5` the store lacks conditional-put. See the troubleshooting table for the fix per code.
 >
@@ -76,10 +76,12 @@ pond status
 
 Write down `sessions / messages / parts`. Step 6 confirms the destination matches these.
 
-> **Agents / CI:** capture counts as numbers for a later equality assertion:
+> **Agents / CI:** capture all three counts from the source explicitly - pass `--storage-path` so a stray `POND_STORAGE_PATH` can't aim the read at the wrong store. `pond sql --format json` returns `{"rows":[{...}],...}`, so the counts are at `.rows[0]`:
 >
 > ```sh
-> src=$(pond sql --format json "select count(*) n from sessions" | jq '.[0].n')
+> counts="select (select count(*) from sessions) s,(select count(*) from messages) m,(select count(*) from parts) p"
+> src=$(pond sql --storage-path ~/.local/share/pond --format json "$counts" | jq -r '.rows[0] | "\(.s) \(.m) \(.p)"')
+> case "$src" in ""|*null*) echo "could not read source counts"; exit 1;; esac
 > ```
 
 ## Step 4 - Copy the data
@@ -118,11 +120,11 @@ pond status
 pond search "something you remember discussing"
 ```
 
-> **Agents / CI:** assert equality before trusting the switch.
+> **Agents / CI:** assert all three counts match before trusting the switch, reusing `$counts` and `$src` from Step 3:
 >
 > ```sh
-> dst=$(pond sql --storage-path "$DEST" --format json "select count(*) n from sessions" | jq '.[0].n')
-> [ "$src" = "$dst" ] || { echo "row counts diverge: $src vs $dst"; exit 1; }
+> dst=$(pond sql --storage-path "$DEST" --format json "$counts" | jq -r '.rows[0] | "\(.s) \(.m) \(.p)"')
+> [ "$src" = "$dst" ] || { echo "row counts diverge: [$src] vs [$dst]"; exit 1; }
 > ```
 >
 > If they diverge, re-run Step 4 - the union merge converges - then re-check.
@@ -135,7 +137,9 @@ Rolling back is the same switch in reverse, and it is instant and safe because `
 pond storage use ~/.local/share/pond
 ```
 
-Keep `~/.local/share/pond` after migrating. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond export` rather than removing the live directory.
+If you took the agents/CI path and exported `POND_STORAGE_PATH`, `unset` it (or point it back at the local path) - the environment overrides `config.toml`, so `use` alone won't take effect while it is set.
+
+Keep `~/.local/share/pond` after migrating. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond export -o ~/pond-backup.pond` rather than removing the live directory.
 
 Switching storage is transparent to your agent clients: they talk to pond over `pond mcp`, which reads the same `config.toml`, so nothing in Claude Code / Codex / others needs reconfiguring.
 
@@ -155,24 +159,34 @@ Point each machine's `config.toml` (or `POND_*` environment) at the same URL and
 | Counts do not reconcile after migrate | The copy did not finish | Re-run `migrate`, then re-verify; do not delete the destination |
 | `pond status` still shows local data after `use` | `POND_STORAGE_PATH` is set and overrides config | Unset it, or set it to the new URL |
 | `pond sync` auth-fails in cron after switching | The scheduler's environment does not inherit your shell exports | Put `POND_CREDS_*` in the launchd plist / systemd unit / crontab environment |
+| Verify step prints `jq: command not found` | `jq` not installed | Install `jq` - the agents/CI snippets pipe `pond sql` JSON through it |
 
 ## One-shot script (agents / CI)
 
-The whole migration, non-interactive, with gates:
+The whole migration, non-interactive, with gates. Needs `pond` and `jq`:
 
 ```sh
 set -euo pipefail
 
 export POND_CREDS_DEFAULT_ACCESS_KEY_ID="<access-key>"
 export POND_CREDS_DEFAULT_SECRET_ACCESS_KEY="<secret-key>"
+SRC=~/.local/share/pond
 DEST=s3+https://nbg1.your-objectstorage.com/my-pond/pond
+counts="select (select count(*) from sessions) s,(select count(*) from messages) m,(select count(*) from parts) p"
 
 pond storage check "$DEST"                                   # gate: exit 0 required
 
-src=$(pond sql --format json "select count(*) n from sessions" | jq '.[0].n')
-pond storage migrate --from ~/.local/share/pond --to "$DEST"
-dst=$(pond sql --storage-path "$DEST" --format json "select count(*) n from sessions" | jq '.[0].n')
-[ "$src" = "$dst" ] || { echo "row counts diverge: $src vs $dst"; exit 1; }
+src=$(pond sql --storage-path "$SRC" --format json "$counts" | jq -r '.rows[0] | "\(.s) \(.m) \(.p)"')
+case "$src" in ""|*null*) echo "could not read source counts"; exit 1;; esac
+
+# migrate is resumable - retry a transient interruption instead of aborting
+n=0; until pond storage migrate --from "$SRC" --to "$DEST"; do
+  n=$((n + 1)); [ "$n" -ge 5 ] && { echo "migrate failed after $n attempts"; exit 1; }
+  echo "migrate interrupted; retrying ($n)..."; sleep 5
+done
+
+dst=$(pond sql --storage-path "$DEST" --format json "$counts" | jq -r '.rows[0] | "\(.s) \(.m) \(.p)"')
+[ "$src" = "$dst" ] || { echo "row counts diverge: [$src] vs [$dst]"; exit 1; }
 
 pond storage use "$DEST"                                     # or: export POND_STORAGE_PATH="$DEST"
 pond status

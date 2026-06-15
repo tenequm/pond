@@ -6,9 +6,12 @@ pond keeps every AI conversation you've ever had intact and searchable, and lets
 
 Current automatically synced agent clients:
 - Claude Code CLI
+- Claude desktop app (local agent mode)
 - Codex CLI
 - opencode CLI
 - pi-coding-agent CLI
+
+You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --source-dir <path>`.
 
 ## Install
 
@@ -24,21 +27,28 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
 ## Quickstart
 
-1. Ingest your local sessions. First run prompts you to enable each detected adapter; pass `-y` for non-interactive runs:
+1. Run the guided setup. `pond init` walks through storage, source adapters, MCP registration, and an optional sync schedule, then writes `config.toml` in one pass. It is idempotent - re-run it any time to repair or update your setup:
 
    ```sh
-   pond sync         # interactive prompts on a TTY
-   pond sync -y      # auto-accept every probe (cron, CI, headless agents)
+   pond init                                                     # interactive, on a TTY
+   pond init -y --adapters claude-code,codex-cli --schedule 5m   # non-interactive
    ```
 
-   Each adapter you accept lands as `[sources.<name>] enabled = true` in `config.toml` (under `$XDG_CONFIG_HOME/pond/`). Sections without `enabled = true` are skipped; re-enable interactively with `pond sync <name>`.
-
-2. Add pond as an MCP server in your agent client:
+   `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)). init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
 
    ```sh
    claude mcp add -s user pond -- pond mcp   # Claude Code
    codex mcp add pond -- pond mcp            # Codex
    ```
+
+2. Import your sessions:
+
+   ```sh
+   pond sync         # ingest, embed, update indexes
+   pond sync -y      # non-interactive (cron, CI, headless agents)
+   ```
+
+   If you enabled a schedule in step 1, this runs automatically on that cadence too. Each enabled adapter is `[sources.<name>] enabled = true` in `config.toml` (under `$XDG_CONFIG_HOME/pond/`); re-enable one later with `pond sync <name>`.
 
 3. Now just ask your agent - it searches your history through pond for you:
 
@@ -47,7 +57,7 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
    - "pick up where we left off on the tokenizer experiment"
    - "find the exact command from when we set up that config"
 
-pond runs hybrid search across every session from every client - including sessions made in a different tool than the one you're asking in. Re-run `pond sync` to pick up new sessions.
+pond runs hybrid search across every session from every client - including sessions made in a different tool than the one you're asking in. Re-run `pond sync` (or let the schedule do it) to pick up new sessions.
 
 ## Remote storage
 
@@ -55,14 +65,14 @@ By default pond stores its data locally (under `$XDG_DATA_HOME/pond`). To put it
 
 ```sh
 pond storage creds add        # interactive: set name (default), access key, hidden secret
-pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond/pond
 ```
 
 `creds add` writes a `[creds.<name>]` block to `config.toml`; `use` probes the destination end-to-end and flips `[storage].path` to it. The result is just config you could also write by hand:
 
 ```toml
 [storage]
-path = "s3+https://nbg1.your-objectstorage.com/my-pond"
+path = "s3+https://nbg1.your-objectstorage.com/my-pond/pond"
 
 [creds.default]
 access_key_id     = "..."
@@ -83,8 +93,8 @@ Several machines can share one bucket: give each the same `config.toml` and run 
 `use` only switches the pointer; it never moves data. To carry your existing local sessions into the bucket, copy them first, then switch:
 
 ```sh
-pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
-pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
+pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond/pond
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond/pond
 ```
 
 Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
