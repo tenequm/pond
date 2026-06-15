@@ -658,7 +658,7 @@ fn strip_one_newline(mut text: String) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     #[error(
-        "authentication failed and no creds set matched this URL; add one with `pond storage creds add` (or set POND_CREDS_*), or provide ambient AWS_* credentials"
+        "authentication failed and no creds set matched this URL; add one with `pond creds add` (or set POND_CREDS_*), or provide ambient AWS_* credentials"
     )]
     NoCreds { source: anyhow::Error },
     #[error("authentication failed using creds set {set:?}; check its keys and scope")]
@@ -2022,7 +2022,7 @@ impl Handle {
     /// Whether the store holds synced data yet. `open` eagerly creates empty
     /// `sessions`/`messages` datasets, but `parts` opens lazily on first write
     /// (see `open_with_options`), so its presence is the "has been synced"
-    /// signal - letting read-only surfaces (`pond status`, `pond storage`)
+    /// signal - letting read-only surfaces (`pond status`)
     /// render an empty state instead of erroring on the first `parts` describe.
     pub async fn initialized(&self) -> Result<bool> {
         let request = DescribeTableRequest {

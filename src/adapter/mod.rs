@@ -43,7 +43,7 @@ pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
 pub use discovery::{
     Candidate, apply_to_doc, discover, persist_accept, probe_unconfigured, prompt_and_persist,
-    set_source_enabled,
+    set_adapter_enabled,
 };
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
@@ -56,7 +56,7 @@ pub use pi_coding_agent::{PiCodingAgentAdapter, PiCodingAgentFactory};
 /// instantiating it. One implementation per known format, registered in
 /// [`registry`].
 pub trait AdapterFactory: Send + Sync {
-    /// Stable short name. Used as the `[sources.<name>]` config key, the
+    /// Stable short name. Used as the `[adapters.<name>]` config key, the
     /// `pond sync <name>` positional arg, and the `Session.source_agent`
     /// value emitted by the corresponding adapter.
     fn name(&self) -> &'static str;
@@ -69,7 +69,7 @@ pub trait AdapterFactory: Send + Sync {
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError>;
 
     /// Probe the user's environment for a default config. Returns the JSON
-    /// blob that would go into `[sources.<name>]` if the picker writes it
+    /// blob that would go into `[adapters.<name>]` if the picker writes it
     /// back. Filesystem adapters check their canonical install path under
     /// `env.home`; adapters with no auto-discovery rule (e.g. API adapters
     /// that need explicit creds) return `None`.

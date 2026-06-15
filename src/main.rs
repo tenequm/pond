@@ -159,10 +159,30 @@ impl pond::adapter::SkipOracle for StoredWatermarks {
     }
 }
 
+/// The platform default local data dir (`$XDG_DATA_HOME/pond`, then
+/// `~/.local/share/pond`) as a `StorageUrl`. Backs both the no-config fallback
+/// and the `local` keyword so they resolve to exactly the same place.
+fn default_local_storage() -> anyhow::Result<StorageUrl> {
+    let url = pond::config::default_storage_path(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )?;
+    StorageUrl::parse(url.as_str())
+}
+
 /// Adapter clap can call to parse `--storage-path` / `POND_STORAGE_PATH`:
 /// bare paths, `~/...`, `file://`, and the remote URL grammar
-/// (spec.md#storage-url-grammar) including the fat `s3+https://` form.
+/// (spec.md#storage-url-grammar) including the fat `s3+https://` form. The bare
+/// keyword `local` (or `default`, case-insensitive) resolves to the platform
+/// default local data dir - so rolling back never needs the path memorized.
+/// A directory literally named `local` is still reachable as `./local`.
 fn parse_storage_path(input: &str) -> anyhow::Result<StorageUrl> {
+    if matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "local" | "default"
+    ) {
+        return default_local_storage();
+    }
     StorageUrl::parse(input)
 }
 
@@ -221,7 +241,7 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     max_term_width = 100,
     after_long_help = "\
 Getting started:
-  pond init                                  set up storage, sources, MCP, and scheduling
+  pond init                                  set up storage, adapters, MCP, and scheduling
   pond sync                                  import new sessions, embed, update indexes
   pond search \"that auth refactor\"           find past work
   claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
@@ -249,7 +269,8 @@ struct StoreArgs {
     /// Storage destination: a local path or remote URL.
     ///
     /// Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`,
-    /// `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default:
+    /// `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword
+    /// `local` (the platform default local data dir). Default:
     /// `[storage].path` from config, then the platform data dir
     /// (`~/.local/share/pond`).
     #[arg(
@@ -279,7 +300,7 @@ struct StoreArgs {
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
     ///
-    /// Walks through storage, source adapters, MCP registration, and an
+    /// Walks through storage, adapters, MCP registration, and an
     /// optional sync schedule, then writes config.toml in one pass at the
     /// end. Re-running repairs or updates an existing setup; flags answer
     /// sections non-interactively.
@@ -293,22 +314,22 @@ enum Command {
     /// Make pond current: import, embed, update indexes.
     ///
     /// The everyday command: pulls fresh sessions from every enabled
-    /// `[sources.*]` entry (or one named adapter), embeds the backlog, and
-    /// folds new rows into the search indexes. It only ever syncs sources you
-    /// have already enabled - enabling one is an explicit step (`pond sources
-    /// enable` / `pond sources discover` / `pond init`), never a side effect
+    /// `[adapters.*]` entry (or one named adapter), embeds the backlog, and
+    /// folds new rows into the search indexes. It only ever syncs adapters you
+    /// have already enabled - enabling one is an explicit step (`pond adapters
+    /// enable` / `pond adapters discover` / `pond init`), never a side effect
     /// of sync.
     #[command(after_long_help = "Examples:
-  pond sync                                  sync every enabled source
+  pond sync                                  sync every enabled adapter
   pond sync claude-code                      sync one enabled adapter
   pond sync codex-cli --source-dir ~/backup  one-off path override, config untouched
   pond sync --only embed                     run a single stage")]
     Sync {
-        /// Adapter name (claude-code, codex-cli, ...); default: every enabled source.
+        /// Adapter name (claude-code, codex-cli, ...); default: every enabled adapter.
         adapter: Option<String>,
         /// One-off source-path override (requires <ADAPTER>).
         ///
-        /// Bypasses `[sources.<adapter>]` and does not modify config.toml.
+        /// Bypasses `[adapters.<adapter>]` and does not modify config.toml.
         #[arg(long, value_name = "DIR")]
         source_dir: Option<PathBuf>,
         /// Run exactly one stage: import, embed, or update-indexes.
@@ -321,25 +342,25 @@ enum Command {
         #[arg(long)]
         force_embed: bool,
     },
-    /// Manage which adapters `pond sync` ingests (the `[sources.*]` entries).
+    /// Manage which adapters `pond sync` ingests (the `[adapters.*]` entries).
     ///
-    /// Enabling a source is the explicit owner of source state: `list` shows
+    /// Enabling an adapter is the explicit owner of adapter state: `list` shows
     /// what is configured and what was detected, `discover` probes and enables
     /// interactively, `enable`/`disable` flip one by name. `pond sync` reads
     /// these but never writes them.
     #[command(after_long_help = "Examples:
-  pond sources list                          configured sources + detected adapters
-  pond sources discover                      probe this machine, pick what to enable
-  pond sources enable claude-code            enable one (discovers its path if needed)
-  pond sources disable opencode              stop syncing one, keep it on record")]
-    Sources {
+  pond adapters list                         configured + detected adapters
+  pond adapters discover                     probe this machine, pick what to enable
+  pond adapters enable claude-code           enable one (discovers its path if needed)
+  pond adapters disable opencode             stop syncing one, keep it on record")]
+    Adapters {
         #[command(subcommand)]
-        command: SourcesCmd,
+        command: AdaptersCmd,
     },
-    /// Show pond health, data, and source status.
+    /// Show pond health, data, and adapter status.
     ///
     /// Storage destination and size, row counts, index readiness, embedding
-    /// backlog, configured sources, and the sync schedule. Anything off
+    /// backlog, configured adapters, and the sync schedule. Anything off
     /// names its fix inline.
     #[command(after_long_help = "Examples:
   pond status              the one-screen overview
@@ -562,20 +583,63 @@ enum Command {
         #[command(subcommand)]
         command: schedule::ScheduleCmd,
     },
-    /// Inspect, probe, switch, copy, and verify storage destinations.
+    /// Probe and switch storage destinations.
     ///
-    /// Bare `pond storage` shows the resolved destination, its creds
-    /// binding, and per-table sizes. Subcommands probe a destination
-    /// (check), switch the active destination (use), copy between
-    /// destinations (migrate), and verify a copy without moving data
-    /// (verify).
+    /// `check` probes a destination end-to-end; `use` switches the
+    /// configured destination - a pointer change that moves no data. To copy
+    /// data between stores use `pond migrate`; to see where data lives and
+    /// how big it is use `pond status`.
     #[command(after_long_help = "Examples:
-  pond storage                                     where data lives, and how big
   pond storage check s3+https://host/bucket/pond   probe a destination end-to-end
   pond storage use s3+https://host/bucket/pond     probe, then switch the destination")]
     Storage {
         #[command(subcommand)]
-        command: Option<StorageCmd>,
+        command: StorageCmd,
+    },
+    /// Manage URL-scoped credential sets in config.toml.
+    ///
+    /// `add` captures a set's keys (secret via hidden prompt) and writes
+    /// `[creds.<name>]`; `list` shows configured sets with secrets redacted;
+    /// `delete` removes one. Sets bind to storage URLs by scope match, never
+    /// by activation (spec.md#creds-scope-match) - there is no "current" set.
+    #[command(after_long_help = "Examples:
+  pond creds add                            interactive: name (default), key, hidden secret
+  pond creds add work --scope s3+https://host/work
+  pond creds list
+  pond creds delete work")]
+    Creds {
+        #[command(subcommand)]
+        command: CredsCmd,
+    },
+    /// Copy canonical data between two storages (or just verify a copy).
+    ///
+    /// Copies already-canonical pond data from `--from` to `--to`, rebuilds
+    /// the destination's indexes, and verifies every row landed. Idempotent
+    /// union merge (`lance-deterministic-pk` + merge-insert): re-runnable,
+    /// resumable, valid onto a populated destination, never deletes or
+    /// modifies the source. Exit 6 if the destination is missing source rows.
+    /// `--verify-only` runs just the read-only membership check, copying
+    /// nothing. This is the durable-corpus copy path, distinct from `pond
+    /// sync` which re-reads your client tools (spec.md#session-durable-copy).
+    #[command(after_long_help = "Examples:
+  pond migrate --from ~/.local/share/pond --to s3+https://host/bucket/pond
+  pond migrate --from ~/.local/share/pond --to s3://bucket/pond --verify-only   re-check sync, copy nothing")]
+    Migrate {
+        /// Source storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        from: StorageUrl,
+        /// Destination storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        to: StorageUrl,
+        /// Skip the post-copy index rebuild (for very large stores you will
+        /// index later). The copy and verify still run; build indexes after
+        /// with `pond sync --only update-indexes --storage-path <to>`.
+        #[arg(long)]
+        skip_indexes: bool,
+        /// Only verify the destination already contains the source - copy
+        /// nothing, rebuild no indexes. Read-only.
+        #[arg(long, conflicts_with = "skip_indexes")]
+        verify_only: bool,
     },
     /// Export a compact restorable .pond archive.
     ///
@@ -654,9 +718,6 @@ Homebrew and nix packages ship these pre-installed.")]
     },
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum StorageCmd {
     /// Probe a destination end-to-end.
@@ -677,71 +738,14 @@ enum StorageCmd {
     /// Probes the destination end-to-end, then flips `[storage].path` in
     /// config.toml. Nothing is copied: switching to a different storage, or
     /// rolling back to a previous one, is a pointer change that leaves every
-    /// store untouched. To copy data into a destination, run `pond storage
-    /// migrate` first - it is always a separate, explicit step.
+    /// store untouched. To copy data into a destination, run `pond migrate`
+    /// first - it is always a separate, explicit step.
     #[command(after_long_help = "Examples:
   pond storage use s3+https://host/bucket/pond      probe, then switch the active destination
-  pond storage use ~/.local/share/pond              roll back to a previous (local) destination")]
+  pond storage use local                            roll back to the default local store")]
     Use {
-        /// The new destination URL.
+        /// The new destination URL, or `local` for the default local store.
         url: String,
-    },
-    /// Copy canonical data between two storages, rebuild the destination's
-    /// indexes, and verify the copy landed.
-    ///
-    /// Idempotent union merge: re-runnable, resumable, valid onto a
-    /// populated destination. Never deletes or modifies the source. On
-    /// completion it rebuilds the destination indexes (skip with
-    /// `--skip-indexes`) so the store is queryable on exit, then compares
-    /// the `id` set of every table end to end - exit 0 only when the
-    /// destination provably contains every source row, exit 6 (naming the
-    /// short table) otherwise. This is the only data-copy path; `use` only
-    /// switches the pointer.
-    #[command(after_long_help = "Examples:
-  pond storage migrate --from ~/.local/share/pond --to s3://bucket/pond")]
-    Migrate {
-        /// Source storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        from: StorageUrl,
-        /// Destination storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        to: StorageUrl,
-        /// Skip the post-copy index rebuild (for very large stores you will
-        /// index later). The copy and verify still run; build indexes after
-        /// with `pond sync --only update-indexes --storage-path <to>`.
-        #[arg(long)]
-        skip_indexes: bool,
-    },
-    /// Verify a destination fully contains a source, without copying.
-    ///
-    /// Read-only. Compares the `id` set of every table between the two
-    /// storages and reports whether the destination is a complete superset
-    /// of the source. Exit codes: 0 synced, 6 destination missing source
-    /// rows. Confirms two stores are in sync without running `migrate`.
-    #[command(after_long_help = "Examples:
-  pond storage verify --from ~/.local/share/pond --to s3+https://host/bucket/pond")]
-    Verify {
-        /// Source storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        from: StorageUrl,
-        /// Destination storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        to: StorageUrl,
-    },
-    /// Manage URL-scoped credential sets in config.toml.
-    ///
-    /// `add` captures a set's keys (secret via hidden prompt) and writes
-    /// `[creds.<name>]`; `list` shows configured sets with secrets redacted;
-    /// `delete` removes one. Sets bind to storage URLs by scope match, never
-    /// by activation (spec.md#creds-scope-match) - there is no "current" set.
-    #[command(after_long_help = "Examples:
-  pond storage creds add                            interactive: name (default), key, hidden secret
-  pond storage creds add work --scope s3+https://host/work
-  pond storage creds list
-  pond storage creds delete work")]
-    Creds {
-        #[command(subcommand)]
-        command: CredsCmd,
     },
 }
 
@@ -768,17 +772,17 @@ enum CredsCmd {
 }
 
 #[derive(Debug, Subcommand)]
-enum SourcesCmd {
-    /// List configured sources (enabled state, path) and detected-but-unconfigured adapters.
+enum AdaptersCmd {
+    /// List configured adapters (enabled state, path) and detected-but-unconfigured adapters.
     List,
     /// Probe this machine for adapters and interactively enable the ones you pick.
     Discover,
-    /// Enable a source, discovering its default path if it has no config entry yet.
+    /// Enable an adapter, discovering its default path if it has no config entry yet.
     Enable {
         /// Adapter name (claude-code, codex-cli, ...).
         name: String,
     },
-    /// Disable a source so `pond sync` skips it (kept as `enabled = false`).
+    /// Disable an adapter so `pond sync` skips it (kept as `enabled = false`).
     Disable {
         /// Adapter name to disable.
         name: String,
@@ -903,7 +907,7 @@ async fn main() -> anyhow::Result<()> {
                 )?;
                 render_status_header("pond status", &resolved, &sizes, &stats.totals)?;
                 render_status_checks(&stats, &index_status, embedding, adapters)?;
-                let probes = adapter::probe_unconfigured(&loaded.sources);
+                let probes = adapter::probe_unconfigured(&loaded.adapters);
                 if !probes.is_empty() {
                     let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
                     output_err(&pond::output::paint(
@@ -944,10 +948,10 @@ async fn main() -> anyhow::Result<()> {
             }
             render_sync_summary(&store, &summary).await?;
         }
-        Command::Sources { command } => {
+        Command::Adapters { command } => {
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
-            run_sources(command, &config_file, &loaded)?;
+            run_adapters(command, &config_file, &loaded)?;
         }
         Command::Embed { limit, force } => {
             let config = Config::load(config_path(config))?;
@@ -1114,6 +1118,17 @@ async fn main() -> anyhow::Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }
         Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
+        Command::Creds { command } => {
+            let config_file = config_path(config);
+            let loaded = Config::load(&config_file)?;
+            run_creds(command, &config_file, &loaded)?;
+        }
+        Command::Migrate {
+            from,
+            to,
+            skip_indexes,
+            verify_only,
+        } => run_migrate(from, to, skip_indexes, verify_only, config).await?,
         Command::Export { out, format } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
@@ -1321,11 +1336,7 @@ fn resolve_storage_location(
     if let Some(path) = &loaded.storage.path {
         return StorageUrl::parse(path).context("invalid [storage].path in config");
     }
-    let url = pond::config::default_storage_path(
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )?;
-    StorageUrl::parse(url.as_str())
+    default_local_storage()
 }
 
 /// Resolve creds for the destination and open the store. One chokepoint so
@@ -1493,7 +1504,7 @@ fn render_check_cause(failure: &CheckFailure) -> anyhow::Result<()> {
 }
 
 async fn run_storage_command(
-    command: Option<StorageCmd>,
+    command: StorageCmd,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1501,22 +1512,9 @@ async fn run_storage_command(
     let config_file = config_path(config);
     let loaded = Config::load(&config_file)?;
     match command {
-        // Bare `pond storage`: where the data lives, under which creds, and
-        // how big - the storage slice of `pond status`.
-        None => {
-            let (resolved, store) = open_store(storage_path, &loaded, false).await?;
-            if !store.initialized().await? {
-                render_empty_status("pond storage", &resolved)?;
-            } else {
-                let (sizes, stats) =
-                    tokio::try_join!(store.table_sizes(), store.corpus_stats(false))?;
-                render_status_header("pond storage", &resolved, &sizes, &stats.totals)?;
-            }
-            warn_unmatched_sets(&[&resolved], &loaded)?;
-        }
-        Some(StorageCmd::Check { url }) => {
+        StorageCmd::Check { url } => {
             let storage = match url {
-                Some(raw) => match StorageUrl::parse(&raw) {
+                Some(raw) => match parse_storage_path(&raw) {
                     Ok(parsed) => parsed,
                     Err(error) => {
                         output_err(&format!("check: parse error: {error:#}"))?;
@@ -1547,70 +1545,76 @@ async fn run_storage_command(
                 }
             }
         }
-        Some(StorageCmd::Use { url }) => {
+        StorageCmd::Use { url } => {
             run_storage_use(&loaded, &config_file, storage_path, &url).await?;
         }
-        Some(StorageCmd::Creds { command }) => {
-            run_storage_creds(command, &config_file, &loaded)?;
-        }
-        Some(StorageCmd::Migrate {
-            from,
-            to,
-            skip_indexes,
-        }) => {
-            let dim = pond::output::dim();
-            let (from_resolved, from_store, to_resolved, to_store) =
-                resolve_and_open_pair(&from, &to, &loaded).await?;
-            let imported = migrate_between_stores(&from_store, &to_store).await?;
-            output(&format!(
-                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
-                pond::output::paint("migrate:", dim),
-                imported.rows.sessions,
-                imported.rows.messages,
-                imported.rows.parts,
-                imported.inserted.sessions,
-                imported.inserted.messages,
-                imported.inserted.parts,
-            ))?;
-            // Make migrate self-contained: the clean export strips indexes, so
-            // rebuild them here (embeddings rode along as data columns - this
-            // is index-build only, no re-embed) and the destination is
-            // queryable on exit, not after a separate `pond sync`.
-            // spec.md#lance-index-maintenance.
-            if skip_indexes {
-                output(&format!(
-                    "{} indexes not rebuilt (--skip-indexes); run `pond sync --only update-indexes --storage-path {}` before querying",
-                    pond::output::paint("hint", dim),
-                    to_resolved.display(),
-                ))?;
-            } else {
-                let policy = configured_maintenance_policy(&loaded, None)?;
-                run_update_indexes_stage(&to_store, &policy).await?;
-                output(&format!(
-                    "{} rebuilt text + semantic on destination",
-                    pond::output::paint("indexes:", dim),
-                ))?;
-            }
-            // Prove the copy landed by comparing id-sets, not row counts: the
-            // source is never modified, so the user never reconciles by hand.
-            let verify = verify_stores(&from_store, &to_store).await?;
-            if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
-                std::process::exit(6);
-            }
-            output(&format!(
-                "{} destination is ready to query",
-                pond::output::paint("done -", dim),
-            ))?;
-        }
-        Some(StorageCmd::Verify { from, to }) => {
-            let (from_resolved, from_store, to_resolved, to_store) =
-                resolve_and_open_pair(&from, &to, &loaded).await?;
-            let verify = verify_stores(&from_store, &to_store).await?;
-            if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
-                std::process::exit(6);
-            }
-        }
     }
+    Ok(())
+}
+
+/// `pond migrate --from <URL> --to <URL>`: copy canonical data store to store,
+/// rebuild the destination indexes, and verify the copy landed; `--verify-only`
+/// runs just the read-only membership check. Exit 6 when the destination is
+/// missing source rows. Distinct from `pond sync`, which re-reads adapters -
+/// migrate copies the durable record (spec.md#session-durable-copy).
+async fn run_migrate(
+    from: StorageUrl,
+    to: StorageUrl,
+    skip_indexes: bool,
+    verify_only: bool,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let loaded = Config::load(config_path(config))?;
+    let (from_resolved, from_store, to_resolved, to_store) =
+        resolve_and_open_pair(&from, &to, &loaded).await?;
+    if verify_only {
+        let verify = verify_stores(&from_store, &to_store).await?;
+        if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+            std::process::exit(6);
+        }
+        return Ok(());
+    }
+    let dim = pond::output::dim();
+    let imported = migrate_between_stores(&from_store, &to_store).await?;
+    output(&format!(
+        "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
+        pond::output::paint("migrate:", dim),
+        imported.rows.sessions,
+        imported.rows.messages,
+        imported.rows.parts,
+        imported.inserted.sessions,
+        imported.inserted.messages,
+        imported.inserted.parts,
+    ))?;
+    // Make migrate self-contained: the clean export strips indexes, so
+    // rebuild them here (embeddings rode along as data columns - this
+    // is index-build only, no re-embed) and the destination is
+    // queryable on exit, not after a separate `pond sync`.
+    // spec.md#lance-index-maintenance.
+    if skip_indexes {
+        output(&format!(
+            "{} indexes not rebuilt (--skip-indexes); run `pond sync --only update-indexes --storage-path {}` before querying",
+            pond::output::paint("hint", dim),
+            to_resolved.display(),
+        ))?;
+    } else {
+        let policy = configured_maintenance_policy(&loaded, None)?;
+        run_update_indexes_stage(&to_store, &policy).await?;
+        output(&format!(
+            "{} rebuilt text + semantic on destination",
+            pond::output::paint("indexes:", dim),
+        ))?;
+    }
+    // Prove the copy landed by comparing id-sets, not row counts: the
+    // source is never modified, so the user never reconciles by hand.
+    let verify = verify_stores(&from_store, &to_store).await?;
+    if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+        std::process::exit(6);
+    }
+    output(&format!(
+        "{} destination is ready to query",
+        pond::output::paint("done -", dim),
+    ))?;
     Ok(())
 }
 
@@ -1645,7 +1649,7 @@ fn set_storage_path(doc: &mut toml_edit::DocumentMut, path_value: &str) {
 
 /// `pond storage use`: switch-only. Probe the destination end-to-end, then flip
 /// `[storage].path`. It copies nothing - moving data into a destination is
-/// `pond storage migrate`, always a separate explicit step - so switching
+/// `pond migrate`, always a separate explicit step - so switching
 /// stores, or rolling back to a previous one, never touches any store's data.
 async fn run_storage_use(
     loaded: &Config,
@@ -1655,7 +1659,7 @@ async fn run_storage_use(
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
-    let dest = match StorageUrl::parse(url) {
+    let dest = match parse_storage_path(url) {
         Ok(parsed) => parsed,
         Err(error) => {
             output_err(&format!("use: parse error: {error:#}"))?;
@@ -1719,7 +1723,7 @@ async fn run_storage_use(
     // explicit copy step with both URLs filled in, rather than counting rows to
     // guess whether a copy is wanted. Moving the old data over is one paste away.
     output(&format!(
-        "{} previous data at {} is untouched; copy it over with `pond storage migrate --from {} --to {}`",
+        "{} previous data at {} is untouched; copy it over with `pond migrate --from {} --to {}`",
         paint("hint", dim()),
         current.display(),
         current.display(),
@@ -1752,10 +1756,10 @@ fn write_config_doc(config_file: &Path, doc: &toml_edit::DocumentMut) -> anyhow:
         .with_context(|| format!("failed to write {}", config_file.display()))
 }
 
-/// `pond storage creds {add,list,delete}`: manage the `[creds.<name>]` sets in
+/// `pond creds {add,list,delete}`: manage the `[creds.<name>]` sets in
 /// config.toml. Sets bind to URLs by scope match, never activation - there is
 /// no "current" set to select (spec.md#creds-scope-match).
-fn run_storage_creds(command: CredsCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+fn run_creds(command: CredsCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
     match command {
         CredsCmd::Add {
             name,
@@ -1779,7 +1783,7 @@ fn creds_add(
     // Non-interactive callers use POND_CREDS_<NAME>_* or a hand-written set.
     if !io::stdin().is_terminal() {
         bail!(
-            "`pond storage creds add` needs a terminal for hidden secret entry; in non-interactive runs set POND_CREDS_<NAME>_ACCESS_KEY_ID / POND_CREDS_<NAME>_SECRET_ACCESS_KEY or add [creds.<name>] to config.toml"
+            "`pond creds add` needs a terminal for hidden secret entry; in non-interactive runs set POND_CREDS_<NAME>_ACCESS_KEY_ID / POND_CREDS_<NAME>_SECRET_ACCESS_KEY or add [creds.<name>] to config.toml"
         );
     }
 
@@ -1857,7 +1861,7 @@ fn creds_add(
 fn creds_list(loaded: &Config) -> anyhow::Result<()> {
     if loaded.creds.is_empty() {
         output(
-            "no credential sets configured - add one with `pond storage creds add`, or set POND_CREDS_<NAME>_* in the environment",
+            "no credential sets configured - add one with `pond creds add`, or set POND_CREDS_<NAME>_* in the environment",
         )?;
         return Ok(());
     }
@@ -1968,28 +1972,28 @@ fn set_creds_set(
     }
 }
 
-/// `pond sources {list,discover,enable,disable}`: the explicit owner of
-/// `[sources.*]` state. `pond sync` reads these entries but never writes them.
-fn run_sources(command: SourcesCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+/// `pond adapters {list,discover,enable,disable}`: the explicit owner of
+/// `[adapters.*]` state. `pond sync` reads these entries but never writes them.
+fn run_adapters(command: AdaptersCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
     match command {
-        SourcesCmd::List => sources_list(loaded),
-        SourcesCmd::Discover => sources_discover(config_file),
-        SourcesCmd::Enable { name } => sources_enable(config_file, &name),
-        SourcesCmd::Disable { name } => sources_disable(config_file, &name),
+        AdaptersCmd::List => adapters_list(loaded),
+        AdaptersCmd::Discover => adapters_discover(config_file),
+        AdaptersCmd::Enable { name } => adapters_enable(config_file, &name),
+        AdaptersCmd::Disable { name } => adapters_disable(config_file, &name),
     }
 }
 
-fn sources_list(loaded: &Config) -> anyhow::Result<()> {
-    let detected = adapter::probe_unconfigured(&loaded.sources);
-    if loaded.sources.is_empty() && detected.is_empty() {
+fn adapters_list(loaded: &Config) -> anyhow::Result<()> {
+    let detected = adapter::probe_unconfigured(&loaded.adapters);
+    if loaded.adapters.is_empty() && detected.is_empty() {
         output(
-            "no sources configured and none detected - run `pond sources discover` (or `pond init`)",
+            "no adapters configured and none detected - run `pond adapters discover` (or `pond init`)",
         )?;
         return Ok(());
     }
     let mut table = new_table();
-    table.set_header(vec!["source", "enabled", "path"]);
-    for (name, blob) in &loaded.sources {
+    table.set_header(vec!["adapter", "enabled", "path"]);
+    for (name, blob) in &loaded.adapters {
         let enabled = blob
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
@@ -2013,31 +2017,31 @@ fn sources_list(loaded: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sources_discover(config_file: &Path) -> anyhow::Result<()> {
+fn adapters_discover(config_file: &Path) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     let candidates = adapter::discover(None);
     let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
     let names: Vec<&str> = picks.iter().map(|c| c.name.as_str()).collect();
     output(&format!(
-        "{} enabled {} source(s): {}",
-        paint("sources:", dim()),
+        "{} enabled {} adapter(s): {}",
+        paint("adapters:", dim()),
         picks.len(),
         names.join(", "),
     ))?;
     Ok(())
 }
 
-fn sources_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+fn adapters_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     let known = adapter::known_names();
     if !known.contains(&name) {
         bail!("unknown adapter {name:?}; known: {}", known.join(", "));
     }
     // Already configured: flip enabled = true in place, keeping its path/options.
-    if adapter::set_source_enabled(config_file, name, true)? {
+    if adapter::set_adapter_enabled(config_file, name, true)? {
         output(&format!(
-            "{} [sources.{}] enabled = true",
-            paint("sources:", dim()),
+            "{} [adapters.{}] enabled = true",
+            paint("adapters:", dim()),
             name,
         ))?;
         return Ok(());
@@ -2048,30 +2052,30 @@ fn sources_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
         .find(|c| c.name == name)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "adapter {name:?} was not detected on this machine; add a [sources.{name}] entry with its path manually, or run `pond sync {name} --source-dir <path>` for a one-off"
+                "adapter {name:?} was not detected on this machine; add an [adapters.{name}] entry with its path manually, or run `pond sync {name} --source-dir <path>` for a one-off"
             )
         })?;
     adapter::persist_accept(config_file, &[candidate])?;
     output(&format!(
-        "{} [sources.{}] enabled = true (discovered)",
-        paint("sources:", dim()),
+        "{} [adapters.{}] enabled = true (discovered)",
+        paint("adapters:", dim()),
         name,
     ))?;
     Ok(())
 }
 
-fn sources_disable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+fn adapters_disable(config_file: &Path, name: &str) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
-    if adapter::set_source_enabled(config_file, name, false)? {
+    if adapter::set_adapter_enabled(config_file, name, false)? {
         output(&format!(
-            "{} [sources.{}] enabled = false",
-            paint("sources:", dim()),
+            "{} [adapters.{}] enabled = false",
+            paint("adapters:", dim()),
             name,
         ))?;
         Ok(())
     } else {
         bail!(
-            "no [sources.{name}] entry to disable in {}",
+            "no [adapters.{name}] entry to disable in {}",
             config_file.display()
         );
     }
@@ -2135,7 +2139,7 @@ fn redact_config_value(key: &str, value: &str) -> String {
     value.to_owned()
 }
 
-/// `pond storage migrate` core: export the source's clean datasets into local
+/// `pond migrate` core: export the source's clean datasets into local
 /// staging, then merge-import into the destination. Idempotency comes from
 /// `lance-deterministic-pk` + merge-insert: a rerun inserts nothing, and a
 /// populated destination unions rather than clobbers.
@@ -2227,8 +2231,7 @@ impl StorageVerify {
 /// Compare the `id` set of every table across two stores - read-only on both
 /// sides. Matching row counts can hide divergent membership, so verification
 /// keys on the deterministic per-row id, not the cardinalities. Drives
-/// `pond storage migrate`'s closing check and the standalone `pond storage
-/// verify`.
+/// `pond migrate`'s closing check and `pond migrate --verify-only`.
 async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify> {
     use substrate::Table;
     let mut tables = Vec::with_capacity(3);
@@ -2295,7 +2298,7 @@ fn render_storage_verify(
         ))?;
         output_err(&paint(
             &format!(
-                "  fix: re-run `pond storage migrate --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
+                "  fix: re-run `pond migrate --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
             ),
             dim(),
         ))?;
@@ -2360,18 +2363,18 @@ async fn run_import_stage(
     adapter: Option<String>,
     source_dir: Option<PathBuf>,
 ) -> anyhow::Result<IngestSummary> {
-    let sources = resolve_sync_sources(loaded, adapter.as_deref(), source_dir)?;
-    if sources.is_empty() {
-        let disabled = loaded.disabled_source_names();
+    let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), source_dir)?;
+    if adapters.is_empty() {
+        let disabled = loaded.disabled_adapter_names();
         let label = pond::output::paint("import:", pond::output::dim());
         if disabled.is_empty() {
             output(&format!(
-                "{label} no sources configured. Run `pond sources discover` (or `pond init`) to detect and enable adapters, or add `[sources.<name>]` blocks to {}.",
+                "{label} no adapters configured. Run `pond adapters discover` (or `pond init`) to detect and enable adapters, or add `[adapters.<name>]` blocks to {}.",
                 config_file.display(),
             ))?;
         } else {
             output(&format!(
-                "{label} no enabled sources. Found {} disabled: {}. Enable one with `pond sources enable <name>` (or add `enabled = true` to its section in {}).",
+                "{label} no enabled adapters. Found {} disabled: {}. Enable one with `pond adapters enable <name>` (or add `enabled = true` to its section in {}).",
                 disabled.len(),
                 disabled.join(", "),
                 config_file.display(),
@@ -2381,7 +2384,7 @@ async fn run_import_stage(
     }
     let watermarks = StoredWatermarks::new(store.session_last_ingested_at().await?);
     let mut total = IngestSummary::default();
-    for (name, blob) in sources {
+    for (name, blob) in adapters {
         let summary = sync_with_progress(store, &name, blob, &watermarks).await?;
         total.merge(&summary);
     }
@@ -2730,16 +2733,16 @@ fn unzip_archive(source: &Path, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
-/// Read-only over config - enabling a source is `pond sources` / `pond init`,
+/// Read-only over config - enabling an adapter is `pond adapters` / `pond init`,
 /// never a side effect of sync (spec.md#cli-verbs).
 ///
 /// Precedence:
 /// 1. `--source-dir <path>` with `<adapter>` set: one-off run, no config writes.
-/// 2. `<adapter>` set, `[sources.<adapter>]` present: use that.
-/// 3. `<adapter>` set, no config entry: error pointing at `pond sources enable`.
-/// 4. No `<adapter>`, `[sources]` non-empty: sync every enabled entry.
-/// 5. No `<adapter>`, empty `[sources]`: error pointing at `pond sources discover`.
-fn resolve_sync_sources(
+/// 2. `<adapter>` set, `[adapters.<adapter>]` present: use that.
+/// 3. `<adapter>` set, no config entry: error pointing at `pond adapters enable`.
+/// 4. No `<adapter>`, `[adapters]` non-empty: sync every enabled entry.
+/// 5. No `<adapter>`, empty `[adapters]`: error pointing at `pond adapters discover`.
+fn resolve_sync_adapters(
     config: &Config,
     name: Option<&str>,
     source_dir: Option<PathBuf>,
@@ -2762,21 +2765,21 @@ fn resolve_sync_sources(
         if !known.contains(&name) {
             bail!("unknown adapter {name:?}; known: {}", known.join(", "));
         }
-        if let Some(blob) = config.sources.get(name) {
+        if let Some(blob) = config.adapters.get(name) {
             return Ok(vec![(name.to_owned(), blob.clone())]);
         }
         // spec.md#cli-verbs: sync never enables. Enabling is the explicit job of
-        // `pond sources enable` / `pond init`.
+        // `pond adapters enable` / `pond init`.
         bail!(
-            "adapter {name:?} has no [sources.{name}] entry; enable it with `pond sources enable {name}` (or `pond init`), then re-run `pond sync`"
+            "adapter {name:?} has no [adapters.{name}] entry; enable it with `pond adapters enable {name}` (or `pond init`), then re-run `pond sync`"
         );
     }
 
-    if !config.sources.is_empty() {
-        return config.resolve_sources(None);
+    if !config.adapters.is_empty() {
+        return config.resolve_adapters(None);
     }
     bail!(
-        "no sources configured; run `pond sources discover` (or `pond init`) to detect and enable adapters, then re-run `pond sync`"
+        "no adapters configured; run `pond adapters discover` (or `pond init`) to detect and enable adapters, then re-run `pond sync`"
     );
 }
 
@@ -3212,7 +3215,7 @@ fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
 }
 
 /// Title + storage-destination line, shared by the populated header and the
-/// empty-store render so both `pond status` and `pond storage` open the same way.
+/// empty-store render so `pond status` opens the same way in either state.
 fn render_status_storage_line(title: &str, resolved: &ResolvedStorage) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
     output(&paint(title, bold()))?;
@@ -3336,8 +3339,8 @@ fn render_status_checks(
 
     if !adapters {
         output(&format!(
-            "{}    {} adapter(s); pass `--adapters` for project tables",
-            paint("sources", dim()),
+            "{}  {} adapter(s); pass `--adapters` for project tables",
+            paint("adapters", dim()),
             stats.adapters.len(),
         ))?;
         output(&crate::schedule::status_line())?;
@@ -4029,6 +4032,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_storage_path_local_keyword_resolves_to_the_default_dir() {
+        // `local`/`default` (case-insensitive) resolve to the same place the
+        // no-config fallback uses, so a rollback never needs the path typed out.
+        let keyword = parse_storage_path("local").unwrap();
+        assert!(keyword.is_local());
+        assert_eq!(
+            keyword.canonical(),
+            default_local_storage().unwrap().canonical(),
+        );
+        assert_eq!(
+            parse_storage_path("DEFAULT").unwrap().canonical(),
+            keyword.canonical(),
+        );
+        // A directory literally named `local` is the relative path, not the keyword.
+        let literal = parse_storage_path("./local").unwrap();
+        assert_ne!(literal.canonical(), keyword.canonical());
+    }
+
+    #[test]
     fn cli_parses_and_subcommands_are_wired() {
         // The canonical clap derive self-check: catches conflicting flags,
         // broken groups, and missing value parsers at test time.
@@ -4088,29 +4110,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_sync_sources_errors_point_at_the_sources_commands() {
-        // Empty config: sync names `pond sources discover`, never enables.
+    fn resolve_sync_adapters_errors_point_at_the_adapters_commands() {
+        // Empty config: sync names `pond adapters discover`, never enables.
         let empty = Config::load_str("").expect("empty config");
-        let err = resolve_sync_sources(&empty, None, None).expect_err("empty must error");
+        let err = resolve_sync_adapters(&empty, None, None).expect_err("empty must error");
         assert!(
-            err.to_string().contains("pond sources discover"),
+            err.to_string().contains("pond adapters discover"),
             "empty error should name discover: {err}"
         );
 
-        // Named-but-unconfigured: sync names `pond sources enable <name>`.
-        let err = resolve_sync_sources(&empty, Some("claude-code"), None)
+        // Named-but-unconfigured: sync names `pond adapters enable <name>`.
+        let err = resolve_sync_adapters(&empty, Some("claude-code"), None)
             .expect_err("unconfigured named must error");
         assert!(
-            err.to_string().contains("pond sources enable claude-code"),
+            err.to_string().contains("pond adapters enable claude-code"),
             "named error should name enable: {err}"
         );
 
-        // Configured source resolves without touching config.
+        // Configured adapter resolves without touching config.
         let configured =
-            Config::load_str("[sources.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
+            Config::load_str("[adapters.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
                 .expect("configured");
         let resolved =
-            resolve_sync_sources(&configured, Some("claude-code"), None).expect("resolves");
+            resolve_sync_adapters(&configured, Some("claude-code"), None).expect("resolves");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "claude-code");
     }

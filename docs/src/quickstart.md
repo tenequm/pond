@@ -27,11 +27,11 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
 ## Quickstart
 
-1. Run the guided setup. `pond init` walks through storage, source adapters, MCP registration, and an optional sync schedule, then writes `config.toml` in one pass. It is idempotent - re-run it any time to repair or update your setup:
+1. Run the guided setup. `pond init` walks through storage, adapters, MCP registration, and an optional sync schedule, then writes `config.toml` in one pass. It is idempotent - re-run it any time to repair or update your setup:
 
    ```sh
    pond init                                                     # interactive, on a TTY
-   pond init -y --schedule 5m                                    # non-interactive: enables every discovered source
+   pond init -y --schedule 5m                                    # non-interactive: enables every discovered adapter
    ```
 
    `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)) - when that destination is remote, init prompts for credentials inline, so a bucket is one command. init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
@@ -44,10 +44,10 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 2. Import your sessions:
 
    ```sh
-   pond sync         # ingest, embed, update indexes - every enabled source
+   pond sync         # ingest, embed, update indexes - every enabled adapter
    ```
 
-   `pond init` already enabled your adapters; `sync` only ever ingests already-enabled `[sources.*]` and never enables on its own. Manage the set explicitly with `pond sources list|discover|enable|disable` (e.g. `pond sources enable codex-cli`). If you set a schedule in step 1, `sync` also runs automatically on that cadence.
+   `pond init` already enabled your adapters; `sync` only ever ingests already-enabled `[adapters.*]` and never enables on its own. Manage the set explicitly with `pond adapters list|discover|enable|disable` (e.g. `pond adapters enable codex-cli`). If you set a schedule in step 1, `sync` also runs automatically on that cadence.
 
 3. Now just ask your agent - it searches your history through pond for you:
 
@@ -63,7 +63,7 @@ pond runs hybrid search across every session from every client - including sessi
 By default pond stores its data locally (under `$XDG_DATA_HOME/pond`). To put it on an object store instead, add a credential set, then switch the destination:
 
 ```sh
-pond storage creds add        # interactive: set name (default), access key, hidden secret
+pond creds add                # interactive: set name (default), access key, hidden secret
 pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
@@ -92,11 +92,11 @@ Several machines can share one bucket: give each the same `config.toml` and run 
 `use` only switches the pointer; it never moves data. To carry your existing local sessions into the bucket, copy them first, then switch:
 
 ```sh
-pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
+pond migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
 pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. It rebuilds the destination's indexes and verifies every row landed before it exits, so the bucket is ready to query with no manual reconciliation; `pond storage verify --from <local> --to <url>` re-runs that membership check read-only. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
+Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. It rebuilds the destination's indexes and verifies every row landed before it exits, so the bucket is ready to query with no manual reconciliation; `pond migrate --verify-only --from <local> --to <url>` re-runs that membership check read-only. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
 
 ### Troubleshooting
 

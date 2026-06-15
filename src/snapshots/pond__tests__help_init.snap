@@ -4,13 +4,13 @@ expression: sub.render_long_help().to_string()
 ---
 Set up pond (idempotent: safe to re-run).
 
-Walks through storage, source adapters, MCP registration, and an optional sync schedule, then writes config.toml in one pass at the end. Re-running repairs or updates an existing setup; flags answer sections non-interactively.
+Walks through storage, adapters, MCP registration, and an optional sync schedule, then writes config.toml in one pass at the end. Re-running repairs or updates an existing setup; flags answer sections non-interactively.
 
 Usage: pond init [OPTIONS]
 
 Options:
       --adapters <NAMES>
-          Comma-separated adapter names to enable (skips the source picker)
+          Comma-separated adapter names to enable (skips the adapter picker)
 
       --schedule <EVERY>
           Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules
@@ -33,7 +33,7 @@ Global options:
       --storage-path <URL>
           Storage destination: a local path or remote URL.
           
-          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
           
           [env: POND_STORAGE_PATH]
 

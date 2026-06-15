@@ -9,15 +9,17 @@ Usage: pond [OPTIONS] <COMMAND>
 Commands:
   init         Set up pond (idempotent: safe to re-run)
   sync         Make pond current: import, embed, update indexes
-  sources      Manage which adapters `pond sync` ingests (the `[sources.*]` entries)
-  status       Show pond health, data, and source status
+  adapters     Manage which adapters `pond sync` ingests (the `[adapters.*]` entries)
+  status       Show pond health, data, and adapter status
   search       Search stored messages
   get          Fetch a session or message
   sql          Run one read-only SQL query over the corpus
   serve        Run the HTTP API server (or MCP over stdio with --transport stdio)
   mcp          Serve the MCP tools over stdio (for agent clients)
   schedule     Manage the automatic sync schedule
-  storage      Inspect, probe, switch, copy, and verify storage destinations
+  storage      Probe and switch storage destinations
+  creds        Manage URL-scoped credential sets in config.toml
+  migrate      Copy canonical data between two storages (or just verify a copy)
   export       Export a compact restorable .pond archive
   import       Restore a .pond archive
   config       Inspect configuration
@@ -35,7 +37,7 @@ Global options:
       --storage-path <URL>
           Storage destination: a local path or remote URL.
           
-          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
           
           [env: POND_STORAGE_PATH]
 
@@ -51,7 +53,7 @@ Global options:
           Decrease logging verbosity
 
 Getting started:
-  pond init                                  set up storage, sources, MCP, and scheduling
+  pond init                                  set up storage, adapters, MCP, and scheduling
   pond sync                                  import new sessions, embed, update indexes
   pond search "that auth refactor"           find past work
   claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code

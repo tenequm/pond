@@ -1125,7 +1125,7 @@ impl Store {
     }
 
     /// The primary-key (`id`) set for `table`. Powers storage verification
-    /// (`pond storage verify` and migrate's closing check).
+    /// (`pond migrate --verify-only` and migrate's closing check).
     pub async fn collect_ids(&self, table: Table) -> Result<std::collections::HashSet<String>> {
         self.handle.collect_ids(table).await
     }
@@ -4169,7 +4169,7 @@ mod tests {
     async fn initialized_flips_only_after_first_ingest() -> anyhow::Result<()> {
         // `open` eagerly creates sessions/messages but `parts` is lazy, so a
         // configured-but-never-synced store reports uninitialized - the signal
-        // `pond status`/`pond storage` use to render an empty state instead of
+        // `pond status` uses to render an empty state instead of
         // erroring on the first parts describe.
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;

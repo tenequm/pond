@@ -8,7 +8,7 @@ The shape of the migration is four steps that each do exactly one thing: **add c
 
 - It copies your canonical sessions to a new storage URL and points pond at it.
 - It never deletes or mutates the local store at `~/.local/share/pond`. That directory remains a complete, queryable copy - treat it as your backup, not a cleanup target.
-- It never moves data as a side effect of switching. `pond storage use` only flips a pointer; copying is always the separate, explicit `pond storage migrate`.
+- It never moves data as a side effect of switching. `pond storage use` only flips a pointer; copying is always the separate, explicit `pond migrate`.
 
 ## Before you start
 
@@ -38,7 +38,7 @@ DEST=s3+https://nbg1.your-objectstorage.com/my-pond
 ## Step 1 - Add credentials
 
 ```sh
-pond storage creds add
+pond creds add
 ```
 
 It prompts for a set name (press Enter for `default`), your access key ID (visible), and your secret access key (hidden). It writes a `[creds.<name>]` block to `config.toml`. A single scope-less `default` set matches any URL, which is all one bucket needs.
@@ -71,7 +71,7 @@ It parses the URL, resolves credentials, performs a conditional put (the optimis
 ## Step 3 - Copy, index, and verify
 
 ```sh
-pond storage migrate --from ~/.local/share/pond --to "$DEST"
+pond migrate --from ~/.local/share/pond --to "$DEST"
 ```
 
 This is the only step that moves data. It is an idempotent union merge: re-runnable, resumable, and valid onto a populated destination; the source is never modified. When the copy finishes, migrate rebuilds the destination's search indexes and then compares the `id` set of every table end to end - it exits `0` only when the destination provably contains every source row (printing a `verify: SYNCED` line) and exits `6`, naming the short table, otherwise. You do not reconcile counts by hand.
@@ -83,7 +83,7 @@ This is the only step that moves data. It is an idempotent union merge: re-runna
 > **Agents / CI:** branch on the exit code - `0` synced and ready, `6` destination missing source rows (re-run migrate; it converges). No `jq`, no count parsing:
 >
 > ```sh
-> pond storage migrate --from ~/.local/share/pond --to "$DEST" || exit 1
+> pond migrate --from ~/.local/share/pond --to "$DEST" || exit 1
 > ```
 
 ## Step 4 - Switch pond to the bucket
@@ -109,18 +109,18 @@ pond status
 pond search "something you remember discussing"
 ```
 
-> **Agents / CI:** re-check membership at any time, read-only and without copying, with `pond storage verify` - exit `0` synced, `6` diverged:
+> **Agents / CI:** re-check membership at any time, read-only and without copying, with `pond migrate --verify-only` - exit `0` synced, `6` diverged:
 >
 > ```sh
-> pond storage verify --from ~/.local/share/pond --to "$DEST"
+> pond migrate --verify-only --from ~/.local/share/pond --to "$DEST"
 > ```
 
 ## Roll back, keep your backup
 
-Rolling back is the same switch in reverse, and it is instant and safe because `use` never touched any data:
+Rolling back is the same switch in reverse, and it is instant and safe because `use` never touched any data. The keyword `local` resolves to the default local data dir, so you do not need to remember its path:
 
 ```sh
-pond storage use ~/.local/share/pond
+pond storage use local
 ```
 
 If you took the agents/CI path and exported `POND_STORAGE_PATH`, `unset` it (or point it back at the local path) - the environment overrides `config.toml`, so `use` alone won't take effect while it is set.
@@ -139,11 +139,11 @@ Point each machine's `config.toml` (or `POND_*` environment) at the same URL and
 |---|---|---|
 | `check` exits `1` | Generic I/O error - DNS failure, endpoint unreachable, bucket missing | Check connectivity and the endpoint host; run `pond -vv storage check "$DEST"` for the full error |
 | `check` exits `2` | URL malformed, unknown query param, or embedded credentials | Fix the URL grammar; never put a secret in the URL |
-| `check` exits `3` | No credential set matched the destination | Add `[creds.default]` (`pond storage creds add`) or export `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY`; confirm the binding with `pond config show` |
+| `check` exits `3` | No credential set matched the destination | Add `[creds.default]` (`pond creds add`) or export `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY`; confirm the binding with `pond config show` |
 | `check` exits `4` | Auth failed - wrong key/secret, or bucket policy denies write/read/delete | Re-check the credentials; ensure the key can put/get/delete/list the bucket; run `pond -vv storage check "$DEST"` for the full error |
 | `check` exits `5` | The store does not support conditional put | Use a store with conditional writes (Hetzner, R2, B2, AWS S3, GCS, Azure; recent MinIO) |
 | `migrate` stalls or is interrupted | Transient network/timeout | Re-run the same `migrate` - it resumes and de-duplicates |
-| `migrate` or `verify` exits `6` | Destination is missing source rows (the copy did not finish) | Re-run `migrate` - the union merge converges; do not delete the destination. Re-check read-only with `pond storage verify --from <src> --to <dest>` |
+| `migrate` (or `migrate --verify-only`) exits `6` | Destination is missing source rows (the copy did not finish) | Re-run `migrate` - the union merge converges; do not delete the destination. Re-check read-only with `pond migrate --verify-only --from <src> --to <dest>` |
 | `pond status` still shows local data after `use` | `POND_STORAGE_PATH` is set and overrides config | Unset it, or set it to the new URL |
 | `pond sync` auth-fails in cron after switching | The scheduler's environment does not inherit your shell exports | Put `POND_CREDS_*` in the launchd plist / systemd unit / crontab environment |
 
@@ -164,7 +164,7 @@ pond storage check "$DEST"                                   # gate: exit 0 requ
 # migrate is resumable and self-verifying: exit 0 = destination provably holds
 # every source row (indexes rebuilt); exit 6 = rows missing. Retry transient
 # interruptions; both converge on re-run.
-n=0; until pond storage migrate --from "$SRC" --to "$DEST"; do
+n=0; until pond migrate --from "$SRC" --to "$DEST"; do
   n=$((n + 1)); [ "$n" -ge 5 ] && { echo "migrate failed after $n attempts"; exit 1; }
   echo "migrate incomplete; retrying ($n)..."; sleep 5
 done

@@ -1,6 +1,6 @@
 //! `pond init`: the idempotent setup-and-repair wizard.
 //!
-//! One pass over four sections - storage, sources, MCP registration, sync
+//! One pass over four sections - storage, adapters, MCP registration, sync
 //! schedule - then a single `config.toml` write at the end. Every section is
 //! answerable by a flag for non-interactive use; re-running against an
 //! existing setup proposes only what would change. Bin-only module: the
@@ -21,7 +21,7 @@ use crate::schedule::{self, ScheduleEvery};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InitArgs {
-    /// Comma-separated adapter names to enable (skips the source picker).
+    /// Comma-separated adapter names to enable (skips the adapter picker).
     #[arg(long, value_delimiter = ',', value_name = "NAMES")]
     adapters: Option<Vec<String>>,
     /// Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules.
@@ -161,6 +161,15 @@ pub(crate) async fn run(
         None => None,
     };
 
+    // ---- repair: pre-rename [sources.*] adapter map -> [adapters.*] ---------
+    let migrated_adapters = rewrite_legacy_sources(&mut doc);
+    if !migrated_adapters.is_empty() {
+        cliclack::log::info(format!(
+            "migrated [sources.*] -> [adapters.*]: {}",
+            migrated_adapters.join(", "),
+        ))?;
+    }
+
     // ---- storage -----------------------------------------------------------
     let default_storage = if args.force {
         platform_default_storage()
@@ -190,9 +199,9 @@ pub(crate) async fn run(
         crate::set_storage_path(&mut doc, &chosen_display);
     }
 
-    // ---- sources -----------------------------------------------------------
-    let rows = source_rows(&doc, args.force);
-    let picked = pick_sources(&args, &rows, prompts)?;
+    // ---- adapters ----------------------------------------------------------
+    let rows = adapter_rows(&doc, args.force);
+    let picked = pick_adapters(&args, &rows, prompts)?;
     let mut fresh_accepts: Vec<Candidate> = Vec::new();
     let mut fresh_declines: Vec<&str> = Vec::new();
     for row in &rows {
@@ -209,7 +218,7 @@ pub(crate) async fn run(
             }
             RowState::Configured { enabled } => {
                 if *enabled != want {
-                    doc["sources"][row.name.as_str()]["enabled"] = value(want);
+                    doc["adapters"][row.name.as_str()]["enabled"] = value(want);
                 }
             }
         }
@@ -265,7 +274,7 @@ pub(crate) async fn run(
         .map(|row| row.name.as_str())
         .collect();
     plan.push_str(&format!(
-        "\nsources    {}",
+        "\nadapters   {}",
         if enabled.is_empty() {
             "(none)".to_owned()
         } else {
@@ -417,7 +426,7 @@ async fn pick_storage(
                 }
             } else {
                 bail!(
-                    "--storage-path {} failed the end-to-end check: {reason}; add credentials with `pond storage creds add` (or POND_CREDS_DEFAULT_*), then re-run",
+                    "--storage-path {} failed the end-to-end check: {reason}; add credentials with `pond creds add` (or POND_CREDS_DEFAULT_*), then re-run",
                     chosen.display(),
                 );
             }
@@ -610,19 +619,19 @@ enum RowState {
     Fresh(Candidate),
 }
 
-struct SourceRow {
+struct AdapterRow {
     name: String,
     hint: String,
     state: RowState,
     preselected: bool,
 }
 
-/// Union of configured `[sources.*]` entries and fresh probe candidates, in
+/// Union of configured `[adapters.*]` entries and fresh probe candidates, in
 /// registry order (configured-but-unknown names append at the end so they
 /// are never silently dropped). `force` resets preselection to "what the
 /// probe detects", ignoring saved enables/declines.
-fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
-    let configured = doc.get("sources").and_then(Item::as_table_like);
+fn adapter_rows(doc: &DocumentMut, force: bool) -> Vec<AdapterRow> {
+    let configured = doc.get("adapters").and_then(Item::as_table_like);
     let candidates = adapter::discover(None);
     let candidate_for = |name: &str| candidates.iter().find(|c| c.name == name);
     let mut rows = Vec::new();
@@ -645,14 +654,14 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
                     .map(|path| config::contract_home(Path::new(path)).display().to_string())
                     .or_else(|| candidate.map(|c| c.hint.clone()))
                     .unwrap_or_default();
-                rows.push(SourceRow {
+                rows.push(AdapterRow {
                     name: name.to_owned(),
                     hint,
                     state: RowState::Configured { enabled },
                     preselected: if force { candidate.is_some() } else { enabled },
                 });
             }
-            (None, Some(candidate)) => rows.push(SourceRow {
+            (None, Some(candidate)) => rows.push(AdapterRow {
                 name: name.to_owned(),
                 hint: candidate.hint.clone(),
                 state: RowState::Fresh(candidate.clone()),
@@ -671,7 +680,7 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
                 .and_then(|t| t.get("enabled"))
                 .and_then(Item::as_bool)
                 .unwrap_or(false);
-            rows.push(SourceRow {
+            rows.push(AdapterRow {
                 name: name.to_owned(),
                 hint: "(unknown adapter)".to_owned(),
                 state: RowState::Configured { enabled },
@@ -682,10 +691,10 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
     rows
 }
 
-/// Resolve the sources section: `--adapters` list (validated against known
+/// Resolve the adapters section: `--adapters` list (validated against known
 /// names and against what is actually detectable) > interactive multiselect
 /// (zero picks allowed) > the preselection defaults.
-fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Vec<String>> {
+fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<Vec<String>> {
     if let Some(requested) = &args.adapters {
         let known = adapter::known_names();
         for name in requested {
@@ -694,14 +703,14 @@ fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Ve
             }
             if !rows.iter().any(|row| &row.name == name) {
                 bail!(
-                    "adapter {name:?} was not detected on this machine and has no [sources.{name}] entry; pass a path via `pond sync {name} --source-dir <path>` or add the section manually"
+                    "adapter {name:?} was not detected on this machine and has no [adapters.{name}] entry; pass a path via `pond sync {name} --source-dir <path>` or add the section manually"
                 );
             }
         }
         return Ok(requested.clone());
     }
     if rows.is_empty() {
-        cliclack::log::info("sources: none detected - add [sources.<adapter>] entries manually")?;
+        cliclack::log::info("adapters: none detected - add [adapters.<adapter>] entries manually")?;
         return Ok(Vec::new());
     }
     if !prompts {
@@ -711,7 +720,7 @@ fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Ve
             .map(|row| row.name.clone())
             .collect());
     }
-    let mut picker = cliclack::multiselect("Which sources should pond sync?")
+    let mut picker = cliclack::multiselect("Which adapters should pond sync?")
         .required(false)
         .initial_values(
             rows.iter()
@@ -925,6 +934,43 @@ fn legacy_url_guess(legacy: &LegacyStorage) -> Option<String> {
     }
 }
 
+/// Repair: the adapter config map was renamed `[sources.*]` -> `[adapters.*]`.
+/// Move any legacy `[sources.<name>]` entry to `[adapters.<name>]`, preserving
+/// values and comments and never clobbering an already-migrated entry; drop the
+/// emptied `sources` table. Returns the moved names (empty when there is nothing
+/// to migrate). Transitional - delete once live configs have migrated.
+fn rewrite_legacy_sources(doc: &mut DocumentMut) -> Vec<String> {
+    let names: Vec<String> = match doc.get("sources").and_then(Item::as_table) {
+        Some(table) => table.iter().map(|(name, _)| name.to_owned()).collect(),
+        None => return Vec::new(),
+    };
+    if !doc.contains_key("adapters") {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        doc.insert("adapters", Item::Table(table));
+    }
+    let mut moved = Vec::new();
+    for name in names {
+        let already = doc
+            .get("adapters")
+            .and_then(Item::as_table)
+            .is_some_and(|table| table.contains_key(&name));
+        let entry = doc
+            .get_mut("sources")
+            .and_then(Item::as_table_mut)
+            .and_then(|table| table.remove(&name));
+        if let Some(entry) = entry
+            && !already
+            && let Some(adapters) = doc.get_mut("adapters").and_then(Item::as_table_mut)
+        {
+            adapters.insert(&name, entry);
+            moved.push(name);
+        }
+    }
+    doc.remove("sources");
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -934,7 +980,7 @@ mod tests {
     #[test]
     fn legacy_rewrite_moves_keys_and_prefills_the_url() {
         let mut doc: DocumentMut = r#"
-[sources.claude-code]
+[adapters.claude-code]
 enabled = true
 path = "/srv/claude"
 
@@ -950,7 +996,7 @@ AWS_ENDPOINT = "https://nbg1.example.com"
         let prefill = apply_legacy_rewrite(&mut doc, &legacy);
         assert_eq!(prefill.as_deref(), Some("s3+https://nbg1.example.com/"));
         let body = doc.to_string();
-        // Keys moved, region dropped, sources untouched.
+        // Keys moved, region dropped, adapters untouched.
         assert!(body.contains("[creds.default]"), "got: {body}");
         assert!(body.contains("access_key_id = \"AKIA123\""), "got: {body}");
         assert!(!body.contains("AWS_ACCESS_KEY_ID"), "got: {body}");
@@ -958,9 +1004,45 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             !body.contains("nbg1\""),
             "region must not carry over: {body}"
         );
-        assert!(body.contains("[sources.claude-code]"), "got: {body}");
+        assert!(body.contains("[adapters.claude-code]"), "got: {body}");
         // The rewritten doc now loads under the new schema.
         Config::load_str(&body).expect("rewritten config loads");
+    }
+
+    #[test]
+    fn rewrite_legacy_sources_renames_the_adapter_map() {
+        let mut doc: DocumentMut = r#"
+[sources.claude-code]
+enabled = true
+path = "/srv/claude"
+
+[sources.codex-cli]
+enabled = false
+
+[storage]
+path = "/srv/pond"
+"#
+        .parse()
+        .unwrap();
+        let moved = rewrite_legacy_sources(&mut doc);
+        assert_eq!(moved, vec!["claude-code", "codex-cli"]);
+        let body = doc.to_string();
+        assert!(!body.contains("[sources."), "legacy block removed: {body}");
+        assert!(body.contains("[adapters.claude-code]"), "got: {body}");
+        assert!(body.contains("[adapters.codex-cli]"), "got: {body}");
+        // Values and untouched sections survive the move.
+        assert!(
+            body.contains("path = \"/srv/claude\""),
+            "values preserved: {body}"
+        );
+        assert!(
+            body.contains("[storage]"),
+            "other sections untouched: {body}"
+        );
+        // Idempotent: nothing left to migrate on a second pass.
+        assert!(rewrite_legacy_sources(&mut doc).is_empty());
+        // The migrated config loads under the new schema.
+        Config::load_str(&doc.to_string()).expect("migrated config loads");
     }
 
     #[test]

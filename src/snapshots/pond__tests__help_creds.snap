@@ -2,15 +2,17 @@
 source: src/main.rs
 expression: sub.render_long_help().to_string()
 ---
-Generate shell completions.
+Manage URL-scoped credential sets in config.toml.
 
-Writes the completion script for the given shell to stdout.
+`add` captures a set's keys (secret via hidden prompt) and writes `[creds.<name>]`; `list` shows configured sets with secrets redacted; `delete` removes one. Sets bind to storage URLs by scope match, never by activation (spec.md#creds-scope-match) - there is no "current" set.
 
-Usage: pond completions [OPTIONS] <SHELL>
+Usage: pond creds [OPTIONS] <COMMAND>
 
-Arguments:
-  <SHELL>
-          [possible values: bash, elvish, fish, powershell, zsh]
+Commands:
+  add     Add or replace a credential set (secret captured via a hidden prompt)
+  list    List configured credential sets (secrets redacted)
+  delete  Remove a credential set
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -35,9 +37,8 @@ Global options:
   -q, --quiet...
           Decrease logging verbosity
 
-Install:
-  bash:  pond completions bash > ~/.local/share/bash-completion/completions/pond
-  zsh:   pond completions zsh > "${fpath[1]}/_pond"
-  fish:  pond completions fish > ~/.config/fish/completions/pond.fish
-
-Homebrew and nix packages ship these pre-installed.
+Examples:
+  pond creds add                            interactive: name (default), key, hidden secret
+  pond creds add work --scope s3+https://host/work
+  pond creds list
+  pond creds delete work

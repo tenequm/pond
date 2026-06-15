@@ -1,4 +1,4 @@
-//! Configuration loading: the `[embeddings]`, `[sources]`, `[storage]`, and
+//! Configuration loading: the `[embeddings]`, `[adapters]`, `[storage]`, and
 //! `[creds.*]` blocks.
 //!
 //! pond ships built-in defaults, so an instance with no `config.toml` still
@@ -177,23 +177,23 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # pond ships built-in defaults, so every setting here is optional - delete this
 # file and pond still works. Uncomment and edit to override.
 
-# Where pond looks for source data to import. One entry per adapter type
+# Where pond looks for adapter data to import. One entry per adapter type
 # (`claude-code`, `codex-cli`, ...). `pond sync` with no arguments syncs every
-# entry; `pond sync <adapter>` syncs just one. With an empty `[sources]`,
+# entry; `pond sync <adapter>` syncs just one. With an empty `[adapters]`,
 # `pond sync` runs an interactive discovery against the known default paths
 # and writes the picks back here.
 #
-# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[sources]` is
-# flat here. When multi-namespace pond lands, source registration becomes
-# per-tenant under `[namespaces.<ns>.sources.<adapter>]`. Pre-v1 the schema
+# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[adapters]` is
+# flat here. When multi-namespace pond lands, adapter registration becomes
+# per-tenant under `[namespaces.<ns>.adapters.<adapter>]`. Pre-v1 the schema
 # is breakable; the rename is operationally free until a real second tenant
 # exists.
 #
-# [sources.claude-code]
+# [adapters.claude-code]
 # enabled = true
 # path = \"~/.claude/projects\"
 #
-# [sources.codex-cli]
+# [adapters.codex-cli]
 # enabled = true
 # path = \"~/.codex/sessions\"
 #
@@ -310,13 +310,13 @@ pub struct Config {
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
-    /// `[sources.<adapter>]` map: per-adapter config blobs the matching
+    /// `[adapters.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
     /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
     /// expect endpoint + auth keys), so this layer stays opaque. Empty by
     /// default; `pond sync` runs discovery into this map on first use.
     #[serde(default)]
-    pub sources: BTreeMap<String, Value>,
+    pub adapters: BTreeMap<String, Value>,
     /// `[storage]`: the default destination URL (spec.md#storage-url-grammar).
     /// `None` = the platform-local data dir.
     #[serde(default)]
@@ -371,7 +371,7 @@ pub struct CredsSet {
 
 /// `[creds.<name>]` name charset `[a-z][a-z0-9]{0,15}` (spec.md#storage-env-mirror):
 /// lowercase-alphanumeric keeps `POND_CREDS_<NAME>_<FIELD>` splittable at the
-/// first `_` after the name. Shared by config validation and `pond storage creds`.
+/// first `_` after the name. Shared by config validation and `pond creds`.
 pub fn valid_creds_set_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -527,6 +527,9 @@ impl Config {
             if let Some(recipe) = detect_legacy_storage(path) {
                 return anyhow!("{recipe}");
             }
+            if let Some(recipe) = detect_legacy_sources(path) {
+                return anyhow!("{recipe}");
+            }
             // Inline figment's message (it already names the failing key and
             // source layer) so single-line error surfaces keep the detail.
             anyhow!("failed to load config {}: {error}", path.display())
@@ -602,7 +605,7 @@ impl Config {
         Ok(())
     }
 
-    /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. Only
+    /// Resolve the `[adapters.<adapter>]` entries to drive `pond sync`. Only
     /// sections with `enabled = true` flow through; sections with
     /// `enabled = false` (or absent) are treated as opt-out and the
     /// per-adapter blob (minus `enabled`) is handed to the factory's
@@ -610,21 +613,21 @@ impl Config {
     /// `Some(name)` returns just that one - and errors if it's not in
     /// config OR if it's currently disabled (the caller should then
     /// re-prompt or report).
-    pub fn resolve_sources(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
+    pub fn resolve_adapters(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
         match adapter {
             None => Ok(self
-                .sources
+                .adapters
                 .iter()
                 .filter_map(|(name, blob)| take_enabled(name, blob))
                 .collect()),
             Some(name) => {
                 let blob = self
-                    .sources
+                    .adapters
                     .get(name)
-                    .ok_or_else(|| anyhow!("no [sources.{name}] entry in config"))?;
+                    .ok_or_else(|| anyhow!("no [adapters.{name}] entry in config"))?;
                 take_enabled(name, blob).map(|entry| vec![entry]).ok_or_else(|| {
                     anyhow!(
-                        "source [{name}] is disabled (enabled = false); run `pond sync {name}` to re-enable"
+                        "adapter [{name}] is disabled (enabled = false); run `pond sync {name}` to re-enable"
                     )
                 })
             }
@@ -635,8 +638,8 @@ impl Config {
     /// `pond sync` post-import to know not to re-probe an adapter the user
     /// already declined (the decline persists; re-prompt only via the
     /// positional override `pond sync <name>`).
-    pub fn disabled_source_names(&self) -> Vec<&str> {
-        self.sources
+    pub fn disabled_adapter_names(&self) -> Vec<&str> {
+        self.adapters
             .iter()
             .filter_map(|(name, blob)| {
                 let enabled = blob
@@ -744,7 +747,21 @@ fn detect_legacy_storage(path: &Path) -> Option<String> {
     Some(recipe)
 }
 
-/// Inner helper: return `Some((name, blob))` when the source section is
+/// Recognize a pre-rename `[sources.<name>]` config block (the adapter map was
+/// renamed `sources` -> `adapters`) and return a one-line recipe pointing at
+/// `pond init`. An error with a recipe, not a shim: old configs do not silently
+/// keep working. Transitional - delete once live configs have migrated.
+fn detect_legacy_sources(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value.get("sources")?.as_table()?;
+    Some(format!(
+        "config {} uses a [sources.*] block; the adapter map was renamed to [adapters.*]. Run `pond init` to migrate it, or rename each `[sources.<name>]` header to `[adapters.<name>]` by hand.",
+        path.display(),
+    ))
+}
+
+/// Inner helper: return `Some((name, blob))` when the adapter section is
 /// enabled, stripping the discriminator from the blob before handing it on;
 /// `None` when the section is missing `enabled` or has `enabled = false`.
 fn take_enabled(name: &str, blob: &Value) -> Option<(String, Value)> {
@@ -982,18 +999,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_sources_returns_one_or_all_or_errors() {
+    fn resolve_adapters_returns_one_or_all_or_errors() {
         let temp = TempDir::new().unwrap();
         let body = "\
-[sources.claude-code]
+[adapters.claude-code]
 enabled = true
 path = \"/srv/claude\"
 
-[sources.codex-cli]
+[adapters.codex-cli]
 enabled = true
 path = \"/srv/codex\"
 
-[sources.opencode]
+[adapters.opencode]
 enabled = false
 ";
         let path = temp.path().join("config.toml");
@@ -1001,7 +1018,7 @@ enabled = false
         let config = Config::load(&path).unwrap();
 
         // None -> only enabled entries
-        let all = config.resolve_sources(None).unwrap();
+        let all = config.resolve_adapters(None).unwrap();
         assert_eq!(all.len(), 2);
         let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"claude-code"));
@@ -1012,7 +1029,7 @@ enabled = false
         }
 
         // Some(name) -> one entry, opaque JSON blob
-        let one = config.resolve_sources(Some("codex-cli")).unwrap();
+        let one = config.resolve_adapters(Some("codex-cli")).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].0, "codex-cli");
         assert_eq!(
@@ -1021,7 +1038,7 @@ enabled = false
         );
 
         // Disabled positional -> errors with the recovery hint baked in.
-        let disabled = config.resolve_sources(Some("opencode"));
+        let disabled = config.resolve_adapters(Some("opencode"));
         let err = disabled
             .expect_err("disabled adapter must error")
             .to_string();
@@ -1029,10 +1046,10 @@ enabled = false
         assert!(err.contains("pond sync opencode"), "got: {err}");
 
         // Unknown -> error
-        assert!(config.resolve_sources(Some("nope")).is_err());
+        assert!(config.resolve_adapters(Some("nope")).is_err());
 
-        // disabled_source_names lists exactly the off ones.
-        assert_eq!(config.disabled_source_names(), vec!["opencode"]);
+        // disabled_adapter_names lists exactly the off ones.
+        assert_eq!(config.disabled_adapter_names(), vec!["opencode"]);
     }
 
     #[test]
@@ -1197,6 +1214,22 @@ AWS_ENDPOINT = "https://ttq.nbg1.your-objectstorage.com"
                 err.contains("s3+https://ttq.nbg1.your-objectstorage.com/<bucket>/<prefix>"),
                 "got: {err}",
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_sources_block_errors_with_the_adapters_recipe() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[sources.claude-code]\nenabled = true\npath = \"/srv/claude\"\n",
+            )?;
+            let err = Config::load("config.toml")
+                .expect_err("legacy [sources.*] must error")
+                .to_string();
+            assert!(err.contains("[adapters.*]"), "names the new key: {err}");
+            assert!(err.contains("pond init"), "points at the fix: {err}");
             Ok(())
         });
     }

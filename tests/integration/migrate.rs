@@ -1,4 +1,4 @@
-//! `pond storage migrate` data path (spec.md#substrate): export the source's clean
+//! `pond migrate` data path (spec.md#substrate): export the source's clean
 //! datasets, merge-import into the destination. The properties under test
 //! are the plan's contract: round-trip, rerun-is-a-no-op, and union onto a
 //! populated destination - all consequences of `lance-deterministic-pk` +
@@ -113,7 +113,7 @@ async fn migrate_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The id-set comparison behind `pond storage verify` and migrate's closing
+/// The id-set comparison behind `pond migrate --verify-only` and migrate's closing
 /// check: a destination is in sync iff it is missing none of the source's
 /// per-table ids. Row counts alone can't prove this (a surplus destination
 /// matches no count), so verification keys on the deterministic ids.

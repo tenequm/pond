@@ -58,7 +58,7 @@ pub(crate) struct FileState {
     tool_call_names: HashMap<String, Extracted<String>>,
 }
 
-/// Stable adapter name. Surfaces as the `[sources.claude-code]` config key,
+/// Stable adapter name. Surfaces as the `[adapters.claude-code]` config key,
 /// the `pond sync claude-code` CLI arg, and `Session.source_agent` on every
 /// emitted row.
 const NAME: &str = "claude-code";

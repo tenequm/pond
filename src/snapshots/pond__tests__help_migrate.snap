@@ -1,0 +1,48 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Copy canonical data between two storages (or just verify a copy).
+
+Copies already-canonical pond data from `--from` to `--to`, rebuilds the destination's indexes, and verifies every row landed. Idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, resumable, valid onto a populated destination, never deletes or modifies the source. Exit 6 if the destination is missing source rows. `--verify-only` runs just the read-only membership check, copying nothing. This is the durable-corpus copy path, distinct from `pond sync` which re-reads your client tools (spec.md#session-durable-copy).
+
+Usage: pond migrate [OPTIONS] --from <FROM> --to <TO>
+
+Options:
+      --from <FROM>
+          Source storage URL
+
+      --to <TO>
+          Destination storage URL
+
+      --skip-indexes
+          Skip the post-copy index rebuild (for very large stores you will index later). The copy and verify still run; build indexes after with `pond sync --only update-indexes --storage-path <to>`
+
+      --verify-only
+          Only verify the destination already contains the source - copy nothing, rebuild no indexes. Read-only
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond migrate --from ~/.local/share/pond --to s3+https://host/bucket/pond
+  pond migrate --from ~/.local/share/pond --to s3://bucket/pond --verify-only   re-check sync, copy nothing

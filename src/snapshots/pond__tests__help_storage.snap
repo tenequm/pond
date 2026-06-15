@@ -2,19 +2,16 @@
 source: src/main.rs
 expression: sub.render_long_help().to_string()
 ---
-Inspect, probe, switch, copy, and verify storage destinations.
+Probe and switch storage destinations.
 
-Bare `pond storage` shows the resolved destination, its creds binding, and per-table sizes. Subcommands probe a destination (check), switch the active destination (use), copy between destinations (migrate), and verify a copy without moving data (verify).
+`check` probes a destination end-to-end; `use` switches the configured destination - a pointer change that moves no data. To copy data between stores use `pond migrate`; to see where data lives and how big it is use `pond status`.
 
-Usage: pond storage [OPTIONS] [COMMAND]
+Usage: pond storage [OPTIONS] <COMMAND>
 
 Commands:
-  check    Probe a destination end-to-end
-  use      Switch the configured destination. Moves no data
-  migrate  Copy canonical data between two storages, rebuild the destination's indexes, and verify the copy landed
-  verify   Verify a destination fully contains a source, without copying
-  creds    Manage URL-scoped credential sets in config.toml
-  help     Print this message or the help of the given subcommand(s)
+  check  Probe a destination end-to-end
+  use    Switch the configured destination. Moves no data
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -24,7 +21,7 @@ Global options:
       --storage-path <URL>
           Storage destination: a local path or remote URL.
           
-          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
           
           [env: POND_STORAGE_PATH]
 
@@ -40,6 +37,5 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond storage                                     where data lives, and how big
   pond storage check s3+https://host/bucket/pond   probe a destination end-to-end
   pond storage use s3+https://host/bucket/pond     probe, then switch the destination

@@ -1,5 +1,5 @@
-//! Source discovery and the interactive registration picker: probe the
-//! environment for configurable sources, prompt the operator, and persist the
+//! Adapter discovery and the interactive registration picker: probe the
+//! environment for configurable adapters, prompt the operator, and persist the
 //! picks to `config.toml`. Config-time and interactive - kept off the
 //! sync-time seam in `mod.rs`.
 
@@ -13,7 +13,7 @@ use super::{Env, by_name, known_names, probe_all};
 
 /// One discovered adapter: its name, a hint to show the operator (typically
 /// the probed path or endpoint), and the JSON config blob that will be
-/// persisted under `[sources.<name>]` if the operator confirms.
+/// persisted under `[adapters.<name>]` if the operator confirms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub name: String,
@@ -104,19 +104,19 @@ pub fn prompt_and_persist(
 ) -> anyhow::Result<Vec<Candidate>> {
     if candidates.is_empty() {
         bail!(
-            "no adapter sources detected in this environment; known adapters: {}",
+            "no adapters detected in this environment; known adapters: {}",
             known_names().join(", "),
         );
     }
     if !stdin_is_tty {
         bail!(
-            "[sources] is empty and stdin is not a terminal; run `pond init --yes` to enable \
-             detected sources, or add a [sources.<adapter>] entry to {} (known adapters: {})",
+            "[adapters] is empty and stdin is not a terminal; run `pond init --yes` to enable \
+             detected adapters, or add an [adapters.<adapter>] entry to {} (known adapters: {})",
             config_path.display(),
             known_names().join(", "),
         );
     }
-    let mut picker = cliclack::multiselect("Select sources to register")
+    let mut picker = cliclack::multiselect("Select adapters to register")
         .initial_values(candidates.iter().map(|c| c.name.clone()).collect());
     for candidate in candidates {
         picker = picker.item(candidate.name.clone(), &candidate.name, &candidate.hint);
@@ -126,12 +126,12 @@ pub fn prompt_and_persist(
         // Esc / Ctrl-C in the picker means "register nothing", same outcome
         // as an empty selection - not a failure.
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-            bail!("no sources selected; nothing to sync");
+            bail!("no adapters selected; nothing to sync");
         }
-        Err(error) => return Err(error).context("source picker prompt failed"),
+        Err(error) => return Err(error).context("adapter picker prompt failed"),
     };
     if selected.is_empty() {
-        bail!("no sources selected; nothing to sync");
+        bail!("no adapters selected; nothing to sync");
     }
     let picks: Vec<Candidate> = candidates
         .iter()
@@ -142,8 +142,8 @@ pub fn prompt_and_persist(
     Ok(picks)
 }
 
-/// Shape accepted and declined sources into a `toml_edit` document:
-/// `[sources.<name>]` with `enabled` as the first key, the accept's config
+/// Shape accepted and declined adapters into a `toml_edit` document:
+/// `[adapters.<name>]` with `enabled` as the first key, the accept's config
 /// blob unpacked into TOML pairs (home-prefixed `path` values contracted to
 /// `~/...` so the file stays portable), declines as `enabled = false` stubs.
 /// The one table-shaping routine shared by the sync picker writes and the
@@ -156,12 +156,12 @@ pub fn apply_to_doc(
     if accepts.is_empty() && declines.is_empty() {
         return Ok(());
     }
-    if !doc.contains_key("sources") {
+    if !doc.contains_key("adapters") {
         let mut table = Table::new();
         table.set_implicit(true);
-        doc.insert("sources", Item::Table(table));
+        doc.insert("adapters", Item::Table(table));
     }
-    let sources = sources_table_mut(doc)?;
+    let adapters = adapters_table_mut(doc)?;
     for pick in accepts {
         let mut entry = json_to_toml_table(&pick.config).with_context(|| {
             format!(
@@ -171,12 +171,12 @@ pub fn apply_to_doc(
         })?;
         contract_path_key(&mut entry);
         prepend_enabled(&mut entry, true);
-        sources.insert(&pick.name, Item::Table(entry));
+        adapters.insert(&pick.name, Item::Table(entry));
     }
     for name in declines {
         let mut entry = Table::new();
         prepend_enabled(&mut entry, false);
-        sources.insert(name, Item::Table(entry));
+        adapters.insert(name, Item::Table(entry));
     }
     Ok(())
 }
@@ -195,7 +195,7 @@ fn contract_path_key(table: &mut Table) {
     }
 }
 
-/// Write the picked sources back to `config.toml` under `[sources.<name>]`,
+/// Write the picked adapters back to `config.toml` under `[adapters.<name>]`,
 /// preserving any existing user comments/formatting via `toml_edit`.
 pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
     let mut doc = open_or_init(config_path)?;
@@ -205,13 +205,13 @@ pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result
     Ok(())
 }
 
-/// Flip `[sources.<name>].enabled` on an already-configured source. Returns
+/// Flip `[adapters.<name>].enabled` on an already-configured adapter. Returns
 /// `false` (writing nothing) when the section is absent - the caller decides
-/// whether to discover it first. Backs `pond sources enable|disable`.
-pub fn set_source_enabled(config_path: &Path, name: &str, enabled: bool) -> anyhow::Result<bool> {
+/// whether to discover it first. Backs `pond adapters enable|disable`.
+pub fn set_adapter_enabled(config_path: &Path, name: &str, enabled: bool) -> anyhow::Result<bool> {
     let mut doc = open_or_init(config_path)?;
-    let sources = sources_table_mut(&mut doc)?;
-    let Some(entry) = sources.get_mut(name).and_then(Item::as_table_mut) else {
+    let adapters = adapters_table_mut(&mut doc)?;
+    let Some(entry) = adapters.get_mut(name).and_then(Item::as_table_mut) else {
         return Ok(false);
     };
     entry.insert("enabled", toml_edit::value(enabled));
@@ -234,18 +234,18 @@ fn open_or_init(config_path: &Path) -> anyhow::Result<DocumentMut> {
     let mut doc: DocumentMut = existing
         .parse()
         .with_context(|| format!("failed to parse {} as TOML", config_path.display()))?;
-    if !doc.contains_key("sources") {
+    if !doc.contains_key("adapters") {
         let mut table = Table::new();
         table.set_implicit(true);
-        doc.insert("sources", Item::Table(table));
+        doc.insert("adapters", Item::Table(table));
     }
     Ok(doc)
 }
 
-fn sources_table_mut(doc: &mut DocumentMut) -> anyhow::Result<&mut Table> {
-    doc["sources"]
+fn adapters_table_mut(doc: &mut DocumentMut) -> anyhow::Result<&mut Table> {
+    doc["adapters"]
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("config.toml has a `sources` value that is not a table"))
+        .ok_or_else(|| anyhow::anyhow!("config.toml has an `adapters` value that is not a table"))
 }
 
 fn prepend_enabled(table: &mut Table, value: bool) {
@@ -365,20 +365,20 @@ mod tests {
         let body = doc.to_string();
         // Accepted entry: discriminator on top, then the blob.
         assert!(
-            body.contains("[sources.claude-code]")
+            body.contains("[adapters.claude-code]")
                 && body.contains("enabled = true")
                 && body.contains("path = \"/tmp/cc\""),
             "expected accepted entry; got: {body}",
         );
         // Declined entry: discriminator only, no path leak.
         assert!(
-            body.contains("[sources.opencode]") && body.contains("enabled = false"),
+            body.contains("[adapters.opencode]") && body.contains("enabled = false"),
             "expected declined entry; got: {body}",
         );
     }
 
     #[test]
-    fn set_source_enabled_flips_in_place_and_reports_absence() {
+    fn set_adapter_enabled_flips_in_place_and_reports_absence() {
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("config.toml");
         let accept = Candidate {
@@ -388,17 +388,17 @@ mod tests {
         };
         persist_accept(&config_path, &[accept]).unwrap();
 
-        // Absent source: writes nothing, reports false.
-        assert!(!set_source_enabled(&config_path, "opencode", false).unwrap());
+        // Absent adapter: writes nothing, reports false.
+        assert!(!set_adapter_enabled(&config_path, "opencode", false).unwrap());
 
-        // Present source: flips enabled, keeps the path.
-        assert!(set_source_enabled(&config_path, "claude-code", false).unwrap());
+        // Present adapter: flips enabled, keeps the path.
+        assert!(set_adapter_enabled(&config_path, "claude-code", false).unwrap());
         let body = std::fs::read_to_string(&config_path).unwrap();
         assert!(
             body.contains("enabled = false") && body.contains("path = \"/tmp/cc\""),
             "flip must preserve the blob; got: {body}",
         );
-        assert!(set_source_enabled(&config_path, "claude-code", true).unwrap());
+        assert!(set_adapter_enabled(&config_path, "claude-code", true).unwrap());
         assert!(
             std::fs::read_to_string(&config_path)
                 .unwrap()

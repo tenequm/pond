@@ -10,7 +10,7 @@
 //! download that can land anywhere, so `probe_default` returns `None` (an
 //! opportunistic `~/Downloads` scan would silently latch onto a stale or wrong
 //! archive). Point the adapter at the file explicitly via
-//! `[sources.claude-ai-export]` config or
+//! `[adapters.claude-ai-export]` config or
 //! `pond sync claude-ai-export --source-dir <export.zip>`. `open` accepts a
 //! `.zip`, an extracted directory, or a bare `conversations.json` path.
 //!
