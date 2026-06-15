@@ -176,7 +176,7 @@ pub(crate) async fn run(
             })
             .unwrap_or_else(platform_default_storage)
     };
-    let chosen = pick_storage(storage_path.as_ref(), &doc, &default_storage, prompts).await?;
+    let chosen = pick_storage(storage_path.as_ref(), &mut doc, &default_storage, prompts).await?;
     let chosen_display = crate::storage_config_value(&chosen);
     let current_path = doc
         .get("storage")
@@ -377,13 +377,14 @@ fn structural_error(url: &StorageUrl) -> Option<String> {
 /// keep-anyway escape.
 async fn pick_storage(
     storage_path: Option<&StorageUrl>,
-    doc: &DocumentMut,
+    doc: &mut DocumentMut,
     default: &str,
     prompts: bool,
 ) -> Result<StorageUrl> {
     // Creds for the probe come from the in-progress document (plus the
-    // POND_* env mirror) - nothing has been written yet.
-    let creds = Config::load_str(&doc.to_string())
+    // POND_* env mirror) - nothing has been written yet. Mutable because an
+    // inline capture below can add `[creds.default]` and re-probe.
+    let mut creds = Config::load_str(&doc.to_string())
         .map(|config| config.creds)
         .unwrap_or_default();
     if let Some(chosen) = storage_path.cloned() {
@@ -396,10 +397,30 @@ async fn pick_storage(
         if !chosen.is_local()
             && let Err(reason) = probe_destination(&chosen, &creds).await
         {
-            bail!(
-                "--storage-path {} failed the end-to-end check: {reason}; fix the creds (define [creds.default] or POND_CREDS_DEFAULT_*) or pick another destination",
-                chosen.display(),
-            );
+            // On a TTY, offer to capture credentials inline and re-probe - so
+            // `pond init --storage-path <bucket>` is one-command remote setup
+            // rather than a bail telling you to add creds elsewhere first.
+            if prompts
+                && wiz(cliclack::confirm(format!(
+                    "{} failed the check ({reason}). Enter credentials for it now?",
+                    chosen.display()
+                ))
+                .initial_value(true)
+                .interact())?
+            {
+                creds = capture_default_creds(doc)?;
+                if let Err(reason) = probe_destination(&chosen, &creds).await {
+                    bail!(
+                        "--storage-path {} still failed after entering credentials: {reason}",
+                        chosen.display()
+                    );
+                }
+            } else {
+                bail!(
+                    "--storage-path {} failed the end-to-end check: {reason}; add credentials with `pond storage creds add` (or POND_CREDS_DEFAULT_*), then re-run",
+                    chosen.display(),
+                );
+            }
         }
         return Ok(chosen);
     }
@@ -493,6 +514,11 @@ async fn pick_storage(
                 ))?;
                 let action = wiz(cliclack::select("What now?")
                     .item(
+                        'c',
+                        "Enter credentials for this destination",
+                        "saved as [creds.default]",
+                    )
+                    .item(
                         'l',
                         format!("Store locally instead ({local})"),
                         "safe default",
@@ -505,6 +531,18 @@ async fn pick_storage(
                     )
                     .interact())?;
                 match action {
+                    'c' => {
+                        creds = capture_default_creds(doc)?;
+                        match probe_destination(&chosen, &creds).await {
+                            Ok(()) => return Ok(chosen),
+                            Err(reason) => {
+                                cliclack::log::warning(format!(
+                                    "still failing with those credentials: {reason}"
+                                ))?;
+                                prefill = Some(text);
+                            }
+                        }
+                    }
                     'l' => {
                         return StorageUrl::parse(&local).with_context(|| {
                             format!("platform default storage path {local:?} does not parse")
@@ -516,6 +554,27 @@ async fn pick_storage(
             }
         }
     }
+}
+
+/// Capture an access key + hidden secret and write them as `[creds.default]`
+/// (the catch-all set) into the in-progress doc, returning the refreshed creds
+/// map for an immediate re-probe. init's one inline credential path - the
+/// secret comes from a masked prompt, never argv (spec.md#storage-redaction).
+fn capture_default_creds(doc: &mut DocumentMut) -> Result<BTreeMap<String, CredsSet>> {
+    let access_key_id: String = wiz(cliclack::input("Access key ID").interact())?;
+    let secret_access_key: String =
+        wiz(cliclack::password("Secret access key").mask('*').interact())?;
+    crate::set_creds_set(
+        doc,
+        "default",
+        &access_key_id,
+        &secret_access_key,
+        None,
+        None,
+    );
+    Ok(Config::load_str(&doc.to_string())
+        .map(|config| config.creds)
+        .unwrap_or_default())
 }
 
 /// End-to-end probe (same primitive as `pond storage check`) with a wizard
