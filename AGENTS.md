@@ -37,7 +37,7 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ## Errors
 
 - `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
-- When a command fails or detects a recoverable bad state, its output names the fix - the exact recovery command or concrete next step, not just the symptom (e.g. an incomplete index points the user at `pond sync --reindex`).
+- When a command fails or detects a recoverable bad state, its output names the fix - the exact recovery command or concrete next step, not just the symptom (e.g. an incomplete index points the user at `pond sync --only update-indexes`).
 
 ## Repo layout
 
