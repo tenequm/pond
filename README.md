@@ -136,7 +136,7 @@ pond storage use s3+https://nbg1.your-objectstorage.com/my-pond   # probe end-to
 pond storage check                                                # verify: parse, creds, conditional-put (OCC), write/read/delete
 ```
 
-`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond storage migrate --from <local> --to <url>` carries existing local data into the bucket - idempotent, and it never deletes the source. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
+`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond storage migrate --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing, so you never reconcile by hand). `pond storage verify --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
 
 ### Configuration
 

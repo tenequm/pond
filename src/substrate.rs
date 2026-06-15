@@ -14,7 +14,7 @@ use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{CompactionOptions, commit_compaction, plan_compaction};
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
-use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
+use lance::deps::arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use lance::index::DatasetIndexExt;
 use lance::index::DatasetIndexInternalExt;
 use lance::index::vector::VectorIndexParams;
@@ -1944,6 +1944,21 @@ impl Handle {
             .count_rows(None)
             .await
             .map_err(Into::into)
+    }
+    /// Collect the primary-key (`id`) set for `table`. Storage verification
+    /// compares these sets across two stores: matching row counts can still
+    /// hide divergent membership, so proving a destination is a complete
+    /// superset of a source needs the ids, not the cardinalities
+    /// (spec.md#substrate, `lance-deterministic-pk`).
+    pub async fn collect_ids(&self, table: Table) -> Result<std::collections::HashSet<String>> {
+        let batch = self.scan_batch(table, None, &["id"]).await?;
+        let ids = batch
+            .column_by_name("id")
+            .context("scan projection dropped the id column")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("id column is not Utf8")?;
+        Ok(ids.iter().flatten().map(str::to_owned).collect())
     }
     /// Names of every index on `messages` - the vector-index tests read this.
     #[cfg(test)]

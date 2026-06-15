@@ -9,6 +9,7 @@ use chrono::Utc;
 use pond::{
     handlers::ingest_events,
     sessions::{IngestEvent, OutcomeStatus, Store},
+    substrate::Table,
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -109,5 +110,52 @@ async fn migrate_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
     // And the source is untouched.
     let (src_sessions, _, _) = source.row_counts().await?;
     assert_eq!(src_sessions, 2);
+    Ok(())
+}
+
+/// The id-set comparison behind `pond storage verify` and migrate's closing
+/// check: a destination is in sync iff it is missing none of the source's
+/// per-table ids. Row counts alone can't prove this (a surplus destination
+/// matches no count), so verification keys on the deterministic ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn collect_ids_proves_destination_is_a_superset() -> anyhow::Result<()> {
+    let source = Store::open(&Url::parse("shared-memory://pond-test-verify-src/")?).await?;
+    seed(&source, "01HXYVERIFY00001").await?;
+    seed(&source, "01HXYVERIFY00002").await?;
+
+    // Before any copy: the fresh destination is missing every source id.
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-verify-dst/")?).await?;
+    let src_sessions = source.collect_ids(Table::Sessions).await?;
+    let dst_sessions = dest.collect_ids(Table::Sessions).await?;
+    assert_eq!(src_sessions.len(), 2);
+    assert!(dst_sessions.is_empty());
+    assert_eq!(src_sessions.difference(&dst_sessions).count(), 2);
+
+    // After migrate: the destination contains every source id, every table.
+    migrate(&source, &dest).await?;
+    for table in [Table::Sessions, Table::Messages, Table::Parts] {
+        let src = source.collect_ids(table).await?;
+        let dst = dest.collect_ids(table).await?;
+        assert_eq!(
+            src.difference(&dst).count(),
+            0,
+            "{} not fully contained after migrate",
+            table.as_str(),
+        );
+    }
+
+    // A destination carrying extra unrelated rows is still a valid superset -
+    // surplus ids are not "missing", so this must verify as synced.
+    let populated = Store::open(&Url::parse("shared-memory://pond-test-verify-extra/")?).await?;
+    seed(&populated, "01HXYVERIFYLOCAL").await?;
+    migrate(&source, &populated).await?;
+    let src = source.collect_ids(Table::Sessions).await?;
+    let dst = populated.collect_ids(Table::Sessions).await?;
+    assert_eq!(src.difference(&dst).count(), 0, "source fully contained");
+    assert_eq!(
+        dst.len(),
+        3,
+        "destination keeps its own row plus the source's"
+    );
     Ok(())
 }

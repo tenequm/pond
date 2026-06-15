@@ -1124,6 +1124,12 @@ impl Store {
         self.handle.row_counts().await
     }
 
+    /// The primary-key (`id`) set for `table`. Powers storage verification
+    /// (`pond storage verify` and migrate's closing check).
+    pub async fn collect_ids(&self, table: Table) -> Result<std::collections::HashSet<String>> {
+        self.handle.collect_ids(table).await
+    }
+
     /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
     /// DataFusion `LanceTableProvider` in `pond_sql_query`. Goes through the
     /// handle's freshness gate, so each query sees a current snapshot.

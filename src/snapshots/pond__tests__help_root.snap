@@ -17,7 +17,7 @@ Commands:
   serve        Run the HTTP API server (or MCP over stdio with --transport stdio)
   mcp          Serve the MCP tools over stdio (for agent clients)
   schedule     Manage the automatic sync schedule
-  storage      Inspect, probe, and switch storage destinations
+  storage      Inspect, probe, switch, copy, and verify storage destinations
   export       Export a compact restorable .pond archive
   import       Restore a .pond archive
   config       Inspect configuration

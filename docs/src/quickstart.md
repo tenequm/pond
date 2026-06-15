@@ -31,7 +31,7 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
    ```sh
    pond init                                                     # interactive, on a TTY
-   pond init -y --adapters claude-code,codex-cli --schedule 5m   # non-interactive
+   pond init -y --schedule 5m                                    # non-interactive: enables every discovered source
    ```
 
    `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)) - when that destination is remote, init prompts for credentials inline, so a bucket is one command. init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
@@ -96,7 +96,7 @@ pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-object
 pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
+Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. It rebuilds the destination's indexes and verifies every row landed before it exits, so the bucket is ready to query with no manual reconciliation; `pond storage verify --from <local> --to <url>` re-runs that membership check read-only. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
 
 ### Troubleshooting
 

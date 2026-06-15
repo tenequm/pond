@@ -26,7 +26,7 @@ use pond::{
         Store,
     },
     substrate::{
-        CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
+        self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
         OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
         default_cleanup_older_than, index_lag_threshold,
     },
@@ -562,16 +562,17 @@ enum Command {
         #[command(subcommand)]
         command: schedule::ScheduleCmd,
     },
-    /// Inspect, probe, and switch storage destinations.
+    /// Inspect, probe, switch, copy, and verify storage destinations.
     ///
     /// Bare `pond storage` shows the resolved destination, its creds
     /// binding, and per-table sizes. Subcommands probe a destination
-    /// (check), switch with guided migration (use), and copy between
-    /// destinations (migrate).
+    /// (check), switch the active destination (use), copy between
+    /// destinations (migrate), and verify a copy without moving data
+    /// (verify).
     #[command(after_long_help = "Examples:
   pond storage                                     where data lives, and how big
   pond storage check s3+https://host/bucket/pond   probe a destination end-to-end
-  pond storage use s3+https://host/bucket/pond     migrate to it and switch config")]
+  pond storage use s3+https://host/bucket/pond     probe, then switch the destination")]
     Storage {
         #[command(subcommand)]
         command: Option<StorageCmd>,
@@ -662,7 +663,8 @@ enum StorageCmd {
     ///
     /// Parse, creds resolution, conditional put (the OCC primitive Lance's
     /// commit handler relies on), read-back, delete. Exit codes: 0 ok,
-    /// 2 parse error, 3 no creds, 4 auth failed, 5 OCC unsupported.
+    /// 1 I/O error (network/DNS/bucket unreachable), 2 parse error,
+    /// 3 no creds, 4 auth failed, 5 OCC unsupported.
     #[command(after_long_help = "Examples:
   pond storage check                                  probe the configured destination
   pond storage check s3+https://host/bucket/prefix    probe a candidate before switching")]
@@ -684,14 +686,41 @@ enum StorageCmd {
         /// The new destination URL.
         url: String,
     },
-    /// Copy canonical data between two storages.
+    /// Copy canonical data between two storages, rebuild the destination's
+    /// indexes, and verify the copy landed.
     ///
     /// Idempotent union merge: re-runnable, resumable, valid onto a
-    /// populated destination. Never deletes or modifies the source. This is
-    /// the only data-copy path; `use` only switches the pointer.
+    /// populated destination. Never deletes or modifies the source. On
+    /// completion it rebuilds the destination indexes (skip with
+    /// `--skip-indexes`) so the store is queryable on exit, then compares
+    /// the `id` set of every table end to end - exit 0 only when the
+    /// destination provably contains every source row, exit 6 (naming the
+    /// short table) otherwise. This is the only data-copy path; `use` only
+    /// switches the pointer.
     #[command(after_long_help = "Examples:
   pond storage migrate --from ~/.local/share/pond --to s3://bucket/pond")]
     Migrate {
+        /// Source storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        from: StorageUrl,
+        /// Destination storage URL.
+        #[arg(long, value_parser = parse_storage_path)]
+        to: StorageUrl,
+        /// Skip the post-copy index rebuild (for very large stores you will
+        /// index later). The copy and verify still run; build indexes after
+        /// with `pond sync --only update-indexes --storage-path <to>`.
+        #[arg(long)]
+        skip_indexes: bool,
+    },
+    /// Verify a destination fully contains a source, without copying.
+    ///
+    /// Read-only. Compares the `id` set of every table between the two
+    /// storages and reports whether the destination is a complete superset
+    /// of the source. Exit codes: 0 synced, 6 destination missing source
+    /// rows. Confirms two stores are in sync without running `migrate`.
+    #[command(after_long_help = "Examples:
+  pond storage verify --from ~/.local/share/pond --to s3+https://host/bucket/pond")]
+    Verify {
         /// Source storage URL.
         #[arg(long, value_parser = parse_storage_path)]
         from: StorageUrl,
@@ -1524,37 +1553,14 @@ async fn run_storage_command(
         Some(StorageCmd::Creds { command }) => {
             run_storage_creds(command, &config_file, &loaded)?;
         }
-        Some(StorageCmd::Migrate { from, to }) => {
-            let from_resolved = from.resolve(&loaded.creds)?;
-            let to_resolved = to.resolve(&loaded.creds)?;
-            warn_unmatched_sets(&[&from_resolved, &to_resolved], &loaded)?;
-            // Per-URL binding lines before any work: a wrong scope match must
-            // be visible immediately, not after an auth error.
+        Some(StorageCmd::Migrate {
+            from,
+            to,
+            skip_indexes,
+        }) => {
             let dim = pond::output::dim();
-            output(&format!(
-                "{} {}  {}",
-                pond::output::paint("from:", dim),
-                from_resolved.display(),
-                pond::output::paint(&format!("[{}]", from_resolved.binding.describe()), dim),
-            ))?;
-            output(&format!(
-                "{}   {}  {}",
-                pond::output::paint("to:", dim),
-                to_resolved.display(),
-                pond::output::paint(&format!("[{}]", to_resolved.binding.describe()), dim),
-            ))?;
-            let from_store = Store::open_with_options(
-                from_resolved.lance_url(),
-                from_resolved.options.clone(),
-                runtime_caps(&loaded),
-            )
-            .await?;
-            let to_store = Store::open_with_options(
-                to_resolved.lance_url(),
-                to_resolved.options.clone(),
-                runtime_caps(&loaded),
-            )
-            .await?;
+            let (from_resolved, from_store, to_resolved, to_store) =
+                resolve_and_open_pair(&from, &to, &loaded).await?;
             let imported = migrate_between_stores(&from_store, &to_store).await?;
             output(&format!(
                 "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
@@ -1566,11 +1572,43 @@ async fn run_storage_command(
                 imported.inserted.messages,
                 imported.inserted.parts,
             ))?;
+            // Make migrate self-contained: the clean export strips indexes, so
+            // rebuild them here (embeddings rode along as data columns - this
+            // is index-build only, no re-embed) and the destination is
+            // queryable on exit, not after a separate `pond sync`.
+            // spec.md#lance-index-maintenance.
+            if skip_indexes {
+                output(&format!(
+                    "{} indexes not rebuilt (--skip-indexes); run `pond sync --only update-indexes --storage-path {}` before querying",
+                    pond::output::paint("hint", dim),
+                    to_resolved.display(),
+                ))?;
+            } else {
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                run_update_indexes_stage(&to_store, &policy).await?;
+                output(&format!(
+                    "{} rebuilt text + semantic on destination",
+                    pond::output::paint("indexes:", dim),
+                ))?;
+            }
+            // Prove the copy landed by comparing id-sets, not row counts: the
+            // source is never modified, so the user never reconciles by hand.
+            let verify = verify_stores(&from_store, &to_store).await?;
+            if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+                std::process::exit(6);
+            }
             output(&format!(
-                "{} the source was not modified; run `pond sync --only update-indexes --storage-path {}` to build destination indexes",
-                pond::output::paint("hint", dim),
-                to_resolved.display(),
+                "{} destination is ready to query",
+                pond::output::paint("done -", dim),
             ))?;
+        }
+        Some(StorageCmd::Verify { from, to }) => {
+            let (from_resolved, from_store, to_resolved, to_store) =
+                resolve_and_open_pair(&from, &to, &loaded).await?;
+            let verify = verify_stores(&from_store, &to_store).await?;
+            if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+                std::process::exit(6);
+            }
         }
     }
     Ok(())
@@ -2119,6 +2157,150 @@ async fn migrate_between_stores(from: &Store, to: &Store) -> anyhow::Result<Lanc
     let imported = to.import_clean_lance_datasets(&data_dir).await;
     spinner.finish_and_clear();
     imported
+}
+
+/// Resolve both URLs against the loaded creds, print the from/to binding
+/// lines (a wrong scope match must surface before any work, not after an auth
+/// error), and open both stores. Shared by `migrate` and `verify`.
+async fn resolve_and_open_pair(
+    from: &StorageUrl,
+    to: &StorageUrl,
+    loaded: &Config,
+) -> anyhow::Result<(ResolvedStorage, Store, ResolvedStorage, Store)> {
+    let from_resolved = from.resolve(&loaded.creds)?;
+    let to_resolved = to.resolve(&loaded.creds)?;
+    warn_unmatched_sets(&[&from_resolved, &to_resolved], loaded)?;
+    let dim = pond::output::dim();
+    output(&format!(
+        "{} {}  {}",
+        pond::output::paint("from:", dim),
+        from_resolved.display(),
+        pond::output::paint(&format!("[{}]", from_resolved.binding.describe()), dim),
+    ))?;
+    output(&format!(
+        "{}   {}  {}",
+        pond::output::paint("to:", dim),
+        to_resolved.display(),
+        pond::output::paint(&format!("[{}]", to_resolved.binding.describe()), dim),
+    ))?;
+    let from_store = Store::open_with_options(
+        from_resolved.lance_url(),
+        from_resolved.options.clone(),
+        runtime_caps(loaded),
+    )
+    .await?;
+    let to_store = Store::open_with_options(
+        to_resolved.lance_url(),
+        to_resolved.options.clone(),
+        runtime_caps(loaded),
+    )
+    .await?;
+    Ok((from_resolved, from_store, to_resolved, to_store))
+}
+
+/// Per-table membership: `missing` = source ids absent from the destination,
+/// the count that must be zero for the destination to fully contain the
+/// source. A destination may legitimately hold more (migrate never deletes),
+/// so a surplus is not a failure and is not surfaced.
+struct TableVerify {
+    table: substrate::Table,
+    source_rows: usize,
+    missing: usize,
+}
+
+struct StorageVerify {
+    tables: Vec<TableVerify>,
+}
+
+impl StorageVerify {
+    fn synced(&self) -> bool {
+        self.tables.iter().all(|t| t.missing == 0)
+    }
+    fn total_missing(&self) -> usize {
+        self.tables.iter().map(|t| t.missing).sum()
+    }
+    fn total_source_rows(&self) -> usize {
+        self.tables.iter().map(|t| t.source_rows).sum()
+    }
+}
+
+/// Compare the `id` set of every table across two stores - read-only on both
+/// sides. Matching row counts can hide divergent membership, so verification
+/// keys on the deterministic per-row id, not the cardinalities. Drives
+/// `pond storage migrate`'s closing check and the standalone `pond storage
+/// verify`.
+async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify> {
+    use substrate::Table;
+    let mut tables = Vec::with_capacity(3);
+    for table in [Table::Sessions, Table::Messages, Table::Parts] {
+        let (source_ids, dest_ids) =
+            tokio::try_join!(from.collect_ids(table), to.collect_ids(table))?;
+        tables.push(TableVerify {
+            table,
+            source_rows: source_ids.len(),
+            missing: source_ids.difference(&dest_ids).count(),
+        });
+    }
+    Ok(StorageVerify { tables })
+}
+
+/// One-line SYNCED / FAILED verdict so the user never guesses whether a copy
+/// fully landed. On failure it names the short tables and the exact
+/// idempotent re-run. Returns whether the destination is in sync.
+fn render_storage_verify(
+    verify: &StorageVerify,
+    from_display: &str,
+    to_display: &str,
+) -> anyhow::Result<bool> {
+    use pond::output::{dim, paint};
+    if verify.synced() {
+        let detail = verify
+            .tables
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} {}",
+                    t.table.as_str(),
+                    format_thousands(t.source_rows as u64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        output(&format!(
+            "{} SYNCED - destination contains all {} source rows ({})",
+            paint("verify:", dim()),
+            format_thousands(verify.total_source_rows() as u64),
+            detail,
+        ))?;
+        Ok(true)
+    } else {
+        let short = verify
+            .tables
+            .iter()
+            .filter(|t| t.missing > 0)
+            .map(|t| {
+                format!(
+                    "{} {}",
+                    t.table.as_str(),
+                    format_thousands(t.missing as u64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        output_err(&format!(
+            "{} FAILED - {} source rows missing from destination ({})",
+            paint("verify:", dim()),
+            format_thousands(verify.total_missing() as u64),
+            short,
+        ))?;
+        output_err(&paint(
+            &format!(
+                "  fix: re-run `pond storage migrate --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
+            ),
+            dim(),
+        ))?;
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Default)]
