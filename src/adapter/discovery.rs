@@ -205,71 +205,6 @@ pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result
     Ok(())
 }
 
-/// Outcome of a per-adapter `Confirm` prompt during `pond sync`. `enable`
-/// is the answer to "should this adapter be enabled?"; `sync_now` is the
-/// follow-up "should we sync it this run?" (only meaningful when
-/// `enable == true`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptOutcome {
-    pub candidate: Candidate,
-    pub enable: bool,
-    pub sync_now: bool,
-}
-
-/// Prompt the operator about each freshly-detected unconfigured adapter:
-/// "Enable X?" and, on accept, "Sync X now?". When `auto_accept` is true
-/// (the operator passed `--yes`) every prompt is skipped and answered
-/// yes/yes. Returns the per-adapter outcomes.
-pub fn prompt_each(
-    candidates: &[Candidate],
-    auto_accept: bool,
-) -> anyhow::Result<Vec<PromptOutcome>> {
-    let mut out = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let label = if candidate.hint.is_empty() {
-            candidate.name.clone()
-        } else {
-            format!("{} ({})", candidate.name, candidate.hint)
-        };
-        let (enable, sync_now) = if auto_accept {
-            (true, true)
-        } else {
-            let enable = cliclack::confirm(format!("Enable {label}?"))
-                .initial_value(true)
-                .interact()
-                .context("enable prompt failed")?;
-            let sync_now = if enable {
-                cliclack::confirm(format!("Sync {} now?", candidate.name))
-                    .initial_value(true)
-                    .interact()
-                    .context("sync-now prompt failed")?
-            } else {
-                false
-            };
-            (enable, sync_now)
-        };
-        out.push(PromptOutcome {
-            candidate: candidate.clone(),
-            enable,
-            sync_now,
-        });
-    }
-    Ok(out)
-}
-
-/// Persist `[sources.<name>] enabled = false` for adapters the operator
-/// declined during a probe prompt. Keeps the decline sticky across runs.
-pub fn persist_decline(config_path: &Path, names: &[&str]) -> anyhow::Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let mut doc = open_or_init(config_path)?;
-    apply_to_doc(&mut doc, &[], names)?;
-    std::fs::write(config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
-}
-
 /// Flip `[sources.<name>].enabled` on an already-configured source. Returns
 /// `false` (writing nothing) when the section is absent - the caller decides
 /// whether to discover it first. Backs `pond sources enable|disable`.
@@ -419,17 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn persist_accept_and_decline_write_enabled_first() {
-        let temp = TempDir::new().unwrap();
-        let config_path = temp.path().join("config.toml");
+    fn apply_to_doc_writes_enabled_first_for_accepts_and_declines() {
         let accept = Candidate {
             name: "claude-code".to_owned(),
             hint: "/tmp/cc".to_owned(),
             config: json!({ "path": "/tmp/cc" }),
         };
-        persist_accept(&config_path, &[accept]).unwrap();
-        persist_decline(&config_path, &["opencode"]).unwrap();
-        let body = std::fs::read_to_string(&config_path).unwrap();
+        let mut doc = DocumentMut::new();
+        apply_to_doc(&mut doc, &[accept], &["opencode"]).unwrap();
+        let body = doc.to_string();
         // Accepted entry: discriminator on top, then the blob.
         assert!(
             body.contains("[sources.claude-code]")

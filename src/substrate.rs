@@ -658,7 +658,7 @@ fn strip_one_newline(mut text: String) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     #[error(
-        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials"
+        "authentication failed and no creds set matched this URL; add one with `pond storage creds add` (or set POND_CREDS_*), or provide ambient AWS_* credentials"
     )]
     NoCreds { source: anyhow::Error },
     #[error("authentication failed using creds set {set:?}; check its keys and scope")]
