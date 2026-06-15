@@ -369,6 +369,16 @@ pub struct CredsSet {
     pub extra: BTreeMap<String, String>,
 }
 
+/// `[creds.<name>]` name charset `[a-z][a-z0-9]{0,15}` (spec.md#storage-env-mirror):
+/// lowercase-alphanumeric keeps `POND_CREDS_<NAME>_<FIELD>` splittable at the
+/// first `_` after the name. Shared by config validation and `pond storage creds`.
+pub fn valid_creds_set_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && name.len() <= 16
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
 /// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
 /// optional - `None` lets `pond::substrate` pick the backend-aware default
@@ -541,15 +551,7 @@ impl Config {
         let mut scopeless: Option<&str> = None;
         let mut scopes: BTreeMap<String, &str> = BTreeMap::new();
         for (name, set) in &self.creds {
-            // Lowercase alphanumeric only - load-bearing for the env mirror:
-            // it makes `POND_CREDS_<NAME>_<FIELD>` splittable at the first
-            // `_` after the name (field names contain underscores).
-            let mut chars = name.chars();
-            let head_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-            if !head_ok
-                || name.len() > 16
-                || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            {
+            if !valid_creds_set_name(name) {
                 bail!(
                     "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
                 );
@@ -1129,6 +1131,16 @@ extra = { request_timeout = "60 seconds" }
             }
             Ok(())
         });
+    }
+
+    #[test]
+    fn valid_creds_set_name_matches_env_mirror_charset() {
+        for ok in ["default", "work", "work2", "a", "abcdefghij123456"] {
+            assert!(valid_creds_set_name(ok), "{ok:?} should be valid");
+        }
+        for bad in ["", "Work", "my_set", "2fast", "abcdefghij1234567", "set-1"] {
+            assert!(!valid_creds_set_name(bad), "{bad:?} should be invalid");
+        }
     }
 
     #[test]

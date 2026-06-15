@@ -51,7 +51,14 @@ pond runs hybrid search across every session from every client - including sessi
 
 ## Remote storage
 
-By default pond stores its data locally (under `$XDG_DATA_HOME/pond`). To put it on an object store instead, set one URL and one credential set in `config.toml`:
+By default pond stores its data locally (under `$XDG_DATA_HOME/pond`). To put it on an object store instead, add a credential set, then switch the destination:
+
+```sh
+pond storage creds add        # interactive: set name (default), access key, hidden secret
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+`creds add` writes a `[creds.<name>]` block to `config.toml`; `use` probes the destination end-to-end and flips `[storage].path` to it. The result is just config you could also write by hand:
 
 ```toml
 [storage]
@@ -71,13 +78,16 @@ pond config show     # resolved config: redacted values, where each came from
 
 Everything also works with no config file at all - `POND_STORAGE_PATH` plus `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAULT_SECRET_ACCESS_KEY` is a complete configuration (handy for containers and CI).
 
-Several machines can share one bucket: give each the same `config.toml` and run `pond sync` from cron on each. Concurrent writers are safe - Lance's optimistic concurrency control serializes commits through the object store's conditional writes. To move an existing local pond into the bucket:
+Several machines can share one bucket: give each the same `config.toml` and run `pond sync` from cron on each. Concurrent writers are safe - Lance's optimistic concurrency control serializes commits through the object store's conditional writes.
+
+`use` only switches the pointer; it never moves data. To carry your existing local sessions into the bucket, copy them first, then switch:
 
 ```sh
 pond storage migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes the source.
+Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
 
 ### Troubleshooting
 

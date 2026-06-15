@@ -679,34 +679,25 @@ enum StorageCmd {
         /// Destination URL. Defaults to the configured storage path.
         url: Option<String>,
     },
-    /// Switch the configured destination, with guided migration.
+    /// Switch the configured destination. Moves no data.
     ///
-    /// Probes the destination first, offers to copy existing data, verifies
-    /// row counts reconcile, and only then updates `[storage].path` in
-    /// config.toml. The previous destination is never modified.
+    /// Probes the destination end-to-end, then flips `[storage].path` in
+    /// config.toml. Nothing is copied: switching to a different storage, or
+    /// rolling back to a previous one, is a pointer change that leaves every
+    /// store untouched. To copy data into a destination, run `pond storage
+    /// migrate` first - it is always a separate, explicit step.
     #[command(after_long_help = "Examples:
-  pond storage use s3+https://host/bucket/pond      probe, offer migration, switch
-  pond storage use ~/pond-data --migrate -y         non-interactive: copy, verify, switch
-  pond storage use s3://bucket/pond --no-migrate    switch without copying")]
+  pond storage use s3+https://host/bucket/pond      probe, then switch the active destination
+  pond storage use ~/.local/share/pond              roll back to a previous (local) destination")]
     Use {
         /// The new destination URL.
         url: String,
-        /// Copy existing data to the destination before switching.
-        #[arg(long, conflicts_with = "no_migrate")]
-        migrate: bool,
-        /// Switch without copying existing data.
-        #[arg(long)]
-        no_migrate: bool,
-        /// Skip the confirmation prompt (copies data unless --no-migrate).
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
     /// Copy canonical data between two storages.
     ///
     /// Idempotent union merge: re-runnable, resumable, valid onto a
-    /// populated destination. Never deletes the source. `pond storage use`
-    /// wraps this with a config switch; reach for migrate directly for
-    /// one-off copies.
+    /// populated destination. Never deletes or modifies the source. This is
+    /// the only data-copy path; `use` only switches the pointer.
     #[command(after_long_help = "Examples:
   pond storage migrate --from ~/.local/share/pond --to s3://bucket/pond")]
     Migrate {
@@ -716,6 +707,43 @@ enum StorageCmd {
         /// Destination storage URL.
         #[arg(long, value_parser = parse_storage_path)]
         to: StorageUrl,
+    },
+    /// Manage URL-scoped credential sets in config.toml.
+    ///
+    /// `add` captures a set's keys (secret via hidden prompt) and writes
+    /// `[creds.<name>]`; `list` shows configured sets with secrets redacted;
+    /// `delete` removes one. Sets bind to storage URLs by scope match, never
+    /// by activation (spec.md#creds-scope-match) - there is no "current" set.
+    #[command(after_long_help = "Examples:
+  pond storage creds add                            interactive: name (default), key, hidden secret
+  pond storage creds add work --scope s3+https://host/work
+  pond storage creds list
+  pond storage creds delete work")]
+    Creds {
+        #[command(subcommand)]
+        command: CredsCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CredsCmd {
+    /// Add or replace a credential set (secret captured via a hidden prompt).
+    Add {
+        /// Set name. Omit to be prompted, with `default` as the default.
+        name: Option<String>,
+        /// Bind only to URLs under this prefix. Omit for the catch-all set.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Region override (S3-compatible stores ignore the SigV4 region).
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// List configured credential sets (secrets redacted).
+    List,
+    /// Remove a credential set.
+    Delete {
+        /// Name of the set to remove.
+        name: String,
     },
 }
 
@@ -1671,22 +1699,11 @@ async fn run_storage_command(
                 }
             }
         }
-        Some(StorageCmd::Use {
-            url,
-            migrate,
-            no_migrate,
-            yes,
-        }) => {
-            run_storage_use(
-                &loaded,
-                &config_file,
-                storage_path,
-                &url,
-                migrate,
-                no_migrate,
-                yes,
-            )
-            .await?;
+        Some(StorageCmd::Use { url }) => {
+            run_storage_use(&loaded, &config_file, storage_path, &url).await?;
+        }
+        Some(StorageCmd::Creds { command }) => {
+            run_storage_creds(command, &config_file, &loaded)?;
         }
         Some(StorageCmd::Migrate { from, to }) => {
             let from_resolved = from.resolve(&loaded.creds)?;
@@ -1769,18 +1786,15 @@ fn set_storage_path(doc: &mut toml_edit::DocumentMut, path_value: &str) {
     }
 }
 
-/// `pond storage use`: validate-then-activate. The destination is probed
-/// end-to-end and (optionally) populated + verified BEFORE `[storage].path`
-/// flips, so a typo or auth failure can never strand the config pointing at
-/// a broken destination.
+/// `pond storage use`: switch-only. Probe the destination end-to-end, then flip
+/// `[storage].path`. It copies nothing - moving data into a destination is
+/// `pond storage migrate`, always a separate explicit step - so switching
+/// stores, or rolling back to a previous one, never touches any store's data.
 async fn run_storage_use(
     loaded: &Config,
     config_file: &Path,
     storage_path: Option<StorageUrl>,
     url: &str,
-    migrate: bool,
-    no_migrate: bool,
-    yes: bool,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
@@ -1799,7 +1813,8 @@ async fn run_storage_use(
     ))?;
     warn_unmatched_sets(&[&dest_resolved], loaded)?;
 
-    // 1. End-to-end probe first - same classes and exit codes as `check`.
+    // Probe before any config change - same exit codes as `check`, so a typo or
+    // auth failure can never strand the config pointing at a broken destination.
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.green} probing destination... [{elapsed_precise}]")
@@ -1817,7 +1832,6 @@ async fn run_storage_use(
     }
     output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
 
-    // 2. Offer to copy existing data before the switch.
     let current = resolve_storage_location(storage_path, loaded)?;
     let already_configured = loaded.storage.path.as_deref() == Some(dest.canonical().as_str())
         || loaded.storage.path.as_deref().is_some_and(|path| {
@@ -1833,100 +1847,268 @@ async fn run_storage_use(
         ))?;
         return Ok(());
     }
-    let current_resolved = current.resolve(&loaded.creds)?;
-    let from_store = Store::open_with_options(
-        current_resolved.lance_url(),
-        current_resolved.options.clone(),
-        runtime_caps(loaded),
-    )
-    .await?;
-    let from_totals = from_store.corpus_stats(false).await?.totals;
-    if from_totals.sessions > 0 && !no_migrate {
-        let copy = if migrate || yes {
-            true
-        } else if io::stdin().is_terminal() {
-            cliclack::confirm(format!(
-                "Copy existing data ({} sessions) from {} first?",
-                format_thousands(from_totals.sessions),
-                current.display(),
-            ))
-            .initial_value(true)
-            .interact()
-            .context("migration prompt failed")?
-        } else {
-            bail!(
-                "current storage has data and stdin is not a terminal; pass --migrate to copy it or --no-migrate to switch without copying"
-            );
-        };
-        if copy {
-            let to_store = Store::open_with_options(
-                dest_resolved.lance_url(),
-                dest_resolved.options.clone(),
-                runtime_caps(loaded),
-            )
-            .await?;
-            let imported = migrate_between_stores(&from_store, &to_store).await?;
-            output(&format!(
-                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
-                paint("migrate:", dim()),
-                imported.rows.sessions,
-                imported.rows.messages,
-                imported.rows.parts,
-                imported.inserted.sessions,
-                imported.inserted.messages,
-                imported.inserted.parts,
-            ))?;
-            let policy = configured_maintenance_policy(loaded, None)?;
-            run_update_indexes_stage(&to_store, &policy).await?;
-            // 3. Verify the copy reconciles BEFORE flipping config.
-            let dest_totals = to_store.corpus_stats(false).await?.totals;
-            if dest_totals.sessions < from_totals.sessions
-                || dest_totals.messages < from_totals.messages
-                || dest_totals.parts < from_totals.parts
-            {
-                bail!(
-                    "destination row counts do not reconcile (source {}/{}/{} vs destination {}/{}/{} sessions/messages/parts); config not changed - rerun `pond storage use` to retry the copy",
-                    from_totals.sessions,
-                    from_totals.messages,
-                    from_totals.parts,
-                    dest_totals.sessions,
-                    dest_totals.messages,
-                    dest_totals.parts,
-                );
-            }
-        }
-    }
 
-    // 4. Flip `[storage].path`, preserving the rest of the file verbatim.
-    let existing = if config_file.exists() {
-        fs::read_to_string(config_file)
-            .with_context(|| format!("failed to read {}", config_file.display()))?
-    } else {
-        String::new()
-    };
-    let mut doc: toml_edit::DocumentMut = existing
-        .parse()
-        .with_context(|| format!("failed to parse {} as TOML", config_file.display()))?;
+    let mut doc = read_config_doc(config_file)?;
     let path_value = storage_config_value(&dest);
     set_storage_path(&mut doc, &path_value);
-    if let Some(parent) = config_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(config_file, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_file.display()))?;
+    write_config_doc(config_file, &doc)?;
     output(&format!(
         "{} [storage].path = {} written to {}",
         paint("use:", dim()),
         path_value,
         config::display(&config::url_for_path(config_file)?),
     ))?;
+    // `use` reads no store but the destination probe above - so it names the
+    // explicit copy step with both URLs filled in, rather than counting rows to
+    // guess whether a copy is wanted. Moving the old data over is one paste away.
     output(&format!(
-        "{} previous data at {} is untouched; verify with `pond storage check` and `pond status`",
+        "{} previous data at {} is untouched; copy it over with `pond storage migrate --from {} --to {}`",
         paint("hint", dim()),
         current.display(),
+        current.display(),
+        dest.display(),
     ))?;
     Ok(())
+}
+
+/// Read `config_file` into an editable TOML document, preserving formatting and
+/// comments; an absent file parses as empty.
+fn read_config_doc(config_file: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let existing = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .with_context(|| format!("failed to read {}", config_file.display()))?
+    } else {
+        String::new()
+    };
+    existing
+        .parse()
+        .with_context(|| format!("failed to parse {} as TOML", config_file.display()))
+}
+
+/// Write an edited TOML document back to `config_file`, creating its directory.
+fn write_config_doc(config_file: &Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(config_file, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_file.display()))
+}
+
+/// `pond storage creds {add,list,delete}`: manage the `[creds.<name>]` sets in
+/// config.toml. Sets bind to URLs by scope match, never activation - there is
+/// no "current" set to select (spec.md#creds-scope-match).
+fn run_storage_creds(command: CredsCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+    match command {
+        CredsCmd::Add {
+            name,
+            scope,
+            region,
+        } => creds_add(config_file, name, scope, region),
+        CredsCmd::List => creds_list(loaded),
+        CredsCmd::Delete { name } => creds_delete(config_file, name),
+    }
+}
+
+fn creds_add(
+    config_file: &Path,
+    name: Option<String>,
+    scope: Option<String>,
+    region: Option<String>,
+) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+
+    // The secret is captured via a hidden prompt, which needs a real terminal.
+    // Non-interactive callers use POND_CREDS_<NAME>_* or a hand-written set.
+    if !io::stdin().is_terminal() {
+        bail!(
+            "`pond storage creds add` needs a terminal for hidden secret entry; in non-interactive runs set POND_CREDS_<NAME>_ACCESS_KEY_ID / POND_CREDS_<NAME>_SECRET_ACCESS_KEY or add [creds.<name>] to config.toml"
+        );
+    }
+
+    let name = match name {
+        Some(name) => name,
+        None => cliclack::input("Credential set name")
+            .default_input("default")
+            .interact()
+            .context("credential prompt failed; nothing written")?,
+    };
+    if !config::valid_creds_set_name(&name) {
+        bail!(
+            "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
+        );
+    }
+
+    // Replacing an existing set (rotating keys) is legitimate, but it overwrites
+    // a stored secret - gate it on an explicit confirm, never a silent clobber.
+    // Checked against the file, since only a file-defined set is what `add`
+    // overwrites; confirm before prompting for keys so a decline costs nothing.
+    let mut doc = read_config_doc(config_file)?;
+    let exists = doc
+        .get("creds")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|creds| creds.contains_key(&name));
+    if exists
+        && !cliclack::confirm(format!("Replace existing credential set [creds.{name}]?"))
+            .initial_value(false)
+            .interact()
+            .context("credential prompt failed; nothing written")?
+    {
+        output(&format!(
+            "{} kept existing [creds.{}]; nothing written",
+            paint("creds:", dim()),
+            name,
+        ))?;
+        return Ok(());
+    }
+
+    let access_key_id: String = cliclack::input("Access key ID")
+        .interact()
+        .context("credential prompt failed; nothing written")?;
+    let secret_access_key: String = cliclack::password("Secret access key")
+        .mask('*')
+        .interact()
+        .context("credential prompt failed; nothing written")?;
+
+    // Build and validate the result in memory; only a config that parses and
+    // passes the [creds.*] structural rules is written, so a bad set can't land.
+    set_creds_set(
+        &mut doc,
+        &name,
+        &access_key_id,
+        &secret_access_key,
+        scope.as_deref(),
+        region.as_deref(),
+    );
+    Config::load_str(&doc.to_string())
+        .context("the resulting config would be invalid; nothing written")?;
+    write_config_doc(config_file, &doc)?;
+
+    output(&format!(
+        "{} [creds.{}] written to {} (secret redacted)",
+        paint("creds:", dim()),
+        name,
+        config::display(&config::url_for_path(config_file)?),
+    ))?;
+    output(&format!(
+        "{} verify it binds with `pond storage check <url>`",
+        paint("hint", dim()),
+    ))?;
+    Ok(())
+}
+
+fn creds_list(loaded: &Config) -> anyhow::Result<()> {
+    if loaded.creds.is_empty() {
+        output(
+            "no credential sets configured - add one with `pond storage creds add`, or set POND_CREDS_<NAME>_* in the environment",
+        )?;
+        return Ok(());
+    }
+    let mut table = new_table();
+    table.set_header(vec!["set", "scope", "access key", "secret", "region"]);
+    for (name, set) in &loaded.creds {
+        let scope = set
+            .scope
+            .clone()
+            .unwrap_or_else(|| "(catch-all)".to_owned());
+        let access = match (&set.access_key_id, &set.access_key_id_file) {
+            (Some(_), _) => "********".to_owned(),
+            (None, Some(path)) => format!("file:{}", path.display()),
+            (None, None) => "-".to_owned(),
+        };
+        let secret = if set.secret_access_key.is_some() {
+            "********".to_owned()
+        } else if let Some(path) = &set.secret_access_key_file {
+            format!("file:{}", path.display())
+        } else if let Some(command) = &set.secret_access_key_command {
+            format!("command:{command}")
+        } else {
+            "-".to_owned()
+        };
+        let region = set.region.clone().unwrap_or_else(|| "-".to_owned());
+        table.add_row(vec![name.clone(), scope, access, secret, region]);
+    }
+    output(&table.to_string())?;
+    Ok(())
+}
+
+fn creds_delete(config_file: &Path, name: String) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+
+    let mut doc = read_config_doc(config_file)?;
+    let removed = doc
+        .get_mut("creds")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .is_some_and(|creds| creds.remove(&name).is_some());
+    if !removed {
+        bail!(
+            "no [creds.{name}] set in {}",
+            config::display(&config::url_for_path(config_file)?)
+        );
+    }
+    if doc
+        .get("creds")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(toml_edit::TableLike::is_empty)
+    {
+        doc.remove("creds");
+    }
+    write_config_doc(config_file, &doc)?;
+    output(&format!(
+        "{} [creds.{}] removed",
+        paint("creds:", dim()),
+        name
+    ))?;
+
+    // Rotation must never silently strand the default store: if removing the
+    // set leaves the active storage URL matching nothing, say so.
+    if let Ok(reloaded) = Config::load(config_file)
+        && let Some(path) = reloaded.storage.path.as_deref()
+        && let Ok(url) = StorageUrl::parse(path)
+        && let Ok(resolved) = url.resolve(&reloaded.creds)
+        && matches!(resolved.binding, CredsBinding::Ambient)
+    {
+        output(&format!(
+            "{} active storage {} now matches no creds set; it will fall back to the ambient cloud chain",
+            paint("note:", dim()),
+            url.display(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Write `[creds.<name>]` into `doc`, replacing any existing set of that name.
+/// Only the captured fields are emitted; `scope`/`region` only when provided.
+fn set_creds_set(
+    doc: &mut toml_edit::DocumentMut,
+    name: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    scope: Option<&str>,
+    region: Option<&str>,
+) {
+    use toml_edit::{Item, Table, value};
+    let mut set = Table::new();
+    if let Some(scope) = scope {
+        set.insert("scope", value(scope));
+    }
+    set.insert("access_key_id", value(access_key_id));
+    set.insert("secret_access_key", value(secret_access_key));
+    if let Some(region) = region {
+        set.insert("region", value(region));
+    }
+    match doc.get_mut("creds").and_then(Item::as_table_like_mut) {
+        Some(creds) => {
+            creds.insert(name, Item::Table(set));
+        }
+        None => {
+            let mut parent = Table::new();
+            // Implicit so the file renders `[creds.<name>]`, not a bare `[creds]`.
+            parent.set_implicit(true);
+            parent.insert(name, Item::Table(set));
+            doc.insert("creds", Item::Table(parent));
+        }
+    }
 }
 
 /// Map a figment provenance lookup onto the source column vocabulary.
@@ -3741,6 +3923,58 @@ mod tests {
         // The canonical clap derive self-check: catches conflicting flags,
         // broken groups, and missing value parsers at test time.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn set_creds_set_round_trips_through_config() {
+        let mut doc: toml_edit::DocumentMut =
+            "[storage]\npath = \"/tmp/p\"\n".parse().expect("parse");
+        set_creds_set(&mut doc, "default", "AKIA", "shh", None, None);
+        set_creds_set(
+            &mut doc,
+            "work",
+            "AKIB",
+            "shh2",
+            Some("s3+https://host/work"),
+            Some("fsn1"),
+        );
+        let config = Config::load_str(&doc.to_string()).expect("valid config");
+        let default = &config.creds["default"];
+        assert_eq!(default.access_key_id.as_deref(), Some("AKIA"));
+        assert_eq!(default.secret_access_key.as_deref(), Some("shh"));
+        assert!(default.scope.is_none());
+        let work = &config.creds["work"];
+        assert_eq!(work.scope.as_deref(), Some("s3+https://host/work"));
+        assert_eq!(work.region.as_deref(), Some("fsn1"));
+
+        // Re-adding a name replaces in place; the single catch-all is preserved.
+        set_creds_set(&mut doc, "default", "AKIC", "shh3", None, None);
+        let config = Config::load_str(&doc.to_string()).expect("valid after replace");
+        assert_eq!(config.creds.len(), 2);
+        assert_eq!(
+            config.creds["default"].access_key_id.as_deref(),
+            Some("AKIC")
+        );
+    }
+
+    #[test]
+    fn creds_delete_removes_set_drops_empty_parent_and_errors_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_file = dir.path().join("config.toml");
+        let mut doc: toml_edit::DocumentMut = String::new().parse().expect("parse empty");
+        set_creds_set(&mut doc, "default", "AKIA", "shh", None, None);
+        write_config_doc(&config_file, &doc).expect("write");
+
+        assert!(
+            creds_delete(&config_file, "missing".to_owned()).is_err(),
+            "deleting an absent set must error"
+        );
+        creds_delete(&config_file, "default".to_owned()).expect("delete present set");
+        let body = std::fs::read_to_string(&config_file).expect("read back");
+        assert!(
+            !body.contains("creds"),
+            "emptied [creds] parent removed: {body:?}"
+        );
     }
 
     // Long-help snapshots for the root and every visible subcommand. The
