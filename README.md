@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/tenequm/pond/ci.yml?branch=main&style=flat-square)](https://github.com/tenequm/pond/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/pond-db.svg?style=flat-square)](https://crates.io/crates/pond-db)
-[![docs](https://img.shields.io/badge/docs-pond.cascade.fyi-blue?style=flat-square)](https://pond.cascade.fyi/)
+[![docs](https://img.shields.io/badge/docs-pond.locker-blue?style=flat-square)](https://pond.locker/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
 Lossless storage and hybrid search for AI agent sessions, across every agentic client.
@@ -33,7 +33,7 @@ Current automatically synced agent clients:
 
 You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --path <path>`.
 
-Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.cascade.fyi](https://pond.cascade.fyi/); the contract is [`docs/spec.md`](docs/spec.md).
+Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
 
 ## Background
 
@@ -136,7 +136,7 @@ pond storage use s3+https://nbg1.your-objectstorage.com/my-pond   # probe end-to
 pond storage check                                                # verify: parse, creds, conditional-put (OCC), write/read/delete
 ```
 
-`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond copy --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing, so you never reconcile by hand). `pond copy --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
+`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond copy --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing, so you never reconcile by hand). `pond copy --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.locker](https://pond.locker/).
 
 ### Configuration
 
