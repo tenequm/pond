@@ -669,8 +669,10 @@ enum Command {
     /// pond store URL - `local` is the local default dir, `@` is your configured
     /// store (the one every other command uses). Store-to-store copies are an
     /// idempotent union merge (`lance-deterministic-pk` + merge-insert):
-    /// re-runnable, resumable, valid onto a populated destination, never deletes
-    /// or modifies the source; they rebuild the destination indexes, verify
+    /// re-runnable, resumable, incremental (a re-run transfers only the sessions
+    /// absent or grown on the destination), valid onto a populated destination,
+    /// never deletes or modifies the source; they rebuild the destination
+    /// indexes, verify
     /// every row landed, and exit 6 if any are missing. `--verify-only` runs
     /// just the read-only membership check (store-to-store only). This is the
     /// durable-corpus copy path, distinct from `pond sync` which re-reads your

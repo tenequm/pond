@@ -1,6 +1,6 @@
 //! `pond copy` store-to-store data path (spec.md#session-durable-copy): plan an
 //! incremental delta (sessions absent or grown on the destination, by the
-//! per-session message-timestamp key), then stream only that delta straight
+//! per-session message-count key), then stream only that delta straight
 //! into the destination merge - no staging copy. The properties under test are
 //! the plan's contract: round-trip, rerun-is-a-no-op, union onto a populated
 //! destination, and that a second copy moves only what actually changed - all
@@ -68,7 +68,7 @@ async fn seed(store: &Store, session_id: &str) -> anyhow::Result<()> {
 
 /// Run the store-to-store copy once: plan the incremental delta, then stream
 /// it from `from` into `to` - the same composition the `pond copy` CLI runs.
-async fn migrate(from: &Store, to: &Store) -> anyhow::Result<pond::sessions::LanceArchiveImport> {
+async fn copy(from: &Store, to: &Store) -> anyhow::Result<pond::sessions::LanceArchiveImport> {
     let plan = to.plan_incremental_from(from).await?;
     to.copy_delta_from(from, &plan).await
 }
@@ -129,27 +129,27 @@ async fn ingest_at(store: &Store, events: Vec<IngestEvent>) -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn migrate_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
+async fn copy_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
     let source = Store::open(&Url::parse("shared-memory://pond-test-migrate-src/")?).await?;
     seed(&source, "01HXYMIGRATE0001").await?;
     seed(&source, "01HXYMIGRATE0002").await?;
 
     // Round trip into an empty destination: everything inserts.
     let dest = Store::open(&Url::parse("shared-memory://pond-test-migrate-dst/")?).await?;
-    let first = migrate(&source, &dest).await?;
+    let first = copy(&source, &dest).await?;
     assert_eq!(first.inserted.sessions, 2);
     assert_eq!(first.inserted.messages, 2);
     assert_eq!(first.inserted.parts, 2);
     let stored = dest
         .get_session("01HXYMIGRATE0001")
         .await?
-        .expect("migrated session readable on destination");
+        .expect("copied session readable on destination");
     assert_eq!(stored.messages.len(), 1);
     assert_eq!(stored.messages[0].parts.len(), 1);
 
     // Immediate rerun is a no-op: deterministic PKs make merge-insert skip
     // every row that already landed.
-    let rerun = migrate(&source, &dest).await?;
+    let rerun = copy(&source, &dest).await?;
     assert_eq!(rerun.inserted.sessions, 0, "rerun must insert nothing");
     assert_eq!(rerun.inserted.messages, 0);
     assert_eq!(rerun.inserted.parts, 0);
@@ -158,7 +158,7 @@ async fn migrate_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
     // archive's rows merge in, nothing is deleted.
     let populated = Store::open(&Url::parse("shared-memory://pond-test-migrate-union/")?).await?;
     seed(&populated, "01HXYMIGRATELOCAL").await?;
-    let union = migrate(&source, &populated).await?;
+    let union = copy(&source, &populated).await?;
     assert_eq!(union.inserted.sessions, 2);
     let (sessions, messages, parts) = populated.row_counts().await?;
     assert_eq!(sessions, 3, "union must keep the destination's own rows");
@@ -188,15 +188,15 @@ async fn collect_ids_proves_destination_is_a_superset() -> anyhow::Result<()> {
     assert!(dst_sessions.is_empty());
     assert_eq!(src_sessions.difference(&dst_sessions).count(), 2);
 
-    // After migrate: the destination contains every source id, every table.
-    migrate(&source, &dest).await?;
+    // After copy: the destination contains every source id, every table.
+    copy(&source, &dest).await?;
     for table in [Table::Sessions, Table::Messages, Table::Parts] {
         let src = source.collect_ids(table).await?;
         let dst = dest.collect_ids(table).await?;
         assert_eq!(
             src.difference(&dst).count(),
             0,
-            "{} not fully contained after migrate",
+            "{} not fully contained after copy",
             table.as_str(),
         );
     }
@@ -205,7 +205,7 @@ async fn collect_ids_proves_destination_is_a_superset() -> anyhow::Result<()> {
     // surplus ids are not "missing", so this must verify as synced.
     let populated = Store::open(&Url::parse("shared-memory://pond-test-verify-extra/")?).await?;
     seed(&populated, "01HXYVERIFYLOCAL").await?;
-    migrate(&source, &populated).await?;
+    copy(&source, &populated).await?;
     let src = source.collect_ids(Table::Sessions).await?;
     let dst = populated.collect_ids(Table::Sessions).await?;
     assert_eq!(src.difference(&dst).count(), 0, "source fully contained");
@@ -235,7 +235,7 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
 
     // First copy is full: both seeded sessions land on the empty destination.
     let dest = Store::open(&Url::parse("shared-memory://pond-test-incremental-dst/")?).await?;
-    let first = migrate(&source, &dest).await?;
+    let first = copy(&source, &dest).await?;
     assert_eq!(first.inserted.sessions, 2);
     assert_eq!(first.inserted.messages, 2);
 
