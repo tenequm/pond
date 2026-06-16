@@ -1,0 +1,47 @@
+# Remote storage
+
+pond stores data locally by default (`$XDG_DATA_HOME/pond`). To use an S3-compatible bucket (Hetzner, R2, B2, MinIO, AWS): add credentials, probe, copy, switch. Your local data is never modified - it stays as a backup.
+
+## 1. Add credentials
+
+```sh
+pond creds add   # set name (default), access key, hidden secret
+```
+
+Writes a `[creds.<name>]` block to `config.toml`. A scope-less `default` set matches any URL.
+
+:::warning[CI]
+Skip the prompt with env: `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAULT_SECRET_ACCESS_KEY`. Never pass secrets as flags or in the URL.
+:::
+
+## 2. Probe (gate)
+
+```sh
+pond storage check s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = usable. See [Exit codes](/reference/exit-codes).
+
+## 3. Copy
+
+```sh
+pond copy --from local --to s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Idempotent union merge: re-runnable, resumable, never touches the source. Rebuilds destination indexes and verifies every row landed - exit `0` synced, `6` missing rows (re-run; it converges). Large stores: `--no-optimize` defers the index rebuild.
+
+## 4. Switch
+
+```sh
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Re-probes, then flips `[storage].path`. Moves no data. Roll back with `pond storage use local`.
+
+## URL forms
+
+`s3+https://host/bucket` carries endpoint + bucket in one URL (any S3-compatible store); append `/prefix` for a subpath. `s3://`, `gs://`, `az://` use the ambient cloud SDK credential chain when no creds set matches.
+
+## No config file
+
+`POND_STORAGE_PATH` + `POND_CREDS_DEFAULT_*` is a complete configuration - handy for containers and CI.

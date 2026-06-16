@@ -1,0 +1,32 @@
+# CLI commands
+
+```sh
+pond <command> --help   # full flags for any command
+```
+
+## Setup
+- `pond init` - guided setup-and-repair: storage, adapters, MCP, schedule
+- `pond adapters list|discover|enable|disable` - manage which adapters sync ingests
+- `pond storage check|use` - probe a destination; switch the active store
+- `pond creds add|list|delete` - manage URL-scoped credential sets
+- `pond schedule start|stop|status|logs` - manage the automatic sync schedule
+- `pond config show|path|schema` - inspect resolved configuration
+
+## Data
+- `pond sync [<adapter>]` - import, embed, index; `--no-optimize` imports only
+- `pond optimize` - embed the backlog, fold the indexes; `--only` / `--skip <stage>`
+- `pond copy --from <x> --to <y>` - move data between stores, `.pond` archives, JSONL; `--verify-only`
+
+## Query
+- `pond search <query>` - hybrid search; `--explain` for the query plan
+- `pond get <--session-id|--message-id>` - fetch a session or message
+- `pond sql <query>` - one read-only SQL query over the corpus
+- `pond status` - health, row counts, embedding coverage, schedule state
+
+## Serve
+- `pond serve --transport http|stdio` - run the API (HTTP default)
+- `pond mcp` - alias for `pond serve --transport stdio`
+- `pond completions <shell>` - shell completion scripts
+
+## Copy endpoints
+`local` local default dir · `@` configured store · `*.pond` archive · `*.jsonl` or `-` JSONL wire stream.

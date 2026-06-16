@@ -1,0 +1,29 @@
+# Configuration & environment
+
+Config lives in `config.toml`; every field has a `POND_*` env override. Precedence: flag > env > config > default. `pond config show` prints resolved values with secrets redacted and per-field source.
+
+## config.toml
+
+```toml
+[storage]
+path = "s3+https://nbg1.your-objectstorage.com/my-pond"
+
+[creds.default]
+access_key_id     = "..."
+secret_access_key = "..."
+
+[adapters.claude-code]
+enabled = true
+```
+
+## Environment
+
+- `POND_STORAGE_PATH` - storage URL (overrides `[storage].path`)
+- `POND_CONFIG_FILE` - config path
+- `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAULT_SECRET_ACCESS_KEY` - default creds
+
+`POND_STORAGE_PATH` plus the two creds vars is a complete configuration with no file.
+
+## Secrets
+
+Keep secrets out of the URL and CLI flags. Instead of inline values: `secret_access_key_file = "/run/secrets/pond-s3"` or `secret_access_key_command = "op read op://vault/pond/secret"`. pond writes `config.toml` with `0600` permissions.

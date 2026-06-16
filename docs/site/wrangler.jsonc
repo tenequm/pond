@@ -2,7 +2,8 @@
   "name": "pond-docs",
   "compatibility_date": "2026-06-03",
   "assets": {
-    "directory": "../target/book",
+    "directory": "./dist/public",
+    "html_handling": "drop-trailing-slash",
     "not_found_handling": "404-page"
   },
   "routes": [

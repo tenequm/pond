@@ -1,0 +1,5 @@
+# Several machines, one bucket
+
+Point each machine's `config.toml` (or `POND_*` env) at the same URL and credentials, and run `pond sync` on each.
+
+Concurrent writers are safe: Lance serializes commits through the object store's conditional writes (optimistic concurrency), so two syncs at once cannot corrupt the dataset.

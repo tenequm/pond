@@ -1,0 +1,14 @@
+# Exit codes
+
+Branch on exit codes, not output text.
+
+| Code | Meaning | Commands |
+|---|---|---|
+| 0 | success / synced | all |
+| 2 | URL parse error | storage, copy |
+| 3 | no credentials matched | storage, copy |
+| 4 | auth failed | storage, copy |
+| 5 | store lacks conditional-put (OCC) | storage, copy |
+| 6 | destination missing source rows | copy |
+
+`copy` exit `6` is recoverable: re-run, the union merge converges.
