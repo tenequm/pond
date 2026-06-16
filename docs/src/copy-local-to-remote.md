@@ -125,7 +125,7 @@ pond storage use local
 
 If you took the agents/CI path and exported `POND_STORAGE_PATH`, `unset` it (or point it back at the local path) - the environment overrides `config.toml`, so `use` alone won't take effect while it is set.
 
-Keep `~/.local/share/pond` after copying. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond copy --to ~/pond-backup.pond` rather than removing the live directory.
+Keep `~/.local/share/pond` after copying. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond copy --from local --to ~/pond-backup.pond` rather than removing the live directory.
 
 Switching storage is transparent to your agent clients: they talk to pond over `pond mcp`, which reads the same `config.toml`, so nothing in Claude Code / Codex / others needs reconfiguring.
 

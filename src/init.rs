@@ -306,8 +306,7 @@ pub(crate) async fn run(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        std::fs::write(&config_file, &new_text)
-            .with_context(|| format!("failed to write {}", config_file.display()))?;
+        crate::config::write_config_file(&config_file, &new_text)?;
     }
 
     // External side effects (MCP registration, OS-scheduler registration) run

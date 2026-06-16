@@ -55,7 +55,7 @@ global:  --storage-path <URL> [POND_STORAGE_PATH]   --config-file <PATH> [POND_C
 pond init      [--adapters <NAMES>] [--every 5m|15m|1h|6h|1d] [--skip-mcp] [-y] [--force]
 pond sync      [ADAPTER] [--path <DIR>] [--no-optimize]
 pond optimize  [--only embed|index] [--skip embed|index] [--force-embed]
-pond copy      [--from <url|file>] [--to <url|file>] [--verify-only] [--no-optimize]
+pond copy      --from <url|file> --to <url|file> [--verify-only] [--no-optimize]
 pond search    <QUERY> [--limit] [--project] [--session-id] [--source-agent]
                [--include-subagents] [--from-date] [--to-date] [--min-score] [--explain] [--format text|json]
 pond get       <--session-id|--message-id> [--context-depth] [--limit]
@@ -77,7 +77,7 @@ pond completions <SHELL>
 1. Mechanical renames: `--config`->`--config-file`/env; init `--schedule`->`--every`; `sync --source-dir`->`--path`; `SyncStage::UpdateIndexes`->`Index` (CLI `index`); `OutputFormat::Pretty`->`Text`.
 2. Add `optimize`; remove hidden `embed` + `index` (and `IndexCommand`); route `--only embed|index` to `run_embed_stage` / `run_update_indexes_stage`; keep `--force-embed`.
 3. `sync`: drop `--only/--skip/--force-embed`; add `--no-optimize`; after the import stage, run optimize on the store unless `--no-optimize`.
-4. Add `copy` with the suffix-sniff dispatcher over the existing `run_migrate` (store->store), archive export, and archive import paths; `--from/--to` default to the configured store; `--verify-only`; `--no-optimize`. Remove `migrate`, `export`, `import`.
+4. Add `copy` with the suffix-sniff dispatcher over the existing `run_migrate` (store->store), archive export, and archive import paths; `--from` and `--to` both required (each a store URL, `*.pond`, or - for `--to` - `*.jsonl`/`-`; `local` is the default-store keyword); `--verify-only`; `--no-optimize`. Remove `migrate`, `export`, `import`.
 5. Internal doc-comment sweep: `pond embed`/`pond index optimize`/`pond migrate`/`pond export`/`pond import` -> new verbs across `src/**`.
 6. Regenerate help snapshots (`cargo insta`/`INSTA_UPDATE`), rename the `migrate` integration module to `copy` where it tests the public path, add `--verify-only`/sniff coverage.
 7. Docs sweep (below).

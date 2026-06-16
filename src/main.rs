@@ -224,6 +224,47 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     }
 });
 
+/// Root `-h`/`--help` command list, hand-grouped into blocks with blank-line
+/// spacing. clap can't group or space subcommands natively (clap-rs/clap#1553;
+/// PR #6183 unmerged as of 4.6), so the visible list lives here while
+/// `{options}` and `{after-help}` render the rest. The
+/// `help_template_lists_every_subcommand` test fails if a verb is added to
+/// `Command` without a line here.
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
+
+Commands:
+  Setup
+    init         Set up pond (idempotent: safe to re-run)
+    adapters     Choose which adapters pond sync ingests
+    storage      Probe and switch storage destinations
+    creds        Manage URL-scoped credential sets
+    schedule     Manage the automatic sync schedule
+    config       Inspect configuration
+
+  Data flow
+    sync         Make pond current: import, embed, index
+    optimize     Embed the backlog, then fold the indexes
+    copy         Copy data between stores, archives, JSONL
+
+  Query
+    search       Search stored messages
+    get          Fetch a session or message
+    sql          Run one read-only SQL query
+    status       Show pond health, data, and adapters
+
+  Serve
+    serve        Run the HTTP API server
+    mcp          Serve the MCP tools over stdio
+
+  Shell
+    completions  Generate shell completions
+    help         Print this message or a subcommand's help
+
+Options:
+{options}{after-help}";
+
 /// Lossless storage and hybrid search for sessions from any AI agent client.
 #[derive(Debug, Parser)]
 #[command(
@@ -232,6 +273,7 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     long_version = LONG_VERSION.as_str(),
     styles = STYLES,
     max_term_width = 100,
+    help_template = HELP_TEMPLATE,
     after_long_help = "\
 Getting started:
   pond init                                  set up storage, adapters, MCP, and scheduling
@@ -303,9 +345,10 @@ enum Command {
   pond init --storage-path s3://bucket/pond   preset storage, prompt for the rest
   pond init --adapters claude-code,codex-cli --yes
   pond init --every 1h --yes                  also register an hourly sync")]
-    // display_order groups the `--help` list: onboarding/setup (1-6), everyday
-    // data flow (7-9), query (10-13), serve (14-15), shell (16). Keep it in sync
-    // when adding a verb so the grouping holds.
+    // The visible `-h` command list (grouping + blank-line spacing) is rendered
+    // by HELP_TEMPLATE, not by these display_order values - clap can't group or
+    // space subcommands itself. display_order is kept only as the fallback order
+    // if the template is ever removed.
     #[command(display_order = 1)]
     Init(init::InitArgs),
     /// Make pond current: import, embed, update indexes.
@@ -617,35 +660,37 @@ enum Command {
         #[command(subcommand)]
         command: CredsCmd,
     },
-    /// Copy canonical data between stores, archives, and the JSONL wire stream.
+    /// Copy canonical data between pond stores, `.pond` archives, and the JSONL
+    /// wire stream.
     ///
-    /// `--from`/`--to` each default to the configured store; the other endpoint
-    /// is sniffed by suffix: `*.pond` is a compact restorable archive, `*.jsonl`
-    /// (or `-` for stdout) is the JSONL wire stream, anything else is a pond
-    /// store URL. Store-to-store copies are an idempotent union merge
-    /// (`lance-deterministic-pk` + merge-insert): re-runnable, resumable, valid
-    /// onto a populated destination, never deletes or modifies the source; they
-    /// rebuild the destination indexes, verify every row landed, and exit 6 if
-    /// any are missing. `--verify-only` runs just the read-only membership check
-    /// (store-to-store only). This is the durable-corpus copy path, distinct
-    /// from `pond sync` which re-reads your client tools
-    /// (spec.md#session-durable-copy).
+    /// Both `--from` and `--to` are required. Each endpoint is sniffed by
+    /// suffix: `*.pond` is a compact restorable archive, `*.jsonl` (or `-` for
+    /// stdout) is the JSONL wire stream and is export-only, anything else is a
+    /// pond store URL - `local` is the local default dir, `@` is your configured
+    /// store (the one every other command uses). Store-to-store copies are an
+    /// idempotent union merge (`lance-deterministic-pk` + merge-insert):
+    /// re-runnable, resumable, valid onto a populated destination, never deletes
+    /// or modifies the source; they rebuild the destination indexes, verify
+    /// every row landed, and exit 6 if any are missing. `--verify-only` runs
+    /// just the read-only membership check (store-to-store only). This is the
+    /// durable-corpus copy path, distinct from `pond sync` which re-reads your
+    /// client tools (spec.md#session-durable-copy).
     #[command(after_long_help = "Examples:
-  pond copy --from ~/.local/share/pond --to s3+https://host/bucket/pond
-  pond copy --from ~/.local/share/pond --to s3://bucket/pond --verify-only   re-check, copy nothing
-  pond copy --to backup/$(date +%F).pond                                     export an archive
-  pond copy --to - | jq .                                                    stream the JSONL wire form
-  pond copy --from backup/2026-06-01.pond                                    restore an archive")]
+  pond copy --from local --to s3+https://host/bucket/pond          migrate the local store to a bucket
+  pond copy --from @ --to backup/2026-06-16.pond                   snapshot the configured store to an archive
+  pond copy --from backup/2026-06-16.pond --to @                   restore an archive into the configured store
+  pond copy --from @ --to s3://bucket/pond --verify-only           re-check membership, copy nothing
+  pond copy --from @ --to - | jq .                                 stream the configured store as JSONL")]
     #[command(display_order = 9)]
     Copy {
-        /// Source endpoint (store URL, `*.pond`, `*.jsonl`, or `-`).
-        /// Default: the configured store.
+        /// Source endpoint: a store URL, `local` (local default dir), `@`
+        /// (configured store), or a `*.pond` archive.
         #[arg(long, value_name = "URL|FILE")]
-        from: Option<String>,
-        /// Destination endpoint (store URL, `*.pond`, `*.jsonl`, or `-`).
-        /// Default: the configured store.
+        from: String,
+        /// Destination endpoint: a store URL, `local`, `@`, a `*.pond` archive,
+        /// a `*.jsonl` file, or `-` for stdout.
         #[arg(long, value_name = "URL|FILE")]
-        to: Option<String>,
+        to: String,
         /// Only verify the destination already contains the source - copy
         /// nothing, rebuild no indexes. Read-only; store-to-store only.
         #[arg(long, conflicts_with = "no_optimize")]
@@ -1566,41 +1611,50 @@ fn sniff_copy_endpoint(raw: &str) -> anyhow::Result<CopyEndpoint> {
     Ok(CopyEndpoint::Store(parse_storage_path(raw)?))
 }
 
-/// Resolve one copy endpoint: an explicit value is sniffed; an omitted one
-/// defaults to the configured store.
+/// Sniff a `--from`/`--to` value into an endpoint, resolving the `@` keyword to
+/// the configured store (what every other command defaults to). `@` needs the
+/// config and `--storage-path`, so - unlike the config-free `local` keyword - it
+/// can't be a value-parser keyword and is resolved here instead. A directory
+/// literally named `@` is still reachable as `./@`.
 fn resolve_copy_endpoint(
-    raw: Option<String>,
-    explicit_store: Option<StorageUrl>,
+    raw: &str,
+    storage_path: &Option<StorageUrl>,
     loaded: &Config,
 ) -> anyhow::Result<CopyEndpoint> {
-    match raw {
-        Some(raw) => sniff_copy_endpoint(&raw),
-        None => Ok(CopyEndpoint::Store(resolve_storage_location(
-            explicit_store,
+    if raw == "@" {
+        return Ok(CopyEndpoint::Store(resolve_storage_location(
+            storage_path.clone(),
             loaded,
-        )?)),
+        )?));
     }
+    sniff_copy_endpoint(raw)
 }
 
 /// `pond copy`: move canonical data between pond stores, `.pond` archives, and
-/// the JSONL wire stream. Each endpoint defaults to the configured store; the
-/// verb routes on the sniffed endpoint kinds (spec.md#session-durable-copy).
+/// the JSONL wire stream. Both endpoints are required; the verb routes on the
+/// sniffed endpoint kinds (spec.md#session-durable-copy).
 async fn run_copy(
-    from: Option<String>,
-    to: Option<String>,
+    from: String,
+    to: String,
     verify_only: bool,
     no_optimize: bool,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    if from.is_none() && to.is_none() {
+    let loaded = Config::load(config_path(config))?;
+    let from_ep = resolve_copy_endpoint(&from, &storage_path, &loaded)?;
+    let to_ep = resolve_copy_endpoint(&to, &storage_path, &loaded)?;
+    // A mistyped local `--from` would otherwise open as an empty store and
+    // "copy" zero rows with a success exit; fail loudly on a missing source.
+    if let CopyEndpoint::Store(url) = &from_ep
+        && let Some(path) = pond::config::local_path(url.canonical())
+        && !path.exists()
+    {
         bail!(
-            "pond copy needs at least one of --from / --to; the other defaults to the configured store"
+            "source store {} does not exist; check --from",
+            url.display()
         );
     }
-    let loaded = Config::load(config_path(config))?;
-    let from_ep = resolve_copy_endpoint(from, storage_path.clone(), &loaded)?;
-    let to_ep = resolve_copy_endpoint(to, storage_path, &loaded)?;
     match (from_ep, to_ep) {
         (CopyEndpoint::Store(from), CopyEndpoint::Store(to)) => {
             run_store_to_store_copy(from, to, verify_only, no_optimize, &loaded).await
@@ -1648,6 +1702,7 @@ async fn run_store_to_store_copy(
         resolve_and_open_pair(&from, &to, loaded).await?;
     if verify_only {
         let verify = verify_stores(&from_store, &to_store).await?;
+        ensure_source_not_empty(&verify, &from_resolved.display())?;
         if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
             std::process::exit(6);
         }
@@ -1678,6 +1733,7 @@ async fn run_store_to_store_copy(
     // Prove the copy landed by comparing id-sets, not row counts: the
     // source is never modified, so the user never reconciles by hand.
     let verify = verify_stores(&from_store, &to_store).await?;
+    ensure_source_not_empty(&verify, &from_resolved.display())?;
     if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
         std::process::exit(6);
     }
@@ -1716,6 +1772,7 @@ async fn copy_store_to_jsonl(
     loaded: &Config,
 ) -> anyhow::Result<()> {
     let (_, store) = open_store(Some(from), loaded, false).await?;
+    let to_stdout = path.is_none();
     let summary = match path {
         Some(path) => {
             let file = tokio::fs::File::create(&path)
@@ -1731,13 +1788,20 @@ async fn copy_store_to_jsonl(
             handlers::pond_export(&store, None, &mut stdout).await?
         }
     };
-    output(&format!(
+    let line = format!(
         "{} jsonl sessions={} messages={} parts={}",
         pond::output::paint("copy:", pond::output::dim()),
         summary.sessions,
         summary.messages,
         summary.parts,
-    ))?;
+    );
+    // With `--to -` the wire stream owns stdout; keep the summary off it so
+    // `pond copy --to - | jq` stays clean.
+    if to_stdout {
+        output_err(&line)?;
+    } else {
+        output(&line)?;
+    }
     Ok(())
 }
 
@@ -1920,8 +1984,7 @@ fn write_config_doc(config_file: &Path, doc: &toml_edit::DocumentMut) -> anyhow:
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(config_file, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_file.display()))
+    pond::config::write_config_file(config_file, &doc.to_string())
 }
 
 /// `pond creds {add,list,delete}`: manage the `[creds.<name>]` sets in
@@ -2489,6 +2552,19 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
     })
     .collect();
     Ok(StorageVerify { tables })
+}
+
+/// A 0-row source almost always means a mistyped `--from`: a remote store
+/// auto-vivifies empty, so the copy would otherwise "succeed" having moved
+/// nothing. The `run_copy` guard catches a missing local path; this catches
+/// the remote/empty case for parity (spec.md#session-durable-copy).
+fn ensure_source_not_empty(verify: &StorageVerify, from_display: &str) -> anyhow::Result<()> {
+    if verify.total_source_rows() == 0 {
+        bail!(
+            "source store {from_display} has 0 rows; check --from (a mistyped source opens as an empty store)"
+        );
+    }
+    Ok(())
 }
 
 /// One-line SYNCED / FAILED verdict so the user never guesses whether a copy
@@ -4429,5 +4505,61 @@ mod tests {
                 .expect("visible subcommand exists");
             insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
         }
+    }
+
+    // HELP_TEMPLATE hand-lists the root commands (clap can't group or space
+    // them), so a new verb on `Command` would silently miss the `-h` list - the
+    // help_root snapshot can't catch it, since the template text is literal and
+    // doesn't change when a variant is added. This does.
+    #[test]
+    fn help_template_lists_every_subcommand() {
+        let mut root = Cli::command();
+        root.build();
+        let help = root.render_long_help().to_string();
+        for sub in root.get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                help.contains(name),
+                "subcommand `{name}` is missing from HELP_TEMPLATE - add a line for it",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_endpoint_at_keyword_resolves_to_the_configured_store() {
+        let mut loaded = Config::default();
+        loaded.storage.path = Some("s3://from-config/p".to_owned());
+        // `@` follows the same ladder as every other command (flag > config >
+        // default); `local` stays the config-free local default dir.
+        let from_config = resolve_copy_endpoint("@", &None, &loaded).unwrap();
+        assert!(
+            matches!(&from_config, CopyEndpoint::Store(url) if url.lance_url().as_str() == "s3://from-config/p"),
+        );
+        let flag = StorageUrl::parse("s3://from-flag/p").unwrap();
+        let from_flag = resolve_copy_endpoint("@", &Some(flag), &loaded).unwrap();
+        assert!(
+            matches!(&from_flag, CopyEndpoint::Store(url) if url.lance_url().as_str() == "s3://from-flag/p"),
+        );
+        assert!(matches!(
+            resolve_copy_endpoint("local", &None, &loaded).unwrap(),
+            CopyEndpoint::Store(url) if url.is_local()
+        ));
+    }
+
+    #[test]
+    fn ensure_source_not_empty_rejects_a_zero_row_source() {
+        let table = |source_rows| TableVerify {
+            table: substrate::Table::Sessions,
+            source_rows,
+            missing: 0,
+        };
+        let empty = StorageVerify {
+            tables: vec![table(0)],
+        };
+        assert!(ensure_source_not_empty(&empty, "s3://typo/bucket").is_err());
+        let populated = StorageVerify {
+            tables: vec![table(3)],
+        };
+        assert!(ensure_source_not_empty(&populated, "local").is_ok());
     }
 }

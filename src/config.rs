@@ -847,6 +847,38 @@ impl EmbeddingsConfig {
     }
 }
 
+/// Write `config.toml` with owner-only perms (0600). The file can carry a
+/// plaintext `secret_access_key` (inline `[creds.*]`), so it must never be
+/// group/world-readable - matching the AWS CLI's 0600 on its credentials file.
+/// Unix only; Windows is out of v1 scope. Order is truncate -> chmod -> write,
+/// so the secret is only ever written once perms are already 0600, even when
+/// repairing a pre-existing 0644 file.
+pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        // `.mode()` applies only on creation; chmod also repairs a pre-existing file.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // `result_large_err`: `figment::Jail` closures return `figment::Error`
@@ -856,6 +888,25 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        // A pre-existing world-readable file must be repaired, not left at 0644.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_file(&path, "[creds.default]\nsecret_access_key = \"x\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config with secrets must be owner-only");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("secret_access_key")
+        );
+    }
 
     #[test]
     fn validate_catches_empty_model_and_bad_dim() {

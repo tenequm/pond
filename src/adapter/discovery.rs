@@ -200,8 +200,7 @@ fn contract_path_key(table: &mut Table) {
 pub fn persist_accept(config_path: &Path, picks: &[Candidate]) -> anyhow::Result<()> {
     let mut doc = open_or_init(config_path)?;
     apply_to_doc(&mut doc, picks, &[])?;
-    std::fs::write(config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    crate::config::write_config_file(config_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -215,8 +214,7 @@ pub fn set_adapter_enabled(config_path: &Path, name: &str, enabled: bool) -> any
         return Ok(false);
     };
     entry.insert("enabled", toml_edit::value(enabled));
-    std::fs::write(config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    crate::config::write_config_file(config_path, &doc.to_string())?;
     Ok(true)
 }
 

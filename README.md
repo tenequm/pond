@@ -98,8 +98,8 @@ Fetch a single session or message, or move a whole corpus:
 
 ```sh
 pond get --session-id <id>
-pond copy --to snapshot.pond
-pond copy --from snapshot.pond
+pond copy --from local --to snapshot.pond
+pond copy --from snapshot.pond --to local
 ```
 
 Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):

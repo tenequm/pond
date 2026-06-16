@@ -2,18 +2,18 @@
 source: src/main.rs
 expression: sub.render_long_help().to_string()
 ---
-Copy canonical data between stores, archives, and the JSONL wire stream.
+Copy canonical data between pond stores, `.pond` archives, and the JSONL wire stream.
 
-`--from`/`--to` each default to the configured store; the other endpoint is sniffed by suffix: `*.pond` is a compact restorable archive, `*.jsonl` (or `-` for stdout) is the JSONL wire stream, anything else is a pond store URL. Store-to-store copies are an idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, resumable, valid onto a populated destination, never deletes or modifies the source; they rebuild the destination indexes, verify every row landed, and exit 6 if any are missing. `--verify-only` runs just the read-only membership check (store-to-store only). This is the durable-corpus copy path, distinct from `pond sync` which re-reads your client tools (spec.md#session-durable-copy).
+Both `--from` and `--to` are required. Each endpoint is sniffed by suffix: `*.pond` is a compact restorable archive, `*.jsonl` (or `-` for stdout) is the JSONL wire stream and is export-only, anything else is a pond store URL - `local` is the local default dir, `@` is your configured store (the one every other command uses). Store-to-store copies are an idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, resumable, valid onto a populated destination, never deletes or modifies the source; they rebuild the destination indexes, verify every row landed, and exit 6 if any are missing. `--verify-only` runs just the read-only membership check (store-to-store only). This is the durable-corpus copy path, distinct from `pond sync` which re-reads your client tools (spec.md#session-durable-copy).
 
-Usage: pond copy [OPTIONS]
+Usage: pond copy [OPTIONS] --from <URL|FILE> --to <URL|FILE>
 
 Options:
       --from <URL|FILE>
-          Source endpoint (store URL, `*.pond`, `*.jsonl`, or `-`). Default: the configured store
+          Source endpoint: a store URL, `local` (local default dir), `@` (configured store), or a `*.pond` archive
 
       --to <URL|FILE>
-          Destination endpoint (store URL, `*.pond`, `*.jsonl`, or `-`). Default: the configured store
+          Destination endpoint: a store URL, `local`, `@`, a `*.pond` archive, a `*.jsonl` file, or `-` for stdout
 
       --verify-only
           Only verify the destination already contains the source - copy nothing, rebuild no indexes. Read-only; store-to-store only
@@ -44,8 +44,8 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond copy --from ~/.local/share/pond --to s3+https://host/bucket/pond
-  pond copy --from ~/.local/share/pond --to s3://bucket/pond --verify-only   re-check, copy nothing
-  pond copy --to backup/$(date +%F).pond                                     export an archive
-  pond copy --to - | jq .                                                    stream the JSONL wire form
-  pond copy --from backup/2026-06-01.pond                                    restore an archive
+  pond copy --from local --to s3+https://host/bucket/pond          migrate the local store to a bucket
+  pond copy --from @ --to backup/2026-06-16.pond                   snapshot the configured store to an archive
+  pond copy --from backup/2026-06-16.pond --to @                   restore an archive into the configured store
+  pond copy --from @ --to s3://bucket/pond --verify-only           re-check membership, copy nothing
+  pond copy --from @ --to - | jq .                                 stream the configured store as JSONL
