@@ -12,7 +12,7 @@ Options:
       --adapters <NAMES>
           Comma-separated adapter names to enable (skips the adapter picker)
 
-      --schedule <EVERY>
+      --every <EVERY>
           Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules
           
           [possible values: 5m, 15m, 1h, 6h, 1d]
@@ -37,10 +37,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity
@@ -53,4 +53,4 @@ Examples:
   pond init --yes                             accept defaults, no prompts
   pond init --storage-path s3://bucket/pond   preset storage, prompt for the rest
   pond init --adapters claude-code,codex-cli --yes
-  pond init --schedule 1h --yes               also register an hourly sync
+  pond init --every 1h --yes                  also register an hourly sync

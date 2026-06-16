@@ -31,7 +31,7 @@ Current automatically synced agent clients:
 - opencode CLI
 - pi-coding-agent CLI
 
-You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --source-dir <path>`.
+You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --path <path>`.
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.cascade.fyi](https://pond.cascade.fyi/); the contract is [`docs/spec.md`](docs/spec.md).
 
@@ -98,8 +98,8 @@ Fetch a single session or message, or move a whole corpus:
 
 ```sh
 pond get --session-id <id>
-pond export -o snapshot.pond
-pond import snapshot.pond
+pond copy --to snapshot.pond
+pond copy --from snapshot.pond
 ```
 
 Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):
@@ -108,12 +108,12 @@ Ask structured questions with read-only SQL (the same surface as the `pond_sql_q
 pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DESC"
 ```
 
-Stages can be run independently when needed:
+Import alone, then run maintenance stages independently when needed:
 
 ```sh
-pond sync --only import
-pond sync --only embed
-pond sync --only update-indexes
+pond sync --no-optimize
+pond optimize --only embed
+pond optimize --only index
 ```
 
 Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
@@ -136,7 +136,7 @@ pond storage use s3+https://nbg1.your-objectstorage.com/my-pond   # probe end-to
 pond storage check                                                # verify: parse, creds, conditional-put (OCC), write/read/delete
 ```
 
-`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond migrate --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing, so you never reconcile by hand). `pond migrate --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
+`pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond copy --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing, so you never reconcile by hand). `pond copy --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.cascade.fyi](https://pond.cascade.fyi/).
 
 ### Configuration
 
@@ -164,7 +164,7 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Canonical Session / Message / Part interlingua.** Owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This schema is pond's product; everything else is machinery around it.
 - **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
 - **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `model-no-synthesis`, `model-schema-honesty`, and `adapter-provenance-required` are structural, not review rules.
-- **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. `pond sync` runs index maintenance by default, and `pond sync --only update-indexes` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
+- **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
 - **Score-normalized hybrid fusion.** Per-arm shaping (max-norm BM25 for FTS, rank-norm for vector), min-max to [0, 1], then weighted sum. Session-root-keyed dedup so cross-arm agreement compounds at the conversation level.
 - **Language-neutral full-text.** Character `ngram` tokenizer (3-5), no monolingual stemmer - pond indexes sessions in any language alike.
 - **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql_query` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.

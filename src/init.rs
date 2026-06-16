@@ -25,7 +25,7 @@ pub(crate) struct InitArgs {
     #[arg(long, value_delimiter = ',', value_name = "NAMES")]
     adapters: Option<Vec<String>>,
     /// Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules.
-    #[arg(long, value_enum, value_name = "EVERY")]
+    #[arg(long = "every", value_enum, value_name = "EVERY")]
     schedule: Option<ScheduleEvery>,
     /// Skip MCP registration.
     #[arg(long)]
@@ -93,7 +93,7 @@ pub(crate) async fn run(
     if !interactive && !args.yes && !any_flag {
         bail!(
             "stdin is not a terminal; run `pond init --yes` to accept defaults, or answer \
-             sections with --storage-path / --adapters / --schedule"
+             sections with --storage-path / --adapters / --every"
         );
     }
     // With any flag (or --yes) present, unflagged sections take defaults
@@ -703,7 +703,7 @@ fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<
             }
             if !rows.iter().any(|row| &row.name == name) {
                 bail!(
-                    "adapter {name:?} was not detected on this machine and has no [adapters.{name}] entry; pass a path via `pond sync {name} --source-dir <path>` or add the section manually"
+                    "adapter {name:?} was not detected on this machine and has no [adapters.{name}] entry; pass a path via `pond sync {name} --path <path>` or add the section manually"
                 );
             }
         }

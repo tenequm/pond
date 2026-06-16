@@ -227,7 +227,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # refine_factor = 2
 
 # Storage maintenance. Tunes the compaction + cleanup pass that runs inside
-# `pond sync` and `pond index optimize`.
+# `pond sync` and `pond optimize`.
 #
 # - `compaction_fragment_cap` is the per-task fragment-count backstop: a
 #   planned compaction task touching at least this many fragments always runs
@@ -238,7 +238,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #   what protects in-flight readers). Versions older than this are reclaimed
 #   by Lance's OCC-coordinated GC.
 # - `index_lag_threshold` is the minimum unindexed-fragment count before a
-#   per-intent append/rebuild runs in `pond index optimize`; the brute-force
+#   per-intent append/rebuild runs in `pond optimize`; the brute-force
 #   fallback keeps queries correct while fragments accumulate. Default 4.
 #
 # [maintenance]
@@ -403,7 +403,7 @@ pub struct SearchConfig {
 }
 
 /// `[maintenance]`: storage-maintenance knobs shared by `pond sync` and
-/// `pond index optimize`. All optional - omit and pond falls back to the
+/// `pond optimize`. All optional - omit and pond falls back to the
 /// in-process defaults in `pond::substrate` (`DEFAULT_COMPACTION_FRAGMENT_CAP`,
 /// `default_cleanup_older_than`, and the `index_lag_threshold` initializer).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -655,7 +655,7 @@ impl Config {
 /// The `POND_*` env mirror (spec.md#storage-env-mirror): `POND_STORAGE_PATH`
 /// -> `storage.path`, `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`.
 /// Filtered to exactly those two shapes - clap owns its own `POND_*` vars
-/// (`POND_CONFIG`, `POND_HOST`, ...) and an unfiltered prefix would turn each
+/// (`POND_CONFIG_FILE`, `POND_HOST`, ...) and an unfiltered prefix would turn each
 /// of them into an unknown-field error here.
 fn env_mirror() -> Env {
     // Keys reach these closures pre-lowercasing (`CREDS_...`), so compare on

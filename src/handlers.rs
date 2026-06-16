@@ -683,8 +683,8 @@ pub use export_handler::{ExportSummary, pond_export};
 
 mod restore_handler {
     //! `restore_lineage` (spec.md#adapter-lineage-complete-restore): collect the named
-    //! session plus its direct subagent children for the `pond export session
-    //! --as` restore path. The spawn graph is one level deep; a collected
+    //! session plus its direct subagent children for the `pond copy` restore
+    //! path. The spawn graph is one level deep; a collected
     //! child that is itself a parent means a deeper graph, which is a typed
     //! error - never a silently flattened restore.
 

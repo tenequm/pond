@@ -11,7 +11,7 @@ Current automatically synced agent clients:
 - opencode CLI
 - pi-coding-agent CLI
 
-You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --source-dir <path>`.
+You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --path <path>`.
 
 ## Install
 
@@ -31,10 +31,10 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
    ```sh
    pond init                                                     # interactive, on a TTY
-   pond init -y --schedule 5m                                    # non-interactive: enables every discovered adapter
+   pond init -y --every 5m                                       # non-interactive: enables every discovered adapter
    ```
 
-   `-y` accepts defaults for everything a flag doesn't cover; `--schedule` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)) - when that destination is remote, init prompts for credentials inline, so a bucket is one command. init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
+   `-y` accepts defaults for everything a flag doesn't cover; `--every` is opt-in (`-y` alone never schedules), and `--storage-path <url>` sets remote storage during setup (see [Remote storage](#remote-storage)) - when that destination is remote, init prompts for credentials inline, so a bucket is one command. init registers pond as an MCP server for detected clients; to add it by hand, or for another client:
 
    ```sh
    claude mcp add -s user pond -- pond mcp   # Claude Code
@@ -92,11 +92,11 @@ Several machines can share one bucket: give each the same `config.toml` and run 
 `use` only switches the pointer; it never moves data. To carry your existing local sessions into the bucket, copy them first, then switch:
 
 ```sh
-pond migrate --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
+pond copy --from ~/.local/share/pond --to s3+https://nbg1.your-objectstorage.com/my-pond
 pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Migrate is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. It rebuilds the destination's indexes and verifies every row landed before it exits, so the bucket is ready to query with no manual reconciliation; `pond migrate --verify-only --from <local> --to <url>` re-runs that membership check read-only. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Migrate from local to remote](./migrate-local-to-remote.md).
+`pond copy` is an idempotent union merge: re-runnable, safe onto a populated destination, and it never deletes or modifies the source - your local data stays put as a backup. It rebuilds the destination's indexes and verifies every row landed before it exits, so the bucket is ready to query with no manual reconciliation; `pond copy --verify-only --from <local> --to <url>` re-runs that membership check read-only. For the full walkthrough (credentials, verification, rollback, and the agents/CI path), see [Copy from local to remote](./copy-local-to-remote.md).
 
 ### Troubleshooting
 

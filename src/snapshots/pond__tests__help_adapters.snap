@@ -27,10 +27,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity

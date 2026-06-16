@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Probe and switch storage destinations.
 
-`check` probes a destination end-to-end; `use` switches the configured destination - a pointer change that moves no data. To copy data between stores use `pond migrate`; to see where data lives and how big it is use `pond status`.
+`check` probes a destination end-to-end; `use` switches the configured destination - a pointer change that moves no data. To copy data between stores use `pond copy`; to see where data lives and how big it is use `pond status`.
 
 Usage: pond storage [OPTIONS] <COMMAND>
 
@@ -25,10 +25,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity

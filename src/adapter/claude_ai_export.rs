@@ -11,7 +11,7 @@
 //! opportunistic `~/Downloads` scan would silently latch onto a stale or wrong
 //! archive). Point the adapter at the file explicitly via
 //! `[adapters.claude-ai-export]` config or
-//! `pond sync claude-ai-export --source-dir <export.zip>`. `open` accepts a
+//! `pond sync claude-ai-export --path <export.zip>`. `open` accepts a
 //! `.zip`, an extracted directory, or a bare `conversations.json` path.
 //!
 //! Mapping (spec.md#model-*): `conversation.uuid` -> `Session.id`;
@@ -66,7 +66,7 @@ impl AdapterFactory for ClaudeAiExportFactory {
 
     fn probe_default(&self, _env: &Env) -> Option<Value> {
         // No canonical install path: the export is a manual download. The user
-        // points pond at it (config `path` or `pond sync ... --source-dir`).
+        // points pond at it (config `path` or `pond sync ... --path`).
         None
     }
 

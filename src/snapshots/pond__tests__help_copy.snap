@@ -1,0 +1,51 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Copy canonical data between stores, archives, and the JSONL wire stream.
+
+`--from`/`--to` each default to the configured store; the other endpoint is sniffed by suffix: `*.pond` is a compact restorable archive, `*.jsonl` (or `-` for stdout) is the JSONL wire stream, anything else is a pond store URL. Store-to-store copies are an idempotent union merge (`lance-deterministic-pk` + merge-insert): re-runnable, resumable, valid onto a populated destination, never deletes or modifies the source; they rebuild the destination indexes, verify every row landed, and exit 6 if any are missing. `--verify-only` runs just the read-only membership check (store-to-store only). This is the durable-corpus copy path, distinct from `pond sync` which re-reads your client tools (spec.md#session-durable-copy).
+
+Usage: pond copy [OPTIONS]
+
+Options:
+      --from <URL|FILE>
+          Source endpoint (store URL, `*.pond`, `*.jsonl`, or `-`). Default: the configured store
+
+      --to <URL|FILE>
+          Destination endpoint (store URL, `*.pond`, `*.jsonl`, or `-`). Default: the configured store
+
+      --verify-only
+          Only verify the destination already contains the source - copy nothing, rebuild no indexes. Read-only; store-to-store only
+
+      --no-optimize
+          Skip the post-copy index rebuild (store-to-store and archive restore, for very large stores you will index later). Build indexes after with `pond optimize --only index --storage-path <to>`
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond copy --from ~/.local/share/pond --to s3+https://host/bucket/pond
+  pond copy --from ~/.local/share/pond --to s3://bucket/pond --verify-only   re-check, copy nothing
+  pond copy --to backup/$(date +%F).pond                                     export an archive
+  pond copy --to - | jq .                                                    stream the JSONL wire form
+  pond copy --from backup/2026-06-01.pond                                    restore an archive

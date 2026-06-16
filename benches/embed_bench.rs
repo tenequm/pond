@@ -248,7 +248,8 @@ async fn main() -> Result<()> {
     // Start RSS sampling *before* model load: weight loading is a real
     // transient (the safetensors are mmap'd and the candle model is built on
     // the GPU), and the report covers "the whole run, model load included", so
-    // the sampler must be live for it. No warmup beyond that: `pond embed` runs
+    // the sampler must be live for it. No warmup beyond that: the optimize embed
+    // stage runs
     // once and pays the cold start once, so the honest number includes it - the
     // per-batch table shows the cold-to-steady curve directly.
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
@@ -370,7 +371,7 @@ fn report(r: &Report<'_>) {
         )
     };
 
-    println!("=== pond embed bench ===");
+    println!("=== pond embedding bench ===");
     let window = r.args.window.unwrap_or(DEFAULT_SORT_WINDOW);
     println!(
         "config        device={}  limit={}  sort-window={}",

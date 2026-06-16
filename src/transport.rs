@@ -243,7 +243,7 @@ response_mode: \"conversational\" (default - human/model text only), \
 at 1000. Bounded by a size budget: when the footer shows `after_id=`, pass it \
 back to page. A whole-session response also lists the session's subagents (each \
 stored as its own session) in a footer; pass a listed id back as session_id to \
-open it. Not for bulk export - use `pond export`.";
+open it. Not for bulk export - use `pond copy --to <file>`.";
 
     /// Static documentation served as the `schema://pond-sql` resource: the
     /// table/column schema, dialect, function set, output modes, pagination
@@ -716,7 +716,7 @@ Examples (4 patterns the agent should recognize):
                            messages, \
                            e.g. to recover context after compaction). \
                            Tool/result lines render as `-> name [call_id]` / `<- name \
-                           [call_id] (ok|failed)`. Not for bulk export - use `pond export`.",
+                           [call_id] (ok|failed)`. Not for bulk export - use `pond copy --to <file>`.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_get(

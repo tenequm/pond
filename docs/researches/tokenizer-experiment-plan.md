@@ -58,7 +58,7 @@ A fixed bilingual corpus, ingested once into a throwaway pond data dir.
   files, ~27 MB, genuine heavily-inflected conversational Ukrainian + code-mixing.
 - Ratio ~13:1 English:Ukrainian by size - English-dominant (realistic for pond) while leaving
   Ukrainian large enough to retrieve against. Combined ~382 MB, staged at
-  `/tmp/pond-mle/corpus/projects/`, ingested via `pond sync claude-code --source-dir`.
+  `/tmp/pond-mle/corpus/projects/`, ingested via `pond sync claude-code --path`.
 
 ## 4. Tokenizer matrix
 

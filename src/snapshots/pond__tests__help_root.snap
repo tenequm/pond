@@ -8,21 +8,20 @@ Usage: pond [OPTIONS] <COMMAND>
 
 Commands:
   init         Set up pond (idempotent: safe to re-run)
-  sync         Make pond current: import, embed, update indexes
   adapters     Manage which adapters `pond sync` ingests (the `[adapters.*]` entries)
-  status       Show pond health, data, and adapter status
+  storage      Probe and switch storage destinations
+  creds        Manage URL-scoped credential sets in config.toml
+  schedule     Manage the automatic sync schedule
+  config       Inspect configuration
+  sync         Make pond current: import, embed, update indexes
+  optimize     Keep the lake queryable: embed the backlog, then fold the search indexes
+  copy         Copy canonical data between stores, archives, and the JSONL wire stream
   search       Search stored messages
   get          Fetch a session or message
   sql          Run one read-only SQL query over the corpus
+  status       Show pond health, data, and adapter status
   serve        Run the HTTP API server (or MCP over stdio with --transport stdio)
   mcp          Serve the MCP tools over stdio (for agent clients)
-  schedule     Manage the automatic sync schedule
-  storage      Probe and switch storage destinations
-  creds        Manage URL-scoped credential sets in config.toml
-  migrate      Copy canonical data between two storages (or just verify a copy)
-  export       Export a compact restorable .pond archive
-  import       Restore a .pond archive
-  config       Inspect configuration
   completions  Generate shell completions
   help         Print this message or the help of the given subcommand(s)
 
@@ -41,10 +40,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity

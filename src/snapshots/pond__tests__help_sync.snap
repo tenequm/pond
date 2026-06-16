@@ -13,23 +13,13 @@ Arguments:
           Adapter name (claude-code, codex-cli, ...); default: every enabled adapter
 
 Options:
-      --source-dir <DIR>
+      --path <DIR>
           One-off source-path override (requires <ADAPTER>).
           
           Bypasses `[adapters.<adapter>]` and does not modify config.toml.
 
-      --only <ONLY>
-          Run exactly one stage: import, embed, or update-indexes
-          
-          [possible values: import, embed, update-indexes]
-
-      --skip <SKIP>
-          Skip a stage. Can be passed multiple times
-          
-          [possible values: import, embed, update-indexes]
-
-      --force-embed
-          Re-embed stale rows after an embedding model change
+      --no-optimize
+          Import only: skip the embed + index maintenance that normally runs after the import. Catch up later with `pond optimize`
 
   -h, --help
           Print help (see a summary with '-h')
@@ -42,10 +32,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity
@@ -56,5 +46,5 @@ Global options:
 Examples:
   pond sync                                  sync every enabled adapter
   pond sync claude-code                      sync one enabled adapter
-  pond sync codex-cli --source-dir ~/backup  one-off path override, config untouched
-  pond sync --only embed                     run a single stage
+  pond sync codex-cli --path ~/backup        one-off path override, config untouched
+  pond sync --no-optimize                    import only; embed and index later

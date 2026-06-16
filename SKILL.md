@@ -35,5 +35,5 @@ Register the MCP server in your client:
 - MCP tools: `pond_search`, `pond_get`, `pond_sql_query`.
 - CLI: run `pond --help`; every command's `--help` carries copy-pasteable
   examples (`pond sync`, `pond search`, `pond status`, `pond schedule`,
-  `pond migrate`, ...).
+  `pond copy`, ...).
 - Docs: https://pond.cascade.fyi/

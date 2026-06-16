@@ -1,10 +1,10 @@
-//! Durable-copy story (spec.md#session-durable-copy): `pond export` produces a portable
-//! snapshot of canonical session rows that can be ingested into a fresh store.
+//! Durable-copy story (spec.md#session-durable-copy): `pond copy --to <file>` produces a
+//! portable snapshot of canonical session rows that can be ingested into a fresh store.
 //! This test proves the loop round-trips identical row counts and identical
-//! `pond export` output.
+//! `pond copy --to <file>` output.
 //!
-//! Plus: `pond export` produces JSONL `IngestEvent`s that round-trip back
-//! through `ingest_events`, so `export | ingest` is a portable backup.
+//! Plus: the JSONL wire stream produces `IngestEvent`s that round-trip back
+//! through `ingest_events`, so `copy --to - | ingest` is a portable backup.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;

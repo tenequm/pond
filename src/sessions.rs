@@ -96,7 +96,7 @@ pub struct PendingMessage {
     pub search_text: String,
 }
 
-/// One embedded message: a primary key and the vector to store. `pond embed`
+/// One embedded message: a primary key and the vector to store. `pond optimize`
 /// writes a batch of these into `messages.vector` keyed on `(session_id, id)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddedMessage {
@@ -194,7 +194,7 @@ pub struct RowTotals {
     pub parts: u64,
 }
 
-/// Embedding coverage for `pond status` / `pond embed`. `total` is the count of
+/// Embedding coverage for `pond status` / `pond optimize`. `total` is the count of
 /// `messages` rows that carry `search_text` (i.e. are eligible to embed); rows
 /// without `search_text` produce no vector. `embedded` is the subset of those
 /// already carrying a vector under the current [`embed::model_id()`]. The pending
@@ -1125,7 +1125,7 @@ impl Store {
     }
 
     /// The primary-key (`id`) set for `table`. Powers storage verification
-    /// (`pond migrate --verify-only` and migrate's closing check).
+    /// (`pond copy --verify-only` and copy's closing check).
     pub async fn collect_ids(&self, table: Table) -> Result<std::collections::HashSet<String>> {
         self.handle.collect_ids(table).await
     }
@@ -1275,7 +1275,7 @@ impl Store {
     }
 
     /// Stream messages that are either never embedded or stale under the
-    /// current model. `pond embed --force` feeds this to the same unconditional
+    /// current model. `pond optimize --force-embed` feeds this to the same unconditional
     /// merge_update as the normal backlog; the filter makes that semantically
     /// equivalent to the conditional update in spec.md#session-embed-from-canonical.
     pub fn pending_or_stale_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
@@ -1595,7 +1595,7 @@ impl Store {
 
     /// Embedding coverage: how many `messages` rows carry a vector and how
     /// many are still eligible. Drives the `pond status` embeddings line and
-    /// the `pond embed` progress bar's known total. `embedded` reads the
+    /// the `pond optimize` progress bar's known total. `embedded` reads the
     /// `vector IS NOT NULL` count directly - the single-active-model invariant
     /// (see `MESSAGE_SCALAR_INDICES`) means there is no need to scope by the
     /// `embedding_model` column.
@@ -1615,8 +1615,8 @@ impl Store {
     }
 
     /// Count rows whose `embedding_model` is not the currently configured
-    /// model AND whose `vector` is still populated - the signal `pond embed`
-    /// uses to detect a model swap and require `--force`.
+    /// model AND whose `vector` is still populated - the signal `pond optimize`
+    /// uses to detect a model swap and require `--force-embed`.
     pub async fn stale_embedding_count(&self) -> Result<usize> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         dataset
@@ -1654,7 +1654,7 @@ impl Store {
     }
 
     /// Fold trailing fragments into existing indices across every table,
-    /// without running compaction. Used by `pond embed`'s tail so newly
+    /// without running compaction. Used by `pond optimize`'s tail so newly
     /// written vectors land in the FTS / IVF_PQ / btree / bitmap indices
     /// without paying the compaction retry budget while embed itself may
     /// still be writing in a sibling process.
@@ -1724,8 +1724,8 @@ impl Store {
         Ok(statuses)
     }
 
-    /// Drop the IVF_PQ index on `messages.vector`. Used by `pond embed
-    /// --force` before re-bootstrapping under a different model. Silent
+    /// Drop the IVF_PQ index on `messages.vector`. Used by `pond optimize
+    /// --force-embed` before re-bootstrapping under a different model. Silent
     /// when the index does not exist.
     pub async fn drop_vector_index(&self) -> Result<()> {
         match self
@@ -2999,7 +2999,7 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// Scalar indexes on `messages` (spec.md#datasets): BTREE for high-cardinality
 /// and range columns, BITMAP for low-cardinality columns. There is no index
 /// on `embedding_model`: pond's invariant is one active model at a time
-/// (a model swap goes through `pond embed --force` which drops the IVF_PQ,
+/// (a model swap goes through `pond optimize --force-embed` which drops the IVF_PQ,
 /// clears stale rows, and re-bootstraps), so `embedding_model` is never a
 /// query-time predicate - the only embedding-state filter is `vector IS NOT
 /// NULL`. `id` lookups are rare and full-scan.
@@ -3182,10 +3182,10 @@ pub fn init_embedding_dim(dim: usize) {
 
 /// Initial-`CREATE` write params for the namespace-mediated path. The
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
-/// `auto_cleanup` is short; long-term recovery is `pond export` snapshots
-/// plus deferred Lance tags (spec.md#session-durable-copy). `skip_auto_cleanup`
-/// suppresses the per-commit hook so cleanup stays operator-driven via
-/// `pond index optimize` (one LIST per command instead of per write).
+/// `auto_cleanup` is short; long-term recovery is `pond copy --to <file>`
+/// snapshots plus deferred Lance tags (spec.md#session-durable-copy).
+/// `skip_auto_cleanup` suppresses the per-commit hook so cleanup stays
+/// operator-driven via `pond optimize` (one LIST per command instead of per write).
 pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_1),
@@ -3264,7 +3264,7 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
         // The message's derived embedding (spec.md#session-embed-from-canonical):
-        // both null until `pond embed` fills them, set together thereafter.
+        // both null until `pond optimize` fills them, set together thereafter.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
         json_field("options", false),
@@ -3330,7 +3330,7 @@ fn embedding_vector_type() -> DataType {
 }
 
 /// The partial-schema source for the embedding column update: the `messages`
-/// primary key plus the two columns `pond embed` fills. The field definitions
+/// primary key plus the two columns `pond optimize` fills. The field definitions
 /// match `message_schema` exactly so Lance accepts it as a subset upsert.
 fn embedding_update_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -3577,7 +3577,7 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<R
                 rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
             )),
             // `vector` / `embedding_model` are written null at ingest; every
-            // message starts un-embedded and `pond embed` fills them later
+            // message starts un-embedded and `pond optimize` fills them later
             // (spec.md#session-embed-from-canonical).
             new_null_array(&embedding_vector_type(), rows.len()),
             new_null_array(&DataType::Utf8, rows.len()),

@@ -107,7 +107,7 @@ async fn embed_worker_drains_the_backlog() -> anyhow::Result<()> {
         "the worker must prefix documents with e5's `passage: ` marker",
     );
 
-    // `pond embed` filled `vector` + `embedding_model`, so search is now hybrid.
+    // `pond optimize` filled `vector` + `embedding_model`, so search is now hybrid.
     assert!(
         store.has_embeddings().await?,
         "the worker must fill vector + embedding_model on messages",

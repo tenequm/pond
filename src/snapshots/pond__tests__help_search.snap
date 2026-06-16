@@ -61,8 +61,8 @@ Options:
           Print Lance query plans instead of search results
 
       --format <FORMAT>
-          [default: pretty]
-          [possible values: pretty, json]
+          [default: text]
+          [possible values: text, json]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -75,10 +75,10 @@ Global options:
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity

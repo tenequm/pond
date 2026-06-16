@@ -957,7 +957,7 @@ fn keep_task(stats: &[FragmentStat], cap: usize, deletion_threshold: f32) -> boo
 }
 
 /// Declarative description of one index pond keeps on a table. Created when
-/// its trigger fires; folded forward by `pond index optimize`.
+/// its trigger fires; folded forward by `pond optimize`.
 #[derive(Debug, Clone)]
 pub struct IndexIntent {
     /// Stable on-disk name. Must match across runs so existence checks
@@ -1755,7 +1755,7 @@ impl Handle {
                 // pond presents each PK at most once per batch; FirstSeen keeps
                 // the first occurrence rather than failing (Lance's default).
                 builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-                // Cleanup is operator-driven via `pond index optimize`; the
+                // Cleanup is operator-driven via `pond optimize`; the
                 // per-commit auto hook would add a LIST per write on remote
                 // backends without changing the steady-state retention.
                 builder.skip_auto_cleanup(true);
@@ -1811,7 +1811,8 @@ impl Handle {
         }
     }
 
-    /// Run only the indices phase for one table. Used by `pond embed`'s tail
+    /// Run only the indices phase for one table. Used by the optimize embed
+    /// stage's tail
     /// to fold newly written vectors into the indices without paying the
     /// compaction retry budget while embed itself may still be writing.
     pub async fn optimize_table_indices_only(
@@ -1969,7 +1970,7 @@ impl Handle {
     }
 
     /// Count rows in `table` not yet covered by `index_name`. Manifest-only;
-    /// a missing index reports the whole table. Powers `pond index status`.
+    /// a missing index reports the whole table. Powers `pond status`.
     pub(crate) async fn unindexed_row_count(
         &self,
         table: Table,
@@ -1986,7 +1987,7 @@ impl Handle {
             .sum())
     }
 
-    /// Drop the named index. Used by the `pond embed --force` model-swap path
+    /// Drop the named index. Used by the `pond optimize --force-embed` model-swap path
     /// to retire an IVF_PQ whose centroids belong to the old distance
     /// space, before the next write re-bootstraps it over the new model's
     /// vectors. Errors when the index does not exist; callers may swallow

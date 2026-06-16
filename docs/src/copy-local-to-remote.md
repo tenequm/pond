@@ -1,14 +1,14 @@
-# Migrate from local to remote storage
+# Copy from local to remote storage
 
 This guide moves an existing local pond install onto an S3-compatible object store (Hetzner, Cloudflare R2, Backblaze B2, MinIO, AWS S3, ...). It is written to be run by a person at a terminal, and to be executed by an agent or CI job with no terminal - every interactive step carries an `Agents / CI` note with its non-interactive equivalent, and the whole thing is repeated as one script at the end.
 
-The shape of the migration is four steps that each do exactly one thing: **add credentials -> probe -> copy -> switch**. The copy step verifies itself and rebuilds the destination's indexes, so a clean `migrate` exits with the destination provably complete and ready to query - you never reconcile row counts by hand. Your local data is never modified or deleted at any point; it stays as a full backup.
+The shape of the copy is four steps that each do exactly one thing: **add credentials -> probe -> copy -> switch**. The copy step verifies itself and rebuilds the destination's indexes, so a clean `copy` exits with the destination provably complete and ready to query - you never reconcile row counts by hand. Your local data is never modified or deleted at any point; it stays as a full backup.
 
 ## What this does, and what it never does
 
 - It copies your canonical sessions to a new storage URL and points pond at it.
 - It never deletes or mutates the local store at `~/.local/share/pond`. That directory remains a complete, queryable copy - treat it as your backup, not a cleanup target.
-- It never moves data as a side effect of switching. `pond storage use` only flips a pointer; copying is always the separate, explicit `pond migrate`.
+- It never moves data as a side effect of switching. `pond storage use` only flips a pointer; copying is always the separate, explicit `pond copy`.
 
 ## Before you start
 
@@ -20,7 +20,7 @@ You need three things: pond installed with local data, a bucket, and its S3 cred
    pond status
    ```
 
-   Confirm the `sessions / messages / parts` row counts are non-zero - that is all the baseline you need, because migrate verifies the copy's completeness itself at the end.
+   Confirm the `sessions / messages / parts` row counts are non-zero - that is all the baseline you need, because copy verifies the copy's completeness itself at the end.
 
 2. Create a bucket at your provider and get S3 credentials. Worked example for Hetzner:
    - Hetzner Cloud Console -> your project -> Object Storage -> create a bucket (pick a region, e.g. Nuremberg `nbg1`, Falkenstein `fsn1`, or Helsinki `hel1`). Note the bucket name, say `my-pond`.
@@ -71,19 +71,19 @@ It parses the URL, resolves credentials, performs a conditional put (the optimis
 ## Step 3 - Copy, index, and verify
 
 ```sh
-pond migrate --from ~/.local/share/pond --to "$DEST"
+pond copy --from ~/.local/share/pond --to "$DEST"
 ```
 
-This is the only step that moves data. It is an idempotent union merge: re-runnable, resumable, and valid onto a populated destination; the source is never modified. When the copy finishes, migrate rebuilds the destination's search indexes and then compares the `id` set of every table end to end - it exits `0` only when the destination provably contains every source row (printing a `verify: SYNCED` line) and exits `6`, naming the short table, otherwise. You do not reconcile counts by hand.
+This is the only step that moves data. It is an idempotent union merge: re-runnable, resumable, and valid onto a populated destination; the source is never modified. When the copy finishes, copy rebuilds the destination's search indexes and then compares the `id` set of every table end to end - it exits `0` only when the destination provably contains every source row (printing a `verify: SYNCED` line) and exits `6`, naming the short table, otherwise. You do not reconcile counts by hand.
 
 > **Note:** if the copy is interrupted (network drop, timeout), just run the same command again. Rows already at the destination are skipped, not duplicated. Never wipe the destination to "retry clean" - re-running converges.
 
-> **Large stores:** the index rebuild is the slow part. Pass `--skip-indexes` to defer it - the copy and verify still run - then build the indexes later with `pond sync --only update-indexes --storage-path "$DEST"`.
+> **Large stores:** the index rebuild is the slow part. Pass `--no-optimize` to defer it - the copy and verify still run - then build the indexes later with `pond optimize --only index --storage-path "$DEST"`.
 
-> **Agents / CI:** branch on the exit code - `0` synced and ready, `6` destination missing source rows (re-run migrate; it converges). No `jq`, no count parsing:
+> **Agents / CI:** branch on the exit code - `0` synced and ready, `6` destination missing source rows (re-run copy; it converges). No `jq`, no count parsing:
 >
 > ```sh
-> pond migrate --from ~/.local/share/pond --to "$DEST" || exit 1
+> pond copy --from ~/.local/share/pond --to "$DEST" || exit 1
 > ```
 
 ## Step 4 - Switch pond to the bucket
@@ -92,7 +92,7 @@ This is the only step that moves data. It is an idempotent union merge: re-runna
 pond storage use "$DEST"
 ```
 
-`use` re-probes the destination and then flips `[storage].path` in `config.toml`. It moves no data - the copy already happened in Step 3. It reads no store other than the destination probe; its closing hint prints the exact `migrate --from <old> --to <new>` command so copying the old data over later is one paste away.
+`use` re-probes the destination and then flips `[storage].path` in `config.toml`. It moves no data - the copy already happened in Step 3. It reads no store other than the destination probe; its closing hint prints the exact `pond copy --from <old> --to <new>` command so copying the old data over later is one paste away.
 
 > **Agents / CI:** instead of writing config, set the destination in the environment - `POND_STORAGE_PATH` overrides config everywhere, so containers and ephemeral agents need no `use` step at all:
 >
@@ -102,17 +102,17 @@ pond storage use "$DEST"
 
 ## Step 5 - Confirm
 
-migrate already verified the copy and built the indexes, so this is just a final sanity check that the switch points where you expect:
+copy already verified the copy and built the indexes, so this is just a final sanity check that the switch points where you expect:
 
 ```sh
 pond status
 pond search "something you remember discussing"
 ```
 
-> **Agents / CI:** re-check membership at any time, read-only and without copying, with `pond migrate --verify-only` - exit `0` synced, `6` diverged:
+> **Agents / CI:** re-check membership at any time, read-only and without copying, with `pond copy --verify-only` - exit `0` synced, `6` diverged:
 >
 > ```sh
-> pond migrate --verify-only --from ~/.local/share/pond --to "$DEST"
+> pond copy --verify-only --from ~/.local/share/pond --to "$DEST"
 > ```
 
 ## Roll back, keep your backup
@@ -125,7 +125,7 @@ pond storage use local
 
 If you took the agents/CI path and exported `POND_STORAGE_PATH`, `unset` it (or point it back at the local path) - the environment overrides `config.toml`, so `use` alone won't take effect while it is set.
 
-Keep `~/.local/share/pond` after migrating. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond export -o ~/pond-backup.pond` rather than removing the live directory.
+Keep `~/.local/share/pond` after copying. It is your only full local copy and the doc deliberately does not delete it. If you genuinely need the disk space, take a portable snapshot elsewhere first with `pond copy --to ~/pond-backup.pond` rather than removing the live directory.
 
 Switching storage is transparent to your agent clients: they talk to pond over `pond mcp`, which reads the same `config.toml`, so nothing in Claude Code / Codex / others needs reconfiguring.
 
@@ -142,14 +142,14 @@ Point each machine's `config.toml` (or `POND_*` environment) at the same URL and
 | `check` exits `3` | No credential set matched the destination | Add `[creds.default]` (`pond creds add`) or export `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY`; confirm the binding with `pond config show` |
 | `check` exits `4` | Auth failed - wrong key/secret, or bucket policy denies write/read/delete | Re-check the credentials; ensure the key can put/get/delete/list the bucket; run `pond -vv storage check "$DEST"` for the full error |
 | `check` exits `5` | The store does not support conditional put | Use a store with conditional writes (Hetzner, R2, B2, AWS S3, GCS, Azure; recent MinIO) |
-| `migrate` stalls or is interrupted | Transient network/timeout | Re-run the same `migrate` - it resumes and de-duplicates |
-| `migrate` (or `migrate --verify-only`) exits `6` | Destination is missing source rows (the copy did not finish) | Re-run `migrate` - the union merge converges; do not delete the destination. Re-check read-only with `pond migrate --verify-only --from <src> --to <dest>` |
+| `copy` stalls or is interrupted | Transient network/timeout | Re-run the same `copy` - it resumes and de-duplicates |
+| `copy` (or `copy --verify-only`) exits `6` | Destination is missing source rows (the copy did not finish) | Re-run `copy` - the union merge converges; do not delete the destination. Re-check read-only with `pond copy --verify-only --from <src> --to <dest>` |
 | `pond status` still shows local data after `use` | `POND_STORAGE_PATH` is set and overrides config | Unset it, or set it to the new URL |
 | `pond sync` auth-fails in cron after switching | The scheduler's environment does not inherit your shell exports | Put `POND_CREDS_*` in the launchd plist / systemd unit / crontab environment |
 
 ## One-shot script (agents / CI)
 
-The whole migration, non-interactive, with gates. Needs only `pond`:
+The whole copy, non-interactive, with gates. Needs only `pond`:
 
 ```sh
 set -euo pipefail
@@ -161,12 +161,12 @@ DEST=s3+https://nbg1.your-objectstorage.com/my-pond
 
 pond storage check "$DEST"                                   # gate: exit 0 required
 
-# migrate is resumable and self-verifying: exit 0 = destination provably holds
+# copy is resumable and self-verifying: exit 0 = destination provably holds
 # every source row (indexes rebuilt); exit 6 = rows missing. Retry transient
 # interruptions; both converge on re-run.
-n=0; until pond migrate --from "$SRC" --to "$DEST"; do
-  n=$((n + 1)); [ "$n" -ge 5 ] && { echo "migrate failed after $n attempts"; exit 1; }
-  echo "migrate incomplete; retrying ($n)..."; sleep 5
+n=0; until pond copy --from "$SRC" --to "$DEST"; do
+  n=$((n + 1)); [ "$n" -ge 5 ] && { echo "copy failed after $n attempts"; exit 1; }
+  echo "copy incomplete; retrying ($n)..."; sleep 5
 done
 
 pond storage use "$DEST"                                     # or: export POND_STORAGE_PATH="$DEST"
