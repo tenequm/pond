@@ -12,9 +12,12 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{CompactionOptions, commit_compaction, plan_compaction};
+pub use lance::dataset::write::merge_insert::MergeStats;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
+use lance::dataset::{InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
+pub use lance::dataset::{WriteParams, WriteStats};
 use lance::deps::arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
+use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
 use lance::index::DatasetIndexInternalExt;
 use lance::index::vector::VectorIndexParams;
@@ -1491,6 +1494,19 @@ impl CachedDataset {
         self.last_refresh = Instant::now();
     }
 }
+
+/// Outcome of one [`Handle::append_stream`] write. Lance's `execute_stream`
+/// returns only the new `Dataset` (no write summary), so these totals are
+/// captured from the cumulative `WriteStats` ticks - the same source the live
+/// progress reads - plus pond's own OCC attempt counter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendStats {
+    pub rows: u64,
+    pub bytes_written: u64,
+    pub files_written: u64,
+    pub attempts: u32,
+}
+
 impl Handle {
     /// Open without storage options or explicit cache caps. Backend-aware
     /// defaults from `[runtime]` apply.
@@ -1698,6 +1714,21 @@ impl Handle {
         batch: RecordBatch,
         row_count: usize,
     ) -> Result<u64> {
+        self.merge_insert_stats(table, batch, row_count)
+            .await
+            .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
+    }
+
+    /// Insert-only merge that surfaces Lance's full `MergeStats`. Callers that
+    /// need bytes written, file count, or OCC retry count (e.g. `pond copy`'s
+    /// progress display) use this; the thin wrapper above keeps the
+    /// affected-rows return for everyone else.
+    pub(crate) async fn merge_insert_stats(
+        &self,
+        table: Table,
+        batch: RecordBatch,
+        row_count: usize,
+    ) -> Result<MergeStats> {
         self.merge(
             table,
             batch,
@@ -1726,11 +1757,14 @@ impl Handle {
             WhenNotMatched::DoNothing,
         )
         .await
+        .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
     }
 
     /// Shared merge path for [`Self::merge_insert`] and [`Self::merge_update`].
-    /// Returns the number of rows affected (inserted or updated, whichever the
-    /// behaviors produce).
+    /// Returns Lance's `MergeStats` verbatim so the progress layer can read
+    /// `bytes_written` / `num_files_written` / `num_attempts` without a second
+    /// round-trip; the thin wrappers above project to `u64` for callers that
+    /// only need the affected-rows count.
     async fn merge(
         &self,
         table: Table,
@@ -1739,9 +1773,9 @@ impl Handle {
         op: &'static str,
         when_matched: WhenMatched,
         when_not_matched: WhenNotMatched,
-    ) -> Result<u64> {
+    ) -> Result<MergeStats> {
         if row_count == 0 {
-            return Ok(0);
+            return Ok(MergeStats::default());
         }
         let started = Instant::now();
         let result = self
@@ -1764,13 +1798,13 @@ impl Handle {
                     .execute_reader(Box::new(reader))
                     .await?;
                 cached.replace(dataset.as_ref().clone());
-                Ok((
-                    stats.num_inserted_rows + stats.num_updated_rows,
-                    stats.num_skipped_duplicates,
-                ))
+                Ok(stats)
             })
             .await;
-        let skipped = result.as_ref().map(|(_, s)| *s).unwrap_or(0);
+        let skipped = result
+            .as_ref()
+            .map(|s| s.num_skipped_duplicates)
+            .unwrap_or(0);
         tracing::info!(
             target: "pond::perf",
             op,
@@ -1780,7 +1814,93 @@ impl Handle {
             skipped,
             "merge",
         );
-        result.map(|(affected, _)| affected)
+        result
+    }
+
+    /// Append a streamed source into `table` under a single commit - the
+    /// bandwidth-bound counterpart to [`Self::merge`]. spec.md#session-durable-copy:
+    /// rows that cannot collide on the destination (absent sessions) take this
+    /// path. `Append` never joins or probes the target, so its cost is the
+    /// bytes written, not the per-batch commit + key-scan that `merge_insert`
+    /// pays - the fix for store-to-store copy being commit-latency-bound on
+    /// remote object stores.
+    ///
+    /// `make_source` is a *factory*, not a prebuilt stream: a Lance scan stream
+    /// is one-shot, so an OCC retry rebuilds it. A single per-call
+    /// `WriteCumulative` (shared across attempts, NOT fresh per attempt) makes
+    /// the progress fold exact under retries - see
+    /// [`crate::progress::CopyState::record_write_progress`].
+    pub(crate) async fn append_stream<F, Fut>(
+        &self,
+        table: Table,
+        make_source: F,
+        state: Option<&Arc<crate::progress::CopyState>>,
+    ) -> Result<AppendStats>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<SendableRecordBatchStream>>,
+    {
+        let state = state.cloned();
+        let cum = Arc::new(crate::progress::WriteCumulative::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // Byte-sized fragments, not Lance's 90 GB default: kilobyte rows would
+        // otherwise pack multi-GiB fragments that compaction rewrites
+        // wholesale (see TARGET_FRAGMENT_BYTES). Reuse the create params so the
+        // appended fragments match the table's storage version / row-id mode.
+        let mut params = sessions::write_params_for_create();
+        params.mode = WriteMode::Append;
+        params.max_bytes_per_file = TARGET_FRAGMENT_BYTES as usize;
+
+        let started = Instant::now();
+        self.retry_lance(table.label(), || {
+            let make_source = &make_source;
+            let cum = cum.clone();
+            let state = state.clone();
+            let attempts = attempts.clone();
+            let params = &params;
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut cached = self.cached(table).await?.lock().await;
+                let existing = cached.latest().await?;
+                let stream = make_source().await?;
+                let builder = InsertBuilder::new(Arc::new(existing))
+                    .with_params(params)
+                    .progress(move |stats| match &state {
+                        // Both arms advance `cum`; the live fold only runs when
+                        // a reporter is attached.
+                        Some(state) => state.record_write_progress(table, &cum, &stats),
+                        None => {
+                            cum.observe(&stats);
+                        }
+                    });
+                let new_dataset = builder.execute_stream(stream).await?;
+                cached.replace(new_dataset);
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .await?;
+
+        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(state) = &state {
+            state.record_append(attempts);
+        }
+        let stats = AppendStats {
+            rows: cum.rows(),
+            bytes_written: cum.bytes(),
+            files_written: cum.files(),
+            attempts,
+        };
+        tracing::info!(
+            target: "pond::perf",
+            op = "append",
+            table = %table.label(),
+            rows = stats.rows,
+            files = stats.files_written,
+            attempts,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "append",
+        );
+        Ok(stats)
     }
 
     /// Run the table-local maintenance cycle for the supplied index intents.

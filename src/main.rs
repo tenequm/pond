@@ -132,6 +132,9 @@ impl From<CliSessionFrom> for SessionFrom {
 }
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
 
@@ -702,6 +705,13 @@ enum Command {
         /// after with `pond optimize --only index --storage-path <to>`.
         #[arg(long)]
         no_optimize: bool,
+        /// Emit one NDJSON event per tick to stderr (restic shape:
+        /// `message_type: "status" | "summary"`). Replaces the human
+        /// progress block; the final exit code is unchanged. Store-to-store
+        /// only - the archive/JSONL paths already exit on a final summary
+        /// line.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect configuration.
     ///
@@ -1150,7 +1160,19 @@ async fn main() -> anyhow::Result<()> {
             to,
             verify_only,
             no_optimize,
-        } => run_copy(from, to, verify_only, no_optimize, storage_path, config).await?,
+            json,
+        } => {
+            run_copy(
+                from,
+                to,
+                verify_only,
+                no_optimize,
+                json,
+                storage_path,
+                config,
+            )
+            .await?;
+        }
         Command::Sql {
             sql,
             format,
@@ -1247,7 +1269,19 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
             "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error"
         ))
     });
-    fmt().with_env_filter(filter).with_writer(io::stderr).init();
+    // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)
+    // and the fmt log writer through a shared draw target, so log lines
+    // never clobber an active progress bar. Today no pond span requests a
+    // bar, so the layer is essentially a "safe stderr writer for fmt that
+    // coexists with future bar-rendering spans"; the migration cost when we
+    // do start instrumenting spans (e.g. ingest, optimize) is zero.
+    let indicatif_layer = IndicatifLayer::new();
+    let fmt_layer = fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(indicatif_layer)
+        .init();
 }
 
 #[allow(clippy::print_stdout)]
@@ -1640,6 +1674,7 @@ async fn run_copy(
     to: String,
     verify_only: bool,
     no_optimize: bool,
+    json: bool,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1657,9 +1692,20 @@ async fn run_copy(
             url.display()
         );
     }
+    // `--json` only applies to the store-to-store path; the archive/JSONL
+    // legs already exit with a single final summary line. Reject the
+    // combination loudly rather than silently dropping the flag.
+    if json
+        && !matches!(
+            (&from_ep, &to_ep),
+            (CopyEndpoint::Store(_), CopyEndpoint::Store(_))
+        )
+    {
+        bail!("--json applies to store-to-store copies only");
+    }
     match (from_ep, to_ep) {
         (CopyEndpoint::Store(from), CopyEndpoint::Store(to)) => {
-            run_store_to_store_copy(from, to, verify_only, no_optimize, &loaded).await
+            run_store_to_store_copy(from, to, verify_only, no_optimize, json, &loaded).await
         }
         _ if verify_only => bail!("--verify-only applies to store-to-store copies only"),
         (CopyEndpoint::Store(from), CopyEndpoint::Archive(path)) => {
@@ -1692,6 +1738,7 @@ async fn run_store_to_store_copy(
     to: StorageUrl,
     verify_only: bool,
     no_optimize: bool,
+    json: bool,
     loaded: &Config,
 ) -> anyhow::Result<()> {
     if from.canonical() == to.canonical() {
@@ -1710,65 +1757,127 @@ async fn run_store_to_store_copy(
         }
         return Ok(());
     }
+
     let dim = pond::output::dim();
+    let mode = if json {
+        pond::progress::Mode::Json
+    } else {
+        pond::progress::Mode::Human
+    };
+    let state = pond::progress::CopyState::new();
+    let mut reporter = pond::progress::Reporter::new(state.clone(), mode);
+    reporter.start();
+
+    state.set_phase(pond::progress::Phase::Plan);
+    let plan_started = std::time::Instant::now();
     // Incremental: transfer only the sessions absent or grown on the
     // destination, detected by a data-intrinsic per-session message-count key
     // (spec.md#session-durable-copy). A re-run after a small delta moves and
     // indexes only that delta, never the whole corpus.
     let plan = to_store.plan_incremental_from(&from_store).await?;
+    let plan_elapsed = plan_started.elapsed();
+    // Gauge totals against the whole source corpus; the bar starts at the
+    // sessions already synced (source minus the delta) and fills as the run's
+    // message+part rows land - the denominator that moves on a resumed copy.
+    let new_sessions = plan.new_sessions();
+    let grown_sessions = plan.total().saturating_sub(new_sessions);
+    let already_synced = plan.source_sessions.saturating_sub(plan.total());
+    state.set_sessions_total(plan.source_sessions as u64);
+    state.set_gauge(
+        already_synced as u64,
+        plan.total() as u64,
+        plan.rows_to_copy,
+    );
+    reporter.receipt(&format!(
+        "{} {} sessions to copy ({} new + {} grown, {} on source)  {:.1}s",
+        pond::output::paint("plan", dim),
+        plan.total(),
+        new_sessions,
+        grown_sessions,
+        plan.source_sessions,
+        plan_elapsed.as_secs_f64(),
+    ));
+
     if plan.is_empty() {
         // An empty source is the mistyped-`--from` case caught by the closing
         // `ensure_source_not_empty`; only call a non-empty source up to date.
         if plan.source_sessions > 0 {
-            output(&format!(
+            reporter.receipt(&format!(
                 "{} destination already up to date (0 sessions copied)",
                 pond::output::paint("copy:", dim),
-            ))?;
+            ));
         }
     } else {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        spinner.enable_steady_tick(Duration::from_millis(120));
-        spinner.set_message(format!(
-            "copy: streaming {} session(s) to destination...",
-            plan.sessions.len(),
+        state.set_phase(pond::progress::Phase::Stream);
+        let stream_started = std::time::Instant::now();
+        let imported = to_store
+            .copy_delta_from(&from_store, &plan, Some(&state))
+            .await?;
+        let stream_elapsed = stream_started.elapsed();
+        reporter.receipt(&format!(
+            "{} sessions {} ({} new)  messages {} ({} new)  parts {} ({} new)  {:.1}s",
+            pond::output::paint("stream", dim),
+            imported.rows.sessions,
+            imported.inserted.sessions,
+            imported.rows.messages,
+            imported.inserted.messages,
+            imported.rows.parts,
+            imported.inserted.parts,
+            stream_elapsed.as_secs_f64(),
         ));
-        let imported = to_store.copy_delta_from(&from_store, &plan).await?;
-        spinner.finish_and_clear();
-        render_copy_import(&imported)?;
+
         // Fold the new fragments into the destination indexes (embeddings rode
         // along as data columns - index-build only, no re-embed) so the
         // destination is queryable on exit, not after a separate `pond
         // optimize`. spec.md#lance-index-maintenance.
+        state.set_phase(pond::progress::Phase::Indexes);
+        let indexes_started = std::time::Instant::now();
         if no_optimize {
-            output(&format!(
-                "{} indexes not rebuilt (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
-                pond::output::paint("hint", dim),
+            reporter.receipt(&format!(
+                "{} skipped (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
+                pond::output::paint("indexes", dim),
                 to_resolved.display(),
-            ))?;
+            ));
         } else {
+            // The optimize stage draws its own progress bar; suspend ours so the
+            // two indicatif renderers don't fight over the cursor (the flicker).
+            // Resume before propagating any error so a failed rebuild still
+            // restores the terminal instead of leaving it on a hidden target.
+            reporter.suspend_live();
             let policy = configured_maintenance_policy(loaded, None)?;
-            run_update_indexes_stage(&to_store, &policy).await?;
-            output(&format!(
-                "{} rebuilt text + semantic on destination",
-                pond::output::paint("indexes:", dim),
-            ))?;
+            let indexes_result = run_update_indexes_stage(&to_store, &policy).await;
+            reporter.resume_live();
+            indexes_result?;
+            reporter.receipt(&format!(
+                "{} rebuilt text + semantic on destination  {:.1}s",
+                pond::output::paint("indexes", dim),
+                indexes_started.elapsed().as_secs_f64(),
+            ));
         }
     }
+
     // Prove the copy landed by comparing id-sets, not row counts: the
     // source is never modified, so the user never reconciles by hand.
+    state.set_phase(pond::progress::Phase::Verify);
     let verify = verify_stores(&from_store, &to_store).await?;
     ensure_source_not_empty(&verify, &from_resolved.display())?;
-    if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+    // `render_storage_verify` already prints the SYNCED/FAILED line with
+    // per-table counts, so it is the single verify surface - no duplicate
+    // receipt. The "ready to query" final line is emitted only when the copy
+    // actually verified; on divergence we suppress it (the FAILED line stands)
+    // so the run never contradicts itself before `exit(6)`.
+    let verify_ok =
+        render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?;
+    let final_line = verify_ok.then(|| {
+        format!(
+            "{} destination is ready to query",
+            pond::output::paint("done -", dim),
+        )
+    });
+    reporter.finish(final_line.as_deref()).await;
+    if !verify_ok {
         std::process::exit(6);
     }
-    output(&format!(
-        "{} destination is ready to query",
-        pond::output::paint("done -", dim),
-    ))?;
     Ok(())
 }
 

@@ -4,9 +4,11 @@
 //! incremental copy path is supposed to have:
 //!
 //!   1. **Streaming beats temp-staging on a full copy.** The new path streams
-//!      the source scan straight into the destination merge; the old path
-//!      rewrote every row into a local staging dataset first, then re-read it.
-//!      Both are timed back to back on identical inputs.
+//!      the source scan straight into the destination - appending absent
+//!      sessions under one commit per table; the old path rewrote every row
+//!      into a local staging dataset first, then re-read it. Both are timed
+//!      back to back on identical inputs, and the new path's commit count is
+//!      printed to show it does not scale with scan batches.
 //!   2. **A re-copy is delta-proportional.** After a full copy, a no-op re-copy
 //!      moves zero rows (detection only), and a one-session delta moves only
 //!      that session - not the whole corpus.
@@ -27,6 +29,7 @@ use clap::Parser;
 use pond::{
     handlers::ingest_events,
     sessions::{DeltaPlan, IngestEvent, Store},
+    substrate::Table,
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -133,12 +136,18 @@ async fn seed(store: &Store, sessions: usize, messages: usize) -> Result<()> {
     Ok(())
 }
 
-/// New path: plan the delta, stream it into the destination merge.
-async fn streaming_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128)> {
+/// New path: plan the delta, append absent sessions / merge grown ones into the
+/// destination. Also returns the destination `messages` version bump, i.e. the
+/// number of commits this copy added - the metric that proves the append
+/// collapses to one commit per table instead of one per scan batch.
+async fn streaming_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
+    let before = to.dataset(Table::Messages).await?.version_id();
     let started = Instant::now();
     let plan = to.plan_incremental_from(from).await?;
-    to.copy_delta_from(from, &plan).await?;
-    Ok((plan, started.elapsed().as_millis()))
+    to.copy_delta_from(from, &plan, None).await?;
+    let elapsed = started.elapsed().as_millis();
+    let after = to.dataset(Table::Messages).await?.version_id();
+    Ok((plan, elapsed, after - before))
 }
 
 /// Old path: rewrite every visible row into a local staging dataset, then
@@ -168,10 +177,10 @@ async fn main() -> Result<()> {
 
     // 1. Full copy, streaming (new path).
     let dest = open_store(&args.backend, "dest-stream").await?;
-    let (full_plan, stream_ms) = streaming_copy(&source.store, &dest.store).await?;
+    let (full_plan, stream_ms, full_commits) = streaming_copy(&source.store, &dest.store).await?;
     println!(
-        "[1] full copy  streaming      : {stream_ms:>6} ms  (delta sessions={})",
-        full_plan.sessions.len(),
+        "[1] full copy  streaming      : {stream_ms:>6} ms  (delta sessions={}, messages commits={full_commits})",
+        full_plan.total(),
     );
 
     // 2. Full copy, temp-staging (old path) into a separate fresh destination.
@@ -187,29 +196,30 @@ async fn main() -> Result<()> {
     );
 
     // 3. No-op re-copy of the streamed destination: detection only, zero rows.
-    let (noop_plan, noop_ms) = streaming_copy(&source.store, &dest.store).await?;
+    let (noop_plan, noop_ms, noop_commits) = streaming_copy(&source.store, &dest.store).await?;
     println!(
-        "[3] re-copy    no change      : {noop_ms:>6} ms  (delta sessions={}, expect 0)",
-        noop_plan.sessions.len(),
+        "[3] re-copy    no change      : {noop_ms:>6} ms  (delta sessions={}, messages commits={noop_commits}, expect 0/0)",
+        noop_plan.total(),
     );
 
     // 4. One-session delta: add a session to the source, re-copy.
     ingest_events(&source.store, session_events(args.sessions, args.messages)).await?;
-    let (delta_plan, delta_ms) = streaming_copy(&source.store, &dest.store).await?;
+    let (delta_plan, delta_ms, delta_commits) = streaming_copy(&source.store, &dest.store).await?;
     println!(
-        "[4] re-copy    +1 session     : {delta_ms:>6} ms  (delta sessions={}, expect 1)",
-        delta_plan.sessions.len(),
+        "[4] re-copy    +1 session     : {delta_ms:>6} ms  (delta sessions={}, messages commits={delta_commits}, expect 1/1)",
+        delta_plan.total(),
     );
 
     println!("\nverification:");
     println!(
         "  full delta == all sessions : {}",
-        full_plan.sessions.len() == args.sessions
+        full_plan.total() == args.sessions
+    );
+    println!(
+        "  full copy == 1 msg commit  : {}  (append collapses to one commit per table)",
+        full_commits == 1
     );
     println!("  no-op delta == 0           : {}", noop_plan.is_empty());
-    println!(
-        "  +1 delta == 1              : {}",
-        delta_plan.sessions.len() == 1
-    );
+    println!("  +1 delta == 1              : {}", delta_plan.total() == 1);
     Ok(())
 }

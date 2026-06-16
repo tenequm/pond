@@ -130,6 +130,7 @@ tempfile = "3.25"
 # records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays
 # bounded (see src/adapter/jsonl.rs).
 struson = "0.7"
+termpulse-core = { version = "0.1.0", features = ["std"] }
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 tokio = { version = "1.52", features = ["fs", "io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
@@ -137,6 +138,7 @@ tokio-stream = "0.1.18"
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1.44"
+tracing-indicatif = "0.3.14"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
@@ -156,6 +158,7 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
+assert_cmd = "2"
 # `Jail` for env-mirror tests: sandboxed env vars + cwd without `unsafe`
 # `std::env::set_var` in pond's own code (the crate denies unsafe).
 figment = { version = "0.10.19", features = ["test"] }

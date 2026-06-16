@@ -1,5 +1,6 @@
 ---
 source: src/main.rs
+assertion_line: 4609
 expression: sub.render_long_help().to_string()
 ---
 Copy canonical data between pond stores, `.pond` archives, and the JSONL wire stream.
@@ -20,6 +21,9 @@ Options:
 
       --no-optimize
           Skip the post-copy index rebuild (store-to-store and archive restore, for very large stores you will index later). Build indexes after with `pond optimize --only index --storage-path <to>`
+
+      --json
+          Emit one NDJSON event per tick to stderr (restic shape: `message_type: "status" | "summary"`). Replaces the human progress block; the final exit code is unchanged. Store-to-store only - the archive/JSONL paths already exit on a final summary line
 
   -h, --help
           Print help (see a summary with '-h')

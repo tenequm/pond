@@ -1,11 +1,14 @@
 //! `pond copy` store-to-store data path (spec.md#session-durable-copy): plan an
 //! incremental delta (sessions absent or grown on the destination, by the
-//! per-session message-count key), then stream only that delta straight
-//! into the destination merge - no staging copy. The properties under test are
-//! the plan's contract: round-trip, rerun-is-a-no-op, union onto a populated
-//! destination, and that a second copy moves only what actually changed - all
-//! consequences of `lance-deterministic-pk` + merge-insert, asserted here
-//! rather than promised.
+//! per-session message-count key), then stream only that delta straight into
+//! the destination - **appending** the absent sessions (one commit per scan, no
+//! merge join) and **merging** the grown ones. The properties under test are the
+//! plan's contract: round-trip, rerun-is-a-no-op, union onto a populated
+//! destination, that a second copy moves only what actually changed, that the
+//! append collapses to one commit per table (not one per scan batch), and that a
+//! resumed copy never double-appends - all consequences of
+//! `lance-deterministic-pk` + append-only storage, asserted here rather than
+//! promised.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use chrono::{DateTime, Utc};
@@ -15,7 +18,6 @@ use pond::{
     substrate::Table,
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
-use std::collections::HashSet;
 use url::Url;
 
 fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
@@ -70,7 +72,7 @@ async fn seed(store: &Store, session_id: &str) -> anyhow::Result<()> {
 /// it from `from` into `to` - the same composition the `pond copy` CLI runs.
 async fn copy(from: &Store, to: &Store) -> anyhow::Result<pond::sessions::LanceArchiveImport> {
     let plan = to.plan_incremental_from(from).await?;
-    to.copy_delta_from(from, &plan).await
+    to.copy_delta_from(from, &plan, None).await
 }
 
 fn ts(offset_secs: i64) -> DateTime<Utc> {
@@ -245,20 +247,40 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
     ingest_at(&source, events_at(grown, ts(0), 2, ts(0))).await?;
     ingest_at(&source, events_at(added, ts(5), 1, ts(5))).await?;
 
-    // The plan names exactly the grown and added sessions, not the unchanged one.
+    // The plan routes each session per table: the brand-new session is absent
+    // everywhere (append in all three tables); the grown session's row is
+    // present (no session-table work) but its messages/parts are partially
+    // present, so they merge. The unchanged session appears nowhere.
     let plan = dest.plan_incremental_from(&source).await?;
-    let planned: HashSet<&str> = plan.sessions.iter().map(String::as_str).collect();
     assert_eq!(
-        planned,
-        HashSet::from([grown, added]),
-        "plan must be {{grown, added}}, was {planned:?}",
+        plan.total(),
+        2,
+        "only the grown and added sessions are touched"
     );
+    assert_eq!(
+        plan.sessions.append,
+        vec![added.to_owned()],
+        "only the brand-new session row is appended",
+    );
+    assert!(plan.sessions.merge.is_empty(), "session rows never merge");
+    assert_eq!(
+        plan.messages.append,
+        vec![added.to_owned()],
+        "the new session's messages append",
+    );
+    assert_eq!(
+        plan.messages.merge,
+        vec![grown.to_owned()],
+        "the grown session's messages merge (partially present)",
+    );
+    assert_eq!(plan.parts.append, vec![added.to_owned()]);
+    assert_eq!(plan.parts.merge, vec![grown.to_owned()]);
 
     // The copy inserts only the new rows: the added session row, the added
     // message, and the grown session's one new message - nothing for the
     // unchanged session, and the already-present rows of the grown session are
     // merge-skipped.
-    let delta = dest.copy_delta_from(&source, &plan).await?;
+    let delta = dest.copy_delta_from(&source, &plan, None).await?;
     assert_eq!(delta.inserted.sessions, 1, "only the added session is new");
     assert_eq!(
         delta.inserted.messages, 2,
@@ -277,9 +299,228 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
         );
     }
 
+    // Grown still dedups: the destination row counts equal the source's
+    // exactly - the grown session's already-present message was merge-skipped,
+    // not re-inserted (an append would have duplicated it).
+    assert_eq!(
+        dest.row_counts().await?,
+        source.row_counts().await?,
+        "destination must equal source exactly (grown rows deduped, not doubled)",
+    );
+
     // A third copy with no further source changes is a pure no-op plan.
     let noop = dest.plan_incremental_from(&source).await?;
     assert!(noop.is_empty(), "stable source must plan an empty delta");
     assert_eq!(noop.source_sessions, 3);
+    Ok(())
+}
+
+/// The append fast path collapses to **one commit per table**, independent of
+/// how many scan batches the source produces - the property that makes
+/// store-to-store copy bandwidth-bound instead of commit-latency-bound. Read
+/// the destination `messages` dataset version before and after a from-empty
+/// copy and assert it advanced by exactly one (a single `Append`), not once per
+/// batch. In-memory, no S3 needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_collapses_to_one_commit_per_table() -> anyhow::Result<()> {
+    let source = Store::open(&Url::parse("shared-memory://pond-test-collapse-src/")?).await?;
+    for n in 0..24 {
+        seed(&source, &format!("01HXYCOLLAPSE{n:04}")).await?;
+    }
+
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-collapse-dst/")?).await?;
+    // Force the destination table into existence so the "before" version is the
+    // empty table, then measure the bump the copy adds.
+    let before = dest.dataset(Table::Messages).await?.version_id();
+    let plan = dest.plan_incremental_from(&source).await?;
+    assert_eq!(
+        plan.messages.append.len(),
+        24,
+        "from-empty: every session's messages append",
+    );
+    assert!(plan.messages.merge.is_empty());
+    dest.copy_delta_from(&source, &plan, None).await?;
+    let after = dest.dataset(Table::Messages).await?.version_id();
+
+    assert_eq!(
+        after - before,
+        1,
+        "from-empty append must be a single commit, not one per scan batch \
+         (before={before}, after={after})",
+    );
+    Ok(())
+}
+
+/// A resumed copy never double-appends. Append does not dedup, so correctness
+/// rests entirely on re-planning: once a session has landed it is no longer
+/// `absent`, so a re-run skips it. Copy fully, copy again, and assert the
+/// destination row counts equal the source's exactly - no phantom duplicates.
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_copy_appends_no_duplicates() -> anyhow::Result<()> {
+    let source = Store::open(&Url::parse("shared-memory://pond-test-resume-src/")?).await?;
+    seed(&source, "01HXYRESUME000001").await?;
+    seed(&source, "01HXYRESUME000002").await?;
+    seed(&source, "01HXYRESUME000003").await?;
+
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-resume-dst/")?).await?;
+    copy(&source, &dest).await?;
+    // Re-plan sees a full destination: nothing absent, nothing grown.
+    let replan = dest.plan_incremental_from(&source).await?;
+    assert!(
+        replan.is_empty(),
+        "a complete destination plans an empty delta"
+    );
+    let again = dest.copy_delta_from(&source, &replan, None).await?;
+    assert_eq!(again.inserted.messages, 0, "re-run appends nothing");
+
+    assert_eq!(
+        dest.row_counts().await?,
+        source.row_counts().await?,
+        "resumed copy must not duplicate already-appended rows",
+    );
+    Ok(())
+}
+
+/// The case that made a real resumed copy crawl: the destination already has
+/// every session *row* (the small `sessions` table committed) but its
+/// `messages`/`parts` are empty (the interrupted append never committed - it
+/// commits once at the end). The per-table plan must route those messages/parts
+/// to **append**, not merge, even though the session ids are present. Proven by
+/// the destination `messages` version advancing by exactly one commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_present_but_messages_empty_appends_not_merges() -> anyhow::Result<()> {
+    let source = Store::open(&Url::parse("shared-memory://pond-test-msgempty-src/")?).await?;
+    let ids: Vec<String> = (0..16).map(|n| format!("01HXYMSGEMPTY{n:04}")).collect();
+    for id in &ids {
+        seed(&source, id).await?;
+    }
+
+    // Destination carries only the session rows - no messages, no parts - the
+    // state an interrupted first copy leaves behind.
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-msgempty-dst/")?).await?;
+    for id in &ids {
+        let session = Session {
+            id: id.clone(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: pond::adapter::extract_str(&serde_json::json!({"x": "/tmp/migrate"}), "x")
+                .unwrap(),
+            options: ProviderOptions::new(),
+        };
+        ingest_at(&dest, vec![IngestEvent::Session(session)]).await?;
+    }
+
+    let plan = dest.plan_incremental_from(&source).await?;
+    assert!(
+        plan.sessions.append.is_empty(),
+        "session rows are already present",
+    );
+    assert_eq!(
+        plan.messages.append.len(),
+        ids.len(),
+        "messages are absent on the destination -> append, not merge",
+    );
+    assert!(
+        plan.messages.merge.is_empty(),
+        "nothing to merge: the destination has no messages",
+    );
+    assert_eq!(plan.parts.append.len(), ids.len());
+    assert!(plan.parts.merge.is_empty());
+
+    // The append is a single commit on the messages table despite the session
+    // rows already being present - the resumed-copy fast path.
+    let before = dest.dataset(Table::Messages).await?.version_id();
+    dest.copy_delta_from(&source, &plan, None).await?;
+    let after = dest.dataset(Table::Messages).await?.version_id();
+    assert_eq!(
+        after - before,
+        1,
+        "messages must append in one commit, not per-batch merge (before={before}, after={after})",
+    );
+
+    // And the destination is now a complete, non-duplicated superset.
+    assert_eq!(
+        dest.row_counts().await?,
+        source.row_counts().await?,
+        "destination equals source after appending the missing messages/parts",
+    );
+    Ok(())
+}
+
+/// `pond copy --json` emits NDJSON on stderr: restic-shaped `status` events
+/// during the run and a single closing `summary` event.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_mode_emits_ndjson_status_and_summary() -> anyhow::Result<()> {
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    #[derive(Debug, Deserialize)]
+    struct StatusLine {
+        message_type: String,
+        phase: String,
+        total_files: u64,
+        files_done: u64,
+    }
+    #[derive(Debug, Deserialize)]
+    struct SummaryLine {
+        message_type: String,
+        total_duration: f64,
+        sessions_copied: u64,
+    }
+
+    let src = TempDir::new()?;
+    let dst = TempDir::new()?;
+    let store = Store::open_local(src.path()).await?;
+    seed(&store, "01HXYJSONTEST001").await?;
+    seed(&store, "01HXYJSONTEST002").await?;
+    drop(store);
+
+    let out = assert_cmd::Command::cargo_bin("pond")?
+        .args([
+            "copy",
+            "--from",
+            src.path().to_str().unwrap(),
+            "--to",
+            dst.path().to_str().unwrap(),
+            "--json",
+            "--no-optimize",
+        ])
+        .output()?;
+    assert!(out.status.success(), "pond copy --json must exit 0");
+
+    let stderr = String::from_utf8(out.stderr)?;
+    let json_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with('{')).collect();
+
+    let status_lines: Vec<StatusLine> = json_lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<StatusLine>(l).ok())
+        .filter(|e| e.message_type == "status")
+        .collect();
+    let summary_lines: Vec<SummaryLine> = json_lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<SummaryLine>(l).ok())
+        .filter(|e| e.message_type == "summary")
+        .collect();
+
+    // Status events fire every 100ms; a sub-100ms copy may produce none.
+    // Validate shape on whatever arrived rather than asserting a count.
+    for s in &status_lines {
+        assert_eq!(s.message_type, "status");
+        assert!(
+            matches!(s.phase.as_str(), "plan" | "stream" | "indexes" | "verify"),
+            "unexpected phase {:?}",
+            s.phase,
+        );
+        assert!(s.files_done <= s.total_files || s.total_files == 0);
+    }
+
+    assert_eq!(summary_lines.len(), 1, "expected exactly one summary event");
+    let summary = &summary_lines[0];
+    assert_eq!(summary.message_type, "summary");
+    assert_eq!(summary.sessions_copied, 2, "both seeded sessions copied");
+    assert!(summary.total_duration > 0.0, "total_duration must be > 0");
+
     Ok(())
 }
