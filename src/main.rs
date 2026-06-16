@@ -1709,26 +1709,52 @@ async fn run_store_to_store_copy(
         return Ok(());
     }
     let dim = pond::output::dim();
-    let imported = migrate_between_stores(&from_store, &to_store).await?;
-    render_copy_import(&imported)?;
-    // Make copy self-contained: the clean export strips indexes, so
-    // rebuild them here (embeddings rode along as data columns - this
-    // is index-build only, no re-embed) and the destination is
-    // queryable on exit, not after a separate `pond optimize`.
-    // spec.md#lance-index-maintenance.
-    if no_optimize {
-        output(&format!(
-            "{} indexes not rebuilt (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
-            pond::output::paint("hint", dim),
-            to_resolved.display(),
-        ))?;
+    // Incremental: transfer only the sessions absent or grown on the
+    // destination, detected by a data-intrinsic per-session message-count key
+    // (spec.md#session-durable-copy). A re-run after a small delta moves and
+    // indexes only that delta, never the whole corpus.
+    let plan = to_store.plan_incremental_from(&from_store).await?;
+    if plan.is_empty() {
+        // An empty source is the mistyped-`--from` case caught by the closing
+        // `ensure_source_not_empty`; only call a non-empty source up to date.
+        if plan.source_sessions > 0 {
+            output(&format!(
+                "{} destination already up to date (0 sessions copied)",
+                pond::output::paint("copy:", dim),
+            ))?;
+        }
     } else {
-        let policy = configured_maintenance_policy(loaded, None)?;
-        run_update_indexes_stage(&to_store, &policy).await?;
-        output(&format!(
-            "{} rebuilt text + semantic on destination",
-            pond::output::paint("indexes:", dim),
-        ))?;
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        spinner.set_message(format!(
+            "copy: streaming {} session(s) to destination...",
+            plan.sessions.len(),
+        ));
+        let imported = to_store.copy_delta_from(&from_store, &plan).await?;
+        spinner.finish_and_clear();
+        render_copy_import(&imported)?;
+        // Fold the new fragments into the destination indexes (embeddings rode
+        // along as data columns - index-build only, no re-embed) so the
+        // destination is queryable on exit, not after a separate `pond
+        // optimize`. spec.md#lance-index-maintenance.
+        if no_optimize {
+            output(&format!(
+                "{} indexes not rebuilt (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
+                pond::output::paint("hint", dim),
+                to_resolved.display(),
+            ))?;
+        } else {
+            let policy = configured_maintenance_policy(loaded, None)?;
+            run_update_indexes_stage(&to_store, &policy).await?;
+            output(&format!(
+                "{} rebuilt text + semantic on destination",
+                pond::output::paint("indexes:", dim),
+            ))?;
+        }
     }
     // Prove the copy landed by comparing id-sets, not row counts: the
     // source is never modified, so the user never reconciles by hand.
@@ -2438,26 +2464,6 @@ fn redact_config_value(key: &str, value: &str) -> String {
 /// local staging, then merge-import into the destination. Idempotency comes from
 /// `lance-deterministic-pk` + merge-insert: a rerun inserts nothing, and a
 /// populated destination unions rather than clobbers.
-async fn migrate_between_stores(from: &Store, to: &Store) -> anyhow::Result<LanceArchiveImport> {
-    let staging = tempfile::Builder::new()
-        .prefix("pond-migrate-")
-        .tempdir()
-        .context("failed to create migrate staging dir")?;
-    let data_dir = staging.path().join("data");
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(120));
-    spinner.set_message("copy: reading from source...");
-    let _exported = from.export_clean_lance_datasets(&data_dir).await?;
-    spinner.set_message("copy: merging into destination...");
-    let imported = to.import_clean_lance_datasets(&data_dir).await;
-    spinner.finish_and_clear();
-    imported
-}
-
 /// Resolve both URLs against the loaded creds, print the from/to binding
 /// lines (a wrong scope match must surface before any work, not after an auth
 /// error), and open both stores. Shared by store-to-store copy and verify.

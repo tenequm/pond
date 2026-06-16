@@ -69,6 +69,28 @@ pub struct LanceArchiveImport {
     pub inserted: LanceArchiveCounts,
 }
 
+/// The sessions a store-to-store `pond copy` must transfer: source sessions
+/// absent on the destination, plus those the source has more messages for.
+/// `source_sessions` is the full source session count, kept so the caller can
+/// tell "destination already up to date" (empty delta, non-empty source) from
+/// "empty source" (spec.md#session-durable-copy).
+#[derive(Debug, Clone, Default)]
+pub struct DeltaPlan {
+    pub sessions: Vec<String>,
+    pub source_sessions: usize,
+}
+
+impl DeltaPlan {
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+    /// Every source session is in the delta - a first/full copy, so the table
+    /// scans skip the per-session `IN` filter and stream the source wholesale.
+    fn is_full(&self) -> bool {
+        self.sessions.len() == self.source_sessions
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexIntents {
     pub sessions: Vec<IndexIntent>,
@@ -392,29 +414,197 @@ impl Store {
         // archive table yields zero batches, so merge_insert alone would
         // leave a lazily-created table (parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
-        let mut scan = dataset.scan();
-        // Mirror of the export side: materialize blob bytes, not descriptor
-        // structs - merge_insert writes them into the destination's schema.
-        scan.blob_handling(lance::datatypes::BlobHandling::AllBinary);
-        let mut stream = scan
+        self.merge_scanner(table, dataset.scan(), "archive import")
+            .await
+    }
+
+    /// Stream a prepared source `scanner` into this store's `table` via
+    /// `merge_insert`, materializing blob bytes (not descriptor structs) so the
+    /// merge writes them into the destination's own schema. Shared by the
+    /// archive-restore and store-to-store copy paths; `context` names the
+    /// caller in error messages. Returns (rows scanned, rows inserted).
+    async fn merge_scanner(
+        &self,
+        table: Table,
+        mut scanner: lance::dataset::scanner::Scanner,
+        context: &'static str,
+    ) -> Result<(usize, usize)> {
+        scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
+        let mut stream = scanner
             .try_into_stream()
             .await
-            .with_context(|| format!("failed to scan {} archive table", table.as_str()))?;
+            .with_context(|| format!("failed to scan {} for {context}", table.as_str()))?;
         let mut rows = 0usize;
         let mut inserted = 0usize;
         while let Some(batch) = stream.next().await {
             let batch = batch
-                .with_context(|| format!("failed to read {} archive batch", table.as_str()))?;
+                .with_context(|| format!("failed to read {} {context} batch", table.as_str()))?;
             let row_count = batch.num_rows();
             rows += row_count;
             inserted += self
                 .handle
                 .merge_insert(table, batch, row_count)
                 .await
-                .with_context(|| format!("failed to import {} archive table", table.as_str()))?
+                .with_context(|| format!("failed to merge {} during {context}", table.as_str()))?
                 as usize;
         }
         Ok((rows, inserted))
+    }
+
+    /// Per-session message count - the data-intrinsic freshness key for
+    /// incremental `pond copy`. pond is append-only (merge is
+    /// `WhenMatched::DoNothing`; no edits or deletes), so this count rises iff a
+    /// session gained messages, catching growth a `MAX(timestamp)` key would
+    /// miss when a new message shares the session's latest timestamp. The count
+    /// is source-authored and survives the copy unchanged, so it compares
+    /// soundly across two stores with independent manifest clocks - unlike the
+    /// `_row_last_updated_at_version` commit-clock watermark behind
+    /// `session_last_ingested_at` (spec.md#session-durable-copy). Projects only
+    /// the one column it counts; resolves the `session_id` array once per batch
+    /// and allocates a key only on a session's first row. Distinct from
+    /// `session_message_counts`, which counts a supplied id list one query each;
+    /// this counts every session in a single scan.
+    pub async fn all_session_message_counts(&self) -> Result<HashMap<String, usize>> {
+        let scanner = self
+            .handle
+            .scan(Table::Messages, ScanOpts::project_only(&["session_id"]))
+            .await?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut out: HashMap<String, usize> = HashMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let session_ids = batch
+                .column_by_name("session_id")
+                .context("scan projection dropped the session_id column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("session_id column is not Utf8")?;
+            for row in 0..batch.num_rows() {
+                if session_ids.is_null(row) {
+                    continue;
+                }
+                let session_id = session_ids.value(row);
+                if let Some(count) = out.get_mut(session_id) {
+                    *count += 1;
+                } else {
+                    out.insert(session_id.to_owned(), 1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Plan an incremental store-to-store copy into `self` from `source`: the
+    /// source sessions missing on the destination, plus those the source has
+    /// more messages for than the destination. One fan-out reads both id-sets
+    /// and both count maps; a missing destination count is 0, so a session
+    /// present on the destination with no messages yet still counts as grown the
+    /// moment the source has any.
+    pub async fn plan_incremental_from(&self, source: &Store) -> Result<DeltaPlan> {
+        let (source_ids, dest_ids, source_counts, dest_counts) = tokio::try_join!(
+            source.collect_ids(Table::Sessions),
+            self.collect_ids(Table::Sessions),
+            source.all_session_message_counts(),
+            self.all_session_message_counts(),
+        )?;
+        let source_sessions = source_ids.len();
+        let sessions = source_ids
+            .into_iter()
+            .filter(|id| {
+                let absent = !dest_ids.contains(id);
+                let grown = source_counts.get(id).copied().unwrap_or(0)
+                    > dest_counts.get(id).copied().unwrap_or(0);
+                absent || grown
+            })
+            .collect();
+        Ok(DeltaPlan {
+            sessions,
+            source_sessions,
+        })
+    }
+
+    /// Copy the planned delta sessions from `source` into `self`, streaming the
+    /// source scan straight into the destination merge - no local staging copy.
+    /// `merge_insert` (`WhenMatched::DoNothing`) makes re-merging a grown
+    /// session's already-present rows a no-op, so the unit of work is the whole
+    /// changed session, not an exact per-message diff.
+    pub async fn copy_delta_from(
+        &self,
+        source: &Store,
+        plan: &DeltaPlan,
+    ) -> Result<LanceArchiveImport> {
+        let full = plan.is_full();
+        // The three tables are independent Lance datasets with separate write
+        // locks, so copy them concurrently - mirrors the ingest path's
+        // three-table `try_join!` (see `upsert_session_batch`).
+        let ((sessions, sessions_inserted), (messages, messages_inserted), (parts, parts_inserted)) =
+            tokio::try_join!(
+                self.copy_table_delta(source, Table::Sessions, "id", &plan.sessions, full),
+                self.copy_table_delta(source, Table::Messages, "session_id", &plan.sessions, full),
+                self.copy_table_delta(source, Table::Parts, "session_id", &plan.sessions, full),
+            )?;
+        Ok(LanceArchiveImport {
+            rows: LanceArchiveCounts {
+                sessions,
+                messages,
+                parts,
+            },
+            inserted: LanceArchiveCounts {
+                sessions: sessions_inserted,
+                messages: messages_inserted,
+                parts: parts_inserted,
+            },
+        })
+    }
+
+    async fn copy_table_delta(
+        &self,
+        source: &Store,
+        table: Table,
+        key_column: &'static str,
+        session_ids: &[String],
+        full: bool,
+    ) -> Result<(usize, usize)> {
+        // Force the destination table into existence up front so a lazily
+        // created table (parts) is never left missing when its delta is empty -
+        // same reason as the archive import path.
+        let _ = self.handle.dataset(table).await?;
+        if full {
+            return self.copy_table_scan(source, table, None).await;
+        }
+        let mut rows = 0usize;
+        let mut inserted = 0usize;
+        // Chunk the `IN` list: the key column is btree-indexed on every table
+        // (`sessions.id`, `messages.session_id`, `parts.session_id`), so each
+        // chunk pushes down to an index lookup rather than a full scan.
+        for chunk in session_ids.chunks(COPY_SESSION_IN_CHUNK) {
+            let predicate = in_predicate(key_column, chunk);
+            let (r, i) = self
+                .copy_table_scan(source, table, Some(&predicate))
+                .await?;
+            rows += r;
+            inserted += i;
+        }
+        Ok((rows, inserted))
+    }
+
+    async fn copy_table_scan(
+        &self,
+        source: &Store,
+        table: Table,
+        predicate: Option<&Predicate>,
+    ) -> Result<(usize, usize)> {
+        let scanner = source
+            .handle
+            .scan(
+                table,
+                ScanOpts {
+                    predicate,
+                    projection: None,
+                },
+            )
+            .await?;
+        self.merge_scanner(table, scanner, "copy").await
     }
 
     /// Flat write path. Per-row insert/match truth is not synthesized here -
@@ -3042,6 +3232,11 @@ const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
 /// `get` and every grouped search.
 const SESSIONS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] =
     &[("id", BuiltinIndexType::BTree, "sessions_id_btree")];
+
+/// Session ids per `session_id IN (...)` chunk in an incremental copy: large
+/// enough to amortize per-scan setup, small enough to keep the pushed-down
+/// predicate string and its btree lookup batch bounded.
+const COPY_SESSION_IN_CHUNK: usize = 512;
 
 fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
     Predicate::In(

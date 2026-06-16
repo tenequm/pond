@@ -200,6 +200,10 @@ harness = false
 name = "multiwriter_bench"
 harness = false
 
+[[bench]]
+name = "copy_bench"
+harness = false
+
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo
 # only a step-debugger uses. Faster codegen on every rebuild.
 [profile.dev]
