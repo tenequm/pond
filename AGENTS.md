@@ -34,6 +34,11 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 - Lance crates are pinned to crates.io `7.0.0`. Don't bump without explicit ask.
 
+## Sync change-detection oracle (S3 perf, measured)
+
+- Benchmarked on the real `s3+https://nbg1.../pondarium/pond` corpus (`cargo bench --bench sync_oracle_bench -- --url <store>`): the per-session staleness oracle dominates remote sync time. `Store::session_last_ingested_at` (the `Dataset::versions()` row-version -> commit-timestamp join) costs **79 s warm / 133 s cold on S3** - the version-list is a microsecond local metadata read but a per-manifest-object fetch storm over the network. A messages-based key (`COUNT(*)` / `MAX(timestamp)` / last-id `GROUP BY session_id`) is **0.5-0.6 s warm / 3-5 s cold** - 25-160x faster. Never derive a per-sync watermark from `versions()` on a remote store.
+- Source-side change detection (mtime stat vs JSONL last-record tail-peek) is always **local filesystem** work - adapter files never live on the store - so it's backend-independent (~150 ms warm to tail-peek the whole ~9.4k-file corpus) and needs no S3 measurement. Only the store-side oracle is backend-sensitive.
+
 ## Errors
 
 - `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
