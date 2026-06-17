@@ -40,6 +40,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
 use lance_index::scalar::InvertedIndexParams;
@@ -1242,13 +1243,32 @@ fn newest_index_size_bytes(indices_dir: &std::path::Path) -> u64 {
 /// Rebuild the `search_text` inverted index under one tokenizer; return build ms.
 /// Matches pond's production FTS config (stem off, stop-words kept) so only the
 /// tokenizer differs across variants.
-async fn build_fts_index(messages_path: &std::path::Path, tokenizer: &str) -> Result<u128> {
-    let mut dataset = Dataset::open(messages_path.to_str().context("non-utf8 path")?).await?;
+/// Open the `messages` dataset for index rebuild - locally by path, or remotely
+/// via the resolved S3 URL + creds (mirrors how pond's substrate opens it).
+async fn open_messages_dataset(target: &OpenTarget) -> Result<Dataset> {
+    match target {
+        OpenTarget::Local(dir) => {
+            let path = dir.join("messages.lance");
+            Ok(Dataset::open(path.to_str().context("non-utf8 path")?).await?)
+        }
+        OpenTarget::Remote(resolved) => {
+            let base = resolved.lance_url().as_str().trim_end_matches('/');
+            let uri = format!("{base}/messages.lance");
+            Ok(DatasetBuilder::from_uri(&uri)
+                .with_storage_options(resolved.options.clone())
+                .load()
+                .await?)
+        }
+    }
+}
+
+async fn build_fts_index(dataset: &mut Dataset, tokenizer: &str) -> Result<u128> {
     let params = match tokenizer {
+        // Match pond's production ngram config (FTS_NGRAM_MIN=3, MAX=5).
         "ngram" => InvertedIndexParams::default()
             .base_tokenizer("ngram".to_owned())
-            .ngram_min_length(2)
-            .ngram_max_length(3)
+            .ngram_min_length(3)
+            .ngram_max_length(5)
             .stem(false)
             .remove_stop_words(false),
         "whitespace" => InvertedIndexParams::default()
@@ -1260,9 +1280,11 @@ async fn build_fts_index(messages_path: &std::path::Path, tokenizer: &str) -> Re
             .remove_stop_words(false),
     };
     let t = Instant::now();
+    // Reuse pond's exact index name so replace(true) overwrites the existing
+    // FTS index rather than leaving two inverted indexes on search_text.
     dataset
         .create_index_builder(&["search_text"], IndexType::Inverted, &params)
-        .name("search_text_fts".to_owned())
+        .name("messages_search_text_fts".to_owned())
         .replace(true)
         .await?;
     Ok(t.elapsed().as_millis())
@@ -1272,18 +1294,24 @@ async fn build_fts_index(messages_path: &std::path::Path, tokenizer: &str) -> Re
 /// index size + FTS peak RSS + p50/p95 latency. Answers "do other tokenizers
 /// move the needle" without mutating any shared remote store.
 async fn run_tokenizer_sweep(args: &Args) -> Result<()> {
-    let data_dir = resolve_data_dir(args.data_dir.clone())?;
-    let messages = data_dir.join("messages.lance");
-    if !messages.exists() {
-        anyhow::bail!(
-            "no messages.lance under {} - pass a local --data-dir copy",
-            data_dir.display(),
-        );
-    }
-    let indices_dir = messages.join("_indices");
+    let target = resolve_open_target(args)?;
+    // Index dir is only locally measurable; remote reports size as n/a (the
+    // point at 2M-scale is RAM + latency, not on-disk size which we already
+    // have from the local small-corpus sweep).
+    let local_indices_dir = match &target {
+        OpenTarget::Local(dir) => Some(dir.join("messages.lance").join("_indices")),
+        OpenTarget::Remote(_) => None,
+    };
 
     println!("=== pond serve-mem bench: --tokenizer-sweep ===");
-    println!("data_dir         {}", data_dir.display());
+    println!("store            {}", target_label(&target));
+    println!(
+        "caps             index={} metadata={}",
+        args.index_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+        args.metadata_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+    );
     println!(
         "queries/phase    {} (warmup={}, limit={})",
         args.queries, args.warmup, args.limit
@@ -1303,12 +1331,16 @@ async fn run_tokenizer_sweep(args: &Args) -> Result<()> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
 
     for tokenizer in ["simple", "whitespace", "ngram"] {
-        let build_ms = build_fts_index(&messages, tokenizer).await?;
-        let index_mib = newest_index_size_bytes(&indices_dir) as f64 / 1024.0 / 1024.0;
+        let mut dataset = open_messages_dataset(&target).await?;
+        let build_ms = build_fts_index(&mut dataset, tokenizer).await?;
+        drop(dataset);
+        let index_mib = local_indices_dir
+            .as_ref()
+            .map(|d| newest_index_size_bytes(d) as f64 / 1024.0 / 1024.0);
 
         let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
         thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-        let store = Store::open_local(&data_dir).await?;
+        let store = open_bench_store(&target, bench_caps(args)).await?;
         run_search_phase(SearchPhase {
             name: "warm",
             store: &store,
@@ -1339,10 +1371,11 @@ async fn run_tokenizer_sweep(args: &Args) -> Result<()> {
         sampler.finish();
         drop(store);
 
+        let index_col = index_mib.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.1}"));
         println!(
-            "{:>11}  {:>10.1}  {:>9.1}  {:>9.1}  {:>8}  {:>8}",
+            "{:>11}  {:>10}  {:>9.1}  {:>9.1}  {:>8}  {:>8}",
             tokenizer,
-            index_mib,
+            index_col,
             build_ms as f64 / 1000.0,
             fts_peak_mib,
             steady.p50(),
@@ -1363,7 +1396,7 @@ async fn run_tokenizer_sweep(args: &Args) -> Result<()> {
         "JSON {}",
         serde_json::json!({
             "mode": "tokenizer_sweep",
-            "data_dir": data_dir.display().to_string(),
+            "store": target_label(&target),
             "rows": rows,
         })
     );

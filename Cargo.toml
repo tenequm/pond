@@ -205,6 +205,10 @@ name = "serve_mem_bench"
 harness = false
 
 [[bench]]
+name = "tokenizer_quality_bench"
+harness = false
+
+[[bench]]
 name = "multiwriter_bench"
 harness = false
 
