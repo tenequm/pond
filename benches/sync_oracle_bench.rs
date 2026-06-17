@@ -294,6 +294,52 @@ async fn main() -> Result<()> {
         .await;
     }
 
+    // A3: cost of a per-session PARTS signal (the candidate fix for the
+    // parts-only-growth under-copy). Parts is the largest table - this is the
+    // number that says whether routing copy off a per-session parts key is
+    // affordable on S3.
+    if run("parts_group_count") {
+        println!(
+            "\n[H] parts_group_count - SELECT session_id, COUNT(*) FROM parts GROUP BY session_id (A3)"
+        );
+        let s = store.clone();
+        timed_pair("parts_group_count", args.cold_only, move || {
+            let s = s.clone();
+            async move {
+                let tables = fetch_tables(&s).await.context("fetch tables")?;
+                run_sql(
+                    &tables,
+                    "SELECT session_id, COUNT(*) AS n FROM parts GROUP BY session_id",
+                )
+                .await
+            }
+        })
+        .await;
+    }
+
+    // A2: cost of the closing id-set verify. `verify_stores` runs
+    // `collect_ids` on all three tables of BOTH stores (concurrently); this
+    // times one store's three-table id read - the dominant cost, the set-diff
+    // is in-memory. Parts dominates.
+    if run("verify_collect_ids_all") {
+        println!(
+            "\n[I] verify_collect_ids_all - collect_ids(sessions)+collect_ids(messages)+collect_ids(parts) (A2)"
+        );
+        let s = store.clone();
+        timed_pair("verify_collect_ids_all", args.cold_only, move || {
+            let s = s.clone();
+            async move {
+                let (a, b, c) = tokio::try_join!(
+                    s.collect_ids(Table::Sessions),
+                    s.collect_ids(Table::Messages),
+                    s.collect_ids(Table::Parts),
+                )?;
+                Ok(a.len() + b.len() + c.len())
+            }
+        })
+        .await;
+    }
+
     println!("\ndone");
     println!("\nFor true cold-process timings re-run with --only NAME --cold-only:");
     for name in [
@@ -304,6 +350,8 @@ async fn main() -> Result<()> {
         "messages_total_count",
         "sessions_ids_only",
         "sessions_full_scan",
+        "parts_group_count",
+        "verify_collect_ids_all",
     ] {
         println!(
             "  cargo bench --bench sync_oracle_bench -- --url {url} --only {name} --cold-only"

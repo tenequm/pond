@@ -39,6 +39,11 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 - Benchmarked on the real `s3+https://nbg1.../pondarium/pond` corpus (`cargo bench --bench sync_oracle_bench -- --url <store>`): the per-session staleness oracle dominates remote sync time. `Store::session_last_ingested_at` (the `Dataset::versions()` row-version -> commit-timestamp join) costs **79 s warm / 133 s cold on S3** - the version-list is a microsecond local metadata read but a per-manifest-object fetch storm over the network. A messages-based key (`COUNT(*)` / `MAX(timestamp)` / last-id `GROUP BY session_id`) is **0.5-0.6 s warm / 3-5 s cold** - 25-160x faster. Never derive a per-sync watermark from `versions()` on a remote store.
 - Source-side change detection (mtime stat vs JSONL last-record tail-peek) is always **local filesystem** work - adapter files never live on the store - so it's backend-independent (~150 ms warm to tail-peek the whole ~9.4k-file corpus) and needs no S3 measurement. Only the store-side oracle is backend-sensitive.
 
+## Copy write path: the append fast-path is load-bearing (S3 perf, measured)
+
+- Benchmarked full real corpus (11,185 sessions / ~276k messages) local-source -> S3 scratch, clean cold each (`cargo bench --bench copy_bench -- --source-url <store> --dest-url <s3> --only append|merge`): appending absent sessions is **13.8 min / 1 commit per table**; routing the same rows through merge-insert is **75.7 min / 354 commits** - **5.47x slower** and it left **2,685 objects vs 62**. Merge over S3 is **commit-latency-bound** (one commit per chunk = one round-trip), append is bandwidth-bound (spec.md#session-durable-copy / spec.md:573). Absent rows can't collide, so they MUST append - never merge-insert them on a remote store.
+- Consequence for any write-path unification: a single shared write seam is good (stops bespoke write paths re-appearing), but it MUST expose append-for-absent as a first-class mode, not collapse everything into merge_insert. `copy_bench --only append|merge` is the regression guard.
+
 ## Errors
 
 - `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.

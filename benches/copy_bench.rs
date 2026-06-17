@@ -27,9 +27,10 @@ use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use pond::{
+    config::Config,
     handlers::ingest_events,
     sessions::{DeltaPlan, IngestEvent, Store},
-    substrate::Table,
+    substrate::{RuntimeCaps, StorageUrl, Table},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -46,13 +47,42 @@ struct Args {
     /// Messages (and parts) per seeded session.
     #[arg(long, default_value_t = 5)]
     messages: usize,
-    /// Storage backend for every store in the run.
+    /// Storage backend for the SOURCE store (and dests when --dest-url unset).
     #[arg(long, default_value = "local", value_parser = ["local", "memory"])]
     backend: String,
+    /// C8 S3 mode: base store URL for the destinations. When set, the append
+    /// and merge dests open as real stores at `<base>-c8append` / `<base>-c8merge`
+    /// (creds from the pond config), so the append-vs-merge comparison runs on
+    /// the actual remote write path. The bench prints the two prefixes; clean
+    /// them up after (they are scratch).
+    #[arg(long)]
+    dest_url: Option<String>,
+    /// Use an existing store as the SOURCE (read-only) instead of seeding a
+    /// synthetic one - e.g. the real local corpus, for representative shapes
+    /// at full scale. Skips the seed entirely.
+    #[arg(long)]
+    source_url: Option<String>,
+    /// Run only one copy path: `append` or `merge`. Each then runs as the
+    /// FIRST (cold) S3 op in its own process, removing the connection-warmup
+    /// bias of running append-then-merge in sequence.
+    #[arg(long)]
+    only: Option<String>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
     bench: bool,
+}
+
+async fn open_configured(url: &str) -> Result<Store> {
+    let config_path = pond::config::default_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+    );
+    let config = Config::load(&config_path)?;
+    let storage = StorageUrl::parse(url)?;
+    let resolved = storage.resolve(&config.creds)?;
+    let caps = RuntimeCaps::from_config(&config.runtime);
+    Store::open_with_options(resolved.lance_url(), resolved.options.clone(), caps).await
 }
 
 /// Holds backing dirs alive for the store's lifetime (local backend only).
@@ -161,6 +191,26 @@ async fn temp_staging_copy(from: &Store, to: &Store) -> Result<u128> {
     Ok(started.elapsed().as_millis())
 }
 
+/// C8 treatment: force every absent session through merge-insert instead of the
+/// append fast-path - what routing copy through the unified write seam
+/// (`upsert_session_batch`, `WhenMatched::DoNothing`) would do. Same inputs as
+/// `streaming_copy`; the only difference is append ids are moved into the merge
+/// bucket, so the destination pays a per-row target probe/join. The delta vs
+/// `streaming_copy` is the cost of dropping the append fast-path.
+async fn merge_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
+    let before = to.dataset(Table::Messages).await?.version_id();
+    let mut plan = to.plan_incremental_from(from).await?;
+    for table in [&mut plan.sessions, &mut plan.messages, &mut plan.parts] {
+        let appended = std::mem::take(&mut table.append);
+        table.merge.extend(appended);
+    }
+    let started = Instant::now();
+    to.copy_delta_from(from, &plan).await?;
+    let elapsed = started.elapsed().as_millis();
+    let after = to.dataset(Table::Messages).await?.version_id();
+    Ok((plan, elapsed, after - before))
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -170,30 +220,109 @@ async fn main() -> Result<()> {
         args.backend, args.sessions, args.messages, total_rows,
     );
 
-    let source = open_store(&args.backend, "source").await?;
-    let seed_start = Instant::now();
-    seed(&source.store, args.sessions, args.messages).await?;
-    println!("seed source: {} ms", seed_start.elapsed().as_millis());
+    let source = match &args.source_url {
+        Some(url) => {
+            println!("source: existing store {url} (no seed)");
+            StoreHandle {
+                store: open_configured(url).await?,
+                _temp: None,
+            }
+        }
+        None => {
+            let source = open_store(&args.backend, "source").await?;
+            let seed_start = Instant::now();
+            seed(&source.store, args.sessions, args.messages).await?;
+            println!("seed source: {} ms", seed_start.elapsed().as_millis());
+            source
+        }
+    };
 
-    // 1. Full copy, streaming (new path).
-    let dest = open_store(&args.backend, "dest-stream").await?;
+    // Open the two dests: S3 scratch stores when --dest-url is set, else the
+    // same backend as the source. The append dest carries [1]+[3]+[4]; the
+    // merge dest carries [1b]; they must be distinct so each measures a copy
+    // into a fresh destination.
+    let (append_dest, merge_dest) = match &args.dest_url {
+        Some(base) => {
+            let append_url = format!("{base}-c8append");
+            let merge_url = format!("{base}-c8merge");
+            println!("S3 scratch dests (clean up after):\n  append: {append_url}\n  merge:  {merge_url}\n");
+            (
+                StoreHandle {
+                    store: open_configured(&append_url).await?,
+                    _temp: None,
+                },
+                StoreHandle {
+                    store: open_configured(&merge_url).await?,
+                    _temp: None,
+                },
+            )
+        }
+        None => (
+            open_store(&args.backend, "dest-stream").await?,
+            open_store(&args.backend, "dest-merge").await?,
+        ),
+    };
+
+    // --only: run a single path as the FIRST (cold) S3 op in this process, so
+    // append and merge each get an unbiased cold measurement (no warmup
+    // inherited from the other).
+    match args.only.as_deref() {
+        Some("append") => {
+            let (plan, ms, commits) = streaming_copy(&source.store, &append_dest.store).await?;
+            println!(
+                "[append-only] full copy streaming  : {ms:>6} ms  (delta sessions={}, messages commits={commits})",
+                plan.total(),
+            );
+            return Ok(());
+        }
+        Some("merge") => {
+            let (plan, ms, commits) = merge_copy(&source.store, &merge_dest.store).await?;
+            println!(
+                "[merge-only]  full copy merge-insert: {ms:>6} ms  (delta sessions={}, messages commits={commits})",
+                plan.total(),
+            );
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("--only must be append|merge, got {other:?}"),
+        None => {}
+    }
+
+    // 1. Full copy, streaming (append fast-path).
+    let dest = append_dest;
     let (full_plan, stream_ms, full_commits) = streaming_copy(&source.store, &dest.store).await?;
     println!(
         "[1] full copy  streaming      : {stream_ms:>6} ms  (delta sessions={}, messages commits={full_commits})",
         full_plan.total(),
     );
 
-    // 2. Full copy, temp-staging (old path) into a separate fresh destination.
-    let dest_legacy = open_store(&args.backend, "dest-legacy").await?;
-    let legacy_ms = temp_staging_copy(&source.store, &dest_legacy.store).await?;
-    let speedup = if stream_ms > 0 {
-        legacy_ms as f64 / stream_ms as f64
+    // 1b. C8: full copy of the SAME source via merge-insert (unified seam)
+    // into a fresh destination - the append-vs-merge comparison.
+    let dest_merge = merge_dest;
+    let (merge_plan, merge_ms, merge_commits) = merge_copy(&source.store, &dest_merge.store).await?;
+    let merge_ratio = if stream_ms > 0 {
+        merge_ms as f64 / stream_ms as f64
     } else {
         f64::INFINITY
     };
     println!(
-        "[2] full copy  temp-staging   : {legacy_ms:>6} ms  ({speedup:.2}x slower than streaming)"
+        "[1b] full copy  merge-insert   : {merge_ms:>6} ms  ({merge_ratio:.2}x append; delta sessions={}, messages commits={merge_commits})",
+        merge_plan.total(),
     );
+
+    // 2. Full copy, temp-staging (old path). Local-only: it's the 400x-slow
+    // legacy baseline and would need a third S3 dest, so skip it in S3 mode.
+    if args.dest_url.is_none() {
+        let dest_legacy = open_store(&args.backend, "dest-legacy").await?;
+        let legacy_ms = temp_staging_copy(&source.store, &dest_legacy.store).await?;
+        let speedup = if stream_ms > 0 {
+            legacy_ms as f64 / stream_ms as f64
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "[2] full copy  temp-staging   : {legacy_ms:>6} ms  ({speedup:.2}x slower than streaming)"
+        );
+    }
 
     // 3. No-op re-copy of the streamed destination: detection only, zero rows.
     let (noop_plan, noop_ms, noop_commits) = streaming_copy(&source.store, &dest.store).await?;
