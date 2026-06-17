@@ -41,11 +41,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pond::{
     PROTOCOL_VERSION,
-    config::SearchConfig,
+    config::{Config, SearchConfig},
     embed::{CandleEmbedder, Embedder, LazyEmbedder},
     handlers::{pond_get, pond_search},
     sessions::Store,
-    substrate::RuntimeCaps,
+    sql::{self, Mode, Tables},
+    substrate::{ResolvedStorage, RuntimeCaps, StorageUrl, Table},
     wire::{
         GetEnvelope, GetRequest, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
         SearchResponse,
@@ -78,6 +79,18 @@ const QUERIES: &[&str] = &[
     "schema evolution add column",
 ];
 
+/// `pond_sql_query` workload: one metadata-only count (manifest, no data
+/// read), two column scans, a token filter (FTS-accelerated), and a group-by.
+/// Mirrors the analytic shapes the MCP tool actually serves so the SQL phase
+/// exercises both the cheap-metadata and the read-the-column-from-S3 paths.
+const SQL_QUERIES: &[&str] = &[
+    "SELECT COUNT(*) FROM messages",
+    "SELECT MIN(timestamp), MAX(timestamp) FROM messages",
+    "SELECT COUNT(*) FROM messages WHERE project LIKE '%pond%'",
+    "SELECT message_id FROM messages WHERE contains_tokens(search_text, 'storage') LIMIT 10",
+    "SELECT source_agent, COUNT(*) AS n FROM messages GROUP BY source_agent ORDER BY n DESC LIMIT 5",
+];
+
 #[derive(Parser)]
 #[command(about = "pond mcp/serve read-only memory bench: peak RSS per phase vs target ceiling")]
 struct Args {
@@ -85,6 +98,21 @@ struct Args {
     /// when present.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Remote storage URL (e.g. `s3+https://host/bucket/prefix`). When set, the
+    /// bench opens the remote store with creds resolved from the pond config
+    /// instead of `--data-dir` - this is how we measure real S3 read cost.
+    #[arg(long)]
+    storage_path: Option<String>,
+    /// Config file for creds (default `~/.config/pond/config.toml`). Only used
+    /// with `--storage-path`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Override the Lance index cache cap (MiB). Default: remote 2048, local 256.
+    #[arg(long)]
+    index_cache_mib: Option<u64>,
+    /// Override the Lance metadata cache cap (MiB). Default: remote 512, local 128.
+    #[arg(long)]
+    metadata_cache_mib: Option<u64>,
     /// Queries per steady-state phase.
     #[arg(long, default_value_t = 30)]
     queries: usize,
@@ -555,6 +583,111 @@ async fn run_get_phase(
     })
 }
 
+async fn run_sql_phase(
+    name: &'static str,
+    store: &Store,
+    sampler: &RssSampler,
+    queries: &[&str],
+) -> Result<PhaseStats> {
+    let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
+    sampler.mark_phase_start();
+    let mut elapsed_ms: Vec<u128> = Vec::with_capacity(queries.len());
+
+    for q in queries {
+        // Mirror the MCP tool exactly: build `Tables` fresh per call (the
+        // try_join of the three dataset() freshness gates) then run one
+        // read-only query. The dataset handles are cached in the shared
+        // Session, so this isn't a reopen - it's the same per-request shape
+        // `transport.rs` serves.
+        let t = Instant::now();
+        let tables = Tables {
+            sessions: store.dataset(Table::Sessions).await?,
+            messages: store.dataset(Table::Messages).await?,
+            parts: store.dataset(Table::Parts).await?,
+        };
+        match sql::run(&tables, q, Mode::Inline, sql::DEFAULT_INLINE_ROWS).await {
+            Ok(_) => {}
+            Err(error) => anyhow::bail!("{name}: sql {q:?} failed: {error:?}"),
+        }
+        elapsed_ms.push(t.elapsed().as_millis());
+    }
+
+    Ok(PhaseStats {
+        name,
+        queries: queries.len(),
+        elapsed_ms,
+        rss_start_kb,
+        rss_end_kb: sampler.current_kb(),
+        rss_phase_peak_kb: sampler.phase_peak_kb(),
+        rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: String::new(),
+    })
+}
+
+/// Where the bench opens its store. `Local` keeps the original
+/// `~/.local/share/pond` behavior; `Remote` carries a creds-resolved S3
+/// destination so we can measure real object-store read cost.
+enum OpenTarget {
+    Local(PathBuf),
+    Remote(ResolvedStorage),
+}
+
+fn target_label(target: &OpenTarget) -> String {
+    match target {
+        OpenTarget::Local(path) => format!("local  {}", path.display()),
+        OpenTarget::Remote(resolved) => format!("remote {}", resolved.lance_url()),
+    }
+}
+
+fn load_bench_config(args: &Args) -> Result<Config> {
+    let path = args.config.clone().unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        home.join(".config").join("pond").join("config.toml")
+    });
+    Config::load(&path).with_context(|| format!("load config {}", path.display()))
+}
+
+/// Explicit cache caps from CLI; `None` lets the substrate pick its
+/// backend-aware default (remote 2 GiB/512 MiB, local 256/128 MiB).
+fn bench_caps(args: &Args) -> RuntimeCaps {
+    RuntimeCaps {
+        index_cache_bytes: args.index_cache_mib.map(|m| (m as usize) * 1024 * 1024),
+        metadata_cache_bytes: args.metadata_cache_mib.map(|m| (m as usize) * 1024 * 1024),
+    }
+}
+
+fn resolve_open_target(args: &Args) -> Result<OpenTarget> {
+    if let Some(storage_path) = &args.storage_path {
+        let config = load_bench_config(args)?;
+        let url = StorageUrl::parse(storage_path).context("parse --storage-path")?;
+        let resolved = url
+            .resolve(&config.creds)
+            .context("resolve creds for --storage-path")?;
+        Ok(OpenTarget::Remote(resolved))
+    } else {
+        Ok(OpenTarget::Local(resolve_data_dir(args.data_dir.clone())?))
+    }
+}
+
+async fn open_bench_store(target: &OpenTarget, caps: RuntimeCaps) -> Result<Store> {
+    match target {
+        OpenTarget::Local(dir) => {
+            let url = pond::config::url_for_path(dir)?;
+            Store::open_with_options(&url, std::collections::HashMap::new(), caps).await
+        }
+        OpenTarget::Remote(resolved) => {
+            Store::open_with_options(resolved.lance_url(), resolved.options.clone(), caps).await
+        }
+    }
+}
+
 fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -761,16 +894,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let data_dir = resolve_data_dir(args.data_dir.clone())?;
-    if !data_dir.join("sessions.lance").exists() {
-        anyhow::bail!(
-            "no Lance datasets under {} - pass --data-dir to a populated pond",
-            data_dir.display(),
-        );
+    let target = resolve_open_target(&args)?;
+    if let OpenTarget::Local(dir) = &target {
+        if !dir.join("sessions.lance").exists() {
+            anyhow::bail!(
+                "no Lance datasets under {} - pass --data-dir or --storage-path",
+                dir.display(),
+            );
+        }
     }
 
     if args.cap_sweep {
-        return run_cap_sweep(&args, &data_dir).await;
+        return run_cap_sweep(&args, &target).await;
     }
 
     let cfg = SearchConfig::default();
@@ -778,7 +913,14 @@ async fn main() -> Result<()> {
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
 
     println!("=== pond serve-mem bench (read-only) ===");
-    println!("data_dir         {}", data_dir.display());
+    println!("store            {}", target_label(&target));
+    println!(
+        "caps             index={} metadata={} (None = backend default)",
+        args.index_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+        args.metadata_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+    );
     println!(
         "queries          {} per phase, warmup={}, limit={}",
         args.queries, args.warmup, args.limit,
@@ -802,7 +944,7 @@ async fn main() -> Result<()> {
     let mut phases: Vec<PhaseStats> = Vec::new();
     sampler.mark_phase_start();
     let t = Instant::now();
-    let store = Store::open_local(&data_dir).await?;
+    let store = open_bench_store(&target, bench_caps(&args)).await?;
     let open_ms = t.elapsed().as_millis();
     // Give the sampler one tick to catch any post-open allocation.
     thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
@@ -824,6 +966,18 @@ async fn main() -> Result<()> {
     // For cold_open, latency stats use the one open() call.
     cold.elapsed_ms = vec![open_ms];
     phases.push(cold);
+
+    // ---- Phase: sql_cold (first sql_query on a freshly opened store) ----
+    // One column-scan query, cache cold - the cold-start a `pond_sql_query`
+    // caller pays before anything is resident.
+    run_sql_phase("sql_cold", &store, &sampler, &SQL_QUERIES[1..2])
+        .await
+        .map(|s| phases.push(s))?;
+
+    // ---- Phase: sql_steady (warm-cache sql_query latency) ----
+    run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
+        .await
+        .map(|s| phases.push(s))?;
 
     // LazyEmbedder created but NOT loaded - matches `pond mcp` lazy behavior.
     let embedder = LazyEmbedder::candle();
@@ -995,7 +1149,7 @@ async fn main() -> Result<()> {
         })
         .collect();
     let json = serde_json::json!({
-        "data_dir": data_dir.display().to_string(),
+        "store": target_label(&target),
         "queries_per_phase": args.queries,
         "target_mib": args.target_mib,
         "baseline_mib": baseline_kb as f64 / 1024.0,
@@ -1016,11 +1170,11 @@ async fn main() -> Result<()> {
 /// `[runtime]` defaults against a real corpus (`docs/plans/mcp-memory-budget.md`
 /// Q5). The E5 embedder loads once and is reused across grid points so the
 /// model-load spike is not double-counted.
-async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
+async fn run_cap_sweep(args: &Args, target: &OpenTarget) -> Result<()> {
     const SWEEP_MIB: &[u64] = &[32, 64, 128, 256, 512, 1024];
 
     println!("=== pond serve-mem bench: --cap-sweep ===");
-    println!("data_dir         {}", data_dir.display());
+    println!("store            {}", target_label(target));
     println!(
         "queries/phase    {} (warmup={}, limit={})",
         args.queries, args.warmup, args.limit
@@ -1048,8 +1202,7 @@ async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
 
         let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
         thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-        let url = pond::config::url_for_path(data_dir)?;
-        let store = Store::open_with_options(&url, Default::default(), caps).await?;
+        let store = open_bench_store(target, caps).await?;
 
         run_search_phase(SearchPhase {
             name: "warm",
@@ -1104,7 +1257,7 @@ async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
 
     let json = serde_json::json!({
         "mode": "cap_sweep",
-        "data_dir": data_dir.display().to_string(),
+        "store": target_label(target),
         "rows": rows,
     });
     println!();
