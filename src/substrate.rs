@@ -1029,6 +1029,7 @@ impl IndexParamsKind {
     fn index_type(&self) -> IndexType {
         match self {
             Self::Scalar(BuiltinIndexType::Bitmap) => IndexType::Bitmap,
+            Self::Scalar(BuiltinIndexType::ZoneMap) => IndexType::ZoneMap,
             Self::Scalar(_) => IndexType::BTree,
             Self::InvertedFtsNgram { .. } => IndexType::Inverted,
             Self::IvfPqCosine { .. } => IndexType::Vector,
@@ -1146,6 +1147,18 @@ pub enum OptimizeEvent {
         phase: OptimizePhase,
         elapsed_ms: u64,
     },
+    /// Intra-index liveness, forwarded from Lance's `IndexBuildProgress`
+    /// callbacks (FTS tokenize/copy, IVF train/shuffle/merge, BTree/Bitmap
+    /// build stages). Fires many times per index between `PhaseStart` /
+    /// `PhaseDone`; the spinner just overwrites its message each tick.
+    IndexStage {
+        table: Table,
+        index: String,
+        stage: String,
+        completed: u64,
+        total: Option<u64>,
+        unit: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1169,11 +1182,132 @@ impl OptimizePhase {
     }
 }
 
-pub type OptimizeProgressFn = Box<dyn Fn(OptimizeEvent) + Send + Sync>;
+/// `Arc` rather than `Box` so the same callback can be cloned into the
+/// `PondIndexProgress` Arc that Lance's `IndexBuildProgress` builder demands -
+/// otherwise intra-index stage events have no path back to the CLI spinner.
+pub type OptimizeProgressFn = Arc<dyn Fn(OptimizeEvent) + Send + Sync>;
 
 fn emit(progress: Option<&OptimizeProgressFn>, event: OptimizeEvent) {
     if let Some(callback) = progress {
         callback(event);
+    }
+}
+
+/// Bridges Lance's `IndexBuildProgress` async callbacks (`stage_start`,
+/// `stage_progress`, `stage_complete`) into pond's `OptimizeEvent::IndexStage`
+/// stream so the CLI spinner can show "fts tokenize_docs 1.4M / 2M rows"
+/// instead of going dark for 10-20 minutes during a single `create_index` or
+/// `optimize_indices` call. Remembers the active stage's `total` / `unit` so
+/// `stage_progress` (which only carries `completed`) can render a full
+/// fraction. Emissions are throttled to one every 100ms; FTS's per-batch
+/// `stage_progress` calls would otherwise contend the spinner mutex.
+struct PondIndexProgress {
+    callback: OptimizeProgressFn,
+    table: Table,
+    index: String,
+    state: std::sync::Mutex<PondIndexStageState>,
+}
+
+// `IndexBuildProgress` requires `Debug`; the `callback` field is
+// `Arc<dyn Fn...>` which has no `Debug` impl, so derive doesn't apply.
+impl std::fmt::Debug for PondIndexProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PondIndexProgress")
+            .field("table", &self.table)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PondIndexStageState {
+    total: Option<u64>,
+    unit: String,
+    last_emit: Option<Instant>,
+}
+
+impl PondIndexProgress {
+    fn new(callback: OptimizeProgressFn, table: Table, index: String) -> Arc<Self> {
+        Arc::new(Self {
+            callback,
+            table,
+            index,
+            state: std::sync::Mutex::new(PondIndexStageState::default()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_index::progress::IndexBuildProgress for PondIndexProgress {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
+        if let Ok(mut state) = self.state.lock() {
+            state.total = total;
+            state.unit = unit.to_owned();
+            state.last_emit = Some(Instant::now());
+        }
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed: 0,
+            total,
+            unit: unit.to_owned(),
+        });
+        Ok(())
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
+        let (total, unit) = {
+            let Ok(mut state) = self.state.lock() else {
+                return Ok(());
+            };
+            let now = Instant::now();
+            if let Some(prev) = state.last_emit
+                && now.duration_since(prev) < Duration::from_millis(100)
+            {
+                return Ok(());
+            }
+            state.last_emit = Some(now);
+            (state.total, state.unit.clone())
+        };
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed,
+            total,
+            unit,
+        });
+        Ok(())
+    }
+
+    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
+        let (total, unit) = {
+            let Ok(state) = self.state.lock() else {
+                return Ok(());
+            };
+            (state.total, state.unit.clone())
+        };
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed: total.unwrap_or(0),
+            total,
+            unit,
+        });
+        Ok(())
+    }
+}
+
+fn lance_progress(
+    progress: Option<&OptimizeProgressFn>,
+    table: Table,
+    index: &str,
+) -> Arc<dyn lance_index::progress::IndexBuildProgress> {
+    match progress {
+        Some(callback) => PondIndexProgress::new(callback.clone(), table, index.to_owned()),
+        None => Arc::new(lance_index::progress::NoopIndexBuildProgress),
     }
 }
 
@@ -1497,14 +1631,44 @@ impl CachedDataset {
 
 /// Outcome of one [`Handle::append_stream`] write. Lance's `execute_stream`
 /// returns only the new `Dataset` (no write summary), so these totals are
-/// captured from the cumulative `WriteStats` ticks - the same source the live
-/// progress reads - plus pond's own OCC attempt counter.
+/// captured from the cumulative `WriteStats` ticks plus pond's own OCC attempt
+/// counter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppendStats {
     pub rows: u64,
     pub bytes_written: u64,
     pub files_written: u64,
     pub attempts: u32,
+}
+
+/// Monotonic high-water fold over the cumulative `WriteStats` ticks
+/// `append_stream` receives. Lance restarts a stream's cumulative counters from
+/// zero on each OCC retry, so `fetch_max` keeps the fold monotonic - a retry
+/// contributes nothing until it passes the prior mark, making `AppendStats`
+/// exact under retries.
+#[derive(Default)]
+struct WriteAccum {
+    rows: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    files: std::sync::atomic::AtomicU64,
+}
+
+impl WriteAccum {
+    fn observe(&self, stats: &WriteStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows.fetch_max(stats.rows_written, Relaxed);
+        self.bytes.fetch_max(stats.bytes_written, Relaxed);
+        self.files.fetch_max(stats.files_written as u64, Relaxed);
+    }
+    fn rows(&self) -> u64 {
+        self.rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn files(&self) -> u64 {
+        self.files.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Handle {
@@ -1826,22 +1990,19 @@ impl Handle {
     /// remote object stores.
     ///
     /// `make_source` is a *factory*, not a prebuilt stream: a Lance scan stream
-    /// is one-shot, so an OCC retry rebuilds it. A single per-call
-    /// `WriteCumulative` (shared across attempts, NOT fresh per attempt) makes
-    /// the progress fold exact under retries - see
-    /// [`crate::progress::CopyState::record_write_progress`].
+    /// is one-shot, so an OCC retry rebuilds it. A single per-call `WriteAccum`
+    /// (shared across attempts, NOT fresh per attempt) makes the row/byte/file
+    /// fold exact under retries.
     pub(crate) async fn append_stream<F, Fut>(
         &self,
         table: Table,
         make_source: F,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<AppendStats>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<SendableRecordBatchStream>>,
     {
-        let state = state.cloned();
-        let cum = Arc::new(crate::progress::WriteCumulative::default());
+        let cum = Arc::new(WriteAccum::default());
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         // Byte-sized fragments, not Lance's 90 GB default: kilobyte rows would
         // otherwise pack multi-GiB fragments that compaction rewrites
@@ -1855,7 +2016,6 @@ impl Handle {
         self.retry_lance(table.label(), || {
             let make_source = &make_source;
             let cum = cum.clone();
-            let state = state.clone();
             let attempts = attempts.clone();
             let params = &params;
             async move {
@@ -1865,14 +2025,7 @@ impl Handle {
                 let stream = make_source().await?;
                 let builder = InsertBuilder::new(Arc::new(existing))
                     .with_params(params)
-                    .progress(move |stats| match &state {
-                        // Both arms advance `cum`; the live fold only runs when
-                        // a reporter is attached.
-                        Some(state) => state.record_write_progress(table, &cum, &stats),
-                        None => {
-                            cum.observe(&stats);
-                        }
-                    });
+                    .progress(move |stats| cum.observe(&stats));
                 let new_dataset = builder.execute_stream(stream).await?;
                 cached.replace(new_dataset);
                 Ok::<_, anyhow::Error>(())
@@ -1881,9 +2034,6 @@ impl Handle {
         .await?;
 
         let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(state) = &state {
-            state.record_append(attempts);
-        }
         let stats = AppendStats {
             rows: cum.rows(),
             bytes_written: cum.bytes(),
@@ -1994,15 +2144,39 @@ impl Handle {
         }
     }
 
-    pub async fn rebuild_index(&self, table: Table, intent: &IndexIntent) -> Result<()> {
-        self.retry_lance(table.label(), || async {
-            let mut guard = self.cached(table).await?.lock().await;
-            let mut dataset = guard.latest().await?;
-            rebuild_index(&mut dataset, intent).await?;
-            guard.replace(dataset);
-            Ok(())
-        })
-        .await
+    pub async fn rebuild_index(
+        &self,
+        table: Table,
+        intent: &IndexIntent,
+        progress: Option<&OptimizeProgressFn>,
+    ) -> Result<()> {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::IndexRebuild,
+                detail: Some(intent.name.to_owned()),
+            },
+        );
+        let started = Instant::now();
+        let result = self
+            .retry_lance(table.label(), || async {
+                let mut guard = self.cached(table).await?.lock().await;
+                let mut dataset = guard.latest().await?;
+                rebuild_index(&mut dataset, intent, progress, table).await?;
+                guard.replace(dataset);
+                Ok(())
+            })
+            .await;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::IndexRebuild,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+        result
     }
 
     pub async fn index_status(
@@ -2105,6 +2279,41 @@ impl Handle {
             .iter()
             .map(|fragment| fragment.num_rows().unwrap_or(0))
             .sum())
+    }
+
+    /// Which table owns the named index, if any. Used by
+    /// `pond optimize --drop-index <name>` to route the drop to the right
+    /// dataset without sequentially probing-and-swallowing errors (the prior
+    /// loop hid permission/network failures behind "no such index"). Runs the
+    /// three `load_indices` calls in parallel; an error here is a real I/O
+    /// failure and propagates with context.
+    pub(crate) async fn find_index_owner(&self, name: &str) -> Result<Option<Table>> {
+        let list = |table: Table| async move {
+            let dataset = self.dataset(table).await?;
+            let names: Vec<String> = dataset
+                .load_indices()
+                .await
+                .with_context(|| format!("load_indices failed for {}", table.label()))?
+                .iter()
+                .map(|index| index.name.clone())
+                .collect();
+            Ok::<_, anyhow::Error>(names)
+        };
+        let (sessions, messages, parts) = tokio::try_join!(
+            list(Table::Sessions),
+            list(Table::Messages),
+            list(Table::Parts),
+        )?;
+        for (table, names) in [
+            (Table::Sessions, sessions),
+            (Table::Messages, messages),
+            (Table::Parts, parts),
+        ] {
+            if names.iter().any(|n| n == name) {
+                return Ok(Some(table));
+            }
+        }
+        Ok(None)
     }
 
     /// Drop the named index. Used by the `pond optimize --force-embed` model-swap path
@@ -2445,6 +2654,11 @@ async fn optimize_table_compact(
         },
     );
     let started = Instant::now();
+    // Lance v7 `cleanup_old_versions` removes orphan files inside
+    // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
+    // index merges accumulate empty UUID dirs forever (one inode each).
+    // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
+    // here (spec.md#concurrency: Lance-native maintenance only).
     dataset
         .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
         .await
@@ -2500,13 +2714,10 @@ async fn optimize_table_indices(
             );
             let started = Instant::now();
             dataset
-                .create_index(
-                    &[intent.column],
-                    index_type,
-                    Some(intent.name.to_owned()),
-                    params.as_ref(),
-                    false,
-                )
+                .create_index_builder(&[intent.column], index_type, params.as_ref())
+                .name(intent.name.to_owned())
+                .replace(false)
+                .progress(lance_progress(progress, table, intent.name))
                 .await
                 .with_context(|| format!("failed to create index {}", intent.name))?;
             emit(
@@ -2551,13 +2762,10 @@ async fn optimize_table_indices(
                 );
                 let started = Instant::now();
                 dataset
-                    .create_index(
-                        &[intent.column],
-                        index_type,
-                        Some(intent.name.to_owned()),
-                        params.as_ref(),
-                        true,
-                    )
+                    .create_index_builder(&[intent.column], index_type, params.as_ref())
+                    .name(intent.name.to_owned())
+                    .replace(true)
+                    .progress(lance_progress(progress, table, intent.name))
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
                 emit(
@@ -2587,13 +2795,14 @@ async fn optimize_table_indices(
                 );
                 let started = Instant::now();
                 dataset
-                    .create_index(
+                    .create_index_builder(
                         &[intent.column],
                         intent.params.index_type(),
-                        Some(intent.name.to_owned()),
                         params.as_ref(),
-                        true,
                     )
+                    .name(intent.name.to_owned())
+                    .replace(true)
+                    .progress(lance_progress(progress, table, intent.name))
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
                 emit(
@@ -2643,19 +2852,25 @@ async fn optimize_table_indices(
     Ok(did_work)
 }
 
-async fn rebuild_index(dataset: &mut Dataset, intent: &IndexIntent) -> Result<()> {
+async fn rebuild_index(
+    dataset: &mut Dataset,
+    intent: &IndexIntent,
+    progress: Option<&OptimizeProgressFn>,
+    table: Table,
+) -> Result<()> {
     if !intent.trigger.should_create(dataset).await? {
         return Ok(());
     }
     let params = intent.params.build(dataset).await?;
     dataset
-        .create_index(
+        .create_index_builder(
             &[intent.column],
             intent.params.index_type(),
-            Some(intent.name.to_owned()),
             params.as_ref(),
-            true,
         )
+        .name(intent.name.to_owned())
+        .replace(true)
+        .progress(lance_progress(progress, table, intent.name))
         .await
         .with_context(|| format!("failed to rebuild index {}", intent.name))?;
     Ok(())

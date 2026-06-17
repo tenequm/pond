@@ -121,6 +121,7 @@ object_store = { version = "0.13", default-features = false }
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+rlimit = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # `~` + `$VAR` expansion for user-supplied paths in config values.
@@ -130,7 +131,6 @@ tempfile = "3.25"
 # records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays
 # bounded (see src/adapter/jsonl.rs).
 struson = "0.7"
-termpulse-core = { version = "0.1.0", features = ["std"] }
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 tokio = { version = "1.52", features = ["fs", "io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
@@ -205,6 +205,14 @@ harness = false
 
 [[bench]]
 name = "copy_bench"
+harness = false
+
+[[bench]]
+name = "ops_bench"
+harness = false
+
+[[bench]]
+name = "sync_oracle_bench"
 harness = false
 
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo

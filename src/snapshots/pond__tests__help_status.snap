@@ -1,5 +1,6 @@
 ---
 source: src/main.rs
+assertion_line: 4707
 expression: sub.render_long_help().to_string()
 ---
 Show pond health, data, and adapter status.
@@ -9,15 +10,8 @@ Storage destination and size, row counts, index readiness, embedding backlog, co
 Usage: pond status [OPTIONS]
 
 Options:
-      --adapters
-          Show one section per adapter, with project tables and index detail.
-          
-          Implies `--include-subagents` so the rollup reconciles with the storage row counts above.
-
       --include-subagents
-          Break out sub-agent sessions (e.g. `claude-code/general-purpose`).
-          
-          Default rolls sessions up to the main agent only.
+          Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`) as its own adapter. Default counts only main agents
 
       --format <FORMAT>
           Output format: `text` (human tables) or `json` (one document)
@@ -48,5 +42,5 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond status              the one-screen overview
-  pond status --adapters   per-adapter and per-project breakdown
+  pond status                       the one-screen overview
+  pond status --include-subagents   count each subagent as its own adapter

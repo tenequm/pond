@@ -141,52 +141,28 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 }
 
 #[tokio::test]
-async fn corpus_stats_groups_by_adapter_and_project() -> anyhow::Result<()> {
+async fn adapter_names_filters_subagents_by_default() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
-    let stats = store.corpus_stats(false).await?;
-    assert!(stats.totals.sessions > 0);
-    assert!(stats.totals.messages > 0);
-
-    let claude = stats
-        .adapters
-        .iter()
-        .find(|stat| stat.adapter == "claude-code")
-        .expect("claude-code section present");
-    assert!(!claude.projects.is_empty());
-    let project_sessions: u64 = claude.projects.iter().map(|p| p.sessions).sum();
-    let project_messages: u64 = claude.projects.iter().map(|p| p.messages).sum();
-    assert_eq!(claude.sessions, project_sessions);
-    assert_eq!(claude.messages, project_messages);
     // `include_subagents=false` (the CLI default): sub-branded sessions
-    // (`source_agent` with a `/`) are filtered out of the breakdown, so no
-    // adapter row carries a `/` and the breakdown sums to strictly less than
-    // `totals` - the fixture corpus has two subagent sessions.
-    assert!(stats.adapters.iter().all(|s| !s.adapter.contains('/')));
-    let filtered_messages: u64 = stats.adapters.iter().map(|s| s.messages).sum();
-    assert!(filtered_messages < stats.totals.messages);
+    // (`source_agent` with a `/`) are dropped, so only the bare `claude-code`
+    // name survives - the cheap adapter count `pond status` renders.
+    let names = store.adapter_names(false).await?;
+    assert_eq!(names, vec!["claude-code".to_owned()]);
 
-    // Projects sort by message count desc.
-    for pair in claude.projects.windows(2) {
-        assert!(
-            pair[0].messages >= pair[1].messages,
-            "projects must be ordered by message count desc",
-        );
-    }
-
-    // `include_subagents=true`: every `source_agent` gets its own row,
-    // including `claude-code/<type>`, and the breakdown reconciles exactly
-    // with `totals`.
-    let full = store.corpus_stats(true).await?;
-    let full_messages: u64 = full.adapters.iter().map(|s| s.messages).sum();
-    assert_eq!(full_messages, full.totals.messages);
+    // `include_subagents=true`: every distinct `source_agent` surfaces,
+    // including the `claude-code/<type>` subagent rows the fixture carries.
+    let full = store.adapter_names(true).await?;
+    assert!(full.contains(&"claude-code".to_owned()));
     assert!(
-        full.adapters.iter().any(|s| s.adapter.contains('/')),
-        "a subagent session must surface as its own claude-code/<type> row",
+        full.iter().any(|name| name.contains('/')),
+        "a subagent session must surface as its own claude-code/<type> name",
     );
+    // Sorted, distinct.
+    assert!(full.windows(2).all(|pair| pair[0] < pair[1]));
 
     Ok(())
 }

@@ -11,9 +11,7 @@ use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
-use comfy_table::{
-    Attribute, Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, presets::NOTHING,
-};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
@@ -21,14 +19,13 @@ use pond::{
     embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
-        AdapterStats, CorpusStats, EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport,
-        LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals,
-        Store,
+        EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport, LanceArchiveImport,
+        MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals, Store,
     },
     substrate::{
         self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
         OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
-        default_cleanup_older_than, index_lag_threshold,
+        VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than, index_lag_threshold,
     },
     transport::{self, AppState},
     wire::{
@@ -137,23 +134,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
-
-/// `SkipOracle` backed by a pre-loaded `Store::last_message_timestamps` map.
-struct StoredWatermarks {
-    map: HashMap<String, DateTime<Utc>>,
-}
-
-impl StoredWatermarks {
-    fn new(map: HashMap<String, DateTime<Utc>>) -> Self {
-        Self { map }
-    }
-}
-
-impl pond::adapter::SkipOracle for StoredWatermarks {
-    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
-        self.map.get(session_id).copied()
-    }
-}
 
 /// The platform default local data dir (`$XDG_DATA_HOME/pond`, then
 /// `~/.local/share/pond`) as a `StorageUrl`. Backs both the no-config fallback
@@ -403,19 +383,12 @@ enum Command {
     /// backlog, configured adapters, and the sync schedule. Anything off
     /// names its fix inline.
     #[command(after_long_help = "Examples:
-  pond status              the one-screen overview
-  pond status --adapters   per-adapter and per-project breakdown")]
+  pond status                       the one-screen overview
+  pond status --include-subagents   count each subagent as its own adapter")]
     #[command(display_order = 13)]
     Status {
-        /// Show one section per adapter, with project tables and index detail.
-        ///
-        /// Implies `--include-subagents` so the rollup reconciles with the
-        /// storage row counts above.
-        #[arg(long)]
-        adapters: bool,
-        /// Break out sub-agent sessions (e.g. `claude-code/general-purpose`).
-        ///
-        /// Default rolls sessions up to the main agent only.
+        /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
+        /// as its own adapter. Default counts only main agents.
         #[arg(long)]
         include_subagents: bool,
         /// Output format: `text` (human tables) or `json` (one document).
@@ -705,13 +678,6 @@ enum Command {
         /// after with `pond optimize --only index --storage-path <to>`.
         #[arg(long)]
         no_optimize: bool,
-        /// Emit one NDJSON event per tick to stderr (restic shape:
-        /// `message_type: "status" | "summary"`). Replaces the human
-        /// progress block; the final exit code is unchanged. Store-to-store
-        /// only - the archive/JSONL paths already exit on a final summary
-        /// line.
-        #[arg(long)]
-        json: bool,
     },
     /// Inspect configuration.
     ///
@@ -766,6 +732,18 @@ Homebrew and nix packages ship these pre-installed.")]
         /// silent.
         #[arg(long)]
         force_embed: bool,
+        /// Recovery: rebuild every index from scratch via
+        /// `create_index(replace=true)`. Use this when normal optimize errors
+        /// with "<N> delta segments; run `pond optimize --rebuild`". Skips
+        /// embed and the incremental index-fold; runs only the rebuild.
+        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "drop_index"])]
+        rebuild: bool,
+        /// One-shot orphan cleanup: drop a single named index from whichever
+        /// table owns it. Used after renaming an intent (the old name is
+        /// orphaned in the manifest until dropped). Tries every table in turn;
+        /// errors when no table has an index by that name.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["only", "skip", "force_embed", "rebuild"])]
+        drop_index: Option<String>,
     },
 }
 
@@ -913,12 +891,60 @@ enum OutputFormat {
     Json,
 }
 
+/// Lance's DataFusion `FairSpillPool` defaults to 100 MiB total
+/// (`lance-datafusion::exec::DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION`), which
+/// the multi-consumer fair-share splits below the working set of BTree
+/// `SortExec` over ~2M-row tables and crashes `create_index` with
+/// `ExternalSorterMerge` reservation failures. Lance offers no programmatic
+/// `MemoryPool` injection in 7.0.0; the env var is the only lever, and the
+/// session-context cache resolves it at first use, so setting it here (before
+/// any Lance call) is sufficient.
+fn raise_lance_mem_pool() {
+    if std::env::var_os("LANCE_MEM_POOL_SIZE").is_some() {
+        return;
+    }
+    // Process-wide, set once at startup before tokio spawns Lance work. Safe
+    // here per Rust 2024's set_var contract (no other threads reading env).
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("LANCE_MEM_POOL_SIZE", "1073741824");
+    }
+    tracing::debug!("LANCE_MEM_POOL_SIZE defaulted to 1 GiB");
+}
+
+fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
+    use rlimit::{Resource, getrlimit, setrlimit};
+
+    let (soft, hard) = getrlimit(Resource::NOFILE).context("getrlimit(RLIMIT_NOFILE)")?;
+    let new_soft = target.min(hard);
+    if new_soft <= soft {
+        return Ok(());
+    }
+    setrlimit(Resource::NOFILE, new_soft, hard).context("setrlimit(RLIMIT_NOFILE)")?;
+    tracing::info!(
+        target: "pond::perf",
+        soft = new_soft,
+        hard,
+        "raised RLIMIT_NOFILE to clear the FTS index-merge EMFILE class"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
     init_tracing(cli.verbose.tracing_level_filter());
+    if let Err(error) = try_raise_fd_limit(65_536) {
+        tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
+    }
+    raise_lance_mem_pool();
+    // `-v` opts default `pond status` into the embedding probe, which scans the
+    // `vector` and `search_text` columns on the 2M-row messages table - tens of
+    // seconds on a cold remote store, because Lance v2 has no per-column
+    // null_count metadata (lance 7.0.0 forces a data-page read for any filter).
+    let verbose = cli.verbose.tracing_level_filter() >= tracing::level_filters::LevelFilter::INFO;
     // Root-global selectors, bound once so every arm reads the same locals it
     // did when each variant flattened its own copy.
     let StoreArgs {
@@ -929,13 +955,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => init::run(args, storage_path, config).await?,
         Command::Status {
-            adapters,
             include_subagents,
             format,
         } => {
-            // --adapters needs sub-agents broken out so the per-adapter
-            // rollup reconciles with the storage row counts above.
-            let include_subagents = include_subagents || adapters;
             let loaded = Config::load(config_path(config))?;
             let (resolved, store) = open_store(storage_path, &loaded, false).await?;
             if !store.initialized().await? {
@@ -947,25 +969,45 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                let (sizes, stats, index_status, embedding) = tokio::try_join!(
+                // Default status never scans the 2M-row `messages` table:
+                // totals come from manifest metadata (`row_counts`), adapter
+                // count from a scan of the small `sessions` table, and the
+                // embedding probe (which DOES scan messages) only runs under
+                // `-v`. Skipping it drops a cold-S3 status from ~43s to ~3s.
+                let embedding_fut = async {
+                    if verbose {
+                        store.embedding_progress().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let (sizes, (sessions, messages, parts), names, index_status, embedding) = tokio::try_join!(
                     store.table_sizes(),
-                    store.corpus_stats(include_subagents),
+                    store.row_counts(),
+                    store.adapter_names(include_subagents),
                     store.index_status(),
-                    store.embedding_progress(),
+                    embedding_fut,
                 )?;
+                let totals = RowTotals {
+                    sessions: sessions as u64,
+                    messages: messages as u64,
+                    parts: parts as u64,
+                };
+                let adapter_count = names.len();
                 match format {
                     OutputFormat::Json => {
                         output(&status_json(
                             &resolved,
                             &sizes,
-                            &stats,
+                            &totals,
+                            adapter_count,
                             &index_status,
                             embedding,
                         )?)?;
                     }
                     OutputFormat::Text => {
-                        render_status_header("pond status", &resolved, &sizes, &stats.totals)?;
-                        render_status_checks(&stats, &index_status, embedding, adapters)?;
+                        render_status_header("pond status", &resolved, &sizes, &totals)?;
+                        render_status_checks(&totals, adapter_count, &index_status, embedding)?;
                         let probes = adapter::probe_unconfigured(&loaded.adapters);
                         if !probes.is_empty() {
                             let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
@@ -990,17 +1032,24 @@ async fn main() -> anyhow::Result<()> {
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
+            let import_summary =
+                run_import_stage(&store, &loaded, &config_file, adapter.clone(), path).await?;
+            let any_new_rows = import_summary.inserted > 0;
             let summary = SyncRunSummary {
-                ingest: Some(
-                    run_import_stage(&store, &loaded, &config_file, adapter.clone(), path).await?,
-                ),
+                ingest: Some(import_summary),
             };
-            // Leave a queryable lake by default: embed the backlog and fold the
-            // indexes after import. `--no-optimize` defers both to `pond optimize`.
+            // Leave a queryable lake by default. Index fold always runs - it
+            // is a fast no-op once fragments are caught up, and catches up any
+            // backlog left by a prior crashed sync without waiting for new
+            // rows. Embed stage stays gated on `any_new_rows` because its
+            // self-skip costs two filtered count_rows on remote messages;
+            // operator catches up an embed backlog via `pond optimize`.
             if !no_optimize {
-                // sync has no --force-embed; on a model swap point at the command that does.
-                run_embed_stage_with_limit(&store, false, None, "pond optimize --force-embed")
-                    .await?;
+                if any_new_rows {
+                    // sync has no --force-embed; on a model swap point at the command that does.
+                    run_embed_stage_with_limit(&store, false, None, "pond optimize --force-embed")
+                        .await?;
+                }
                 let policy = configured_maintenance_policy(&loaded, None)?;
                 run_update_indexes_stage(&store, &policy).await?;
             }
@@ -1010,18 +1059,34 @@ async fn main() -> anyhow::Result<()> {
             only,
             skip,
             force_embed,
+            rebuild,
+            drop_index,
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
-            let stages = OptimizeStages::resolve(only, &skip)?;
-            if stages.embed {
-                run_embed_stage(&store, force_embed).await?;
-            }
-            if stages.index {
-                let policy = configured_maintenance_policy(&loaded, None)?;
-                let outcome = run_update_indexes_stage(&store, &policy).await?;
-                if outcome.any_indices_failed() {
-                    std::process::exit(1);
+            if let Some(name) = drop_index {
+                store
+                    .drop_index_by_name(&name)
+                    .await
+                    .with_context(|| format!("drop_index({name}) failed"))?;
+                output(&format!("optimize: dropped index {name}"))?;
+            } else if rebuild {
+                let (progress, bar) = optimize_progress_bar();
+                let result = store.rebuild_indices(None, Some(progress)).await;
+                bar.finish_and_clear();
+                result.context("rebuild_indices failed")?;
+                output("optimize: indexes rebuilt")?;
+            } else {
+                let stages = OptimizeStages::resolve(only, &skip)?;
+                if stages.embed {
+                    run_embed_stage(&store, force_embed).await?;
+                }
+                if stages.index {
+                    let policy = configured_maintenance_policy(&loaded, None)?;
+                    let outcome = run_update_indexes_stage(&store, &policy).await?;
+                    if outcome.any_indices_failed() {
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -1160,18 +1225,8 @@ async fn main() -> anyhow::Result<()> {
             to,
             verify_only,
             no_optimize,
-            json,
         } => {
-            run_copy(
-                from,
-                to,
-                verify_only,
-                no_optimize,
-                json,
-                storage_path,
-                config,
-            )
-            .await?;
+            run_copy(from, to, verify_only, no_optimize, storage_path, config).await?;
         }
         Command::Sql {
             sql,
@@ -1674,7 +1729,6 @@ async fn run_copy(
     to: String,
     verify_only: bool,
     no_optimize: bool,
-    json: bool,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1692,20 +1746,9 @@ async fn run_copy(
             url.display()
         );
     }
-    // `--json` only applies to the store-to-store path; the archive/JSONL
-    // legs already exit with a single final summary line. Reject the
-    // combination loudly rather than silently dropping the flag.
-    if json
-        && !matches!(
-            (&from_ep, &to_ep),
-            (CopyEndpoint::Store(_), CopyEndpoint::Store(_))
-        )
-    {
-        bail!("--json applies to store-to-store copies only");
-    }
     match (from_ep, to_ep) {
         (CopyEndpoint::Store(from), CopyEndpoint::Store(to)) => {
-            run_store_to_store_copy(from, to, verify_only, no_optimize, json, &loaded).await
+            run_store_to_store_copy(from, to, verify_only, no_optimize, &loaded).await
         }
         _ if verify_only => bail!("--verify-only applies to store-to-store copies only"),
         (CopyEndpoint::Store(from), CopyEndpoint::Archive(path)) => {
@@ -1738,7 +1781,6 @@ async fn run_store_to_store_copy(
     to: StorageUrl,
     verify_only: bool,
     no_optimize: bool,
-    json: bool,
     loaded: &Config,
 ) -> anyhow::Result<()> {
     if from.canonical() == to.canonical() {
@@ -1752,23 +1794,22 @@ async fn run_store_to_store_copy(
     if verify_only {
         let verify = verify_stores(&from_store, &to_store).await?;
         ensure_source_not_empty(&verify, &from_resolved.display())?;
-        if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())? {
+        if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced
+        {
             std::process::exit(6);
         }
         return Ok(());
     }
 
     let dim = pond::output::dim();
-    let mode = if json {
-        pond::progress::Mode::Json
-    } else {
-        pond::progress::Mode::Human
-    };
-    let state = pond::progress::CopyState::new();
-    let mut reporter = pond::progress::Reporter::new(state.clone(), mode);
-    reporter.start();
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
 
-    state.set_phase(pond::progress::Phase::Plan);
+    spinner.set_message("plan  comparing source <-> destination");
     let plan_started = std::time::Instant::now();
     // Incremental: transfer only the sessions absent or grown on the
     // destination, detected by a data-intrinsic per-session message-count key
@@ -1776,19 +1817,19 @@ async fn run_store_to_store_copy(
     // indexes only that delta, never the whole corpus.
     let plan = to_store.plan_incremental_from(&from_store).await?;
     let plan_elapsed = plan_started.elapsed();
-    // Gauge totals against the whole source corpus; the bar starts at the
-    // sessions already synced (source minus the delta) and fills as the run's
-    // message+part rows land - the denominator that moves on a resumed copy.
+    // A 0-row source almost always means a mistyped `--from`: a remote store
+    // auto-vivifies empty, so the copy would otherwise "succeed" having moved
+    // nothing. Bail before touching the destination.
+    if plan.source_sessions == 0 {
+        spinner.finish_and_clear();
+        bail!(
+            "source store {} has 0 sessions; check --from (a mistyped source opens as an empty store)",
+            from_resolved.display(),
+        );
+    }
     let new_sessions = plan.new_sessions();
     let grown_sessions = plan.total().saturating_sub(new_sessions);
-    let already_synced = plan.source_sessions.saturating_sub(plan.total());
-    state.set_sessions_total(plan.source_sessions as u64);
-    state.set_gauge(
-        already_synced as u64,
-        plan.total() as u64,
-        plan.rows_to_copy,
-    );
-    reporter.receipt(&format!(
+    spinner.println(format!(
         "{} {} sessions to copy ({} new + {} grown, {} on source)  {:.1}s",
         pond::output::paint("plan", dim),
         plan.total(),
@@ -1799,22 +1840,19 @@ async fn run_store_to_store_copy(
     ));
 
     if plan.is_empty() {
-        // An empty source is the mistyped-`--from` case caught by the closing
-        // `ensure_source_not_empty`; only call a non-empty source up to date.
-        if plan.source_sessions > 0 {
-            reporter.receipt(&format!(
-                "{} destination already up to date (0 sessions copied)",
-                pond::output::paint("copy:", dim),
-            ));
-        }
+        spinner.println(format!(
+            "{} destination already up to date (0 sessions copied)",
+            pond::output::paint("copy:", dim),
+        ));
     } else {
-        state.set_phase(pond::progress::Phase::Stream);
+        spinner.set_message(format!(
+            "stream  copying {} sessions to destination",
+            plan.total(),
+        ));
         let stream_started = std::time::Instant::now();
-        let imported = to_store
-            .copy_delta_from(&from_store, &plan, Some(&state))
-            .await?;
+        let imported = to_store.copy_delta_from(&from_store, &plan).await?;
         let stream_elapsed = stream_started.elapsed();
-        reporter.receipt(&format!(
+        spinner.println(format!(
             "{} sessions {} ({} new)  messages {} ({} new)  parts {} ({} new)  {:.1}s",
             pond::output::paint("stream", dim),
             imported.rows.sessions,
@@ -1825,58 +1863,44 @@ async fn run_store_to_store_copy(
             imported.inserted.parts,
             stream_elapsed.as_secs_f64(),
         ));
-
-        // Fold the new fragments into the destination indexes (embeddings rode
-        // along as data columns - index-build only, no re-embed) so the
-        // destination is queryable on exit, not after a separate `pond
-        // optimize`. spec.md#lance-index-maintenance.
-        state.set_phase(pond::progress::Phase::Indexes);
-        let indexes_started = std::time::Instant::now();
-        if no_optimize {
-            reporter.receipt(&format!(
-                "{} skipped (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
-                pond::output::paint("indexes", dim),
-                to_resolved.display(),
-            ));
-        } else {
-            // The optimize stage draws its own progress bar; suspend ours so the
-            // two indicatif renderers don't fight over the cursor (the flicker).
-            // Resume before propagating any error so a failed rebuild still
-            // restores the terminal instead of leaving it on a hidden target.
-            reporter.suspend_live();
-            let policy = configured_maintenance_policy(loaded, None)?;
-            let indexes_result = run_update_indexes_stage(&to_store, &policy).await;
-            reporter.resume_live();
-            indexes_result?;
-            reporter.receipt(&format!(
-                "{} rebuilt text + semantic on destination  {:.1}s",
-                pond::output::paint("indexes", dim),
-                indexes_started.elapsed().as_secs_f64(),
-            ));
-        }
     }
 
-    // Prove the copy landed by comparing id-sets, not row counts: the
-    // source is never modified, so the user never reconciles by hand.
-    state.set_phase(pond::progress::Phase::Verify);
-    let verify = verify_stores(&from_store, &to_store).await?;
-    ensure_source_not_empty(&verify, &from_resolved.display())?;
-    // `render_storage_verify` already prints the SYNCED/FAILED line with
-    // per-table counts, so it is the single verify surface - no duplicate
-    // receipt. The "ready to query" final line is emitted only when the copy
-    // actually verified; on divergence we suppress it (the FAILED line stands)
-    // so the run never contradicts itself before `exit(6)`.
-    let verify_ok =
-        render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?;
-    let final_line = verify_ok.then(|| {
-        format!(
+    // The index stage draws its own progress bar; clear ours first so two
+    // indicatif renderers never fight over the cursor.
+    spinner.finish_and_clear();
+
+    // Fold destination indexes even on an empty stream plan: an interrupted
+    // previous copy can leave data complete but index creation missing.
+    // spec.md#lance-index-maintenance.
+    let indexes_started = std::time::Instant::now();
+    if no_optimize {
+        output(&format!(
+            "{} skipped (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
+            pond::output::paint("indexes", dim),
+            to_resolved.display(),
+        ))?;
+    } else {
+        let policy = configured_maintenance_policy(loaded, None)?;
+        run_update_indexes_stage(&to_store, &policy).await?;
+        output(&format!(
+            "{} rebuilt text + semantic on destination  {:.1}s",
+            pond::output::paint("indexes", dim),
+            indexes_started.elapsed().as_secs_f64(),
+        ))?;
+    }
+
+    // Run `pond copy --verify-only` for the full id-set proof when paranoid.
+    if no_optimize {
+        output(&format!(
+            "{} data copied; indexes pending (run `pond optimize --only index --storage-path {}`)",
+            pond::output::paint("done -", dim),
+            to_resolved.display(),
+        ))?;
+    } else {
+        output(&format!(
             "{} destination is ready to query",
             pond::output::paint("done -", dim),
-        )
-    });
-    reporter.finish(final_line.as_deref()).await;
-    if !verify_ok {
-        std::process::exit(6);
+        ))?;
     }
     Ok(())
 }
@@ -2626,6 +2650,7 @@ struct TableVerify {
 
 struct StorageVerify {
     tables: Vec<TableVerify>,
+    dest_indexes: IndexCoverage,
 }
 
 impl StorageVerify {
@@ -2640,6 +2665,23 @@ impl StorageVerify {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IndexCoverage {
+    fts_present: bool,
+    vector_present_or_below_activation: bool,
+}
+
+impl IndexCoverage {
+    fn ready(self) -> bool {
+        self.fts_present && self.vector_present_or_below_activation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifyOutcome {
+    synced: bool,
+}
+
 /// Compare the `id` set of every table across two stores - read-only on both
 /// sides. Matching row counts can hide divergent membership, so verification
 /// keys on the deterministic per-row id, not the cardinalities. Drives
@@ -2648,13 +2690,15 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
     use substrate::Table;
     // One fan-out over both stores x three tables, not three sequential
     // round-trip pairs - on a remote backend that is 3x fewer round-trip waits.
-    let (s_from, s_to, m_from, m_to, p_from, p_to) = tokio::try_join!(
+    let (s_from, s_to, m_from, m_to, p_from, p_to, dest_index_status, dest_embedding) = tokio::try_join!(
         from.collect_ids(Table::Sessions),
         to.collect_ids(Table::Sessions),
         from.collect_ids(Table::Messages),
         to.collect_ids(Table::Messages),
         from.collect_ids(Table::Parts),
         to.collect_ids(Table::Parts),
+        to.index_status(),
+        to.embedding_progress(),
     )?;
     let tables = [
         (Table::Sessions, s_from, s_to),
@@ -2668,7 +2712,21 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
         missing: source.difference(&dest).count(),
     })
     .collect();
-    Ok(StorageVerify { tables })
+    let fts_present = dest_index_status
+        .iter()
+        .any(|status| status.intent_name == MESSAGES_FTS_INDEX && status.exists);
+    let vector_present = dest_index_status
+        .iter()
+        .any(|status| status.intent_name == MESSAGES_VECTOR_INDEX && status.exists);
+    let dest_indexes = IndexCoverage {
+        fts_present,
+        vector_present_or_below_activation: vector_present
+            || dest_embedding.embedded < VECTOR_INDEX_ACTIVATION_ROWS,
+    };
+    Ok(StorageVerify {
+        tables,
+        dest_indexes,
+    })
 }
 
 /// A 0-row source almost always means a mistyped `--from`: a remote store
@@ -2686,12 +2744,12 @@ fn ensure_source_not_empty(verify: &StorageVerify, from_display: &str) -> anyhow
 
 /// One-line SYNCED / FAILED verdict so the user never guesses whether a copy
 /// fully landed. On failure it names the short tables and the exact
-/// idempotent re-run. Returns whether the destination is in sync.
+/// idempotent re-run.
 fn render_storage_verify(
     verify: &StorageVerify,
     from_display: &str,
     to_display: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VerifyOutcome> {
     use pond::output::{dim, paint};
     if verify.synced() {
         let detail = verify
@@ -2712,7 +2770,13 @@ fn render_storage_verify(
             format_thousands(verify.total_source_rows() as u64),
             detail,
         ))?;
-        Ok(true)
+        if !verify.dest_indexes.ready() {
+            output(&format!(
+                "{} data copied; indexes pending - run `pond optimize --only index --storage-path {to_display}` before querying",
+                paint("verify:", dim()),
+            ))?;
+        }
+        Ok(VerifyOutcome { synced: true })
     } else {
         let short = verify
             .tables
@@ -2739,7 +2803,7 @@ fn render_storage_verify(
             ),
             dim(),
         ))?;
-        Ok(false)
+        Ok(VerifyOutcome { synced: false })
     }
 }
 
@@ -2812,10 +2876,10 @@ async fn run_import_stage(
         }
         return Ok(IngestSummary::default());
     }
-    let watermarks = StoredWatermarks::new(store.session_last_ingested_at().await?);
+    let last_seen = store.session_last_ingested_at().await?;
     let mut total = IngestSummary::default();
     for (name, blob) in adapters {
-        let summary = sync_with_progress(store, &name, blob, &watermarks).await?;
+        let summary = sync_with_progress(store, &name, blob, &last_seen).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -2977,9 +3041,7 @@ async fn run_update_indexes_stage(
 ///
 /// indexes   text + semantic ready
 /// added     +44 sessions, +2,337 messages
-/// stored    8,460 sessions, 172,710 messages
-///
-/// (messages = searchable text rows; use -v for full counts)
+/// stored    8,460 sessions, 172,710 searchable messages
 /// ```
 ///
 /// `added` is suppressed when both deltas are zero (a no-op sync still
@@ -2997,12 +3059,12 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
         None => (0, 0),
     };
 
-    let (index_status, embedding, stats) = tokio::try_join!(
+    let (index_status, embedding, (stored_sessions, _, _)) = tokio::try_join!(
         store.index_status(),
         store.embedding_progress(),
-        store.corpus_stats(false),
+        store.row_counts(),
     )?;
-    let health = classify_index_health(&index_status, index_lag_threshold(), &embedding);
+    let health = classify_index_health(&index_status, index_lag_threshold(), Some(&embedding));
 
     output("")?;
     output(&render_indexes_line(&health))?;
@@ -3015,15 +3077,10 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
         ))?;
     }
     output(&format!(
-        "{}    {} sessions, {} messages",
+        "{}    {} sessions, {} searchable messages",
         paint("stored", dim()),
-        format_thousands(stats.totals.sessions),
+        format_thousands(stored_sessions as u64),
         format_thousands(embedding.total as u64),
-    ))?;
-    output_err("")?;
-    output_err(&paint(
-        "(messages = searchable text rows; use -v for full counts)",
-        dim(),
     ))?;
     Ok(())
 }
@@ -3507,7 +3564,7 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
     );
     bar.enable_steady_tick(Duration::from_millis(120));
     let bar_for_callback = bar.clone();
-    let callback: OptimizeProgressFn = Box::new(move |event| match event {
+    let callback: OptimizeProgressFn = Arc::new(move |event| match event {
         OptimizeEvent::PhaseStart {
             table,
             phase,
@@ -3531,6 +3588,31 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
                 elapsed_ms,
                 "index phase done"
             );
+        }
+        OptimizeEvent::IndexStage {
+            table,
+            index,
+            stage,
+            completed,
+            total,
+            unit,
+        } => {
+            // Live intra-index progress, fired from Lance's IndexBuildProgress
+            // callbacks. Re-render the spinner suffix every tick. Total may be
+            // absent during init phases (Lance doesn't always know the count
+            // upfront); show just the completed count then.
+            let progress = match total {
+                Some(t) if t > 0 => format!("{completed}/{t} {unit}"),
+                _ => format!("{completed} {unit}"),
+            };
+            bar_for_callback.set_message(format!(
+                "{} {} ({}): {} {}",
+                table.as_str(),
+                "index-build",
+                index,
+                stage,
+                progress.trim_end(),
+            ));
         }
     });
     (callback, bar)
@@ -3600,9 +3682,10 @@ fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
 fn status_json(
     resolved: &ResolvedStorage,
     sizes: &TableSizes,
-    stats: &CorpusStats,
+    totals: &RowTotals,
+    adapter_count: usize,
     index_status: &[IndexStatus],
-    embedding: EmbeddingProgress,
+    embedding: Option<EmbeddingProgress>,
 ) -> anyhow::Result<String> {
     let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
     let indexes: Vec<serde_json::Value> = index_status
@@ -3614,28 +3697,33 @@ fn status_json(
             })
         })
         .collect();
+    // null on default `pond status`; populated under `-v` (skipping the
+    // 2M-row messages scan keeps default JSON status cheap on cold S3).
+    let embedding_doc = embedding.map(|e| {
+        serde_json::json!({
+            "embedded": e.embedded,
+            "eligible": e.total,
+        })
+    });
     let doc = serde_json::json!({
         "storage": {
             "url": resolved.display(),
             "binding": resolved.binding.describe(),
             "total_bytes": total_bytes,
             "tables": {
-                "sessions": { "bytes": sizes.sessions, "rows": stats.totals.sessions },
-                "messages": { "bytes": sizes.messages, "rows": stats.totals.messages },
-                "parts": { "bytes": sizes.parts, "rows": stats.totals.parts },
+                "sessions": { "bytes": sizes.sessions, "rows": totals.sessions },
+                "messages": { "bytes": sizes.messages, "rows": totals.messages },
+                "parts": { "bytes": sizes.parts, "rows": totals.parts },
             },
         },
         "corpus": {
-            "sessions": stats.totals.sessions,
-            "messages": stats.totals.messages,
-            "parts": stats.totals.parts,
+            "sessions": totals.sessions,
+            "messages": totals.messages,
+            "parts": totals.parts,
         },
         "indexes": indexes,
-        "embedding": {
-            "embedded": embedding.embedded,
-            "eligible": embedding.total,
-        },
-        "adapters": stats.adapters.len(),
+        "embedding": embedding_doc,
+        "adapters": adapter_count,
         "schedule": crate::schedule::status_line(),
         "initialized": true,
     });
@@ -3727,73 +3815,41 @@ fn render_status_header(
 /// Render the checks that can take longer on a large corpus. The command
 /// prints storage first, then calls this once the bounded scans finish.
 fn render_status_checks(
-    stats: &CorpusStats,
+    totals: &RowTotals,
+    adapter_count: usize,
     index_status: &[IndexStatus],
-    embedding: EmbeddingProgress,
-    adapters: bool,
+    embedding: Option<EmbeddingProgress>,
 ) -> anyhow::Result<()> {
-    use pond::output::{dim, paint, yellow};
+    use pond::output::{dim, paint};
 
     output("")?;
-    let health = classify_index_health(index_status, index_lag_threshold(), &embedding);
+    let health = classify_index_health(index_status, index_lag_threshold(), embedding.as_ref());
     output(&render_indexes_line(&health))?;
+    // Default: `stored` shows the manifest row count (cheap); under `-v` the
+    // embedding probe ran, so swap in the searchable subset and report it.
+    let messages_label = match &embedding {
+        Some(e) => format!("{} searchable messages", format_thousands(e.total as u64)),
+        None => format!("{} messages", format_thousands(totals.messages)),
+    };
     output(&format!(
-        "{}    {} sessions, {} messages",
+        "{}    {} sessions, {}",
         paint("stored", dim()),
-        format_thousands(stats.totals.sessions),
-        format_thousands(embedding.total as u64),
+        format_thousands(totals.sessions),
+        messages_label,
     ))?;
-    if adapters {
-        output("")?;
-        output(&paint("index detail", dim()))?;
-        for status in index_status {
-            let line = format!(
-                "  {}.{}  exists={}  fragments={}  unindexed={}",
-                status.table.as_str(),
-                status.intent_name,
-                if status.exists { "yes" } else { "no" },
-                status.fragments_covered,
-                format_thousands(status.unindexed_rows as u64),
-            );
-            if status.unindexed_rows == 0 {
-                output(&line)?;
-            } else {
-                output(&paint(&line, yellow()))?;
-            }
-        }
-    }
-
-    if !adapters {
-        output(&format!(
-            "{}  {} adapter(s); pass `--adapters` for project tables",
-            paint("adapters", dim()),
-            stats.adapters.len(),
-        ))?;
-        output(&crate::schedule::status_line())?;
-    } else {
-        // Render adapters in registry order so the layout matches the discovery
-        // picker; adapters present in the data but not in the registry append at
-        // the bottom (defensive: catches deleted adapters whose data is still on
-        // disk).
-        let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
-            .adapters
-            .iter()
-            .map(|stat| (stat.adapter.as_str(), stat))
-            .collect();
-        for factory in adapter::registry() {
-            if let Some(stat) = by_name.remove(factory.name()) {
-                render_adapter_block(stat)?;
-            }
-        }
-        for stat in by_name.values() {
-            render_adapter_block(stat)?;
-        }
-    }
+    output(&format!(
+        "{}  {} adapter(s)",
+        paint("adapters", dim()),
+        adapter_count,
+    ))?;
+    output(&crate::schedule::status_line())?;
     output_err("")?;
-    output_err(&paint(
-        "(messages = searchable text rows; use -v for full counts)",
-        dim(),
-    ))?;
+    if embedding.is_none() {
+        output_err(&paint(
+            "(use -v for searchable message count + embedding backlog)",
+            dim(),
+        ))?;
+    }
     Ok(())
 }
 
@@ -3816,7 +3872,7 @@ struct IndexHealth {
 fn classify_index_health(
     statuses: &[IndexStatus],
     lag_threshold: usize,
-    embedding: &EmbeddingProgress,
+    embedding: Option<&EmbeddingProgress>,
 ) -> IndexHealth {
     use IndexHealthState::*;
 
@@ -3841,10 +3897,14 @@ fn classify_index_health(
         }
     }
     // Semantic search misses unembedded rows even when IVF_PQ's own
-    // unindexed-fragments check passes.
-    let embed_backlog = embedding.total.saturating_sub(embedding.embedded);
-    if embed_backlog > 0 && matches!(semantic, Ready) {
-        semantic = Pending(embed_backlog as u64);
+    // unindexed-fragments check passes. Without the embedding probe (default
+    // `pond status`), this correction is skipped: the IVF_PQ fragment-lag
+    // check still flags indexed-but-unfolded rows; only unembedded ones hide.
+    if let Some(progress) = embedding {
+        let embed_backlog = progress.total.saturating_sub(progress.embedded);
+        if embed_backlog > 0 && matches!(semantic, Ready) {
+            semantic = Pending(embed_backlog as u64);
+        }
     }
     IndexHealth { text, semantic }
 }
@@ -3876,55 +3936,6 @@ fn render_indexes_line(health: &IndexHealth) -> String {
         paint("indexes", dim())
     };
     format!("{label}   {body}")
-}
-
-fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
-    use pond::output::{bold, cyan, paint};
-
-    output("")?;
-    output(&format!(
-        "{}  {} sessions  {} messages  {} projects",
-        paint(&stat.adapter, cyan().bold()),
-        paint(&format_thousands(stat.sessions), bold()),
-        paint(&format_thousands(stat.messages), bold()),
-        paint(&format_thousands(stat.projects.len() as u64), bold()),
-    ))?;
-    if stat.projects.is_empty() {
-        return Ok(());
-    }
-    let mut table = new_table();
-    table.set_header(vec![
-        Cell::new("project")
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-        Cell::new("sessions")
-            .set_alignment(CellAlignment::Right)
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-        Cell::new("messages")
-            .set_alignment(CellAlignment::Right)
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-    ]);
-    for project in &stat.projects {
-        let label = project.project.as_str();
-        table.add_row(vec![
-            Cell::new(label),
-            Cell::new(format_thousands(project.sessions)).set_alignment(CellAlignment::Right),
-            Cell::new(format_thousands(project.messages)).set_alignment(CellAlignment::Right),
-        ]);
-    }
-    // Let the project column flex; right-size the numeric columns to their
-    // content so the long path takes the remaining width and truncates with
-    // an ellipsis on narrow terminals.
-    if let Some(col) = table.column_mut(1) {
-        col.set_constraint(ColumnConstraint::ContentWidth);
-    }
-    if let Some(col) = table.column_mut(2) {
-        col.set_constraint(ColumnConstraint::ContentWidth);
-    }
-    output(&table.to_string())?;
-    Ok(())
 }
 
 /// House style for `pond status` tables: borderless, dynamic-width, no inner
@@ -4672,10 +4683,18 @@ mod tests {
         };
         let empty = StorageVerify {
             tables: vec![table(0)],
+            dest_indexes: IndexCoverage {
+                fts_present: false,
+                vector_present_or_below_activation: true,
+            },
         };
         assert!(ensure_source_not_empty(&empty, "s3://typo/bucket").is_err());
         let populated = StorageVerify {
             tables: vec![table(3)],
+            dest_indexes: IndexCoverage {
+                fts_present: false,
+                vector_present_or_below_activation: true,
+            },
         };
         assert!(ensure_source_not_empty(&populated, "local").is_ok());
     }

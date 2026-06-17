@@ -163,6 +163,18 @@ pub trait SkipOracle: Send + Sync {
     }
 }
 
+/// `pond sync` passes the result of `Store::session_last_ingested_at` straight
+/// in as the oracle - no wrapper struct, no second representation. The blanket
+/// `is_empty` short-circuits the JSONL header-peek on a fresh corpus.
+impl SkipOracle for std::collections::HashMap<String, DateTime<Utc>> {
+    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+        self.get(session_id).copied()
+    }
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+}
+
 /// `SkipOracle` that always returns `None`. Used by tests and benches that
 /// don't want skip behavior interfering with their assertions.
 #[derive(Debug, Default, Clone, Copy)]

@@ -144,7 +144,7 @@ async fn streaming_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u6
     let before = to.dataset(Table::Messages).await?.version_id();
     let started = Instant::now();
     let plan = to.plan_incremental_from(from).await?;
-    to.copy_delta_from(from, &plan, None).await?;
+    to.copy_delta_from(from, &plan).await?;
     let elapsed = started.elapsed().as_millis();
     let after = to.dataset(Table::Messages).await?.version_id();
     Ok((plan, elapsed, after - before))

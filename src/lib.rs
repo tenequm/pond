@@ -2,7 +2,6 @@ pub mod adapter;
 pub mod config;
 pub mod embed;
 pub mod handlers;
-pub mod progress;
 pub mod sessions;
 pub mod sql;
 pub mod substrate;

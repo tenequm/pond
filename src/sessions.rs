@@ -104,10 +104,6 @@ pub struct DeltaPlan {
     pub messages: TablePlan,
     pub parts: TablePlan,
     pub source_sessions: usize,
-    /// Total message + part rows this copy must write (per session, the source
-    /// count minus what the destination already holds, summed). The progress
-    /// gauge's denominator - it moves even when no new session rows are written.
-    pub rows_to_copy: u64,
 }
 
 impl DeltaPlan {
@@ -232,26 +228,6 @@ impl OptimizeOutcome {
     }
 }
 
-/// What `pond status` reports: where the data lives, total rows per table,
-/// and a per-(adapter, project) breakdown built from one `messages` scan.
-#[derive(Debug, Clone)]
-pub struct CorpusStats {
-    pub data_url: Url,
-    pub totals: RowTotals,
-    /// One entry per adapter present in the corpus. When `include_subagents`
-    /// is false (the CLI default), sub-agent rows (`source_agent` containing
-    /// `/`) are filtered out so only the main-agent sessions appear. When
-    /// true, each distinct `source_agent` (e.g. `claude-code/general-purpose`)
-    /// gets its own entry. Always in alphabetical order; the CLI re-sorts
-    /// this into registry order at render time so the tree matches the
-    /// discovery picker.
-    pub adapters: Vec<AdapterStats>,
-    /// Whether the rollup includes sub-agent sessions. The renderer prints a
-    /// hint about `--include-subagents` when this is false so users know the
-    /// `totals` row above counts sessions that aren't broken down below.
-    pub include_subagents: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowTotals {
     pub sessions: u64,
@@ -269,32 +245,6 @@ pub struct EmbeddingProgress {
     pub embedded: usize,
     pub total: usize,
     pub model: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub struct AdapterStats {
-    /// Either the main-agent name (`claude-code`) when sub-agents are filtered
-    /// out, or the full `source_agent` (`claude-code/general-purpose`) when
-    /// `include_subagents` is on.
-    pub adapter: String,
-    pub sessions: u64,
-    pub messages: u64,
-    /// Projects under this adapter, sorted by message count desc, then by
-    /// project name asc.
-    pub projects: Vec<ProjectStats>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProjectStats {
-    pub project: String,
-    pub sessions: u64,
-    pub messages: u64,
-}
-
-#[derive(Default)]
-struct GroupAccumulator {
-    messages: u64,
-    session_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -457,7 +407,7 @@ impl Store {
         // archive table yields zero batches, so merge_insert alone would
         // leave a lazily-created table (parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
-        self.merge_scanner(table, dataset.scan(), "archive import", None)
+        self.merge_scanner(table, dataset.scan(), "archive import")
             .await
     }
 
@@ -465,30 +415,14 @@ impl Store {
     /// `merge_insert_stats`, materializing blob bytes (not descriptor structs)
     /// so the merge writes them into the destination's own schema. Shared by
     /// the archive-restore and store-to-store copy paths; `context` names the
-    /// caller in error messages. When `state` is `Some`, the rich Lance
-    /// `MergeStats` per batch (bytes written, fragments, OCC retries, dedupe
-    /// skips) is reported to the live progress surface; the archive-import
-    /// caller passes `None`. Returns (rows scanned, rows inserted).
+    /// caller in error messages. Returns (rows scanned, rows inserted).
     async fn merge_scanner(
         &self,
         table: Table,
         mut scanner: lance::dataset::scanner::Scanner,
         context: &'static str,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<(usize, usize)> {
         scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
-        // The Lance scanner can publish a single end-of-scan
-        // `ExecutionSummaryCounts` (iops/requests/bytes_read + per-node
-        // timings). Wire it into `CopyState::record_scan_summary` so the
-        // read-side MB/s number is sourced from Lance's own counters, not
-        // synthesized at the merge boundary (which would be the *post*-merge
-        // byte count, not the bytes pulled from the source).
-        if let Some(state) = state {
-            let state_for_cb = state.clone();
-            scanner.scan_stats_callback(std::sync::Arc::new(move |counts| {
-                state_for_cb.record_scan_summary(counts.bytes_read as u64);
-            }));
-        }
         let mut stream = scanner
             .try_into_stream()
             .await
@@ -506,9 +440,6 @@ impl Store {
                 .await
                 .with_context(|| format!("failed to merge {} during {context}", table.as_str()))?;
             inserted += (stats.num_inserted_rows + stats.num_updated_rows) as usize;
-            if let Some(state) = state {
-                state.record_merge(table, &stats);
-            }
         }
         Ok((rows, inserted))
     }
@@ -519,25 +450,14 @@ impl Store {
     /// session gained messages, catching growth a `MAX(timestamp)` key would
     /// miss when a new message shares the session's latest timestamp. The count
     /// is source-authored and survives the copy unchanged, so it compares
-    /// soundly across two stores with independent manifest clocks - unlike the
-    /// `_row_last_updated_at_version` commit-clock watermark behind
-    /// `session_last_ingested_at` (spec.md#session-durable-copy). Projects only
+    /// soundly across two stores with independent clocks
+    /// (spec.md#session-durable-copy). Projects only
     /// the one column it counts; resolves the `session_id` array once per batch
     /// and allocates a key only on a session's first row. Distinct from
     /// `session_message_counts`, which counts a supplied id list one query each;
     /// this counts every session in a single scan.
     pub async fn all_session_message_counts(&self) -> Result<HashMap<String, usize>> {
         self.all_session_row_counts(Table::Messages).await
-    }
-
-    /// Per-session row count for `parts`, the parts-table analog of
-    /// [`Self::all_session_message_counts`]. `pond copy` compares this against
-    /// the destination so a session's parts can be appended (none present) or
-    /// merged (some present) independently of its messages - the two tables are
-    /// written by separate commits, so an interrupted copy can leave one
-    /// populated and the other empty.
-    pub async fn all_session_part_counts(&self) -> Result<HashMap<String, usize>> {
-        self.all_session_row_counts(Table::Parts).await
     }
 
     /// Count rows per `session_id` across one table in a single scan, projecting
@@ -577,57 +497,38 @@ impl Store {
     /// Plan an incremental store-to-store copy into `self` from `source`,
     /// deciding **per table** whether each source session's rows can be appended
     /// (the destination has none, so they cannot collide) or must be merged (the
-    /// destination has some, source has more). One fan-out reads both id-sets and
-    /// the source+dest per-session message and parts counts. A missing
-    /// destination count is 0, so a session present on the destination with no
-    /// messages yet routes its messages to the **append** fast path - the key
-    /// case for a resumed copy whose small `sessions` table landed but whose
-    /// `messages`/`parts` had not (spec.md#session-durable-copy).
+    /// destination has some, source has more). Reads both id-sets, per-session
+    /// message counts, and whole-table row totals; parts piggy-back on the
+    /// message-count signal (no per-session parts scan, the largest table).
+    /// Parts share `session_id` with messages, so `dest_msgs == 0` implies the
+    /// dest has no parts for the session (append fast path) and a grown message
+    /// count is the only case whose parts could have grown alongside (merge).
+    /// When whole-table parts totals diverge with messages in steady state, a
+    /// prior copy committed messages but crashed before parts: existing
+    /// sessions get a recovery sweep through `parts.merge`, idempotent via
+    /// `WhenMatched::DoNothing` (spec.md#session-durable-copy).
     pub async fn plan_incremental_from(&self, source: &Store) -> Result<DeltaPlan> {
-        let (
-            source_ids,
-            dest_ids,
-            source_msg_counts,
-            dest_msg_counts,
-            source_part_counts,
-            dest_part_counts,
-        ) = tokio::try_join!(
-            source.collect_ids(Table::Sessions),
-            self.collect_ids(Table::Sessions),
-            source.all_session_message_counts(),
-            self.all_session_message_counts(),
-            source.all_session_part_counts(),
-            self.all_session_part_counts(),
-        )?;
+        let (source_ids, dest_ids, source_msg_counts, dest_msg_counts, source_totals, dest_totals) =
+            tokio::try_join!(
+                source.collect_ids(Table::Sessions),
+                self.collect_ids(Table::Sessions),
+                source.all_session_message_counts(),
+                self.all_session_message_counts(),
+                source.row_counts(),
+                self.row_counts(),
+            )?;
         let source_sessions = source_ids.len();
-        // Rows this run must write = per session, source rows minus what the
-        // destination already holds, summed over messages and parts.
-        let remaining =
-            |source_map: &HashMap<String, usize>, dest_map: &HashMap<String, usize>| -> u64 {
-                source_map
-                    .iter()
-                    .map(|(id, &source_n)| {
-                        source_n.saturating_sub(dest_map.get(id).copied().unwrap_or(0)) as u64
-                    })
-                    .sum()
-            };
-        let rows_to_copy = remaining(&source_msg_counts, &dest_msg_counts)
-            + remaining(&source_part_counts, &dest_part_counts);
+        // Whole-table COUNT(*) is metadata-only in Lance v2 - a manifest read,
+        // not a data scan. The interrupted-prior-copy signal is "parts totals
+        // diverge while messages totals match": in steady-state messages, the
+        // only way parts grew on source vs dest is a prior copy that committed
+        // messages but crashed before parts. Normal growth has both diverging
+        // together, in which case the per-session message-count routing already
+        // catches the parts via the grown-session merge.
+        let parts_recovery = source_totals.2 > dest_totals.2 && source_totals.1 == dest_totals.1;
         let mut plan = DeltaPlan {
             source_sessions,
-            rows_to_copy,
             ..DeltaPlan::default()
-        };
-        // Per session, per table: dest has none -> append; dest has some but
-        // fewer than source -> merge; equal -> nothing.
-        let route = |table: &mut TablePlan, id: &str, source_n: usize, dest_n: usize| {
-            if dest_n == 0 {
-                if source_n > 0 {
-                    table.append.push(id.to_owned());
-                }
-            } else if source_n > dest_n {
-                table.merge.push(id.to_owned());
-            }
         };
         for id in &source_ids {
             // The `sessions` table holds one immutable row per session, so it
@@ -635,18 +536,19 @@ impl Store {
             if !dest_ids.contains(id) {
                 plan.sessions.append.push(id.clone());
             }
-            route(
-                &mut plan.messages,
-                id,
-                source_msg_counts.get(id).copied().unwrap_or(0),
-                dest_msg_counts.get(id).copied().unwrap_or(0),
-            );
-            route(
-                &mut plan.parts,
-                id,
-                source_part_counts.get(id).copied().unwrap_or(0),
-                dest_part_counts.get(id).copied().unwrap_or(0),
-            );
+            let source_msgs = source_msg_counts.get(id).copied().unwrap_or(0);
+            let dest_msgs = dest_msg_counts.get(id).copied().unwrap_or(0);
+            if dest_msgs == 0 {
+                if source_msgs > 0 {
+                    plan.messages.append.push(id.clone());
+                    plan.parts.append.push(id.clone());
+                }
+            } else if source_msgs > dest_msgs {
+                plan.messages.merge.push(id.clone());
+                plan.parts.merge.push(id.clone());
+            } else if parts_recovery {
+                plan.parts.merge.push(id.clone());
+            }
         }
         Ok(plan)
     }
@@ -660,13 +562,11 @@ impl Store {
     /// rows already there). Append-only storage is what makes the append safe: a
     /// re-run re-plans from current destination state, so an
     /// interrupted-then-resumed copy never double-appends (landed rows are no
-    /// longer absent). The optional `state` receives live progress; pass `None`
-    /// for non-interactive paths.
+    /// longer absent).
     pub async fn copy_delta_from(
         &self,
         source: &Store,
         plan: &DeltaPlan,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<LanceArchiveImport> {
         // The three tables are independent Lance datasets with separate write
         // locks, so copy them concurrently - mirrors the ingest path's
@@ -679,7 +579,6 @@ impl Store {
                     "id",
                     &plan.sessions,
                     plan.source_sessions,
-                    state
                 ),
                 self.copy_table(
                     source,
@@ -687,7 +586,6 @@ impl Store {
                     "session_id",
                     &plan.messages,
                     plan.source_sessions,
-                    state
                 ),
                 self.copy_table(
                     source,
@@ -695,7 +593,6 @@ impl Store {
                     "session_id",
                     &plan.parts,
                     plan.source_sessions,
-                    state
                 ),
             )?;
         Ok(LanceArchiveImport {
@@ -724,7 +621,6 @@ impl Store {
         key_column: &'static str,
         table_plan: &TablePlan,
         source_sessions: usize,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front so a lazily
         // created table (parts) is never left missing when its slice is empty -
@@ -738,7 +634,6 @@ impl Store {
                 key_column,
                 &table_plan.append,
                 source_sessions,
-                state,
             )
             .await?;
 
@@ -759,7 +654,7 @@ impl Store {
                     },
                 )
                 .await?;
-            let (r, i) = self.merge_scanner(table, scanner, "copy", state).await?;
+            let (r, i) = self.merge_scanner(table, scanner, "copy").await?;
             merged_rows += r;
             merged_inserted += i;
         }
@@ -780,20 +675,17 @@ impl Store {
         key_column: &'static str,
         session_ids: &[String],
         source_sessions: usize,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<usize> {
         if session_ids.is_empty() {
             return Ok(0);
         }
         if session_ids.len() == source_sessions {
-            return self.append_scanner(source, table, None, state).await;
+            return self.append_scanner(source, table, None).await;
         }
         let mut rows = 0usize;
         for chunk in session_ids.chunks(COPY_SESSION_IN_CHUNK) {
             let predicate = in_predicate(key_column, chunk);
-            rows += self
-                .append_scanner(source, table, Some(&predicate), state)
-                .await?;
+            rows += self.append_scanner(source, table, Some(&predicate)).await?;
         }
         Ok(rows)
     }
@@ -801,15 +693,13 @@ impl Store {
     /// Append a prepared source scan into this store's `table` via
     /// `Handle::append_stream`, materializing blob bytes (`AllBinary`) so the
     /// write is self-contained. The closure is a *factory*: `append_stream`
-    /// rebuilds the one-shot scan stream on each OCC attempt. When `state` is
-    /// `Some`, the scan's end-of-scan `ExecutionSummaryCounts` feed the
-    /// read-side throughput number. Returns rows appended.
+    /// rebuilds the one-shot scan stream on each OCC attempt. Returns rows
+    /// appended.
     async fn append_scanner(
         &self,
         source: &Store,
         table: Table,
         predicate: Option<&Predicate>,
-        state: Option<&Arc<crate::progress::CopyState>>,
     ) -> Result<usize> {
         let make_source = || async {
             let mut scanner = source
@@ -823,12 +713,6 @@ impl Store {
                 )
                 .await?;
             scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
-            if let Some(state) = state {
-                let state = state.clone();
-                scanner.scan_stats_callback(std::sync::Arc::new(move |counts| {
-                    state.record_scan_summary(counts.bytes_read as u64);
-                }));
-            }
             let stream: SendableRecordBatchStream = scanner
                 .try_into_stream()
                 .await
@@ -836,7 +720,7 @@ impl Store {
                 .into();
             Ok(stream)
         };
-        let stats = self.handle.append_stream(table, make_source, state).await?;
+        let stats = self.handle.append_stream(table, make_source).await?;
         Ok(stats.rows as usize)
     }
 
@@ -1199,14 +1083,19 @@ impl Store {
         Ok(sessions)
     }
 
-    /// `session_id -> wall-clock time of the Lance manifest version that
-    /// last wrote the row` for the per-session staleness skip
-    /// (spec.md#adapter-integrity-event-ordering). Reads Lance's `_row_last_updated_at_version` system
-    /// column (available because pond enables stable row ids per spec.md#lance-table-creation-stable-row-ids)
-    /// and joins it against `Dataset::versions()` for commit timestamps.
+    /// `session_id -> pond's last ingest timestamp for that session`
+    /// (spec.md#adapter-integrity-event-ordering). Adapters compare their
+    /// source file's mtime against this map and skip the re-decode when the
+    /// file is not newer. Sourced from the `sessions` table's
+    /// `_row_last_updated_at_version` column (available because pond enables
+    /// stable row ids per spec.md#lance-table-creation-stable-row-ids) joined
+    /// against `Dataset::versions()` for commit timestamps - so the watermark
+    /// reflects when pond last wrote the session row, not when the
+    /// conversation inside it happened. Scanning message timestamps instead
+    /// would collapse the skip: file mtime is always >= the newest message
+    /// inside, so every session would look stale and `pond sync` would re-
+    /// decode the entire corpus on every run.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
-        use lance::deps::arrow_array::UInt64Array;
-
         let dataset = self.handle.dataset(Table::Sessions).await?;
         let version_list = dataset.versions().await?;
         let versions: HashMap<u64, DateTime<Utc>> = version_list
@@ -1270,7 +1159,6 @@ impl Store {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-
         let mut rows = match params.mode {
             ResponseMode::Conversational => self
                 .scan_conversational_messages(session_id)
@@ -1575,76 +1463,29 @@ impl Store {
         self.handle.export_local_path(name)
     }
 
-    /// Compute the per-adapter / per-project rollup that drives
-    /// `pond status`. One scan over `messages` projecting the three
-    /// columns the rollup keys on (`source_agent`, `project`, `session_id`),
-    /// aggregated in-memory. Bounded by the cross product of adapters and
-    /// projects, which stays small on real corpora.
-    pub async fn corpus_stats(&self, include_subagents: bool) -> Result<CorpusStats> {
+    /// Distinct adapter names present in the corpus, sorted. Scans only the
+    /// `source_agent` column of the small `sessions` table, so `pond status`
+    /// gets its adapter count without touching the 2M-row `messages` table.
+    /// `include_subagents=false` drops `source_agent` values containing `/`
+    /// (e.g. `claude-code/general-purpose`).
+    pub async fn adapter_names(&self, include_subagents: bool) -> Result<Vec<String>> {
         let scanner = self
             .handle
-            .scan(
-                Table::Messages,
-                ScanOpts::project_only(&["source_agent", "project", "session_id"]),
-            )
+            .scan(Table::Sessions, ScanOpts::project_only(&["source_agent"]))
             .await?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut groups: HashMap<(String, String), GroupAccumulator> = HashMap::new();
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
-                let source_agent = string(&batch, "source_agent", row)?.unwrap_or_default();
-                let project = string(&batch, "project", row)?.unwrap_or_default();
-                let session_id = string(&batch, "session_id", row)?.unwrap_or_default();
-                let is_subagent = source_agent.contains('/');
-                if is_subagent && !include_subagents {
+                let agent = string(&batch, "source_agent", row)?.unwrap_or_default();
+                if !include_subagents && agent.contains('/') {
                     continue;
                 }
-                let entry = groups.entry((source_agent, project)).or_default();
-                entry.messages += 1;
-                entry.session_ids.insert(session_id);
+                names.insert(agent);
             }
         }
-
-        let (totals_sessions, totals_messages, totals_parts) = self.handle.row_counts().await?;
-        let totals = RowTotals {
-            sessions: totals_sessions as u64,
-            messages: totals_messages as u64,
-            parts: totals_parts as u64,
-        };
-
-        let mut by_adapter: BTreeMap<String, Vec<ProjectStats>> = BTreeMap::new();
-        for ((adapter, project), acc) in groups {
-            by_adapter.entry(adapter).or_default().push(ProjectStats {
-                project,
-                sessions: acc.session_ids.len() as u64,
-                messages: acc.messages,
-            });
-        }
-
-        let mut adapters = Vec::with_capacity(by_adapter.len());
-        for (adapter, mut projects) in by_adapter {
-            projects.sort_by(|a, b| {
-                b.messages
-                    .cmp(&a.messages)
-                    .then_with(|| a.project.cmp(&b.project))
-            });
-            let sessions: u64 = projects.iter().map(|p| p.sessions).sum();
-            let messages: u64 = projects.iter().map(|p| p.messages).sum();
-            adapters.push(AdapterStats {
-                adapter,
-                sessions,
-                messages,
-                projects,
-            });
-        }
-
-        Ok(CorpusStats {
-            data_url: self.handle.location().clone(),
-            totals,
-            adapters,
-            include_subagents,
-        })
+        Ok(names.into_iter().collect())
     }
 
     /// Write a batch of embeddings into `messages`: set `vector` and
@@ -1792,10 +1633,8 @@ impl Store {
     pub async fn searchable_in_scope(&self, filter: &Predicate) -> Result<usize> {
         let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
         let dataset = self.handle.dataset(Table::Messages).await?;
-        dataset
-            .count_rows(Some(scope.to_lance()))
-            .await
-            .map_err(Into::into)
+        let count = dataset.count_rows(Some(scope.to_lance())).await?;
+        Ok(count)
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
@@ -1970,7 +1809,14 @@ impl Store {
         Ok(metas)
     }
 
-    /// Total message count per session, for search session summaries.
+    /// Total message count per session, for search session summaries. One
+    /// `session_id IN (...)` scan projecting only `session_id`, aggregated in
+    /// pond, instead of `N` concurrent `count_rows(session_id = X)` round-trips
+    /// against `messages_session_id_btree`. Same wire shape for any backend,
+    /// but one S3 operation instead of `N` on remote stores. Sessions with
+    /// zero matching messages are present in the map with count `0` so the
+    /// caller can distinguish "filter excluded everything" from "session
+    /// missing from the response."
     pub async fn session_message_counts(
         &self,
         session_ids: &[String],
@@ -1978,21 +1824,33 @@ impl Store {
         if session_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let mut tasks = tokio::task::JoinSet::new();
-        for session_id in session_ids {
-            let dataset = dataset.clone();
-            let session_id = session_id.clone();
-            tasks.spawn(async move {
-                let filter = Predicate::Eq("session_id", session_id.as_str().into()).to_lance();
-                let count = dataset.count_rows(Some(filter)).await?;
-                anyhow::Ok((session_id, count))
-            });
-        }
-        let mut counts = BTreeMap::new();
-        while let Some(joined) = tasks.join_next().await {
-            let (session_id, count) = joined.context("session count task panicked")??;
-            counts.insert(session_id, count);
+        let predicate = in_predicate("session_id", session_ids);
+        let scanner = self
+            .handle
+            .scan(
+                Table::Messages,
+                ScanOpts::with_predicate_and_projection(&predicate, &["session_id"]),
+            )
+            .await?;
+        let mut stream = scanner
+            .try_into_stream()
+            .await
+            .context("failed to open session_message_counts stream")?;
+        let mut counts: BTreeMap<String, usize> =
+            session_ids.iter().map(|id| (id.clone(), 0)).collect();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.context("failed to read session_message_counts batch")?;
+            let column = batch
+                .column_by_name("session_id")
+                .context("session_message_counts: session_id column missing")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("session_message_counts: session_id column is not Utf8")?;
+            for value in column.iter().flatten() {
+                if let Some(entry) = counts.get_mut(value) {
+                    *entry += 1;
+                }
+            }
         }
         Ok(counts)
     }
@@ -2119,14 +1977,20 @@ impl Store {
         Ok(OptimizeOutcome { tables })
     }
 
-    pub async fn rebuild_indices(&self, intent_name: Option<&str>) -> Result<()> {
+    pub async fn rebuild_indices(
+        &self,
+        intent_name: Option<&str>,
+        progress: Option<OptimizeProgressFn>,
+    ) -> Result<()> {
         let policy = pond_index_intents();
         let mut matched = false;
         for (table, intents) in policy.all() {
             for intent in intents {
                 if intent_name.is_none_or(|name| name == intent.name) {
                     matched = true;
-                    self.handle.rebuild_index(table, intent).await?;
+                    self.handle
+                        .rebuild_index(table, intent, progress.as_ref())
+                        .await?;
                 }
             }
         }
@@ -2136,6 +2000,19 @@ impl Store {
             anyhow::bail!("unknown index intent {name:?}");
         }
         Ok(())
+    }
+
+    /// Drop a named index from whichever table owns it. Used by `pond optimize
+    /// --drop-index <name>` to clean up orphaned indices (e.g. after renaming
+    /// an intent whose on-disk name no longer matches the policy). Finds the
+    /// owning table via parallel `load_indices` lookups, then drops on just
+    /// that table - so real I/O errors surface with the right context instead
+    /// of being hidden behind "no such index" from the wrong table.
+    pub async fn drop_index_by_name(&self, name: &str) -> Result<()> {
+        let Some(owner) = self.handle.find_index_owner(name).await? else {
+            anyhow::bail!("no index named {name:?} found on any table");
+        };
+        self.handle.drop_index(owner, name).await
     }
 
     pub async fn index_status(&self) -> Result<Vec<IndexStatus>> {
@@ -3433,10 +3310,18 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         BuiltinIndexType::BTree,
         "messages_session_id_btree",
     ),
+    // Range-only column (`from_date`/`to_date` -> `timestamp >=` / `<=`,
+    // never exact-equality, never `ORDER BY` against the index). ZoneMap's
+    // per-fragment min/max prunes those filters with no recall loss, and
+    // skips the global ExternalSort that `parts_session_id_btree` paid
+    // during build at the FairSpillPool default. The renamed index causes
+    // Lance to treat this as a fresh intent: next optimize builds the
+    // ZoneMap; the prior `messages_timestamp_btree` becomes orphaned and
+    // is reaped passively by `cleanup_old_versions`.
     (
         "timestamp",
-        BuiltinIndexType::BTree,
-        "messages_timestamp_btree",
+        BuiltinIndexType::ZoneMap,
+        "messages_timestamp_zonemap",
     ),
     (
         "source_agent",
@@ -5386,17 +5271,11 @@ mod tests {
         let temp = TempDir::new()?;
         let (store, _keys) = store_with_messages(&temp, 4).await?;
 
-        // Produce several distinct manifest versions on `sessions` so the
-        // older ones become eligible for cleanup.
         for tag in 0..3 {
             let extra = synthetic_session(&format!("extra-{tag}"));
             store.upsert_sessions(&[extra]).await?;
         }
 
-        // Prune everything older than ~now, leaving only the latest manifest.
-        // `delete_unverified=None` and `error_if_tagged=Some(false)` mirror
-        // Lance's auto-cleanup hook semantics. The chrono 0-duration is fine:
-        // Lance's `delete_unverified` floor still protects in-flight files.
         let dataset = store.handle.dataset(Table::Sessions).await?;
         dataset
             .cleanup_old_versions(chrono::Duration::zero(), None, Some(false))
@@ -5435,6 +5314,38 @@ mod tests {
         let full = store.embedding_progress().await?;
         assert_eq!(full.embedded, 10);
         assert_eq!(full.total, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_message_counts_returns_per_session_counts_with_zeros_for_unknown_sessions()
+    -> anyhow::Result<()> {
+        // store_with_messages stripes `count` messages across 8 sessions
+        // round-robin. 32 messages -> 4 per session, 0..8 deterministic.
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 32).await?;
+
+        let mut requested: Vec<String> = (0..8).map(|s| format!("session-{s}")).collect();
+        requested.push("session-unknown-a".to_owned());
+        requested.push("session-unknown-b".to_owned());
+        let counts = store.session_message_counts(&requested).await?;
+
+        // Map has an entry for every requested id (the contract): known
+        // sessions hit 4, unknown sessions sit at 0.
+        assert_eq!(counts.len(), requested.len());
+        for s in 0..8 {
+            assert_eq!(
+                counts.get(&format!("session-{s}")).copied(),
+                Some(4),
+                "session-{s} should have 4 messages",
+            );
+        }
+        assert_eq!(counts.get("session-unknown-a").copied(), Some(0));
+        assert_eq!(counts.get("session-unknown-b").copied(), Some(0));
+
+        // Empty input is the documented zero-path.
+        let empty = store.session_message_counts(&[]).await?;
+        assert!(empty.is_empty());
         Ok(())
     }
 }

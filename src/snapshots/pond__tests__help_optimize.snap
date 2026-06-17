@@ -1,5 +1,6 @@
 ---
 source: src/main.rs
+assertion_line: 4771
 expression: sub.render_long_help().to_string()
 ---
 Keep the lake queryable: embed the backlog, then fold the search indexes.
@@ -21,6 +22,12 @@ Options:
 
       --force-embed
           Re-embed rows whose stored `embedding_model` does not match the configured model (a model swap), dropping the IVF_PQ first. Without this, such rows abort the run with a typed error so a swap is never silent
+
+      --rebuild
+          Recovery: rebuild every index from scratch via `create_index(replace=true)`. Use this when normal optimize errors with "<N> delta segments; run `pond optimize --rebuild`". Skips embed and the incremental index-fold; runs only the rebuild
+
+      --drop-index <NAME>
+          One-shot orphan cleanup: drop a single named index from whichever table owns it. Used after renaming an intent (the old name is orphaned in the manifest until dropped). Tries every table in turn; errors when no table has an index by that name
 
   -h, --help
           Print help (see a summary with '-h')

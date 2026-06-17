@@ -6504,6 +6504,7 @@ dependencies = [
  "libc",
  "object_store",
  "parquet",
+ "rlimit",
  "rmcp",
  "s3s",
  "s3s-fs",
@@ -6512,7 +6513,6 @@ dependencies = [
  "shellexpand",
  "struson",
  "tempfile",
- "termpulse-core",
  "thiserror 2.0.18",
  "tokenizers",
  "tokio",
@@ -7335,6 +7335,15 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rlimit"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -8468,12 +8477,6 @@ dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "termpulse-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a54c1baeddb3f7c4797e70aac785de4534bb73b0236946e99914e9751c66fc1e"
 
 [[package]]
 name = "termtree"
