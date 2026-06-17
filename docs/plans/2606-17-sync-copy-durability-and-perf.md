@@ -10,6 +10,16 @@ Do not re-run the investigations. Every number below was measured on the real co
 
 All changes from this plan MUST land as ONE chunk and ONE commit. Do not split into multiple commits. The single commit also subsumes the already-present uncommitted working-tree artifacts from the investigation (see "Current working-tree state" at the end): the `AGENTS.md` notes and the `benches/sync_oracle_bench.rs` + `benches/copy_bench.rs` extensions. Mark the commit breaking if it changes the oracle/skip wire or copy semantics (`<type>!:`), per the repo's release-plz convention.
 
+## Spec rules this plan satisfies
+
+The investigation has since been written into `docs/spec.md`; this plan is the implementation of those rules. Anchor each change to its rule:
+
+- **`session-movement-complete`** (spec 5.4) - the load-bearing rule this whole plan enforces: storage is the union of every still-reachable source, the skip and the copy delta are optimizations that may never drop an un-ingested row, a partial non-atomic flush re-ingests rather than latching, copy's id-set verify is unconditional, and the freshness signal stays cheap on every backend. Phase-1 A1/A2/A3 and Phase-2 B6/B7 are its enforcement.
+- **`adapter-integrity-dedup`** (spec 6.6e, tightened) - same-id-different-content is not a duplicate; this is the contract for A4.
+- **`lance-deterministic-pk`** (spec 3.3) - already governs A1's idempotent-replay healing and the B2 tiebreaker note.
+
+Out of this plan's scope - now spec'd but their own efforts - see "Separate efforts" at the end: `session-append-only-exception` (erasure), the §9.4 micro-batch live-write design, and the SDK-backend ordering tiebreaker.
+
 ## Background: how sync, copy, and adapters work today
 
 pond is a Lance-backed store of agent session transcripts. Three logical tables, each a separate Lance dataset with its own manifest: `sessions`, `messages`, `parts`. Lance has NO cross-dataset transaction - this is load-bearing and the spec encodes it as `no-cross-shard-atomic-write` (spec.md:186): no write batch may span more than one primary-key family atomically.
@@ -123,6 +133,14 @@ Adapter dedup hash (A4), full corpus, 1.59M records (`/tmp/dedup_hash_probe.rs`)
 ## Part 7: Open items
 
 - The user observed "failed events" on a real sync that they could not locate in shell history. When those logs surface, classify them: if they are storage/write errors, M1 is firing LIVE (real loss in progress, raises Phase 1 urgency); if they are adapter decode drops, they are the longstanding adapter drops (problem 5) that the broken-watermark full-rescan re-surfaced on every run. Not blocking, but verify.
+
+## Separate efforts - spec'd here, NOT in this commit
+
+These are now defined in `docs/spec.md` but are distinct features with their own implementation surface and risk. Do NOT fold them into this plan's one correctness/perf commit; each gets its own plan doc and commit.
+
+- **Erasure** - `session-append-only-exception` (spec 5.4) + the `pond erase <session-id>` verb (spec 7.8). New work: the verb, cascade-to-child-sessions (deletion mirror of `adapter-lineage-complete-restore`), the byte-purge pipeline (delete predicate -> compaction -> version-history cleanup -> blob purge), and the resurrection denylist the ingest path consults. Highest care item: it is the only append-only exception and it touches the delicate GC/compaction machinery and the 7.0.0 pin.
+- **Live-write** - spec 9.4 micro-batch design. New feature (issue #43): a long-running single-writer process buffers live events and flushes one merge-insert per interval/size. Needs no new substrate (reuses the write chokepoint + OCC); durability of in-flight events is via re-sync (`session-movement-complete`), so pond is a mirror unless a store-of-record backstops it (the tee pattern).
+- **SDK SessionStore backend** - depends on live-write. Mostly integration the existing rules already enable (placement-rule-3 catch-all for fidelity, child-session model for keys). The only spec-touch already landed: the §4.6 ordering-tiebreaker clause (source-intrinsic, never a write-time counter). Remaining is the Python shim + the SDK's 13/14-contract conformance run; the SDK's `delete` method maps to pond's `erase`.
 
 ## Current working-tree state (fold into the single commit)
 
