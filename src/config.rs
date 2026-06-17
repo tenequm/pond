@@ -198,7 +198,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # path = \"~/.codex/sessions\"
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
-# re-enable via `pond sync <adapter>`.
+# re-enable via `pond adapters enable <adapter>`.
 
 # Embeddings. Search runs hybrid (vector + FTS) whenever the store has any
 # vectors, and FTS-only otherwise - the model loads lazily on the first hybrid
@@ -627,7 +627,7 @@ impl Config {
                     .ok_or_else(|| anyhow!("no [adapters.{name}] entry in config"))?;
                 take_enabled(name, blob).map(|entry| vec![entry]).ok_or_else(|| {
                     anyhow!(
-                        "adapter [{name}] is disabled (enabled = false); run `pond sync {name}` to re-enable"
+                        "adapter [{name}] is disabled (enabled = false); run `pond adapters enable {name}` to re-enable, then `pond sync {name}`"
                     )
                 })
             }

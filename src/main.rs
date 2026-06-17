@@ -346,7 +346,8 @@ enum Command {
   pond sync                                  sync every enabled adapter
   pond sync claude-code                      sync one enabled adapter
   pond sync codex-cli --path ~/backup        one-off path override, config untouched
-  pond sync --no-optimize                    import only; embed and index later")]
+  pond sync --no-optimize                    import only; embed and index later
+  pond sync --verify                         full re-read; heal anything the skip missed")]
     #[command(display_order = 7)]
     Sync {
         /// Adapter name (claude-code, codex-cli, ...); default: every enabled adapter.
@@ -360,6 +361,15 @@ enum Command {
         /// after the import. Catch up later with `pond optimize`.
         #[arg(long)]
         no_optimize: bool,
+        /// Reconcile pass: bypass the freshness skip and re-read every source
+        /// body, re-ingesting through the idempotent merge. The skip compares
+        /// source mtime to pond's per-session ingest watermark; a session that
+        /// was partially flushed before the commit-row-last fix kept a frozen
+        /// watermark that mtime can never re-read past. This is the body-reading
+        /// tier that heals that historical damage (and audits completeness). It
+        /// is slower - every file is decoded - so it is opt-in, not the default.
+        #[arg(long)]
+        verify: bool,
     },
     /// Manage which adapters `pond sync` ingests (the `[adapters.*]` entries).
     ///
@@ -1028,28 +1038,27 @@ async fn main() -> anyhow::Result<()> {
             adapter,
             path,
             no_optimize,
+            verify,
         } => {
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
             let import_summary =
-                run_import_stage(&store, &loaded, &config_file, adapter.clone(), path).await?;
+                run_import_stage(&store, &loaded, &config_file, adapter.clone(), path, verify)
+                    .await?;
             let any_new_rows = import_summary.inserted > 0;
             let summary = SyncRunSummary {
                 ingest: Some(import_summary),
             };
-            // Leave a queryable lake by default. Index fold always runs - it
-            // is a fast no-op once fragments are caught up, and catches up any
-            // backlog left by a prior crashed sync without waiting for new
-            // rows. Embed stage stays gated on `any_new_rows` because its
-            // self-skip costs two filtered count_rows on remote messages;
-            // operator catches up an embed backlog via `pond optimize`.
-            if !no_optimize {
-                if any_new_rows {
-                    // sync has no --force-embed; on a model swap point at the command that does.
-                    run_embed_stage_with_limit(&store, false, None, "pond optimize --force-embed")
-                        .await?;
-                }
+            // Optimize stages gated on `any_new_rows`: cleanup_old_versions
+            // walks the version log on every call (real work even when "caught
+            // up"), so an idempotent no-op sync should not pay it. Catch up an
+            // accumulated backlog with `pond optimize` (the verb that exists
+            // precisely for this) or the scheduled maintenance run.
+            if !no_optimize && any_new_rows {
+                // sync has no --force-embed; on a model swap point at the command that does.
+                run_embed_stage_with_limit(&store, false, None, "pond optimize --force-embed")
+                    .await?;
                 let policy = configured_maintenance_policy(&loaded, None)?;
                 run_update_indexes_stage(&store, &policy).await?;
             }
@@ -1889,7 +1898,13 @@ async fn run_store_to_store_copy(
         ))?;
     }
 
-    // Run `pond copy --verify-only` for the full id-set proof when paranoid.
+    let verify = verify_stores(&from_store, &to_store).await?;
+    if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced {
+        std::process::exit(6);
+    }
+
+    // `pond copy` always closes with the id-set proof; `--verify-only` runs
+    // just this read-only check.
     if no_optimize {
         output(&format!(
             "{} data copied; indexes pending (run `pond optimize --only index --storage-path {}`)",
@@ -2856,6 +2871,7 @@ async fn run_import_stage(
     config_file: &Path,
     adapter: Option<String>,
     path: Option<PathBuf>,
+    verify: bool,
 ) -> anyhow::Result<IngestSummary> {
     let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), path)?;
     if adapters.is_empty() {
@@ -2876,10 +2892,26 @@ async fn run_import_stage(
         }
         return Ok(IngestSummary::default());
     }
-    let last_seen = store.session_last_ingested_at().await?;
+    // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
+    // watermark, so every source body is re-decoded and re-ingested through the
+    // idempotent merge. This is the only path that heals historical M1 damage -
+    // a session partially flushed before the commit-row-last fix keeps a frozen
+    // watermark that mtime can never re-read past (spec.md#session-movement-complete).
+    let noop = pond::adapter::NoopOracle;
+    let watermarks;
+    let oracle: &dyn pond::adapter::SkipOracle = if verify {
+        output(&pond::output::paint(
+            "import: --verify: re-reading every source body, bypassing the freshness skip",
+            pond::output::yellow(),
+        ))?;
+        &noop
+    } else {
+        watermarks = store.session_last_ingested_at().await?;
+        &watermarks
+    };
     let mut total = IngestSummary::default();
     for (name, blob) in adapters {
-        let summary = sync_with_progress(store, &name, blob, &last_seen).await?;
+        let summary = sync_with_progress(store, &name, blob, oracle).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -3252,11 +3284,12 @@ fn resolve_sync_adapters(
         if !known.contains(&name) {
             bail!("unknown adapter {name:?}; known: {}", known.join(", "));
         }
-        if let Some(blob) = config.adapters.get(name) {
-            return Ok(vec![(name.to_owned(), blob.clone())]);
+        if config.adapters.contains_key(name) {
+            // spec.md#cli-verbs: sync only ingests already-enabled adapters and
+            // never enables. resolve_adapters strips `enabled` and refuses a
+            // disabled entry, pointing the user at `pond adapters enable`.
+            return config.resolve_adapters(Some(name));
         }
-        // spec.md#cli-verbs: sync never enables. Enabling is the explicit job of
-        // `pond adapters enable` / `pond init`.
         bail!(
             "adapter {name:?} has no [adapters.{name}] entry; enable it with `pond adapters enable {name}` (or `pond init`), then re-run `pond sync`"
         );
@@ -3409,6 +3442,21 @@ async fn sync_with_progress(
             if !matches!(outcome.status, SyncStatus::Empty) {
                 // Empty already shrunk `len`; ticking `pos` would over-count.
                 bar_ref.inc(1);
+            }
+            bar_ref.set_message(format_bar_message(
+                messages,
+                drops,
+                errors,
+                started.elapsed(),
+            ));
+        }
+        SyncEvent::SkippedBulk { status, count } => {
+            match status {
+                SyncStatus::Empty => {
+                    let len = bar_ref.length().unwrap_or(0);
+                    bar_ref.set_length(len.saturating_sub(count as u64));
+                }
+                _ => bar_ref.inc(count as u64),
             }
             bar_ref.set_message(format_bar_message(
                 messages,
@@ -4600,7 +4648,8 @@ mod tests {
             "named error should name enable: {err}"
         );
 
-        // Configured adapter resolves without touching config.
+        // Configured adapter resolves without touching config, and the
+        // `enabled` discriminator is stripped before it reaches the factory.
         let configured =
             Config::load_str("[adapters.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
                 .expect("configured");
@@ -4608,6 +4657,26 @@ mod tests {
             resolve_sync_adapters(&configured, Some("claude-code"), None).expect("resolves");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "claude-code");
+        assert!(
+            resolved[0].1.get("enabled").is_none(),
+            "enabled discriminator must not reach the factory blob",
+        );
+
+        // Configured-but-disabled: sync refuses and names the enable verb,
+        // never silently syncing a disabled adapter (spec.md#cli-verbs).
+        let disabled =
+            Config::load_str("[adapters.claude-code]\nenabled = false\npath = \"/tmp/cc\"\n")
+                .expect("disabled config");
+        let err = resolve_sync_adapters(&disabled, Some("claude-code"), None)
+            .expect_err("disabled named must error");
+        assert!(
+            err.to_string().contains("disabled"),
+            "disabled error should say disabled: {err}"
+        );
+        assert!(
+            err.to_string().contains("pond adapters enable claude-code"),
+            "disabled error should name the enable verb: {err}"
+        );
     }
 
     // Long-help snapshots for the root and every visible subcommand. The

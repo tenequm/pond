@@ -145,21 +145,26 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
             Err(join) => { yield Err(join_error(name, join)); return; }
         };
 
+        // Fresh skips batch: per-file yield made recurring sync ~60s on a
+        // ~9k-file corpus from indicatif Mutex + per-callback work.
         let mut survivors = Vec::with_capacity(heads.len());
+        let mut fresh_count = 0usize;
         for head in heads {
             if let Some(id) = &head.session_id
                 && let Some(mtime) = head.mtime
                 && let Some(ingested) = oracle.last_ingested_at(id)
                 && mtime <= ingested
             {
-                yield Ok(AdapterYield::Skipped {
-                    session_id: Some(id.clone()),
-                    project: None,
-                    reason: SkipReason::Fresh,
-                });
+                fresh_count += 1;
                 continue;
             }
             survivors.push(head.path);
+        }
+        if fresh_count > 0 {
+            yield Ok(AdapterYield::SkippedBatch {
+                reason: SkipReason::Fresh,
+                count: fresh_count,
+            });
         }
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
@@ -199,15 +204,11 @@ fn collect_heads<D: JsonlTree>(
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
     let mut heads = Vec::with_capacity(files.len());
     for path in files {
-        let mtime = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .map(DateTime::<Utc>::from);
-        // First-line peek + driver parse cost roughly one open + 4 KB read +
-        // a JSON decode per file. On a first-time ingest (`NoopOracle` or
-        // any oracle with no watermarks) `last_ingested_at` will always
-        // return `None`, so the peek result would never feed the freshness
-        // check - skip it.
+        let mtime = file_mtime(&path);
+        // Header peek + driver parse cost one open + bounded read + a JSON
+        // decode per file. On a first-time ingest (`NoopOracle` or any oracle
+        // with no watermarks) `last_ingested_at` always returns `None`, so the
+        // peeked session id would never feed the freshness check - skip it.
         let session_id = if oracle_is_empty {
             None
         } else {
@@ -221,6 +222,15 @@ fn collect_heads<D: JsonlTree>(
         });
     }
     Ok(heads)
+}
+
+/// File mtime as a `DateTime<Utc>`; `None` on any io error. The freshness gate
+/// compares it against the per-session ingest watermark (spec.md#adapters).
+pub(crate) fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
 }
 
 /// First non-empty line of `path`, read bounded so a pathological first line

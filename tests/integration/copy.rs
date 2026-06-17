@@ -130,6 +130,18 @@ async fn ingest_at(store: &Store, events: Vec<IngestEvent>) -> anyhow::Result<()
     Ok(())
 }
 
+fn extra_part(session_id: &str, message_id: &str, part_id: &str, text: &str) -> Part {
+    Part {
+        session_id: session_id.to_owned(),
+        id: part_id.to_owned(),
+        message_id: message_id.to_owned(),
+        ordinal: 1,
+        provenance: Provenance::Conversational,
+        options: ProviderOptions::new(),
+        kind: PartKind::Text { text: s(text) },
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_round_trips_reruns_as_noop_and_unions() -> anyhow::Result<()> {
     let source = Store::open(&Url::parse("shared-memory://pond-test-migrate-src/")?).await?;
@@ -312,6 +324,56 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
     let noop = dest.plan_incremental_from(&source).await?;
     assert!(noop.is_empty(), "stable source must plan an empty delta");
     assert_eq!(noop.source_sessions, 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_copy_moves_parts_only_growth_with_other_message_growth() -> anyhow::Result<()>
+{
+    let source = Store::open(&Url::parse("shared-memory://pond-test-partgrowth-src/")?).await?;
+    let parts_only = "01HXYPARTGROW0001";
+    let message_grown = "01HXYPARTGROW0002";
+    ingest_at(&source, events_at(parts_only, ts(0), 1, ts(0))).await?;
+    ingest_at(&source, events_at(message_grown, ts(0), 1, ts(0))).await?;
+
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-partgrowth-dst/")?).await?;
+    copy(&source, &dest).await?;
+
+    source
+        .upsert_parts(&[extra_part(
+            parts_only,
+            &format!("{parts_only}-msg-1"),
+            &format!("{parts_only}-msg-1:0002"),
+            "parts-only delta",
+        )])
+        .await?;
+    ingest_at(&source, events_at(message_grown, ts(0), 2, ts(0))).await?;
+
+    let plan = dest.plan_incremental_from(&source).await?;
+    assert!(
+        !plan.messages.merge.contains(&parts_only.to_owned()),
+        "message count is unchanged for the parts-only session",
+    );
+    assert!(
+        plan.parts.merge.contains(&parts_only.to_owned()),
+        "per-session parts count must route the parts-only session",
+    );
+    assert!(
+        plan.messages.merge.contains(&message_grown.to_owned()),
+        "the other grown session still routes by message count",
+    );
+
+    dest.copy_delta_from(&source, &plan).await?;
+    for table in [Table::Sessions, Table::Messages, Table::Parts] {
+        let src = source.collect_ids(table).await?;
+        let dst = dest.collect_ids(table).await?;
+        assert_eq!(
+            src.difference(&dst).count(),
+            0,
+            "{} not fully contained after parts-only growth copy",
+            table.as_str(),
+        );
+    }
     Ok(())
 }
 

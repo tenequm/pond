@@ -109,18 +109,16 @@ async fn main() -> Result<()> {
     timed("adapter_names(false)", store.adapter_names(false)).await?;
 
     // pond sync: the change-detection oracle built before any progress prints.
-    // First call is COLD (scans the sessions table, writes the local
-    // manifest-keyed cache); second is WARM (cache hit) - the gap is the
-    // remote scan cost the warm path avoids.
+    // The key derives from durable message rows, not Lance version history.
     println!("\n[sync] change-detection oracle (read-only)");
     timed(
-        "session_last_ingested_at COLD",
-        store.session_last_ingested_at(),
+        "session_last_message_ids COLD",
+        store.session_last_message_ids(),
     )
     .await?;
     timed(
-        "session_last_ingested_at WARM",
-        store.session_last_ingested_at(),
+        "session_last_message_ids WARM",
+        store.session_last_message_ids(),
     )
     .await?;
 

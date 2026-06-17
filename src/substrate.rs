@@ -3082,6 +3082,13 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     }
     set_default(options, &["pool_idle_timeout"], "300 seconds");
     set_default(options, &["connect_timeout"], "10 seconds");
+    // `request_timeout` bounds a single object-store request (one range GET/PUT),
+    // not a whole scan - a streaming read issues many small requests, each well
+    // under this. We keep it deliberately tight as a HARD BARRIER: a single
+    // request exceeding 60s means a design/infra problem to fix (chunk the read,
+    // use change-data-feed, fix the endpoint), never something to paper over with
+    // a longer timeout. An explicit `[storage]` override still wins.
+    set_default(options, &["request_timeout"], "60 seconds");
     let has_custom_endpoint = ["aws_endpoint", "endpoint"]
         .iter()
         .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)));

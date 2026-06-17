@@ -645,7 +645,7 @@ async fn run_sql_phase(
 /// destination so we can measure real object-store read cost.
 enum OpenTarget {
     Local(PathBuf),
-    Remote(ResolvedStorage),
+    Remote(Box<ResolvedStorage>),
 }
 
 fn target_label(target: &OpenTarget) -> String {
@@ -681,7 +681,7 @@ fn resolve_open_target(args: &Args) -> Result<OpenTarget> {
         let resolved = url
             .resolve(&config.creds)
             .context("resolve creds for --storage-path")?;
-        Ok(OpenTarget::Remote(resolved))
+        Ok(OpenTarget::Remote(Box::new(resolved)))
     } else {
         Ok(OpenTarget::Local(resolve_data_dir(args.data_dir.clone())?))
     }
@@ -910,13 +910,13 @@ async fn main() -> Result<()> {
     }
 
     let target = resolve_open_target(&args)?;
-    if let OpenTarget::Local(dir) = &target {
-        if !dir.join("sessions.lance").exists() {
-            anyhow::bail!(
-                "no Lance datasets under {} - pass --data-dir or --storage-path",
-                dir.display(),
-            );
-        }
+    if let OpenTarget::Local(dir) = &target
+        && !dir.join("sessions.lance").exists()
+    {
+        anyhow::bail!(
+            "no Lance datasets under {} - pass --data-dir or --storage-path",
+            dir.display(),
+        );
     }
 
     if args.cap_sweep {

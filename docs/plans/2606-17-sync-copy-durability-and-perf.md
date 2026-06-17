@@ -10,6 +10,23 @@ Do not re-run the investigations. Every number below was measured on the real co
 
 All changes from this plan MUST land as ONE chunk and ONE commit. Do not split into multiple commits. The single commit also subsumes the already-present uncommitted working-tree artifacts from the investigation (see "Current working-tree state" at the end): the `AGENTS.md` notes and the `benches/sync_oracle_bench.rs` + `benches/copy_bench.rs` extensions. Mark the commit breaking if it changes the oracle/skip wire or copy semantics (`<type>!:`), per the repo's release-plz convention.
 
+## Decision update (2026-06-17): mtime oracle retained; `versions()` made cheap (supersedes B6/B7)
+
+The original Phase-2 plan replaced the watermark with a messages-based last-id key (B6) and the source skip with a tail-peek of the JSONL last-record id (B7). We deliberately did NOT do that. The shipped design keeps the original mtime comparison - source file mtime on the left, the per-session Lance ingest-commit timestamp on the right - and instead made the right side cheap.
+
+Why the divergence:
+
+- The S3 catastrophe (79-133 s) was never inherent to the mtime watermark. It was `Dataset::versions()` enumerating EVERY historical manifest (one LIST + ~2 object reads per version, over thousands of versions). Resolving only the distinct versions the live session rows actually reference - via `Dataset::checkout_version`, one manifest tail-read each, run concurrently - collapses it to 6.3 s cold on the real S3 store, the same order as the messages-based key, with no change to the comparison semantics. The `_row_last_updated_at_version` column itself is free (RLE metadata held inline in the manifest already loaded at open).
+- A1 (commit-row-last) prevents M1 at write time, so the read-side last-id heal B7 provided is not required for NEW partial flushes: a partial first-ingest leaves no session row -> no watermark -> re-ingest.
+- Clock-coupling - the property B6/B7 chose last-id to obtain - is a non-issue for pond's single-host sync. The source file mtime and the Lance manifest commit timestamp are both the writing host's clock (the manifest stamp is the writer process's `utc_now()` at commit, NOT the object store's `last_modified`), so the comparison is same-clock by construction.
+
+What this costs vs the original plan (accepted):
+
+- mtime does NOT heal HISTORICAL M1 damage: a session partially flushed BEFORE A1 landed keeps a frozen watermark, and mtime won't re-read its source. The compensating control is `pond sync --verify` (SHIPPED) - the body-reading tier the plan's Phase-3 `pond verify` always intended for exactly this case. It drives ingest with a `NoopOracle` instead of the per-session watermark map, so the freshness gate never fires and every source body is re-decoded and re-ingested through the idempotent merge; missing rows land, present rows are no-ops. `src/main.rs` `run_import_stage` (the `verify` branch) + the `Command::Sync { verify }` flag; test `recovery::verify_bypasses_the_freshness_skip_and_re_reads_every_session`.
+- M2 (copy stamps dest rows with a fresh copy-time version) does not "dissolve" the way a content-derived last-id would, but it is benign under A2: copy's unconditional id-set verify guarantees the destination is a complete superset before any watermark exists, so a later sync skipping an unchanged source on the destination is correct (the destination already holds the full session).
+
+Implementation (`Store::session_last_ingested_at`, `src/sessions.rs`): scan `sessions.id` + `_row_last_updated_at_version`, collect the distinct version set, resolve each via `checkout_version(v).version().timestamp` with a continuously-refilled `JoinSet` (64 in flight), and fall back to `min(resolved)` (or the current manifest stamp) for versions pruned by `cleanup_old_versions`. The `SkipOracle` trait keeps `last_ingested_at(&str) -> Option<DateTime<Utc>>` and the adapter gates keep `mtime <= ingested`.
+
 ## Spec rules this plan satisfies
 
 The investigation has since been written into `docs/spec.md`; this plan is the implementation of those rules. Anchor each change to its rule:
@@ -77,14 +94,14 @@ One controlled write seam, two modes. Custom write paths popping up in corners i
 
 ### Phase 2 - perf and the stateless redesign
 
-- B6 Replace the sync oracle. Replace `session_last_ingested_at`'s `versions()`-join with a messages-based per-session key (last message-id, or count). Measured: 79 s -> 0.5 s warm on S3. This SUPERSEDES `7a6601e` (replace the function body, do not add alongside) and closes M2 (the watermark now derives from actual messages copy carries, so there is no copy-time stamp to poison). Keep the correct comparison semantics; do NOT reintroduce the `MAX(messages.timestamp)`-vs-file-mtime bug that caused full rescans (file mtime is always newer than the newest message inside, so that comparison never skips).
-- B7 Source skip: mtime -> tail-peek last-id. Replace the `mtime <= ingested` check (`src/adapter/jsonl.rs` ~148-163) with reading the JSONL file's last record id and comparing it to the store's per-session last-id. Stateless, clock-free, single path - NO `--recheck` mode. Measured marginal cost: +150 ms warm to tail-peek the whole 9,383-file corpus (sync already opens every file for the header, so the tail read is incremental). The current sync already does a header read per file; this adds a tail read.
+- B6 **[SUPERSEDED - see "Decision update" above]** Originally: replace the oracle with a messages-based last-id/count key. Shipped instead: keep the mtime/ingest-commit-timestamp comparison and make `session_last_ingested_at` cheap by resolving only the distinct referenced versions via `checkout_version` (65-133 s -> 6.3 s cold on S3). Still SUPERSEDES `7a6601e` (the function body is replaced, not added alongside). The `MAX(messages.timestamp)`-vs-file-mtime bug remains a do-not (it never skips); we compare against the ingest-commit timestamp, which is correctly newer than the file mtime.
+- B7 **[SUPERSEDED - see "Decision update" above]** Originally: replace `mtime <= ingested` with a tail-peek last-id. Shipped instead: the mtime gate (`src/adapter/jsonl.rs` `collect_heads` + loop) is retained unchanged; only the right-side watermark source was made cheap (B6). Trade-off (historical-M1 heal) and its compensating control (`pond sync --verify`) are in the Decision update.
 - A3 also belongs here if you prefer to land all the oracle/plan key changes together; it is listed in Phase 1 because it is a data-loss catch.
 
 ### Phase 3 - structure (lock it in)
 
 - C8 Unify the write seam with BOTH modes. One shared seam exposing `append` (absent/new - the load-bearing fast path) and `merge` (grown/existing). Refactor copy's bespoke append/merge_scanner path and sync's `upsert_session_batch` to route through it; the plan decides the mode. Do NOT drop append-for-absent (5.47x S3 regression). Note: sync's streaming per-flush ingest does not pre-plan absence the way copy does, so applying append-for-absent to sync-to-remote is more involved - treat that as a stretch, not a requirement; the minimum is one seam that exposes both primitives so no caller hand-rolls writes again.
-- `pond verify` / reconcile command. An explicit deep stateless full count/id-set comparison between source files (or a source store) and the store - the only body-reading tier. A maintenance verb, NOT a sync mode. This is where the expensive "read everything and prove completeness" lives, for healing historical M1 damage or auditing.
+- `pond verify` / reconcile command. **[SHIPPED as `pond sync --verify`.]** The body-reading tier: re-read every source body and re-ingest through the idempotent merge, healing historical M1 damage and auditing completeness. Shipped as a sync flag rather than a standalone verb because the reconcile is exactly an unskipped sync - the import path already reads sources, decodes bodies, and merges idempotently; `--verify` only swaps the watermark oracle for `NoopOracle` so nothing is skipped. A separate verb would duplicate that whole path to add a read-only count/id-set diff; deferred until an audit-without-write use case actually needs the diff-only mode.
 
 ### Cross-cutting (every phase)
 
@@ -94,7 +111,8 @@ Every step emits structured progress/tracing. The motivating anti-pattern is the
 
 Sync oracle, real S3 store, fresh cold process each (`cargo bench --bench sync_oracle_bench -- --url <store> --only <name> --cold-only`):
 
-- current (`session_last_ingested_at`, versions-join): 133 s cold / 79 s warm on S3; 98 ms / 26 ms local.
+- current (`session_last_ingested_at`, full `versions()`-join): 133 s cold / 79 s warm on S3; 98 ms / 26 ms local.
+- ingested_at (`session_last_ingested_at`, SHIPPED - distinct-version `checkout_version` resolution): 6.3 s cold on S3 (`--only ingested_at --cold-only`); ~44 ms local. The retained mtime oracle, made cheap; see Decision update.
 - messages_group_count: 5.4 s cold / 0.6 s warm on S3; 52 ms / 17 ms local.
 - messages_group_maxts: 3.0 s cold / 0.5 s warm on S3; 24 ms / 18 ms local.
 - verify_collect_ids_all (A2): 3.2 s cold / 4.2 s warm on S3; 0.8 s local.
@@ -124,7 +142,7 @@ Adapter dedup hash (A4), full corpus, 1.59M records (`/tmp/dedup_hash_probe.rs`)
 ## Part 6: What NOT to do
 
 - Do NOT make the three tables transactional / merge them into one dataset. Forbidden by `no-cross-shard-atomic-write` and impossible in Lance 7.0. Use commit-row-last ordering instead.
-- Do NOT derive a per-sync watermark from `Dataset::versions()` on a remote store (79-133 s).
+- Do NOT ENUMERATE ALL versions via `Dataset::versions()` for the watermark on a remote store (79-133 s). Resolving only the distinct referenced versions via `checkout_version` is cheap (6.3 s) and is the shipped path - see the Decision update.
 - Do NOT compare file mtime against `MAX(messages.timestamp)` (file mtime is always newer -> never skips -> full rescan; this was the briefly-shipped bug `7a6601e` reverted).
 - Do NOT route absent sessions through merge-insert on a remote store (5.47x; commit-latency-bound).
 - Do NOT add a `--recheck` two-mode skip; the single stateless tail-peek path replaces mtime outright.

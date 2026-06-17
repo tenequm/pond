@@ -116,7 +116,9 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
     let first = events.first().expect("at least one progress event");
     let discovered_total = match first {
         SyncEvent::Discovered { total } => total.expect("discovery total available on a local dir"),
-        SyncEvent::SessionDone(_) => panic!("first event must be Discovered, got SessionDone"),
+        SyncEvent::SessionDone(_) | SyncEvent::SkippedBulk { .. } => {
+            panic!("first event must be Discovered, got {first:?}")
+        }
     };
 
     let done_count = events

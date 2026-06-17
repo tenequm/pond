@@ -79,6 +79,8 @@ mod ingest_handler {
         /// One session finished: committed, skipped (undecodable source),
         /// or rejected by the validator.
         SessionDone(SessionOutcome),
+        /// Aggregate skip: one callback for N files (typically `Fresh`).
+        SkippedBulk { status: SyncStatus, count: usize },
     }
 
     /// What happened to one session in an adapter-driven sync.
@@ -258,6 +260,23 @@ mod ingest_handler {
                         messages: 0,
                         status,
                     }));
+                }
+                Ok(AdapterYield::SkippedBatch { reason, count }) => {
+                    let status = match reason {
+                        SkipReason::Fresh => {
+                            summary.skipped_fresh += count;
+                            SyncStatus::Fresh
+                        }
+                        SkipReason::Empty => {
+                            summary.skipped_empty += count;
+                            SyncStatus::Empty
+                        }
+                        SkipReason::Unsupported(reason) => {
+                            summary.skipped_files += count;
+                            SyncStatus::Skipped { reason }
+                        }
+                    };
+                    on_event(SyncEvent::SkippedBulk { status, count });
                 }
                 Ok(AdapterYield::Event(event)) => {
                     // A new Session means the current one is being closed

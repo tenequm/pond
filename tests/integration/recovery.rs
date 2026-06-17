@@ -118,6 +118,70 @@ async fn export_then_ingest_round_trips_canonical_events() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn verify_bypasses_the_freshness_skip_and_re_reads_every_session() -> anyhow::Result<()> {
+    // `pond sync --verify` drives ingest with a `NoopOracle` instead of the
+    // per-session watermark map, so the freshness gate never fires and every
+    // source body is re-decoded. This is the only path that heals historical
+    // M1 damage: a session partially flushed before the commit-row-last fix
+    // keeps a frozen watermark mtime can never re-read past
+    // (spec.md#session-movement-complete).
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+    let first = ingest_adapter(
+        &store,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &pond::adapter::NoopOracle,
+        |_| {},
+    )
+    .await?;
+    assert!(first.sessions_inserted > 0, "fixtures must yield sessions");
+
+    // Skip-everything oracle: claim pond wrote every session in the far
+    // future, newer than any source mtime, so a normal sync skips them all.
+    let future = chrono::Utc::now() + chrono::Duration::days(3650);
+    let skip_all: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .map(|id| (id, future))
+        .collect();
+    let skipped =
+        ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), &skip_all, |_| {}).await?;
+    assert_eq!(
+        skipped.sessions_inserted, 0,
+        "a future watermark must insert nothing"
+    );
+    assert!(
+        skipped.skipped_fresh > 0,
+        "a normal sync must skip the fresh sessions"
+    );
+
+    // `--verify` (NoopOracle): no session is skipped; the idempotent merge
+    // re-reads every body and inserts nothing new on already-complete data.
+    let verified = ingest_adapter(
+        &store,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &pond::adapter::NoopOracle,
+        |_| {},
+    )
+    .await?;
+    assert_eq!(
+        verified.skipped_fresh, 0,
+        "--verify must not skip any session"
+    );
+    assert_eq!(
+        verified.sessions_inserted, 0,
+        "re-reading complete sessions is an idempotent no-op, not a duplicate insert"
+    );
+    assert_eq!(
+        verified.storage_errors, 0,
+        "--verify re-ingest must not error"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn export_filtered_to_one_session_carries_only_that_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;

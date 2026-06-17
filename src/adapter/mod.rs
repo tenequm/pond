@@ -128,7 +128,7 @@ pub trait Adapter: Send + Sync {
         let stream = self.events_with(&NoopOracle);
         Box::pin(stream.filter_map(|res| match res {
             Ok(AdapterYield::Event(event)) => Some(Ok(event)),
-            Ok(AdapterYield::Skipped { .. }) => None,
+            Ok(AdapterYield::Skipped { .. } | AdapterYield::SkippedBatch { .. }) => None,
             Err(error) => Some(Err(error)),
         }))
     }
@@ -149,7 +149,7 @@ pub trait Adapter: Send + Sync {
 
 /// Per-session watermark lookup: when did pond last write this session?
 /// Backed by Lance's `_row_last_updated_at_version` joined to the manifest
-/// commit timestamp (spec.md#adapter-integrity-event-ordering). Adapter compares this to the source
+/// commit timestamp (spec.md#adapters). Adapter compares this to the source
 /// file's mtime to decide whether to re-decode.
 pub trait SkipOracle: Send + Sync {
     fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
@@ -160,18 +160,6 @@ pub trait SkipOracle: Send + Sync {
     /// Defaults to `false` so existing oracles stay correct without changes.
     fn is_empty(&self) -> bool {
         false
-    }
-}
-
-/// `pond sync` passes the result of `Store::session_last_ingested_at` straight
-/// in as the oracle - no wrapper struct, no second representation. The blanket
-/// `is_empty` short-circuits the JSONL header-peek on a fresh corpus.
-impl SkipOracle for std::collections::HashMap<String, DateTime<Utc>> {
-    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
-        self.get(session_id).copied()
-    }
-    fn is_empty(&self) -> bool {
-        Self::is_empty(self)
     }
 }
 
@@ -190,6 +178,18 @@ impl SkipOracle for NoopOracle {
     }
 }
 
+/// `pond sync` passes the `Store::session_last_ingested_at` map straight in as
+/// the oracle - no wrapper struct, no second representation. The blanket
+/// `is_empty` short-circuits the per-file mtime stat on a fresh corpus.
+impl SkipOracle for std::collections::HashMap<String, DateTime<Utc>> {
+    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+        self.get(session_id).copied()
+    }
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AdapterYield {
     Event(IngestEvent),
@@ -198,6 +198,12 @@ pub enum AdapterYield {
         session_id: Option<String>,
         project: Option<String>,
         reason: SkipReason,
+    },
+    /// Aggregate skip; one yield per N files (typically `Fresh` recurring
+    /// sync) instead of N. Avoids O(N) per-session orchestrator overhead.
+    SkippedBatch {
+        reason: SkipReason,
+        count: usize,
     },
 }
 

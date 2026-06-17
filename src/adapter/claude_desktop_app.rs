@@ -53,7 +53,7 @@ use super::{
         Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::RECORD_CAP,
+    jsonl::{RECORD_CAP, file_mtime},
     jsonl_bytes, part_id, part_ordinal, raw_record, source_options,
 };
 
@@ -146,7 +146,7 @@ impl Adapter for ClaudeDesktopAppAdapter {
                 if let Some(ingested) = oracle.last_ingested_at(&file.session_id) {
                     let paths = (file.audit_path.clone(), file.meta_path.clone());
                     let mtime = tokio::task::spawn_blocking(move || {
-                        newest_mtime(&paths.0).max(newest_mtime(&paths.1))
+                        file_mtime(&paths.0).max(file_mtime(&paths.1))
                     })
                     .await;
                     let mtime = match mtime {
@@ -250,13 +250,6 @@ fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     }
     out.sort_by(|a, b| a.audit_path.cmp(&b.audit_path));
     Ok(out)
-}
-
-fn newest_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .map(DateTime::<Utc>::from)
 }
 
 fn read_sessions(
@@ -620,8 +613,10 @@ fn message_events(
                 options: assistant_options(record, message_value, line),
             }
         }
-        (other, _) => {
-            return Err(format!("unsupported message role {other}"));
+        _ => {
+            return Ok(vec![message_carrier_event(
+                session_id, uuid, timestamp, record, line, role,
+            )]);
         }
     };
 
@@ -629,6 +624,23 @@ fn message_events(
     events.push(IngestEvent::Message(message));
     events.extend(parts.into_iter().map(IngestEvent::Part));
     Ok(events)
+}
+
+fn message_carrier_event(
+    session_id: &str,
+    uuid: &str,
+    timestamp: DateTime<Utc>,
+    record: &Value,
+    line: usize,
+    role: &str,
+) -> IngestEvent {
+    IngestEvent::Message(Message::System {
+        id: uuid.to_owned(),
+        session_id: session_id.to_owned(),
+        timestamp,
+        content: extract_self_str(&Value::String(role.to_owned())),
+        options: row_options(record, line),
+    })
 }
 
 fn text_part(
@@ -1148,5 +1160,28 @@ mod tests {
             "native restore re-ingests as the same session set",
         );
         Ok(())
+    }
+
+    #[test]
+    fn unexpected_message_content_becomes_lossless_carrier() {
+        let names = HashMap::new();
+        let record = json!({
+            "type": "user",
+            "uuid": "local-message-1",
+            "_audit_timestamp": "2026-06-01T00:00:00Z",
+            "message": {
+                "role": "user",
+                "content": null,
+            },
+        });
+
+        let events = record_events("local_session", 7, &record, Utc::now(), &names)
+            .expect("carrier is valid");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            IngestEvent::Message(Message::System { id, content, .. })
+                if id == "local-message-1" && content.as_deref().map(String::as_str) == Some("user")
+        ));
     }
 }

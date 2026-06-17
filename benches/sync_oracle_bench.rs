@@ -9,7 +9,7 @@
 //!
 //! Candidates timed:
 //!
-//!   A. `current`              -> `Store::session_last_ingested_at`. Scans
+//!   A. `current`              -> `Store::session_last_message_ids`. Scans
 //!                                 `messages.session_id` + `messages.timestamp`
 //!                                 and folds `MAX(timestamp) GROUP BY session_id`
 //!                                 in Rust. C is the underlying shape; A times
@@ -146,6 +146,7 @@ async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Set LANCE_IO_THREADS in the env to A/B thread counts for this bench.
     let args = Args::parse();
     let config_path = pond::config::default_config_path(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
@@ -179,9 +180,21 @@ async fn main() -> Result<()> {
     };
 
     if run("current") {
-        println!("\n[A] current - Store::session_last_ingested_at");
+        println!("\n[A] current - Store::session_last_message_ids");
         let s = store.clone();
         timed_pair("current", args.cold_only, move || {
+            let s = s.clone();
+            async move { s.session_last_message_ids().await.map(|m| m.len()) }
+        })
+        .await;
+    }
+
+    if run("ingested_at") {
+        println!(
+            "\n[M] ingested_at - Store::session_last_ingested_at (mtime oracle; distinct-version resolution, no versions() storm)"
+        );
+        let s = store.clone();
+        timed_pair("ingested_at", args.cold_only, move || {
             let s = s.clone();
             async move { s.session_last_ingested_at().await.map(|m| m.len()) }
         })
@@ -248,6 +261,33 @@ async fn main() -> Result<()> {
                 let tables = fetch_tables(&s).await.context("fetch tables")?;
                 run_sql(&tables, "SELECT session_id FROM sessions").await
             }
+        })
+        .await;
+    }
+
+    // (2) The read/plan cost the id-set approach ADDS over the current counts:
+    // `collect_ids(messages)` materializes a HashSet of every message id (~2M
+    // strings); `all_session_message_counts` folds into a tiny per-session map.
+    // Run each with cold+warm and compare the WARM numbers - that isolates the
+    // materialization cost from S3 cache noise.
+    if run("messages_idset") {
+        println!("\n[K] messages_idset - collect_ids(messages) -> HashSet<id> (id-diff input)");
+        let s = store.clone();
+        timed_pair("messages_idset", args.cold_only, move || {
+            let s = s.clone();
+            async move { s.collect_ids(Table::Messages).await.map(|m| m.len()) }
+        })
+        .await;
+    }
+
+    if run("messages_counts") {
+        println!(
+            "\n[L] messages_counts - all_session_message_counts() -> per-session map (current plan input)"
+        );
+        let s = store.clone();
+        timed_pair("messages_counts", args.cold_only, move || {
+            let s = s.clone();
+            async move { s.all_session_message_counts().await.map(|m| m.len()) }
         })
         .await;
     }
@@ -338,6 +378,39 @@ async fn main() -> Result<()> {
             }
         })
         .await;
+    }
+
+    // CDF: does `_row_created_at_version > V` prune to recent fragments (cheap,
+    // metadata-driven) or full-scan the column? `V = latest-1` selects only the
+    // last commit's new rows - the "what changed since the last copy" slice copy
+    // would append. If this is fast vs `messages_total_count`, the change-data-feed
+    // can replace the per-session count-comparison in `plan_incremental_from`.
+    if run("cdf_recent") {
+        println!(
+            "\n[J] cdf_recent - COUNT messages WHERE _row_created_at_version > latest-1 (change data feed)"
+        );
+        let ds = store
+            .dataset(Table::Messages)
+            .await
+            .context("open messages")?;
+        let latest = ds.version().version;
+        for k in [1u64, 20, 100, latest] {
+            let v = latest.saturating_sub(k);
+            let start = Instant::now();
+            match ds
+                .count_rows(Some(format!("_row_created_at_version > {v}")))
+                .await
+            {
+                Ok(n) => println!(
+                    "  cdf since v{v:<4} (latest=v{latest}, -{k}): {n:>8} rows  {:>8.1} ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                ),
+                Err(error) => {
+                    println!("  cdf since v{v}: ERR: {error:#}");
+                    break;
+                }
+            }
+        }
     }
 
     println!("\ndone");

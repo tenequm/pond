@@ -224,6 +224,10 @@ harness = false
 name = "sync_oracle_bench"
 harness = false
 
+[[bench]]
+name = "commands_bench"
+harness = false
+
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo
 # only a step-debugger uses. Faster codegen on every rebuild.
 [profile.dev]

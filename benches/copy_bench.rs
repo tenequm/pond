@@ -26,11 +26,13 @@ use std::time::Instant;
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
+use std::path::PathBuf;
+
 use pond::{
     config::Config,
     handlers::ingest_events,
     sessions::{DeltaPlan, IngestEvent, Store},
-    substrate::{RuntimeCaps, StorageUrl, Table},
+    substrate::{MaintenancePolicy, RuntimeCaps, StorageUrl, Table},
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -67,6 +69,19 @@ struct Args {
     /// bias of running append-then-merge in sequence.
     #[arg(long)]
     only: Option<String>,
+    /// Grown sessions to bake into the `grown` corpus (`--prepare`), or to
+    /// expect when running `--corpus`. Each grows by `--messages` messages.
+    #[arg(long, default_value_t = 0)]
+    grown: usize,
+    /// Seed `<dir>/base` and `<dir>/grown` persistent local corpora once, then
+    /// exit. Reused by `--corpus` so measurements never re-seed.
+    #[arg(long)]
+    prepare: Option<PathBuf>,
+    /// Run the grown-delta comparison from a `--prepare`d corpus: baseline-copy
+    /// `base` into each dest, then copy the `grown` delta via count+merge vs
+    /// id-diff+append, each followed by `optimize_indices`. Reports both stages.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -111,6 +126,30 @@ async fn open_store(backend: &str, authority: &str) -> Result<StoreHandle> {
     }
 }
 
+async fn open_two_dests(args: &Args) -> Result<(StoreHandle, StoreHandle)> {
+    match &args.dest_url {
+        Some(base) => {
+            let append_url = format!("{base}-c8append");
+            let merge_url = format!("{base}-c8merge");
+            println!("dests (scratch, clean up):\n  A: {merge_url}\n  B: {append_url}\n");
+            Ok((
+                StoreHandle {
+                    store: open_configured(&merge_url).await?,
+                    _temp: None,
+                },
+                StoreHandle {
+                    store: open_configured(&append_url).await?,
+                    _temp: None,
+                },
+            ))
+        }
+        None => Ok((
+            open_store(&args.backend, "dest-a").await?,
+            open_store(&args.backend, "dest-b").await?,
+        )),
+    }
+}
+
 fn base_ts() -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts")
 }
@@ -133,6 +172,48 @@ fn session_events(index: usize, messages: usize) -> Vec<IngestEvent> {
         options: ProviderOptions::new(),
     }));
     for m in 0..messages {
+        let message = Message::User {
+            id: format!("{session_id}-msg-{m}"),
+            session_id: session_id.clone(),
+            timestamp: created + chrono::Duration::seconds(m as i64),
+            options: ProviderOptions::new(),
+        };
+        let part = Part {
+            session_id: session_id.clone(),
+            id: format!("{session_id}-msg-{m}:0001"),
+            message_id: message.id().to_owned(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: pond::adapter::extract_str(
+                    &serde_json::json!({"x": "lorem ipsum dolor sit amet copy bench payload"}),
+                    "x",
+                ),
+            },
+        };
+        events.push(IngestEvent::Message(message));
+        events.push(IngestEvent::Part(part));
+    }
+    events
+}
+
+/// Append `count` new messages (ids `from_m..`) to an already-seeded session.
+fn grow_events(index: usize, from_m: usize, count: usize) -> Vec<IngestEvent> {
+    let session_id = format!("copybench-{index:08}");
+    let created = base_ts();
+    let mut events = Vec::with_capacity(1 + count * 2);
+    events.push(IngestEvent::Session(Session {
+        id: session_id.clone(),
+        parent_session_id: None,
+        parent_message_id: None,
+        source_agent: "claude-code".to_owned(),
+        created_at: created,
+        project: pond::adapter::extract_str(&serde_json::json!({"x": "/tmp/copybench"}), "x")
+            .unwrap(),
+        options: ProviderOptions::new(),
+    }));
+    for m in from_m..from_m + count {
         let message = Message::User {
             id: format!("{session_id}-msg-{m}"),
             session_id: session_id.clone(),
@@ -220,6 +301,103 @@ async fn main() -> Result<()> {
         args.backend, args.sessions, args.messages, total_rows,
     );
 
+    if let Some(dir) = &args.prepare {
+        std::fs::create_dir_all(dir.join("base"))?;
+        std::fs::create_dir_all(dir.join("grown"))?;
+        let base = Store::open_local(&dir.join("base")).await?;
+        let t = Instant::now();
+        seed(&base, args.sessions, args.messages).await?;
+        println!(
+            "seed base  ({} x {} msgs): {} ms",
+            args.sessions,
+            args.messages,
+            t.elapsed().as_millis()
+        );
+        let grown = Store::open_local(&dir.join("grown")).await?;
+        let t2 = Instant::now();
+        seed(&grown, args.sessions, args.messages).await?;
+        for index in 0..args.grown {
+            ingest_events(&grown, grow_events(index, args.messages, args.messages)).await?;
+        }
+        println!(
+            "seed grown (+{} sessions x {} msgs): {} ms",
+            args.grown,
+            args.messages,
+            t2.elapsed().as_millis()
+        );
+        println!("corpus ready at {}", dir.display());
+        return Ok(());
+    }
+
+    if let Some(dir) = &args.corpus {
+        let base = Store::open_local(&dir.join("base")).await?;
+        let grown = Store::open_local(&dir.join("grown")).await?;
+        let (dh_a, dh_b) = open_two_dests(&args).await?;
+        let (dest_a, dest_b) = (&dh_a.store, &dh_b.store);
+        streaming_copy(&base, dest_a).await?;
+        streaming_copy(&base, dest_b).await?;
+
+        let before_a = dest_a.dataset(Table::Messages).await?.version_id();
+        let t = Instant::now();
+        let plan_a = dest_a.plan_incremental_from(&grown).await?;
+        let plan_ms = t.elapsed().as_millis();
+        let t2 = Instant::now();
+        dest_a.copy_delta_from(&grown, &plan_a).await?;
+        let copy_ms = t2.elapsed().as_millis();
+        let commits_a = dest_a.dataset(Table::Messages).await?.version_id() - before_a;
+        let t3 = Instant::now();
+        dest_a
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?;
+        let opt_a = t3.elapsed().as_millis();
+        println!(
+            "[A] count+merge   : plan {plan_ms:>5} + copy {copy_ms:>6} + optimize {opt_a:>7} = {:>7} ms | msg merge={} commits={commits_a}",
+            plan_ms + copy_ms + opt_a,
+            plan_a.messages.merge.len(),
+        );
+
+        let before_b = dest_b.dataset(Table::Messages).await?.version_id();
+        let t4 = Instant::now();
+        let (s_sess, d_sess, s_msg, d_msg) = tokio::try_join!(
+            grown.collect_ids(Table::Sessions),
+            dest_b.collect_ids(Table::Sessions),
+            grown.collect_ids(Table::Messages),
+            dest_b.collect_ids(Table::Messages),
+        )?;
+        let sess_absent: Vec<String> = s_sess.difference(&d_sess).cloned().collect();
+        let msg_absent: Vec<String> = s_msg.difference(&d_msg).cloned().collect();
+        let diff_ms = t4.elapsed().as_millis();
+        let t5 = Instant::now();
+        tokio::try_join!(
+            dest_b.append_absent_rows(&grown, Table::Sessions, "id", &sess_absent),
+            dest_b.append_absent_rows(&grown, Table::Messages, "id", &msg_absent),
+            dest_b.append_absent_rows(&grown, Table::Parts, "message_id", &msg_absent),
+        )?;
+        let append_ms = t5.elapsed().as_millis();
+        let commits_b = dest_b.dataset(Table::Messages).await?.version_id() - before_b;
+        let t6 = Instant::now();
+        dest_b
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?;
+        let opt_b = t6.elapsed().as_millis();
+        println!(
+            "[B] id-diff+append: diff {diff_ms:>5} + append {append_ms:>6} + optimize {opt_b:>7} = {:>7} ms | msg appended={} commits={commits_b}",
+            diff_ms + append_ms + opt_b,
+            msg_absent.len(),
+        );
+
+        for (label, dest) in [("A count+merge", dest_a), ("B id-diff", dest_b)] {
+            let mut missing = 0usize;
+            for table in [Table::Sessions, Table::Messages, Table::Parts] {
+                let s = grown.collect_ids(table).await?;
+                let d = dest.collect_ids(table).await?;
+                missing += s.difference(&d).count();
+            }
+            println!("  {label} missing source rows: {missing} (expect 0)");
+        }
+        return Ok(());
+    }
+
     let source = match &args.source_url {
         Some(url) => {
             println!("source: existing store {url} (no seed)");
@@ -245,7 +423,9 @@ async fn main() -> Result<()> {
         Some(base) => {
             let append_url = format!("{base}-c8append");
             let merge_url = format!("{base}-c8merge");
-            println!("S3 scratch dests (clean up after):\n  append: {append_url}\n  merge:  {merge_url}\n");
+            println!(
+                "S3 scratch dests (clean up after):\n  append: {append_url}\n  merge:  {merge_url}\n"
+            );
             (
                 StoreHandle {
                     store: open_configured(&append_url).await?,
@@ -298,7 +478,8 @@ async fn main() -> Result<()> {
     // 1b. C8: full copy of the SAME source via merge-insert (unified seam)
     // into a fresh destination - the append-vs-merge comparison.
     let dest_merge = merge_dest;
-    let (merge_plan, merge_ms, merge_commits) = merge_copy(&source.store, &dest_merge.store).await?;
+    let (merge_plan, merge_ms, merge_commits) =
+        merge_copy(&source.store, &dest_merge.store).await?;
     let merge_ratio = if stream_ms > 0 {
         merge_ms as f64 / stream_ms as f64
     } else {

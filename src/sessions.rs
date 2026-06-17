@@ -460,6 +460,10 @@ impl Store {
         self.all_session_row_counts(Table::Messages).await
     }
 
+    pub async fn all_session_part_counts(&self) -> Result<HashMap<String, usize>> {
+        self.all_session_row_counts(Table::Parts).await
+    }
+
     /// Count rows per `session_id` across one table in a single scan, projecting
     /// only the `session_id` column and allocating a key on a session's first
     /// row. Both `messages` and `parts` lead their primary key with `session_id`
@@ -497,35 +501,28 @@ impl Store {
     /// Plan an incremental store-to-store copy into `self` from `source`,
     /// deciding **per table** whether each source session's rows can be appended
     /// (the destination has none, so they cannot collide) or must be merged (the
-    /// destination has some, source has more). Reads both id-sets, per-session
-    /// message counts, and whole-table row totals; parts piggy-back on the
-    /// message-count signal (no per-session parts scan, the largest table).
-    /// Parts share `session_id` with messages, so `dest_msgs == 0` implies the
-    /// dest has no parts for the session (append fast path) and a grown message
-    /// count is the only case whose parts could have grown alongside (merge).
-    /// When whole-table parts totals diverge with messages in steady state, a
-    /// prior copy committed messages but crashed before parts: existing
-    /// sessions get a recovery sweep through `parts.merge`, idempotent via
-    /// `WhenMatched::DoNothing` (spec.md#session-durable-copy).
+    /// destination has some, source has more). Reads both id-sets plus
+    /// per-session message and part counts. Parts have their own data-derived
+    /// signal so a part added under an existing message routes through merge
+    /// instead of relying on the closing verify to catch it
+    /// (spec.md#session-movement-complete).
     pub async fn plan_incremental_from(&self, source: &Store) -> Result<DeltaPlan> {
-        let (source_ids, dest_ids, source_msg_counts, dest_msg_counts, source_totals, dest_totals) =
-            tokio::try_join!(
-                source.collect_ids(Table::Sessions),
-                self.collect_ids(Table::Sessions),
-                source.all_session_message_counts(),
-                self.all_session_message_counts(),
-                source.row_counts(),
-                self.row_counts(),
-            )?;
+        let (
+            source_ids,
+            dest_ids,
+            source_msg_counts,
+            dest_msg_counts,
+            source_part_counts,
+            dest_part_counts,
+        ) = tokio::try_join!(
+            source.collect_ids(Table::Sessions),
+            self.collect_ids(Table::Sessions),
+            source.all_session_message_counts(),
+            self.all_session_message_counts(),
+            source.all_session_part_counts(),
+            self.all_session_part_counts(),
+        )?;
         let source_sessions = source_ids.len();
-        // Whole-table COUNT(*) is metadata-only in Lance v2 - a manifest read,
-        // not a data scan. The interrupted-prior-copy signal is "parts totals
-        // diverge while messages totals match": in steady-state messages, the
-        // only way parts grew on source vs dest is a prior copy that committed
-        // messages but crashed before parts. Normal growth has both diverging
-        // together, in which case the per-session message-count routing already
-        // catches the parts via the grown-session merge.
-        let parts_recovery = source_totals.2 > dest_totals.2 && source_totals.1 == dest_totals.1;
         let mut plan = DeltaPlan {
             source_sessions,
             ..DeltaPlan::default()
@@ -541,12 +538,17 @@ impl Store {
             if dest_msgs == 0 {
                 if source_msgs > 0 {
                     plan.messages.append.push(id.clone());
-                    plan.parts.append.push(id.clone());
                 }
             } else if source_msgs > dest_msgs {
                 plan.messages.merge.push(id.clone());
-                plan.parts.merge.push(id.clone());
-            } else if parts_recovery {
+            }
+            let source_parts = source_part_counts.get(id).copied().unwrap_or(0);
+            let dest_parts = dest_part_counts.get(id).copied().unwrap_or(0);
+            if dest_parts == 0 {
+                if source_parts > 0 {
+                    plan.parts.append.push(id.clone());
+                }
+            } else if source_parts > dest_parts {
                 plan.parts.merge.push(id.clone());
             }
         }
@@ -724,6 +726,29 @@ impl Store {
         Ok(stats.rows as usize)
     }
 
+    /// Append source rows whose `filter_column` is in `values`. Absent rows
+    /// can't collide, so append is safe where the count-based plan would merge
+    /// (spec.md#session-durable-copy). Drives the `copy_bench` append-vs-merge
+    /// regression guard.
+    pub async fn append_absent_rows(
+        &self,
+        source: &Store,
+        table: Table,
+        filter_column: &'static str,
+        values: &[String],
+    ) -> Result<usize> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let _ = self.handle.dataset(table).await?;
+        let mut rows = 0usize;
+        for chunk in values.chunks(COPY_SESSION_IN_CHUNK) {
+            let predicate = in_predicate(filter_column, chunk);
+            rows += self.append_scanner(source, table, Some(&predicate)).await?;
+        }
+        Ok(rows)
+    }
+
     /// Flat write path. Per-row insert/match truth is not synthesized here -
     /// honest outcomes come from the pre-existence scan on
     /// [`Self::upsert_session_batch`]; the CLI sync and wire ingest paths use
@@ -756,9 +781,9 @@ impl Store {
     ///      semantics, not policing the PK uniqueness Lance handles itself.
     ///   3. Builds one combined `RecordBatch` per table (sessions, messages,
     ///      parts) across every valid substream.
-    ///   4. Fires the three `merge_insert` calls in parallel via
-    ///      `tokio::try_join!`. Cross-table mutex on `CachedDataset` is
-    ///      independent, so these proceed concurrently.
+    ///   4. Commits messages + parts first, then sessions. The session row is
+    ///      the freshness-bearing row; writing it last makes a partial
+    ///      non-atomic flush re-ingest and heal (spec.md#session-movement-complete).
     ///   5. Composes per-session [`RowOutcome`]s in original substream order.
     async fn upsert_session_batch(
         &self,
@@ -978,11 +1003,12 @@ impl Store {
         // writer the sets are authoritative for THIS request's wire shape -
         // matched-no-op (spec.md#adapter-integrity-additive-sync) makes the
         // distinction informational, not behavioral.
-        let (_sessions_inserted, _messages_inserted, _parts_inserted) = tokio::try_join!(
-            merge_insert_chunks(&self.handle, Table::Sessions, session_batches),
+        let (_messages_inserted, _parts_inserted) = tokio::try_join!(
             merge_insert_chunks(&self.handle, Table::Messages, message_batches),
             merge_insert_chunks(&self.handle, Table::Parts, part_batches),
         )?;
+        let _sessions_inserted =
+            merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;
 
         for substream in &writeable {
             outcomes.extend(success_outcomes_for_substream(
@@ -1083,33 +1109,92 @@ impl Store {
         Ok(sessions)
     }
 
-    /// `session_id -> pond's last ingest timestamp for that session`
-    /// (spec.md#adapter-integrity-event-ordering). Adapters compare their
-    /// source file's mtime against this map and skip the re-decode when the
-    /// file is not newer. Sourced from the `sessions` table's
-    /// `_row_last_updated_at_version` column (available because pond enables
-    /// stable row ids per spec.md#lance-table-creation-stable-row-ids) joined
-    /// against `Dataset::versions()` for commit timestamps - so the watermark
-    /// reflects when pond last wrote the session row, not when the
-    /// conversation inside it happened. Scanning message timestamps instead
-    /// would collapse the skip: file mtime is always >= the newest message
-    /// inside, so every session would look stale and `pond sync` would re-
-    /// decode the entire corpus on every run.
+    /// `session_id -> last durable message id` for the sync freshness gate.
+    /// Scans stored message data only, never Lance version history:
+    /// `Dataset::versions()` is remote-manifest-bound on object stores, and a
+    /// write timestamp can exist even when a non-atomic ingest did not commit
+    /// the messages (spec.md#session-movement-complete).
+    ///
+    /// Only emits a key when the session row is ALSO durable. `upsert_session_batch`
+    /// commits messages+parts before the session row, so a partial flush can leave
+    /// a session whose messages are stored but whose session row is not; keying on
+    /// messages alone would report it fresh and orphan the missing row. Intersecting
+    /// with the sessions id-set forces a re-ingest that heals it
+    /// (spec.md#session-movement-complete).
+    pub async fn session_last_message_ids(&self) -> Result<HashMap<String, String>> {
+        let (session_ids, latest) = tokio::try_join!(self.collect_ids(Table::Sessions), async {
+            let scanner = self
+                .handle
+                .scan(
+                    Table::Messages,
+                    ScanOpts::project_only(&["session_id", "id", "timestamp"]),
+                )
+                .await?;
+            let mut stream = scanner.try_into_stream().await?;
+            let mut latest: HashMap<String, (DateTime<Utc>, String)> = HashMap::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let session_ids = batch
+                    .column_by_name("session_id")
+                    .context("scan projection dropped the session_id column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("session_id column is not Utf8")?;
+                for row in 0..batch.num_rows() {
+                    if session_ids.is_null(row) {
+                        continue;
+                    }
+                    let session_id = session_ids.value(row);
+                    let Some(id) = string(&batch, "id", row)? else {
+                        continue;
+                    };
+                    let timestamp = datetime(&batch, "timestamp", row)?;
+                    match latest.get_mut(session_id) {
+                        Some((stored_ts, stored_id))
+                            if timestamp > *stored_ts
+                                || (timestamp == *stored_ts
+                                    && id.as_str() > stored_id.as_str()) =>
+                        {
+                            *stored_ts = timestamp;
+                            *stored_id = id;
+                        }
+                        None => {
+                            latest.insert(session_id.to_owned(), (timestamp, id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(latest)
+        })?;
+        Ok(latest
+            .into_iter()
+            .filter(|(session_id, _)| session_ids.contains(session_id))
+            .map(|(session_id, (_, message_id))| (session_id, message_id))
+            .collect())
+    }
+
+    /// Per-session ingest watermark: the manifest commit timestamp of the
+    /// version that last wrote each session row. The adapter freshness gate
+    /// compares it to the source file's mtime - `mtime <= ingested` => skip
+    /// (spec.md#adapters). Unchanged sessions are not rewritten
+    /// (`WhenMatched::DoNothing`), so their `_row_last_updated_at_version`
+    /// stays pinned to the commit that first wrote them.
+    ///
+    /// Resolves ONLY the distinct versions the session rows reference, one
+    /// manifest read each (`checkout_version`), never `Dataset::versions()` -
+    /// that enumerates every historical manifest, a per-object fetch storm
+    /// (79-133s on S3, measured). The version column itself is free: it is RLE
+    /// metadata held inline in the fragment list already loaded at open.
     pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        use lance::deps::arrow_array::UInt64Array;
+
+        // One manifest read per distinct version; bound the in-flight fan-out.
+        // 64 is a moderate width: enough to hide S3 round-trip latency without
+        // tripping the object store's rate limiter into retry/backoff.
+        const RESOLVE_CONCURRENCY: usize = 64;
+
         let dataset = self.handle.dataset(Table::Sessions).await?;
-        let version_list = dataset.versions().await?;
-        let versions: HashMap<u64, DateTime<Utc>> = version_list
-            .iter()
-            .map(|v| (v.version, v.timestamp))
-            .collect();
-        // `Dataset::cleanup_old_versions` (and the auto_cleanup hook) drops
-        // pruned versions from the manifest list, leaving rows whose
-        // `_row_last_updated_at_version` points at a version that no longer
-        // resolves. Those rows are still real and were ingested at some time
-        // <= the oldest still-visible version's commit timestamp - so falling
-        // back to that bound preserves a sound `mtime <= ingested` upper edge
-        // and keeps the staleness skip working after cleanup.
-        let oldest_visible_ts = version_list.iter().map(|v| v.timestamp).min();
 
         let scanner = self
             .handle
@@ -1119,7 +1204,8 @@ impl Store {
             )
             .await?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut out: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut session_version: Vec<(String, u64)> = Vec::new();
+        let mut wanted: std::collections::HashSet<u64> = std::collections::HashSet::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let version_array = batch
@@ -1136,13 +1222,54 @@ impl Store {
                     continue;
                 }
                 let version = version_array.value(row);
-                let ts = versions.get(&version).copied().or(oldest_visible_ts);
-                if let Some(ts) = ts {
-                    out.insert(id, ts);
-                }
+                wanted.insert(version);
+                session_version.push((id, version));
             }
         }
-        Ok(out)
+
+        let mut resolved: HashMap<u64, DateTime<Utc>> = HashMap::with_capacity(wanted.len());
+        let resolve = |version: u64| {
+            let dataset = dataset.clone();
+            async move {
+                dataset
+                    .checkout_version(version)
+                    .await
+                    .ok()
+                    .map(|snapshot| (version, snapshot.version().timestamp))
+            }
+        };
+        // Keep `RESOLVE_CONCURRENCY` manifest reads in flight continuously -
+        // spawn the next as each completes - so a slow read never barriers the
+        // rest (a fixed-chunk drain would idle the pool on every boundary).
+        let mut pending = wanted.into_iter();
+        let mut set = tokio::task::JoinSet::new();
+        for version in pending.by_ref().take(RESOLVE_CONCURRENCY) {
+            set.spawn(resolve(version));
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Some((version, ts))) = joined {
+                resolved.insert(version, ts);
+            }
+            if let Some(version) = pending.next() {
+                set.spawn(resolve(version));
+            }
+        }
+
+        // `cleanup_old_versions` can prune a referenced version's manifest, so
+        // it no longer resolves. Such a row was ingested no later than the
+        // oldest version we DID resolve, so that bound keeps `mtime <= ingested`
+        // sound; if nothing resolved, the current manifest stamp (in RAM) is a
+        // safe upper bound for every row.
+        let fallback = resolved
+            .values()
+            .min()
+            .copied()
+            .unwrap_or_else(|| dataset.version().timestamp);
+
+        Ok(session_version
+            .into_iter()
+            .map(|(id, version)| (id, resolved.get(&version).copied().unwrap_or(fallback)))
+            .collect())
     }
 
     /// Whole-session view for `pond_get` session mode (spec.md#protocol).
@@ -5259,38 +5386,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_last_ingested_at_falls_back_when_versions_pruned() -> anyhow::Result<()> {
-        // Regression: `_row_last_updated_at_version` can point at a Lance
-        // manifest version that `cleanup_old_versions` or the auto_cleanup
-        // hook has since dropped from `Dataset::versions()`. The old code
-        // silently dropped any session whose row-version was not in the
-        // visible list, collapsing the staleness-skip map down to recent
-        // commits and forcing `pond sync` to re-touch every file. The fix
-        // falls back to the oldest still-visible commit timestamp - a
-        // sound upper bound on the row's true ingest time.
+    async fn session_last_message_ids_come_from_durable_messages() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let (store, _keys) = store_with_messages(&temp, 4).await?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("oracle");
+        store
+            .upsert_sessions(std::slice::from_ref(&session))
+            .await?;
+        let timestamp =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+        let message_a = Message::User {
+            id: "oracle-a".to_owned(),
+            session_id: session.id.clone(),
+            timestamp,
+            options: ProviderOptions::new(),
+        };
+        let message_b = Message::User {
+            id: "oracle-b".to_owned(),
+            session_id: session.id.clone(),
+            timestamp,
+            options: ProviderOptions::new(),
+        };
+        store
+            .upsert_messages(
+                &session,
+                &[
+                    MessageWrite {
+                        message: &message_a,
+                        parts: &[],
+                        search_text: Some("a"),
+                    },
+                    MessageWrite {
+                        message: &message_b,
+                        parts: &[],
+                        search_text: Some("b"),
+                    },
+                ],
+            )
+            .await?;
 
-        for tag in 0..3 {
-            let extra = synthetic_session(&format!("extra-{tag}"));
-            store.upsert_sessions(&[extra]).await?;
-        }
+        let empty_session = synthetic_session("session-row-only");
+        store.upsert_sessions(&[empty_session]).await?;
 
-        let dataset = store.handle.dataset(Table::Sessions).await?;
-        dataset
-            .cleanup_old_versions(chrono::Duration::zero(), None, Some(false))
-            .await
-            .context("cleanup_old_versions failed")?;
+        // Orphan: messages committed but the session row never was (the crash
+        // window `upsert_session_batch`'s write order can leave). The gate must
+        // NOT key on it, so the source re-ingests and heals the missing row.
+        let orphan = synthetic_session("messages-no-row");
+        let orphan_message = Message::User {
+            id: "orphan-a".to_owned(),
+            session_id: orphan.id.clone(),
+            timestamp,
+            options: ProviderOptions::new(),
+        };
+        store
+            .upsert_messages(
+                &orphan,
+                &[MessageWrite {
+                    message: &orphan_message,
+                    parts: &[],
+                    search_text: Some("a"),
+                }],
+            )
+            .await?;
+
+        let map = store.session_last_message_ids().await?;
+        assert_eq!(map.get("oracle").map(String::as_str), Some("oracle-b"));
+        assert!(
+            !map.contains_key("session-row-only"),
+            "a session row without durable messages must not produce a freshness key",
+        );
+        assert!(
+            !map.contains_key("messages-no-row"),
+            "messages without a durable session row must not produce a freshness key",
+        );
+        Ok(())
+    }
+
+    /// M1 / commit-row-last: the mtime oracle's watermark is tied to the SESSION
+    /// ROW. A1 commits messages+parts, then the session row last, so a partial
+    /// first-flush that fails before the session commit leaves messages with no
+    /// session row -> no watermark -> the source re-ingests and heals. A
+    /// committed session row, by contrast, does carry a watermark.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_last_ingested_at_keys_on_session_row_so_partial_flush_reingests()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+
+        let complete = synthetic_session("complete");
+        store
+            .upsert_sessions(std::slice::from_ref(&complete))
+            .await?;
+
+        // Partial first-flush: messages committed, the session row never was.
+        let timestamp =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+        let orphan = synthetic_session("messages-no-row");
+        let orphan_message = Message::User {
+            id: "orphan-a".to_owned(),
+            session_id: orphan.id.clone(),
+            timestamp,
+            options: ProviderOptions::new(),
+        };
+        store
+            .upsert_messages(
+                &orphan,
+                &[MessageWrite {
+                    message: &orphan_message,
+                    parts: &[],
+                    search_text: Some("a"),
+                }],
+            )
+            .await?;
 
         let map = store.session_last_ingested_at().await?;
-        let session_count = store.row_counts().await?.0;
         assert!(
-            map.len() >= session_count,
-            "watermark map ({}) must still cover every session ({}) after \
-             version cleanup; an empty fallback regresses pond sync to a \
-             full re-scan",
-            map.len(),
-            session_count,
+            map.contains_key("complete"),
+            "a committed session row must carry an ingest watermark",
+        );
+        assert!(
+            !map.contains_key("messages-no-row"),
+            "messages without a session row must not produce a watermark, so a \
+             partial first-flush re-ingests rather than latching a frozen skip",
+        );
+        Ok(())
+    }
+
+    /// The mtime oracle resolves a per-session commit timestamp (each row's
+    /// distinct `_row_last_updated_at_version` -> manifest commit time) and PINS
+    /// it: a no-op re-ingest (`WhenMatched::DoNothing`) must not advance an
+    /// unchanged session's watermark, or `mtime <= ingested` would stop skipping
+    /// it and every sync would re-decode the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_last_ingested_at_resolves_per_commit_and_pins_unchanged() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let before = Utc::now();
+
+        // Two sessions in two separate commits -> two distinct row versions,
+        // exercising the distinct-version resolution path.
+        let a = synthetic_session("sess-a");
+        store.upsert_sessions(std::slice::from_ref(&a)).await?;
+        let b = synthetic_session("sess-b");
+        store.upsert_sessions(std::slice::from_ref(&b)).await?;
+
+        let first = store.session_last_ingested_at().await?;
+        let a_ts = *first.get("sess-a").expect("session a has a watermark");
+        let b_ts = *first.get("sess-b").expect("session b has a watermark");
+        assert!(a_ts >= before, "watermark is the real commit wall-clock");
+        assert!(
+            a_ts <= b_ts,
+            "a committed before b, so its watermark is <= b's"
+        );
+
+        // No-op re-ingest of an unchanged row must not move its watermark.
+        store.upsert_sessions(std::slice::from_ref(&a)).await?;
+        let second = store.session_last_ingested_at().await?;
+        assert_eq!(
+            second.get("sess-a").copied(),
+            Some(a_ts),
+            "an unchanged session's watermark must stay pinned to its first commit",
         );
         Ok(())
     }

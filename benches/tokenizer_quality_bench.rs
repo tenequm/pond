@@ -165,7 +165,7 @@ struct Query {
 
 enum OpenTarget {
     Local(PathBuf),
-    Remote(ResolvedStorage),
+    Remote(Box<ResolvedStorage>),
 }
 
 fn resolve_target(args: &Args) -> Result<OpenTarget> {
@@ -179,9 +179,9 @@ fn resolve_target(args: &Args) -> Result<OpenTarget> {
         let config =
             Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
         let url = StorageUrl::parse(sp).context("parse --storage-path")?;
-        Ok(OpenTarget::Remote(
+        Ok(OpenTarget::Remote(Box::new(
             url.resolve(&config.creds).context("resolve creds")?,
-        ))
+        )))
     } else {
         let dir = args
             .data_dir
@@ -211,7 +211,7 @@ async fn open_messages_dataset(target: &OpenTarget) -> Result<Dataset> {
         }
         OpenTarget::Remote(r) => {
             let base = r.lance_url().as_str().trim_end_matches('/');
-            Ok(DatasetBuilder::from_uri(&format!("{base}/messages.lance"))
+            Ok(DatasetBuilder::from_uri(format!("{base}/messages.lance"))
                 .with_storage_options(r.options.clone())
                 .load()
                 .await?)
@@ -402,13 +402,13 @@ async fn main() -> Result<()> {
         resolve_anchors(&store, &mut queries).await?;
     }
     for q in &queries {
-        if let GroundTruth::Anchor(a, set) = &q.gt {
-            if set.is_empty() {
-                println!(
-                    "  WARN {}: anchor {a:?} resolved to 0 messages in this corpus",
-                    q.id
-                );
-            }
+        if let GroundTruth::Anchor(a, set) = &q.gt
+            && set.is_empty()
+        {
+            println!(
+                "  WARN {}: anchor {a:?} resolved to 0 messages in this corpus",
+                q.id
+            );
         }
     }
 
@@ -475,7 +475,7 @@ async fn main() -> Result<()> {
 
     print!("{:<22}", "stratum (n)");
     for cid in CONFIG_IDS {
-        print!("{:>16}", cid);
+        print!("{cid:>16}");
     }
     println!();
     println!("{}", "-".repeat(22 + 16 * CONFIG_IDS.len()));
