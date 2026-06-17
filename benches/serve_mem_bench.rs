@@ -39,6 +39,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use lance::Dataset;
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
+use lance_index::scalar::InvertedIndexParams;
 use pond::{
     PROTOCOL_VERSION,
     config::{Config, SearchConfig},
@@ -149,6 +153,12 @@ struct Args {
     /// memory-budget.md` Q5).
     #[arg(long)]
     cap_sweep: bool,
+    /// Rebuild the `search_text` inverted index under each tokenizer (simple,
+    /// whitespace, ngram) on a LOCAL `--data-dir` copy and report index size +
+    /// FTS RAM + latency per tokenizer. Requires a local data dir (mutates its
+    /// indexes); never point it at a shared remote store.
+    #[arg(long)]
+    tokenizer_sweep: bool,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -894,6 +904,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.tokenizer_sweep {
+        return run_tokenizer_sweep(&args).await;
+    }
+
     let target = resolve_open_target(&args)?;
     if let OpenTarget::Local(dir) = &target {
         if !dir.join("sessions.lance").exists() {
@@ -1108,6 +1122,32 @@ async fn main() -> Result<()> {
             pf_global_peak_kb: sampler.peak_pf_kb(),
             notes: format!("slept {}s with no requests", args.idle_seconds),
         });
+
+        // ---- Phase: idle_drained (the achievable low-idle floor) ----
+        // Drop the embedder to simulate the idle-unload of the candle model
+        // (the ~5-min unload we want in `pond mcp`), then sleep and resample.
+        // This is the load-bearing question: can the server sit idle-cheap and
+        // spike only during requests? Compares directly against the `idle`
+        // floor above (model still resident).
+        drop(embedder);
+        sampler.mark_phase_start();
+        let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
+        thread::sleep(Duration::from_secs(args.idle_seconds));
+        phases.push(PhaseStats {
+            name: "idle_drained",
+            queries: 0,
+            elapsed_ms: vec![(args.idle_seconds * 1000) as u128],
+            rss_start_kb,
+            rss_end_kb: sampler.current_kb(),
+            rss_phase_peak_kb: sampler.phase_peak_kb(),
+            rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
+            notes: "embedder dropped (idle-unload); slept to measure drained floor".to_owned(),
+        });
     }
 
     let global_peak_kb = sampler.finish();
@@ -1162,6 +1202,171 @@ async fn main() -> Result<()> {
     if !pass {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Sum of all regular-file sizes under `path` (recursive, best-effort).
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(_) => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Size of the most-recently-modified subdir under `_indices` - the index just
+/// built. Lance keeps prior index versions until GC, so a before/after delta is
+/// unreliable; the newest subdir is the new index.
+fn newest_index_size_bytes(indices_dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(indices_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| dir_size_bytes(&e.path()))
+        .unwrap_or(0)
+}
+
+/// Rebuild the `search_text` inverted index under one tokenizer; return build ms.
+/// Matches pond's production FTS config (stem off, stop-words kept) so only the
+/// tokenizer differs across variants.
+async fn build_fts_index(messages_path: &std::path::Path, tokenizer: &str) -> Result<u128> {
+    let mut dataset = Dataset::open(messages_path.to_str().context("non-utf8 path")?).await?;
+    let params = match tokenizer {
+        "ngram" => InvertedIndexParams::default()
+            .base_tokenizer("ngram".to_owned())
+            .ngram_min_length(2)
+            .ngram_max_length(3)
+            .stem(false)
+            .remove_stop_words(false),
+        "whitespace" => InvertedIndexParams::default()
+            .base_tokenizer("whitespace".to_owned())
+            .stem(false)
+            .remove_stop_words(false),
+        _ => InvertedIndexParams::default()
+            .stem(false)
+            .remove_stop_words(false),
+    };
+    let t = Instant::now();
+    dataset
+        .create_index_builder(&["search_text"], IndexType::Inverted, &params)
+        .name("search_text_fts".to_owned())
+        .replace(true)
+        .await?;
+    Ok(t.elapsed().as_millis())
+}
+
+/// Rebuild the FTS index under each tokenizer on a LOCAL corpus copy and report
+/// index size + FTS peak RSS + p50/p95 latency. Answers "do other tokenizers
+/// move the needle" without mutating any shared remote store.
+async fn run_tokenizer_sweep(args: &Args) -> Result<()> {
+    let data_dir = resolve_data_dir(args.data_dir.clone())?;
+    let messages = data_dir.join("messages.lance");
+    if !messages.exists() {
+        anyhow::bail!(
+            "no messages.lance under {} - pass a local --data-dir copy",
+            data_dir.display(),
+        );
+    }
+    let indices_dir = messages.join("_indices");
+
+    println!("=== pond serve-mem bench: --tokenizer-sweep ===");
+    println!("data_dir         {}", data_dir.display());
+    println!(
+        "queries/phase    {} (warmup={}, limit={})",
+        args.queries, args.warmup, args.limit
+    );
+    println!();
+    println!(
+        "{:>11}  {:>10}  {:>9}  {:>9}  {:>8}  {:>8}",
+        "tokenizer", "index_MiB", "build_s", "ftsPk_MB", "p50_ms", "p95_ms",
+    );
+    println!("{}", "-".repeat(70));
+
+    let cfg = SearchConfig::default();
+    let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
+    let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
+    let embedder = LazyEmbedder::candle();
+    let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+
+    for tokenizer in ["simple", "whitespace", "ngram"] {
+        let build_ms = build_fts_index(&messages, tokenizer).await?;
+        let index_mib = newest_index_size_bytes(&indices_dir) as f64 / 1024.0 / 1024.0;
+
+        let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
+        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+        let store = Store::open_local(&data_dir).await?;
+        run_search_phase(SearchPhase {
+            name: "warm",
+            store: &store,
+            embedder: &embedder,
+            cfg: &cfg,
+            sampler: &sampler,
+            mode: Some(SearchModeWire::Fts),
+            queries: &warmup,
+            limit: args.limit,
+            record_hits: false,
+            hit_sink: &hit_sink,
+        })
+        .await?;
+        let steady = run_search_phase(SearchPhase {
+            name: "steady",
+            store: &store,
+            embedder: &embedder,
+            cfg: &cfg,
+            sampler: &sampler,
+            mode: Some(SearchModeWire::Fts),
+            queries: &queries,
+            limit: args.limit,
+            record_hits: false,
+            hit_sink: &hit_sink,
+        })
+        .await?;
+        let fts_peak_mib = sampler.peak_pf_kb() as f64 / 1024.0;
+        sampler.finish();
+        drop(store);
+
+        println!(
+            "{:>11}  {:>10.1}  {:>9.1}  {:>9.1}  {:>8}  {:>8}",
+            tokenizer,
+            index_mib,
+            build_ms as f64 / 1000.0,
+            fts_peak_mib,
+            steady.p50(),
+            steady.p95(),
+        );
+        rows.push(serde_json::json!({
+            "tokenizer": tokenizer,
+            "index_mib": index_mib,
+            "build_s": build_ms as f64 / 1000.0,
+            "fts_peak_pf_mib": fts_peak_mib,
+            "p50_ms": steady.p50(),
+            "p95_ms": steady.p95(),
+        }));
+    }
+
+    println!();
+    println!(
+        "JSON {}",
+        serde_json::json!({
+            "mode": "tokenizer_sweep",
+            "data_dir": data_dir.display().to_string(),
+            "rows": rows,
+        })
+    );
     Ok(())
 }
 

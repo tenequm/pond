@@ -164,6 +164,11 @@ assert_cmd = "2"
 figment = { version = "0.10.19", features = ["test"] }
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
 lance-linalg = "7.0.0"
+# Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
+# inverted index under different tokenizers (ngram vs simple) via the raw lance
+# create_index API and measure the index-size / RAM / latency tradeoff.
+lance = { version = "7.0.0", features = ["protoc"] }
+lance-index = "7.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
