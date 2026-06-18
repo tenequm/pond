@@ -21,7 +21,7 @@ Options:
           [possible values: embed, index]
 
       --force-embed
-          Re-embed rows whose stored `embedding_model` does not match the configured model (a model swap), dropping the IVF_PQ first. Without this, such rows abort the run with a typed error so a swap is never silent
+          Re-embed rows whose stored `embedding_model` does not match the configured model (a model swap), dropping the IVF_SQ first. Without this, such rows abort the run with a typed error so a swap is never silent
 
       --rebuild
           Recovery: rebuild every index from scratch via `create_index(replace=true)`. Use this when normal optimize errors with "<N> delta segments; run `pond optimize --rebuild`". Skips embed and the incremental index-fold; runs only the rebuild

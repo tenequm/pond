@@ -43,10 +43,10 @@ use std::{
 use tokio::sync::{Mutex, OnceCell};
 use tokio_stream::StreamExt;
 use url::Url;
-/// Embedded-row count at which pond builds the IVF_PQ vector index on
+/// Embedded-row count at which pond builds the IVF_SQ vector index on
 /// `messages.vector` (spec.md#search). Below it, vector search runs a
 /// brute-force flat scan - exact and fast at small and medium scale, and
-/// IVF_PQ cannot train well on fewer vectors anyway.
+/// IVF_SQ cannot train well on fewer vectors anyway.
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
 /// Segment count at which an incremental index fold consolidates instead of
@@ -962,7 +962,7 @@ pub struct IndexIntent {
     /// Condition evaluated against the live dataset before each cycle.
     pub trigger: IndexTrigger,
     /// How the params are built at create time. Some intents have static
-    /// params (FTS, scalars); IVF_PQ needs the row count to size partitions.
+    /// params (FTS, scalars); IVF_SQ needs the row count to size partitions.
     pub params: IndexParamsKind,
 }
 
@@ -973,7 +973,7 @@ pub enum IndexTrigger {
     /// indices: there is no training cost worth delaying.
     OnAnyRows,
     /// Build when `count(<column> IS NOT NULL) >= threshold`. Used for the
-    /// IVF_PQ vector index, which trains poorly on too few vectors.
+    /// IVF_SQ vector index, which trains poorly on too few vectors.
     OnNonNullCount {
         column: &'static str,
         threshold: usize,
@@ -1509,7 +1509,7 @@ const LOCAL_INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const LOCAL_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// Object-store defaults: latency to refill is per-page, so keep more in cache
 /// than local - but bounded above the warm working set, not Lance's 6 GiB.
-/// Post word-tokenizer FTS that set is ~450 MB (simple invert + IVF_PQ aux), so
+/// Post word-tokenizer FTS that set is ~450 MB (simple invert + IVF_SQ aux), so
 /// 1 GiB holds both indices warm with headroom while capping the RSS ceiling.
 const REMOTE_INDEX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 const REMOTE_METADATA_CACHE_BYTES: usize = 512 * 1024 * 1024;
@@ -2132,7 +2132,7 @@ impl Handle {
 
     /// Run the table-local maintenance cycle for the supplied index intents.
     /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
-    /// BTree combine bug; Bitmap, FTS, and IVF_PQ fold via append.
+    /// BTree combine bug; Bitmap, FTS, and IVF_SQ fold via append.
     ///
     /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
@@ -2422,7 +2422,7 @@ impl Handle {
     }
 
     /// Drop the named index. Used by the `pond optimize --force-embed` model-swap path
-    /// to retire an IVF_PQ whose centroids belong to the old distance
+    /// to retire an IVF_SQ whose centroids belong to the old distance
     /// space, before the next write re-bootstraps it over the new model's
     /// vectors. Errors when the index does not exist; callers may swallow
     /// that.

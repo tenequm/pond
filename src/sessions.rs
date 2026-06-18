@@ -1591,13 +1591,13 @@ impl Store {
 
     /// Page the heavy search indices in from storage so the first user query
     /// after process start never eats the 175-442 s cold S3 load
-    /// (spec.md#search). Vector via `prewarm_index` (loads the IVF_PQ partition
+    /// (spec.md#search). Vector via `prewarm_index` (loads the IVF_SQ partition
     /// storage). FTS is warmed with one synthetic query: Lance's full FTS
     /// `prewarm_index` loads *every* token's posting list, which resident-sets
     /// the whole inverted index (~1.7 GiB on the 2M-row corpus) and blows the
     /// server RAM budget - so we settle the term dictionary + a hot token
     /// instead and let real queries page their own postings. Best effort: a
-    /// missing index (IVF_PQ below activation, or no FTS yet on an empty store)
+    /// missing index (IVF_SQ below activation, or no FTS yet on an empty store)
     /// is logged, not fatal.
     pub async fn prewarm(&self) -> Result<()> {
         let messages = self.dataset(Table::Messages).await?;
@@ -1895,7 +1895,7 @@ impl Store {
             };
             hits.push((key, float32(&batch, "_distance", row)?));
         }
-        // Stable secondary sort: same reasoning as `fts_search` - IVF_PQ can
+        // Stable secondary sort: same reasoning as `fts_search` - IVF_SQ can
         // emit hits with effectively identical `_distance` in fragment-dependent
         // order, which makes RRF dedup-ranks nondeterministic for tied
         // neighbors. Sort by distance asc (smaller = more similar), then by
@@ -2070,7 +2070,7 @@ impl Store {
             .await
     }
 
-    /// Rows added or rewritten in `messages` since the IVF_PQ vector index
+    /// Rows added or rewritten in `messages` since the IVF_SQ vector index
     /// was last optimized. Below
     /// [`VECTOR_INDEX_ACTIVATION_ROWS`] no index exists yet, so the caller
     /// must read [`embedding_progress`](Self::embedding_progress) too and
@@ -2086,16 +2086,27 @@ impl Store {
     /// the `pond optimize` progress bar's known total.
     pub async fn embedding_progress(&self) -> Result<EmbeddingProgress> {
         let dataset = self.handle.dataset(Table::Messages).await?;
-        // Lance 7.0.0 has no per-column null_count metadata, so each count is a
-        // data-page read; run the two concurrently rather than in series.
         // `embedded` counts `embedding_model IS NOT NULL`, not `vector`: the two
         // are co-set (spec.md#session-embed-from-canonical) so the count is
         // identical, but the model-id string column is ~50x narrower than the
-        // Float16 vector, so its page read is far cheaper.
-        let (embedded, total) = tokio::try_join!(
-            dataset.count_rows(Some(Predicate::IsNotNull("embedding_model").to_lance())),
-            dataset.count_rows(Some(Predicate::IsNotNull("search_text").to_lance())),
-        )?;
+        // Float16 vector (Lance 7.0.0 has no per-column null_count, so this is a
+        // data-page read).
+        let embedded = dataset
+            .count_rows(Some(Predicate::IsNotNull("embedding_model").to_lance()))
+            .await?;
+        // `total` (eligible = non-null search_text) reads the FTS index's
+        // num_docs instead of a ~133 MB search_text column scan (same trick as
+        // `searchable_in_scope`). num_docs counts indexed docs, which can
+        // briefly lag the true non-null count while the FTS index catches up, so
+        // floor it at `embedded` to keep progress <= 100%. No FTS index => scan.
+        let total = match self.fts_num_docs().await? {
+            Some(indexed) => indexed.max(embedded),
+            None => {
+                dataset
+                    .count_rows(Some(Predicate::IsNotNull("search_text").to_lance()))
+                    .await?
+            }
+        };
         Ok(EmbeddingProgress {
             embedded,
             total,
@@ -2149,7 +2160,7 @@ impl Store {
 
     /// Fold trailing fragments into existing indices across every table,
     /// without running compaction. Used by `pond optimize`'s tail so newly
-    /// written vectors land in the FTS / IVF_PQ / btree / bitmap indices
+    /// written vectors land in the FTS / IVF_SQ / btree / bitmap indices
     /// without paying the compaction retry budget while embed itself may
     /// still be writing in a sibling process.
     pub async fn build_indices_only(
@@ -2251,7 +2262,7 @@ impl Store {
         Ok(statuses)
     }
 
-    /// Drop the IVF_PQ index on `messages.vector`. Used by `pond optimize
+    /// Drop the IVF_SQ index on `messages.vector`. Used by `pond optimize
     /// --force-embed` before re-bootstrapping under a different model. Silent
     /// when the index does not exist.
     pub async fn drop_vector_index(&self) -> Result<()> {
@@ -3529,7 +3540,7 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// accelerate, and `role` is never filtered - both are deliberately unindexed
 /// (substring lookup stays on the SQL `LIKE` path). There is no index on
 /// `embedding_model`: pond's invariant is one active model at a time (a model
-/// swap goes through `pond optimize --force-embed` which drops the IVF_PQ,
+/// swap goes through `pond optimize --force-embed` which drops the IVF_SQ,
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
 /// `vector IS NOT NULL`. `id` lookups are rare and full-scan.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
@@ -3593,7 +3604,7 @@ fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
 /// forces a full read of the ~3 GiB `vector` column from the object store on
 /// every query (the ANN prefilter is evaluated as a `LanceScan` over the
 /// column) - measured at ~57 s/query on the 2M-row S3 corpus, dwarfing the
-/// IVF probe itself. It is also redundant: the IVF_PQ index only contains
+/// IVF probe itself. It is also redundant: the IVF_SQ index only contains
 /// embedded rows, and Lance's `_distance IS NOT NULL` post-filter (present in
 /// both the ANN and brute-force branches of the plan) already drops any
 /// null-vector row the brute-force tail might surface. So an empty caller
@@ -3614,7 +3625,7 @@ pub const DEFAULT_NPROBES: usize = 32;
 /// probe-every-partition behavior. No refine: IVF_SQ's per-dimension codes are
 /// precise enough to rank from the prewarmed partition, so pond never re-reads
 /// exact vectors from the data files (the remote-store GET storm PQ+refine
-/// incurred). `[search].refine_factor` is therefore intentionally ignored.
+/// incurred).
 fn apply_vector_search_knobs(
     scanner: &mut lance::dataset::scanner::Scanner,
     search: Option<&config::SearchConfig>,
@@ -3637,9 +3648,11 @@ pub(crate) const PARTS: &str = "parts";
 pub const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
 /// IVF_SQ index name on `messages.vector` (spec.md#search). Stable so the
-/// activation check and index creation name the same index. The literal keeps
-/// the `_ivfpq` suffix so the index rebuilds in place rather than orphaning the
-/// old segment under a renamed intent.
+/// activation check, optimize/append, and status all name the same index. The
+/// literal keeps the historical `_ivfpq` suffix as a stable identifier:
+/// renaming it would orphan the existing segment under a new name. A plain
+/// `optimize` folds into whatever index type already exists, so switching an
+/// existing IVF_PQ store to IVF_SQ needs `pond optimize --rebuild`.
 pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 
 /// IVF_SQ tuning constants (spec.md#search):
@@ -3655,7 +3668,7 @@ pub fn pond_index_intents() -> IndexIntents {
     pond_index_intents_with_vector_threshold(VECTOR_INDEX_ACTIVATION_ROWS)
 }
 
-/// Same as [`pond_index_intents`] but with an overridable IVF_PQ activation
+/// Same as [`pond_index_intents`] but with an overridable IVF_SQ activation
 /// threshold. Used by tests that need to exercise the activation boundary
 /// without writing 100k vectors.
 pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) -> IndexIntents {
@@ -3874,10 +3887,10 @@ pub(crate) struct MessageBatchRow<'a> {
     pub search_text: Option<&'a str>,
 }
 
-// Lance v7.0.0-beta.16's IVF_PQ build path (`rust/lance/src/index/vector/utils.rs`
+// Lance v7.0.0-beta.16's IVF_SQ build path (`rust/lance/src/index/vector/utils.rs`
 // `infer_vector_element_type_impl`) accepts only Float16/Float32/Float64/UInt8/Int8;
 // `FixedSizeBinary(2)`-backed `lance.bfloat16` is rejected. The format docs list
-// BFloat16 as a future-supported embedding type; until the Rust IVF_PQ build
+// BFloat16 as a future-supported embedding type; until the Rust IVF_SQ build
 // path catches up, store as Float16 (half-precision, also 2 bytes/element).
 fn embedding_vector_type() -> DataType {
     DataType::FixedSizeList(
@@ -5255,7 +5268,7 @@ mod tests {
     }
 
     /// Same as [`store_with_messages`] but tests optimize with a custom
-    /// IVF_PQ activation threshold.
+    /// IVF_SQ activation threshold.
     async fn store_with_messages_at_threshold(
         temp: &TempDir,
         count: usize,
@@ -5397,7 +5410,7 @@ mod tests {
         let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
 
         // First batch: 255 vectors, one below threshold. Optimize does not
-        // create the IVF_PQ because the trigger is not met.
+        // create the IVF_SQ because the trigger is not met.
         store.write_embeddings(&embedded(&keys[..255])).await?;
         store
             .optimize_indices_with_vector_threshold(256)
@@ -5410,11 +5423,11 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "IVF_PQ must not exist below the activation threshold",
+            "IVF_SQ must not exist below the activation threshold",
         );
 
         // Next batch: one more vector. Total reaches 256; optimize creates
-        // the IVF_PQ.
+        // the IVF_SQ.
         store.write_embeddings(&embedded(&keys[255..256])).await?;
         store
             .optimize_indices_with_vector_threshold(256)
@@ -5427,10 +5440,10 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "optimize must create the IVF_PQ once the threshold is crossed",
+            "optimize must create the IVF_SQ once the threshold is crossed",
         );
 
-        // The remaining 44 rows stay un-embedded; the IVF_PQ trains over the
+        // The remaining 44 rows stay un-embedded; the IVF_SQ trains over the
         // non-null subset and a planted vector is retrievable.
         let hits = store
             .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()), None)
@@ -5464,7 +5477,7 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "IVF_PQ must exist before a model swap",
+            "IVF_SQ must exist before a model swap",
         );
         assert_eq!(store.stale_embedding_count().await?, keys.len());
 
@@ -5493,7 +5506,7 @@ mod tests {
                 .await?
                 .iter()
                 .any(|name| name == MESSAGES_VECTOR_INDEX),
-            "optimize must rebuild IVF_PQ after force re-embed",
+            "optimize must rebuild IVF_SQ after force re-embed",
         );
 
         let stream = store.pending_or_stale_messages();

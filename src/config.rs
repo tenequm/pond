@@ -205,7 +205,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # query, so there's no cost on FTS-only corpora. `model` selects the
 # HuggingFace XLM-RoBERTa model; `dim` declares its output width and is baked
 # into the messages.vector schema on table creation - it must equal the
-# model's hidden_size and be a multiple of 8 (IVF_PQ subspace stride).
+# model's hidden_size.
 #
 # Common pairings:
 #   model = \"intfloat/multilingual-e5-small\"   dim = 384   (default)
@@ -219,12 +219,11 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384
 
-# Search tuning. Leave unset for Lance defaults; set when tuning IVF_PQ recall
+# Search tuning. Leave unset for Lance defaults; set when tuning vector recall
 # against a corpus.
 #
 # [search]
 # nprobes = 16
-# refine_factor = 2
 
 # Storage maintenance. Tunes the compaction + cleanup pass that runs inside
 # `pond sync` and `pond optimize`.
@@ -394,8 +393,6 @@ pub struct RuntimeConfig {
 pub struct SearchConfig {
     #[serde(default)]
     pub nprobes: Option<usize>,
-    #[serde(default)]
-    pub refine_factor: Option<u32>,
 }
 
 /// `[maintenance]`: storage-maintenance knobs shared by `pond sync` and
@@ -433,8 +430,7 @@ pub struct EmbeddingsConfig {
     /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
     /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-small`.
     pub model: String,
-    /// Output dimension of `model`. Must equal the model's `hidden_size` and
-    /// be divisible by 8 (the IVF_PQ subspace stride; see `embed::index_params`).
+    /// Output dimension of `model`. Must equal the model's `hidden_size`.
     /// Defaults to 384 (e5-small). Set to 768 for e5-base, 1024 for e5-large.
     pub dim: usize,
 }
@@ -807,19 +803,15 @@ pub fn contract_home(path: &Path) -> PathBuf {
 }
 
 impl EmbeddingsConfig {
-    /// Surface-level validation: model id non-empty and dim divisible by 8.
-    /// The dim/model mismatch is the load-time check inside `CandleEmbedder::load`,
-    /// which knows the model's `hidden_size`; what we can catch up front is the
-    /// IVF_PQ subspace stride (`dim / 8` in `embed::index_params`).
+    /// Surface-level validation: model id non-empty and dim positive. The
+    /// dim/model mismatch is the load-time check inside `CandleEmbedder::load`,
+    /// which knows the model's `hidden_size`.
     pub fn validate(&self) -> Result<()> {
         if self.model.trim().is_empty() {
             bail!("embeddings.model must be a non-empty HuggingFace model id");
         }
-        if self.dim == 0 || !self.dim.is_multiple_of(8) {
-            bail!(
-                "embeddings.dim = {} must be a positive multiple of 8 (IVF_PQ subspace stride)",
-                self.dim,
-            );
+        if self.dim == 0 {
+            bail!("embeddings.dim must be positive; got {}", self.dim);
         }
         Ok(())
     }
@@ -904,13 +896,14 @@ mod tests {
             dim: 768,
         };
         assert!(bad_model.validate().is_err());
-        // Dim must divide 8 (PQ subspace stride in `embed::index_params`).
-        let bad_dim = EmbeddingsConfig {
+        // Non-multiple-of-8 dims are accepted now: IVF_SQ has no subspace
+        // stride, so the old `dim % 8` requirement is gone.
+        let odd_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
         };
-        assert!(bad_dim.validate().is_err());
-        // Zero is rejected too (would divide-by-zero inside index_params).
+        assert!(odd_dim.validate().is_ok());
+        // Zero is still rejected.
         let zero_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,

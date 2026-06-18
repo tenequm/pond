@@ -146,10 +146,6 @@ struct Args {
     /// partition - the dominant cost of an unbounded vector scan.
     #[arg(long)]
     nprobes: Option<usize>,
-    /// IVF `refine_factor` for the vector arm (re-rank `k * factor` PQ
-    /// candidates against exact vectors). Unset = no refine.
-    #[arg(long)]
-    refine: Option<u32>,
     /// Attribution mode: time the three hybrid components in isolation -
     /// `searchable_in_scope` (the per-query IsNotNull(search_text) count),
     /// `fts_search`, and `vector_search` - over the query set, printing p50/p95
@@ -983,7 +979,6 @@ async fn main() -> Result<()> {
 
     let cfg = SearchConfig {
         nprobes: args.nprobes,
-        refine_factor: args.refine,
     };
     let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();

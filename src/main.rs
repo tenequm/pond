@@ -737,7 +737,7 @@ Homebrew and nix packages ship these pre-installed.")]
         #[arg(long, value_enum)]
         skip: Vec<OptimizeStage>,
         /// Re-embed rows whose stored `embedding_model` does not match the
-        /// configured model (a model swap), dropping the IVF_PQ first. Without
+        /// configured model (a model swap), dropping the IVF_SQ first. Without
         /// this, such rows abort the run with a typed error so a swap is never
         /// silent.
         #[arg(long)]
@@ -1398,7 +1398,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
-    // Lance's IVF_PQ builder warns once per empty centroid during merge
+    // Lance's IVF_SQ builder warns once per empty centroid during merge
     // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
     // It already handles the case - records a zero-sized partition and continues -
     // so the warning is benign log noise during index maintenance.
@@ -3025,7 +3025,7 @@ async fn run_embed_stage_with_limit(
         }
         output(&pond::output::paint(
             &format!(
-                "embed: --force-embed: re-embedding {} stale-model row(s) after dropping IVF_PQ",
+                "embed: --force-embed: re-embedding {} stale-model row(s) after dropping IVF_SQ",
                 format_thousands(stale as u64),
             ),
             pond::output::yellow(),
@@ -4046,9 +4046,9 @@ fn classify_index_health(
             _ => {}
         }
     }
-    // Semantic search misses unembedded rows even when IVF_PQ's own
+    // Semantic search misses unembedded rows even when IVF_SQ's own
     // unindexed-fragments check passes. Without the embedding probe (default
-    // `pond status`), this correction is skipped: the IVF_PQ fragment-lag
+    // `pond status`), this correction is skipped: the IVF_SQ fragment-lag
     // check still flags indexed-but-unfolded rows; only unembedded ones hide.
     if let Some(progress) = embedding {
         let embed_backlog = progress.total.saturating_sub(progress.embedded);
