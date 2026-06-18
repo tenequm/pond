@@ -237,14 +237,10 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
 #   what protects in-flight readers). Versions older than this are reclaimed
 #   by Lance's OCC-coordinated GC.
-# - `index_lag_threshold` is the minimum unindexed-fragment count before a
-#   per-intent append/rebuild runs in `pond optimize`; the brute-force
-#   fallback keeps queries correct while fragments accumulate. Default 4.
 #
 # [maintenance]
 # compaction_fragment_cap = 64
 # cleanup_older_than = \"1d\"
-# index_lag_threshold = 4
 
 # Long-running process caps. Both accept either a plain byte count or a
 # humansize-style suffix (\"128 MiB\", \"1 GiB\"). Both are optional - leave
@@ -405,7 +401,7 @@ pub struct SearchConfig {
 /// `[maintenance]`: storage-maintenance knobs shared by `pond sync` and
 /// `pond optimize`. All optional - omit and pond falls back to the
 /// in-process defaults in `pond::substrate` (`DEFAULT_COMPACTION_FRAGMENT_CAP`,
-/// `default_cleanup_older_than`, and the `index_lag_threshold` initializer).
+/// `default_cleanup_older_than`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
@@ -421,13 +417,6 @@ pub struct MaintenanceConfig {
     /// which never races a concurrent writer on any backend.
     #[serde(default)]
     pub cleanup_older_than: Option<String>,
-    /// Minimum unindexed-fragment count below which `optimize_table_indices`
-    /// skips the per-intent append/rebuild path; the brute-force fallback
-    /// keeps queries correct while fragments accumulate. Default 4 trades a
-    /// little query latency on cold fragments for far fewer remote index
-    /// commits during high-rate ingest.
-    #[serde(default)]
-    pub index_lag_threshold: Option<usize>,
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master
@@ -537,9 +526,6 @@ impl Config {
         config.embeddings.validate()?;
         config.validate_creds()?;
         config.embeddings.install_runtime();
-        if let Some(threshold) = config.maintenance.index_lag_threshold {
-            crate::substrate::init_index_lag_threshold(threshold);
-        }
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.

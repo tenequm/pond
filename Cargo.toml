@@ -156,6 +156,11 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Diagnostic only: enables lance-io per-request IO recording so the
+# serve_mem_bench `--io-trace` mode can attribute exact S3 GET counts/paths
+# per query. Never enabled for release builds; `read_iops`/`read_bytes` are
+# tracked without it, only the per-request path list needs `test-util`.
+io-trace = ["lance-io/test-util"]
 
 [dev-dependencies]
 assert_cmd = "2"

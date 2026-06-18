@@ -25,7 +25,7 @@ use pond::{
     substrate::{
         self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
         OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
-        VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than, index_lag_threshold,
+        VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than,
     },
     transport::{self, AppState},
     wire::{
@@ -1096,11 +1096,11 @@ async fn main() -> anyhow::Result<()> {
             // accumulated backlog with `pond optimize` (the verb that exists
             // precisely for this) or the scheduled maintenance run.
             if !no_optimize && any_new_rows {
-                // sync has no --force-embed; on a model swap point at the command that does.
-                run_embed_stage_with_limit(&store, false, None, "pond optimize --force-embed")
-                    .await?;
+                // Same finalize seam as `pond optimize` and `pond copy`. sync
+                // has no --force-embed; finalize's embed points a model swap at
+                // the command that does.
                 let policy = configured_maintenance_policy(&loaded, None)?;
-                run_update_indexes_stage(&store, &policy).await?;
+                finalize_indexes(&store, &policy, false).await?;
             }
             render_sync_summary(&store, &summary).await?;
         }
@@ -1120,22 +1120,42 @@ async fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("drop_index({name}) failed"))?;
                 output(&format!("optimize: dropped index {name}"))?;
             } else if rebuild {
+                // Migration path: bring the store to the regular-optimize end
+                // state (embed + fold + compaction + cleanup), then rebuild
+                // every index from scratch so it adopts current params, then
+                // reclaim the segments the rebuild superseded.
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let outcome = finalize_indexes(&store, &policy, force_embed).await?;
+                if outcome.any_indices_failed() {
+                    std::process::exit(1);
+                }
                 let (progress, bar) = optimize_progress_bar();
                 let result = store.rebuild_indices(None, Some(progress)).await;
                 bar.finish_and_clear();
                 result.context("rebuild_indices failed")?;
-                output("optimize: indexes rebuilt")?;
+                store
+                    .cleanup_old_versions(policy.cleanup_older_than)
+                    .await
+                    .context("cleanup after rebuild failed")?;
+                output("optimize: indexes rebuilt, old segments reclaimed")?;
             } else {
                 let stages = OptimizeStages::resolve(only, &skip)?;
-                if stages.embed {
-                    run_embed_stage(&store, force_embed).await?;
-                }
-                if stages.index {
-                    let policy = configured_maintenance_policy(&loaded, None)?;
-                    let outcome = run_update_indexes_stage(&store, &policy).await?;
-                    if outcome.any_indices_failed() {
-                        std::process::exit(1);
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let outcome = if stages.embed && stages.index {
+                    // Full optimize: the same finalize seam sync and copy use.
+                    Some(finalize_indexes(&store, &policy, force_embed).await?)
+                } else {
+                    if stages.embed {
+                        run_embed_stage(&store, force_embed).await?;
                     }
+                    if stages.index {
+                        Some(run_update_indexes_stage(&store, &policy).await?)
+                    } else {
+                        None
+                    }
+                };
+                if outcome.is_some_and(|outcome| outcome.any_indices_failed()) {
+                    std::process::exit(1);
                 }
             }
         }
@@ -1952,7 +1972,9 @@ async fn run_store_to_store_copy(
         ))?;
     } else {
         let policy = configured_maintenance_policy(loaded, None)?;
-        run_update_indexes_stage(&to_store, &policy).await?;
+        // Same finalize seam as optimize/sync. The embed pass no-ops because the
+        // copied rows arrive already embedded from the source.
+        finalize_indexes(&to_store, &policy, false).await?;
         output(&format!(
             "{} rebuilt text + semantic on destination  {:.1}s",
             pond::output::paint("indexes", dim),
@@ -2064,7 +2086,9 @@ async fn copy_archive_to_store(
         ))?;
     } else {
         let policy = configured_maintenance_policy(loaded, None)?;
-        run_update_indexes_stage(&store, &policy).await?;
+        // Same finalize seam as optimize/sync; the archive carries embeddings as
+        // data columns, so finalize's embed pass no-ops.
+        finalize_indexes(&store, &policy, false).await?;
         output(&format!(
             "{} rebuilt text + semantic on destination",
             pond::output::paint("indexes:", dim),
@@ -3129,6 +3153,20 @@ async fn run_update_indexes_stage(
     Ok(outcome)
 }
 
+/// The shared index-finalize stage for a full `pond optimize`, `pond sync`, and
+/// `pond copy`: embed the backlog - a no-op when every row is already embedded,
+/// as with a same-model copy - then fold every trailing fragment into the
+/// indexes and run the compaction + version-cleanup pass. One seam so the three
+/// entry points can't drift in what "indexes up to date" means.
+async fn finalize_indexes(
+    store: &Store,
+    policy: &MaintenancePolicy,
+    force_embed: bool,
+) -> anyhow::Result<OptimizeOutcome> {
+    run_embed_stage(store, force_embed).await?;
+    run_update_indexes_stage(store, policy).await
+}
+
 /// Final recap of a `pond sync` run. Three-line shape:
 ///
 /// ```text
@@ -3158,7 +3196,7 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
         store.embedding_progress(),
         store.row_counts(),
     )?;
-    let health = classify_index_health(&index_status, index_lag_threshold(), Some(&embedding));
+    let health = classify_index_health(&index_status, Some(&embedding));
 
     output("")?;
     output(&render_indexes_line(&health))?;
@@ -3933,7 +3971,7 @@ fn render_status_checks(
     use pond::output::{dim, paint};
 
     output("")?;
-    let health = classify_index_health(index_status, index_lag_threshold(), embedding.as_ref());
+    let health = classify_index_health(index_status, embedding.as_ref());
     output(&render_indexes_line(&health))?;
     // Default: `stored` shows the manifest row count (cheap); under `-v` the
     // embedding probe ran, so swap in the searchable subset and report it.
@@ -3981,16 +4019,18 @@ struct IndexHealth {
 /// means the trailing fragment count crossed the threshold and a fold is owed.
 fn classify_index_health(
     statuses: &[IndexStatus],
-    lag_threshold: usize,
     embedding: Option<&EmbeddingProgress>,
 ) -> IndexHealth {
     use IndexHealthState::*;
 
-    fn classify_one(status: &IndexStatus, lag_threshold: usize) -> IndexHealthState {
+    // `pond optimize` folds every trailing fragment (no lag threshold), so an
+    // index is current only when nothing is unindexed; any tail means a fold is
+    // still owed (e.g. after `--no-optimize`).
+    fn classify_one(status: &IndexStatus) -> IndexHealthState {
         if !status.exists {
             return NotBuilt;
         }
-        if status.unindexed_rows == 0 || status.unindexed_fragments < lag_threshold {
+        if status.unindexed_rows == 0 {
             Ready
         } else {
             Pending(status.unindexed_rows as u64)
@@ -4001,8 +4041,8 @@ fn classify_index_health(
     let mut semantic = NotBuilt;
     for status in statuses {
         match status.intent_name.as_str() {
-            MESSAGES_FTS_INDEX => text = classify_one(status, lag_threshold),
-            MESSAGES_VECTOR_INDEX => semantic = classify_one(status, lag_threshold),
+            MESSAGES_FTS_INDEX => text = classify_one(status),
+            MESSAGES_VECTOR_INDEX => semantic = classify_one(status),
             _ => {}
         }
     }

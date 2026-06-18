@@ -1591,10 +1591,14 @@ impl Store {
 
     /// Page the heavy search indices in from storage so the first user query
     /// after process start never eats the 175-442 s cold S3 load
-    /// (spec.md#search). Vector via `prewarm_index`; FTS has no prewarm API, so
-    /// one synthetic query warms the inverted index. Best effort: a missing
-    /// index (IVF_PQ below activation, or no FTS yet on an empty store) is
-    /// logged, not fatal.
+    /// (spec.md#search). Vector via `prewarm_index` (loads the IVF_PQ partition
+    /// storage). FTS is warmed with one synthetic query: Lance's full FTS
+    /// `prewarm_index` loads *every* token's posting list, which resident-sets
+    /// the whole inverted index (~1.7 GiB on the 2M-row corpus) and blows the
+    /// server RAM budget - so we settle the term dictionary + a hot token
+    /// instead and let real queries page their own postings. Best effort: a
+    /// missing index (IVF_PQ below activation, or no FTS yet on an empty store)
+    /// is logged, not fatal.
     pub async fn prewarm(&self) -> Result<()> {
         let messages = self.dataset(Table::Messages).await?;
         if let Err(error) = messages.prewarm_index(MESSAGES_VECTOR_INDEX).await {
@@ -1750,6 +1754,9 @@ impl Store {
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
+        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
+            scanner.fast_search();
+        }
         // Lance ships an autoprojection that silently appends `_score` to FTS
         // output when the projection omits it. That behavior is going away;
         // we opt into the future explicit-projection contract here so the
@@ -1817,12 +1824,11 @@ impl Store {
     }
 
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
-    /// scalar predicate (spec.md#search-prefilter-pushdown). Combines the caller's
-    /// filter with `vector IS NOT NULL` to exclude un-embedded rows from the
-    /// scan; the brute-force kNN path requires this (the IVF_PQ path would
-    /// skip them anyway). The single-active-model invariant lets pond drop
-    /// the per-row model filter: every non-null vector belongs to the current
-    /// model.
+    /// scalar predicate alone (spec.md#search-prefilter-pushdown) - see
+    /// `embedded_scope` for why pond does NOT add `vector IS NOT NULL`. nprobes
+    /// and refine fall back to [`DEFAULT_NPROBES`] / [`DEFAULT_REFINE_FACTOR`]
+    /// when `[search]` leaves them unset, so a default install never inherits
+    /// Lance's unbounded "probe every partition" behavior on a remote store.
     pub async fn vector_search(
         &self,
         query: &[f32],
@@ -1834,11 +1840,13 @@ impl Store {
         let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
-        if let Some(nprobes) = search.and_then(|cfg| cfg.nprobes) {
-            scanner.nprobes(nprobes);
-        }
-        if let Some(refine_factor) = search.and_then(|cfg| cfg.refine_factor) {
-            scanner.refine(refine_factor);
+        apply_vector_search_knobs(&mut scanner, search);
+        if self
+            .handle
+            .messages_has_index(MESSAGES_VECTOR_INDEX)
+            .await?
+        {
+            scanner.fast_search();
         }
         // Mirror the explicit-projection contract from `fts_search`: opt out
         // of `_distance` autoprojection and list it ourselves since the loop
@@ -1882,11 +1890,13 @@ impl Store {
         let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
         let key = Float32Array::from(query.to_vec());
         scanner.nearest("vector", &key, limit)?;
-        if let Some(nprobes) = search.and_then(|cfg| cfg.nprobes) {
-            scanner.nprobes(nprobes);
-        }
-        if let Some(refine_factor) = search.and_then(|cfg| cfg.refine_factor) {
-            scanner.refine(refine_factor);
+        apply_vector_search_knobs(&mut scanner, search);
+        if self
+            .handle
+            .messages_has_index(MESSAGES_VECTOR_INDEX)
+            .await?
+        {
+            scanner.fast_search();
         }
         scanner
             .explain_plan(true)
@@ -1904,6 +1914,9 @@ impl Store {
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
+        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
+            scanner.fast_search();
+        }
         scanner.project(&["session_id", "id"])?;
         scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
         scanner
@@ -2142,6 +2155,20 @@ impl Store {
             tables.push(outcome);
         }
         Ok(OptimizeOutcome { tables })
+    }
+
+    /// Reclaim superseded data/index files across every indexed table (Lance
+    /// `cleanup_old_versions`), without compaction. `pond optimize --rebuild`
+    /// runs this after the rebuild so the index segments it just replaced are
+    /// dropped immediately. The retention floor still protects versions a live
+    /// reader may have pinned (spec.md#concurrency).
+    pub async fn cleanup_old_versions(&self, older_than: chrono::Duration) -> Result<()> {
+        for (table, _) in pond_index_intents().all() {
+            self.handle
+                .cleanup_table_versions(table, older_than)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn rebuild_indices(
@@ -3527,12 +3554,51 @@ fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
     )
 }
 
-/// Combine the caller's filter with `vector IS NOT NULL` so the kNN scanner
-/// never sees a null-vector row. Under the single-active-model invariant,
-/// `vector IS NOT NULL` is equivalent to "row is currently embedded under
-/// the configured model" - no per-row `embedding_model` filter needed.
+/// The kNN prefilter is the caller's scalar filter alone - pond does NOT add
+/// `vector IS NOT NULL`. That looks like a safe guard but it is a remote-read
+/// trap: Lance v2 keeps no per-column null metadata, so `IsNotNull(vector)`
+/// forces a full read of the ~3 GiB `vector` column from the object store on
+/// every query (the ANN prefilter is evaluated as a `LanceScan` over the
+/// column) - measured at ~57 s/query on the 2M-row S3 corpus, dwarfing the
+/// IVF probe itself. It is also redundant: the IVF_PQ index only contains
+/// embedded rows, and Lance's `_distance IS NOT NULL` post-filter (present in
+/// both the ANN and brute-force branches of the plan) already drops any
+/// null-vector row the brute-force tail might surface. So an empty caller
+/// filter yields an empty prefilter and a pure index probe (spec.md#search,
+/// spec.md#search-prefilter-pushdown).
 fn embedded_scope(filter: &Predicate) -> Predicate {
-    Predicate::And(vec![Predicate::IsNotNull("vector"), filter.clone()])
+    filter.clone()
+}
+
+/// IVF `nprobes` applied when `[search].nprobes` is unset. Left unset, Lance
+/// probes up to every partition (~num_rows/4096, ~500 on the 2M-row corpus),
+/// one object-store read each - the dominant cost of a vector scan on a remote
+/// store. 32 bounds the reads while keeping recall (benchmarked, spec.md#search).
+pub const DEFAULT_NPROBES: usize = 32;
+/// IVF `refine_factor` applied when `[search].refine_factor` is unset: re-rank
+/// `k * factor` PQ candidates against their exact vectors, recovering the
+/// recall PQ quantization loses. A user may set `0` to disable refine.
+pub const DEFAULT_REFINE_FACTOR: u32 = 5;
+
+/// Apply pond's vector-search tuning to a kNN scanner, defaulting any unset
+/// `[search]` knob so a default install never inherits Lance's unbounded
+/// probe-every-partition behavior.
+fn apply_vector_search_knobs(
+    scanner: &mut lance::dataset::scanner::Scanner,
+    search: Option<&config::SearchConfig>,
+) {
+    let nprobes = search
+        .and_then(|cfg| cfg.nprobes)
+        .unwrap_or(DEFAULT_NPROBES);
+    scanner.nprobes(nprobes);
+    let refine = search
+        .and_then(|cfg| cfg.refine_factor)
+        .unwrap_or(DEFAULT_REFINE_FACTOR);
+    // refine(0) is rejected by Lance ("Refine factor cannot be zero"); treat a
+    // configured 0 as "no refine".
+    if refine > 0 {
+        scanner.refine(refine);
+    }
 }
 
 // Bare logical table names: the lance-namespace Directory impl owns the

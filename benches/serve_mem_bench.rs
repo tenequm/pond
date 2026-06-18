@@ -51,7 +51,7 @@ use pond::{
     handlers::{pond_get, pond_search},
     sessions::Store,
     sql::{self, Mode, Tables},
-    substrate::{ResolvedStorage, RuntimeCaps, StorageUrl, Table},
+    substrate::{Predicate, ResolvedStorage, RuntimeCaps, StorageUrl, Table},
     wire::{
         GetEnvelope, GetRequest, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
         SearchResponse,
@@ -141,6 +141,30 @@ struct Args {
     /// index load shows up here instead of in `fts_warm`/`first_hybrid`.
     #[arg(long)]
     prewarm: bool,
+    /// IVF `nprobes` for the vector arm. Unset lets Lance probe up to every
+    /// partition (num_rows/4096), which on a remote store is one S3 read per
+    /// partition - the dominant cost of an unbounded vector scan.
+    #[arg(long)]
+    nprobes: Option<usize>,
+    /// IVF `refine_factor` for the vector arm (re-rank `k * factor` PQ
+    /// candidates against exact vectors). Unset = no refine.
+    #[arg(long)]
+    refine: Option<u32>,
+    /// Attribution mode: time the three hybrid components in isolation -
+    /// `searchable_in_scope` (the per-query IsNotNull(search_text) count),
+    /// `fts_search`, and `vector_search` - over the query set, printing p50/p95
+    /// per component. Pinpoints which one is the real steady-state floor instead
+    /// of only seeing max(arms) through the full `pond_search`. Runs after
+    /// prewarm and exits before the normal phases.
+    #[arg(long)]
+    attribute: bool,
+    /// S3 IO attribution: count the exact GETs (read_iops), bytes, and - built
+    /// with `--features io-trace` - the per-request paths each warm query issues
+    /// against the remote store, broken out by component (scope count / fts /
+    /// vector / get). Answers "how much and why are we hitting S3 per query".
+    /// Runs after prewarm and exits before the normal phases.
+    #[arg(long)]
+    io_trace: bool,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
@@ -485,6 +509,27 @@ fn percentile(values: &[u128], p: f64) -> u128 {
     #[allow(clippy::cast_precision_loss)]
     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Classify an S3 object path into a coarse bucket so the io-trace request
+/// histogram shows *what* each GET is for: a specific index file (FTS posting
+/// segment, IVF partition store), a data fragment, the manifest, or the
+/// transaction log.
+#[cfg(feature = "io-trace")]
+fn io_bucket(path: &str) -> String {
+    if let Some(pos) = path.find("/_indices/") {
+        let after = &path[pos + "/_indices/".len()..];
+        let file = after.rsplit('/').next().unwrap_or(after);
+        format!("index/{file}")
+    } else if path.contains("/data/") {
+        "data".to_string()
+    } else if path.contains("manifest") || path.contains("/_versions/") {
+        "manifest".to_string()
+    } else if path.contains("_transactions") {
+        "txn".to_string()
+    } else {
+        path.rsplit('/').next().unwrap_or(path).to_string()
+    }
 }
 
 fn first_hit_message_id(response: &SearchResponse) -> Option<String> {
@@ -928,7 +973,10 @@ async fn main() -> Result<()> {
         return run_cap_sweep(&args, &target).await;
     }
 
-    let cfg = SearchConfig::default();
+    let cfg = SearchConfig {
+        nprobes: args.nprobes,
+        refine_factor: args.refine,
+    };
     let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
 
@@ -960,6 +1008,12 @@ async fn main() -> Result<()> {
     );
     println!();
 
+    // Arm S3 IO tracing before the store opens so the tracker is injected as
+    // the object-store wrapper on every dataset read open.
+    if args.io_trace {
+        pond::substrate::io_trace::enable();
+    }
+
     // ---- Phase: cold_open ----
     let mut phases: Vec<PhaseStats> = Vec::new();
     sampler.mark_phase_start();
@@ -987,6 +1041,16 @@ async fn main() -> Result<()> {
     cold.elapsed_ms = vec![open_ms];
     phases.push(cold);
 
+    // LazyEmbedder created but NOT loaded yet - matches `pond mcp` lazy
+    // behavior. With `--prewarm` it is warmed in the prewarm phase (mirroring
+    // a startup embedder prewarm), so eviction is disabled to keep the model
+    // resident through the long S3 phases up to `first_hybrid`.
+    let embedder = if args.prewarm {
+        LazyEmbedder::candle().with_idle_threshold(Duration::MAX)
+    } else {
+        LazyEmbedder::candle()
+    };
+
     // ---- Phase: prewarm (optional; mirrors `pond mcp` startup) ----
     if args.prewarm {
         sampler.mark_phase_start();
@@ -994,6 +1058,11 @@ async fn main() -> Result<()> {
         let pf_start_kb = sampler.current_pf_kb();
         let t = Instant::now();
         store.prewarm().await?;
+        // Warm the E5 model too, off the request path - production loads it at
+        // startup so the first user hybrid query never pays the model load.
+        let embed_t = Instant::now();
+        embedder.get().await?;
+        let embed_ms = embed_t.elapsed().as_millis();
         let prewarm_ms = t.elapsed().as_millis();
         thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
         phases.push(PhaseStats {
@@ -1008,7 +1077,9 @@ async fn main() -> Result<()> {
             pf_end_kb: sampler.current_pf_kb(),
             pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
             pf_global_peak_kb: sampler.peak_pf_kb(),
-            notes: format!("prewarm_ms={prewarm_ms} (vector prewarm_index + synthetic FTS)"),
+            notes: format!(
+                "prewarm_ms={prewarm_ms} (vector prewarm_index + synthetic FTS, e5 model {embed_ms}ms)"
+            ),
         });
     }
 
@@ -1024,8 +1095,166 @@ async fn main() -> Result<()> {
         .await
         .map(|s| phases.push(s))?;
 
-    // LazyEmbedder created but NOT loaded - matches `pond mcp` lazy behavior.
-    let embedder = LazyEmbedder::candle();
+    // ---- Attribution: isolate the three hybrid components ----
+    // pond_search runs `searchable_in_scope` (an IsNotNull(search_text) count)
+    // concurrently with the retrieval arms via try_join!, so the observed
+    // latency is max(scope_count, fts, vector). Time each alone to see the
+    // real floor. Exits before the normal phases.
+    if args.attribute {
+        let empty = Predicate::And(Vec::new());
+        let backend = embedder.get().await?;
+        // Warm each path once so steady-state cache state matches the phases.
+        store.searchable_in_scope(&empty).await?;
+        store.fts_search(QUERIES[0], 100, &empty).await?;
+        let warm_vec = backend.embed(&[QUERIES[0].to_string()])?;
+        store
+            .vector_search(
+                warm_vec.first().context("no warm vec")?,
+                100,
+                &empty,
+                Some(&cfg),
+            )
+            .await?;
+
+        let mut scope_ms = Vec::new();
+        let mut fts_ms = Vec::new();
+        let mut vec_ms = Vec::new();
+        for q in &queries {
+            let t = Instant::now();
+            store.searchable_in_scope(&empty).await?;
+            scope_ms.push(t.elapsed().as_millis());
+
+            let t = Instant::now();
+            store.fts_search(q, 100, &empty).await?;
+            fts_ms.push(t.elapsed().as_millis());
+
+            let v = backend.embed(&[(*q).to_string()])?;
+            let t = Instant::now();
+            store
+                .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                .await?;
+            vec_ms.push(t.elapsed().as_millis());
+        }
+        println!("\n=== attribution (isolated component latency, ms) ===");
+        println!("{:<22}{:>8}{:>8}", "component", "p50", "p95");
+        for (name, v) in [
+            ("searchable_in_scope", &scope_ms),
+            ("fts_search", &fts_ms),
+            ("vector_search", &vec_ms),
+        ] {
+            println!(
+                "{name:<22}{:>8}{:>8}",
+                percentile(v, 0.5),
+                percentile(v, 0.95)
+            );
+        }
+        println!("raw scope_ms={scope_ms:?}");
+        println!("raw fts_ms={fts_ms:?}");
+        println!("raw vec_ms={vec_ms:?}");
+        return Ok(());
+    }
+
+    // ---- IO attribution: exact S3 GETs per warm query, per component ----
+    if args.io_trace {
+        use pond::substrate::io_trace;
+        let empty = Predicate::And(Vec::new());
+        let backend = embedder.get().await?;
+        // Warm every path so we measure a warm server's steady-state IO, not
+        // the one-time cold index/metadata load.
+        store.searchable_in_scope(&empty).await?;
+        store.fts_search(QUERIES[0], 100, &empty).await?;
+        let wv = backend.embed(&[QUERIES[0].to_string()])?;
+        store
+            .vector_search(wv.first().context("no warm vec")?, 100, &empty, Some(&cfg))
+            .await?;
+        let warm_hits = store.fts_search(QUERIES[0], 1, &empty).await?;
+        let get_id = warm_hits.first().map(|(key, _)| key.message_id.clone());
+        if let Some(id) = &get_id {
+            let _ = pond_get(&store, get_request(id.clone())).await;
+        }
+        io_trace::take(); // discard warm IO
+
+        let labels = ["scope_count", "fts_search", "vector_search", "pond_get"];
+        let mut iops: [Vec<u128>; 4] = Default::default();
+        let mut rbytes: [Vec<u128>; 4] = Default::default();
+        #[cfg(feature = "io-trace")]
+        let mut hist: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new();
+
+        macro_rules! meas {
+            ($idx:expr, $body:expr) => {{
+                io_trace::take();
+                $body;
+                let s = io_trace::take().unwrap_or_default();
+                iops[$idx].push(u128::from(s.read_iops));
+                rbytes[$idx].push(u128::from(s.read_bytes));
+                #[cfg(feature = "io-trace")]
+                for r in &s.requests {
+                    let key = format!(
+                        "{:<14}{:>11}  {}",
+                        labels[$idx],
+                        r.method,
+                        io_bucket(&r.path.to_string())
+                    );
+                    let entry = hist.entry(key).or_insert((0u64, 0u64));
+                    entry.0 += 1;
+                    entry.1 += r.range.as_ref().map_or(0, |x| x.end - x.start);
+                }
+            }};
+        }
+
+        for q in &queries {
+            meas!(0, store.searchable_in_scope(&empty).await?);
+            meas!(1, store.fts_search(q, 100, &empty).await?);
+            let v = backend.embed(&[(*q).to_string()])?;
+            meas!(
+                2,
+                store
+                    .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                    .await?
+            );
+            if let Some(id) = &get_id {
+                meas!(3, {
+                    let _ = pond_get(&store, get_request(id.clone())).await;
+                });
+            }
+        }
+
+        println!("\n=== S3 IO per warm query (component isolated, optimized corpus) ===");
+        println!(
+            "{:<16}{:>10}{:>10}{:>13}{:>13}",
+            "component", "iops_p50", "iops_p95", "bytes_p50", "bytes_p95"
+        );
+        for i in 0..labels.len() {
+            if iops[i].is_empty() {
+                continue;
+            }
+            println!(
+                "{:<16}{:>10}{:>10}{:>13}{:>13}",
+                labels[i],
+                percentile(&iops[i], 0.5),
+                percentile(&iops[i], 0.95),
+                percentile(&rbytes[i], 0.5),
+                percentile(&rbytes[i], 0.95),
+            );
+        }
+        #[cfg(feature = "io-trace")]
+        {
+            println!(
+                "\n=== request breakdown (component / method / path-bucket -> reqs, bytes), summed over {} queries ===",
+                queries.len()
+            );
+            let mut rows: Vec<(String, (u64, u64))> = hist.into_iter().collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
+            for (key, (count, bytes)) in rows.into_iter().take(50) {
+                println!("{count:>6} reqs  {bytes:>11} B   {key}");
+            }
+        }
+        #[cfg(not(feature = "io-trace"))]
+        println!("(build with --features io-trace for the per-request path breakdown)");
+        return Ok(());
+    }
+
     let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // ---- Phase: fts_warm ----

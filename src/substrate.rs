@@ -47,27 +47,13 @@ use url::Url;
 /// IVF_PQ cannot train well on fewer vectors anyway.
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
-/// Default minimum unindexed-fragment count required before a per-intent
-/// append/rebuild step is admitted into `optimize_table_indices`. Lower
-/// values make each commit smaller and more frequent (bad on remote
-/// stores); higher values let fragments accumulate behind the brute-force
-/// fallback. 4 is the floor of the documented 4-8 band.
-pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
-
-static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Seed the process-wide index-lag threshold from `[maintenance].index_lag_threshold`.
-/// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
-pub fn init_index_lag_threshold(value: usize) {
-    INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
-}
-
-pub fn index_lag_threshold() -> usize {
-    INDEX_LAG_THRESHOLD_RUNTIME
-        .get()
-        .copied()
-        .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
-}
+/// Segment count at which an incremental index fold consolidates instead of
+/// appending. Each `optimize_indices(append)` writes a new same-name segment
+/// (lance `num_indices_to_merge=0`), and every vector/FTS query reads the
+/// probed partition or token postings from *every* segment - so unbounded
+/// delta growth multiplies per-query object-store round-trips. At this many
+/// segments pond folds with `merge` to collapse them back into one.
+pub const DELTA_MERGE_THRESHOLD: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Storage addresses (spec.md#storage-url-grammar)
@@ -2265,6 +2251,23 @@ impl Handle {
         result
     }
 
+    /// Lance `cleanup_old_versions` for one table: reclaim files no manifest
+    /// within the retention window references. No compaction and no new commit -
+    /// it only deletes superseded files, so no OCC retry is needed.
+    pub async fn cleanup_table_versions(
+        &self,
+        table: Table,
+        older_than: chrono::Duration,
+    ) -> Result<()> {
+        let mut guard = self.cached(table).await?.lock().await;
+        let dataset = guard.latest().await?;
+        dataset
+            .cleanup_old_versions(older_than, Some(false), Some(false))
+            .await
+            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
+        Ok(())
+    }
+
     pub async fn index_status(
         &self,
         table: Table,
@@ -2347,6 +2350,17 @@ impl Handle {
         let dataset = self.dataset(Table::Messages).await?;
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().map(|index| index.name.clone()).collect())
+    }
+
+    /// Whether `messages` carries an index named `name`. Manifest-only and
+    /// cache-backed (`load_indices` hits the dataset index cache), so it is
+    /// cheap enough to gate `Scanner::fast_search` per query: fast-search
+    /// returns an empty plan when the index is absent, so the retrievers must
+    /// only opt in once it exists.
+    pub(crate) async fn messages_has_index(&self, name: &str) -> Result<bool> {
+        let dataset = self.dataset(Table::Messages).await?;
+        let indices = dataset.load_indices().await?;
+        Ok(indices.iter().any(|index| index.name == name))
     }
 
     /// Count rows in `table` not yet covered by `index_name`. Manifest-only;
@@ -2818,14 +2832,13 @@ async fn optimize_table_indices(
             continue;
         }
 
+        // Fold every trailing fragment so the index is always current after an
+        // optimize - no lag threshold. A tiny tail (rows written between this
+        // fold and the next) stays invisible to `fast_search` queries until the
+        // next fold, and the `DELTA_MERGE_THRESHOLD` cadence keeps the per-fold
+        // segment from accumulating without bound (spec.md#search).
         let unindexed = dataset.unindexed_fragments(intent.name).await?;
         if unindexed.is_empty() {
-            continue;
-        }
-        // Lag guard: let fragments accumulate behind the brute-force fallback
-        // rather than firing a commit per tiny append. Threshold is operator-
-        // tunable via `[maintenance].index_lag_threshold`.
-        if unindexed.len() < index_lag_threshold() {
             continue;
         }
         match intent.params {
@@ -2905,7 +2918,22 @@ async fn optimize_table_indices(
     }
 
     if !append_indices.is_empty() {
-        let to_append = append_indices.clone();
+        // Per-index segment count from the manifest loaded above (delta segments
+        // share the intent name). Indices that have piled up
+        // `DELTA_MERGE_THRESHOLD` segments fold with `merge` (collapse to one);
+        // the rest take the cheap append. Splitting keeps each query reading few
+        // segments without paying a consolidation on every tiny fold.
+        let segment_count = |name: &str| {
+            existing
+                .iter()
+                .filter(|index| index.name.as_str() == name)
+                .count()
+        };
+        let (to_merge, to_append): (Vec<String>, Vec<String>) = append_indices
+            .iter()
+            .cloned()
+            .partition(|name| segment_count(name) >= DELTA_MERGE_THRESHOLD);
+
         emit(
             progress,
             OptimizeEvent::PhaseStart {
@@ -2915,10 +2943,20 @@ async fn optimize_table_indices(
             },
         );
         let started = Instant::now();
-        dataset
-            .optimize_indices(&OptimizeOptions::append().index_names(to_append))
-            .await
-            .context("optimize_indices(append) failed during index optimize")?;
+        if !to_append.is_empty() {
+            dataset
+                .optimize_indices(&OptimizeOptions::append().index_names(to_append))
+                .await
+                .context("optimize_indices(append) failed during index optimize")?;
+        }
+        if !to_merge.is_empty() {
+            dataset
+                .optimize_indices(
+                    &OptimizeOptions::merge(DELTA_MERGE_THRESHOLD).index_names(to_merge),
+                )
+                .await
+                .context("optimize_indices(merge) failed during index optimize")?;
+        }
         emit(
             progress,
             OptimizeEvent::PhaseDone {
@@ -2930,7 +2968,7 @@ async fn optimize_table_indices(
         tracing::debug!(
             target: "pond::perf",
             indices = ?append_indices,
-            "appended trailing fragments into indices",
+            "folded trailing fragments into indices",
         );
         did_work = true;
     }
@@ -3018,6 +3056,35 @@ async fn index_status(
 /// wrap level and downcasts cleanly. Managed-versioning hookup (REST
 /// namespace external-manifest commits) is not wired here; v1 ships
 /// Directory v2 only.
+/// Diagnostic S3 IO tracing. Inert unless [`io_trace::enable`] is called
+/// before the store opens; then a shared `IOTracker` is injected as the
+/// object-store wrapper on every dataset read open, counting exactly how many
+/// GETs (and bytes, and - under the `io-trace` feature - which paths) each
+/// query issues against a remote store. Used by `serve_mem_bench --io-trace`
+/// to attribute the per-query S3 request load. Not a production code path.
+pub mod io_trace {
+    use lance_io::utils::tracking_store::{IOTracker, IoStats};
+    use std::sync::{Arc, OnceLock};
+
+    static TRACKER: OnceLock<IOTracker> = OnceLock::new();
+
+    /// Arm tracing. Must run before the store opens so the wrapper is applied
+    /// when the datasets' object store is built.
+    pub fn enable() {
+        let _ = TRACKER.set(IOTracker::default());
+    }
+
+    /// The shared tracker as an object-store wrapper, when armed.
+    pub(super) fn wrapper() -> Option<Arc<IOTracker>> {
+        TRACKER.get().map(|tracker| Arc::new(tracker.clone()))
+    }
+
+    /// Read and reset the IO accumulated since the last call.
+    pub fn take() -> Option<IoStats> {
+        TRACKER.get().map(IOTracker::incremental_stats)
+    }
+}
+
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
@@ -3038,8 +3105,23 @@ async fn open_or_create_via_ns(
                 format!("namespace returned no location for table {table_name}")
             })?;
             let mut builder = DatasetBuilder::from_uri(&location).with_session(session.clone());
-            if !storage_options.is_empty() {
-                builder = builder.with_storage_options(storage_options.clone());
+            match io_trace::wrapper() {
+                Some(wrapper) => {
+                    builder = builder.with_store_params(ObjectStoreParams {
+                        object_store_wrapper: Some(wrapper),
+                        storage_options_accessor: (!storage_options.is_empty()).then(|| {
+                            Arc::new(StorageOptionsAccessor::with_static_options(
+                                storage_options.clone(),
+                            ))
+                        }),
+                        ..Default::default()
+                    });
+                }
+                None => {
+                    if !storage_options.is_empty() {
+                        builder = builder.with_storage_options(storage_options.clone());
+                    }
+                }
             }
             let dataset = builder
                 .load()
