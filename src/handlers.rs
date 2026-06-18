@@ -969,16 +969,21 @@ mod search_handler {
     pub struct SearchPlan {
         pub mode: SearchMode,
         pub query: String,
+        /// User filters only. Drives both the arms and `searchable_in_scope`;
+        /// empty for an unfiltered search so the count reads the FTS `num_docs`
+        /// stat, not the search_text scan. The subagent exclusion is applied
+        /// in-memory (`exclude_subagents`), not as a SQL clause, so the arms stay
+        /// index-only - no `source_agent` materialization on a remote store.
         pub filter: Predicate,
-        /// User filters only (no subagent-exclusion default), used by
-        /// `searchable_in_scope`. Empty for an unfiltered search so the count
-        /// reads the FTS `num_docs` stat instead of the search_text scan.
-        pub scope_filter: Predicate,
         pub filters: SearchFilters,
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
         pub min_score: f64,
+        /// Drop subagent hits (session id contains `/`) from the arm results in
+        /// memory - the spec.md#search retrieval default. See `plan_search` for
+        /// when it is on.
+        pub exclude_subagents: bool,
     }
 
     const LIMIT_CAP: usize = 200;
@@ -1091,10 +1096,11 @@ mod search_handler {
         let candidates_fut = async {
             match plan.mode {
                 SearchMode::Fts => {
-                    let hits = store
+                    let mut hits = store
                         .fts_search(&plan.query, plan.pool, &plan.filter)
                         .await
                         .map_err(map_storage)?;
+                    retain_non_subagents(&mut hits, plan.exclude_subagents);
                     Ok(normalize_fts(hits))
                 }
                 SearchMode::Hybrid => {
@@ -1114,7 +1120,12 @@ mod search_handler {
                             .await
                             .map_err(map_storage)
                     };
-                    let (fts, vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
+                    let (mut fts, mut vector_raw) = tokio::try_join!(fts_fut, vector_fut)?;
+                    // Drop subagents before fusion so each arm's min-max
+                    // normalization spans only the kept candidates, matching the
+                    // old pre-retrieval SQL exclusion.
+                    retain_non_subagents(&mut fts, plan.exclude_subagents);
+                    retain_non_subagents(&mut vector_raw, plan.exclude_subagents);
                     // Per-arm scores carry raw magnitude into fusion: BM25 for
                     // FTS, cosine similarity (`1 - distance`) for the vector arm.
                     // Fusion (`fuse_arms`) min-max normalizes each arm over its
@@ -1158,17 +1169,18 @@ mod search_handler {
                 SearchMode::Vector => {
                     let backend = load_embedder(embedder).await?;
                     let vector = embed_query(backend.as_ref(), &plan.query)?;
-                    let vector_raw = store
+                    let mut vector_raw = store
                         .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                         .await
                         .map_err(map_storage)?;
+                    retain_non_subagents(&mut vector_raw, plan.exclude_subagents);
                     Ok(normalize_vector(vector_raw))
                 }
             }
         };
         let scope_fut = async {
             store
-                .searchable_in_scope(&plan.scope_filter)
+                .searchable_in_scope(&plan.filter)
                 .await
                 .map_err(map_storage)
         };
@@ -1304,21 +1316,28 @@ mod search_handler {
         }
         let limit = request.limit.min(LIMIT_CAP);
         let min_score = filters.min_score;
-        let filter = build_filter(&filters)?;
-        let scope_filter = build_scope_filter(&filters)?;
+        let filter = build_scope_filter(&filters)?;
+        let exclude_subagents = default_excludes_subagents(&filters);
         // Retriever candidate pool: wider than `limit` so the fuser has
-        // material to merge.
-        let pool = limit.saturating_mul(5).max(50);
+        // material to merge. When excluding subagents in-memory, over-fetch by
+        // half (subagents are ~30% of the corpus) so ~`pool` non-subagent
+        // candidates survive the drop.
+        let mut pool = limit.saturating_mul(5).max(50);
+        let mut vector_pool = pool.saturating_mul(2);
+        if exclude_subagents {
+            pool = pool.saturating_mul(3) / 2;
+            vector_pool = vector_pool.saturating_mul(3) / 2;
+        }
         Ok(SearchPlan {
             mode,
             query,
             filter,
-            scope_filter,
             filters,
             pool,
-            vector_pool: pool.saturating_mul(2),
+            vector_pool,
             limit,
             min_score,
+            exclude_subagents,
         })
     }
 
@@ -1375,6 +1394,16 @@ mod search_handler {
         match session_id.find('/') {
             Some(idx) => &session_id[..idx],
             None => session_id,
+        }
+    }
+
+    /// Drop subagent hits in memory when `exclude` is set: a subagent session id
+    /// carries a `/` (the same marker `session_root` splits on). Replaces the
+    /// `NOT source_agent LIKE` SQL prefilter, which forced a `source_agent`
+    /// materialization that cost scattered GETs on a remote store.
+    fn retain_non_subagents(hits: &mut Vec<(MessageKey, f32)>, exclude: bool) {
+        if exclude {
+            hits.retain(|(key, _)| !key.session_id.contains('/'));
         }
     }
 
@@ -1871,13 +1900,9 @@ mod search_handler {
         })
     }
 
-    /// Build the shared scalar filter predicate pushed into both retrievers.
-    /// Both the FTS and vector retrievers scan `messages` (spec.md#datasets),
-    /// so one predicate serves both.
-    /// User-scope clauses (project/session/source_agent/date) - the explicit
-    /// filters that define the universe a count should measure. The default
-    /// subagent exclusion is a retrieval-ranking default, not a user scope, so
-    /// it is added only by `build_filter` (the arms), never here.
+    /// User-scope clauses (project/session/source_agent/date) shared by the arms
+    /// and `searchable_in_scope`. The subagent exclusion is not here, nor a SQL
+    /// clause anywhere - it is applied in-memory (see `retain_non_subagents`).
     fn build_scope_clauses(filters: &SearchFilters) -> Result<Vec<Predicate>, ErrorEnvelope> {
         let mut clauses = Vec::new();
 
@@ -1920,25 +1945,13 @@ mod search_handler {
         Ok(Predicate::And(build_scope_clauses(filters)?))
     }
 
-    /// Retrieval predicate for the FTS/vector arms: user scope plus the default
-    /// subagent exclusion.
-    pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
-        let mut clauses = build_scope_clauses(filters)?;
-
-        // spec.md#search: subagent sessions (`source_agent` with a "/") are
-        // excluded by default; an explicit session_id/source_agent filter means
-        // the caller is already scoping, so the exclusion would only fight it.
-        if !filters.include_subagents
-            && filters.session_id.is_none()
-            && filters.source_agent.is_none()
-        {
-            clauses.push(Predicate::Not(Box::new(Predicate::LikeContains(
-                "source_agent",
-                "/".to_owned(),
-            ))));
-        }
-
-        Ok(Predicate::And(clauses))
+    /// spec.md#search: subagents are excluded by default, except when the caller
+    /// opts in or already scopes to one session/agent (the exclusion would only
+    /// fight an explicit filter there). The single source of truth so the arms
+    /// (`plan_search`) and the transcript note (`render_search_transcript`) can't
+    /// drift on what "default" means.
+    pub fn default_excludes_subagents(filters: &SearchFilters) -> bool {
+        !filters.include_subagents && filters.session_id.is_none() && filters.source_agent.is_none()
     }
 
     /// Parse a `YYYY-MM-DD` filter date into a timestamp literal. `end_of_day`
@@ -1983,6 +1996,32 @@ mod search_handler {
             );
             // Multiple slashes: still cut at the first one (defensive).
             assert_eq!(session_root("root/a/b"), "root");
+        }
+
+        #[test]
+        fn retain_non_subagents_drops_slash_ids_only_when_excluding() {
+            let hit = |sid: &str| {
+                (
+                    crate::sessions::MessageKey {
+                        session_id: sid.to_owned(),
+                        message_id: "m1".to_owned(),
+                    },
+                    1.0_f32,
+                )
+            };
+            let base = vec![hit("root-a"), hit("root-b/agent-x"), hit("root-c")];
+
+            let mut excluded = base.clone();
+            retain_non_subagents(&mut excluded, true);
+            let ids: Vec<&str> = excluded
+                .iter()
+                .map(|(key, _)| key.session_id.as_str())
+                .collect();
+            assert_eq!(ids, ["root-a", "root-c"]);
+
+            let mut kept = base;
+            retain_non_subagents(&mut kept, false);
+            assert_eq!(kept.len(), 3);
         }
 
         #[test]
@@ -2101,8 +2140,9 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    FusedHit, FusionKey, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter,
-    build_scope_filter, explain_search_plan, fuse_arms, hit_payload, plan_search, pond_search,
+    FusedHit, FusionKey, RankedList, RetrieverKind, SearchMode, SearchPlan, build_scope_filter,
+    default_excludes_subagents, explain_search_plan, fuse_arms, hit_payload, plan_search,
+    pond_search,
 };
 
 #[cfg(test)]
@@ -2263,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_pushes_down_each_predicate_and_handles_empty() {
+    fn build_scope_filter_pushes_down_each_predicate_and_handles_empty() {
         let filters = SearchFilters {
             project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
             session_id: Some("01HXY".to_owned()),
@@ -2273,67 +2313,41 @@ mod tests {
             min_score: 0.0,
             include_subagents: false,
         };
-        let sql = build_filter(&filters).unwrap().to_lance();
+        let sql = build_scope_filter(&filters).unwrap().to_lance();
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
         assert!(sql.contains("session_id = '01HXY'"));
         assert!(sql.contains("source_agent = 'claude-code'"));
         assert!(sql.contains("timestamp >="));
         assert!(sql.contains("timestamp <="));
-        // session_id/source_agent set => default subagent exclusion is skipped.
-        assert!(!sql.contains("NOT ("));
+        // The subagent exclusion is never a SQL clause; it is applied in memory.
+        assert!(!sql.contains("source_agent LIKE"));
 
-        assert_eq!(
-            build_filter(&SearchFilters::default()).unwrap().to_lance(),
-            "NOT (source_agent LIKE '%/%' ESCAPE '\\')",
-        );
-        assert_eq!(
-            build_filter(&SearchFilters {
-                include_subagents: true,
-                ..SearchFilters::default()
-            })
-            .unwrap()
-            .to_lance(),
-            "",
-        );
-    }
-
-    #[test]
-    fn build_scope_filter_drops_the_subagent_default() {
-        // Default search: scope filter is empty so `searchable_in_scope` reads
-        // the FTS num_docs stat instead of the ~133 MB search_text scan, even
-        // though the retrieval filter carries the subagent exclusion.
+        // Unfiltered: empty `And` so `searchable_in_scope` reads the FTS num_docs
+        // stat instead of the ~133 MB search_text scan.
         assert_eq!(
             build_scope_filter(&SearchFilters::default())
                 .unwrap()
                 .to_lance(),
             "",
         );
-        // User filters survive into the scope; the subagent default never does.
-        let filters = SearchFilters {
-            project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
-            ..SearchFilters::default()
-        };
-        let sql = build_scope_filter(&filters).unwrap().to_lance();
-        assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
-        assert!(!sql.contains("source_agent"));
     }
 
     #[test]
-    fn build_filter_rejects_bad_date() {
+    fn build_scope_filter_rejects_bad_date() {
         let bad_date = SearchFilters {
             from_date: Some("01-01-2026".to_owned()),
             ..SearchFilters::default()
         };
-        assert!(build_filter(&bad_date).is_err());
+        assert!(build_scope_filter(&bad_date).is_err());
     }
 
     #[test]
-    fn build_filter_contains_escapes_like_wildcards() {
+    fn build_scope_filter_escapes_like_wildcards() {
         let filters = SearchFilters {
             project: Some(ProjectFilter::Contains("/Users/me/my_project".to_owned())),
             ..SearchFilters::default()
         };
-        let sql = build_filter(&filters).unwrap().to_lance();
+        let sql = build_scope_filter(&filters).unwrap().to_lance();
         // `_` is a LIKE wildcard and is everywhere in real paths; it must be escaped
         // so `my_project` matches literally, with an ESCAPE clause naming the char.
         assert!(
@@ -2355,24 +2369,32 @@ mod tests {
         assert_eq!(plan.mode, SearchMode::Hybrid);
         assert_eq!(plan.query, "vector memory");
         assert_eq!(plan.limit, 200);
-        assert_eq!(plan.pool, 1000);
-        assert_eq!(plan.vector_pool, 2000);
+        // Default filters exclude subagents, so the pools over-fetch by half
+        // (200*5=1000 -> 1500, *2 -> 3000) to survive the in-memory drop.
+        assert!(plan.exclude_subagents);
+        assert_eq!(plan.pool, 1500);
+        assert_eq!(plan.vector_pool, 3000);
         assert_eq!(plan.min_score, 0.42);
 
-        // Case 2: a tiny limit floors the pools so retrievers don't starve.
+        // Case 2: a tiny limit floors the pools so retrievers don't starve
+        // (50 floor -> 75 after the subagent-exclusion over-fetch).
         let mut request = search_request("tiny pool");
         request.limit = 1;
         let plan = plan_search(request, SearchMode::Fts).unwrap();
         assert_eq!(plan.mode, SearchMode::Fts);
         assert_eq!(plan.limit, 1);
-        assert_eq!(plan.pool, 50);
-        assert_eq!(plan.vector_pool, 100);
+        assert_eq!(plan.pool, 75);
+        assert_eq!(plan.vector_pool, 150);
 
-        // Case 3: filters get plumbed into the shared filter predicate.
+        // Case 3: an explicit source_agent scope turns the exclusion off, so no
+        // over-fetch - base pools (20*5=100, *2=200) - and the filter plumbs through.
         let mut request = search_request("filtered");
         request.filters.project = Some(ProjectFilter::Contains("/Users/me/pond".to_owned()));
         request.filters.source_agent = Some("claude-code".to_owned());
         let plan = plan_search(request, SearchMode::Fts).unwrap();
+        assert!(!plan.exclude_subagents);
+        assert_eq!(plan.pool, 100);
+        assert_eq!(plan.vector_pool, 200);
         let sql = plan.filter.to_lance();
         assert!(sql.contains("project LIKE"));
         assert!(sql.contains("source_agent = 'claude-code'"));

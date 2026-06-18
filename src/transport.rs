@@ -195,6 +195,7 @@ pub mod mcp {
     use super::AppState;
     use crate::{
         PROTOCOL_VERSION,
+        handlers::default_excludes_subagents,
         handlers::pond_get as run_get,
         handlers::pond_search as run_search,
         sql,
@@ -1186,11 +1187,7 @@ Examples (4 patterns the agent should recognize):
 
     fn render_search_transcript(response: &SearchResponse, request: &SearchRequest) -> String {
         use std::fmt::Write;
-        // Must mirror build_filter's default-exclusion condition, else the note lies.
-        let subagent_note = if !request.filters.include_subagents
-            && request.filters.session_id.is_none()
-            && request.filters.source_agent.is_none()
-        {
+        let subagent_note = if default_excludes_subagents(&request.filters) {
             " Subagent sessions excluded; pass include_subagents=true to include them."
         } else {
             ""
