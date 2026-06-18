@@ -1060,7 +1060,8 @@ async fn main() -> Result<()> {
         let rss_start_kb = sampler.current_kb();
         let pf_start_kb = sampler.current_pf_kb();
         let t = Instant::now();
-        store.prewarm().await?;
+        let cache = tempfile::tempdir()?;
+        store.prewarm(cache.path()).await?;
         // Warm the E5 model too, off the request path - production loads it at
         // startup so the first user hybrid query never pays the model load.
         let embed_t = Instant::now();

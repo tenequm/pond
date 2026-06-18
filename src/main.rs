@@ -146,6 +146,15 @@ fn default_local_storage() -> anyhow::Result<StorageUrl> {
     StorageUrl::parse(url.as_str())
 }
 
+/// The search row-key map's cache dir. Resolved in this env-owning layer and
+/// passed into `prewarm` so `Store` stays env-agnostic.
+fn default_cache_dir() -> PathBuf {
+    pond::config::default_cache_path(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
 /// Adapter clap can call to parse `--storage-path` / `POND_STORAGE_PATH`:
 /// bare paths, `~/...`, `file://`, and the remote URL grammar
 /// (spec.md#storage-url-grammar) including the fat `s3+https://` form. The bare
@@ -947,10 +956,11 @@ fn cap_serve_io_buffer() {
 /// so the first user query is fast instead of catastrophic. Best effort:
 /// serving starts immediately and a failure is logged, not fatal.
 fn spawn_prewarm(store: Arc<Store>) {
+    let cache_dir = default_cache_dir();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         tracing::info!("prewarm: warming search indices");
-        match store.prewarm().await {
+        match store.prewarm(&cache_dir).await {
             Ok(()) => tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "prewarm: search indices warm"

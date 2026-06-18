@@ -460,6 +460,19 @@ pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf
     url_for_path(PathBuf::from(".pond"))
 }
 
+/// Cache dir for rebuildable artifacts (the search row-key map): the XDG-cache
+/// analog of [`default_storage_path`]. Separate root because the contents are
+/// regenerated from the store, not durable data.
+pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(xdg) = xdg_cache_home.filter(|path| path.is_absolute()) {
+        return xdg.join("pond");
+    }
+    if let Some(home) = home {
+        return home.join(".cache").join("pond");
+    }
+    PathBuf::from(".pond-cache")
+}
+
 /// Local default path for `config.toml`. URI-backed data dirs always land
 /// here because the config file has to be local (it names the bucket and
 /// any creds). XDG hierarchy: `$XDG_CONFIG_HOME/pond/config.toml`, then

@@ -8,10 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
-use lance::dataset::{AutoCleanupParams, WriteMode, WriteParams};
+use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
 use lance::deps::arrow_array::{
     Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
@@ -28,6 +29,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
+    rowmap::RowKeyMap,
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
@@ -43,6 +45,11 @@ use url::Url;
 #[derive(Debug)]
 pub struct Store {
     handle: Handle,
+    /// Row-key map for index-only hit resolution (see [`crate::rowmap`]). `None`
+    /// until [`Store::ensure_rowmap`] builds it (local tests, pre-prewarm), where
+    /// the arms fall back to a data-projection scan. `ArcSwap` so a version-bump
+    /// rebuild swaps it under concurrent searches.
+    rowmap: ArcSwapOption<RowKeyMap>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +271,7 @@ impl Store {
     pub async fn open(location: &Url) -> Result<Self> {
         Ok(Self {
             handle: Handle::open(location).await?,
+            rowmap: ArcSwapOption::empty(),
         })
     }
 
@@ -279,6 +287,7 @@ impl Store {
     ) -> Result<Self> {
         Ok(Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
+            rowmap: ArcSwapOption::empty(),
         })
     }
 
@@ -1599,11 +1608,18 @@ impl Store {
     /// instead and let real queries page their own postings. Best effort: a
     /// missing index (IVF_SQ below activation, or no FTS yet on an empty store)
     /// is logged, not fatal.
-    pub async fn prewarm(&self) -> Result<()> {
+    pub async fn prewarm(&self, cache_dir: &Path) -> Result<()> {
         let messages = self.dataset(Table::Messages).await?;
         if let Err(error) = messages.prewarm_index(MESSAGES_VECTOR_INDEX).await {
             tracing::debug!(%error, "vector index prewarm skipped");
         }
+        // Best-effort: on failure `rowmap` stays empty and the arms fall back to
+        // the data-take path, so search still works (slower on a remote store).
+        if let Err(error) = self.ensure_rowmap(cache_dir).await {
+            tracing::warn!(%error, "rowmap build skipped; arms fall back to data-take resolution");
+        }
+        // Warm the FTS posting lists; the rowmap build above touched only the
+        // data columns.
         if let Err(error) = self
             .fts_search("pond", 1, &Predicate::And(Vec::new()))
             .await
@@ -1611,6 +1627,112 @@ impl Store {
             tracing::debug!(%error, "fts index prewarm skipped");
         }
         Ok(())
+    }
+
+    /// Stable filesystem-safe cache key: same store URL -> same key, so sibling
+    /// pond processes share one map file and distinct stores never collide.
+    fn store_key(&self) -> String {
+        let digest = blake3::hash(self.handle.location().as_str().as_bytes());
+        digest.to_hex()[..16].to_owned()
+    }
+
+    /// Build (or open from cache) and install the row-key map for the current
+    /// `messages` version. Idempotent - a map already at that version is kept.
+    pub async fn ensure_rowmap(&self, cache_dir: &Path) -> Result<()> {
+        let version = self.messages_version().await?;
+        if let Some(current) = self.rowmap.load_full()
+            && current.version() == version
+        {
+            return Ok(());
+        }
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
+        let store_key = self.store_key();
+        let path = RowKeyMap::path_for(cache_dir, &store_key, version);
+        let map = if path.exists() {
+            RowKeyMap::open(&path)?
+        } else {
+            let entries = self.collect_row_keys().await?;
+            RowKeyMap::build(&path, version, entries)?;
+            RowKeyMap::open(&path)?
+        };
+        self.rowmap.store(Some(Arc::new(map)));
+        Self::sweep_stale_rowmaps(cache_dir, &store_key, version);
+        Ok(())
+    }
+
+    /// Remove this store's map files for versions strictly older than `keep`
+    /// (best-effort). Only older versions: a newer file belongs to a sibling
+    /// that advanced past us and is still using it. Deleting a genuinely
+    /// superseded file is safe even if a sibling has it mapped - Unix unlink
+    /// keeps the inode alive until unmap.
+    fn sweep_stale_rowmaps(cache_dir: &Path, store_key: &str, keep: u64) {
+        let prefix = format!("rowkeymap-{store_key}-v");
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(version) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".rkm"))
+                .and_then(|digits| digits.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if version < keep {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Resolve index-only `(row_id, score)` hits to keys via the map; row ids the
+    /// map lacks (appended since build) fall back to one `take_rows` batch. The
+    /// caller re-sorts, so the misses appended at the end carry no order meaning.
+    async fn resolve_rowid_hits(
+        &self,
+        map: &RowKeyMap,
+        hits: Vec<(u64, f32)>,
+    ) -> Result<Vec<(MessageKey, f32)>> {
+        let mut resolved = Vec::with_capacity(hits.len());
+        let mut misses: Vec<(u64, f32)> = Vec::new();
+        for (rowid, score) in hits {
+            match map.lookup(rowid) {
+                Some((session_id, message_id)) => resolved.push((
+                    MessageKey {
+                        session_id: session_id.to_owned(),
+                        message_id: message_id.to_owned(),
+                    },
+                    score,
+                )),
+                None => misses.push((rowid, score)),
+            }
+        }
+        if !misses.is_empty() {
+            let rowids: Vec<u64> = misses.iter().map(|(rowid, _)| *rowid).collect();
+            let keys = self.message_keys_by_rowids(&rowids).await?;
+            for ((_, score), key) in misses.into_iter().zip(keys) {
+                resolved.push((key, score));
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve stable row ids to `(session_id, id)` via `take_rows`, which
+    /// returns rows in `rowids` order - the caller's `zip` relies on that.
+    async fn message_keys_by_rowids(&self, rowids: &[u64]) -> Result<Vec<MessageKey>> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let projection = ProjectionRequest::from_columns(["session_id", "id"], dataset.schema());
+        let batch = dataset.take_rows(rowids, projection).await?;
+        let mut keys = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            keys.push(MessageKey {
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id: string(&batch, "id", row)?.context("fts hit id is null")?,
+            });
+        }
+        Ok(keys)
     }
 
     /// Write a `pond_sql_query` export artifact.
@@ -1743,37 +1865,22 @@ impl Store {
         }
     }
 
-    /// BM25 full-text retriever over `messages.search_text`.
+    /// BM25 full-text retriever over `messages.search_text`. With the row-key map
+    /// loaded the scan is index-only (no data columns -> no `TakeExec`, no
+    /// scattered GETs) and hits resolve through the map; otherwise it falls back
+    /// to `fts_search_keys` so search works before prewarm.
     pub async fn fts_search(
         &self,
         query: &str,
         limit: usize,
         filter: &Predicate,
     ) -> Result<Vec<(MessageKey, f32)>> {
-        let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
-        scanner.full_text_search(
-            FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
-        )?;
-        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
-            scanner.fast_search();
-        }
-        // Lance ships an autoprojection that silently appends `_score` to FTS
-        // output when the projection omits it. That behavior is going away;
-        // we opt into the future explicit-projection contract here so the
-        // scanner stops emitting a per-call deprecation warning, and we list
-        // `_score` ourselves since the loop below reads it.
-        scanner.disable_scoring_autoprojection();
-        scanner.project(&["session_id", "id", "_score"])?;
-        scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
-        let batch = scanner.try_into_batch().await?;
-        let mut hits = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let key = MessageKey {
-                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
-                message_id: string(&batch, "id", row)?.context("fts hit id is null")?,
-            };
-            hits.push((key, float32(&batch, "_score", row)?));
-        }
+        let mut hits = if let Some(map) = self.rowmap.load_full() {
+            let rowid_hits = self.fts_search_rowids(query, limit, filter).await?;
+            self.resolve_rowid_hits(&map, rowid_hits).await?
+        } else {
+            self.fts_search_keys(query, limit, filter).await?
+        };
         // Stable secondary sort: Lance returns tied-BM25-score hits in fragment
         // order, which varies between runs and across calls with different pool
         // sizes (the hybrid arm's `pool=100` and FTS-only's `limit=20` produce
@@ -1789,6 +1896,105 @@ impl Store {
                 .then_with(|| left.0.session_id.cmp(&right.0.session_id))
                 .then_with(|| left.0.message_id.cmp(&right.0.message_id))
         });
+        Ok(hits)
+    }
+
+    /// Shared FTS-scan setup: scope filter, the `search_text` full-text query,
+    /// `fast_search` when indexed, and `limit`. Callers set only their projection.
+    async fn fts_scanner(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &Predicate,
+    ) -> Result<lance::dataset::scanner::Scanner> {
+        let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
+        scanner.full_text_search(
+            FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
+        )?;
+        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
+            scanner.fast_search();
+        }
+        // Lance ships an autoprojection that silently appends `_score` to FTS
+        // output when the projection omits it. That behavior is going away;
+        // we opt into the future explicit-projection contract here so the
+        // scanner stops emitting a per-call deprecation warning, and each caller
+        // lists `_score` in its own projection.
+        scanner.disable_scoring_autoprojection();
+        scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
+        Ok(scanner)
+    }
+
+    /// No-map FTS fallback: project the key columns plus `_score` directly,
+    /// taking the `TakeExec` cost. Unsorted; `fts_search` applies the sort.
+    async fn fts_search_keys(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &Predicate,
+    ) -> Result<Vec<(MessageKey, f32)>> {
+        let mut scanner = self.fts_scanner(query, limit, filter).await?;
+        scanner.project(&["session_id", "id", "_score"])?;
+        let batch = scanner.try_into_batch().await?;
+        let mut hits = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let key = MessageKey {
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id: string(&batch, "id", row)?.context("fts hit id is null")?,
+            };
+            hits.push((key, float32(&batch, "_score", row)?));
+        }
+        Ok(hits)
+    }
+
+    /// Current `messages` dataset version - the key a `RowKeyMap` is built
+    /// against (pond's stable row ids keep a built map valid until this advances).
+    pub async fn messages_version(&self) -> Result<u64> {
+        Ok(self
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .version()
+            .version)
+    }
+
+    /// Scan the two narrow key columns with row ids into a `Vec`, the input to
+    /// `RowKeyMap::build`. One large sequential scan (few big reads), unlike the
+    /// scattered per-hit take it replaces.
+    pub async fn collect_row_keys(&self) -> Result<Vec<(u64, String, String)>> {
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&["session_id", "id"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+                let mid = string(&batch, "id", row)?.context("message id is null")?;
+                out.push((rowids.value(row), sid, mid));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Index-only FTS retriever: `_rowid` + `_score` only, so Lance inserts no
+    /// `TakeExec` and issues no scattered GETs. `fts_search` resolves the row ids.
+    async fn fts_search_rowids(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &Predicate,
+    ) -> Result<Vec<(u64, f32)>> {
+        let mut scanner = self.fts_scanner(query, limit, filter).await?;
+        scanner.with_row_id();
+        scanner.project(&["_score"])?;
+        let batch = scanner.try_into_batch().await?;
+        let rowids = uint64(&batch, "_rowid")?;
+        let mut hits = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            hits.push((rowids.value(row), float32(&batch, "_score", row)?));
+        }
         Ok(hits)
     }
 
@@ -1862,6 +2068,7 @@ impl Store {
     /// falls back to [`DEFAULT_NPROBES`] when `[search]` leaves it unset, so a
     /// default install never inherits Lance's unbounded "probe every partition"
     /// behavior on a remote store. No refine (see `apply_vector_search_knobs`).
+    /// Index-only + map resolve when loaded, else key projection - see `fts_search`.
     pub async fn vector_search(
         &self,
         query: &[f32],
@@ -1869,32 +2076,15 @@ impl Store {
         filter: &Predicate,
         search: Option<&config::SearchConfig>,
     ) -> Result<Vec<(MessageKey, f32)>> {
-        let scope = embedded_scope(filter);
-        let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
-        let key = Float32Array::from(query.to_vec());
-        scanner.nearest("vector", &key, limit)?;
-        apply_vector_search_knobs(&mut scanner, search);
-        if self
-            .handle
-            .messages_has_index(MESSAGES_VECTOR_INDEX)
-            .await?
-        {
-            scanner.fast_search();
-        }
-        // Mirror the explicit-projection contract from `fts_search`: opt out
-        // of `_distance` autoprojection and list it ourselves since the loop
-        // below reads it.
-        scanner.disable_scoring_autoprojection();
-        scanner.project(&["session_id", "id", "_distance"])?;
-        let batch = scanner.try_into_batch().await?;
-        let mut hits = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let key = MessageKey {
-                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
-                message_id: string(&batch, "id", row)?.context("message id is null")?,
-            };
-            hits.push((key, float32(&batch, "_distance", row)?));
-        }
+        let mut hits = if let Some(map) = self.rowmap.load_full() {
+            let rowid_hits = self
+                .vector_search_rowids(query, limit, filter, search)
+                .await?;
+            self.resolve_rowid_hits(&map, rowid_hits).await?
+        } else {
+            self.vector_search_keys(query, limit, filter, search)
+                .await?
+        };
         // Stable secondary sort: same reasoning as `fts_search` - IVF_SQ can
         // emit hits with effectively identical `_distance` in fragment-dependent
         // order, which makes RRF dedup-ranks nondeterministic for tied
@@ -1907,6 +2097,74 @@ impl Store {
                 .then_with(|| left.0.session_id.cmp(&right.0.session_id))
                 .then_with(|| left.0.message_id.cmp(&right.0.message_id))
         });
+        Ok(hits)
+    }
+
+    /// Shared vector-scan setup: scope, `nearest`, knobs, `fast_search`.
+    async fn vector_scanner(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: &Predicate,
+        search: Option<&config::SearchConfig>,
+    ) -> Result<lance::dataset::scanner::Scanner> {
+        let scope = embedded_scope(filter);
+        let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
+        let key = Float32Array::from(query.to_vec());
+        scanner.nearest("vector", &key, limit)?;
+        apply_vector_search_knobs(&mut scanner, search);
+        if self
+            .handle
+            .messages_has_index(MESSAGES_VECTOR_INDEX)
+            .await?
+        {
+            scanner.fast_search();
+        }
+        scanner.disable_scoring_autoprojection();
+        Ok(scanner)
+    }
+
+    /// Index-only vector retriever: `_rowid` + `_distance` only, so no `TakeExec`.
+    /// `vector_search` resolves the row ids. Mirrors `fts_search_rowids`.
+    async fn vector_search_rowids(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: &Predicate,
+        search: Option<&config::SearchConfig>,
+    ) -> Result<Vec<(u64, f32)>> {
+        let mut scanner = self.vector_scanner(query, limit, filter, search).await?;
+        scanner.with_row_id();
+        scanner.project(&["_distance"])?;
+        let batch = scanner.try_into_batch().await?;
+        let rowids = uint64(&batch, "_rowid")?;
+        let mut hits = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            hits.push((rowids.value(row), float32(&batch, "_distance", row)?));
+        }
+        Ok(hits)
+    }
+
+    /// No-map vector fallback: project the key columns plus `_distance` directly.
+    /// Unsorted; `vector_search` sorts. Mirrors `fts_search_keys`.
+    async fn vector_search_keys(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: &Predicate,
+        search: Option<&config::SearchConfig>,
+    ) -> Result<Vec<(MessageKey, f32)>> {
+        let mut scanner = self.vector_scanner(query, limit, filter, search).await?;
+        scanner.project(&["session_id", "id", "_distance"])?;
+        let batch = scanner.try_into_batch().await?;
+        let mut hits = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let key = MessageKey {
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                message_id: string(&batch, "id", row)?.context("message id is null")?,
+            };
+            hits.push((key, float32(&batch, "_distance", row)?));
+        }
         Ok(hits)
     }
 

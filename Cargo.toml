@@ -55,6 +55,9 @@ path = "src/main.rs"
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
+# Lock-free read of the loaded `RowKeyMap` on the hot search path; replaced
+# atomically when `ensure_rowmap` rebuilds. Already in the tree via lance.
+arc-swap = "1"
 # ndjson export writer for `pond_sql_query` (already in the tree via the arrow
 # stack; named directly here for the `LineDelimitedWriter`).
 arrow-json = "58.3"
@@ -64,6 +67,12 @@ async-stream = "0.3.6"
 async-trait = "0.1"
 axum = "0.8.9"
 base64 = "0.22"
+# Stable filesystem-safe `store_key` (hex digest of the store URL) for the
+# row-key map's cache filename. Already in the tree via the candle stack.
+blake3 = "1"
+# Zero-copy cast of the mmap'd row-key map's fixed-size records (`src/rowmap.rs`).
+# Already in the tree via the candle/safetensors stack.
+bytemuck = { version = "1.25", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
@@ -112,6 +121,10 @@ lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
+# Memory-mapped, process-shareable row_id -> key map (`src/rowmap.rs`): the file
+# is mmap'd so the OS page cache holds one physical copy across pond instances.
+# Already in the tree via candle/safetensors.
+memmap2 = "0.9"
 # Already in the tree via lance-io; named directly so `pond storage check` can
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
