@@ -165,6 +165,14 @@ struct Args {
     /// Runs after prewarm and exits before the normal phases.
     #[arg(long)]
     io_trace: bool,
+    /// Recall mode: score hybrid retrieval against a ground-truth TSV
+    /// (`id\tlang\tstratum\tquery\tground_truth`, ground_truth = `prefix:<8-char
+    /// session/msg id>,...`). Runs one hybrid search per query, prints overall
+    /// Success@3 / P@1 / MRR and per-query ranks. Used to confirm a vector-index
+    /// change (e.g. PQ->SQ) holds recall. Runs after prewarm, exits before the
+    /// normal phases. `--storage-path` selects the corpus; no Python harness.
+    #[arg(long)]
+    recall: Option<std::path::PathBuf>,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
@@ -1255,6 +1263,82 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // ---- Recall: score hybrid retrieval against a ground-truth TSV ----
+    if let Some(path) = &args.recall {
+        let tsv = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read recall TSV {}", path.display()))?;
+        let mut n = 0usize;
+        let mut s_at_3 = 0usize;
+        let mut p_at_1 = 0usize;
+        let mut mrr_sum = 0.0f64;
+        println!("\n=== recall (hybrid, {}) ===", target_label(&target));
+        println!("{:<10}{:>6}  query", "id", "rank");
+        for line in tsv.lines().skip(1) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 5 {
+                continue;
+            }
+            let (id, query, gt) = (cols[0], cols[3], cols[4]);
+            let tokens: Vec<&str> = gt
+                .strip_prefix("prefix:")
+                .unwrap_or(gt)
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .collect();
+            let request = search_request(query, Some(SearchModeWire::Hybrid), args.limit);
+            let rank = match pond_search(&store, &embedder, request, &cfg).await {
+                SearchEnvelope::Success(response) => {
+                    let mut hit_rank = 0usize;
+                    let mut position = 0usize;
+                    'scan: for session in &response.sessions {
+                        let sid: String = session.session_id.chars().take(8).collect();
+                        for hit in &session.matches {
+                            position += 1;
+                            let mid: String = hit.message_id.chars().take(8).collect();
+                            if tokens.iter().any(|token| *token == sid || *token == mid) {
+                                hit_rank = position;
+                                break 'scan;
+                            }
+                        }
+                    }
+                    hit_rank
+                }
+                SearchEnvelope::Error(error) => {
+                    anyhow::bail!("recall: query {id} failed: {error:?}")
+                }
+            };
+            n += 1;
+            if rank == 1 {
+                p_at_1 += 1;
+            }
+            if rank != 0 && rank <= 3 {
+                s_at_3 += 1;
+            }
+            if rank != 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let recip = 1.0 / rank as f64;
+                mrr_sum += recip;
+            }
+            let rank_disp = if rank == 0 {
+                "miss".to_owned()
+            } else {
+                rank.to_string()
+            };
+            println!("{id:<10}{rank_disp:>6}  {query}");
+        }
+        if n > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let (success_at_3, precision_at_1, mrr) = (
+                s_at_3 as f64 / n as f64,
+                p_at_1 as f64 / n as f64,
+                mrr_sum / n as f64,
+            );
+            println!("\nN={n}  Success@3={success_at_3:.3}  P@1={precision_at_1:.3}  MRR={mrr:.3}");
+        }
+        return Ok(());
+    }
+
     let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // ---- Phase: fts_warm ----
@@ -1408,6 +1492,31 @@ async fn main() -> Result<()> {
             pf_global_peak_kb: sampler.peak_pf_kb(),
             notes: "embedder dropped (idle-unload); slept to measure drained floor".to_owned(),
         });
+
+        // ---- Phase: from_idle (the goal metric) ----
+        // The literal "search latency from idle on remote storage": recreate the
+        // embedder the way `pond mcp` does on the next call after an idle-unload,
+        // then run the hybrid query set with no warmup. Query 1 pays the E5
+        // reload (~0.4s) and whatever throttle state survived the idle gap; the
+        // rest show how fast it recovers. Indices stay cached across idle, so
+        // this isolates per-query S3 read cost, not cold index load.
+        if !args.skip_hybrid {
+            let reloaded = LazyEmbedder::candle().with_idle_threshold(Duration::MAX);
+            run_search_phase(SearchPhase {
+                name: "from_idle",
+                store: &store,
+                embedder: &reloaded,
+                cfg: &cfg,
+                sampler: &sampler,
+                mode: Some(SearchModeWire::Hybrid),
+                queries: &queries,
+                limit: args.limit,
+                record_hits: false,
+                hit_sink: &hit_sink,
+            })
+            .await
+            .map(|s| phases.push(s))?;
+        }
     }
 
     let global_peak_kb = sampler.finish();

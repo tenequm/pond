@@ -1799,10 +1799,43 @@ impl Store {
     /// searchable at all, and 0 tells the caller their filters excluded
     /// everything before retrieval even started.
     pub async fn searchable_in_scope(&self, filter: &Predicate) -> Result<usize> {
+        // Unfiltered: the FTS index already counts non-null search_text rows
+        // (`num_docs`), and fast_search only searches those indexed docs - so
+        // num_docs is exactly the universe a search ran over. Reading it avoids
+        // the ~133 MB `IsNotNull(search_text)` column scan Lance pays per query
+        // (no per-column null metadata). Filtered scopes fall back to the scan.
+        if matches!(filter, Predicate::And(clauses) if clauses.is_empty())
+            && let Some(count) = self.fts_num_docs().await?
+        {
+            return Ok(count);
+        }
         let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
         let dataset = self.handle.dataset(Table::Messages).await?;
         let count = dataset.count_rows(Some(scope.to_lance())).await?;
         Ok(count)
+    }
+
+    /// Non-null `search_text` count read from the FTS index's `num_docs`
+    /// statistic (summed across delta segments). `None` when the FTS index is
+    /// absent (empty store) so the caller falls back to the count scan.
+    async fn fts_num_docs(&self) -> Result<Option<usize>> {
+        if !self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
+            return Ok(None);
+        }
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let json = dataset.index_statistics(MESSAGES_FTS_INDEX).await?;
+        let parsed: Value =
+            serde_json::from_str(&json).context("failed to parse FTS index_statistics")?;
+        let total: u64 = parsed["indices"]
+            .as_array()
+            .map(|segments| {
+                segments
+                    .iter()
+                    .filter_map(|segment| segment["num_docs"].as_u64())
+                    .sum()
+            })
+            .unwrap_or(0);
+        Ok(Some(usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
@@ -1826,9 +1859,9 @@ impl Store {
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
     /// scalar predicate alone (spec.md#search-prefilter-pushdown) - see
     /// `embedded_scope` for why pond does NOT add `vector IS NOT NULL`. nprobes
-    /// and refine fall back to [`DEFAULT_NPROBES`] / [`DEFAULT_REFINE_FACTOR`]
-    /// when `[search]` leaves them unset, so a default install never inherits
-    /// Lance's unbounded "probe every partition" behavior on a remote store.
+    /// falls back to [`DEFAULT_NPROBES`] when `[search]` leaves it unset, so a
+    /// default install never inherits Lance's unbounded "probe every partition"
+    /// behavior on a remote store. No refine (see `apply_vector_search_knobs`).
     pub async fn vector_search(
         &self,
         query: &[f32],

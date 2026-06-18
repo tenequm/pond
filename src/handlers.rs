@@ -970,6 +970,10 @@ mod search_handler {
         pub mode: SearchMode,
         pub query: String,
         pub filter: Predicate,
+        /// User filters only (no subagent-exclusion default), used by
+        /// `searchable_in_scope`. Empty for an unfiltered search so the count
+        /// reads the FTS `num_docs` stat instead of the search_text scan.
+        pub scope_filter: Predicate,
         pub filters: SearchFilters,
         pub pool: usize,
         pub vector_pool: usize,
@@ -1164,7 +1168,7 @@ mod search_handler {
         };
         let scope_fut = async {
             store
-                .searchable_in_scope(&plan.filter)
+                .searchable_in_scope(&plan.scope_filter)
                 .await
                 .map_err(map_storage)
         };
@@ -1174,9 +1178,26 @@ mod search_handler {
             return Ok(empty_response(searchable_in_scope));
         }
 
+        // Session-scoped searches return one session; the per-session match
+        // cap would silently discard most of what the caller asked for, so
+        // it widens to the requested limit there.
+        let matches_cap = if single_session {
+            plan.limit
+        } else {
+            MAX_MATCHES_PER_SESSION
+        };
+        // Reduce to the hits the response will actually emit *before* any S3
+        // hydration, so the metadata/parts/count fetches below are sized to the
+        // output (~limit*matches_cap), not the full fused pool (~150).
+        let (selected, total_sessions, matched_total) =
+            select_top_hits(candidates, plan.min_score, plan.limit, matches_cap);
+        if selected.is_empty() {
+            return Ok(empty_response(searchable_in_scope));
+        }
+
         // Hydrate hit metadata (timestamp, role, project, preview source) from
         // the `messages` table - the retrievers return only message keys.
-        let keys = candidates
+        let keys = selected
             .iter()
             .map(|candidate| MessageKey {
                 session_id: candidate.session_id.clone(),
@@ -1192,20 +1213,16 @@ mod search_handler {
             .map(|meta| ((meta.session_id.as_str(), meta.message_id.as_str()), meta))
             .collect::<std::collections::HashMap<_, _>>();
 
-        let mut scored = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
+        let mut scored = Vec::with_capacity(selected.len());
+        for candidate in selected {
             let Some(meta) =
                 meta_index.get(&(candidate.session_id.as_str(), candidate.message_id.as_str()))
             else {
                 continue;
             };
-            let score = candidate.base_score;
-            if score < plan.min_score {
-                continue;
-            }
             scored.push(ScoredHit {
                 meta: (*meta).clone(),
-                score,
+                score: candidate.base_score,
             });
         }
         scored.sort_by(|left, right| {
@@ -1217,17 +1234,14 @@ mod search_handler {
                 .then_with(|| left.meta.message_id.cmp(&right.meta.message_id))
         });
 
-        let matched_total = scored.len();
-        // Session-scoped searches return one session; the per-session match
-        // cap would silently discard most of what the caller asked for, so
-        // it widens to the requested limit there.
-        let matches_cap = if single_session {
-            plan.limit
-        } else {
-            MAX_MATCHES_PER_SESSION
-        };
         let sessions = build_sessions(store, &scored, &plan.query, matches_cap).await?;
-        page_sessions(sessions, matched_total, searchable_in_scope, &plan)
+        page_sessions(
+            sessions,
+            matched_total,
+            total_sessions,
+            searchable_in_scope,
+            &plan,
+        )
     }
 
     /// Pick the retrieval mode. An explicit caller override (operator tooling
@@ -1291,6 +1305,7 @@ mod search_handler {
         let limit = request.limit.min(LIMIT_CAP);
         let min_score = filters.min_score;
         let filter = build_filter(&filters)?;
+        let scope_filter = build_scope_filter(&filters)?;
         // Retriever candidate pool: wider than `limit` so the fuser has
         // material to merge.
         let pool = limit.saturating_mul(5).max(50);
@@ -1298,6 +1313,7 @@ mod search_handler {
             mode,
             query,
             filter,
+            scope_filter,
             filters,
             pool,
             vector_pool: pool.saturating_mul(2),
@@ -1651,6 +1667,64 @@ mod search_handler {
         })
     }
 
+    /// Pick the hits that will actually be returned, using only the keys and
+    /// `base_score` the arms already produced - no S3. Hydration and rendering
+    /// then touch ~`limit * matches_cap` rows instead of the full fused pool
+    /// (~150). That post-arm fetch (metadata + parts + per-session counts),
+    /// sized to the whole pool, was where hybrid latency went - the arms
+    /// themselves are ~1s. Recall-neutral: identical to scoring the whole pool
+    /// then paging, because ranking never depended on the hydrated columns.
+    /// Returns the selected hits, the total distinct-session count (for
+    /// `has_more`), and the count of candidates above `min_score` (for
+    /// `matched_total`).
+    fn select_top_hits(
+        mut candidates: Vec<Candidate>,
+        min_score: f64,
+        limit: usize,
+        matches_cap: usize,
+    ) -> (Vec<Candidate>, usize, usize) {
+        candidates.retain(|candidate| candidate.base_score >= min_score);
+        let matched_total = candidates.len();
+        candidates.sort_by(|left, right| {
+            right
+                .base_score
+                .partial_cmp(&left.base_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.message_id.cmp(&right.message_id))
+        });
+        // Distinct session roots in best-score order (candidates are sorted),
+        // then keep the top `limit` - the most sessions the response can emit.
+        let (total_sessions, keep) = {
+            let mut order: Vec<&str> = Vec::new();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for candidate in &candidates {
+                let root = session_root(&candidate.session_id);
+                if seen.insert(root) {
+                    order.push(root);
+                }
+            }
+            let total = order.len();
+            let keep: std::collections::HashSet<String> =
+                order.into_iter().take(limit).map(str::to_owned).collect();
+            (total, keep)
+        };
+        let mut kept: HashMap<String, usize> = HashMap::new();
+        let mut selected = Vec::new();
+        for candidate in candidates {
+            let root = session_root(&candidate.session_id).to_owned();
+            if !keep.contains(&root) {
+                continue;
+            }
+            let count = kept.entry(root).or_insert(0);
+            if *count < matches_cap {
+                *count += 1;
+                selected.push(candidate);
+            }
+        }
+        (selected, total_sessions, matched_total)
+    }
+
     async fn build_sessions(
         store: &Store,
         scored: &[ScoredHit],
@@ -1756,6 +1830,7 @@ mod search_handler {
     fn page_sessions(
         sessions: Vec<SearchSession>,
         matched_total: usize,
+        total_sessions: usize,
         searchable_in_scope: usize,
         plan: &SearchPlan,
     ) -> Result<SearchResponse, ErrorEnvelope> {
@@ -1783,7 +1858,10 @@ mod search_handler {
         // ranked set short - raise `limit` (up to the cap) to see the rest.
         // There is no pagination cursor: the result set is relevance-ranked and
         // capped, so a wider `limit` dominates page-walking (spec.md#search).
-        let has_more = emitted.len() < sessions.len();
+        // `total_sessions` is the full distinct-session count from before the
+        // pre-hydration cap, so the warning stays accurate even though
+        // `sessions` now holds only the capped slice.
+        let has_more = total_sessions > emitted.len();
 
         Ok(SearchResponse {
             sessions: emitted,
@@ -1796,7 +1874,11 @@ mod search_handler {
     /// Build the shared scalar filter predicate pushed into both retrievers.
     /// Both the FTS and vector retrievers scan `messages` (spec.md#datasets),
     /// so one predicate serves both.
-    pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
+    /// User-scope clauses (project/session/source_agent/date) - the explicit
+    /// filters that define the universe a count should measure. The default
+    /// subagent exclusion is a retrieval-ranking default, not a user scope, so
+    /// it is added only by `build_filter` (the arms), never here.
+    fn build_scope_clauses(filters: &SearchFilters) -> Result<Vec<Predicate>, ErrorEnvelope> {
         let mut clauses = Vec::new();
 
         match &filters.project {
@@ -1827,6 +1909,21 @@ mod search_handler {
                 ScalarValue::Raw(date_bound(to_date, "filters.to_date", true)?),
             ));
         }
+
+        Ok(clauses)
+    }
+
+    /// Scope predicate for `searchable_in_scope`: user filters only. Empty
+    /// `And` for an unfiltered search, which lets the count read the FTS
+    /// `num_docs` stat instead of the ~133 MB search_text scan.
+    pub fn build_scope_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
+        Ok(Predicate::And(build_scope_clauses(filters)?))
+    }
+
+    /// Retrieval predicate for the FTS/vector arms: user scope plus the default
+    /// subagent exclusion.
+    pub fn build_filter(filters: &SearchFilters) -> Result<Predicate, ErrorEnvelope> {
+        let mut clauses = build_scope_clauses(filters)?;
 
         // spec.md#search: subagent sessions (`source_agent` with a "/") are
         // excluded by default; an explicit session_id/source_agent filter means
@@ -2005,7 +2102,7 @@ mod search_handler {
 
 pub use search_handler::{
     FusedHit, FusionKey, RankedList, RetrieverKind, SearchMode, SearchPlan, build_filter,
-    explain_search_plan, fuse_arms, hit_payload, plan_search, pond_search,
+    build_scope_filter, explain_search_plan, fuse_arms, hit_payload, plan_search, pond_search,
 };
 
 #[cfg(test)]
@@ -2198,6 +2295,27 @@ mod tests {
             .to_lance(),
             "",
         );
+    }
+
+    #[test]
+    fn build_scope_filter_drops_the_subagent_default() {
+        // Default search: scope filter is empty so `searchable_in_scope` reads
+        // the FTS num_docs stat instead of the ~133 MB search_text scan, even
+        // though the retrieval filter carries the subagent exclusion.
+        assert_eq!(
+            build_scope_filter(&SearchFilters::default())
+                .unwrap()
+                .to_lance(),
+            "",
+        );
+        // User filters survive into the scope; the subagent default never does.
+        let filters = SearchFilters {
+            project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
+            ..SearchFilters::default()
+        };
+        let sql = build_scope_filter(&filters).unwrap().to_lance();
+        assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
+        assert!(!sql.contains("source_agent"));
     }
 
     #[test]
