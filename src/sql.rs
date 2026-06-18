@@ -103,12 +103,27 @@ pub enum Mode {
     Export(Format),
 }
 
-/// The three Lance datasets, fetched fresh per call so each query sees a
-/// current snapshot (the handle freshness gate runs on each `Store::dataset`).
+/// The Lance datasets a query references, fetched fresh per call so each query
+/// sees a current snapshot (the handle freshness gate runs on each
+/// `Store::dataset`). A field is `None` when the query never names that table -
+/// the caller skips opening it, avoiding the slow `parts.lance` open on the
+/// common messages-only query (spec.md#search). See [`mentions_table`].
 pub struct Tables {
-    pub sessions: Arc<Dataset>,
-    pub messages: Arc<Dataset>,
-    pub parts: Arc<Dataset>,
+    pub sessions: Option<Arc<Dataset>>,
+    pub messages: Option<Arc<Dataset>>,
+    pub parts: Option<Arc<Dataset>>,
+}
+
+/// Whether `sql` references the table named `table`. A DataFusion query can
+/// only reach a registered table by writing its name literally - no alias hides
+/// the base name - so this lowercase word-boundary scan never yields a false
+/// negative. At worst it matches the name inside a string or column literal and
+/// opens a table the query won't touch: a cheap, safe false positive. Lets the
+/// caller open only the datasets a query needs.
+pub fn mentions_table(sql: &str, table: &str) -> bool {
+    sql.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|token| token == table)
 }
 
 /// Result of a successful `run`.
@@ -551,6 +566,7 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         ("sessions", &tables.sessions),
         ("messages", &tables.messages),
     ] {
+        let Some(dataset) = dataset else { continue };
         // LanceTableProvider (not the bare Dataset impl) so WHERE/projection/
         // limit push into Lance's indexed scan; (false, false) hides _rowid /
         // _rowaddr from the SQL schema. The view applies `renamed_key`
@@ -566,31 +582,35 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     // columns scan as `{position, size}` descriptor structs, so any SQL touch
     // dies in the planner with an opaque CAST error. The view inlines at plan
     // time - filters still push into the Lance scan underneath.
-    let provider = LanceTableProvider::new(tables.parts.clone(), false, false);
-    let keep: Vec<_> = tables
-        .parts
-        .schema()
-        .fields
-        .iter()
-        .filter(|field| field.name != "data")
-        .map(|field| col(field.name.as_str()))
-        .collect();
-    let plan = LogicalPlanBuilder::scan("parts", provider_as_source(Arc::new(provider)), None)
-        .and_then(|builder| builder.project(keep))
-        .and_then(LogicalPlanBuilder::build)
-        .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
-    ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
-        .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
+    if let Some(parts) = &tables.parts {
+        let provider = LanceTableProvider::new(parts.clone(), false, false);
+        let keep: Vec<_> = parts
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.name != "data")
+            .map(|field| col(field.name.as_str()))
+            .collect();
+        let plan = LogicalPlanBuilder::scan("parts", provider_as_source(Arc::new(provider)), None)
+            .and_then(|builder| builder.project(keep))
+            .and_then(LogicalPlanBuilder::build)
+            .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
+        ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
+            .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
+    }
     // `fts('messages', '{...}')` BM25 search-in-SQL (vendored provider with a
     // declared `_score` column - see `ScoredFtsUdtf`), and lance's JSON /
-    // contains_tokens UDFs for filtering inside the JSON columns.
-    let fts = ScoredFtsUdtf {
-        datasets: HashMap::from([
-            ("sessions".to_owned(), tables.sessions.clone()),
-            ("messages".to_owned(), tables.messages.clone()),
-            ("parts".to_owned(), tables.parts.clone()),
-        ]),
-    };
+    // contains_tokens UDFs for filtering inside the JSON columns. Only the
+    // referenced tables are present, matching the registered views above.
+    let datasets = [
+        ("sessions", &tables.sessions),
+        ("messages", &tables.messages),
+        ("parts", &tables.parts),
+    ]
+    .into_iter()
+    .filter_map(|(name, dataset)| dataset.clone().map(|d| (name.to_owned(), d)))
+    .collect();
+    let fts = ScoredFtsUdtf { datasets };
     ctx.register_udtf("fts", Arc::new(fts));
     register_functions(ctx);
     // Shadow lance's strict json_get_* by name: the strict versions abort the
@@ -1364,6 +1384,34 @@ mod tests {
             ),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn mentions_table_is_sound_for_open_pruning() {
+        // Referenced => must be detected (no false negative, else a valid query
+        // breaks). Case-insensitive: DataFusion lowercases identifiers.
+        assert!(mentions_table("SELECT * FROM messages", "messages"));
+        assert!(mentions_table("select * from MESSAGES", "messages"));
+        assert!(mentions_table(
+            "SELECT s.id FROM sessions s JOIN parts p ON s.id = p.session_id",
+            "parts",
+        ));
+        assert!(mentions_table(
+            "SELECT * FROM fts('messages', '{\"match\":{}}')",
+            "messages",
+        ));
+        assert!(mentions_table(
+            "WITH x AS (SELECT * FROM sessions) SELECT * FROM x",
+            "sessions",
+        ));
+        // Not referenced => skip the open. Word boundary: a longer identifier
+        // that merely contains the name is not a reference.
+        assert!(!mentions_table("SELECT * FROM messages", "parts"));
+        assert!(!mentions_table("SELECT * FROM messages", "sessions"));
+        assert!(!mentions_table(
+            "SELECT counterparts FROM messages",
+            "parts"
+        ));
     }
 
     #[test]

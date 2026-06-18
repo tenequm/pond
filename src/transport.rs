@@ -803,13 +803,31 @@ Examples (4 patterns the agent should recognize):
             };
             let inline_rows = sql::DEFAULT_INLINE_ROWS;
 
-            // The three tables are independent (per-table caches/mutexes), so
-            // overlap their freshness/manifest fetches rather than serialize.
+            // Open only the tables the query names (spec.md#search): the slow
+            // `parts.lance` open is pure waste for the common messages-only
+            // query. The referenced tables are independent (per-table
+            // caches/mutexes), so overlap their freshness/manifest fetches.
             let store = &self.state.store;
+            let query = params.query.as_str();
             let tables = match tokio::try_join!(
-                store.dataset(Table::Sessions),
-                store.dataset(Table::Messages),
-                store.dataset(Table::Parts),
+                async {
+                    anyhow::Ok(match sql::mentions_table(query, "sessions") {
+                        true => Some(store.dataset(Table::Sessions).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match sql::mentions_table(query, "messages") {
+                        true => Some(store.dataset(Table::Messages).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match sql::mentions_table(query, "parts") {
+                        true => Some(store.dataset(Table::Parts).await?),
+                        false => None,
+                    })
+                },
             ) {
                 Ok((sessions, messages, parts)) => sql::Tables {
                     sessions,

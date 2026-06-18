@@ -922,6 +922,46 @@ fn raise_lance_mem_pool() {
     tracing::debug!("LANCE_MEM_POOL_SIZE defaulted to 1 GiB");
 }
 
+/// Bound the per-scan readahead buffer for the long-lived read servers
+/// (`pond mcp` / `pond serve`). Lance's `LANCE_DEFAULT_IO_BUFFER_SIZE` defaults
+/// to 2 GiB, which lets a single scan balloon RSS; 256 MiB keeps a warm server
+/// inside a fixed budget while still feeding the IO threads for the small
+/// result sets reads return (spec.md#search). Set only in server processes -
+/// throughput-bound `copy`/`sync` run in their own processes and keep the
+/// default. Index/metadata caches are bounded separately in `resolve_cache_caps`.
+fn cap_serve_io_buffer() {
+    if std::env::var_os("LANCE_DEFAULT_IO_BUFFER_SIZE").is_some() {
+        return;
+    }
+    // Process-wide, set once before opening the store. Safe per Rust 2024's
+    // set_var contract (no other threads reading env yet).
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
+    }
+    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB for serving");
+}
+
+/// Warm the search indices in the background at server startup (spec.md#search).
+/// The cold S3 index load (175-442 s) is paid once here, off the request path,
+/// so the first user query is fast instead of catastrophic. Best effort:
+/// serving starts immediately and a failure is logged, not fatal.
+fn spawn_prewarm(store: Arc<Store>) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        tracing::info!("prewarm: warming search indices");
+        match store.prewarm().await {
+            Ok(()) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "prewarm: search indices warm"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "prewarm: failed; first query will pay the cold load");
+            }
+        }
+    });
+}
+
 fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
     use rlimit::{Resource, getrlimit, setrlimit};
 
@@ -1109,6 +1149,7 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
         } => {
+            cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             let embedder = Arc::new(LazyEmbedder::candle());
@@ -1117,6 +1158,7 @@ async fn main() -> anyhow::Result<()> {
                 embedder,
                 search: config.search.clone(),
             };
+            spawn_prewarm(state.store.clone());
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
@@ -1129,12 +1171,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Mcp {} => {
+            cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
             // first `pond_search` tool call that needs hybrid retrieval.
             let embedder = Arc::new(LazyEmbedder::candle());
+            spawn_prewarm(store.clone());
             transport::mcp::serve_stdio(AppState {
                 store,
                 embedder,
@@ -1257,10 +1301,28 @@ async fn main() -> anyhow::Result<()> {
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
             let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            // Open only the tables the query names (spec.md#search); the slow
+            // `parts.lance` open is waste for the common messages-only query.
+            use pond::substrate::Table;
             let (sessions, messages, parts) = tokio::try_join!(
-                store.dataset(pond::substrate::Table::Sessions),
-                store.dataset(pond::substrate::Table::Messages),
-                store.dataset(pond::substrate::Table::Parts),
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "sessions") {
+                        true => Some(store.dataset(Table::Sessions).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "messages") {
+                        true => Some(store.dataset(Table::Messages).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "parts") {
+                        true => Some(store.dataset(Table::Parts).await?),
+                        false => None,
+                    })
+                },
             )?;
             let tables = pond::sql::Tables {
                 sessions,

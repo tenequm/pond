@@ -13,7 +13,7 @@
 //!
 //! Configs (the recovered T0-T4 matrix; T5 = RRF(T1 ngram, T4 word) derived):
 //!   T0 ngram 3-3  (the original production control)
-//!   T1 ngram 3-5  (current production: FTS_NGRAM_MIN/MAX)
+//!   T1 ngram 3-5  (the former production tokenizer, before word+stem)
 //!   T2 ngram 4-5  (drops short-token coverage)
 //!   T3 simple     (word tokenizer + ascii-folding, no stemming)
 //!   T4 simple+stem(English) + ascii-folding
@@ -80,9 +80,31 @@ struct Args {
     /// Sessions per search (the retrieval depth scored over).
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    /// Restrict the run to a comma-separated subset of config ids by prefix
+    /// (e.g. `--only T1,T4` to compare current ngram vs word+stem only). Each
+    /// rebuild is minutes on 2M rows, so this is the fast path for a targeted
+    /// re-measure. Default: the full matrix.
+    #[arg(long)]
+    only: Option<String>,
     /// Ignored; absorbs the `--bench` cargo passes to `harness = false` targets.
     #[arg(long, hide = true)]
     bench: bool,
+}
+
+impl Args {
+    /// The matrix rows this run will build, honoring `--only`.
+    fn selected(&self) -> Vec<&'static TokConfig> {
+        match &self.only {
+            None => MATRIX.iter().collect(),
+            Some(list) => {
+                let wanted: Vec<&str> = list.split(',').map(str::trim).collect();
+                MATRIX
+                    .iter()
+                    .filter(|tc| wanted.iter().any(|w| tc.id.starts_with(w)))
+                    .collect()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -278,9 +300,9 @@ fn parse_queries(path: &std::path::Path) -> Result<Vec<Query>> {
 /// for the phrase via pond's own read-only SQL (corpus-portable, no extra deps).
 async fn resolve_anchors(store: &Store, queries: &mut [Query]) -> Result<()> {
     let tables = Tables {
-        sessions: store.dataset(Table::Sessions).await?,
-        messages: store.dataset(Table::Messages).await?,
-        parts: store.dataset(Table::Parts).await?,
+        sessions: Some(store.dataset(Table::Sessions).await?),
+        messages: Some(store.dataset(Table::Messages).await?),
+        parts: Some(store.dataset(Table::Parts).await?),
     };
     for q in queries.iter_mut() {
         if let GroundTruth::Anchor(anchor, set) = &mut q.gt {
@@ -418,7 +440,7 @@ async fn main() -> Result<()> {
     let mut t1: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
     let mut t4: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
 
-    for tc in MATRIX {
+    for tc in args.selected() {
         eprintln!("[{}] rebuilding index...", tc.id);
         let mut ds = open_messages_dataset(&target).await?;
         rebuild_index(&mut ds, tc).await?;
@@ -449,6 +471,14 @@ async fn main() -> Result<()> {
     }
     ranks.insert("T5 RRF(T1,T4)".to_owned(), t5);
 
+    // Only report the configs that actually ran (honors `--only`), in the
+    // canonical CONFIG_IDS order. T5 is always present (derived above).
+    let cols: Vec<&str> = CONFIG_IDS
+        .iter()
+        .copied()
+        .filter(|cid| ranks.contains_key(*cid))
+        .collect();
+
     // Per-stratum Success@K table (rows = strata, cols = configs).
     let mut strata: Vec<(String, String)> = Vec::new();
     for q in &queries {
@@ -474,28 +504,28 @@ async fn main() -> Result<()> {
     };
 
     print!("{:<22}", "stratum (n)");
-    for cid in CONFIG_IDS {
+    for cid in &cols {
         print!("{cid:>16}");
     }
     println!();
-    println!("{}", "-".repeat(22 + 16 * CONFIG_IDS.len()));
+    println!("{}", "-".repeat(22 + 16 * cols.len()));
     for (lang, stratum) in &strata {
         let n = queries
             .iter()
             .filter(|q| &q.lang == lang && &q.stratum == stratum)
             .count();
         print!("{:<22}", format!("{lang}/{stratum} ({n})"));
-        for cid in CONFIG_IDS {
+        for cid in &cols {
             let (h, _) = succ(cid, lang, stratum);
             print!("{:>16}", format!("{h}/{n}"));
         }
         println!();
     }
-    println!("{}", "-".repeat(22 + 16 * CONFIG_IDS.len()));
+    println!("{}", "-".repeat(22 + 16 * cols.len()));
     // Totals + per-language totals (Success@K).
     for label in ["en", "uk", "ALL"] {
         print!("{:<22}", format!("{label} total"));
-        for cid in CONFIG_IDS {
+        for cid in &cols {
             let qs: Vec<&Query> = queries
                 .iter()
                 .filter(|q| label == "ALL" || q.lang == label)
@@ -514,7 +544,7 @@ async fn main() -> Result<()> {
 
     // JSON for diffing across runs.
     let mut json_rows = Vec::new();
-    for cid in CONFIG_IDS {
+    for cid in &cols {
         let p1 = queries
             .iter()
             .filter(|q| ranks[*cid].get(&q.id).copied().unwrap_or(0) == 1)

@@ -865,7 +865,10 @@ pub const COMPACTION_ABSORB_FACTOR: u64 = 4;
 /// in-progress guard still protects unverified files regardless of this value
 /// (`UNVERIFIED_THRESHOLD_DAYS` in lance/dataset/cleanup.rs).
 pub fn default_cleanup_older_than() -> chrono::Duration {
-    chrono::Duration::days(1)
+    // Toward Lance's 1 h floor: fewer retained manifest versions = cheaper
+    // remote open (spec.md#search). The append fast-path already curbs the
+    // version churn that earlier forced a wider window.
+    chrono::Duration::hours(1)
 }
 
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
@@ -996,10 +999,12 @@ pub enum IndexParamsKind {
     /// `BuiltinIndexType::BTree` -> [`IndexType::BTree`];
     /// `BuiltinIndexType::Bitmap` -> [`IndexType::Bitmap`]; etc.
     Scalar(BuiltinIndexType),
-    /// `InvertedIndexParams` with a character `ngram` tokenizer in the
-    /// `[min, max]` range and stemming / stop-words off
-    /// (spec.md#search-language-neutral-index).
-    InvertedFtsNgram { min: u32, max: u32 },
+    /// `InvertedIndexParams` with the word-level `simple` tokenizer plus
+    /// English stemming, stop-words off (spec.md#search-language-neutral-index).
+    /// Word retrieval beats character ngram ~2x on the real corpus at ~4x less
+    /// index weight; substring/symbol lookup stays on the SQL `LIKE` /
+    /// `contains_tokens` path, not here.
+    InvertedFtsWord,
     /// `VectorIndexParams::ivf_pq` with cosine metric (e5 vectors are
     /// L2-normalized). `sub_vectors = embedding_dim / 8` and `num_bits = 8`
     /// are pond's conventions; `max_iters` caps kmeans. Partitions follow
@@ -1031,7 +1036,7 @@ impl IndexParamsKind {
             Self::Scalar(BuiltinIndexType::Bitmap) => IndexType::Bitmap,
             Self::Scalar(BuiltinIndexType::ZoneMap) => IndexType::ZoneMap,
             Self::Scalar(_) => IndexType::BTree,
-            Self::InvertedFtsNgram { .. } => IndexType::Inverted,
+            Self::InvertedFtsWord => IndexType::Inverted,
             Self::IvfPqCosine { .. } => IndexType::Vector,
         }
     }
@@ -1039,12 +1044,10 @@ impl IndexParamsKind {
     async fn build(&self, dataset: &Dataset) -> Result<Box<dyn lance::index::IndexParams>> {
         match self {
             Self::Scalar(kind) => Ok(Box::new(ScalarIndexParams::for_builtin(kind.clone()))),
-            Self::InvertedFtsNgram { min, max } => Ok(Box::new(
+            Self::InvertedFtsWord => Ok(Box::new(
                 InvertedIndexParams::default()
-                    .base_tokenizer("ngram".to_owned())
-                    .ngram_min_length(*min)
-                    .ngram_max_length(*max)
-                    .stem(false)
+                    .base_tokenizer("simple".to_owned())
+                    .stem(true)
                     .remove_stop_words(false),
             )),
             Self::IvfPqCosine {
@@ -1513,8 +1516,11 @@ impl RuntimeCaps {
 /// default (see `benches/serve_mem_bench.rs --cap-sweep`).
 const LOCAL_INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const LOCAL_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
-/// Object-store defaults: latency to refill is per-page, so keep more in cache.
-const REMOTE_INDEX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Object-store defaults: latency to refill is per-page, so keep more in cache
+/// than local - but bounded above the warm working set, not Lance's 6 GiB.
+/// Post word-tokenizer FTS that set is ~450 MB (simple invert + IVF_PQ aux), so
+/// 1 GiB holds both indices warm with headroom while capping the RSS ceiling.
+const REMOTE_INDEX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 const REMOTE_METADATA_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 fn resolve_cache_caps(location: &Url, caps: RuntimeCaps) -> (usize, usize) {
@@ -2859,7 +2865,7 @@ async fn optimize_table_indices(
                 did_work = true;
             }
             IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
-            | IndexParamsKind::InvertedFtsNgram { .. }
+            | IndexParamsKind::InvertedFtsWord
             | IndexParamsKind::IvfPqCosine { .. } => {
                 append_indices.push(intent.name.to_owned());
             }

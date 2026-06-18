@@ -34,6 +34,16 @@ Findings:
 
 Recommended change to `ensure_indices`: `ngram_max_length(3)` -> `ngram_max_length(5)`.
 
+## Update (2026-06-18): word tokenizer adopted, superseding finding 1
+
+The remote-read-performance work (`docs/plans/2606-17-remote-read-perf-and-index-cleanup.md`) re-weighted this decision: pond now indexes with the word-level `simple` tokenizer plus English stemming. Finding 1 above (word "ruled out") is superseded - not because the Ukrainian regression went away, but because the trade-off changed:
+
+- The UK regression reproduced almost exactly (Success@3 **7/21 vs ngram 8/21** on the re-run, a single natural-language query; the symbol-lookup, error-message, conceptual, and bare-keyword strata all tie). Cyrillic passes through the English stemmer unstemmed, so it stays exact-matchable - the loss is confined to inflectional natural-language matching, which ngram's sub-word overlap approximated.
+- Against that, the word index wins decisively on the English-dominant corpus (**EN Success@3 66/111 vs ngram 31/111, ~2x**) and is **~28x lighter** on disk (41 MB vs 1.14 GB inverted-list file on the 2.06M-message corpus).
+- The index weight is the operative constraint: the ngram index dominated remote cold-start (a 175-442 s first-search page-in from S3) and server RAM. The word index removes that.
+
+The 2026-05-22 report treated any Ukrainian regression as disqualifying ("multilingual support is a hard requirement"); the read-path constraints made the English and operational gains decisive over a one-query Ukrainian loss. The spec rule `search-language-neutral-index` is amended accordingly: the invariant is now "no transform that drops or mangles a language's tokens" (a gracefully-degrading stem is allowed), not "no monolingual transform at all."
+
 ## 1. Background and question
 
 pond ingests AI coding-agent session transcripts into Lance and serves

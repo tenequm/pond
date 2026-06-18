@@ -19,6 +19,7 @@ use lance::deps::arrow_array::{
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
+use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1586,6 +1587,26 @@ impl Store {
     /// handle's freshness gate, so each query sees a current snapshot.
     pub async fn dataset(&self, table: Table) -> Result<Arc<Dataset>> {
         Ok(Arc::new(self.handle.dataset(table).await?))
+    }
+
+    /// Page the heavy search indices in from storage so the first user query
+    /// after process start never eats the 175-442 s cold S3 load
+    /// (spec.md#search). Vector via `prewarm_index`; FTS has no prewarm API, so
+    /// one synthetic query warms the inverted index. Best effort: a missing
+    /// index (IVF_PQ below activation, or no FTS yet on an empty store) is
+    /// logged, not fatal.
+    pub async fn prewarm(&self) -> Result<()> {
+        let messages = self.dataset(Table::Messages).await?;
+        if let Err(error) = messages.prewarm_index(MESSAGES_VECTOR_INDEX).await {
+            tracing::debug!(%error, "vector index prewarm skipped");
+        }
+        if let Err(error) = self
+            .fts_search("pond", 1, &Predicate::And(Vec::new()))
+            .await
+        {
+            tracing::debug!(%error, "fts index prewarm skipped");
+        }
+        Ok(())
     }
 
     /// Write a `pond_sql_query` export artifact.
@@ -3442,15 +3463,16 @@ fn role_from_str(value: &str) -> Result<Role> {
     }
 }
 
-/// Scalar indexes on `messages` (spec.md#datasets): BTREE for high-cardinality
-/// and range columns, BITMAP for low-cardinality columns. There is no index
-/// on `embedding_model`: pond's invariant is one active model at a time
-/// (a model swap goes through `pond optimize --force-embed` which drops the IVF_PQ,
-/// clears stale rows, and re-bootstraps), so `embedding_model` is never a
-/// query-time predicate - the only embedding-state filter is `vector IS NOT
-/// NULL`. `id` lookups are rare and full-scan.
+/// Scalar indexes on `messages` (spec.md#datasets): only columns whose index
+/// type matches the predicate actually issued against them. `project` is
+/// filtered solely by `LikeContains`/`Regex` (substring), which a BTree cannot
+/// accelerate, and `role` is never filtered - both are deliberately unindexed
+/// (substring lookup stays on the SQL `LIKE` path). There is no index on
+/// `embedding_model`: pond's invariant is one active model at a time (a model
+/// swap goes through `pond optimize --force-embed` which drops the IVF_PQ,
+/// clears stale rows, and re-bootstraps), so the only embedding-state filter is
+/// `vector IS NOT NULL`. `id` lookups are rare and full-scan.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
-    ("project", BuiltinIndexType::BTree, "messages_project_btree"),
     (
         "session_id",
         BuiltinIndexType::BTree,
@@ -3458,12 +3480,9 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ),
     // Range-only column (`from_date`/`to_date` -> `timestamp >=` / `<=`,
     // never exact-equality, never `ORDER BY` against the index). ZoneMap's
-    // per-fragment min/max prunes those filters with no recall loss, and
-    // skips the global ExternalSort that `parts_session_id_btree` paid
-    // during build at the FairSpillPool default. The renamed index causes
-    // Lance to treat this as a fresh intent: next optimize builds the
-    // ZoneMap; the prior `messages_timestamp_btree` becomes orphaned and
-    // is reaped passively by `cleanup_old_versions`.
+    // per-fragment min/max prunes those filters with no recall loss (measured:
+    // 258 zones -> ~6, ~42x fewer rows scanned on the real S3 corpus), and
+    // skips the global ExternalSort that a BTree would pay during build.
     (
         "timestamp",
         BuiltinIndexType::ZoneMap,
@@ -3474,7 +3493,6 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         BuiltinIndexType::Bitmap,
         "messages_source_agent_bitmap",
     ),
-    ("role", BuiltinIndexType::Bitmap, "messages_role_bitmap"),
 ];
 
 /// Scalar indexes on `parts`: `(session_id, message_id)` is the hot-path lookup key for
@@ -3541,12 +3559,6 @@ const IVF_PQ_NUM_BITS: u8 = 8;
 const IVF_PQ_SUB_VECTOR_STRIDE: usize = 8;
 const IVF_PQ_MAX_ITERS: usize = 15;
 
-/// FTS tokenizer constants (spec.md#search-language-neutral-index): character ngrams
-/// in `[3, 5]`. 4-5-grams discriminate, min=3 keeps 3-char tokens
-/// (`FTS`, `OCC`) searchable.
-const FTS_NGRAM_MIN: u32 = 3;
-const FTS_NGRAM_MAX: u32 = 5;
-
 /// Pond's production IndexIntents: the per-table intent set
 /// `Store::open_with_options` registers with the substrate.
 pub fn pond_index_intents() -> IndexIntents {
@@ -3562,10 +3574,7 @@ pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) 
         name: MESSAGES_FTS_INDEX,
         column: "search_text",
         trigger: IndexTrigger::OnAnyRows,
-        params: IndexParamsKind::InvertedFtsNgram {
-            min: FTS_NGRAM_MIN,
-            max: FTS_NGRAM_MAX,
-        },
+        params: IndexParamsKind::InvertedFtsWord,
     });
     for (column, kind, name) in MESSAGE_SCALAR_INDICES {
         messages.push(IndexIntent {

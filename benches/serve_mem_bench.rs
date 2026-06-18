@@ -112,7 +112,7 @@ struct Args {
     /// with `--storage-path`.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Override the Lance index cache cap (MiB). Default: remote 2048, local 256.
+    /// Override the Lance index cache cap (MiB). Default: remote 1024, local 256.
     #[arg(long)]
     index_cache_mib: Option<u64>,
     /// Override the Lance metadata cache cap (MiB). Default: remote 512, local 128.
@@ -136,6 +136,11 @@ struct Args {
     /// Skip the hybrid phases (no E5 load). Useful to see the FTS-only floor.
     #[arg(long)]
     skip_hybrid: bool,
+    /// Warm the search indices (vector + FTS) right after open, as a measured
+    /// `prewarm` phase, mirroring `pond mcp` startup. With it on, the cold S3
+    /// index load shows up here instead of in `fts_warm`/`first_hybrid`.
+    #[arg(long)]
+    prewarm: bool,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
@@ -613,9 +618,9 @@ async fn run_sql_phase(
         // `transport.rs` serves.
         let t = Instant::now();
         let tables = Tables {
-            sessions: store.dataset(Table::Sessions).await?,
-            messages: store.dataset(Table::Messages).await?,
-            parts: store.dataset(Table::Parts).await?,
+            sessions: Some(store.dataset(Table::Sessions).await?),
+            messages: Some(store.dataset(Table::Messages).await?),
+            parts: Some(store.dataset(Table::Parts).await?),
         };
         match sql::run(&tables, q, Mode::Inline, sql::DEFAULT_INLINE_ROWS).await {
             Ok(_) => {}
@@ -982,6 +987,31 @@ async fn main() -> Result<()> {
     cold.elapsed_ms = vec![open_ms];
     phases.push(cold);
 
+    // ---- Phase: prewarm (optional; mirrors `pond mcp` startup) ----
+    if args.prewarm {
+        sampler.mark_phase_start();
+        let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
+        let t = Instant::now();
+        store.prewarm().await?;
+        let prewarm_ms = t.elapsed().as_millis();
+        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+        phases.push(PhaseStats {
+            name: "prewarm",
+            queries: 0,
+            elapsed_ms: vec![prewarm_ms],
+            rss_start_kb,
+            rss_end_kb: sampler.current_kb(),
+            rss_phase_peak_kb: sampler.phase_peak_kb(),
+            rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
+            notes: format!("prewarm_ms={prewarm_ms} (vector prewarm_index + synthetic FTS)"),
+        });
+    }
+
     // ---- Phase: sql_cold (first sql_query on a freshly opened store) ----
     // One column-scan query, cache cold - the cold-start a `pond_sql_query`
     // caller pays before anything is resident.
@@ -1264,7 +1294,8 @@ async fn open_messages_dataset(target: &OpenTarget) -> Result<Dataset> {
 
 async fn build_fts_index(dataset: &mut Dataset, tokenizer: &str) -> Result<u128> {
     let params = match tokenizer {
-        // Match pond's production ngram config (FTS_NGRAM_MIN=3, MAX=5).
+        // The former ngram config (min=3, max=5), kept as a sweep comparison
+        // point now that production indexes with word+stem.
         "ngram" => InvertedIndexParams::default()
             .base_tokenizer("ngram".to_owned())
             .ngram_min_length(3)

@@ -117,9 +117,9 @@ async fn fetch_tables(store: &Store) -> Result<Tables> {
         store.dataset(Table::Parts),
     )?;
     Ok(Tables {
-        sessions,
-        messages,
-        parts,
+        sessions: Some(sessions),
+        messages: Some(messages),
+        parts: Some(parts),
     })
 }
 

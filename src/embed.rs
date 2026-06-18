@@ -170,11 +170,10 @@ fn device_label(device: &Device) -> &'static str {
 type EmbedLoader = Arc<dyn Fn() -> Result<Arc<dyn Embedder>> + Send + Sync>;
 
 /// How long the cached backend can sit unused before [`LazyEmbedder::get`]
-/// drops it. Five minutes matches typical interactive-MCP conversational
-/// pauses: short enough that a model that's been unused for a turn or two
-/// is gone before the next quiet window, long enough that ordinary
-/// query bursts never pay the reload cost.
-pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(300);
+/// drops it. One minute returns the ~790 MB model to the idle floor quickly
+/// between interactive-MCP bursts; the reload is one cached model-load
+/// (~358 ms) on the first query after a quiet window.
+pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(60);
 
 struct CachedBackend {
     backend: Arc<dyn Embedder>,
