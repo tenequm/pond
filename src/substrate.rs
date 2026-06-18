@@ -1671,6 +1671,17 @@ impl WriteAccum {
     }
 }
 
+/// Append-mode write params. Byte-sized fragments, not Lance's 90 GB default:
+/// kilobyte rows would otherwise pack multi-GiB fragments that compaction
+/// rewrites wholesale (see `TARGET_FRAGMENT_BYTES`). Reuses the create params so
+/// appended fragments match the table's storage version / row-id mode.
+fn append_write_params() -> WriteParams {
+    let mut params = sessions::write_params_for_create();
+    params.mode = WriteMode::Append;
+    params.max_bytes_per_file = TARGET_FRAGMENT_BYTES as usize;
+    params
+}
+
 impl Handle {
     /// Open without storage options or explicit cache caps. Backend-aware
     /// defaults from `[runtime]` apply.
@@ -1924,6 +1935,32 @@ impl Handle {
         .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
     }
 
+    /// The OCC write-commit seam (spec.md#lance-chokepoints-write): every write -
+    /// `merge` and the append paths - runs through here. It takes the cached
+    /// handle's lock, hands `execute` the latest dataset, commits the dataset
+    /// `execute` returns, and keeps the cache coherent - all under retry.
+    /// `execute` builds the table-specific builder, runs it, and returns the new
+    /// dataset plus its own stats payload; it reruns per OCC attempt, so it owns
+    /// what it needs. Write-type specifics (params, stats, tracing) stay with the
+    /// caller.
+    async fn write_committed<E, Fut, P>(&self, table: Table, execute: E) -> Result<P>
+    where
+        E: Fn(Arc<Dataset>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Dataset, P)>>,
+    {
+        self.retry_lance(table.label(), || {
+            let execute = &execute;
+            async move {
+                let mut cached = self.cached(table).await?.lock().await;
+                let existing = cached.latest().await?;
+                let (dataset, payload) = execute(Arc::new(existing)).await?;
+                cached.replace(dataset);
+                Ok(payload)
+            }
+        })
+        .await
+    }
+
     /// Shared merge path for [`Self::merge_insert`] and [`Self::merge_update`].
     /// Returns Lance's `MergeStats` verbatim so the progress layer can read
     /// `bytes_written` / `num_files_written` / `num_attempts` without a second
@@ -1943,26 +1980,29 @@ impl Handle {
         }
         let started = Instant::now();
         let result = self
-            .retry_lance(table.label(), || async {
-                let mut cached = self.cached(table).await?.lock().await;
-                let existing = cached.latest().await?;
-                let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-                let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
-                builder.when_matched(when_matched.clone());
-                builder.when_not_matched(when_not_matched.clone());
-                // pond presents each PK at most once per batch; FirstSeen keeps
-                // the first occurrence rather than failing (Lance's default).
-                builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-                // Cleanup is operator-driven via `pond optimize`; the
-                // per-commit auto hook would add a LIST per write on remote
-                // backends without changing the steady-state retention.
-                builder.skip_auto_cleanup(true);
-                let (dataset, stats) = builder
-                    .try_build()?
-                    .execute_reader(Box::new(reader))
-                    .await?;
-                cached.replace(dataset.as_ref().clone());
-                Ok(stats)
+            .write_committed(table, |existing| {
+                let batch = batch.clone();
+                let when_matched = when_matched.clone();
+                let when_not_matched = when_not_matched.clone();
+                async move {
+                    let schema = batch.schema();
+                    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+                    let mut builder = MergeInsertBuilder::try_new(existing, Vec::new())?;
+                    builder.when_matched(when_matched);
+                    builder.when_not_matched(when_not_matched);
+                    // pond presents each PK at most once per batch; FirstSeen keeps
+                    // the first occurrence rather than failing (Lance's default).
+                    builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+                    // Cleanup is operator-driven via `pond optimize`; the per-commit
+                    // auto hook would add a LIST per write on remote backends without
+                    // changing the steady-state retention.
+                    builder.skip_auto_cleanup(true);
+                    let (dataset, stats) = builder
+                        .try_build()?
+                        .execute_reader(Box::new(reader))
+                        .await?;
+                    Ok((dataset.as_ref().clone(), stats))
+                }
             })
             .await;
         let skipped = result
@@ -2004,31 +2044,20 @@ impl Handle {
     {
         let cum = Arc::new(WriteAccum::default());
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        // Byte-sized fragments, not Lance's 90 GB default: kilobyte rows would
-        // otherwise pack multi-GiB fragments that compaction rewrites
-        // wholesale (see TARGET_FRAGMENT_BYTES). Reuse the create params so the
-        // appended fragments match the table's storage version / row-id mode.
-        let mut params = sessions::write_params_for_create();
-        params.mode = WriteMode::Append;
-        params.max_bytes_per_file = TARGET_FRAGMENT_BYTES as usize;
-
         let started = Instant::now();
-        self.retry_lance(table.label(), || {
+        self.write_committed(table, |existing| {
             let make_source = &make_source;
             let cum = cum.clone();
             let attempts = attempts.clone();
-            let params = &params;
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut cached = self.cached(table).await?.lock().await;
-                let existing = cached.latest().await?;
                 let stream = make_source().await?;
-                let builder = InsertBuilder::new(Arc::new(existing))
-                    .with_params(params)
-                    .progress(move |stats| cum.observe(&stats));
-                let new_dataset = builder.execute_stream(stream).await?;
-                cached.replace(new_dataset);
-                Ok::<_, anyhow::Error>(())
+                let dataset = InsertBuilder::new(existing)
+                    .with_params(&append_write_params())
+                    .progress(move |stats| cum.observe(&stats))
+                    .execute_stream(stream)
+                    .await?;
+                Ok((dataset, ()))
             }
         })
         .await?;
@@ -2043,6 +2072,57 @@ impl Handle {
         tracing::info!(
             target: "pond::perf",
             op = "append",
+            table = %table.label(),
+            rows = stats.rows,
+            files = stats.files_written,
+            attempts,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "append",
+        );
+        Ok(stats)
+    }
+
+    /// [`Self::append_stream`] for batches pond already holds in memory (the sync
+    /// write path) instead of a source-store scan. Row count is taken from the
+    /// batches - exact under OCC retry without depending on the progress tick.
+    pub(crate) async fn append_batches(
+        &self,
+        table: Table,
+        batches: Vec<RecordBatch>,
+    ) -> Result<AppendStats> {
+        let total_rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+        if total_rows == 0 {
+            return Ok(AppendStats::default());
+        }
+        let cum = Arc::new(WriteAccum::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = Instant::now();
+        self.write_committed(table, |existing| {
+            let cum = cum.clone();
+            let attempts = attempts.clone();
+            let batches = batches.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dataset = InsertBuilder::new(existing)
+                    .with_params(&append_write_params())
+                    .progress(move |stats| cum.observe(&stats))
+                    .execute(batches)
+                    .await?;
+                Ok((dataset, ()))
+            }
+        })
+        .await?;
+
+        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
+        let stats = AppendStats {
+            rows: total_rows,
+            bytes_written: cum.bytes(),
+            files_written: cum.files(),
+            attempts,
+        };
+        tracing::info!(
+            target: "pond::perf",
+            op = "append_batches",
             table = %table.label(),
             rows = stats.rows,
             files = stats.files_written,

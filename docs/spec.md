@@ -124,7 +124,7 @@ Every interaction with Lance funnels through one of four chokepoints, each a sin
 
 **read** {#lance-chokepoints-read} - Every scan and search query MUST be built through the substrate's read path. Why: it is the one place `search-prefilter-pushdown` (Section 8) is enforced, and the one place a future scanner change lands.
 
-**write** {#lance-chokepoints-write} - Every write MUST go through the substrate's merge-insert path. Writes through this chokepoint never fold indexes - index lifecycle lives under `lance-index-maintenance` (Section 3.7). Why: `lance-append-only` and `adapter-integrity-additive-sync` (Section 6) hold only with a single write chokepoint; a direct write bypasses both.
+**write** {#lance-chokepoints-write} - Every write MUST go through the substrate's write path - merge-insert for rows that may collide, append for rows that cannot (absent rows under the deterministic PK). Writes through this chokepoint never fold indexes - index lifecycle lives under `lance-index-maintenance` (Section 3.7). Why: `lance-append-only` and `adapter-integrity-additive-sync` (Section 6) hold only with a single write chokepoint; a direct write bypasses both.
 
 **storage** {#lance-chokepoints-storage} - Every read, list, or write of dataset bytes MUST go through Lance's object-store layer; no code resolves a dataset to a local path. Why: a `file://` pond and an `s3://` pond behave identically only when no code reaches around Lance; a single direct-FS access silently backend-locks that operation.
 
@@ -132,7 +132,7 @@ Every interaction with Lance funnels through one of four chokepoints, each a sin
 
 **`lance-append-only`** {#lance-append-only} - Stored rows MUST NOT be mutated; an update produces a new row or a new manifest version. Why: it forecloses corruption-by-mutation and makes every write idempotent under retry.
 
-**`lance-deterministic-pk`** {#lance-deterministic-pk} - Every row MUST have a deterministic primary key - source-supplied where the source carries a stable id, content-derived otherwise. Writes merge-insert on the key, so a retried or re-run write is a no-op for rows already present. Why: idempotent ingest depends on the key being reproducible from the source data alone.
+**`lance-deterministic-pk`** {#lance-deterministic-pk} - Every row MUST have a deterministic primary key - source-supplied where the source carries a stable id, content-derived otherwise. Writes are idempotent on the key - merge-insert no-ops a present row, the append path writes only absent rows - so a retried or re-run write is a no-op for rows already present. Why: idempotent ingest depends on the key being reproducible from the source data alone.
 
 **`lance-dataset-schema-version`** {#lance-dataset-schema-version} - Schema versioning lives at the dataset level - the Lance manifest and a dataset-level metadata key - never as a per-row column. Why: a per-row version column pays storage on every row for a fact that is per-dataset.
 

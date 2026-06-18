@@ -69,19 +69,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 
 ## Comments
 
-<comments>
-A good pond comment names the WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, behavior that would surprise someone reading just the symbols. Keep each as short as the WHY allows - one line when it fits, a few when the constraint genuinely needs more. Anchor to a `spec.md` section or rule-mnemonic anchor (e.g. `spec.md#adapters`, `spec.md#model-no-synthesis`) when one applies. Touch only comments on the code you're changing this turn; leave the rest as-is.
-
-<example>
-// spec.md#protocol: typed `conflict` for OCC failures, not `storage_unavailable`.
-</example>
-<example>
-// Opt out of Lance's `_score` autoprojection; that default is being removed upstream.
-</example>
-<example>
-// Local manifests are microsecond-cheap; refresh=0 removes the stale-read window for free.
-</example>
-</comments>
+Lean toward fewer comments; prefer self-descriptive names and structure over narration. A good comment names a WHY a reader can't see from the code itself: a hidden constraint, an invariant, an upstream workaround, surprising behavior. Avoid restating what the code already says or re-deriving a WHY already documented nearby (a sibling or the function you mirror) - document only the delta there. Keep each as short as the WHY allows; anchor to a `spec.md` section when one applies. Touch only comments on the code you're changing this turn.
 
 ## Adapter seam (load-bearing)
 

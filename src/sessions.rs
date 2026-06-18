@@ -969,6 +969,10 @@ impl Store {
             .iter()
             .map(|substream| substream.session.clone())
             .collect();
+        // Append only rows absent from the pre-existence sweep; present rows are
+        // merge no-ops (spec.md#adapter-integrity-additive-sync). `seen_*` carries
+        // the in-batch dedup floor (spec.md#adapter-integrity-dedup).
+        let mut seen_messages: HashSet<(String, String)> = HashSet::new();
         let message_rows: Vec<MessageBatchRow<'_>> = writeable
             .iter()
             .flat_map(|substream| {
@@ -979,7 +983,15 @@ impl Store {
                     search_text: buffered.search_text.as_deref(),
                 })
             })
+            .filter(|row| {
+                let key = (
+                    row.message.session_id().to_owned(),
+                    row.message.id().to_owned(),
+                );
+                !existing_message_pks.contains(&key) && seen_messages.insert(key)
+            })
             .collect();
+        let mut seen_parts: HashSet<(String, String, String)> = HashSet::new();
         let part_rows: Vec<Part> = writeable
             .iter()
             .flat_map(|substream| {
@@ -990,22 +1002,23 @@ impl Store {
                         .map(|buffered_part| buffered_part.part.clone())
                 })
             })
+            .filter(|part| {
+                let key = (
+                    part.session_id.clone(),
+                    part.message_id.clone(),
+                    part.id.clone(),
+                );
+                !existing_part_pks.contains(&key) && seen_parts.insert(key)
+            })
             .collect();
 
         let session_batches = sessions_batches(&sessions_owned)?;
         let message_batches = messages_batches(&message_rows)?;
         let part_batches = parts_batches(&part_rows)?;
 
-        // Merge_insert returns a batch-level inserted count which we cross-
-        // check against our pre-existence sets, but for per-row truth we
-        // attribute through the sets themselves (next loop). Under
-        // single-writer the two agree exactly; under a hostile concurrent
-        // writer the sets are authoritative for THIS request's wire shape -
-        // matched-no-op (spec.md#adapter-integrity-additive-sync) makes the
-        // distinction informational, not behavioral.
-        let (_messages_inserted, _parts_inserted) = tokio::try_join!(
-            merge_insert_chunks(&self.handle, Table::Messages, message_batches),
-            merge_insert_chunks(&self.handle, Table::Parts, part_batches),
+        let (_messages_appended, _parts_appended) = tokio::try_join!(
+            self.handle.append_batches(Table::Messages, message_batches),
+            self.handle.append_batches(Table::Parts, part_batches),
         )?;
         let _sessions_inserted =
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;
@@ -2003,18 +2016,19 @@ impl Store {
 
     /// Embedding coverage: how many `messages` rows carry a vector and how
     /// many are still eligible. Drives the `pond status` embeddings line and
-    /// the `pond optimize` progress bar's known total. `embedded` reads the
-    /// `vector IS NOT NULL` count directly - the single-active-model invariant
-    /// (see `MESSAGE_SCALAR_INDICES`) means there is no need to scope by the
-    /// `embedding_model` column.
+    /// the `pond optimize` progress bar's known total.
     pub async fn embedding_progress(&self) -> Result<EmbeddingProgress> {
         let dataset = self.handle.dataset(Table::Messages).await?;
-        let embedded = dataset
-            .count_rows(Some(Predicate::IsNotNull("vector").to_lance()))
-            .await?;
-        let total = dataset
-            .count_rows(Some(Predicate::IsNotNull("search_text").to_lance()))
-            .await?;
+        // Lance 7.0.0 has no per-column null_count metadata, so each count is a
+        // data-page read; run the two concurrently rather than in series.
+        // `embedded` counts `embedding_model IS NOT NULL`, not `vector`: the two
+        // are co-set (spec.md#session-embed-from-canonical) so the count is
+        // identical, but the model-id string column is ~50x narrower than the
+        // Float16 vector, so its page read is far cheaper.
+        let (embedded, total) = tokio::try_join!(
+            dataset.count_rows(Some(Predicate::IsNotNull("embedding_model").to_lance())),
+            dataset.count_rows(Some(Predicate::IsNotNull("search_text").to_lance())),
+        )?;
         Ok(EmbeddingProgress {
             embedded,
             total,
@@ -2027,10 +2041,15 @@ impl Store {
     /// uses to detect a model swap and require `--force-embed`.
     pub async fn stale_embedding_count(&self) -> Result<usize> {
         let dataset = self.handle.dataset(Table::Messages).await?;
+        // Same shape as the original (IsNotNull AND Ne), but the null check is on
+        // the narrow model-id column, not the ~50x-wider Float16 vector: the two
+        // are co-set (spec.md#session-embed-from-canonical), so `embedding_model
+        // IS NOT NULL` equals `vector IS NOT NULL`, and the model-id page read is
+        // far cheaper than the vector's.
         dataset
             .count_rows(Some(
                 Predicate::And(vec![
-                    Predicate::IsNotNull("vector"),
+                    Predicate::IsNotNull("embedding_model"),
                     Predicate::Ne("embedding_model", embed::model_id().into()),
                 ])
                 .to_lance(),
