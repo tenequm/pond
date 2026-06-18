@@ -25,6 +25,8 @@ use lance::session::Session;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor, uri_to_url,
 };
@@ -991,15 +993,15 @@ pub enum IndexParamsKind {
     /// index weight; substring/symbol lookup stays on the SQL `LIKE` /
     /// `contains_tokens` path, not here.
     InvertedFtsWord,
-    /// `VectorIndexParams::ivf_pq` with cosine metric (e5 vectors are
-    /// L2-normalized). `sub_vectors = embedding_dim / 8` and `num_bits = 8`
-    /// are pond's conventions; `max_iters` caps kmeans. Partitions follow
-    /// LanceDB's documented `num_rows // 4096` guidance, floored at one.
-    IvfPqCosine {
-        sub_vectors: usize,
-        num_bits: u8,
-        max_iters: usize,
-    },
+    /// `VectorIndexParams::with_ivf_sq_params` with cosine metric (e5 vectors
+    /// are L2-normalized). 8-bit scalar quantization stores per-dimension codes
+    /// in the index itself, so kNN computes distances from the prewarmed
+    /// partition with no refine pass - PQ+refine instead re-reads ~k*factor
+    /// exact vectors from the data files as scattered per-row GETs, the
+    /// dominant per-query S3 request storm on a throttling remote store
+    /// (spec.md#search). `max_iters` caps kmeans; partitions follow LanceDB's
+    /// documented `num_rows // 4096` guidance, floored at one.
+    IvfSqCosine { num_bits: u16, max_iters: usize },
 }
 
 impl IndexTrigger {
@@ -1023,7 +1025,7 @@ impl IndexParamsKind {
             Self::Scalar(BuiltinIndexType::ZoneMap) => IndexType::ZoneMap,
             Self::Scalar(_) => IndexType::BTree,
             Self::InvertedFtsWord => IndexType::Inverted,
-            Self::IvfPqCosine { .. } => IndexType::Vector,
+            Self::IvfSqCosine { .. } => IndexType::Vector,
         }
     }
 
@@ -1036,8 +1038,7 @@ impl IndexParamsKind {
                     .stem(true)
                     .remove_stop_words(false),
             )),
-            Self::IvfPqCosine {
-                sub_vectors,
+            Self::IvfSqCosine {
                 num_bits,
                 max_iters,
             } => {
@@ -1045,12 +1046,16 @@ impl IndexParamsKind {
                     .count_rows(Some("vector IS NOT NULL".to_owned()))
                     .await?;
                 let partitions = count.checked_div(4096).unwrap_or(0).max(1);
-                Ok(Box::new(VectorIndexParams::ivf_pq(
-                    partitions,
-                    *num_bits,
-                    *sub_vectors,
+                let mut ivf = IvfBuildParams::new(partitions);
+                ivf.max_iters = *max_iters;
+                let sq = SQBuildParams {
+                    num_bits: *num_bits,
+                    ..Default::default()
+                };
+                Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
                     MetricType::Cosine,
-                    *max_iters,
+                    ivf,
+                    sq,
                 )))
             }
         }
@@ -2879,7 +2884,7 @@ async fn optimize_table_indices(
             }
             IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
             | IndexParamsKind::InvertedFtsWord
-            | IndexParamsKind::IvfPqCosine { .. } => {
+            | IndexParamsKind::IvfSqCosine { .. } => {
                 append_indices.push(intent.name.to_owned());
             }
             IndexParamsKind::Scalar(_) => {

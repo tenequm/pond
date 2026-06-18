@@ -3575,14 +3575,13 @@ fn embedded_scope(filter: &Predicate) -> Predicate {
 /// one object-store read each - the dominant cost of a vector scan on a remote
 /// store. 32 bounds the reads while keeping recall (benchmarked, spec.md#search).
 pub const DEFAULT_NPROBES: usize = 32;
-/// IVF `refine_factor` applied when `[search].refine_factor` is unset: re-rank
-/// `k * factor` PQ candidates against their exact vectors, recovering the
-/// recall PQ quantization loses. A user may set `0` to disable refine.
-pub const DEFAULT_REFINE_FACTOR: u32 = 5;
 
 /// Apply pond's vector-search tuning to a kNN scanner, defaulting any unset
 /// `[search]` knob so a default install never inherits Lance's unbounded
-/// probe-every-partition behavior.
+/// probe-every-partition behavior. No refine: IVF_SQ's per-dimension codes are
+/// precise enough to rank from the prewarmed partition, so pond never re-reads
+/// exact vectors from the data files (the remote-store GET storm PQ+refine
+/// incurred). `[search].refine_factor` is therefore intentionally ignored.
 fn apply_vector_search_knobs(
     scanner: &mut lance::dataset::scanner::Scanner,
     search: Option<&config::SearchConfig>,
@@ -3591,14 +3590,6 @@ fn apply_vector_search_knobs(
         .and_then(|cfg| cfg.nprobes)
         .unwrap_or(DEFAULT_NPROBES);
     scanner.nprobes(nprobes);
-    let refine = search
-        .and_then(|cfg| cfg.refine_factor)
-        .unwrap_or(DEFAULT_REFINE_FACTOR);
-    // refine(0) is rejected by Lance ("Refine factor cannot be zero"); treat a
-    // configured 0 as "no refine".
-    if refine > 0 {
-        scanner.refine(refine);
-    }
 }
 
 // Bare logical table names: the lance-namespace Directory impl owns the
@@ -3612,18 +3603,18 @@ pub(crate) const PARTS: &str = "parts";
 /// creation name the same index.
 pub const MESSAGES_FTS_INDEX: &str = "messages_search_text_fts";
 
-/// IVF_PQ index name on `messages.vector` (spec.md#search). Stable so the
-/// activation check and index creation name the same index.
+/// IVF_SQ index name on `messages.vector` (spec.md#search). Stable so the
+/// activation check and index creation name the same index. The literal keeps
+/// the `_ivfpq` suffix so the index rebuilds in place rather than orphaning the
+/// old segment under a renamed intent.
 pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 
-/// IVF_PQ tuning constants (spec.md#search):
-/// - num_bits = 8 (256 centroids per PQ subspace; needs >= 256 vectors)
-/// - sub_vectors = embedding_dim / 8 (8-float PQ subspaces)
+/// IVF_SQ tuning constants (spec.md#search):
+/// - num_bits = 8 (per-dimension scalar quantization)
 /// - max_iters = 15 (kmeans cap)
 /// - cosine metric (e5 vectors are L2-normalized)
-const IVF_PQ_NUM_BITS: u8 = 8;
-const IVF_PQ_SUB_VECTOR_STRIDE: usize = 8;
-const IVF_PQ_MAX_ITERS: usize = 15;
+const IVF_SQ_NUM_BITS: u16 = 8;
+const IVF_SQ_MAX_ITERS: usize = 15;
 
 /// Pond's production IndexIntents: the per-table intent set
 /// `Store::open_with_options` registers with the substrate.
@@ -3657,10 +3648,9 @@ pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) 
             column: "vector",
             threshold: vector_threshold,
         },
-        params: IndexParamsKind::IvfPqCosine {
-            sub_vectors: embedding_dim() / IVF_PQ_SUB_VECTOR_STRIDE,
-            num_bits: IVF_PQ_NUM_BITS,
-            max_iters: IVF_PQ_MAX_ITERS,
+        params: IndexParamsKind::IvfSqCosine {
+            num_bits: IVF_SQ_NUM_BITS,
+            max_iters: IVF_SQ_MAX_ITERS,
         },
     });
     let parts = PARTS_SCALAR_INDICES
