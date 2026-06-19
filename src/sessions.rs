@@ -255,12 +255,16 @@ pub struct RowTotals {
 /// Embedding coverage for `pond status` / `pond optimize`. `total` is the count of
 /// `messages` rows that carry `search_text` (i.e. are eligible to embed); rows
 /// without `search_text` produce no vector. `embedded` is the subset of those
-/// already carrying a vector under the current [`embed::model_id()`]. The pending
-/// backlog is `total - embedded`.
+/// already carrying a vector under the current [`embed::model_id()`]. `backlog`
+/// is the authoritative count still owed an embedding (`total - embedded` by
+/// construction), read live from the dataset rather than derived by subtracting
+/// the FTS `num_docs`, which over-counts deleted-but-unpurged docs and would
+/// otherwise report a phantom backlog that never clears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingProgress {
     pub embedded: usize,
     pub total: usize,
+    pub backlog: usize,
     pub model: &'static str,
 }
 
@@ -1577,6 +1581,39 @@ impl Store {
         self.handle.collect_ids(table).await
     }
 
+    /// Stream `table`'s `id` column and return `(rows_scanned, rows whose id is
+    /// absent from `present`)`. Streaming means the scanned side is never
+    /// materialized into a set, so a verify holds only the `present` (other)
+    /// side per table instead of both.
+    pub async fn id_diff_against(
+        &self,
+        table: Table,
+        present: &std::collections::HashSet<String>,
+    ) -> Result<(usize, usize)> {
+        let scanner = self
+            .handle
+            .scan(table, ScanOpts::project_only(&["id"]))
+            .await?;
+        let mut stream = scanner.try_into_stream().await?;
+        let (mut rows, mut absent) = (0usize, 0usize);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let ids = batch
+                .column_by_name("id")
+                .context("scan projection dropped the id column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("id column is not Utf8")?;
+            for id in ids.iter().flatten() {
+                rows += 1;
+                if !present.contains(id) {
+                    absent += 1;
+                }
+            }
+        }
+        Ok((rows, absent))
+    }
+
     /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
     /// DataFusion `LanceTableProvider` in `pond_sql_query`. Goes through the
     /// handle's freshness gate, so each query sees a current snapshot.
@@ -2581,22 +2618,17 @@ impl Store {
         let embedded = dataset
             .count_rows(Some(Predicate::IsNotNull("embedding_model").to_lance()))
             .await?;
-        // `total` (eligible = non-null search_text) reads the FTS index's
-        // num_docs instead of a ~133 MB search_text column scan (same trick as
-        // `searchable_in_scope`). num_docs counts indexed docs, which can
-        // briefly lag the true non-null count while the FTS index catches up, so
-        // floor it at `embedded` to keep progress <= 100%. No FTS index => scan.
-        let total = match self.fts_num_docs().await? {
-            Some(indexed) => indexed.max(embedded),
-            None => {
-                dataset
-                    .count_rows(Some(Predicate::IsNotNull("search_text").to_lance()))
-                    .await?
-            }
-        };
+        // `backlog` and `total` come from live, deletion-aware counts, not the
+        // FTS `num_docs`: num_docs counts indexed docs incl. deleted-but-unpurged
+        // ones, so `num_docs - embedded` reports a phantom backlog that survives
+        // every embed. `embedded` (model present) + `backlog` (model absent,
+        // search_text present) is exactly the live eligible set, since embedding
+        // a row requires its search_text.
+        let backlog = self.embed_backlog_count().await?;
         Ok(EmbeddingProgress {
             embedded,
-            total,
+            total: embedded + backlog,
+            backlog,
             model: embed::model_id(),
         })
     }
@@ -6327,17 +6359,23 @@ mod tests {
         let before = store.embedding_progress().await?;
         assert_eq!(before.embedded, 0);
         assert_eq!(before.total, 10);
+        assert_eq!(before.backlog, 10);
         assert_eq!(before.model, crate::embed::model_id());
 
         store.write_embeddings(&embedded(&keys[..4])).await?;
         let partial = store.embedding_progress().await?;
         assert_eq!(partial.embedded, 4);
         assert_eq!(partial.total, 10);
+        assert_eq!(partial.backlog, 6);
 
         store.write_embeddings(&embedded(&keys[4..])).await?;
         let full = store.embedding_progress().await?;
         assert_eq!(full.embedded, 10);
         assert_eq!(full.total, 10);
+        // The pending signal is the live un-embedded count and matches the
+        // authoritative backlog - never derived from FTS num_docs.
+        assert_eq!(full.backlog, 0);
+        assert_eq!(full.backlog, store.embed_backlog_count().await?);
         Ok(())
     }
 

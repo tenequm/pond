@@ -374,6 +374,14 @@ pub fn valid_creds_set_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// The rejection message for a name that fails [`valid_creds_set_name`], shared
+/// by config validation and `pond creds` so the rule and its wording never drift.
+pub fn creds_set_name_error(name: &str) -> String {
+    format!(
+        "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
+    )
+}
+
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
 /// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
 /// optional - `None` lets `pond::substrate` pick the backend-aware default
@@ -550,9 +558,7 @@ impl Config {
         let mut scopes: BTreeMap<String, &str> = BTreeMap::new();
         for (name, set) in &self.creds {
             if !valid_creds_set_name(name) {
-                bail!(
-                    "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
-                );
+                bail!(creds_set_name_error(name));
             }
             if set.access_key_id.is_some() && set.access_key_id_file.is_some() {
                 bail!("[creds.{name}] sets both access_key_id and access_key_id_file; pick one");

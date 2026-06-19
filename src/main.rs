@@ -2311,9 +2311,7 @@ fn creds_add(
             .context("credential prompt failed; nothing written")?,
     };
     if !config::valid_creds_set_name(&name) {
-        bail!(
-            "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
-        );
+        bail!(config::creds_set_name_error(&name));
     }
 
     // Replacing an existing set (rotating keys) is legitimate, but it overwrites
@@ -2812,30 +2810,30 @@ struct VerifyOutcome {
 /// `pond copy`'s closing check and `pond copy --verify-only`.
 async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify> {
     use substrate::Table;
-    // One fan-out over both stores x three tables, not three sequential
-    // round-trip pairs - on a remote backend that is 3x fewer round-trip waits.
-    let (s_from, s_to, m_from, m_to, p_from, p_to, dest_index_status, dest_embedding) = tokio::try_join!(
-        from.collect_ids(Table::Sessions),
-        to.collect_ids(Table::Sessions),
-        from.collect_ids(Table::Messages),
-        to.collect_ids(Table::Messages),
-        from.collect_ids(Table::Parts),
-        to.collect_ids(Table::Parts),
+    // Per table, materialize only the destination id set and stream the source
+    // ids against it (the source side is never held as a set) - half the peak
+    // memory of holding both sides for all three tables, which matters on a
+    // multi-million-row store. The three tables still verify concurrently, so
+    // the remote round-trip parallelism is preserved. Counts are per source row
+    // (bare `id` is not unique - it repeats across the composite pk), matching
+    // this function's per-row contract; `missing == 0` is identical either way.
+    let verify_table = |table: Table| async move {
+        let dest = to.collect_ids(table).await?;
+        let (source_rows, missing) = from.id_diff_against(table, &dest).await?;
+        anyhow::Ok(TableVerify {
+            table,
+            source_rows,
+            missing,
+        })
+    };
+    let (sessions, messages, parts, dest_index_status, dest_embedding) = tokio::try_join!(
+        verify_table(Table::Sessions),
+        verify_table(Table::Messages),
+        verify_table(Table::Parts),
         to.index_status(),
         to.embedding_progress(),
     )?;
-    let tables = [
-        (Table::Sessions, s_from, s_to),
-        (Table::Messages, m_from, m_to),
-        (Table::Parts, p_from, p_to),
-    ]
-    .into_iter()
-    .map(|(table, source, dest)| TableVerify {
-        table,
-        source_rows: source.len(),
-        missing: source.difference(&dest).count(),
-    })
-    .collect();
+    let tables = vec![sessions, messages, parts];
     let fts_present = dest_index_status
         .iter()
         .any(|status| status.intent_name == MESSAGES_FTS_INDEX && status.exists);
@@ -3018,9 +3016,18 @@ async fn run_import_stage(
         watermarks = store.session_last_ingested_at().await?;
         &watermarks
     };
+    // One MultiProgress owns every adapter's bar as a single continuously
+    // redrawn block: on a terminal resize it desyncs for at most one tick and
+    // then repaints, instead of leaving each independently-finished bar rotting
+    // in scrollback. `stderr_with_hz(8)` lowers the redraw rate so reflows have
+    // time to settle. Scroll-back lines go through `mp.println` so they land
+    // above the live block.
+    let mp = indicatif::MultiProgress::with_draw_target(
+        indicatif::ProgressDrawTarget::stderr_with_hz(8),
+    );
     let mut total = IngestSummary::default();
     for (name, blob) in adapters {
-        let summary = sync_with_progress(store, &name, blob, oracle).await?;
+        let summary = sync_with_progress(store, &mp, &name, blob, oracle).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -3073,12 +3080,10 @@ async fn run_embed_stage_with_limit(
         Some(bar_total as u64),
         indicatif::ProgressDrawTarget::stderr_with_hz(8),
     );
+    // `{wide_msg}`-only: the full line (built in the progress callback) rides
+    // the one template segment indicatif truncates to width, so it never wraps.
     bar.set_style(
-        ProgressStyle::with_template(
-            "semantic embedding [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-"),
+        ProgressStyle::with_template("{wide_msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     bar.enable_steady_tick(Duration::from_millis(120));
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3097,10 +3102,16 @@ async fn run_embed_stage_with_limit(
     let mut worker = EmbedWorker::new(store, &embedder)
         .with_cancel(cancel)
         .with_progress(move |progress: BatchProgress| {
+            let pos = progress.total_messages as u64;
+            let len = bar_for_callback.length().unwrap_or(0);
             let secs = started.elapsed().as_secs_f64().max(0.001);
             let rate = progress.total_messages as f64 / secs;
-            bar_for_callback.set_position(progress.total_messages as u64);
-            bar_for_callback.set_message(format!("{rate:.0} msgs/s"));
+            bar_for_callback.set_position(pos);
+            bar_for_callback.set_message(format!(
+                "semantic embedding [{}] [{}] {pos}/{len} messages  {rate:.0} msgs/s",
+                elapsed_hms(started.elapsed()),
+                progress_glyphs(pos, len, 24),
+            ));
         });
     if force {
         worker = worker.include_stale();
@@ -3429,6 +3440,7 @@ fn resolve_sync_adapters(
 /// one greppable log line per finished (or skipped) session.
 async fn sync_with_progress(
     store: &Store,
+    mp: &indicatif::MultiProgress,
     name: &str,
     config: Value,
     oracle: &dyn pond::adapter::SkipOracle,
@@ -3441,23 +3453,16 @@ async fn sync_with_progress(
     })?;
     let adapter = factory.open(config)?;
 
-    // `stderr_with_hz(8)` (indicatif 0.18.4) lowers the redraw rate from the
-    // 20Hz default so SIGWINCH-triggered terminal reflows have time to
-    // settle between renders. `{wide_msg}` truncates the (variable-length)
-    // message instead of wrapping past the column count, which would leave
-    // the previous render's tail orphaned in scrollback when the user
-    // resizes mid-run (indicatif#144, #695, microsoft/terminal#6932).
-    let bar =
-        ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
+    // Template is `{wide_msg}`-only and the whole status line is built into the
+    // message (see `sync_status_line`): `{wide_msg}` is the one segment
+    // indicatif truncates to width, so every line is exactly one terminal row
+    // and never wraps. The bar is owned by the shared `MultiProgress`, which
+    // redraws all adapter bars as one block.
+    let bar = mp.add(ProgressBar::new(0));
     bar.set_style(
-        ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} sessions  {wide_msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-"),
+        ProgressStyle::with_template("{wide_msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
-    // Pad to the widest adapter name so stacked bars align.
-    bar.set_prefix(format!("{name:<12}"));
+    bar.set_message(sync_status_line(name, 0, 0, Duration::ZERO, "starting..."));
     bar.enable_steady_tick(Duration::from_millis(250));
 
     let mut messages: u64 = 0;
@@ -3536,7 +3541,7 @@ async fn sync_with_progress(
                 outcome.status,
                 SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
             ) {
-                bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
+                let _ = mp.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
             }
             match optional_reason.as_deref() {
                 None => tracing::info!(
@@ -3565,11 +3570,13 @@ async fn sync_with_progress(
                 // Empty already shrunk `len`; ticking `pos` would over-count.
                 bar_ref.inc(1);
             }
-            bar_ref.set_message(format_bar_message(
-                messages,
-                drops,
-                errors,
+            let tail = format_bar_message(messages, drops, errors, started.elapsed());
+            bar_ref.set_message(sync_status_line(
+                name,
+                bar_ref.position(),
+                bar_ref.length().unwrap_or(0),
                 started.elapsed(),
+                &tail,
             ));
         }
         SyncEvent::SkippedBulk { status, count } => {
@@ -3580,18 +3587,27 @@ async fn sync_with_progress(
                 }
                 _ => bar_ref.inc(count as u64),
             }
-            bar_ref.set_message(format_bar_message(
-                messages,
-                drops,
-                errors,
+            let tail = format_bar_message(messages, drops, errors, started.elapsed());
+            bar_ref.set_message(sync_status_line(
+                name,
+                bar_ref.position(),
+                bar_ref.length().unwrap_or(0),
                 started.elapsed(),
+                &tail,
             ));
         }
     })
     .await?;
 
     let tail = format_sync_outcome(&summary, drops, errors);
-    bar.finish_with_message(tail);
+    let final_line = sync_status_line(
+        name,
+        bar.position(),
+        bar.length().unwrap_or(0),
+        started.elapsed(),
+        &tail,
+    );
+    bar.finish_with_message(final_line);
     Ok(summary)
 }
 
@@ -3673,6 +3689,45 @@ fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration)
         out.push_str(&format!("  {} err", format_thousands(errors)));
     }
     out
+}
+
+/// `HH:MM:SS`, matching indicatif's `{elapsed_precise}` key.
+fn elapsed_hms(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// An uncolored `#`/`-` progress bar of `width` cells. pond's templates never
+/// styled `{bar}` (no `.cyan/blue`), so rendering the glyphs by hand is visually
+/// identical - and lets the whole status line ride `{wide_msg}`, the only
+/// template segment indicatif truncates to the terminal width. Fixed template
+/// text cannot shrink, so it wraps on a narrow or resized terminal; combined
+/// with finished bars frozen in scrollback, that corrupts the render until the
+/// run ends. A single-row line removes wrapping as a variable entirely.
+fn progress_glyphs(pos: u64, len: u64, width: usize) -> String {
+    let filled = if len == 0 {
+        0
+    } else {
+        ((u128::from(pos.min(len)) * width as u128) / u128::from(len)) as usize
+    };
+    (0..width)
+        .map(|cell| if cell < filled { '#' } else { '-' })
+        .collect()
+}
+
+/// One single-row sync line built whole, pushed through a `{wide_msg}`-only
+/// template so it is always exactly one terminal row regardless of width.
+fn sync_status_line(name: &str, pos: u64, len: u64, elapsed: Duration, tail: &str) -> String {
+    format!(
+        "sync {name:<12} [{}] [{}] {pos}/{len} sessions  {tail}",
+        elapsed_hms(elapsed),
+        progress_glyphs(pos, len, 12),
+    )
 }
 
 /// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
@@ -3873,6 +3928,7 @@ fn status_json(
         serde_json::json!({
             "embedded": e.embedded,
             "eligible": e.total,
+            "backlog": e.backlog,
         })
     });
     let doc = serde_json::json!({
@@ -4072,11 +4128,14 @@ fn classify_index_health(
     // unindexed-fragments check passes. Without the embedding probe (default
     // `pond status`), this correction is skipped: the IVF_SQ fragment-lag
     // check still flags indexed-but-unfolded rows; only unembedded ones hide.
-    if let Some(progress) = embedding {
-        let embed_backlog = progress.total.saturating_sub(progress.embedded);
-        if embed_backlog > 0 && matches!(semantic, Ready) {
-            semantic = Pending(embed_backlog as u64);
-        }
+    // `backlog` is the live un-embedded count, not `total - embedded`: the
+    // latter mixed the FTS `num_docs` (over-counts deleted docs) with a live
+    // row count and reported a phantom pending that never cleared.
+    if let Some(progress) = embedding
+        && progress.backlog > 0
+        && matches!(semantic, Ready)
+    {
+        semantic = Pending(progress.backlog as u64);
     }
     IndexHealth { text, semantic }
 }
