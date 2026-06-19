@@ -234,8 +234,8 @@ pub async fn run(
         vec![displayable(&RecordBatch::new_empty(result_schema)).map_err(infra)?]
     } else {
         collected
-            .iter()
-            .map(displayable)
+            .into_iter()
+            .map(|batch| displayable(&batch))
             .collect::<Result<_, _>>()
             .map_err(infra)?
     };
