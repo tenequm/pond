@@ -881,6 +881,10 @@ async fn main() -> Result<()> {
     store.ensure_rowmap(cache.path()).await?;
     let build_ms = t.elapsed().as_millis();
     thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+    println!(
+        "[probe] lance cache after build: {:.1} MiB",
+        store.lance_cache_bytes() as f64 / 1024.0 / 1024.0
+    );
     let rmm_mib = rowmap_file_bytes(cache.path()) as f64 / 1024.0 / 1024.0;
     let rss_delta = sampler.current_kb().saturating_sub(rss_before) as f64 / 1024.0;
     let pf_delta = sampler.current_pf_kb().saturating_sub(pf_before) as f64 / 1024.0;
@@ -1229,6 +1233,10 @@ async fn main() -> Result<()> {
         // Drop the embedder to simulate `pond mcp`'s idle-unload of the candle
         // model; the resident cache (mmap) stays. This is the resting floor a
         // server settles to between bursts - pond's own footprint, model gone.
+        println!(
+            "[probe] lance cache at idle: {:.1} MiB",
+            store.lance_cache_bytes() as f64 / 1024.0 / 1024.0
+        );
         drop(embedder);
         sampler.mark_phase_start();
         let rss_start_kb = sampler.current_kb();

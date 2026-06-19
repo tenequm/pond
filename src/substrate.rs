@@ -1686,6 +1686,12 @@ impl Handle {
         Self::open_with_options(location, HashMap::new(), RuntimeCaps::default()).await
     }
 
+    /// Live size in bytes of the shared Lance session caches (index + metadata).
+    /// Walks the caches, so it is not cheap - bench/diagnostic use only.
+    pub fn lance_cache_bytes(&self) -> u64 {
+        self.session.size_bytes()
+    }
+
     /// Open with object-store options handed through to Lance verbatim, plus
     /// the resolved `[runtime]` cache caps. Object-store keys are the
     /// `object_store` crate's standard config names; pond does not parse them.

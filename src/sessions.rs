@@ -284,6 +284,12 @@ impl Store {
         })
     }
 
+    /// Live byte size of the shared Lance session caches (index + metadata).
+    /// Diagnostic only - walks the caches.
+    pub fn lance_cache_bytes(&self) -> u64 {
+        self.handle.lance_cache_bytes()
+    }
+
     /// Open with object-store options (S3 creds, region, endpoint, ...)
     /// threaded through Lance verbatim. Keys are the standard `object_store`
     /// config names; pond does not parse them. Empty options + default caps
