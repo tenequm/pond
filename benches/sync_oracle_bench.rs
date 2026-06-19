@@ -128,7 +128,7 @@ async fn fetch_tables(store: &Store) -> Result<Tables> {
 /// uses. Returns the row count from the result; the inline rendering cost is
 /// kept tiny by passing `inline_rows = 0`.
 async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
-    let outcome = pond::sql::run(tables, sql, Mode::InlineJson, 0)
+    let outcome = pond::sql::run(tables, sql, Mode::Export(pond::sql::Format::Ndjson), 0)
         .await
         .map_err(|err| match err {
             pond::sql::SqlError::Query(msg) => anyhow::anyhow!("query: {msg}"),
@@ -136,9 +136,6 @@ async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
         })?;
     let count = match outcome {
         Outcome::Inline(_) => 0,
-        Outcome::InlineJson(doc) => {
-            doc.get("total_rows").and_then(|v| v.as_u64()).unwrap_or(0) as usize
-        }
         Outcome::Export { rows, .. } => rows,
     };
     Ok(count)

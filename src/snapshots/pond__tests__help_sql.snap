@@ -1,5 +1,6 @@
 ---
 source: src/main.rs
+assertion_line: 4791
 expression: sub.render_long_help().to_string()
 ---
 Run one read-only SQL query over the corpus.
@@ -14,18 +15,18 @@ Arguments:
 
 Options:
       --format <FORMAT>
-          Output format. text/json/ndjson go to stdout; parquet requires `--output-file` (binary)
+          Output format. text/ndjson go to stdout; parquet requires `--output-file` (binary). ndjson is the machine-readable JSON path
           
           [default: text]
-          [possible values: text, json, ndjson, parquet]
+          [possible values: text, ndjson, parquet]
 
       --limit <LIMIT>
-          Inline row cap for text/json output. Default 100, max 1000. Ignored for ndjson/parquet (which return every row)
+          Inline row cap for text output. Default 100, max 1000. Ignored for ndjson/parquet (which return every row)
           
           [default: 100]
 
   -o, --output-file <OUTPUT_FILE>
-          Write the export bytes here instead of stdout (required for `--format parquet`; optional for ndjson). Ignored for text/json
+          Write the export bytes here instead of stdout (required for `--format parquet`; optional for ndjson). Ignored for text
 
   -h, --help
           Print help (see a summary with '-h')

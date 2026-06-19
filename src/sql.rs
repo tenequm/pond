@@ -45,7 +45,6 @@ use lance_datafusion::udf::register_functions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::parser::from_json;
 use parquet::arrow::ArrowWriter;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 /// Per-query memory ceiling for the DataFusion runtime. Not enforced on every
 /// operator (datafusion caveat), so the timeout below is the hard backstop.
@@ -92,13 +91,6 @@ impl Format {
 pub enum Mode {
     /// Render a row-capped table into the tool result.
     Inline,
-    /// Return a row-capped JSON payload; the MCP layer surfaces it through
-    /// `structuredContent` (with a stringified text fallback for clients that
-    /// do not surface the structured channel). Empirically validated on Claude
-    /// Code 2.1.165: when both channels carry the same payload, the agent reads
-    /// the structured one and the text block is a soft-landing for other
-    /// clients (spec 2025-11-25 server SHOULD).
-    InlineJson,
     /// Write the full result to a file and return a `pond-sql-export://` link.
     Export(Format),
 }
@@ -130,9 +122,6 @@ pub fn mentions_table(sql: &str, table: &str) -> bool {
 pub enum Outcome {
     /// A rendered, row-capped table (already includes the metrics footer).
     Inline(String),
-    /// A row-capped JSON payload with metadata fields (`total_rows`,
-    /// `shown_rows`, `truncated`, `elapsed_ms`, `columns`, `rows`).
-    InlineJson(JsonValue),
     /// Encoded export bytes plus metadata for the caller's summary/resource.
     Export {
         bytes: Vec<u8>,
@@ -255,11 +244,6 @@ pub async fn run(
         Mode::Inline => Ok(Outcome::Inline(
             render_inline(&display, inline_rows, elapsed).map_err(infra)?,
         )),
-        Mode::InlineJson => Ok(Outcome::InlineJson(render_inline_json(
-            &display,
-            inline_rows,
-            elapsed,
-        )?)),
         Mode::Export(format) => {
             let rows = display.iter().map(RecordBatch::num_rows).sum();
             let columns = display
@@ -1216,101 +1200,6 @@ fn render_inline(
         ));
     }
     Ok(out)
-}
-
-/// JSON sibling of `render_inline`: same row cap and byte-budget shrinking,
-/// returned as a `JsonValue` so the MCP layer can hand it to
-/// `CallToolResult::structured` (text fallback + structured channel in one
-/// call, see [`Mode::InlineJson`]).
-fn render_inline_json(
-    display: &[RecordBatch],
-    max_rows: usize,
-    elapsed: Duration,
-) -> Result<JsonValue, SqlError> {
-    let total: usize = display.iter().map(RecordBatch::num_rows).sum();
-    let columns: Vec<String> = display
-        .first()
-        .map(|batch| {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-
-    if total == 0 {
-        return Ok(json!({
-            "total_rows": 0,
-            "shown_rows": 0,
-            "truncated": false,
-            "elapsed_ms": elapsed_ms,
-            "columns": columns,
-            "rows": [],
-        }));
-    }
-
-    let mut shown = total.min(max_rows);
-    let mut rows = batches_to_json_rows(&limit_batches(display, shown))?;
-    let mut serialized = serde_json::to_string(&rows)
-        .map_err(|error| SqlError::Infra(anyhow!("json serialize: {error}")))?;
-    while serialized.len() > INLINE_BUDGET_BYTES && shown > 1 {
-        shown = (shown / 2).max(1);
-        rows = batches_to_json_rows(&limit_batches(display, shown))?;
-        serialized = serde_json::to_string(&rows)
-            .map_err(|error| SqlError::Infra(anyhow!("json serialize: {error}")))?;
-    }
-
-    let mut payload = JsonMap::new();
-    payload.insert("total_rows".to_owned(), json!(total));
-    payload.insert("shown_rows".to_owned(), json!(shown));
-    payload.insert("truncated".to_owned(), json!(shown < total));
-    payload.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
-    payload.insert("columns".to_owned(), json!(columns));
-    payload.insert("rows".to_owned(), JsonValue::Array(rows));
-    if shown < total {
-        payload.insert(
-            "next_steps".to_owned(),
-            json!(format!(
-                "{} row(s) omitted; ORDER BY + keyset (`WHERE (col, message_id) < \
-                 (<last_col>, <last_message_id>)`) to page, or format=parquet|ndjson for \
-                 the full set. See schema://pond-sql.",
-                total - shown
-            )),
-        );
-    }
-    Ok(JsonValue::Object(payload))
-}
-
-/// Convert RecordBatches to a JSON array of row objects via the existing
-/// NDJSON writer (handles all Arrow types, including the decoded JSON columns
-/// that come out of `displayable`).
-fn batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<JsonValue>, SqlError> {
-    if batches.iter().all(|batch| batch.num_rows() == 0) {
-        return Ok(Vec::new());
-    }
-    let mut buffer = Vec::new();
-    {
-        let mut writer = LineDelimitedWriter::new(&mut buffer);
-        let refs: Vec<&RecordBatch> = batches.iter().collect();
-        writer
-            .write_batches(&refs)
-            .map_err(|error| SqlError::Infra(anyhow!("ndjson encode: {error}")))?;
-        writer
-            .finish()
-            .map_err(|error| SqlError::Infra(anyhow!("ndjson finish: {error}")))?;
-    }
-    let text = String::from_utf8(buffer)
-        .map_err(|error| SqlError::Infra(anyhow!("ndjson not utf-8: {error}")))?;
-    text.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<JsonValue>(line)
-                .map_err(|error| SqlError::Infra(anyhow!("ndjson parse: {error}")))
-        })
-        .collect()
 }
 
 fn limit_batches(batches: &[RecordBatch], max_rows: usize) -> Vec<RecordBatch> {

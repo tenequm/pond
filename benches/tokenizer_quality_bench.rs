@@ -309,13 +309,16 @@ async fn resolve_anchors(store: &Store, queries: &mut [Query]) -> Result<()> {
             let escaped = anchor.replace('\'', "''");
             let sql =
                 format!("SELECT message_id FROM messages WHERE search_text LIKE '%{escaped}%'");
-            match sql::run(&tables, &sql, Mode::InlineJson, 1000).await {
-                Ok(sql::Outcome::InlineJson(json)) => {
-                    if let Some(rows) = json.get("rows").and_then(|r| r.as_array()) {
-                        for row in rows {
-                            if let Some(id) = row.get("message_id").and_then(|v| v.as_str()) {
-                                set.insert(id.to_owned());
-                            }
+            match sql::run(&tables, &sql, Mode::Export(sql::Format::Ndjson), 0).await {
+                Ok(sql::Outcome::Export { bytes, .. }) => {
+                    for line in String::from_utf8_lossy(&bytes).lines() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(row) = serde_json::from_str::<serde_json::Value>(line)
+                            && let Some(id) = row.get("message_id").and_then(|v| v.as_str())
+                        {
+                            set.insert(id.to_owned());
                         }
                     }
                 }

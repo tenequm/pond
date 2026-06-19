@@ -35,10 +35,7 @@ use crate::{
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
         TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{
-        FileData, Message, Part, PartKind, ResponseMode, Role, SUMMARY_PART_TYPES, Session,
-        SessionFrom,
-    },
+    wire::{FileData, Message, Part, PartKind, Role, SUMMARY_PART_TYPES, Session, SessionFrom},
 };
 use url::Url;
 
@@ -1306,12 +1303,14 @@ impl Store {
             .collect())
     }
 
-    /// Whole-session view for `pond_get` session mode (spec.md#protocol).
-    /// Conversational filters to `search_text IS NOT NULL`; Complete and
-    /// Verbatim scan every message. Every mode attaches compact part summaries;
-    /// Verbatim additionally inlines full parts. `after_id` is an exclusive
-    /// lower bound (a message id); the page is bounded by `limit` and a byte
-    /// budget and never cuts mid-message.
+    /// Whole-session view for `pond_get` session scope (spec.md#protocol).
+    /// Always the conversational view (`search_text IS NOT NULL`) with one-line
+    /// part summaries - full part bodies are reached by `message_id` scope, not
+    /// here. The page is the window selected by the anchors (`after_message_id`
+    /// pages forward, `before_message_id` pages backward) or, with neither,
+    /// `session_from` (start/end); it is bounded by `limit` and a byte budget,
+    /// never cutting mid-message. `before_remaining`/`after_remaining` drive the
+    /// bidirectional page markers.
     pub async fn session_view(
         &self,
         session_id: &str,
@@ -1320,72 +1319,55 @@ impl Store {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        let mut rows = match params.mode {
-            ResponseMode::Conversational => self
-                .scan_conversational_messages(session_id)
-                .await?
-                .into_iter()
-                .map(|row| ScanRow {
-                    id: row.message_id,
-                    role: row.role,
-                    timestamp: row.timestamp,
-                    text: Some(row.text.into_inner()),
-                    content: None,
-                })
-                .collect(),
-            ResponseMode::Complete | ResponseMode::Verbatim => {
-                self.scan_all_messages(session_id).await?
-            }
-        };
+        let mut rows: Vec<ScanRow> = self
+            .scan_conversational_messages(session_id)
+            .await?
+            .into_iter()
+            .map(|row| ScanRow {
+                id: row.message_id,
+                role: row.role,
+                timestamp: row.timestamp,
+                text: Some(row.text.into_inner()),
+                content: None,
+            })
+            .collect();
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
 
-        let start_at = match params.after_id {
-            // Append-only stream: a real anchor never vanishes, so an unknown
-            // `after_id` is a stale/mistyped client cursor, not "start over".
-            Some(after) => match rows.iter().position(|row| row.id == after) {
-                Some(idx) => idx + 1,
-                None => return Ok(GetLookup::UnknownAfterId),
-            },
-            None => 0,
-        };
-        let remaining = rows.get(start_at..).unwrap_or(&[]);
-        let (emitted, messages_remaining) = match params.session_from {
-            SessionFrom::Start => {
-                let n = page_by(remaining, params.limit, params.budget_bytes, |row| {
-                    row.text.as_deref().map_or(0, str::len)
-                });
-                (&remaining[..n], remaining.len() - n)
+        let size = |row: &ScanRow| row.text.as_deref().map_or(0, str::len);
+        let total = rows.len();
+        // Append-only stream: a real anchor never vanishes, so an unknown
+        // anchor is a stale/mistyped client cursor, not "start over".
+        let (win_start, win_end) = match (params.after_message_id, params.before_message_id) {
+            (Some(after), _) => {
+                let pos = match rows.iter().position(|row| row.id == after) {
+                    Some(idx) => idx + 1,
+                    None => return Ok(GetLookup::UnknownAnchor),
+                };
+                let n = page_by(&rows[pos..], params.limit, params.budget_bytes, size);
+                (pos, pos + n)
             }
-            // Tail: the newest messages that fit `limit` and the byte budget,
-            // dropping oldest first; the newest is always kept and the page
-            // stays chronological so the agent reads the flow forward.
-            SessionFrom::End => {
-                let mut bytes = 0usize;
-                let mut start = remaining.len();
-                for row in remaining.iter().rev() {
-                    if remaining.len() - start >= params.limit {
-                        break;
-                    }
-                    let size = row.text.as_deref().map_or(0, str::len);
-                    if start < remaining.len() && bytes + size > params.budget_bytes {
-                        break;
-                    }
-                    bytes += size;
-                    start -= 1;
+            (None, Some(before)) => {
+                let pos = match rows.iter().position(|row| row.id == before) {
+                    Some(idx) => idx,
+                    None => return Ok(GetLookup::UnknownAnchor),
+                };
+                let n = page_tail(&rows[..pos], params.limit, params.budget_bytes, size);
+                (pos - n, pos)
+            }
+            (None, None) => match params.session_from {
+                SessionFrom::Start => (0, page_by(&rows, params.limit, params.budget_bytes, size)),
+                SessionFrom::End => {
+                    let n = page_tail(&rows, params.limit, params.budget_bytes, size);
+                    (total - n, total)
                 }
-                (&remaining[start..], start)
-            }
+            },
         };
+        let emitted = &rows[win_start..win_end];
+        let before_remaining = win_start;
+        let after_remaining = total - win_end;
         let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
 
-        // Conversational/Complete only summarize parts; Verbatim inlines every
-        // part (blobs included).
-        let mut parts_by_message = match params.mode {
-            ResponseMode::Verbatim => self.parts_for_messages(session_id, &ids).await?,
-            ResponseMode::Conversational | ResponseMode::Complete => {
-                self.summary_parts_for_messages(session_id, &ids).await?
-            }
-        };
+        let mut parts_by_message = self.summary_parts_for_messages(session_id, &ids).await?;
         let messages = emitted
             .iter()
             .map(|row| RetrievedMessage {
@@ -1403,19 +1385,20 @@ impl Store {
         Ok(GetLookup::Found(SessionPage {
             session,
             messages,
-            messages_remaining,
+            before_remaining,
+            after_remaining,
         }))
     }
 
-    /// Message-scope retrieval for `pond_get` message mode (spec.md#protocol):
-    /// the target with its full parts (paginated by `after_id` over part
-    /// ordinals, then budget) plus up to `2*context_depth` siblings around it.
-    /// `None` when no stored message carries `message_id`. Sibling parts are
-    /// carried for summarizing; the target's parts ride `target_parts`.
+    /// Message-scope retrieval for `pond_get` message scope (spec.md#protocol):
+    /// the target with its full parts (budget-bounded) plus `context_before`
+    /// conversational siblings before and `context_after` after it. `NotFound`
+    /// when no stored message carries `message_id`. Sibling parts are carried
+    /// for summarizing; the target's parts ride `target_parts`.
     pub async fn message_view(
         &self,
         message_id: &str,
-        params: MessageViewParams<'_>,
+        params: MessageViewParams,
     ) -> Result<GetLookup<MessagePage>> {
         let Some(session_id) = self.session_id_for_message(message_id).await? else {
             return Ok(GetLookup::NotFound);
@@ -1424,21 +1407,18 @@ impl Store {
             return Ok(GetLookup::NotFound);
         };
         let mut rows = self.scan_all_messages(&session_id).await?;
-        // spec.md#protocol: context siblings follow the response mode, and the
-        // default is the conversational view - in carrier-heavy sessions the
-        // system/tool rows would otherwise fill the whole +-depth window and
-        // push the actual conversation out of it. The target stays regardless
-        // of its own role: the caller asked for that message.
-        if matches!(params.mode, ResponseMode::Conversational) {
-            rows.retain(|row| row.text.is_some() || row.id == message_id);
-        }
+        // Siblings are always the conversational view: in carrier-heavy sessions
+        // the system/tool rows would otherwise fill the whole window and push
+        // the actual conversation out of it. The target stays regardless of its
+        // own role - the caller asked for that message.
+        rows.retain(|row| row.text.is_some() || row.id == message_id);
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         let Some(target_pos) = rows.iter().position(|row| row.id == message_id) else {
             return Ok(GetLookup::NotFound);
         };
 
-        let start = target_pos.saturating_sub(params.context_depth);
-        let end = (target_pos + params.context_depth + 1).min(rows.len());
+        let start = target_pos.saturating_sub(params.context_before);
+        let end = (target_pos + params.context_after + 1).min(rows.len());
         let window = &rows[start..end];
         let window_ids: Vec<String> = window.iter().map(|row| row.id.clone()).collect();
         // The target's full parts (blobs included) ride the response; siblings
@@ -1448,25 +1428,13 @@ impl Store {
         let all_parts = parts_by_message
             .remove(&(session_id.clone(), message_id.to_owned()))
             .unwrap_or_default();
-        let start_part = match params.after_id {
-            // Exclusive over ordinals: parts are ordinal-sorted, so the first
-            // part past the anchor's ordinal is the page start. An anchor absent
-            // from the target's parts is a stale/mistyped client cursor.
-            Some(after) => match all_parts.iter().find(|part| part.id == after) {
-                Some(anchor) => all_parts
-                    .iter()
-                    .position(|part| part.ordinal > anchor.ordinal)
-                    .unwrap_or(all_parts.len()),
-                None => return Ok(GetLookup::UnknownAfterId),
-            },
-            None => 0,
-        };
-        let remaining_parts = all_parts.get(start_part..).unwrap_or(&[]);
-        let part_count = page_by(remaining_parts, params.limit, params.budget_bytes, |part| {
+        // Target parts are budget-bounded (no per-part pagination cursor). The
+        // 1000 cap is the page_by hard ceiling; the budget is the real bound.
+        let part_count = page_by(&all_parts, 1000, params.budget_bytes, |part| {
             serde_json::to_string(part).map_or(0, |json| json.len())
         });
-        let target_parts = remaining_parts[..part_count].to_vec();
-        let target_parts_remaining = remaining_parts.len() - part_count;
+        let target_parts = all_parts[..part_count].to_vec();
+        let target_parts_remaining = all_parts.len() - part_count;
 
         let target_row = &rows[target_pos];
         let target = RetrievedMessage {
@@ -1901,11 +1869,9 @@ impl Store {
         };
         // Stable secondary sort: Lance returns tied-BM25-score hits in fragment
         // order, which varies between runs and across calls with different pool
-        // sizes (the hybrid arm's `pool=100` and FTS-only's `limit=20` produce
-        // different orderings at the same tied score). Without an explicit
-        // tiebreak the downstream RRF dedup-rank for a tied target session can
-        // flip session-to-session, making fusion outcomes nondeterministic.
-        // Sort by `score desc`, then `(session_id, message_id)` asc.
+        // sizes. Without an explicit tiebreak the downstream session grouping and
+        // rank for a tied target can flip session-to-session, making results
+        // nondeterministic. Sort by `score desc`, then `(session_id, message_id)` asc.
         hits.sort_by(|left, right| {
             right
                 .score
@@ -2067,7 +2033,7 @@ impl Store {
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
-    /// signal that flips search from FTS-only to hybrid. The single-active-
+    /// signal that lets the `vector` arm run instead of degrading to `fts`. The single-active-
     /// model invariant (see `MESSAGE_SCALAR_INDICES`) means any non-null
     /// vector belongs to the current model.
     pub async fn has_embeddings(&self) -> Result<bool> {
@@ -3747,34 +3713,34 @@ pub struct SessionWithMessages {
 
 #[derive(Debug, Clone)]
 pub struct SessionViewParams<'a> {
-    pub mode: ResponseMode,
-    pub after_id: Option<&'a str>,
+    /// Page forward: messages strictly after this id.
+    pub after_message_id: Option<&'a str>,
+    /// Page backward: messages strictly before this id.
+    pub before_message_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
+    /// First-page end when neither anchor is set.
     pub session_from: SessionFrom,
 }
 
 #[derive(Debug, Clone)]
-pub struct MessageViewParams<'a> {
-    pub context_depth: usize,
-    /// Which siblings fill the context window: conversational (default)
-    /// keeps the window on the human/model exchange; complete/verbatim
-    /// include system/tool carriers.
-    pub mode: ResponseMode,
-    pub after_id: Option<&'a str>,
-    pub limit: usize,
+pub struct MessageViewParams {
+    /// Conversational siblings before the target (`grep -B`).
+    pub context_before: usize,
+    /// Conversational siblings after the target (`grep -A`).
+    pub context_after: usize,
     pub budget_bytes: usize,
 }
 
 /// Outcome of a `pond_get` lookup. Separates a missing target (the handler
-/// maps it to `not_found`) from a stale/unknown `after_id` (mapped to
-/// `validation_failed`): the message/part stream is append-only, so an anchor
-/// that was ever valid never disappears - an unknown one is always a client
-/// error, never a reason to silently restart the page.
+/// maps it to `not_found`) from a stale/unknown pagination anchor (mapped to
+/// `validation_failed`): the message stream is append-only, so an anchor that
+/// was ever valid never disappears - an unknown one is always a client error,
+/// never a reason to silently restart the page.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GetLookup<T> {
     NotFound,
-    UnknownAfterId,
+    UnknownAnchor,
     Found(T),
 }
 
@@ -3785,7 +3751,8 @@ pub enum GetLookup<T> {
 pub struct SessionPage {
     pub session: Session,
     pub messages: Vec<RetrievedMessage>,
-    pub messages_remaining: usize,
+    pub before_remaining: usize,
+    pub after_remaining: usize,
 }
 
 /// Canonical retrieval result for `pond_get` message mode. `target.parts` is
@@ -3839,6 +3806,33 @@ fn page_by<T>(items: &[T], limit: usize, budget_bytes: usize, size: impl Fn(&T) 
     let mut acc = 0usize;
     let mut emitted = 0usize;
     for item in &items[..capped] {
+        let next = acc.saturating_add(size(item));
+        if emitted > 0 && next > budget_bytes {
+            break;
+        }
+        acc = next;
+        emitted += 1;
+    }
+    emitted
+}
+
+/// Like `page_by` but counts from the tail: how many trailing items fit
+/// `limit` and the byte budget, dropping oldest first. The last (newest) item
+/// is always kept, so the returned count is >= 1 for a non-empty slice and the
+/// emitted page (`items[len - n..]`) stays chronological.
+fn page_tail<T>(
+    items: &[T],
+    limit: usize,
+    budget_bytes: usize,
+    size: impl Fn(&T) -> usize,
+) -> usize {
+    let cap = limit.clamp(1, 1000);
+    let mut acc = 0usize;
+    let mut emitted = 0usize;
+    for item in items.iter().rev() {
+        if emitted >= cap {
+            break;
+        }
         let next = acc.saturating_add(size(item));
         if emitted > 0 && next > budget_bytes {
             break;

@@ -29,10 +29,8 @@ use pond::{
     },
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
-        PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
-        SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
-        SessionFrom,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter, SearchEnvelope, SearchFilters,
+        SearchModeWire, SearchRequest, SessionFrom,
     },
 };
 
@@ -98,30 +96,11 @@ impl From<CliSortBy> for wire::SortBy {
     }
 }
 
-/// CLI surface for `pond get --response-mode`. Maps 1:1 to wire `ResponseMode`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliResponseMode {
-    Conversational,
-    Complete,
-    Verbatim,
-}
-
-impl From<CliResponseMode> for ResponseMode {
-    fn from(mode: CliResponseMode) -> Self {
-        match mode {
-            CliResponseMode::Conversational => ResponseMode::Conversational,
-            CliResponseMode::Complete => ResponseMode::Complete,
-            CliResponseMode::Verbatim => ResponseMode::Verbatim,
-        }
-    }
-}
-
 /// CLI surface for `pond sql --format`. Maps to `sql::Mode` / `sql::Format`.
-/// Mirrors the MCP `pond_sql_query` `format` arg (text|json|parquet|ndjson).
+/// Mirrors the MCP `pond_sql_query` `format` arg (text|ndjson|parquet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSqlFormat {
     Text,
-    Json,
     Ndjson,
     Parquet,
 }
@@ -271,7 +250,7 @@ Commands:
 Options:
 {options}{after-help}";
 
-/// Lossless storage and hybrid search for sessions from any AI agent client.
+/// Lossless storage and semantic search for sessions from any AI agent client.
 #[derive(Debug, Parser)]
 #[command(
     name = "pond",
@@ -490,14 +469,15 @@ enum Command {
     },
     /// Fetch a session or message.
     ///
-    /// Returns readable transcripts by id: a whole session (`--session-id`)
-    /// or one message with optional surrounding context (`--message-id`).
-    /// Pagination cursors (`after-id:`) print at the end of truncated output.
+    /// `--session-id` returns the whole session as a conversational transcript
+    /// (user/assistant text + one-line tool/file refs). `--message-id` returns
+    /// that one message with its full parts (tool bodies included) plus
+    /// conversational neighbors. Params are prefixed by scope.
     #[command(after_long_help = "Examples:
   pond get --session-id 58a96901-4a4f-40be-a3c1-62419ec8c580
-  pond get --session-id <ID> --session-from end      most recent messages first
-  pond get --message-id <ID> --context-depth 3       a hit plus its neighbors
-  pond get --session-id <ID> --response-mode verbatim --format json")]
+  pond get --session-id <ID> --session-from end                 most recent messages
+  pond get --session-id <ID> --session-after-message-id <ID>    page down
+  pond get --message-id <ID> --message-context-before 3 --message-context-after 3")]
     #[command(group(ArgGroup::new("get_selector")
         .required(true)
         .args(["session_id", "message_id"])))]
@@ -506,32 +486,18 @@ enum Command {
         /// Fetch an entire session by id. Mutually exclusive with `--message-id`.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Fetch a single message by id. Mutually exclusive with `--session-id`.
+        /// Fetch a single message by id (with its full parts). Mutually
+        /// exclusive with `--session-id`.
         #[arg(long, value_name = "ID")]
         message_id: Option<String>,
         /// Tenant namespace. The personal pond has exactly one; leave at the
         /// default.
         #[arg(long, default_value = "local")]
         namespace: String,
-        /// For `--message-id` mode: include this many sibling messages on each
-        /// side (grep -C style). Ignored in session mode.
-        #[arg(long, default_value_t = 0)]
-        context_depth: usize,
-        /// Cap on returned messages (session mode) or parts (message mode).
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Depth: conversational, complete, or verbatim.
-        ///
-        /// conversational = text + part summaries; complete = all messages +
-        /// summaries; verbatim = full parts inline. With `--message-id` it
-        /// selects which siblings fill the context window.
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = CliResponseMode::Conversational,
-        )]
-        response_mode: CliResponseMode,
-        /// Session mode only: which end to read from.
+        /// Session scope: max messages per page.
+        #[arg(long, default_value_t = 20, conflicts_with = "message_id")]
+        session_limit: usize,
+        /// Session scope: which end to read the first page from.
         ///
         /// start = oldest first (default); end = most recent, e.g. to recover
         /// context after compaction.
@@ -542,10 +508,20 @@ enum Command {
             conflicts_with = "message_id"
         )]
         session_from: CliSessionFrom,
-        /// Continuation anchor from a prior response: last message id (session)
-        /// or last part id (message). Exclusive lower bound.
-        #[arg(long, value_name = "ID")]
-        after_id: Option<String>,
+        /// Session scope: page forward - messages after this id (from a prior
+        /// page's bottom marker).
+        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
+        session_after_message_id: Option<String>,
+        /// Session scope: page backward - messages before this id (from a prior
+        /// page's top marker).
+        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
+        session_before_message_id: Option<String>,
+        /// Message scope: conversational siblings before the target (grep -B).
+        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
+        message_context_before: usize,
+        /// Message scope: conversational siblings after the target (grep -A).
+        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
+        message_context_after: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -564,16 +540,16 @@ enum Command {
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
-        /// Output format. text/json/ndjson go to stdout; parquet requires
-        /// `--output-file` (binary).
+        /// Output format. text/ndjson go to stdout; parquet requires
+        /// `--output-file` (binary). ndjson is the machine-readable JSON path.
         #[arg(long, value_enum, default_value_t = CliSqlFormat::Text)]
         format: CliSqlFormat,
-        /// Inline row cap for text/json output. Default 100, max 1000.
-        /// Ignored for ndjson/parquet (which return every row).
+        /// Inline row cap for text output. Default 100, max 1000. Ignored for
+        /// ndjson/parquet (which return every row).
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Write the export bytes here instead of stdout (required for
-        /// `--format parquet`; optional for ndjson). Ignored for text/json.
+        /// `--format parquet`; optional for ndjson). Ignored for text.
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
     },
@@ -1215,7 +1191,7 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
-            // first `pond_search` tool call that needs hybrid retrieval.
+            // first `pond_search` tool call that runs the vector arm.
             let embedder = Arc::new(LazyEmbedder::candle());
             spawn_prewarm(store.clone());
             transport::mcp::serve_stdio(AppState {
@@ -1262,8 +1238,9 @@ async fn main() -> anyhow::Result<()> {
                 output(&plans)?;
                 return Ok(());
             }
-            let envelope = handlers::pond_search(&store, &embedder, request, &loaded.search).await;
-            if !render_search_envelope(format, &envelope)? {
+            let envelope =
+                handlers::pond_search(&store, &embedder, request.clone(), &loaded.search).await;
+            if !render_search_envelope(format, &envelope, &request)? {
                 std::process::exit(1);
             }
         }
@@ -1271,11 +1248,12 @@ async fn main() -> anyhow::Result<()> {
             session_id,
             message_id,
             namespace,
-            context_depth,
-            limit,
-            response_mode,
+            session_limit,
             session_from,
-            after_id,
+            session_after_message_id,
+            session_before_message_id,
+            message_context_before,
+            message_context_after,
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
@@ -1285,15 +1263,28 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 session_id,
                 message_id,
-                context_depth,
-                limit,
-                response_mode: ResponseMode::from(response_mode),
+                session_limit,
                 session_from: SessionFrom::from(session_from),
-                after_id,
+                session_after_message_id,
+                session_before_message_id,
+                message_context_before,
+                message_context_after,
             };
-            let view_from = request.session_from;
-            let envelope = handlers::pond_get(&store, request).await;
-            if !render_get_envelope(format, &envelope, view_from)? {
+            let envelope = handlers::pond_get(&store, request.clone()).await;
+            // Spawn-only subagents are their own sessions (spec.md#datasets);
+            // surface them on a session's first page so the CLI matches the MCP
+            // transcript. Best-effort: a lookup failure just omits the footer.
+            let mut subagents_footer = String::new();
+            if let GetEnvelope::Success(response) = &envelope
+                && request.message_id.is_none()
+                && request.session_after_message_id.is_none()
+                && request.session_before_message_id.is_none()
+                && let Ok(children) = store.child_sessions(&response.session.id).await
+                && !children.is_empty()
+            {
+                subagents_footer = pond::render::render_subagents_footer(&children);
+            }
+            if !render_get_envelope(format, &envelope, &request, &subagents_footer)? {
                 std::process::exit(1);
             }
         }
@@ -1333,7 +1324,6 @@ async fn main() -> anyhow::Result<()> {
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
-                CliSqlFormat::Json => pond::sql::Mode::InlineJson,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
@@ -1369,11 +1359,6 @@ async fn main() -> anyhow::Result<()> {
             match pond::sql::run(&tables, &sql, mode, inline_rows).await {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
-                }
-                Ok(pond::sql::Outcome::InlineJson(value)) => {
-                    // Pretty-print for the CLI - the structured payload is for
-                    // agents over MCP; humans reading stdout want it readable.
-                    output(&serde_json::to_string_pretty(&value)?)?;
                 }
                 Ok(pond::sql::Outcome::Export {
                     bytes,
@@ -4120,7 +4105,11 @@ fn new_table() -> Table {
 /// always emits the envelope to stdout so scripts can pipe both success and
 /// error bodies through `jq`; text mode routes errors to stderr so stdout
 /// stays parseable.
-fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> anyhow::Result<bool> {
+fn render_search_envelope(
+    format: OutputFormat,
+    envelope: &SearchEnvelope,
+    request: &SearchRequest,
+) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
             output(
@@ -4131,7 +4120,9 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
         }
         OutputFormat::Text => match envelope {
             SearchEnvelope::Success(response) => {
-                render_search_pretty(response)?;
+                // One canonical transcript shared with the MCP tool.
+                let transcript = pond::render::render_search_transcript(response, request);
+                output(transcript.trim_end_matches('\n'))?;
                 Ok(true)
             }
             SearchEnvelope::Error(error) => {
@@ -4145,7 +4136,8 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
 fn render_get_envelope(
     format: OutputFormat,
     envelope: &GetEnvelope,
-    session_from: SessionFrom,
+    request: &GetRequest,
+    subagents_footer: &str,
 ) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
@@ -4157,7 +4149,9 @@ fn render_get_envelope(
         }
         OutputFormat::Text => match envelope {
             GetEnvelope::Success(response) => {
-                render_get_pretty(response, session_from)?;
+                let transcript = pond::render::render_get_transcript(response, request);
+                let combined = format!("{transcript}{subagents_footer}");
+                output(combined.trim_end_matches('\n'))?;
                 Ok(true)
             }
             GetEnvelope::Error(error) => {
@@ -4166,364 +4160,6 @@ fn render_get_envelope(
             }
         },
     }
-}
-
-fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    output(&format!(
-        "{} {} matched {}  {} returned {}  {} {} searchable in scope",
-        paint("search:", dim()),
-        paint(&format_thousands(response.matched_total as u64), bold()),
-        if response.matched_total == 1 {
-            "message"
-        } else {
-            "messages"
-        },
-        paint(&format_thousands(response.sessions.len() as u64), bold()),
-        if response.sessions.len() == 1 {
-            "session"
-        } else {
-            "sessions"
-        },
-        paint("of", dim()),
-        paint(
-            &format_thousands(response.searchable_in_scope as u64),
-            bold()
-        ),
-    ))?;
-    if response.sessions.is_empty() {
-        // spec.md#search-absence-honesty: name the recovery when the scope
-        // itself is empty - the filters, not the query, produced the zero.
-        if response.searchable_in_scope == 0 {
-            output(
-                "scope is empty: the filters exclude every searchable message; widen or drop \
-                 project/date filters",
-            )?;
-        }
-        return Ok(());
-    }
-    for (idx, session) in response.sessions.iter().enumerate() {
-        output("")?;
-        render_search_session(idx + 1, session)?;
-    }
-    Ok(())
-}
-
-fn render_search_session(rank: usize, session: &SearchSession) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    // Highest score among matches; matches render newest-first, so the first
-    // is not necessarily the best.
-    let best_score = session
-        .matches
-        .iter()
-        .map(|hit| hit.score)
-        .fold(0.0_f64, f64::max);
-    output(&format!(
-        "{}  best={}  {}/{} matched",
-        paint(&format!("[{rank}]"), dim()),
-        paint(&format!("{best_score:.4}"), bold()),
-        paint(
-            &format_thousands(session.matched_message_count as u64),
-            bold(),
-        ),
-        paint(
-            &format_thousands(session.session_messages_count as u64),
-            bold(),
-        ),
-    ))?;
-    output(&format!(
-        "    {}  {}  {}",
-        paint(&session.project, dim()),
-        paint(&session.source_agent, dim()),
-        paint(&session.session_id, dim()),
-    ))?;
-    for hit in &session.matches {
-        render_search_match(hit)?;
-    }
-    Ok(())
-}
-
-fn render_search_match(hit: &SearchResult) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-    output(&format!(
-        "    {}  {}  {}  {}",
-        paint(
-            &hit.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-        paint_role(hit.role.as_str()),
-        paint(&format!("{:.4}", hit.score), bold()),
-        paint(&hit.message_id, dim()),
-    ))?;
-    render_hit_text(&hit.text)?;
-    Ok(())
-}
-
-fn render_hit_text(text: &str) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-    let prefix = paint(">", dim());
-    for line in text.lines() {
-        output(&format!("    {prefix} {line}"))?;
-    }
-    Ok(())
-}
-
-fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-    output(&format!(
-        "{} {}  source={}  project={}",
-        paint("session", dim()),
-        paint(&session.id, bold()),
-        session.source_agent,
-        session.project.as_str(),
-    ))?;
-    output(&format!(
-        "{} {}",
-        paint("created:", dim()),
-        paint(
-            &session.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-    ))
-}
-
-fn render_get_pretty(response: &GetResponse, session_from: SessionFrom) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    render_session_header(&response.session)?;
-    match &response.result {
-        GetResult::Session {
-            messages,
-            messages_remaining,
-        } => {
-            for (idx, message) in messages.iter().enumerate() {
-                output("")?;
-                let parts = message.parts.as_deref().unwrap_or(&[]);
-                render_message_view(idx + 1, message, parts, false)?;
-            }
-            output("")?;
-            // Tail page: the remaining messages are *earlier*, before this page;
-            // after_id only pages forward, so label them "earlier" and omit the
-            // dead-end cursor (the start path keeps the forward after-id cursor).
-            let tail = matches!(session_from, SessionFrom::End);
-            let mut footer = format!(
-                "{} {} messages",
-                paint("(total:", dim()),
-                paint(&format_thousands(messages.len() as u64), bold()),
-            );
-            if *messages_remaining > 0 {
-                footer.push_str(&format!(
-                    " {} {}",
-                    paint(&format_thousands(*messages_remaining as u64), bold()),
-                    paint(if tail { "earlier" } else { "remaining [more]" }, dim()),
-                ));
-            }
-            footer.push_str(&paint(")", dim()));
-            output(&footer)?;
-            if *messages_remaining > 0 {
-                if tail {
-                    output(&paint(
-                        "session-from: start to read from the beginning",
-                        dim(),
-                    ))?;
-                } else if let Some(last) = messages.last() {
-                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
-                }
-            }
-        }
-        GetResult::Message {
-            target,
-            target_parts,
-            target_parts_remaining,
-            siblings,
-        } => {
-            // Interleave the target with its siblings in timestamp order so the
-            // thread reads top-to-bottom; the target carries its full parts.
-            let mut thread: Vec<(&MessageView, bool)> =
-                siblings.iter().map(|view| (view, false)).collect();
-            thread.push((target, true));
-            thread.sort_by_key(|(view, _)| view.timestamp);
-            for (idx, (view, is_target)) in thread.iter().enumerate() {
-                output("")?;
-                let parts = if *is_target {
-                    target_parts.as_slice()
-                } else {
-                    &[]
-                };
-                render_message_view(idx + 1, view, parts, *is_target)?;
-            }
-            if *target_parts_remaining > 0 {
-                output("")?;
-                output(&format!(
-                    "{} {} parts remaining {}",
-                    paint("(target:", dim()),
-                    paint(&format_thousands(*target_parts_remaining as u64), bold()),
-                    paint("[more])", dim()),
-                ))?;
-                if let Some(last) = target_parts.last() {
-                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Render one message view: header, text/content, then either full parts (when
-/// supplied - verbatim session parts or a message-mode target) or the compact
-/// part summaries otherwise.
-fn render_message_view(
-    rank: usize,
-    view: &MessageView,
-    full_parts: &[ResponsePart],
-    is_target: bool,
-) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-
-    let marker = if is_target {
-        paint("  <- target", dim())
-    } else {
-        String::new()
-    };
-    output(&format!(
-        "{}  {}  {}  {}{marker}",
-        paint(&format!("[{rank}]"), dim()),
-        paint(
-            &view.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-        paint_role(view.role.as_str()),
-        paint(&view.id, dim()),
-    ))?;
-    // When full parts are present they are the complete content; rendering
-    // `text` (a search_text projection of those same parts) too would just
-    // double the body.
-    if full_parts.is_empty() {
-        if let Some(text) = &view.text {
-            render_hit_text(text)?;
-        }
-        if let Some(content) = &view.content {
-            render_hit_text(content)?;
-        }
-        for summary in &view.parts_summary {
-            render_part_summary(summary)?;
-        }
-    } else {
-        for part in full_parts {
-            render_part(part)?;
-        }
-    }
-    Ok(())
-}
-
-fn render_part_summary(summary: &PartSummary) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-    let mut line = format!("[{}]", summary.kind);
-    if let Some(label) = &summary.label {
-        line.push(' ');
-        line.push_str(label);
-    }
-    if let Some(call_id) = &summary.call_id {
-        line.push_str(&format!(" call_id={call_id}"));
-    }
-    output(&format!("    {}", paint(&line, dim())))
-}
-
-fn render_part(part: &ResponsePart) -> anyhow::Result<()> {
-    use pond::output::{dim, paint, yellow};
-
-    let prefix = paint(">", dim());
-    match &part.kind {
-        // `Option<String>`: render only what's there. A `None` text part
-        // means the source row carried no text field; printing nothing is
-        // the faithful representation - no "<unresolved>" placeholder.
-        PartKind::Text { text } => {
-            if let Some(text) = text {
-                for line in text.lines() {
-                    output(&format!("    {prefix} {line}"))?;
-                }
-            }
-        }
-        PartKind::Reasoning { text } => {
-            let tag = paint("[reasoning]", dim());
-            if let Some(text) = text {
-                for line in text.lines() {
-                    output(&format!("    {tag} {prefix} {line}"))?;
-                }
-            }
-        }
-        PartKind::File {
-            media_type,
-            file_name,
-            ..
-        } => {
-            output(&format!(
-                "    {} media_type={} file_name={}",
-                paint("[file]", yellow()),
-                media_type.as_deref().unwrap_or("-"),
-                file_name.as_deref().unwrap_or("-"),
-            ))?;
-        }
-        // For tool_call / tool_result: omit the field entirely when None.
-        // Concretely: a tool_result with no resolvable name prints as
-        // `[tool_result] call_id=toolu_01...` (no name token), not
-        // `[tool_result] unknown call_id=toolu_01...` (which lied) and
-        // not `[tool_result] - call_id=toolu_01...` (which translates).
-        PartKind::ToolCall { call_id, name, .. } => {
-            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
-            let call_id_token = call_id
-                .as_deref()
-                .map(|id| format!(" call_id={id}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {}{name_token}{call_id_token}",
-                paint("[tool_call]", yellow()),
-            ))?;
-        }
-        PartKind::ToolResult {
-            call_id,
-            name,
-            is_failure,
-            ..
-        } => {
-            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
-            let call_id_token = call_id
-                .as_deref()
-                .map(|id| format!(" call_id={id}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {}{name_token}{call_id_token}{}",
-                paint("[tool_result]", yellow()),
-                if *is_failure { " (failure)" } else { "" },
-            ))?;
-        }
-        PartKind::ToolApprovalRequest {
-            approval_id,
-            tool_call_id,
-        } => {
-            output(&format!(
-                "    {} approval_id={approval_id} tool_call_id={tool_call_id}",
-                paint("[approval_request]", yellow()),
-            ))?;
-        }
-        PartKind::ToolApprovalResponse {
-            approval_id,
-            approved,
-            reason,
-        } => {
-            let suffix = reason
-                .as_deref()
-                .map(|r| format!(" reason={r}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {} approval_id={approval_id} approved={approved}{suffix}",
-                paint("[approval_response]", yellow()),
-            ))?;
-        }
-    }
-    Ok(())
 }
 
 fn render_error_pretty(error: &ErrorEnvelope) {
@@ -4557,17 +4193,6 @@ fn render_error_pretty(error: &ErrorEnvelope) {
             paint(&format!("  details: {}", error.error.details), dim()),
         );
     }
-}
-
-fn paint_role(role: &str) -> String {
-    use pond::output::{cyan, dim, green, paint, yellow};
-    let style = match role {
-        "user" => green(),
-        "assistant" => cyan(),
-        "tool" => yellow(),
-        _ => dim(),
-    };
-    paint(role, style)
 }
 
 #[cfg(test)]

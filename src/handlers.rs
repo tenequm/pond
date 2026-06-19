@@ -744,34 +744,17 @@ mod get_handler {
         sessions::{GetLookup, MessageViewParams, RetrievedMessage, SessionViewParams, Store},
         wire::{
             GetEnvelope, GetRequest, GetResponse, GetResult, GetSession, MessageView, PartSummary,
-            ResponseMode, ResponsePart, validate_protocol,
+            ResponsePart, validate_protocol,
         },
     };
 
     use super::{map_error, map_storage};
 
-    /// Project canonical retrieval data into the response DTO. In `verbatim` the
-    /// full parts ride `parts` and `text`/`content` are dropped - they would just
-    /// duplicate the inlined text part; otherwise the compact summary rides along
-    /// and full parts are elided.
-    fn to_message_view(message: RetrievedMessage, verbatim: bool) -> MessageView {
-        if verbatim {
-            return MessageView {
-                id: message.id,
-                role: message.role,
-                timestamp: message.timestamp,
-                text: None,
-                content: None,
-                parts_summary: Vec::new(),
-                parts: Some(
-                    message
-                        .parts
-                        .into_iter()
-                        .map(ResponsePart::from_part)
-                        .collect(),
-                ),
-            };
-        }
+    /// Project canonical retrieval data into the conversational response DTO:
+    /// `text`/`content` plus one-line part summaries. Full part bodies are never
+    /// inlined here - they ride `GetResult::Message.target_parts`, reached by
+    /// `message_id` scope.
+    fn to_message_view(message: RetrievedMessage) -> MessageView {
         let parts_summary = message
             .parts
             .iter()
@@ -784,14 +767,14 @@ mod get_handler {
             text: message.text,
             content: message.content,
             parts_summary,
-            parts: None,
         }
     }
 
     /// Server response budget, sized to the declared
     /// `_meta["anthropic/maxResultSizeChars"]` cap (~200KB / ~50k tokens). The
     /// server stops adding messages (or parts) when the next would exceed it;
-    /// `messages_remaining` / `target_parts_remaining` then signal pagination.
+    /// `before_remaining` / `after_remaining` (session) and
+    /// `target_parts_remaining` (message) then signal pagination.
     const BUDGET_BYTES: usize = 200_000;
 
     pub async fn pond_get(store: &Store, request: GetRequest) -> GetEnvelope {
@@ -822,14 +805,14 @@ mod get_handler {
         }
     }
 
-    /// Map a stale/unknown `after_id` to a `validation_failed` naming the fix
-    /// (spec.md#protocol); `anchor_of` describes the id the client should supply.
-    fn unknown_after_id(request: &GetRequest, anchor_of: &str) -> crate::wire::ErrorEnvelope {
+    /// Map a stale/unknown pagination anchor to a `validation_failed` naming
+    /// the field and the fix (spec.md#protocol).
+    fn unknown_anchor(field: &str, value: Option<&str>) -> crate::wire::ErrorEnvelope {
         map_error(crate::Error::validation_field(
-            "after_id not found (stale or mistyped continuation anchor)",
-            "after_id",
-            request.after_id.clone().map(serde_json::Value::String),
-            Some(format!("a {anchor_of} from a prior page of this read")),
+            format!("{field} not found (stale or mistyped pagination anchor)"),
+            field,
+            value.map(|v| serde_json::Value::String(v.to_owned())),
+            Some("a message id from a prior page of this read".to_owned()),
         ))
     }
 
@@ -838,10 +821,22 @@ mod get_handler {
         session_id: &str,
         request: &GetRequest,
     ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
+        if request.session_after_message_id.is_some() && request.session_before_message_id.is_some()
+        {
+            return Err(map_error(crate::Error::validation_field(
+                "session_after_message_id and session_before_message_id are mutually exclusive",
+                "session_before_message_id",
+                request
+                    .session_before_message_id
+                    .clone()
+                    .map(serde_json::Value::String),
+                Some("set only one pagination anchor".to_owned()),
+            )));
+        }
         let params = SessionViewParams {
-            mode: request.response_mode,
-            after_id: request.after_id.as_deref(),
-            limit: request.limit,
+            after_message_id: request.session_after_message_id.as_deref(),
+            before_message_id: request.session_before_message_id.as_deref(),
+            limit: request.session_limit,
             budget_bytes: BUDGET_BYTES,
             session_from: request.session_from,
         };
@@ -857,19 +852,24 @@ mod get_handler {
                     format!("session not found: {session_id}"),
                 )));
             }
-            GetLookup::UnknownAfterId => return Err(unknown_after_id(request, "message id")),
+            GetLookup::UnknownAnchor => {
+                let (field, value) = match &request.session_after_message_id {
+                    Some(value) => ("session_after_message_id", Some(value.as_str())),
+                    None => (
+                        "session_before_message_id",
+                        request.session_before_message_id.as_deref(),
+                    ),
+                };
+                return Err(unknown_anchor(field, value));
+            }
             GetLookup::Found(view) => view,
         };
-        let verbatim = matches!(request.response_mode, ResponseMode::Verbatim);
         Ok(GetResponse {
             session: GetSession::from_session(&view.session),
             result: GetResult::Session {
-                messages: view
-                    .messages
-                    .into_iter()
-                    .map(|message| to_message_view(message, verbatim))
-                    .collect(),
-                messages_remaining: view.messages_remaining,
+                messages: view.messages.into_iter().map(to_message_view).collect(),
+                before_remaining: view.before_remaining,
+                after_remaining: view.after_remaining,
             },
         })
     }
@@ -880,10 +880,8 @@ mod get_handler {
         request: &GetRequest,
     ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
         let params = MessageViewParams {
-            context_depth: request.context_depth,
-            mode: request.response_mode,
-            after_id: request.after_id.as_deref(),
-            limit: request.limit,
+            context_before: request.message_context_before,
+            context_after: request.message_context_after,
             budget_bytes: BUDGET_BYTES,
         };
         let view = match store
@@ -898,11 +896,16 @@ mod get_handler {
                     format!("message not found: {message_id}"),
                 )));
             }
-            GetLookup::UnknownAfterId => return Err(unknown_after_id(request, "part id")),
+            // message scope has no pagination anchor, so this is unreachable.
+            GetLookup::UnknownAnchor => {
+                return Err(map_error(crate::Error::internal(
+                    "message_view returned UnknownAnchor for an anchorless lookup",
+                )));
+            }
             GetLookup::Found(view) => view,
         };
-        // The target's body rides `target_parts` (paginated, full); carrying
-        // `text`/`content` on the header too would just duplicate it.
+        // The target's body rides `target_parts` (full); carrying `text`/
+        // `content` on the header too would just duplicate it.
         let target = MessageView {
             id: view.target.id,
             role: view.target.role,
@@ -910,7 +913,6 @@ mod get_handler {
             text: None,
             content: None,
             parts_summary: Vec::new(),
-            parts: None,
         };
         Ok(GetResponse {
             session: GetSession::from_session(&view.session),
@@ -922,11 +924,7 @@ mod get_handler {
                     .map(ResponsePart::from_part)
                     .collect(),
                 target_parts_remaining: view.target_parts_remaining,
-                siblings: view
-                    .siblings
-                    .into_iter()
-                    .map(|sibling| to_message_view(sibling, false))
-                    .collect(),
+                siblings: view.siblings.into_iter().map(to_message_view).collect(),
             },
         })
     }
@@ -935,9 +933,9 @@ mod get_handler {
 pub use get_handler::pond_get;
 
 mod search_handler {
-    //! The `pond_search` handler: hybrid (vector + BM25) retrieval at message
-    //! granularity, with filter pushdown and session-grouped responses
-    //! (spec.md#search).
+    //! The `pond_search` handler: single-arm retrieval at message granularity -
+    //! `vector` (kNN, default) or `fts` (BM25), chosen per query, no fusion -
+    //! with filter pushdown and session-grouped responses (spec.md#search).
 
     use crate::{
         Clock, SystemClock,
@@ -987,7 +985,6 @@ mod search_handler {
     }
 
     const LIMIT_CAP: usize = 200;
-    const SEARCH_BUDGET_BYTES: usize = 60_000;
     /// Centered query-windowed body returned on every hit (spec.md#search).
     /// Calibrated for the agent-context budget: ~600 code points fits a typical
     /// match site without crowding the 10k-token `pond_get` page.
@@ -1009,14 +1006,14 @@ mod search_handler {
     const RECENCY_BOOST_MAGNITUDE: f64 = 0.02;
     const RECENCY_BOOST_SCALE_DAYS: f64 = 30.0;
 
-    /// Run a hybrid or FTS-only search. The mode is server-determined - hybrid
-    /// when the store has any vectors, FTS-only otherwise. The embedder is
-    /// `LazyEmbedder`-loaded on the first hybrid/vector call, so FTS-only
-    /// corpora never pay the model load. The response has no top-level mode
-    /// field; retriever attribution stays in `explain_search_plan`.
+    /// Run a single-arm search. The caller picks the arm via the wire `mode`
+    /// field; `vector` degrades to `fts` only when the store has no embeddings.
+    /// The embedder is `LazyEmbedder`-loaded on the first vector call, so
+    /// fts-only corpora never pay the model load. The response has no top-level
+    /// mode field; retriever attribution stays in `explain_search_plan`.
     ///
-    /// Must run on a multi-threaded Tokio runtime: hybrid mode embeds the query via
-    /// `block_in_place`, which panics on a `current_thread` runtime.
+    /// Must run on a multi-threaded Tokio runtime: the vector arm embeds the
+    /// query via `block_in_place`, which panics on a `current_thread` runtime.
     pub async fn pond_search(
         store: &Store,
         embedder: &LazyEmbedder,
@@ -1691,33 +1688,13 @@ mod search_handler {
         searchable_in_scope: usize,
         plan: &SearchPlan,
     ) -> Result<SearchResponse, ErrorEnvelope> {
-        let mut emitted = Vec::new();
-        let mut used_bytes = 0usize;
-        for session in sessions.iter() {
-            if emitted.len() >= plan.limit {
-                break;
-            }
-            let bytes = serde_json::to_string(session)
-                .map_err(|error| {
-                    map_error(crate::Error::internal(format!(
-                        "failed to size search response session: {error}"
-                    )))
-                })?
-                .len();
-            if !emitted.is_empty() && used_bytes.saturating_add(bytes) > SEARCH_BUDGET_BYTES {
-                break;
-            }
-            used_bytes = used_bytes.saturating_add(bytes);
-            emitted.push(session.clone());
-        }
-
-        // `has_more` warns the caller that `limit` or the byte budget cut the
-        // ranked set short - raise `limit` (up to the cap) to see the rest.
-        // There is no pagination cursor: the result set is relevance-ranked and
-        // capped, so a wider `limit` dominates page-walking (spec.md#search).
-        // `total_sessions` is the full distinct-session count from before the
-        // pre-hydration cap, so the warning stays accurate even though
-        // `sessions` now holds only the capped slice.
+        // Emit the top `limit` sessions with all their matches (no per-session
+        // cap). The structured response carries the full ranked set (bounded by
+        // the arm pool); the rendered-transcript char budget (transport) is the
+        // only output limiter, so `limit` sessions always render at least their
+        // top hit. `has_more` warns the ranked set was cut by `limit` - there
+        // is no pagination cursor (a wider `limit` dominates page-walking).
+        let emitted: Vec<SearchSession> = sessions.into_iter().take(plan.limit).collect();
         let has_more = total_sessions > emitted.len();
 
         Ok(SearchResponse {
@@ -1803,7 +1780,7 @@ mod search_handler {
     }
 
     #[cfg(test)]
-    mod fusion_helpers_tests {
+    mod grouping_helpers_tests {
         #![allow(clippy::expect_used, clippy::unwrap_used)]
 
         use super::*;
@@ -2069,5 +2046,232 @@ mod tests {
         let error = plan_search(blank).unwrap_err().error;
         assert_eq!(error.code, crate::wire::ErrorCode::NamespaceUnknown);
         assert_eq!(error.details["namespace"], "remote");
+    }
+}
+
+#[cfg(test)]
+mod get_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use crate::sessions::Store;
+    use crate::wire::{
+        GetEnvelope, GetRequest, GetResult, IngestEnvelope, IngestRequest, Message, Part, PartKind,
+        Provenance, ProviderOptions, Session, SessionFrom,
+    };
+    use chrono::{TimeZone, Utc};
+    use tempfile::TempDir;
+
+    fn text_part(session_id: &str, message_id: &str, part_id: &str, body: &str) -> Part {
+        Part {
+            session_id: session_id.to_owned(),
+            id: part_id.to_owned(),
+            message_id: message_id.to_owned(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: crate::adapter::extract_str(&serde_json::json!({ "x": body }), "x"),
+            },
+        }
+    }
+
+    async fn ingest(store: &Store, events: Vec<super::IngestEvent>) {
+        let envelope = super::pond_ingest(
+            store,
+            IngestRequest {
+                protocol_version: crate::PROTOCOL_VERSION,
+                namespace: Some("local".to_owned()),
+                events,
+            },
+        )
+        .await;
+        assert!(
+            matches!(envelope, IngestEnvelope::Success(_)),
+            "ingest should succeed: {envelope:?}"
+        );
+    }
+
+    fn session(id: &str, project_marker: &str) -> Session {
+        Session {
+            id: id.to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            project: crate::adapter::extract_str(&serde_json::json!({ "x": project_marker }), "x")
+                .unwrap(),
+            options: ProviderOptions::new(),
+        }
+    }
+
+    /// `pond_get` session scope paginates over the response byte budget: a
+    /// session whose `search_text` exceeds the budget reports `after_remaining
+    /// > 0`, and re-requesting with `session_after_message_id` set to the last
+    /// returned id surfaces the rest, disjoint from the first page.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pond_get_paginates_session_via_after_message_id() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session_id = "paginate-session";
+
+        // ~80KB per message; three exceed the ~200KB page budget so the first
+        // page stops mid-session.
+        let huge_text = "abc def ghi jkl ".repeat(5000);
+        let mut events = vec![super::IngestEvent::Session(session(
+            session_id,
+            "pond-paginate",
+        ))];
+        for index in 0..3 {
+            let message_id = format!("paginate-msg-{index}");
+            events.push(super::IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: session_id.to_owned(),
+                timestamp: Utc
+                    .with_ymd_and_hms(2026, 1, 1, 0, index as u32 + 1, 0)
+                    .unwrap(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(super::IngestEvent::Part(text_part(
+                session_id,
+                &message_id,
+                &format!("paginate-part-{index}"),
+                &huge_text,
+            )));
+        }
+        ingest(&store, events).await;
+
+        let page_request = |after: Option<String>| GetRequest {
+            protocol_version: crate::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            session_id: Some(session_id.to_owned()),
+            message_id: None,
+            session_limit: 1000,
+            session_from: SessionFrom::Start,
+            session_after_message_id: after,
+            session_before_message_id: None,
+            message_context_before: 3,
+            message_context_after: 3,
+        };
+
+        let GetEnvelope::Success(first) = super::pond_get(&store, page_request(None)).await else {
+            panic!("first page must succeed");
+        };
+        let GetResult::Session {
+            messages: first_messages,
+            after_remaining,
+            ..
+        } = first.result
+        else {
+            panic!("first page is session-scope");
+        };
+        assert!(after_remaining > 0, "long corpus must trip the page budget");
+        let after = first_messages.last().expect("non-empty page").id.clone();
+
+        let GetEnvelope::Success(second) = super::pond_get(&store, page_request(Some(after))).await
+        else {
+            panic!("continuation page must succeed");
+        };
+        let GetResult::Session {
+            messages: second_messages,
+            ..
+        } = second.result
+        else {
+            panic!("continuation is session-scope");
+        };
+        assert!(
+            !second_messages.is_empty(),
+            "continuation surfaces the rest"
+        );
+        let first_ids: std::collections::HashSet<&str> =
+            first_messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            second_messages
+                .iter()
+                .all(|m| !first_ids.contains(m.id.as_str())),
+            "session_after_message_id pages must be disjoint"
+        );
+        Ok(())
+    }
+
+    /// `pond_get(session_from = "end")` returns the newest `session_limit`
+    /// messages chronologically (the compaction-recovery path) with the older
+    /// messages reported as `before_remaining`; `start` returns the oldest with
+    /// the newer ones as `after_remaining`. The two are disjoint ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pond_get_session_from_end_returns_the_recent_tail() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session_id = "tail-session";
+
+        let mut events = vec![super::IngestEvent::Session(session(
+            session_id,
+            "pond-tail",
+        ))];
+        for index in 0..5u32 {
+            let message_id = format!("tail-msg-{index}");
+            events.push(super::IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: session_id.to_owned(),
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, index + 1, 0).unwrap(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(super::IngestEvent::Part(text_part(
+                session_id,
+                &message_id,
+                &format!("tail-part-{index}"),
+                &format!("message {index}"),
+            )));
+        }
+        ingest(&store, events).await;
+
+        let request = |from: SessionFrom| GetRequest {
+            protocol_version: crate::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            session_id: Some(session_id.to_owned()),
+            message_id: None,
+            session_limit: 2,
+            session_from: from,
+            session_after_message_id: None,
+            session_before_message_id: None,
+            message_context_before: 3,
+            message_context_after: 3,
+        };
+        let page = |envelope: GetEnvelope| -> (Vec<String>, usize, usize) {
+            let GetEnvelope::Success(response) = envelope else {
+                panic!("get must succeed");
+            };
+            let GetResult::Session {
+                messages,
+                before_remaining,
+                after_remaining,
+            } = response.result
+            else {
+                panic!("session-scope result expected");
+            };
+            (
+                messages.into_iter().map(|m| m.id).collect(),
+                before_remaining,
+                after_remaining,
+            )
+        };
+
+        let (end_ids, end_before, _) =
+            page(super::pond_get(&store, request(SessionFrom::End)).await);
+        assert_eq!(
+            end_ids,
+            ["tail-msg-3", "tail-msg-4"],
+            "end returns the newest two, chronologically"
+        );
+        assert_eq!(end_before, 3, "three older messages precede the tail");
+
+        let (start_ids, _, start_after) =
+            page(super::pond_get(&store, request(SessionFrom::Start)).await);
+        assert_eq!(
+            start_ids,
+            ["tail-msg-0", "tail-msg-1"],
+            "start returns the oldest two"
+        );
+        assert_eq!(start_after, 3, "three newer messages follow the head");
+        Ok(())
     }
 }

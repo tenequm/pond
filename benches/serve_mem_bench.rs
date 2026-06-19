@@ -479,11 +479,12 @@ fn get_request(message_id: String) -> GetRequest {
         namespace: Some("local".to_owned()),
         session_id: None,
         message_id: Some(message_id),
-        context_depth: 0,
-        limit: 50,
-        response_mode: pond::wire::ResponseMode::Conversational,
+        session_limit: 20,
         session_from: pond::wire::SessionFrom::Start,
-        after_id: None,
+        session_after_message_id: None,
+        session_before_message_id: None,
+        message_context_before: 3,
+        message_context_after: 3,
     }
 }
 

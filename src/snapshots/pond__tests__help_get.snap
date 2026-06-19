@@ -1,10 +1,11 @@
 ---
 source: src/main.rs
+assertion_line: 4798
 expression: sub.render_long_help().to_string()
 ---
 Fetch a session or message.
 
-Returns readable transcripts by id: a whole session (`--session-id`) or one message with optional surrounding context (`--message-id`). Pagination cursors (`after-id:`) print at the end of truncated output.
+`--session-id` returns the whole session as a conversational transcript (user/assistant text + one-line tool/file refs). `--message-id` returns that one message with its full parts (tool bodies included) plus conversational neighbors. Params are prefixed by scope.
 
 Usage: pond get [OPTIONS] <--session-id <ID>|--message-id <ID>>
 
@@ -13,41 +14,41 @@ Options:
           Fetch an entire session by id. Mutually exclusive with `--message-id`
 
       --message-id <ID>
-          Fetch a single message by id. Mutually exclusive with `--session-id`
+          Fetch a single message by id (with its full parts). Mutually exclusive with `--session-id`
 
       --namespace <NAMESPACE>
           Tenant namespace. The personal pond has exactly one; leave at the default
           
           [default: local]
 
-      --context-depth <CONTEXT_DEPTH>
-          For `--message-id` mode: include this many sibling messages on each side (grep -C style). Ignored in session mode
-          
-          [default: 0]
-
-      --limit <LIMIT>
-          Cap on returned messages (session mode) or parts (message mode)
+      --session-limit <SESSION_LIMIT>
+          Session scope: max messages per page
           
           [default: 20]
 
-      --response-mode <RESPONSE_MODE>
-          Depth: conversational, complete, or verbatim.
-          
-          conversational = text + part summaries; complete = all messages + summaries; verbatim = full parts inline. With `--message-id` it selects which siblings fill the context window.
-          
-          [default: conversational]
-          [possible values: conversational, complete, verbatim]
-
       --session-from <SESSION_FROM>
-          Session mode only: which end to read from.
+          Session scope: which end to read the first page from.
           
           start = oldest first (default); end = most recent, e.g. to recover context after compaction.
           
           [default: start]
           [possible values: start, end]
 
-      --after-id <ID>
-          Continuation anchor from a prior response: last message id (session) or last part id (message). Exclusive lower bound
+      --session-after-message-id <ID>
+          Session scope: page forward - messages after this id (from a prior page's bottom marker)
+
+      --session-before-message-id <ID>
+          Session scope: page backward - messages before this id (from a prior page's top marker)
+
+      --message-context-before <MESSAGE_CONTEXT_BEFORE>
+          Message scope: conversational siblings before the target (grep -B)
+          
+          [default: 3]
+
+      --message-context-after <MESSAGE_CONTEXT_AFTER>
+          Message scope: conversational siblings after the target (grep -A)
+          
+          [default: 3]
 
       --format <FORMAT>
           [default: text]
@@ -77,6 +78,6 @@ Global options:
 
 Examples:
   pond get --session-id 58a96901-4a4f-40be-a3c1-62419ec8c580
-  pond get --session-id <ID> --session-from end      most recent messages first
-  pond get --message-id <ID> --context-depth 3       a hit plus its neighbors
-  pond get --session-id <ID> --response-mode verbatim --format json
+  pond get --session-id <ID> --session-from end                 most recent messages
+  pond get --session-id <ID> --session-after-message-id <ID>    page down
+  pond get --message-id <ID> --message-context-before 3 --message-context-after 3

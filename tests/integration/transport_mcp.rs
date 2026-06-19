@@ -240,8 +240,8 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         .await?;
     let conversational = tool_text(&result);
     assert!(
-        conversational.starts_with(&format!("pond_get: session {SESSION_ID} (conversational)")),
-        "get transcript header names the session and mode: {conversational}"
+        conversational.starts_with(&format!("pond_get: session {SESSION_ID},")),
+        "get transcript header names the session: {conversational}"
     );
     assert!(
         conversational.contains("key:"),
@@ -260,20 +260,23 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         "conversational mode elides reasoning: {conversational}"
     );
 
+    // Message scope returns the target's full parts - including reasoning,
+    // which the conversational session view elides. (Reasoning is excluded only
+    // from search indexing, not from an explicit by-id message read.)
     let result = client
         .call_tool(
             CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "session_id": SESSION_ID, "response_mode": "verbatim" })
+                json!({ "message_id": MESSAGE_ID })
                     .as_object()
                     .unwrap()
                     .clone(),
             ),
         )
         .await?;
-    let verbatim = tool_text(&result);
+    let message = tool_text(&result);
     assert!(
-        verbatim.contains(REASONING_TEXT),
-        "verbatim mode renders the reasoning part in full: {verbatim}"
+        message.contains(REASONING_TEXT),
+        "message scope renders the target's reasoning part in full: {message}"
     );
 
     // A wire error (unknown session) surfaces as a JSON-RPC tool error.

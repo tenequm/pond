@@ -338,57 +338,19 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         .await;
     assert!(missing.is_err(), "invalid export id is rejected");
 
-    // 7. format=json: spec-compliant dual delivery - text fallback (stringified
-    // JSON) AND structuredContent carrying the typed payload. The metrics
-    // footer fields (total_rows, shown_rows, elapsed_ms, columns, rows) are
-    // present.
+    // 7. format=json was removed; it is now a clean unknown-format error
+    // (ndjson is the machine-readable JSON path, delivered as an export).
     let result = call(json!({
-        "sql": "SELECT role, count(*) AS n FROM messages GROUP BY role ORDER BY role",
+        "sql": "SELECT role FROM messages",
         "format": "json"
     }))
     .await?;
-    assert_ne!(result.is_error, Some(true), "json output should succeed");
-    let structured = result
-        .structured_content
-        .as_ref()
-        .expect("format=json sets structured_content");
-    assert_eq!(
-        structured.get("total_rows").and_then(|v| v.as_u64()),
-        Some(2)
-    );
-    assert_eq!(
-        structured.get("shown_rows").and_then(|v| v.as_u64()),
-        Some(2)
-    );
-    assert_eq!(
-        structured.get("truncated").and_then(|v| v.as_bool()),
-        Some(false)
-    );
+    assert_eq!(result.is_error, Some(true), "format=json is rejected");
+    let text = first_text(&result).expect("error carries a message");
     assert!(
-        structured
-            .get("elapsed_ms")
-            .and_then(|v| v.as_u64())
-            .is_some(),
-        "elapsed_ms present: {structured:?}"
+        text.contains("ndjson"),
+        "error names the valid formats: {text}"
     );
-    let columns = structured
-        .get("columns")
-        .and_then(|v| v.as_array())
-        .expect("columns array");
-    assert!(columns.iter().any(|c| c == "role"));
-    assert!(columns.iter().any(|c| c == "n"));
-    let rows = structured
-        .get("rows")
-        .and_then(|v| v.as_array())
-        .expect("rows array");
-    assert_eq!(rows.len(), 2);
-    // The spec-compliant text fallback is the stringified structured payload
-    // (per `CallToolResult::structured`) - clients that don't render the
-    // structured channel still see the data.
-    let text = first_text(&result).expect("text fallback present");
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).expect("text fallback is the same JSON");
-    assert_eq!(&parsed, structured, "text fallback matches structured");
 
     // 8. EXPLAIN passes the read-only gate and returns a plan.
     let result = call(json!({ "sql": "EXPLAIN SELECT role FROM messages" })).await?;

@@ -2,7 +2,7 @@
 source: src/main.rs
 expression: root.render_long_help().to_string()
 ---
-Lossless storage and hybrid search for sessions from any AI agent client
+Lossless storage and semantic search for sessions from any AI agent client
 
 Usage: pond [OPTIONS] <COMMAND>
 
