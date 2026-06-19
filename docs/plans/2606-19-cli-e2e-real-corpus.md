@@ -87,6 +87,20 @@ Interactive wizards (PTY, sandbox HOME/XDG):
 - `adapters discover` multiselect: drive the picker; on an empty sandbox assert the "no adapters detected" bail; with a seeded fake source assert selection + persist.
 - `creds add` hidden-secret prompt: drive the name input and the masked secret; assert the set is written and `creds list` redacts it.
 
+## Timed operation report (required)
+
+Beyond pass/fail, the harness records and reports the wall-clock time of every operation, with per-phase breakdown where the command exposes phases (open store, oracle, import, embed, optimize, plan, copy, verify). The headline timings the release needs:
+
+- Cold full sync into an empty bucket: local adapters -> a fresh empty remote prefix `pond-e2e-sync`. This re-reads every adapter source and re-embeds the full backlog on-device (sync does not copy existing vectors), so it is the slowest operation and the most important release number (a new user's first sync to a fresh remote). Report total plus import/embed/optimize split.
+- Copy prefix -> prefix: `pond copy --from <real-corpus-prefix> --to pond-e2e-copy-dest` in the same bucket. Embeddings ride along as data (no re-embed), so this is bandwidth/commit-bound, roughly 14 minutes per the perf notes. Report total plus copy/index/verify split.
+- Sync on appends: re-run `pond sync` against `pond-e2e-sync` after the cold sync. With nothing new at the sources this is the incremental near-no-op path; report total (expected seconds, dominated by the change-detection oracle).
+- Status: `pond status` and `pond status -v` on the full real corpus. Report cold and warm.
+- Searches: a fixed set of `pond search` queries (vector and fts) on the full real corpus. Report cold (first query pays the index prewarm, 175-442 s per the remote-read perf notes) and warm per-query.
+- Get invocations: `pond get --session-id` and `pond get --message-id` on the full corpus. Report per-call.
+- SQL queries: a fixed set of `pond sql` queries (count, group-by, contains_tokens) on the full corpus. Report per-call.
+
+Each timing is captured by the harness (wall-clock around the spawned binary) and printed in the final report as a table: operation, target, cold/warm, total, phase split. Cold vs warm is controlled by whether a prior invocation in the same run already warmed the remote cache for that store.
+
 ## Seeding and runtime
 
 - Seed step (once, up front): `pond copy --from <real> --to pond-e2e-base`. A full corpus copy is roughly 14 minutes per the sync/copy perf notes; accepted per decision (full, not a subset). The `copy` write test seeds `pond-e2e-copy-dest` during the run (another full copy). Total wall-clock is dominated by these two copies plus the cold remote prewarms.
