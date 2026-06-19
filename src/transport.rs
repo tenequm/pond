@@ -644,8 +644,11 @@ Examples (4 patterns the agent should recognize):
                            sessions, use pond_sql_query instead (this tool excludes subagents). \
                            Returns a readable transcript: a leading `key:` line explains the \
                            format and the first line states totals plus how many searchable \
-                           messages the filters left in scope (the absence signal - search only \
-                           sees conversational text, never tool calls/results), then results are \
+                           messages the filters left in scope (the absence signal; searchable text \
+                           is user/assistant conversational text by design - tool calls/results and \
+                           reasoning are excluded as low-signal noise, so a gap there is expected, \
+                           not a failure - reach tool output via pond_sql_query over \
+                           parts.variant_data), then results are \
                            grouped by session, best session first; within a session, matching \
                            messages are newest-first. Each hit is a `--- [n] score | role | time \
                            | message_id | project | agent | session ---` rule followed by the \
@@ -914,8 +917,9 @@ Examples (4 patterns the agent should recognize):
                  stats://pond (corpus + embedding stats). For structured/analytic queries \
                  (filtering, joins, counts, group-by) use pond_sql_query: read-only SQL \
                  (SELECT only) over the sessions/messages/parts tables, with optional \
-                 parquet/ndjson export; see resource schema://pond-sql. Search only indexes \
-                 conversational text (tool calls/results are invisible to it), and a \
+                 parquet/ndjson export; see resource schema://pond-sql. Search indexes only \
+                 user/assistant conversational text by design (tool calls/results and \
+                 reasoning are excluded as low-signal noise, not a bug), and a \
                  zero/weak result is not proof of absence - for exact strings, \
                  identifiers, or error messages run pond_sql_query with WHERE \
                  contains_tokens(search_text, 'words') (all words must match; \

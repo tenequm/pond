@@ -29,7 +29,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
-    rowmap::RowKeyMap,
+    rowmap::{RowMetaEntry, RowMetaMap, RowMetaSet, discover_chain},
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
@@ -42,11 +42,12 @@ use url::Url;
 #[derive(Debug)]
 pub struct Store {
     handle: Handle,
-    /// Row-key map for index-only hit resolution (see [`crate::rowmap`]). `None`
-    /// until [`Store::ensure_rowmap`] builds it (local tests, pre-prewarm), where
-    /// the arms fall back to a data-projection scan. `ArcSwap` so a version-bump
-    /// rebuild swaps it under concurrent searches.
-    rowmap: ArcSwapOption<RowKeyMap>,
+    /// Resident per-message meta map for index-only hit resolution and in-memory
+    /// hydration (see [`crate::rowmap`]). `None` until [`Store::ensure_rowmap`]
+    /// builds it (local tests, pre-prewarm), where the arms fall back to a
+    /// data-projection scan and hydration to `take_rows`. `ArcSwap` so a
+    /// version-bump rebuild swaps it under concurrent searches.
+    rowmap: ArcSwapOption<RowMetaSet>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +190,7 @@ pub struct MessageKey {
     pub message_id: String,
 }
 
-/// One retrieval-arm hit. `rowid` is `Some` when the row-key map (or its
+/// One retrieval-arm hit. `rowid` is `Some` when the row meta map (or its
 /// take_rows miss-fallback) resolved a stable row id, which lets hydration
 /// `take_rows` the exact row instead of re-finding it with an `IN`-predicate
 /// scan; `None` on the no-map fallback path (local tests, pre-prewarm).
@@ -1615,8 +1616,29 @@ impl Store {
         digest.to_hex()[..16].to_owned()
     }
 
-    /// Build (or open from cache) and install the row-key map for the current
-    /// `messages` version. Idempotent - a map already at that version is kept.
+    /// Max delta segments before the chain is compacted into a fresh base.
+    const MAX_ROWMAP_DELTAS: usize = 16;
+
+    /// Columns the resident meta map is built from. The full scan and the delta
+    /// scan MUST project the same set in the same order - both feed
+    /// [`row_meta_entry`], so a column added to one only would silently corrupt
+    /// delta hydration.
+    const ROW_META_COLUMNS: [&str; 7] = [
+        "session_id",
+        "id",
+        "role",
+        "project",
+        "source_agent",
+        "timestamp",
+        "search_text",
+    ];
+
+    /// Install the resident meta map covering the current `messages` version.
+    /// Idempotent - a chain already at that version is kept. On a version bump
+    /// it layers a delta segment (scanning only the new fragments), compacts the
+    /// deltas locally once they pile up, and full-rebuilds the base only on a
+    /// store compaction - all under a build `flock` so N local processes don't
+    /// rescan the store at once.
     pub async fn ensure_rowmap(&self, cache_dir: &Path) -> Result<()> {
         let version = self.messages_version().await?;
         if let Some(current) = self.rowmap.load_full()
@@ -1627,43 +1649,149 @@ impl Store {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
         let store_key = self.store_key();
-        let path = RowKeyMap::path_for(cache_dir, &store_key, version);
-        let map = if path.exists() {
-            RowKeyMap::open(&path)?
-        } else {
-            let entries = self.collect_row_keys().await?;
-            RowKeyMap::build(&path, version, entries)?;
-            RowKeyMap::open(&path)?
-        };
-        self.rowmap.store(Some(Arc::new(map)));
-        Self::sweep_stale_rowmaps(cache_dir, &store_key, version);
+
+        // A sibling may already have published a chain at this version; install
+        // it without rebuilding.
+        if let Some(chain) = discover_chain(cache_dir, &store_key)
+            && chain.version() == version
+            && let Ok(set) = RowMetaSet::open(&chain)
+        {
+            self.rowmap.store(Some(Arc::new(set)));
+            Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
+            return Ok(());
+        }
+        if let Some(set) = self
+            .extend_rowmap_coordinated(cache_dir, &store_key, version)
+            .await?
+        {
+            self.rowmap.store(Some(Arc::new(set)));
+        }
         Ok(())
     }
 
-    /// Remove this store's map files for versions strictly older than `keep`
-    /// (best-effort). Only older versions: a newer file belongs to a sibling
-    /// that advanced past us and is still using it. Deleting a genuinely
-    /// superseded file is safe even if a sibling has it mapped - Unix unlink
-    /// keeps the inode alive until unmap.
+    /// Extend the chain to `version` under the build `flock` (spec: lock the
+    /// build only; atomic rename already prevents corruption). `None` when
+    /// another local process holds the lock - this caller keeps its current map
+    /// (or the take_rows fallback) until a later refresh opens what the winner
+    /// published.
+    async fn extend_rowmap_coordinated(
+        &self,
+        cache_dir: &Path,
+        store_key: &str,
+        version: u64,
+    ) -> Result<Option<RowMetaSet>> {
+        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
+        let lock = std::fs::File::create(&lock_path)
+            .with_context(|| format!("create rowmap build lock {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock rowmap build");
+            }
+        }
+
+        // Re-check after acquiring: a sibling may have published `version`.
+        if let Some(chain) = discover_chain(cache_dir, store_key)
+            && chain.version() == version
+        {
+            return Ok(Some(RowMetaSet::open(&chain)?));
+        }
+
+        // Holding the lock makes us the only builder, so every build temp is a
+        // dead orphan from a crashed build - clear them before writing ours.
+        Self::sweep_orphan_temps(cache_dir, store_key);
+
+        let chain = discover_chain(cache_dir, store_key);
+        // A pure-append delta scan (None on store compaction) decides the path.
+        let delta = match &chain {
+            Some(existing) => self.collect_row_metas_delta(existing.version()).await?,
+            None => None,
+        };
+
+        let base_version = match (&chain, delta) {
+            // Pure append with room: layer a new delta segment.
+            (Some(existing), Some(entries)) if existing.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
+                let path = RowMetaMap::delta_path(cache_dir, store_key, version);
+                RowMetaMap::build(&path, version, entries)?;
+                existing.base_version
+            }
+            // Pure append but the deltas are full: compact the existing segments
+            // (read locally from their mmaps) plus this delta into a fresh base -
+            // no full store re-read.
+            (Some(existing), Some(entries)) => {
+                let mut merged = RowMetaSet::open(existing)?.merged_entries();
+                merged.extend(entries);
+                let path = RowMetaMap::path_for(cache_dir, store_key, version);
+                RowMetaMap::build(&path, version, merged)?;
+                version
+            }
+            // No chain, or store compaction since the base: full scan -> base.
+            _ => {
+                let entries = self.collect_row_metas().await?;
+                let path = RowMetaMap::path_for(cache_dir, store_key, version);
+                RowMetaMap::build(&path, version, entries)?;
+                version
+            }
+        };
+
+        let chain =
+            discover_chain(cache_dir, store_key).context("rowmap chain missing after build")?;
+        let set = RowMetaSet::open(&chain)?;
+        Self::sweep_stale_rowmaps(cache_dir, store_key, base_version);
+        Ok(Some(set))
+    }
+
+    /// Remove this store's segment files (`-v{V}` bases, `-d{V}` deltas) for
+    /// versions strictly older than `keep` (best-effort). A newer file belongs
+    /// to a sibling that advanced past us; unlinking a superseded file is safe
+    /// even if a sibling has it mapped - Unix keeps the inode alive until unmap.
     fn sweep_stale_rowmaps(cache_dir: &Path, store_key: &str, keep: u64) {
-        let prefix = format!("rowkeymap-{store_key}-v");
+        let prefix = format!("rowmetamap-{store_key}-");
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|rest| rest.strip_suffix(".rmm"))
+            else {
+                continue;
+            };
+            let version = rest
+                .strip_prefix('v')
+                .or_else(|| rest.strip_prefix('d'))
+                .and_then(|digits| digits.parse::<u64>().ok());
+            if let Some(version) = version
+                && version < keep
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Remove abandoned build temp files (`*.tmp-*`) for this store. Best-effort,
+    /// and only sound under the build lock - the holder is the sole builder, so
+    /// any temp present is a crashed-build orphan, not a live write.
+    fn sweep_orphan_temps(cache_dir: &Path, store_key: &str) {
+        let prefix = format!("rowmetamap-{store_key}-");
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(version) = name
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(".rkm"))
-                .and_then(|digits| digits.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if version < keep {
+            if name.starts_with(&prefix) && name.contains(".tmp-") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rowmap_delta_count(&self) -> Option<usize> {
+        self.rowmap.load_full().map(|set| set.delta_count())
     }
 
     /// Resolve index-only `(row_id, score)` hits to keys via the map; row ids the
@@ -1671,7 +1799,7 @@ impl Store {
     /// caller re-sorts, so the misses appended at the end carry no order meaning.
     async fn resolve_rowid_hits(
         &self,
-        map: &RowKeyMap,
+        map: &RowMetaSet,
         hits: Vec<(u64, f32)>,
     ) -> Result<Vec<SearchHit>> {
         let mut resolved = Vec::with_capacity(hits.len());
@@ -1851,7 +1979,7 @@ impl Store {
         }
     }
 
-    /// BM25 full-text retriever over `messages.search_text`. With the row-key map
+    /// BM25 full-text retriever over `messages.search_text`. With the row meta map
     /// loaded the scan is index-only (no data columns -> no `TakeExec`, no
     /// scattered GETs) and hits resolve through the map; otherwise it falls back
     /// to `fts_search_keys` so search works before prewarm.
@@ -1934,7 +2062,7 @@ impl Store {
         Ok(hits)
     }
 
-    /// Current `messages` dataset version - the key a `RowKeyMap` is built
+    /// Current `messages` dataset version - the key a `RowMetaMap` is built
     /// against (pond's stable row ids keep a built map valid until this advances).
     pub async fn messages_version(&self) -> Result<u64> {
         Ok(self
@@ -1945,25 +2073,63 @@ impl Store {
             .version)
     }
 
-    /// Scan the two narrow key columns with row ids into a `Vec`, the input to
-    /// `RowKeyMap::build`. One large sequential scan (few big reads), unlike the
-    /// scattered per-hit take it replaces.
-    pub async fn collect_row_keys(&self) -> Result<Vec<(u64, String, String)>> {
+    /// Scan the hydration columns with row ids into a `Vec`, the input to
+    /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
+    /// scattered per-hit take it replaces; `search_text` dominates the bytes.
+    pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
-        scanner.project(&["session_id", "id"])?;
+        scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
         let mut out = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;
             for row in 0..batch.num_rows() {
-                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
-                let mid = string(&batch, "id", row)?.context("message id is null")?;
-                out.push((rowids.value(row), sid, mid));
+                out.push(row_meta_entry(&batch, rowids.value(row), row)?);
             }
         }
         Ok(out)
+    }
+
+    /// Row metas for the fragments appended since `base_version` - the input to
+    /// a delta segment. `None` when a fragment present at `base_version` is gone
+    /// now (store compaction / deletion): the chain can't be extended by append,
+    /// so the caller rebuilds the base from a full scan instead.
+    async fn collect_row_metas_delta(
+        &self,
+        base_version: u64,
+    ) -> Result<Option<Vec<RowMetaEntry>>> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let old = dataset.checkout_version(base_version).await?;
+        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
+        let current = dataset.get_fragments();
+        let current_ids: HashSet<u64> = current.iter().map(|f| f.id() as u64).collect();
+        if !old_ids.is_subset(&current_ids) {
+            return Ok(None);
+        }
+        let new_fragments: Vec<_> = current
+            .iter()
+            .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        if new_fragments.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(new_fragments);
+        scanner.with_row_id();
+        scanner.project(&Self::ROW_META_COLUMNS)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                out.push(row_meta_entry(&batch, rowids.value(row), row)?);
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Index-only FTS retriever: `_rowid` + `_score` only, so Lance inserts no
@@ -2208,17 +2374,45 @@ impl Store {
             .context("explain_plan failed")
     }
 
-    /// Hydrate search hits by stable row id (spec.md#search): a precise
-    /// `take_rows` of exactly the displayed rows, instead of re-finding them
-    /// with the `session_id IN (...) AND id IN (...)` cross-product scan
-    /// `message_metas_by_keys` pays. `take_rows` returns rows in `rowids`
-    /// order, so the result aligns positionally with the input. Used when
-    /// every selected hit carries a rowid (row-key map loaded); the IN-scan
-    /// stays the no-map fallback.
+    /// Hydrate search hits by stable row id (spec.md#search). Resolves each
+    /// rowid from the resident meta map in memory (no object-store round-trip -
+    /// Lance caches index/metadata but never data column values, so a `take_rows`
+    /// re-reads `search_text` from storage every query). Rowids the map lacks
+    /// (appended since it was built, or no map loaded) fall back to a single
+    /// `take_rows` batch. The caller indexes the result by key, so order is
+    /// irrelevant.
     pub async fn message_metas_by_rowids(&self, rowids: &[u64]) -> Result<Vec<MessageMeta>> {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut metas = Vec::with_capacity(rowids.len());
+        let misses: Vec<u64> = if let Some(map) = self.rowmap.load_full() {
+            let (hits, misses) = map.hydrate(rowids);
+            metas.extend(hits.into_iter().map(|entry| MessageMeta {
+                message_id: entry.message_id,
+                session_id: entry.session_id,
+                role: entry.role,
+                project: entry.project,
+                source_agent: entry.source_agent,
+                timestamp:
+                    DateTime::from_timestamp_micros(entry.timestamp_micros).unwrap_or_default(),
+                search_text: entry.search_text,
+            }));
+            misses
+        } else {
+            rowids.to_vec()
+        };
+        if !misses.is_empty() {
+            metas.extend(self.message_metas_by_rowids_take(&misses).await?);
+        }
+        Ok(metas)
+    }
+
+    /// `take_rows` hydration of exactly `rowids` - the cache-miss fallback for
+    /// rows the resident meta map lacks. `take_rows` coalesces the reads per
+    /// fragment (Lance's own batching), so a scattered take is few requests, not
+    /// one per row.
+    async fn message_metas_by_rowids_take(&self, rowids: &[u64]) -> Result<Vec<MessageMeta>> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         let projection = ProjectionRequest::from_columns(
             [
@@ -2235,16 +2429,7 @@ impl Store {
         let batch = dataset.take_rows(rowids, projection).await?;
         let mut metas = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            metas.push(MessageMeta {
-                message_id: string(&batch, "id", row)?.context("id is null")?,
-                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
-                role: string(&batch, "role", row)?.context("role is null")?,
-                project: string(&batch, "project", row)?.context("project is null")?,
-                source_agent: string(&batch, "source_agent", row)?
-                    .context("source_agent is null")?,
-                timestamp: datetime(&batch, "timestamp", row)?,
-                search_text: string(&batch, "search_text", row)?.unwrap_or_default(),
-            });
+            metas.push(message_meta_from_batch(&batch, row)?);
         }
         Ok(metas)
     }
@@ -2285,24 +2470,15 @@ impl Store {
             .await?;
         let mut metas = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            let message_id = string(&batch, "id", row)?.context("id is null")?;
-            let session_id = string(&batch, "session_id", row)?.context("session_id is null")?;
-            if !wanted.contains(&MessageKey {
-                session_id: session_id.clone(),
-                message_id: message_id.clone(),
+            // The IN x IN predicate is a cross-product, so the scan can return
+            // pairs that were never asked for; keep only the wanted keys.
+            let meta = message_meta_from_batch(&batch, row)?;
+            if wanted.contains(&MessageKey {
+                session_id: meta.session_id.clone(),
+                message_id: meta.message_id.clone(),
             }) {
-                continue;
+                metas.push(meta);
             }
-            metas.push(MessageMeta {
-                message_id,
-                session_id,
-                role: string(&batch, "role", row)?.context("role is null")?,
-                project: string(&batch, "project", row)?.context("project is null")?,
-                source_agent: string(&batch, "source_agent", row)?
-                    .context("source_agent is null")?,
-                timestamp: datetime(&batch, "timestamp", row)?,
-                search_text: string(&batch, "search_text", row)?.unwrap_or_default(),
-            });
         }
         Ok(metas)
     }
@@ -2321,6 +2497,20 @@ impl Store {
     ) -> Result<BTreeMap<String, usize>> {
         if session_ids.is_empty() {
             return Ok(BTreeMap::new());
+        }
+        // A version-matched resident map covers every current row, so its
+        // per-session counts are authoritative (a session absent from it has 0
+        // messages) - serve them with no scan. The version gate is load-bearing:
+        // unlike meta hydration, a count cannot detect staleness by a row-id
+        // miss, so a map that predates appended rows would undercount. A stale
+        // or absent map falls through to the IN-scan.
+        if let Some(map) = self.rowmap.load_full()
+            && map.version() == self.messages_version().await?
+        {
+            return Ok(session_ids
+                .iter()
+                .map(|id| (id.clone(), map.lookup_count(id).unwrap_or(0)))
+                .collect());
         }
         let predicate = in_predicate("session_id", session_ids);
         let scanner = self
@@ -2403,6 +2593,20 @@ impl Store {
             total,
             model: embed::model_id(),
         })
+    }
+
+    /// Messages eligible but not yet embedded (`search_text` present,
+    /// `embedding_model` null) - the exact set [`crate::embed::EmbedWorker`]
+    /// processes. Read straight from the dataset so it is correct right after
+    /// ingest, unlike the FTS `num_docs` `embedding_progress` shows (which lags
+    /// until the index is rebuilt - the embed stage runs before that).
+    pub async fn embed_backlog_count(&self) -> Result<usize> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let filter = Predicate::And(vec![
+            Predicate::IsNull("embedding_model"),
+            Predicate::IsNotNull("search_text"),
+        ]);
+        Ok(dataset.count_rows(Some(filter.to_lance())).await?)
     }
 
     /// Count rows whose `embedding_model` is not the currently configured
@@ -4606,6 +4810,31 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
     })
 }
 
+fn row_meta_entry(batch: &RecordBatch, row_id: u64, row: usize) -> Result<RowMetaEntry> {
+    Ok(RowMetaEntry {
+        row_id,
+        session_id: string(batch, "session_id", row)?.context("session_id is null")?,
+        message_id: string(batch, "id", row)?.context("message id is null")?,
+        role: string(batch, "role", row)?.context("role is null")?,
+        project: string(batch, "project", row)?.context("project is null")?,
+        source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
+        timestamp_micros: datetime(batch, "timestamp", row)?.timestamp_micros(),
+        search_text: string(batch, "search_text", row)?.unwrap_or_default(),
+    })
+}
+
+pub(crate) fn message_meta_from_batch(batch: &RecordBatch, row: usize) -> Result<MessageMeta> {
+    Ok(MessageMeta {
+        message_id: string(batch, "id", row)?.context("id is null")?,
+        session_id: string(batch, "session_id", row)?.context("session_id is null")?,
+        role: string(batch, "role", row)?.context("role is null")?,
+        project: string(batch, "project", row)?.context("project is null")?,
+        source_agent: string(batch, "source_agent", row)?.context("source_agent is null")?,
+        timestamp: datetime(batch, "timestamp", row)?,
+        search_text: string(batch, "search_text", row)?.unwrap_or_default(),
+    })
+}
+
 pub(crate) fn message_from_batch(batch: &RecordBatch, row: usize) -> Result<Message> {
     let id = string(batch, "id", row)?.context("message id is null")?;
     let session_id = string(batch, "session_id", row)?.context("message session_id is null")?;
@@ -5051,6 +5280,90 @@ mod tests {
         assert_eq!(messages, 1, "valid message committed");
         assert_eq!(parts, 1, "valid part committed; the orphan was dropped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resident_meta_map_hydration_matches_take_rows_fallback() -> anyhow::Result<()> {
+        // The resident meta map must hydrate hits identically to the take_rows
+        // fallback - same fields, and the microsecond timestamp survives the
+        // i64 round-trip through the mmap blob.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("hydration-parity");
+
+        let messages = [
+            (
+                "m1",
+                "the auth refactor landed cleanly",
+                1_700_000_000_123_456_i64,
+            ),
+            (
+                "m2",
+                "balance handler now retries on rpc timeout",
+                1_700_000_050_654_321,
+            ),
+        ];
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        let mut seq = 1;
+        for (mid, text, micros) in messages {
+            let message = Message::User {
+                id: mid.to_owned(),
+                session_id: session.id.clone(),
+                timestamp: DateTime::from_timestamp_micros(micros).unwrap(),
+                options: ProviderOptions::new(),
+            };
+            validator
+                .push(&store, seq, IngestEvent::Message(message))
+                .await?;
+            seq += 1;
+            let part = Part {
+                session_id: session.id.clone(),
+                id: format!("{mid}-p0"),
+                message_id: mid.to_owned(),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(text.to_owned())),
+                },
+            };
+            validator.push(&store, seq, IngestEvent::Part(part)).await?;
+            seq += 1;
+        }
+        validator.finish(&store).await?;
+
+        let rowids: Vec<u64> = store
+            .collect_row_metas()
+            .await?
+            .into_iter()
+            .map(|entry| entry.row_id)
+            .collect();
+        assert_eq!(rowids.len(), 2);
+
+        let sort_by_id = |mut metas: Vec<MessageMeta>| {
+            metas.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+            metas
+        };
+
+        let fallback = sort_by_id(store.message_metas_by_rowids(&rowids).await?);
+
+        // Build and install the resident meta map; the same call now hydrates
+        // from memory (zero misses - the map covers the whole table).
+        store.ensure_rowmap(&temp.path().join("cache")).await?;
+        let resident = sort_by_id(store.message_metas_by_rowids(&rowids).await?);
+
+        assert_eq!(
+            resident, fallback,
+            "resident-map hydration must match the take_rows fallback"
+        );
+        assert_eq!(
+            resident[0].timestamp.timestamp_micros(),
+            1_700_000_000_123_456
+        );
         Ok(())
     }
 
@@ -6019,6 +6332,164 @@ mod tests {
         let full = store.embedding_progress().await?;
         assert_eq!(full.embedded, 10);
         assert_eq!(full.total, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_rowmap_layers_a_delta_on_new_ingest() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(
+            store.rowmap_delta_count(),
+            Some(0),
+            "first build is a lone base"
+        );
+
+        // A new session's message bumps the version with a fresh fragment.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: "session-new".to_owned(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/new".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: "m-new".to_owned(),
+                    session_id: "session-new".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-new".to_owned(),
+                    id: "m-new-part".to_owned(),
+                    message_id: "m-new".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("brand new message".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+
+        // The refresh scans only the new fragment and layers a delta - not a
+        // full rebuild.
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(
+            store.rowmap_delta_count(),
+            Some(1),
+            "new ingest layered a delta"
+        );
+
+        // The new session's count is served from the chain (base + delta sum).
+        let counts = store
+            .session_message_counts(&["session-new".to_owned()])
+            .await?;
+        assert_eq!(counts.get("session-new").copied(), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rowmap_chain_compacts_and_stays_bounded() -> anyhow::Result<()> {
+        // Many version bumps (the remote-writers case) must not grow the chain
+        // unboundedly: deltas cap at MAX, then compact into a fresh base.
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 4).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+
+        let mut reached_cap = false;
+        let mut compacted = false;
+        for i in 0..(Store::MAX_ROWMAP_DELTAS + 2) {
+            let session = format!("session-x{i}");
+            ingest_events(
+                &store,
+                vec![
+                    IngestEvent::Session(Session {
+                        id: session.clone(),
+                        parent_session_id: None,
+                        parent_message_id: None,
+                        source_agent: "claude-code".to_owned(),
+                        created_at: Utc::now(),
+                        project: Extracted::from_test_value("/proj/x".to_owned()),
+                        options: ProviderOptions::new(),
+                    }),
+                    IngestEvent::Message(Message::User {
+                        id: format!("mx{i}"),
+                        session_id: session.clone(),
+                        timestamp: Utc::now(),
+                        options: ProviderOptions::new(),
+                    }),
+                    IngestEvent::Part(Part {
+                        session_id: session.clone(),
+                        id: format!("mx{i}-part"),
+                        message_id: format!("mx{i}"),
+                        ordinal: 0,
+                        provenance: crate::wire::Provenance::Conversational,
+                        options: ProviderOptions::new(),
+                        kind: PartKind::Text {
+                            text: Some(Extracted::from_test_value(format!("msg {i}"))),
+                        },
+                    }),
+                ],
+            )
+            .await?;
+            store.ensure_rowmap(&cache).await?;
+            let deltas = store.rowmap_delta_count().unwrap();
+            assert!(
+                deltas <= Store::MAX_ROWMAP_DELTAS,
+                "delta count {deltas} exceeded the cap",
+            );
+            if deltas == Store::MAX_ROWMAP_DELTAS {
+                reached_cap = true;
+            }
+            if reached_cap && deltas < Store::MAX_ROWMAP_DELTAS {
+                compacted = true;
+            }
+        }
+        assert!(reached_cap, "deltas accumulated to the cap (append path)");
+        assert!(compacted, "the chain compacted back into a base");
+
+        // Files stay bounded and no build temps leak.
+        let mut rmm = 0;
+        for entry in std::fs::read_dir(&cache)? {
+            let name = entry?.file_name().into_string().unwrap_or_default();
+            assert!(!name.contains(".tmp-"), "leaked build temp: {name}");
+            if name.ends_with(".rmm") {
+                rmm += 1;
+            }
+        }
+        assert!(
+            rmm <= Store::MAX_ROWMAP_DELTAS + 1,
+            "files unbounded: {rmm}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embed_backlog_count_tracks_eligible_unembedded_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 10).await?;
+
+        // Read straight from the dataset (no FTS index here), so it is correct
+        // right after ingest - the case that lagged `embedding_progress`.
+        assert_eq!(store.embed_backlog_count().await?, 10);
+
+        store.write_embeddings(&embedded(&keys[..4])).await?;
+        assert_eq!(store.embed_backlog_count().await?, 6);
+
+        store.write_embeddings(&embedded(&keys[4..])).await?;
+        assert_eq!(store.embed_backlog_count().await?, 0);
         Ok(())
     }
 

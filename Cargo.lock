@@ -6532,6 +6532,7 @@ dependencies = [
  "walkdir",
  "whoami",
  "zip 8.6.0",
+ "zstd",
 ]
 
 [[package]]

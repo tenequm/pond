@@ -460,7 +460,7 @@ pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf
     url_for_path(PathBuf::from(".pond"))
 }
 
-/// Cache dir for rebuildable artifacts (the search row-key map): the XDG-cache
+/// Cache dir for rebuildable artifacts (the search row meta map): the XDG-cache
 /// analog of [`default_storage_path`]. Separate root because the contents are
 /// regenerated from the store, not durable data.
 pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {

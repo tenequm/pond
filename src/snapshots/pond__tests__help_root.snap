@@ -1,8 +1,9 @@
 ---
 source: src/main.rs
-expression: root.render_long_help().to_string()
+expression: root_help
 ---
 Lossless storage and semantic search for sessions from any AI agent client
+pond [VERSION]
 
 Usage: pond [OPTIONS] <COMMAND>
 

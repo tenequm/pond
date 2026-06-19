@@ -139,7 +139,7 @@ fn default_local_storage() -> anyhow::Result<StorageUrl> {
     StorageUrl::parse(url.as_str())
 }
 
-/// The search row-key map's cache dir. Resolved in this env-owning layer and
+/// The search row meta map's cache dir. Resolved in this env-owning layer and
 /// passed into `prewarm` so `Store` stays env-agnostic.
 fn default_cache_dir() -> PathBuf {
     pond::config::default_cache_path(
@@ -196,16 +196,23 @@ const STYLES: clap::builder::styling::Styles = clap::builder::styling::Styles::s
     .literal(anstyle::AnsiColor::Cyan.on_default())
     .placeholder(anstyle::Style::new().dimmed());
 
-/// `--version` detail line: crate version plus the release commit (stamped
-/// into release builds via `POND_BUILD_COMMIT`) and the build target. `-V`
-/// stays the short crate version.
+/// Displayed version. Debug builds (a local `cargo build`) carry a `-dev`
+/// suffix so a working binary is never mistaken for an installed release.
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    if cfg!(debug_assertions) {
+        format!("{}-dev", env!("CARGO_PKG_VERSION"))
+    } else {
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
+});
+
+/// `--version` detail line: [`VERSION`] plus the release commit (stamped into
+/// release builds via `POND_BUILD_COMMIT`) and the build target.
 static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
     match option_env!("POND_BUILD_COMMIT") {
-        Some(commit) if !commit.is_empty() => {
-            format!("{} ({commit} {target})", env!("CARGO_PKG_VERSION"))
-        }
-        _ => format!("{} ({target})", env!("CARGO_PKG_VERSION")),
+        Some(commit) if !commit.is_empty() => format!("{} ({commit} {target})", *VERSION),
+        _ => format!("{} ({target})", *VERSION),
     }
 });
 
@@ -216,7 +223,8 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 /// `help_template_lists_every_subcommand` test fails if a verb is added to
 /// `Command` without a line here.
 const HELP_TEMPLATE: &str = "\
-{about-with-newline}
+{about-with-newline}pond {version}
+
 {usage-heading} {usage}
 
 Commands:
@@ -254,7 +262,7 @@ Options:
 #[derive(Debug, Parser)]
 #[command(
     name = "pond",
-    version,
+    version = VERSION.as_str(),
     long_version = LONG_VERSION.as_str(),
     styles = STYLES,
     max_term_width = 100,
@@ -936,10 +944,17 @@ fn cap_serve_io_buffer() {
     tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB for serving");
 }
 
+/// How often a serving process re-ensures the resident meta map after the
+/// initial prewarm. A poll is a cheap version check; an actual rebuild only
+/// fires when sync / remote writers have advanced the messages version.
+const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Warm the search indices in the background at server startup (spec.md#search).
 /// The cold S3 index load (175-442 s) is paid once here, off the request path,
 /// so the first user query is fast instead of catastrophic. Best effort:
-/// serving starts immediately and a failure is logged, not fatal.
+/// serving starts immediately and a failure is logged, not fatal. After warming,
+/// the task stays alive refreshing the resident meta map so a long-running
+/// server tracks new data instead of decaying to the take_rows fallback.
 fn spawn_prewarm(store: Arc<Store>) {
     let cache_dir = default_cache_dir();
     tokio::spawn(async move {
@@ -952,6 +967,12 @@ fn spawn_prewarm(store: Arc<Store>) {
             ),
             Err(error) => {
                 tracing::warn!(%error, "prewarm: failed; first query will pay the cold load");
+            }
+        }
+        loop {
+            tokio::time::sleep(ROWMAP_REFRESH_INTERVAL).await;
+            if let Err(error) = store.ensure_rowmap(&cache_dir).await {
+                tracing::debug!(%error, "rowmap refresh skipped");
             }
         }
     });
@@ -3035,8 +3056,7 @@ async fn run_embed_stage_with_limit(
         store.drop_vector_index().await?;
     }
 
-    let progress = store.embedding_progress().await?;
-    let backlog = progress.total.saturating_sub(progress.embedded);
+    let backlog = store.embed_backlog_count().await?;
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
         None => backlog,
@@ -4436,7 +4456,12 @@ mod tests {
     fn help_snapshots() {
         let mut root = Cli::command();
         root.build();
-        insta::assert_snapshot!("help_root", root.render_long_help().to_string());
+        // Normalize the version so a release bump doesn't churn the snapshot.
+        let root_help = root
+            .render_long_help()
+            .to_string()
+            .replace(VERSION.as_str(), "[VERSION]");
+        insta::assert_snapshot!("help_root", root_help);
         let visible: Vec<String> = root
             .get_subcommands()
             .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")

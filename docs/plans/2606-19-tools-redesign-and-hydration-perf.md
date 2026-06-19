@@ -5,7 +5,7 @@
 The design was reworked with the user on 2026-06-19. **The two authoritative sections are "Decisions locked" and "Hydration architecture" (immediately below).** Sections 0-10 are the original handoff - kept for measurements, mechanics, and the validation playbook, but where they conflict with the two authoritative sections, the authoritative sections win. In particular the original "do A first / drop hybrid to unblock B" framing is **wrong and overruled** (see Outcome): hybrid is being dropped, but for product reasons (vector-default + recency boost), not to unblock B.
 
 **Build order for the next session:**
-1. **Retrieval-shape redesign** - drop hybrid + `fuse_arms`; `mode=vector|fts` (default vector); split scoring (gate = raw cosine `min_score` default 0; order = cosine + recency-boost 0.1/30d post-gate); fts = BM25 + `sort_by`, `min_score`->error; `sort_by=relevance|recency` both modes; drop `include_subagents`/`source_agent`/`format`/`hybrid` params (subagents via SQL only). Rebuild the take_rows hydration on the now-1:1 single-arm surface (it becomes the cache-miss fallback). Validate with the **free local** recall harness.
+1. **Retrieval-shape redesign** - drop hybrid + `fuse_arms`; `mode=vector|fts` (default vector); split scoring (gate = raw cosine `min_score` default 0; order = cosine + recency-boost 0.02/30d post-gate); fts = BM25 + `sort_by`, `min_score`->error; `sort_by=relevance|recency` both modes; drop `include_subagents`/`source_agent`/`format`/`hybrid` params (subagents via SQL only). Rebuild the take_rows hydration on the now-1:1 single-arm surface (it becomes the cache-miss fallback). Validate with the **free local** recall harness.
 2. **`pond_get`** - one tool, prefixed params (`session_*` + `message_*`), `message_context_before/after=3`; drop `response_mode`/`offset`/`after_id`.
 3. **`pond_sql_query`** - drop `json` (keep `text|parquet|ndjson`).
 4. **Output discipline** - 10k per-item truncation + pagination/expansion markers; no-cap session grouping + "N newer messages" footer; tool descriptions carry the decision rule.
@@ -38,7 +38,7 @@ Settled with the user after the recall A/B and an agent-ergonomics discussion. T
 
 **`pond_search` surface:**
 - `mode = vector | fts`, **default vector**. Hybrid and `fuse_arms` are **deleted** (server-side fusion replaced by the agent choosing the arm per query). The recall objection to dropping hybrid was withdrawn: it rested on a fixed-mode A/B over a tiny 21-query set, which does not represent per-query agent routing; vector-default + recency boost is what the user actually wants (it served them well in `~/pj/claude-kb/`; pond's hybrid felt degraded mainly for lack of a recency boost).
-- `vector`: ordering = cosine + recency-boost (additive, magnitude 0.1, 30-day exp decay, **post-gate tiebreaker** - never makes strongly-relevant old content invisible). `min_score` gates on raw cosine, **default 0** (calibrate later against the recall set; present/absent cosine overlap, so 0.3 risks the false-negative problem - `searchable_in_scope` carries the absence honesty). `sort_by` honored.
+- `vector`: ordering = cosine + recency-boost (additive, magnitude 0.02, 30-day exp decay, **post-gate tiebreaker** - never makes strongly-relevant old content invisible). `min_score` gates on raw cosine, **default 0** (calibrate later against the recall set; present/absent cosine overlap, so 0.3 risks the false-negative problem - `searchable_in_scope` carries the absence honesty). `sort_by` honored.
 - `fts`: BM25 as the **matcher**; **default ordering = relevance (BM25)** because agents are trained to expect relevance from anything called "search". `min_score` is **disallowed -> error** (BM25 is unbounded and not comparable across queries, unlike bounded cosine). `sort_by` honored.
 - `sort_by = relevance | recency` on **both** modes. When a response is recency-sorted it must be **labeled** so the agent does not misread rank-1 as best-match.
 - Dropped params: `include_subagents`, `source_agent`, `format`, and the wire `hybrid` mode. Subagents are reachable **only** via `pond_sql_query` (`parent_session_id`) - intentional; they pollute main search too much.
@@ -169,7 +169,7 @@ When no map is loaded (local tests, pre-prewarm) there are no row_ids from the i
 
 **Scoring (prerequisite that makes `min_score` real):**
 - Split the score's two jobs: gating = raw cosine [0,1] (feeds `min_score`); ordering = cosine + recency-boost.
-- Recency boost: additive, magnitude 0.1, scale 30 days, post-gate, exp decay - a gentle cross-session tiebreaker that never makes old content invisible (the gate does the filtering).
+- Recency boost: additive, magnitude 0.02, scale 30 days, post-gate, exp decay - a gentle cross-session tiebreaker that never makes old content invisible (the gate does the filtering).
 - Intra-session supersession is handled by the footer + newest-first, not the boost.
 
 **Decision rule (bake into tool descriptions):** concepts -> `pond_search vector` | known exact words -> `pond_search fts` | symbols/substrings/chars, analytics, subagents -> `pond_sql_query`. Find a thread -> `pond_search` -> read the arc -> `pond_get_session` -> expand a tool/any message -> `pond_get_message` -> latest state -> `from=end`.

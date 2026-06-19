@@ -161,6 +161,7 @@ walkdir = "2.5"
 # fallible username/hostname/devicename lookups.
 whoami = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }

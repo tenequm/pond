@@ -1142,7 +1142,7 @@ mod search_handler {
 
         // Hydrate hit metadata (timestamp, role, project, preview source) from
         // the `messages` table - the retrievers return only keys (+ rowids). When
-        // every selected hit carries a stable rowid (row-key map loaded), take
+        // every selected hit carries a stable rowid (row meta map loaded), take
         // exactly those rows by id - no `IN x IN` cross-product scan and none of
         // its scalar-index page reads. Otherwise fall back to the keyed IN-scan.
         let rowids: Option<Vec<u64>> = selected.iter().map(|candidate| candidate.rowid).collect();
