@@ -577,29 +577,44 @@ pub struct SearchRequest {
     #[serde(default)]
     pub namespace: Option<String>,
     pub query: String,
-    // Server normally decides between hybrid and FTS-only from the embedder +
-    // embeddings-coverage state (spec.md#search); `mode_override` is the
-    // operator-tooling escape hatch. Production callers (MCP, HTTP agents)
-    // should leave it `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode_override: Option<SearchModeWire>,
+    /// Retrieval arm (spec.md#search). `vector` (default) matches on meaning;
+    /// `fts` matches exact whole words via BM25. The agent picks per query -
+    /// there is no server-side fusion. If `vector` is asked of a store with no
+    /// embeddings, the server falls back to `fts`.
+    #[serde(default)]
+    pub mode: SearchModeWire,
+    /// Result ordering. `relevance` (default) ranks by match strength (vector:
+    /// cosine + a gentle recency tiebreaker; fts: BM25); `recency` ranks
+    /// strictly newest-first. A recency-sorted response is labeled so the
+    /// caller does not misread rank-1 as the best match.
+    #[serde(default)]
+    pub sort_by: SortBy,
     #[serde(default)]
     pub filters: SearchFilters,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
 
-/// Wire-level retrieval mode override (spec.md#search). Not normally set on
-/// the wire - the server decides hybrid vs FTS-only from embedding
-/// availability. The variant exists so operator tooling (`pond search --mode`,
-/// the embeddings-benchmark harness) can force one arm without an env-var
-/// backdoor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Wire-level retrieval arm (spec.md#search). The agent chooses per query:
+/// `vector` for concepts/meaning (default), `fts` for known exact words
+/// (BM25). The old server-side hybrid fusion is gone - one arm per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchModeWire {
     Fts,
+    #[default]
     Vector,
-    Hybrid,
+}
+
+/// Result ordering for `pond_search` (spec.md#search).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortBy {
+    /// Match strength: vector = cosine + recency tiebreaker, fts = BM25.
+    #[default]
+    Relevance,
+    /// Strictly newest-first; the response is labeled as recency-sorted.
+    Recency,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -609,26 +624,18 @@ pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
-    /// Score floor; hits below it are dropped. Not an absence signal: present
-    /// and absent content score in overlapping bands (see
-    /// `docs/researches/embeddings.md`), so the default stays 0 and the
-    /// response's `searchable_in_scope` carries the honesty instead.
+    /// Raw-cosine score floor for `vector` mode; hits below it are dropped.
+    /// Not an absence signal: present and absent content score in overlapping
+    /// bands (see `docs/researches/embeddings.md`), so the default stays 0 and
+    /// the response's `searchable_in_scope` carries the honesty instead.
+    /// Disallowed in `fts` mode (BM25 is unbounded and not comparable across
+    /// queries) - the handler rejects a non-zero value there.
     // Skip the default 0.0 so an unfiltered request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
-    /// Include subagent sessions (`source_agent` like `claude-code/<name>`).
-    /// Default false: a search targets the human-facing main sessions.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub include_subagents: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn is_zero_f64(value: &f64) -> bool {

@@ -169,6 +169,16 @@ struct Args {
     /// normal phases. `--storage-path` selects the corpus; no Python harness.
     #[arg(long)]
     recall: Option<std::path::PathBuf>,
+    /// Retrieval mode for `--recall` (`fts` | `vector` | `hybrid`). Defaults to
+    /// the server default (omit override) so recall reflects what production
+    /// search actually returns. Set explicitly to A/B arms.
+    #[arg(long)]
+    recall_mode: Option<String>,
+    /// Per-query `min_score` for `--recall` (raw cosine gate in vector mode).
+    /// Lets the gate be calibrated against the ground-truth set without code
+    /// edits. Default 0 (no gate).
+    #[arg(long)]
+    recall_min_score: Option<f64>,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
@@ -456,7 +466,8 @@ fn search_request(query: &str, mode: Option<SearchModeWire>, limit: usize) -> Se
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode_override: mode,
+        mode: mode.unwrap_or_default(),
+        sort_by: pond::wire::SortBy::Relevance,
         filters: SearchFilters::default(),
         limit,
     }
@@ -1180,14 +1191,14 @@ async fn main() -> Result<()> {
             .vector_search(wv.first().context("no warm vec")?, 100, &empty, Some(&cfg))
             .await?;
         let warm_hits = store.fts_search(QUERIES[0], 1, &empty).await?;
-        let get_id = warm_hits.first().map(|(key, _)| key.message_id.clone());
+        let get_id = warm_hits.first().map(|hit| hit.key.message_id.clone());
         if let Some(id) = &get_id {
             let _ = pond_get(&store, get_request(id.clone())).await;
         }
         let _ = pond_search(
             &store,
             &embedder,
-            search_request(QUERIES[0], Some(SearchModeWire::Hybrid), args.limit),
+            search_request(QUERIES[0], None, args.limit),
             &cfg,
         )
         .await;
@@ -1246,13 +1257,8 @@ async fn main() -> Result<()> {
             // Full request: scope + arms + hydration. Hydration GETs are the
             // remainder once the separately-measured arms are subtracted.
             meas!(4, {
-                let _ = pond_search(
-                    &store,
-                    &embedder,
-                    search_request(q, Some(SearchModeWire::Hybrid), args.limit),
-                    &cfg,
-                )
-                .await;
+                let _ =
+                    pond_search(&store, &embedder, search_request(q, None, args.limit), &cfg).await;
             });
         }
 
@@ -1317,7 +1323,18 @@ async fn main() -> Result<()> {
         let mut s_at_3 = 0usize;
         let mut p_at_1 = 0usize;
         let mut mrr_sum = 0.0f64;
-        println!("\n=== recall (hybrid, {}) ===", target_label(&target));
+        let recall_mode = match args.recall_mode.as_deref() {
+            None => None,
+            Some("fts") => Some(SearchModeWire::Fts),
+            Some("vector") => Some(SearchModeWire::Vector),
+            Some(other) => anyhow::bail!("--recall-mode must be fts|vector, got {other}"),
+        };
+        let mode_label = args.recall_mode.as_deref().unwrap_or("server-default");
+        println!(
+            "\n=== recall ({mode_label}, min_score={}, {}) ===",
+            args.recall_min_score.unwrap_or(0.0),
+            target_label(&target)
+        );
         println!("{:<10}{:>6}  query", "id", "rank");
         for line in tsv.lines().skip(1) {
             let cols: Vec<&str> = line.split('\t').collect();
@@ -1332,7 +1349,8 @@ async fn main() -> Result<()> {
                 .map(str::trim)
                 .filter(|token| !token.is_empty())
                 .collect();
-            let request = search_request(query, Some(SearchModeWire::Hybrid), args.limit);
+            let mut request = search_request(query, recall_mode, args.limit);
+            request.filters.min_score = args.recall_min_score.unwrap_or(0.0);
             let rank = match pond_search(&store, &embedder, request, &cfg).await {
                 SearchEnvelope::Success(response) => {
                     let mut hit_rank = 0usize;
@@ -1424,7 +1442,7 @@ async fn main() -> Result<()> {
         sampler.mark_phase_start();
         let rss_start_kb = sampler.current_kb();
         let pf_start_kb = sampler.current_pf_kb();
-        let request = search_request(QUERIES[0], Some(SearchModeWire::Hybrid), args.limit);
+        let request = search_request(QUERIES[0], None, args.limit);
         let t = Instant::now();
         let envelope = pond_search(&store, &embedder, request, &cfg).await;
         let first_ms = t.elapsed().as_millis();
@@ -1455,7 +1473,7 @@ async fn main() -> Result<()> {
             embedder: &embedder,
             cfg: &cfg,
             sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
+            mode: None,
             queries: &warmup,
             limit: args.limit,
             record_hits: false,
@@ -1471,7 +1489,7 @@ async fn main() -> Result<()> {
             embedder: &embedder,
             cfg: &cfg,
             sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
+            mode: None,
             queries: &queries,
             limit: args.limit,
             record_hits: true,
@@ -1554,7 +1572,7 @@ async fn main() -> Result<()> {
                 embedder: &reloaded,
                 cfg: &cfg,
                 sampler: &sampler,
-                mode: Some(SearchModeWire::Hybrid),
+                mode: None,
                 queries: &queries,
                 limit: args.limit,
                 record_hits: false,
@@ -1863,7 +1881,7 @@ async fn run_cap_sweep(args: &Args, target: &OpenTarget) -> Result<()> {
             embedder: &embedder,
             cfg: &cfg,
             sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
+            mode: None,
             queries: &warmup,
             limit: args.limit,
             record_hits: false,
@@ -1876,7 +1894,7 @@ async fn run_cap_sweep(args: &Args, target: &OpenTarget) -> Result<()> {
             embedder: &embedder,
             cfg: &cfg,
             sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
+            mode: None,
             queries: &queries,
             limit: args.limit,
             record_hits: false,

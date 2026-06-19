@@ -332,7 +332,8 @@ fn search_request(query: &str, limit: usize) -> SearchRequest {
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode_override: Some(SearchModeWire::Fts),
+        mode: SearchModeWire::Fts,
+        sort_by: pond::wire::SortBy::Relevance,
         filters: SearchFilters::default(),
         limit,
     }

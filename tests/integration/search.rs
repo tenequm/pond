@@ -18,7 +18,7 @@ use pond::{
     wire::PartKind,
     wire::{
         GetEnvelope, GetRequest, GetResult, ProjectFilter, ResponseMode, SearchEnvelope,
-        SearchFilters, SearchRequest,
+        SearchFilters, SearchModeWire, SearchRequest, SortBy,
     },
 };
 use std::sync::Arc;
@@ -85,7 +85,8 @@ fn search_request(query: &str) -> SearchRequest {
         protocol_version: pond::PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode_override: None,
+        mode: SearchModeWire::Vector,
+        sort_by: SortBy::Relevance,
         filters: SearchFilters::default(),
         limit: 20,
     }
@@ -169,21 +170,19 @@ fn get_request_text_only(session_id: &str) -> GetRequest {
     }
 }
 
-/// The retrieval mode is server-determined: hybrid when the store has any
-/// vectors, FTS-only otherwise. The wire surface does not carry a mode field;
-/// the only observable is whether the corpus yields scored hits at all.
+/// The default `vector` arm degrades to FTS-only when the store has no
+/// embeddings. Either way the corpus must yield scored, [0,1]-normalized hits.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_picks_hybrid_or_fts_based_on_store_state() -> anyhow::Result<()> {
+async fn search_vector_default_degrades_to_fts_without_embeddings() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;
 
     let hits =
         hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await);
-    assert!(!hits.is_empty(), "hybrid search must return hits");
-    for pair in hits.windows(2) {
-        assert!(pair[0].score >= pair[1].score, "hits must be score-ordered");
-    }
+    assert!(!hits.is_empty(), "vector search must return hits");
+    // Display score is clamped cosine; global hit order follows session rank +
+    // within-session recency, not a flat score sort, so only the bounds hold.
     for hit in &hits {
         assert!(
             (0.0..=1.0).contains(&hit.score),
@@ -237,14 +236,6 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     request.filters.session_id = Some(session_id.clone());
     let hits = hits_of(pond_search(&store, &embedder, request, &search_config()).await);
     assert!(hits.iter().all(|hit| hit.session_id == session_id));
-
-    // source_agent: the real agent returns hits; an unknown one returns none.
-    let mut request = search_request(&phrase);
-    request.filters.source_agent = Some("claude-code".to_owned());
-    assert!(!hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
-    let mut request = search_request(&phrase);
-    request.filters.source_agent = Some("no-such-agent".to_owned());
-    assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
 
     // date window: a far-future lower bound excludes the whole corpus.
     let mut request = search_request(&phrase);
@@ -351,8 +342,15 @@ async fn search_returns_one_session_row_with_top_matches_per_session() -> anyhow
         assert!(session.session_messages_count > 0);
         assert!(session.matched_message_count > 0);
         assert!(!session.matches.is_empty());
-        assert!(session.matches.len() <= 3);
-        assert!(session.matches[0].score > 0.0);
+        // No per-session match cap (the old MAX_MATCHES_PER_SESSION=3 is gone);
+        // scores are clamped to [0, 1].
+        for hit in &session.matches {
+            assert!((0.0..=1.0).contains(&hit.score));
+        }
+        // Within a session, matches render newest-first (recency supersession).
+        for pair in session.matches.windows(2) {
+            assert!(pair[0].timestamp >= pair[1].timestamp);
+        }
     }
     assert!(response.matched_total >= response.sessions.len());
 
@@ -402,7 +400,8 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         protocol_version: pond::PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: marker.to_owned(),
-        mode_override: None,
+        mode: SearchModeWire::Vector,
+        sort_by: SortBy::Relevance,
         filters: SearchFilters::default(),
         limit: 50,
     };

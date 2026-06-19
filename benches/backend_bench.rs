@@ -163,7 +163,8 @@ fn search_request(query: &str, mode: Option<SearchModeWire>) -> SearchRequest {
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode_override: mode,
+        mode: mode.unwrap_or_default(),
+        sort_by: pond::wire::SortBy::Relevance,
         filters: SearchFilters::default(),
         limit: 10,
     }

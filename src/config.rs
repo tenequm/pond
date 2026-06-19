@@ -200,11 +200,11 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
 # re-enable via `pond adapters enable <adapter>`.
 
-# Embeddings. Search runs hybrid (vector + FTS) whenever the store has any
-# vectors, and FTS-only otherwise - the model loads lazily on the first hybrid
-# query, so there's no cost on FTS-only corpora. `model` selects the
-# HuggingFace XLM-RoBERTa model; `dim` declares its output width and is baked
-# into the messages.vector schema on table creation - it must equal the
+# Embeddings. Search defaults to the vector arm (matching on meaning) when the
+# store has any vectors, falling back to FTS otherwise - the model loads lazily
+# on the first vector query, so there's no cost on FTS-only corpora. `model`
+# selects the HuggingFace XLM-RoBERTa model; `dim` declares its output width and
+# is baked into the messages.vector schema on table creation - it must equal the
 # model's hidden_size.
 #
 # Common pairings:
@@ -417,9 +417,9 @@ pub struct MaintenanceConfig {
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master
-/// switch - the search path always runs hybrid when vectors exist in the
-/// store and FTS-only when they don't (`has_embeddings()` is the only gate);
-/// the candle/Metal model is `LazyEmbedder`-loaded on the first query that
+/// switch - a `vector` search degrades to FTS when no vectors exist in the
+/// store (`has_embeddings()` is the only gate); the candle/Metal model is
+/// `LazyEmbedder`-loaded on the first query that
 /// actually needs it. `model` and `dim` are installed into the process at
 /// startup via `embed::init_model_id` / `sessions::init_embedding_dim`, so
 /// swapping models for a one-off experiment is a temporary config file - no

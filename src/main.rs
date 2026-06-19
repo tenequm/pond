@@ -59,7 +59,13 @@ struct PondArchiveManifest {
 pub enum CliSearchMode {
     Fts,
     Vector,
-    Hybrid,
+}
+
+/// CLI surface for `pond search --sort-by`. Maps 1:1 to wire `SortBy`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSortBy {
+    Relevance,
+    Recency,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -79,7 +85,15 @@ impl From<CliSearchMode> for SearchModeWire {
         match mode {
             CliSearchMode::Fts => SearchModeWire::Fts,
             CliSearchMode::Vector => SearchModeWire::Vector,
-            CliSearchMode::Hybrid => SearchModeWire::Hybrid,
+        }
+    }
+}
+
+impl From<CliSortBy> for wire::SortBy {
+    fn from(sort_by: CliSortBy) -> Self {
+        match sort_by {
+            CliSortBy::Relevance => wire::SortBy::Relevance,
+            CliSortBy::Recency => wire::SortBy::Recency,
         }
     }
 }
@@ -416,13 +430,14 @@ enum Command {
     },
     /// Search stored messages.
     ///
-    /// Hybrid retrieval (semantic + full-text) when embeddings exist,
-    /// full-text otherwise. Keep the query about concepts; scope with
+    /// `--mode vector` (default) matches on meaning; `--mode fts` matches exact
+    /// whole words (BM25). Keep the query about concepts; scope with
     /// `--project`, `--from-date`, and friends instead of putting names in
     /// the query.
     #[command(after_long_help = "Examples:
   pond search \"lance compaction tuning\"
   pond search \"auth retry\" --project pond --limit 5
+  pond search \"merge_insert\" --mode fts --sort-by recency
   pond search \"migration plan\" --from-date 2026-05-01 --format json")]
     #[command(display_order = 10)]
     Search {
@@ -436,13 +451,14 @@ enum Command {
         /// Max sessions to return.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Operator-only retrieval mode override.
-        ///
-        /// Production callers should omit this and let the server pick
-        /// (hybrid when embeddings exist, FTS-only otherwise); benchmark and
-        /// ablation harnesses use it to force one arm against the same corpus.
+        /// Retrieval arm: `vector` (default - matches on meaning) or `fts`
+        /// (exact whole words, BM25). Falls back to `fts` when the store has no
+        /// embeddings.
         #[arg(long, value_enum)]
         mode: Option<CliSearchMode>,
+        /// Result order: `relevance` (default) or `recency` (newest first).
+        #[arg(long, value_enum)]
+        sort_by: Option<CliSortBy>,
         /// Project filter: substring match by default.
         ///
         /// `--project pond` -> contains "pond". Prefix with `re:` for regex
@@ -454,23 +470,16 @@ enum Command {
         /// possibly long, session.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Filter to one source agent, e.g. `claude-code` (or
-        /// `claude-code/general-purpose` for a subagent).
-        #[arg(long, value_name = "AGENT")]
-        source_agent: Option<String>,
-        /// Include subagent sessions (excluded by default).
-        #[arg(long)]
-        include_subagents: bool,
         /// ISO date (YYYY-MM-DD) lower bound, inclusive.
         #[arg(long)]
         from_date: Option<String>,
         /// ISO date (YYYY-MM-DD) upper bound, inclusive.
         #[arg(long)]
         to_date: Option<String>,
-        /// Server-side score threshold; hits below this are dropped.
-        ///
-        /// Not an absence signal: present and absent content score in
-        /// overlapping bands, so leave at 0 unless trimming an over-long tail.
+        /// Score floor on raw cosine (vector mode only); hits below it are
+        /// dropped. Rejected in fts mode (BM25 is unbounded). Not an absence
+        /// signal - present and absent content score in overlapping bands, so
+        /// leave at 0 unless trimming an over-long tail.
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
         /// Print Lance query plans instead of search results.
@@ -1221,10 +1230,9 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             limit,
             mode,
+            sort_by,
             project,
             session_id,
-            source_agent,
-            include_subagents,
             from_date,
             to_date,
             min_score,
@@ -1238,15 +1246,14 @@ async fn main() -> anyhow::Result<()> {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
                 query,
-                mode_override: mode.map(SearchModeWire::from),
+                mode: mode.map(SearchModeWire::from).unwrap_or_default(),
+                sort_by: sort_by.map(wire::SortBy::from).unwrap_or_default(),
                 filters: SearchFilters {
                     project,
                     session_id,
-                    source_agent,
                     from_date,
                     to_date,
                     min_score,
-                    include_subagents,
                 },
                 limit,
             };
@@ -4206,11 +4213,13 @@ fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
 fn render_search_session(rank: usize, session: &SearchSession) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
 
+    // Highest score among matches; matches render newest-first, so the first
+    // is not necessarily the best.
     let best_score = session
         .matches
-        .first()
+        .iter()
         .map(|hit| hit.score)
-        .unwrap_or_default();
+        .fold(0.0_f64, f64::max);
     output(&format!(
         "{}  best={}  {}/{} matched",
         paint(&format!("[{rank}]"), dim()),

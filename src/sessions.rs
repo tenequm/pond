@@ -192,6 +192,17 @@ pub struct MessageKey {
     pub message_id: String,
 }
 
+/// One retrieval-arm hit. `rowid` is `Some` when the row-key map (or its
+/// take_rows miss-fallback) resolved a stable row id, which lets hydration
+/// `take_rows` the exact row instead of re-finding it with an `IN`-predicate
+/// scan; `None` on the no-map fallback path (local tests, pre-prewarm).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub rowid: Option<u64>,
+    pub key: MessageKey,
+    pub score: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertStatus {
     Inserted,
@@ -1694,26 +1705,33 @@ impl Store {
         &self,
         map: &RowKeyMap,
         hits: Vec<(u64, f32)>,
-    ) -> Result<Vec<(MessageKey, f32)>> {
+    ) -> Result<Vec<SearchHit>> {
         let mut resolved = Vec::with_capacity(hits.len());
         let mut misses: Vec<(u64, f32)> = Vec::new();
         for (rowid, score) in hits {
             match map.lookup(rowid) {
-                Some((session_id, message_id)) => resolved.push((
-                    MessageKey {
+                Some((session_id, message_id)) => resolved.push(SearchHit {
+                    rowid: Some(rowid),
+                    key: MessageKey {
                         session_id: session_id.to_owned(),
                         message_id: message_id.to_owned(),
                     },
                     score,
-                )),
+                }),
                 None => misses.push((rowid, score)),
             }
         }
+        // A miss still knows its rowid; carry it so hydration can take_rows it
+        // alongside the hits the map resolved.
         if !misses.is_empty() {
             let rowids: Vec<u64> = misses.iter().map(|(rowid, _)| *rowid).collect();
             let keys = self.message_keys_by_rowids(&rowids).await?;
-            for ((_, score), key) in misses.into_iter().zip(keys) {
-                resolved.push((key, score));
+            for ((rowid, score), key) in misses.into_iter().zip(keys) {
+                resolved.push(SearchHit {
+                    rowid: Some(rowid),
+                    key,
+                    score,
+                });
             }
         }
         Ok(resolved)
@@ -1874,7 +1892,7 @@ impl Store {
         query: &str,
         limit: usize,
         filter: &Predicate,
-    ) -> Result<Vec<(MessageKey, f32)>> {
+    ) -> Result<Vec<SearchHit>> {
         let mut hits = if let Some(map) = self.rowmap.load_full() {
             let rowid_hits = self.fts_search_rowids(query, limit, filter).await?;
             self.resolve_rowid_hits(&map, rowid_hits).await?
@@ -1890,11 +1908,11 @@ impl Store {
         // Sort by `score desc`, then `(session_id, message_id)` asc.
         hits.sort_by(|left, right| {
             right
-                .1
-                .partial_cmp(&left.1)
+                .score
+                .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.0.session_id.cmp(&right.0.session_id))
-                .then_with(|| left.0.message_id.cmp(&right.0.message_id))
+                .then_with(|| left.key.session_id.cmp(&right.key.session_id))
+                .then_with(|| left.key.message_id.cmp(&right.key.message_id))
         });
         Ok(hits)
     }
@@ -1931,7 +1949,7 @@ impl Store {
         query: &str,
         limit: usize,
         filter: &Predicate,
-    ) -> Result<Vec<(MessageKey, f32)>> {
+    ) -> Result<Vec<SearchHit>> {
         let mut scanner = self.fts_scanner(query, limit, filter).await?;
         scanner.project(&["session_id", "id", "_score"])?;
         let batch = scanner.try_into_batch().await?;
@@ -1941,7 +1959,11 @@ impl Store {
                 session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
                 message_id: string(&batch, "id", row)?.context("fts hit id is null")?,
             };
-            hits.push((key, float32(&batch, "_score", row)?));
+            hits.push(SearchHit {
+                rowid: None,
+                key,
+                score: float32(&batch, "_score", row)?,
+            });
         }
         Ok(hits)
     }
@@ -2075,7 +2097,7 @@ impl Store {
         limit: usize,
         filter: &Predicate,
         search: Option<&config::SearchConfig>,
-    ) -> Result<Vec<(MessageKey, f32)>> {
+    ) -> Result<Vec<SearchHit>> {
         let mut hits = if let Some(map) = self.rowmap.load_full() {
             let rowid_hits = self
                 .vector_search_rowids(query, limit, filter, search)
@@ -2091,11 +2113,11 @@ impl Store {
         // neighbors. Sort by distance asc (smaller = more similar), then by
         // `(session_id, message_id)` asc.
         hits.sort_by(|left, right| {
-            left.1
-                .partial_cmp(&right.1)
+            left.score
+                .partial_cmp(&right.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.0.session_id.cmp(&right.0.session_id))
-                .then_with(|| left.0.message_id.cmp(&right.0.message_id))
+                .then_with(|| left.key.session_id.cmp(&right.key.session_id))
+                .then_with(|| left.key.message_id.cmp(&right.key.message_id))
         });
         Ok(hits)
     }
@@ -2153,7 +2175,7 @@ impl Store {
         limit: usize,
         filter: &Predicate,
         search: Option<&config::SearchConfig>,
-    ) -> Result<Vec<(MessageKey, f32)>> {
+    ) -> Result<Vec<SearchHit>> {
         let mut scanner = self.vector_scanner(query, limit, filter, search).await?;
         scanner.project(&["session_id", "id", "_distance"])?;
         let batch = scanner.try_into_batch().await?;
@@ -2163,7 +2185,11 @@ impl Store {
                 session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
                 message_id: string(&batch, "id", row)?.context("message id is null")?,
             };
-            hits.push((key, float32(&batch, "_distance", row)?));
+            hits.push(SearchHit {
+                rowid: None,
+                key,
+                score: float32(&batch, "_distance", row)?,
+            });
         }
         Ok(hits)
     }
@@ -2214,6 +2240,47 @@ impl Store {
             .explain_plan(true)
             .await
             .context("explain_plan failed")
+    }
+
+    /// Hydrate search hits by stable row id (spec.md#search): a precise
+    /// `take_rows` of exactly the displayed rows, instead of re-finding them
+    /// with the `session_id IN (...) AND id IN (...)` cross-product scan
+    /// `message_metas_by_keys` pays. `take_rows` returns rows in `rowids`
+    /// order, so the result aligns positionally with the input. Used when
+    /// every selected hit carries a rowid (row-key map loaded); the IN-scan
+    /// stays the no-map fallback.
+    pub async fn message_metas_by_rowids(&self, rowids: &[u64]) -> Result<Vec<MessageMeta>> {
+        if rowids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let projection = ProjectionRequest::from_columns(
+            [
+                "id",
+                "session_id",
+                "role",
+                "project",
+                "source_agent",
+                "timestamp",
+                "search_text",
+            ],
+            dataset.schema(),
+        );
+        let batch = dataset.take_rows(rowids, projection).await?;
+        let mut metas = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            metas.push(MessageMeta {
+                message_id: string(&batch, "id", row)?.context("id is null")?,
+                session_id: string(&batch, "session_id", row)?.context("session_id is null")?,
+                role: string(&batch, "role", row)?.context("role is null")?,
+                project: string(&batch, "project", row)?.context("project is null")?,
+                source_agent: string(&batch, "source_agent", row)?
+                    .context("source_agent is null")?,
+                timestamp: datetime(&batch, "timestamp", row)?,
+                search_text: string(&batch, "search_text", row)?.unwrap_or_default(),
+            });
+        }
+        Ok(metas)
     }
 
     /// Hydrate search hits: fetch message metadata for `(session_id, message_id)` keys.
@@ -5707,7 +5774,7 @@ mod tests {
             .vector_search(&synthetic_vector(0), 10, &Predicate::And(Vec::new()), None)
             .await?;
         assert!(
-            hits.iter().any(|(key, _)| key == &keys[0]),
+            hits.iter().any(|hit| hit.key == keys[0]),
             "an embedded row is retrievable via the index",
         );
         Ok(())

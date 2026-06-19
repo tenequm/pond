@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::{config::SearchConfig, embed::LazyEmbedder, sessions::Store};
 
 /// Shared state handed to both transports. `embedder` holds a lazy handle:
-/// the model isn't loaded until the first hybrid search asks for it, so
+/// the model isn't loaded until the first vector search asks for it, so
 /// `pond mcp` idles at ~50 MB resident and only pays the ~600 MB load cost on
 /// the first query that needs it (spec.md#search opt-in).
 #[derive(Clone)]
@@ -203,8 +203,8 @@ pub mod mcp {
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse,
             GetResult, MessageView, PartKind, PartSummary, ProjectFilter, ResponseMode,
-            ResponsePart, SearchEnvelope, SearchFilters, SearchRequest, SearchResponse,
-            SessionFrom, default_namespace,
+            ResponsePart, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
+            SearchResponse, SessionFrom, SortBy, default_namespace,
         },
     };
 
@@ -493,6 +493,17 @@ Examples (4 patterns the agent should recognize):
         /// not put project names in the query, use the `project` filter
         /// instead.
         query: String,
+        /// Retrieval arm: "vector" (default - matches on meaning) or "fts"
+        /// (matches exact whole words via BM25). Use vector for concepts/
+        /// paraphrases, fts when you know the literal words. Falls back to fts
+        /// when the store has no embeddings.
+        #[serde(default)]
+        mode: Option<String>,
+        /// Result order: "relevance" (default - best match first) or "recency"
+        /// (newest first; the response is labeled so you don't read rank-1 as
+        /// the best match).
+        #[serde(default)]
+        sort_by: Option<String>,
         /// Max sessions to return. Default 10, server-capped at 200. This is
         /// also the "want more results" knob - raise it; there is no pagination.
         #[serde(default)]
@@ -500,29 +511,16 @@ Examples (4 patterns the agent should recognize):
         /// Filter to projects whose path contains this substring.
         #[serde(default)]
         project: Option<String>,
-        /// Filter to one session (exact match) - semantic search within a
-        /// single, possibly long, session.
+        /// Filter to one session (exact match) - search within a single,
+        /// possibly long, session.
         #[serde(default)]
         session_id: Option<String>,
-        /// Filter to one source agent, e.g. "claude-code" or
-        /// "claude-code/general-purpose" (a subagent).
-        #[serde(default)]
-        source_agent: Option<String>,
-        /// Include subagent / sub-task sessions. Default false: search targets
-        /// the main sessions where the human and agent talked. Set true to
-        /// include subagent sessions (source_agent like "claude-code/<name>").
-        #[serde(default)]
-        include_subagents: Option<bool>,
         /// Only messages on or after this date (YYYY-MM-DD).
         #[serde(default)]
         from_date: Option<String>,
         /// Only messages on or before this date (YYYY-MM-DD).
         #[serde(default)]
         to_date: Option<String>,
-        /// Output shape: "text" (default - a rendered transcript of the ranked
-        /// hits) or "json" (the same hits as structured data).
-        #[serde(default)]
-        format: Option<String>,
     }
 
     /// `pond_get` MCP tool parameters. Exactly one of `message_id` /
@@ -603,6 +601,24 @@ Examples (4 patterns the agent should recognize):
         }
     }
 
+    /// Parse the `mode` param; unknown / absent defaults to vector. Returns
+    /// `None` for an explicit unknown value so the caller can reject it.
+    fn parse_search_mode(value: Option<&str>) -> Option<SearchModeWire> {
+        match value {
+            None | Some("vector") => Some(SearchModeWire::Vector),
+            Some("fts") => Some(SearchModeWire::Fts),
+            Some(_) => None,
+        }
+    }
+
+    fn parse_sort_by(value: Option<&str>) -> Option<SortBy> {
+        match value {
+            None | Some("relevance") => Some(SortBy::Relevance),
+            Some("recency") => Some(SortBy::Recency),
+            Some(_) => None,
+        }
+    }
+
     fn parse_response_mode(value: Option<String>) -> ResponseMode {
         match value.as_deref() {
             Some("complete") => ResponseMode::Complete,
@@ -629,53 +645,59 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
-            description = "Hybrid (vector + BM25) search over stored conversation history. \
+            description = "Semantic search over stored conversation history. Pick the arm per \
+                           query with `mode`: \"vector\" (default) matches on meaning - use it \
+                           for concepts and paraphrases; \"fts\" matches exact whole words \
+                           (BM25) - use it when you know the literal words. For symbols, \
+                           substrings, identifiers, cross-session analytics, or subagent \
+                           sessions, use pond_sql_query instead (this tool excludes subagents). \
                            Returns a readable transcript: a leading `key:` line explains the \
                            format and the first line states totals plus how many searchable \
                            messages the filters left in scope (the absence signal - search only \
                            sees conversational text, never tool calls/results), then results are \
-                           grouped by session, ordered by each session's best hit. Each hit is a \
-                           `--- [n] score | role | time | message_id | project | agent | session \
-                           ---` delimiter rule followed by the matched text. Pass a returned \
-                           `message_id` to `pond_get` for full text. Common args: \
-                           query (semantic - concepts, not project names), then project / \
+                           grouped by session, best session first; within a session, matching \
+                           messages are newest-first. Each hit is a `--- [n] score | role | time \
+                           | message_id | project | agent | session ---` rule followed by the \
+                           matched text. Pass a returned `message_id` to `pond_get` for full \
+                           text. Args: query (semantic - concepts, not project names), mode, \
+                           sort_by (\"relevance\" default | \"recency\"), project / session_id / \
                            from_date / to_date to scope, limit to widen (no pagination - raise \
-                           limit for more). Advanced: source_agent (e.g. \"claude-code\", or \
-                           \"claude-code/general-purpose\" for subagents), session_id (search \
-                           within one long session), include_subagents (subagent sessions are \
-                           excluded by default), format (\"text\" default, or \"json\" for \
-                           structured hits). \
-                           Scores are relative within one response; there is no min_score. For \
-                           exact strings, identifiers, or error messages, pond_sql_query is the \
-                           sharper tool - WHERE contains_tokens(search_text, 'words') to \
-                           filter, FROM fts('messages', ...) for BM25 ranking - and it sees \
-                           subagent sessions too.",
+                           limit for more). Scores are relative within one response.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
             &self,
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let json = matches!(params.format.as_deref(), Some("json"));
+            let Some(mode) = parse_search_mode(params.mode.as_deref()) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "unknown mode {:?}; use \"vector\" or \"fts\"",
+                    params.mode.unwrap_or_default()
+                ))]));
+            };
+            let Some(sort_by) = parse_sort_by(params.sort_by.as_deref()) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "unknown sort_by {:?}; use \"relevance\" or \"recency\"",
+                    params.sort_by.unwrap_or_default()
+                ))]));
+            };
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
                 query: params.query,
+                mode,
+                sort_by,
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.session_id,
-                    source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
                     // min_score is intentionally not on the MCP surface; scores
                     // are response-relative, so a server-side threshold is a
-                    // footgun for agent callers. CLI / HTTP still exposes it
-                    // for the bench harness.
+                    // footgun for agent callers. CLI / HTTP still exposes it.
                     min_score: 0.0,
-                    include_subagents: params.include_subagents.unwrap_or(false),
                 },
                 limit: params.limit.unwrap_or(10),
-                mode_override: None,
             };
             match run_search(
                 &self.state.store,
@@ -685,18 +707,6 @@ Examples (4 patterns the agent should recognize):
             )
             .await
             {
-                SearchEnvelope::Success(response) if json => {
-                    // `structured()` mirrors the same bytes into the text
-                    // content block, so shadowing clients still get the data.
-                    Ok(CallToolResult::structured(
-                        serde_json::to_value(&response).map_err(|error| {
-                            ErrorData::internal_error(
-                                format!("failed to serialize search response: {error}"),
-                                None,
-                            )
-                        })?,
-                    ))
-                }
                 SearchEnvelope::Success(response) => {
                     Ok(tool_result(render_search_transcript(&response, &request)))
                 }
@@ -1188,7 +1198,12 @@ Examples (4 patterns the agent should recognize):
     fn render_search_transcript(response: &SearchResponse, request: &SearchRequest) -> String {
         use std::fmt::Write;
         let subagent_note = if default_excludes_subagents(&request.filters) {
-            " Subagent sessions excluded; pass include_subagents=true to include them."
+            " Subagent sessions excluded; reach them via pond_sql_query (parent_session_id)."
+        } else {
+            ""
+        };
+        let recency_note = if matches!(request.sort_by, SortBy::Recency) {
+            " Sorted by recency (newest first) - rank is NOT match strength."
         } else {
             ""
         };
@@ -1217,24 +1232,32 @@ Examples (4 patterns the agent should recognize):
         let _ = writeln!(
             out,
             "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
-             sessions.{}",
+             sessions.{}{}",
             response.matched_total,
             response.searchable_in_scope,
             shown,
             response.sessions.len(),
             subagent_note,
+            recency_note,
         );
+        let order = if matches!(request.sort_by, SortBy::Recency) {
+            "newest session first"
+        } else {
+            "ordered by best hit"
+        };
         let _ = writeln!(
             out,
-            "key: session rules group hits by session, ordered by best hit; \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; raise limit for more (no pagination)."
+            "key: session rules group hits by session, {order}; within a session, messages are newest-first. \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; raise limit for more (no pagination)."
         );
         let mut index = 0;
         for (session_index, session) in response.sessions.iter().enumerate() {
+            // Highest score among the session's matches. Not `matches.first()`:
+            // matches render newest-first, so the first need not be the best.
             let best = session
                 .matches
-                .first()
+                .iter()
                 .map(|hit| hit.score)
-                .unwrap_or_default();
+                .fold(0.0_f64, f64::max);
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
@@ -1773,7 +1796,8 @@ Examples (4 patterns the agent should recognize):
                 protocol_version: crate::PROTOCOL_VERSION,
                 namespace: None,
                 query: "hi".to_owned(),
-                mode_override: None,
+                mode: SearchModeWire::Vector,
+                sort_by: SortBy::Relevance,
                 filters: SearchFilters::default(),
                 limit: 10,
             };
