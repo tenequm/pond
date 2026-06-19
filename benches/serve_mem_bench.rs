@@ -1087,17 +1087,25 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ---- Phase: sql_cold (first sql_query on a freshly opened store) ----
-    // One column-scan query, cache cold - the cold-start a `pond_sql_query`
-    // caller pays before anything is resident.
-    run_sql_phase("sql_cold", &store, &sampler, &SQL_QUERIES[1..2])
-        .await
-        .map(|s| phases.push(s))?;
+    // The isolation modes (attribute / io_trace / recall) early-return below
+    // before the normal phases; skip the SQL warmups for them. The cold
+    // MIN/MAX(timestamp) scan flakily trips pond's 30s query guard on a cold
+    // store, and these modes don't measure SQL - paying it only adds a failure
+    // mode unrelated to what they isolate.
+    let isolation = args.attribute || args.io_trace || args.recall.is_some();
+    if !isolation {
+        // ---- Phase: sql_cold (first sql_query on a freshly opened store) ----
+        // One column-scan query, cache cold - the cold-start a `pond_sql_query`
+        // caller pays before anything is resident.
+        run_sql_phase("sql_cold", &store, &sampler, &SQL_QUERIES[1..2])
+            .await
+            .map(|s| phases.push(s))?;
 
-    // ---- Phase: sql_steady (warm-cache sql_query latency) ----
-    run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
-        .await
-        .map(|s| phases.push(s))?;
+        // ---- Phase: sql_steady (warm-cache sql_query latency) ----
+        run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
+            .await
+            .map(|s| phases.push(s))?;
+    }
 
     // ---- Attribution: isolate the three hybrid components ----
     // pond_search runs `searchable_in_scope` (an IsNotNull(search_text) count)
@@ -1176,11 +1184,24 @@ async fn main() -> Result<()> {
         if let Some(id) = &get_id {
             let _ = pond_get(&store, get_request(id.clone())).await;
         }
+        let _ = pond_search(
+            &store,
+            &embedder,
+            search_request(QUERIES[0], Some(SearchModeWire::Hybrid), args.limit),
+            &cfg,
+        )
+        .await;
         io_trace::take(); // discard warm IO
 
-        let labels = ["scope_count", "fts_search", "vector_search", "pond_get"];
-        let mut iops: [Vec<u128>; 4] = Default::default();
-        let mut rbytes: [Vec<u128>; 4] = Default::default();
+        let labels = [
+            "scope_count",
+            "fts_search",
+            "vector_search",
+            "pond_get",
+            "pond_search",
+        ];
+        let mut iops: [Vec<u128>; 5] = Default::default();
+        let mut rbytes: [Vec<u128>; 5] = Default::default();
         #[cfg(feature = "io-trace")]
         let mut hist: std::collections::BTreeMap<String, (u64, u64)> =
             std::collections::BTreeMap::new();
@@ -1222,6 +1243,17 @@ async fn main() -> Result<()> {
                     let _ = pond_get(&store, get_request(id.clone())).await;
                 });
             }
+            // Full request: scope + arms + hydration. Hydration GETs are the
+            // remainder once the separately-measured arms are subtracted.
+            meas!(4, {
+                let _ = pond_search(
+                    &store,
+                    &embedder,
+                    search_request(q, Some(SearchModeWire::Hybrid), args.limit),
+                    &cfg,
+                )
+                .await;
+            });
         }
 
         println!("\n=== S3 IO per warm query (component isolated, optimized corpus) ===");
@@ -1240,6 +1272,24 @@ async fn main() -> Result<()> {
                 percentile(&iops[i], 0.95),
                 percentile(&rbytes[i], 0.5),
                 percentile(&rbytes[i], 0.95),
+            );
+        }
+        // Hydration = the full pond_search request minus its retrieval arms
+        // (scope_count + fts + vector); the remainder is message-meta + summary-
+        // part + per-session-count reads. Derived from p50s (GET counts are
+        // additive per request, so the subtraction is exact at each percentile).
+        let hydration = |p: f64| {
+            percentile(&iops[4], p) as i128
+                - percentile(&iops[0], p) as i128
+                - percentile(&iops[1], p) as i128
+                - percentile(&iops[2], p) as i128
+        };
+        if !iops[4].is_empty() {
+            println!(
+                "{:<16}{:>10}{:>10}    (derived: pond_search - scope - fts - vector)",
+                "  hydration",
+                hydration(0.5),
+                hydration(0.95),
             );
         }
         #[cfg(feature = "io-trace")]
