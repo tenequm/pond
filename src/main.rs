@@ -253,6 +253,7 @@ Commands:
 
   Shell
     completions  Generate shell completions
+    skill        Print the agent-onboarding SKILL.md
     help         Print this message or a subcommand's help
 
 Options:
@@ -718,6 +719,12 @@ Homebrew and nix packages ship these pre-installed.")]
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Print the bundled SKILL.md - the agent-onboarding pointer for pond.
+    ///
+    /// The same file an agent loads as a skill, emitted to stdout so it stays in
+    /// lockstep with the binary (no separate copy to drift).
+    #[command(display_order = 17)]
+    Skill,
     /// Keep the lake queryable: embed the backlog, then fold the search indexes.
     ///
     /// The maintenance verb. `embed` fills vectors for every message with a null
@@ -1315,6 +1322,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Schedule { command } => schedule::run(command)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
+        }
+        Command::Skill => {
+            use std::io::Write;
+            io::stdout().write_all(include_str!("../SKILL.md").as_bytes())?;
         }
         Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
         Command::Creds { command } => {

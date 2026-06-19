@@ -1,14 +1,14 @@
 ---
 name: pond
-description: Recall past AI agent sessions (Claude Code, Codex, opencode, and more) - lossless storage with hybrid semantic + full-text search, served over MCP.
+description: Recall past AI agent sessions (Claude Code, Codex, opencode, and more) - lossless storage with semantic and full-text search, served over MCP.
 ---
 
 # pond
 
 pond stores every session your AI agent clients produce - losslessly, in
 Lance datasets on a local disk or any S3-compatible bucket - and makes them
-searchable: hybrid (semantic + BM25) retrieval, full-transcript fetch, and
-read-only SQL.
+searchable: semantic (vector) and full-text (BM25) retrieval - the agent picks
+the arm per query - plus full-transcript fetch and read-only SQL.
 
 This file is a pointer, not a manual. pond is MCP-native: once registered,
 the MCP tool descriptions, resources (`schema://pond`, `schema://pond-sql`,
