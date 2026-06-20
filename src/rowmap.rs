@@ -359,6 +359,12 @@ impl RowMetaMap {
         self.count == 0
     }
 
+    /// Highest `row_id` in this segment (records are row_id-sorted), or `None`
+    /// when empty. With stable row ids this is the append high-water mark.
+    pub fn max_row_id(&self) -> Option<u64> {
+        self.records().last().map(|record| record.row_id)
+    }
+
     fn records(&self) -> &[Record] {
         let start = size_of::<Header>();
         let end = start + self.count * size_of::<Record>();
@@ -678,6 +684,21 @@ impl RowMetaSet {
     /// short-circuit the per-session source last-id read.
     pub fn is_empty(&self) -> bool {
         self.segments.iter().all(RowMetaMap::is_empty)
+    }
+
+    /// Total row entries across every segment. Rows are disjoint across segments
+    /// (append-only deltas), so this sums - the live row count the base covers.
+    pub fn len(&self) -> usize {
+        self.segments.iter().map(RowMetaMap::len).sum()
+    }
+
+    /// Highest `row_id` across all segments - the append high-water mark a delta
+    /// extends past. Stable row ids keep it monotonic under fragment churn.
+    pub fn max_row_id(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .filter_map(RowMetaMap::max_row_id)
+            .max()
     }
 
     /// Newest segment wins (a row lives in exactly one segment).

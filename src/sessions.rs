@@ -1653,39 +1653,52 @@ impl Store {
         // Validate any existing chain opens; an unreadable segment (an older
         // MAGIC after a pond upgrade, or a corrupt file) is purged so the build
         // below is a clean full rebuild instead of erroring forever or appending
-        // a fresh delta onto an unreadable base.
-        let mut chain = discover_chain(cache_dir, store_key);
-        if let Some(existing) = &chain
-            && let Err(error) = RowMetaSet::open(existing)
-        {
-            tracing::warn!(%error, store = store_key, "rowmap unreadable; purging and rebuilding");
-            Self::purge_rowmaps(cache_dir, store_key);
-            chain = None;
-        }
-        // A pure-append delta scan (None on store compaction) decides the path.
-        let delta = match &chain {
-            Some(existing) => self.collect_row_metas_delta(existing.version()).await?,
+        // a fresh delta onto an unreadable base. The opened set also feeds the
+        // delta its high-water mark and row count (cheap mmap reads).
+        let chain = discover_chain(cache_dir, store_key);
+        let existing = match &chain {
+            Some(paths) => match RowMetaSet::open(paths) {
+                Ok(set) => Some((paths, set)),
+                Err(error) => {
+                    tracing::warn!(%error, store = store_key, "rowmap unreadable; purging and rebuilding");
+                    Self::purge_rowmaps(cache_dir, store_key);
+                    None
+                }
+            },
+            None => None,
+        };
+        // A row-id-keyed append delta (None on a reclaimed base or net deletion)
+        // decides the path.
+        let delta = match &existing {
+            Some((_, set)) => {
+                self.collect_row_metas_delta(
+                    set.version(),
+                    set.max_row_id().unwrap_or(0),
+                    set.len(),
+                )
+                .await?
+            }
             None => None,
         };
 
-        let base_version = match (&chain, delta) {
-            // Pure append with room: layer a new delta segment.
-            (Some(existing), Some(entries)) if existing.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
+        let base_version = match (&existing, delta) {
+            // Append with room: layer a new delta segment.
+            (Some((paths, _)), Some(entries)) if paths.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
                 let path = RowMetaMap::delta_path(cache_dir, store_key, version);
                 RowMetaMap::build(&path, version, entries)?;
-                existing.base_version
+                paths.base_version
             }
-            // Pure append but the deltas are full: compact the existing segments
+            // Append but the deltas are full: compact the existing segments
             // (read locally from their mmaps) plus this delta into a fresh base -
             // no full store re-read.
-            (Some(existing), Some(entries)) => {
-                let mut merged = RowMetaSet::open(existing)?.merged_entries();
+            (Some((_, set)), Some(entries)) => {
+                let mut merged = set.merged_entries();
                 merged.extend(entries);
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
                 RowMetaMap::build(&path, version, merged)?;
                 version
             }
-            // No chain, or store compaction since the base: full scan -> base.
+            // No chain, or a reclaimed base / deletion since it: full scan -> base.
             _ => {
                 let entries = self.collect_row_metas().await?;
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
@@ -2077,41 +2090,50 @@ impl Store {
         Ok(out)
     }
 
-    /// Row metas for the fragments appended since `base_version` - the input to
-    /// a delta segment. `None` when the chain can't be extended by append, so the
-    /// caller rebuilds the base from a full scan instead: either a fragment
-    /// present at `base_version` is gone now (store compaction / deletion), or
-    /// `base_version`'s manifest was reclaimed by the cleanup retention window so
-    /// the version no longer resolves at all.
+    /// Row metas for the rows appended since the base segment - the input to a
+    /// delta layered on a base whose high-water mark is `base_max_row_id` and
+    /// which covers `base_row_count` rows. `None` (caller rebuilds the base from
+    /// a full scan) when the chain can't be cheaply extended:
+    /// - `base_version`'s manifest was reclaimed by the cleanup retention window
+    ///   (spec.md#concurrency), so the version no longer resolves; or
+    /// - the live row count dropped below the base: rows were deleted, and a
+    ///   pure append can't remove the base's now-stale entries.
+    ///
+    /// Stable row ids (`enable_stable_row_ids`) make this an append: embedding's
+    /// `merge_update` and compaction rewrite message fragments but preserve
+    /// row_ids and never touch a ROW_META column, so existing base entries stay
+    /// valid under that churn. Only genuine appends carry `row_id >
+    /// base_max_row_id`; emitting just those keeps the delta disjoint from the
+    /// base, which the per-segment count sums depend on.
     async fn collect_row_metas_delta(
         &self,
         base_version: u64,
+        base_max_row_id: u64,
+        base_row_count: usize,
     ) -> Result<Option<Vec<RowMetaEntry>>> {
         let dataset = self.handle.dataset(Table::Messages).await?;
-        // The cleanup retention window (spec.md#concurrency) can reclaim
-        // base_version's manifest after the chain was built. A base that no
-        // longer checks out is the compaction case below - rebuild from a full
-        // scan rather than letting the error nuke the whole oracle into
-        // re-reading every source on every sync.
         let Ok(old) = dataset.checkout_version(base_version).await else {
             return Ok(None);
         };
-        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
-        let current = dataset.get_fragments();
-        let current_ids: HashSet<u64> = current.iter().map(|f| f.id() as u64).collect();
-        if !old_ids.is_subset(&current_ids) {
+        if dataset.count_rows(None).await? < base_row_count {
             return Ok(None);
         }
-        let new_fragments: Vec<_> = current
+        // Restrict the scan to fragments added since the base (recent churn -
+        // not the untouched bulk). Rewritten/compacted fragments carry only
+        // existing row_ids (<= base_max_row_id) and are filtered out row-wise;
+        // genuine appends carry higher ids and are kept.
+        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
+        let added: Vec<_> = dataset
+            .get_fragments()
             .iter()
             .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
             .map(|fragment| fragment.metadata().clone())
             .collect();
-        if new_fragments.is_empty() {
+        if added.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let mut scanner = dataset.scan();
-        scanner.with_fragments(new_fragments);
+        scanner.with_fragments(added);
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
@@ -2120,7 +2142,10 @@ impl Store {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;
             for row in 0..batch.num_rows() {
-                out.push(row_meta_entry(&batch, rowids.value(row), row)?);
+                let row_id = rowids.value(row);
+                if row_id > base_max_row_id {
+                    out.push(row_meta_entry(&batch, row_id, row)?);
+                }
             }
         }
         Ok(Some(out))
@@ -6414,6 +6439,81 @@ mod tests {
             .session_message_counts(&["session-after".to_owned()])
             .await?;
         assert_eq!(counts.get("session-after").copied(), Some(1));
+        Ok(())
+    }
+
+    /// The steady-state hot path: embedding rewrites the message fragments every
+    /// sync (merge_update on the `vector` column). Keying the delta off fragment
+    /// identity made that rewrite force a full 2.1M-row rebuild every sync.
+    /// Stable row ids preserve row_ids across the rewrite, so the refresh must
+    /// layer a cheap append-only delta of just the new rows - and must NOT
+    /// double-count the rewritten rows that still live in the base.
+    #[tokio::test]
+    async fn ensure_rowmap_deltas_across_embedding_fragment_rewrite() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(store.rowmap_delta_count(), Some(0), "first build is a base");
+
+        // Embedding rewrites every message fragment (new fragment ids, same
+        // stable row_ids, untouched ROW_META columns).
+        store.write_embeddings(&embedded(&keys)).await?;
+
+        // A new session appends one row on top of the rewritten fragments.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: "session-after".to_owned(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/after".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: "m-after".to_owned(),
+                    session_id: "session-after".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-after".to_owned(),
+                    id: "m-after-part".to_owned(),
+                    message_id: "m-after".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("after embedding".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+
+        // The refresh layers a delta of just the appended row, not a full
+        // rebuild - despite every prior fragment having been rewritten.
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(
+            store.rowmap_delta_count(),
+            Some(1),
+            "fragment rewrite + append must layer a delta, not full-rebuild"
+        );
+
+        // Counts stay honest: the rewritten base rows are not re-emitted into the
+        // delta, so nothing is double-counted across base + delta segments.
+        let counts = store
+            .session_message_counts(&["session-after".to_owned(), "session-0".to_owned()])
+            .await?;
+        assert_eq!(counts.get("session-after").copied(), Some(1));
+        assert_eq!(
+            counts.get("session-0").copied(),
+            Some(1),
+            "a base row survived the rewrite without being double-counted"
+        );
         Ok(())
     }
 
