@@ -28,6 +28,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: pnpm/action-setup@v4
+        with:
+          # uses: steps run from the repo root, not docs/site, so point the
+          # action at the package.json that declares packageManager: pnpm@...
+          package_json_file: docs/site/package.json
 
       - uses: actions/setup-node@v4
         with:
