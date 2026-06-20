@@ -1,8 +1,56 @@
 # Changelog
 ## [0.10.0](https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0) - 2026-06-20
 
+This release rebuilds the admin CLI, the retrieval model, and the sync/copy write path - and makes remote-S3 operation dramatically faster.
+
 ### <!-- 0 -->🛠 Breaking Changes
-- **cli:** [**breaking**] explicit storage/adapter verbs - rename sources to adapters, switch-only use, top-level migrate + creds
+- **cli:** retire the overloaded "sources" - `[sources.*]`/`pond sources` -> `[adapters.*]`/`pond adapters`; config auto-migrates on `pond init`
+- **cli:** `pond storage use` is switch-only (a pure pointer flip, copies nothing); data copy moves to the new top-level `pond copy`; bare `pond storage` removed (use `pond status`)
+- **cli:** remove `pond export` / `pond import` - snapshot to a `.pond` archive or `.jsonl` stream and restore from one is now `pond copy --to <file>` / `pond copy --from <file>`
+- **cli:** split maintenance out of sync - `pond sync` runs import+embed+index by default; the new `pond optimize` verb runs embed+index on demand, and `sync --no-optimize` defers to it
+- **cli:** `pond sync` no longer discovers or auto-enables adapters - enabling is the explicit job of `pond adapters`/`pond init`, so a scheduled sync can never grow the adapter set
+- **cli:** verb convergence + flag renames - `--config`->`--config-file`, init `--schedule`->`--every`, `sync --source-dir`->`--path`, sync stage `update-indexes`->`index`, `--format pretty`->`text`; `--storage-path`/`--config-file` are now root-global selectors
+- **cli:** `pond copy` requires explicit endpoints, adds the `@` (configured store) and `local` keywords; self-verifying with an id-set completeness check (exit 0 SYNCED / exit 6 missing rows)
+- **storage:** first-class `pond creds {add,list,delete}` for URL-scoped credential sets; `pond init` captures remote creds inline (masked prompt, never argv)
+- **search:** drop server-side hybrid fusion for single-arm retrieval - `mode=vector` (default) or `mode=fts`, plus `--sort-by recency`
+- **search:** vector index IVF_PQ -> IVF_SQ (drop the refine pass); FTS moves from character-ngram to a word `simple` tokenizer with English stemming
+- **sync:** durable idempotent-replay sync/copy with a cheap messages-based S3 oracle and `sync --verify`; resident per-session `max_ts` watermark replaces the version-resolution oracle
+- **tools:** redesign `pond_get`/`pond_sql_query` and unify the transcript renderer
+- **copy:** append fast-path + per-table write plan (absent rows append, grown rows merge)
+
+### <!-- 1 -->🎉 New Features
+- **cli:** `pond skill` prints the bundled agent-onboarding SKILL.md, in lockstep with the binary
+- **copy:** incremental store-to-store copy with no temp staging; streams the source scan straight into the destination
+- **search:** resident per-message meta cache (mmap'd, LSM version-delta refresh) shared across pond processes
+- **storage:** self-verifying migrate and `pond storage verify`
+
+### <!-- 3 -->🚀 Performance
+*Measured on the real ~2M-message S3 corpus (Hetzner nbg1); baseline = pre-optimization on this branch.*
+
+Sync & status:
+- per-session staleness oracle: **79s warm / 133s cold -> ~1s / ~4s** (messages-based key replaces the `versions()` per-manifest fetch storm)
+- warm re-sync of the full corpus: **~928s -> ~25s** (append fast-path + the new oracle)
+- `status -v`: **130s -> ~14s**; the stale-embedding count that runs in every default sync: **59.5s -> ~7s**
+
+Copy:
+- append fast-path vs merge-insert for absent rows: **5.47x faster** (13.8 min vs 75.7 min full-corpus; 62 vs 2,685 objects written)
+- streaming store-to-store, no temp staging: **1.92x faster** (24.1s -> 12.6s, local 500-session set); unchanged-source re-copy **~90 ms**
+
+Search:
+- FTS arm latency **2043ms -> 2ms p50** (6667ms -> 125ms p95) and **~60 -> 3 object GETs/query** via the resident row-key map; per-query S3 bytes **-81%** (6.0 -> 1.16 MB)
+- FTS index **1.14 GB -> 41 MB (28x)** and query RAM **2248 -> 379 MB (5.9x)** after the word-tokenizer switch; English Success@3 **31/111 -> 66/111 (2.1x)**
+- FTS cold query (full corpus) **76s -> 27s p50** (148.9s -> 48.5s p95); cold server prewarm **175-442s -> ~81s**
+- vector arm **~393 -> 0-1 object GETs/query** after IVF_PQ -> IVF_SQ and dropping the refine pass
+- bounded server RAM lowers `sql` cold **18s -> 5.9s**
+- resident row-key map: **281.7 MiB** for 2.1M messages, built in **~3.8s**, removing the per-query hydration scan (and a remote Lance decoder panic)
+
+### <!-- 5 -->📚 Documentation
+- **spec:** add the `session-movement-complete` completeness rule, the session-erasure exception, and micro-batch live-write
+- migrate the docs site from mdBook to vocs (pond.locker); correct the search model to single-arm across spec/README/site; refresh SKILL.md for agent ergonomics
+
+### <!-- 2 -->🐛 Bug Fixes
+- **cli:** phantom embed backlog, progress-bar wrapping, and verify memory
+- **sync:** restore the per-session staleness watermark from the row version
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0
 
