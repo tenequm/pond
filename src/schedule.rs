@@ -28,6 +28,7 @@ pub(crate) enum ScheduleEvery {
 }
 
 impl ScheduleEvery {
+    #[cfg(unix)]
     fn secs(self) -> u32 {
         match self {
             Self::M5 => 300,
@@ -48,6 +49,7 @@ impl ScheduleEvery {
         }
     }
 
+    #[cfg(unix)]
     fn from_secs(secs: u32) -> Option<Self> {
         [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
             .into_iter()
