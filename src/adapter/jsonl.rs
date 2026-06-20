@@ -282,6 +282,21 @@ pub(crate) fn peek_last_line(path: &Path) -> Option<String> {
         .map(|line| String::from_utf8_lossy(line).into_owned())
 }
 
+/// Walk non-empty lines of the tail window from last to first, returning the first
+/// that `pick` maps to `Some`. Lets an adapter skip trailing non-message records to
+/// find the latest real message's watermark - e.g. Claude Code appends metadata
+/// rows (`last-prompt`, `permission-mode`, ...) with no timestamp after the
+/// conversation, so the literal last line is rarely the watermark. Short-circuits
+/// at the first match (the newest message sits just behind that trailing metadata),
+/// so it stays as cheap as a single-line peek in practice.
+pub(crate) fn peek_last_mapped<T>(path: &Path, pick: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let buf = read_tail(path, TAIL_CAP)?;
+    buf.split(|&byte| byte == b'\n')
+        .rev()
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .find_map(|line| pick(&String::from_utf8_lossy(line)))
+}
+
 fn read_files<D: JsonlTree>(
     driver: &D,
     paths: Vec<PathBuf>,

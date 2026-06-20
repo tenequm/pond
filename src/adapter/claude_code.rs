@@ -30,7 +30,8 @@ use super::{
     },
     extracted_text,
     jsonl::{
-        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_line, source_line,
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_mapped,
+        source_line,
     },
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
@@ -344,11 +345,16 @@ impl JsonlTree for ClaudeCodeAdapter {
     }
 
     fn peek_last_ts(&self, path: &Path) -> Option<i64> {
-        // The transcript is append-ordered, so the last line is the latest
-        // message; its `timestamp` is the session watermark. A trailing row
-        // without one yields None and the file re-reads (safe).
-        let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
-        Some(parse_timestamp(&row).ok()?.timestamp_micros())
+        // Claude Code appends trailing metadata rows (`last-prompt`,
+        // `permission-mode`, `bridge-session`, ...) with no timestamp after the
+        // conversation, so the literal last line is usually not a message. Walk
+        // back to the latest row that carries a timestamp - the real watermark.
+        // Taking only the last line stranded ~2k sessions perpetually un-fresh,
+        // re-decoding ~1.2M already-stored rows every sync.
+        peek_last_mapped(path, |line| {
+            let row: Value = serde_json::from_str(line).ok()?;
+            Some(parse_timestamp(&row).ok()?.timestamp_micros())
+        })
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -1818,6 +1824,43 @@ mod tests {
             .expect("session row exists");
         assert_eq!(session.messages.len(), 1, "replay must heal messages");
         Ok(())
+    }
+
+    /// Claude Code appends trailing metadata rows (`last-prompt`,
+    /// `permission-mode`, ...) with no timestamp after the conversation. The
+    /// freshness peek must walk back past them to the last real message's
+    /// timestamp - taking only the literal last line returned None and stranded
+    /// ~2k sessions perpetually un-fresh, re-decoding ~1.2M stored rows every sync.
+    #[test]
+    fn peek_last_ts_walks_back_past_trailing_metadata_rows() {
+        let corpus = TempDir::new().unwrap();
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let session_uuid = "44444444-4444-4444-4444-444444444444";
+        let message = serde_json::json!({
+            "type": "user",
+            "uuid": "u-1",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "message": {"role": "user", "content": "hello"},
+        });
+        // Metadata rows Claude Code writes after the conversation - no timestamp.
+        let last_prompt =
+            serde_json::json!({"type": "last-prompt", "sessionId": session_uuid, "prompt": "hi"});
+        let permission = serde_json::json!({"type": "permission-mode", "sessionId": session_uuid});
+        let path = project_dir.join(format!("{session_uuid}.jsonl"));
+        std::fs::write(&path, format!("{message}\n{last_prompt}\n{permission}\n")).unwrap();
+
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let expected = DateTime::parse_from_rfc3339("2026-05-16T00:00:00.000Z")
+            .unwrap()
+            .timestamp_micros();
+        assert_eq!(
+            adapter.peek_last_ts(&path),
+            Some(expected),
+            "walk back past trailing metadata to the last message's timestamp",
+        );
     }
 
     /// One assistant `tool_use` followed by a user `tool_result` in the same
