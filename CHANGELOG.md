@@ -1,4 +1,10 @@
 # Changelog
+## [0.10.0](https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0) - 2026-06-20
+
+### <!-- 0 -->🛠 Breaking Changes
+- **cli:** [**breaking**] explicit storage/adapter verbs - rename sources to adapters, switch-only use, top-level migrate + creds
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0
 
 ## [0.9.0](https://github.com/tenequm/pond/compare/v0.8.1...v0.9.0) - 2026-06-12
 
