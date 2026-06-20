@@ -1,0 +1,45 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Manage which adapters `pond sync` ingests (the `[adapters.*]` entries).
+
+Enabling an adapter is the explicit owner of adapter state: `list` shows what is configured and what was detected, `discover` probes and enables interactively, `enable`/`disable` flip one by name. `pond sync` reads these but never writes them.
+
+Usage: pond adapters [OPTIONS] <COMMAND>
+
+Commands:
+  list      List configured adapters (enabled state, path) and detected-but-unconfigured adapters
+  discover  Probe this machine for adapters and interactively enable the ones you pick
+  enable    Enable an adapter, discovering its default path if it has no config entry yet
+  disable   Disable an adapter so `pond sync` skips it (kept as `enabled = false`)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond adapters list                         configured + detected adapters
+  pond adapters discover                     probe this machine, pick what to enable
+  pond adapters enable claude-code           enable one (discovers its path if needed)
+  pond adapters disable opencode             stop syncing one, keep it on record

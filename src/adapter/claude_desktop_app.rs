@@ -53,7 +53,7 @@ use super::{
         Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::RECORD_CAP,
+    jsonl::{RECORD_CAP, peek_last_line},
     jsonl_bytes, part_id, part_ordinal, raw_record, source_options,
 };
 
@@ -138,24 +138,19 @@ impl Adapter for ClaudeDesktopAppAdapter {
                 Err(join) => { yield Err(join_error(join)); return; }
             };
 
-            // Freshness pre-pass: an mtime stat only when the oracle actually
-            // has a watermark for this session - first ingest (or NoopOracle)
-            // has nothing to compare against, so the stat would be wasted.
+            // Freshness pre-pass: read the audit log's last-message timestamp (its
+            // tail line) and skip when it is no newer than pond's watermark. Only
+            // when the oracle has entries - a first ingest has nothing to compare.
             let mut survivors = Vec::with_capacity(files.len());
             for file in files {
-                if let Some(ingested) = oracle.last_ingested_at(&file.session_id) {
-                    let paths = (file.audit_path.clone(), file.meta_path.clone());
-                    let mtime = tokio::task::spawn_blocking(move || {
-                        newest_mtime(&paths.0).max(newest_mtime(&paths.1))
-                    })
-                    .await;
-                    let mtime = match mtime {
-                        Ok(mtime) => mtime,
-                        Err(join) => { yield Err(join_error(join)); return; }
-                    };
-                    if let Some(mtime) = mtime
-                        && mtime <= ingested
-                    {
+                if !oracle.is_empty() {
+                    let audit = file.audit_path.clone();
+                    let last_ts =
+                        match tokio::task::spawn_blocking(move || source_last_ts(&audit)).await {
+                            Ok(last_ts) => last_ts,
+                            Err(join) => { yield Err(join_error(join)); return; }
+                        };
+                    if crate::adapter::is_session_fresh(oracle, &file.session_id, last_ts) {
                         yield Ok(AdapterYield::Skipped {
                             session_id: Some(file.session_id.clone()),
                             project: None,
@@ -181,6 +176,18 @@ impl Adapter for ClaudeDesktopAppAdapter {
 
 /// A blocking-task panic is a pond bug, not bad source data, so it fails the
 /// whole run rather than skipping a session.
+/// Latest message timestamp (micros) for the freshness gate: the audit log's
+/// last record. The audit stream is append-ordered, so its tail line is the
+/// latest message; an unreadable file or a record without a timestamp yields
+/// `None` and the session re-reads (safe). The sibling metadata file is not
+/// consulted - pond never rewrites an existing session row, so a pure-metadata
+/// change is a no-op.
+fn source_last_ts(audit_path: &Path) -> Option<i64> {
+    let last_line = peek_last_line(audit_path)?;
+    let record: Value = serde_json::from_str(&last_line).ok()?;
+    Some(record_timestamp(&record)?.timestamp_micros())
+}
+
 fn join_error(join: tokio::task::JoinError) -> AdapterError {
     AdapterError::io(
         NAME,
@@ -250,13 +257,6 @@ fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     }
     out.sort_by(|a, b| a.audit_path.cmp(&b.audit_path));
     Ok(out)
-}
-
-fn newest_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .map(DateTime::<Utc>::from)
 }
 
 fn read_sessions(
@@ -620,8 +620,10 @@ fn message_events(
                 options: assistant_options(record, message_value, line),
             }
         }
-        (other, _) => {
-            return Err(format!("unsupported message role {other}"));
+        _ => {
+            return Ok(vec![message_carrier_event(
+                session_id, uuid, timestamp, record, line, role,
+            )]);
         }
     };
 
@@ -629,6 +631,23 @@ fn message_events(
     events.push(IngestEvent::Message(message));
     events.extend(parts.into_iter().map(IngestEvent::Part));
     Ok(events)
+}
+
+fn message_carrier_event(
+    session_id: &str,
+    uuid: &str,
+    timestamp: DateTime<Utc>,
+    record: &Value,
+    line: usize,
+    role: &str,
+) -> IngestEvent {
+    IngestEvent::Message(Message::System {
+        id: uuid.to_owned(),
+        session_id: session_id.to_owned(),
+        timestamp,
+        content: extract_self_str(&Value::String(role.to_owned())),
+        options: row_options(record, line),
+    })
 }
 
 fn text_part(
@@ -1148,5 +1167,28 @@ mod tests {
             "native restore re-ingests as the same session set",
         );
         Ok(())
+    }
+
+    #[test]
+    fn unexpected_message_content_becomes_lossless_carrier() {
+        let names = HashMap::new();
+        let record = json!({
+            "type": "user",
+            "uuid": "local-message-1",
+            "_audit_timestamp": "2026-06-01T00:00:00Z",
+            "message": {
+                "role": "user",
+                "content": null,
+            },
+        });
+
+        let events = record_events("local_session", 7, &record, Utc::now(), &names)
+            .expect("carrier is valid");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            IngestEvent::Message(Message::System { id, content, .. })
+                if id == "local-message-1" && content.as_deref().map(String::as_str) == Some("user")
+        ));
     }
 }

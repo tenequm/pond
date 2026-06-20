@@ -1,0 +1,16 @@
+{
+  "name": "pond-docs",
+  "compatibility_date": "2026-06-03",
+  "main": "./src/worker.ts",
+  "assets": {
+    "directory": "./dist/public",
+    "html_handling": "drop-trailing-slash",
+    "not_found_handling": "404-page",
+    "binding": "ASSETS",
+    "run_worker_first": ["/*"]
+  },
+  "routes": [
+    { "pattern": "pond.locker", "custom_domain": true },
+    { "pattern": "pond.cascade.fyi", "custom_domain": true }
+  ]
+}

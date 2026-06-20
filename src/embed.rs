@@ -170,11 +170,10 @@ fn device_label(device: &Device) -> &'static str {
 type EmbedLoader = Arc<dyn Fn() -> Result<Arc<dyn Embedder>> + Send + Sync>;
 
 /// How long the cached backend can sit unused before [`LazyEmbedder::get`]
-/// drops it. Five minutes matches typical interactive-MCP conversational
-/// pauses: short enough that a model that's been unused for a turn or two
-/// is gone before the next quiet window, long enough that ordinary
-/// query bursts never pay the reload cost.
-pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(300);
+/// drops it. One minute returns the ~790 MB model to the idle floor quickly
+/// between interactive-MCP bursts; the reload is one cached model-load
+/// (~358 ms) on the first query after a quiet window.
+pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(60);
 
 struct CachedBackend {
     backend: Arc<dyn Embedder>,
@@ -272,7 +271,7 @@ impl LazyEmbedder {
 }
 
 /// Default embedding model pond ships a loader for (spec.md#search). Used when
-/// `[embeddings].model` is absent. `pond embed` stamps the runtime model id
+/// `[embeddings].model` is absent. `pond optimize` stamps the runtime model id
 /// (see [`model_id`]) into `messages.embedding_model` with every vector.
 /// e5-small (384-dim) is the default; the paraphrase benchmark set showed no
 /// statistically-significant quality loss vs e5-base while halving vector
@@ -322,7 +321,7 @@ pub fn format_query(query: &str) -> String {
 
 /// Format a document (one message's `search_text`) for the embedder - the
 /// `passage: ` half of the pair documented on [`format_query`]. Used by
-/// `EmbedWorker` when batching messages for `pond embed`.
+/// `EmbedWorker` when batching messages for `pond optimize`.
 pub fn format_passage(text: &str) -> String {
     format!("passage: {text}")
 }
@@ -334,7 +333,7 @@ pub fn format_passage(text: &str) -> String {
 /// time of the write.
 pub trait Embedder: Send + Sync {
     /// A short label naming the hardware/runtime: `"metal"`, `"cuda"`,
-    /// or `"cpu"`. Used by `pond embed` to surface what backend ran the
+    /// or `"cpu"`. Used by `pond optimize` to surface what backend ran the
     /// inference; benches print it alongside latency.
     fn device(&self) -> &str;
 
@@ -356,7 +355,7 @@ pub struct EmbedSummary {
     pub cancelled: bool,
 }
 
-/// Per-batch stats handed to a progress callback. Lets `pond embed` drive an
+/// Per-batch stats handed to a progress callback. Lets `pond optimize` drive an
 /// `indicatif` bar without leaking the crate into this module's API.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchProgress {
@@ -387,9 +386,9 @@ pub struct EmbedWorker<'a, B: Embedder> {
     /// [`EmbedWorker::with_sort_window`].
     sort_window: usize,
     /// Optional per-batch progress callback. Called once per `flush()` with
-    /// the running totals; `pond embed` wires this to an `indicatif` bar.
+    /// the running totals; `pond optimize` wires this to an `indicatif` bar.
     progress: Option<ProgressFn>,
-    /// Set externally (Ctrl-C handler in `pond embed`): the pull loop drains
+    /// Set externally (Ctrl-C handler in `pond optimize`): the pull loop drains
     /// the in-memory window before exiting so partial work is committed.
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -413,7 +412,7 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
     /// Honour `flag` as a cooperative cancellation signal. The pull loop checks
     /// it before each new stream message; once set, the worker drains the
     /// current window (committing the embedded slice) and returns with
-    /// `EmbedSummary { cancelled: true, .. }`. `pond embed` wires this to a
+    /// `EmbedSummary { cancelled: true, .. }`. `pond optimize` wires this to a
     /// Ctrl-C handler so an interrupted run doesn't lose its in-memory window.
     pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
         self.cancel = Some(flag);
@@ -436,7 +435,7 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
 
     /// Register a per-batch progress callback. Called once after each
     /// `flush()` with the messages in the just-finished batch and the running
-    /// totals. `pond embed` uses this to drive an `indicatif` progress bar.
+    /// totals. `pond optimize` uses this to drive an `indicatif` progress bar.
     pub fn with_progress(
         mut self,
         callback: impl Fn(BatchProgress) + Send + Sync + 'static,

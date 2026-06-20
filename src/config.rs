@@ -1,4 +1,4 @@
-//! Configuration loading: the `[embeddings]`, `[sources]`, `[storage]`, and
+//! Configuration loading: the `[embeddings]`, `[adapters]`, `[storage]`, and
 //! `[creds.*]` blocks.
 //!
 //! pond ships built-in defaults, so an instance with no `config.toml` still
@@ -177,35 +177,35 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # pond ships built-in defaults, so every setting here is optional - delete this
 # file and pond still works. Uncomment and edit to override.
 
-# Where pond looks for source data to import. One entry per adapter type
+# Where pond looks for adapter data to import. One entry per adapter type
 # (`claude-code`, `codex-cli`, ...). `pond sync` with no arguments syncs every
-# entry; `pond sync <adapter>` syncs just one. With an empty `[sources]`,
+# entry; `pond sync <adapter>` syncs just one. With an empty `[adapters]`,
 # `pond sync` runs an interactive discovery against the known default paths
 # and writes the picks back here.
 #
-# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[sources]` is
-# flat here. When multi-namespace pond lands, source registration becomes
-# per-tenant under `[namespaces.<ns>.sources.<adapter>]`. Pre-v1 the schema
+# Future wrap: pond is single-namespace in v1 (spec.md#wire-namespace-resolution); `[adapters]` is
+# flat here. When multi-namespace pond lands, adapter registration becomes
+# per-tenant under `[namespaces.<ns>.adapters.<adapter>]`. Pre-v1 the schema
 # is breakable; the rename is operationally free until a real second tenant
 # exists.
 #
-# [sources.claude-code]
+# [adapters.claude-code]
 # enabled = true
 # path = \"~/.claude/projects\"
 #
-# [sources.codex-cli]
+# [adapters.codex-cli]
 # enabled = true
 # path = \"~/.codex/sessions\"
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
-# re-enable via `pond sync <adapter>`.
+# re-enable via `pond adapters enable <adapter>`.
 
-# Embeddings. Search runs hybrid (vector + FTS) whenever the store has any
-# vectors, and FTS-only otherwise - the model loads lazily on the first hybrid
-# query, so there's no cost on FTS-only corpora. `model` selects the
-# HuggingFace XLM-RoBERTa model; `dim` declares its output width and is baked
-# into the messages.vector schema on table creation - it must equal the
-# model's hidden_size and be a multiple of 8 (IVF_PQ subspace stride).
+# Embeddings. Search defaults to the vector arm (matching on meaning) when the
+# store has any vectors, falling back to FTS otherwise - the model loads lazily
+# on the first vector query, so there's no cost on FTS-only corpora. `model`
+# selects the HuggingFace XLM-RoBERTa model; `dim` declares its output width and
+# is baked into the messages.vector schema on table creation - it must equal the
+# model's hidden_size.
 #
 # Common pairings:
 #   model = \"intfloat/multilingual-e5-small\"   dim = 384   (default)
@@ -219,15 +219,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384
 
-# Search tuning. Leave unset for Lance defaults; set when tuning IVF_PQ recall
+# Search tuning. Leave unset for Lance defaults; set when tuning vector recall
 # against a corpus.
 #
 # [search]
 # nprobes = 16
-# refine_factor = 2
 
 # Storage maintenance. Tunes the compaction + cleanup pass that runs inside
-# `pond sync` and `pond index optimize`.
+# `pond sync` and `pond optimize`.
 #
 # - `compaction_fragment_cap` is the per-task fragment-count backstop: a
 #   planned compaction task touching at least this many fragments always runs
@@ -237,14 +236,10 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
 #   what protects in-flight readers). Versions older than this are reclaimed
 #   by Lance's OCC-coordinated GC.
-# - `index_lag_threshold` is the minimum unindexed-fragment count before a
-#   per-intent append/rebuild runs in `pond index optimize`; the brute-force
-#   fallback keeps queries correct while fragments accumulate. Default 4.
 #
 # [maintenance]
 # compaction_fragment_cap = 64
 # cleanup_older_than = \"1d\"
-# index_lag_threshold = 4
 
 # Long-running process caps. Both accept either a plain byte count or a
 # humansize-style suffix (\"128 MiB\", \"1 GiB\"). Both are optional - leave
@@ -310,13 +305,13 @@ pub struct Config {
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
-    /// `[sources.<adapter>]` map: per-adapter config blobs the matching
+    /// `[adapters.<adapter>]` map: per-adapter config blobs the matching
     /// factory deserializes inside its `open()`. The shape is adapter-defined
     /// (filesystem adapters expect `{ path = "..." }`; API-backed adapters
     /// expect endpoint + auth keys), so this layer stays opaque. Empty by
     /// default; `pond sync` runs discovery into this map on first use.
     #[serde(default)]
-    pub sources: BTreeMap<String, Value>,
+    pub adapters: BTreeMap<String, Value>,
     /// `[storage]`: the default destination URL (spec.md#storage-url-grammar).
     /// `None` = the platform-local data dir.
     #[serde(default)]
@@ -369,6 +364,24 @@ pub struct CredsSet {
     pub extra: BTreeMap<String, String>,
 }
 
+/// `[creds.<name>]` name charset `[a-z][a-z0-9]{0,15}` (spec.md#storage-env-mirror):
+/// lowercase-alphanumeric keeps `POND_CREDS_<NAME>_<FIELD>` splittable at the
+/// first `_` after the name. Shared by config validation and `pond creds`.
+pub fn valid_creds_set_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && name.len() <= 16
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// The rejection message for a name that fails [`valid_creds_set_name`], shared
+/// by config validation and `pond creds` so the rule and its wording never drift.
+pub fn creds_set_name_error(name: &str) -> String {
+    format!(
+        "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
+    )
+}
+
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
 /// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
 /// optional - `None` lets `pond::substrate` pick the backend-aware default
@@ -388,14 +401,12 @@ pub struct RuntimeConfig {
 pub struct SearchConfig {
     #[serde(default)]
     pub nprobes: Option<usize>,
-    #[serde(default)]
-    pub refine_factor: Option<u32>,
 }
 
 /// `[maintenance]`: storage-maintenance knobs shared by `pond sync` and
-/// `pond index optimize`. All optional - omit and pond falls back to the
+/// `pond optimize`. All optional - omit and pond falls back to the
 /// in-process defaults in `pond::substrate` (`DEFAULT_COMPACTION_FRAGMENT_CAP`,
-/// `default_cleanup_older_than`, and the `index_lag_threshold` initializer).
+/// `default_cleanup_older_than`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
@@ -411,19 +422,12 @@ pub struct MaintenanceConfig {
     /// which never races a concurrent writer on any backend.
     #[serde(default)]
     pub cleanup_older_than: Option<String>,
-    /// Minimum unindexed-fragment count below which `optimize_table_indices`
-    /// skips the per-intent append/rebuild path; the brute-force fallback
-    /// keeps queries correct while fragments accumulate. Default 4 trades a
-    /// little query latency on cold fragments for far fewer remote index
-    /// commits during high-rate ingest.
-    #[serde(default)]
-    pub index_lag_threshold: Option<usize>,
 }
 
 /// `[embeddings]`: model selector and vector dimension. There is no master
-/// switch - the search path always runs hybrid when vectors exist in the
-/// store and FTS-only when they don't (`has_embeddings()` is the only gate);
-/// the candle/Metal model is `LazyEmbedder`-loaded on the first query that
+/// switch - a `vector` search degrades to FTS when no vectors exist in the
+/// store (`has_embeddings()` is the only gate); the candle/Metal model is
+/// `LazyEmbedder`-loaded on the first query that
 /// actually needs it. `model` and `dim` are installed into the process at
 /// startup via `embed::init_model_id` / `sessions::init_embedding_dim`, so
 /// swapping models for a one-off experiment is a temporary config file - no
@@ -434,8 +438,7 @@ pub struct EmbeddingsConfig {
     /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
     /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-small`.
     pub model: String,
-    /// Output dimension of `model`. Must equal the model's `hidden_size` and
-    /// be divisible by 8 (the IVF_PQ subspace stride; see `embed::index_params`).
+    /// Output dimension of `model`. Must equal the model's `hidden_size`.
     /// Defaults to 384 (e5-small). Set to 768 for e5-base, 1024 for e5-large.
     pub dim: usize,
 }
@@ -463,6 +466,19 @@ pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf
     }
     // No HOME and no usable XDG var - stay usable rather than panic.
     url_for_path(PathBuf::from(".pond"))
+}
+
+/// Cache dir for rebuildable artifacts (the search row meta map): the XDG-cache
+/// analog of [`default_storage_path`]. Separate root because the contents are
+/// regenerated from the store, not durable data.
+pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(xdg) = xdg_cache_home.filter(|path| path.is_absolute()) {
+        return xdg.join("pond");
+    }
+    if let Some(home) = home {
+        return home.join(".cache").join("pond");
+    }
+    PathBuf::from(".pond-cache")
 }
 
 /// Local default path for `config.toml`. URI-backed data dirs always land
@@ -517,6 +533,9 @@ impl Config {
             if let Some(recipe) = detect_legacy_storage(path) {
                 return anyhow!("{recipe}");
             }
+            if let Some(recipe) = detect_legacy_sources(path) {
+                return anyhow!("{recipe}");
+            }
             // Inline figment's message (it already names the failing key and
             // source layer) so single-line error surfaces keep the detail.
             anyhow!("failed to load config {}: {error}", path.display())
@@ -524,9 +543,6 @@ impl Config {
         config.embeddings.validate()?;
         config.validate_creds()?;
         config.embeddings.install_runtime();
-        if let Some(threshold) = config.maintenance.index_lag_threshold {
-            crate::substrate::init_index_lag_threshold(threshold);
-        }
         // Tilde expansion is per-adapter (inside each factory's `open()`):
         // an API-backed adapter has no path to expand, and only the
         // filesystem-shaped adapters need the helper. See `expand_home_under`.
@@ -541,18 +557,8 @@ impl Config {
         let mut scopeless: Option<&str> = None;
         let mut scopes: BTreeMap<String, &str> = BTreeMap::new();
         for (name, set) in &self.creds {
-            // Lowercase alphanumeric only - load-bearing for the env mirror:
-            // it makes `POND_CREDS_<NAME>_<FIELD>` splittable at the first
-            // `_` after the name (field names contain underscores).
-            let mut chars = name.chars();
-            let head_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-            if !head_ok
-                || name.len() > 16
-                || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            {
-                bail!(
-                    "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
-                );
+            if !valid_creds_set_name(name) {
+                bail!(creds_set_name_error(name));
             }
             if set.access_key_id.is_some() && set.access_key_id_file.is_some() {
                 bail!("[creds.{name}] sets both access_key_id and access_key_id_file; pick one");
@@ -600,7 +606,7 @@ impl Config {
         Ok(())
     }
 
-    /// Resolve the `[sources.<adapter>]` entries to drive `pond sync`. Only
+    /// Resolve the `[adapters.<adapter>]` entries to drive `pond sync`. Only
     /// sections with `enabled = true` flow through; sections with
     /// `enabled = false` (or absent) are treated as opt-out and the
     /// per-adapter blob (minus `enabled`) is handed to the factory's
@@ -608,21 +614,21 @@ impl Config {
     /// `Some(name)` returns just that one - and errors if it's not in
     /// config OR if it's currently disabled (the caller should then
     /// re-prompt or report).
-    pub fn resolve_sources(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
+    pub fn resolve_adapters(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
         match adapter {
             None => Ok(self
-                .sources
+                .adapters
                 .iter()
                 .filter_map(|(name, blob)| take_enabled(name, blob))
                 .collect()),
             Some(name) => {
                 let blob = self
-                    .sources
+                    .adapters
                     .get(name)
-                    .ok_or_else(|| anyhow!("no [sources.{name}] entry in config"))?;
+                    .ok_or_else(|| anyhow!("no [adapters.{name}] entry in config"))?;
                 take_enabled(name, blob).map(|entry| vec![entry]).ok_or_else(|| {
                     anyhow!(
-                        "source [{name}] is disabled (enabled = false); run `pond sync {name}` to re-enable"
+                        "adapter [{name}] is disabled (enabled = false); run `pond adapters enable {name}` to re-enable, then `pond sync {name}`"
                     )
                 })
             }
@@ -633,8 +639,8 @@ impl Config {
     /// `pond sync` post-import to know not to re-probe an adapter the user
     /// already declined (the decline persists; re-prompt only via the
     /// positional override `pond sync <name>`).
-    pub fn disabled_source_names(&self) -> Vec<&str> {
-        self.sources
+    pub fn disabled_adapter_names(&self) -> Vec<&str> {
+        self.adapters
             .iter()
             .filter_map(|(name, blob)| {
                 let enabled = blob
@@ -650,7 +656,7 @@ impl Config {
 /// The `POND_*` env mirror (spec.md#storage-env-mirror): `POND_STORAGE_PATH`
 /// -> `storage.path`, `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`.
 /// Filtered to exactly those two shapes - clap owns its own `POND_*` vars
-/// (`POND_CONFIG`, `POND_HOST`, ...) and an unfiltered prefix would turn each
+/// (`POND_CONFIG_FILE`, `POND_HOST`, ...) and an unfiltered prefix would turn each
 /// of them into an unknown-field error here.
 fn env_mirror() -> Env {
     // Keys reach these closures pre-lowercasing (`CREDS_...`), so compare on
@@ -742,7 +748,21 @@ fn detect_legacy_storage(path: &Path) -> Option<String> {
     Some(recipe)
 }
 
-/// Inner helper: return `Some((name, blob))` when the source section is
+/// Recognize a pre-rename `[sources.<name>]` config block (the adapter map was
+/// renamed `sources` -> `adapters`) and return a one-line recipe pointing at
+/// `pond init`. An error with a recipe, not a shim: old configs do not silently
+/// keep working. Transitional - delete once live configs have migrated.
+fn detect_legacy_sources(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value.get("sources")?.as_table()?;
+    Some(format!(
+        "config {} uses a [sources.*] block; the adapter map was renamed to [adapters.*]. Run `pond init` to migrate it, or rename each `[sources.<name>]` header to `[adapters.<name>]` by hand.",
+        path.display(),
+    ))
+}
+
+/// Inner helper: return `Some((name, blob))` when the adapter section is
 /// enabled, stripping the discriminator from the blob before handing it on;
 /// `None` when the section is missing `enabled` or has `enabled = false`.
 fn take_enabled(name: &str, blob: &Value) -> Option<(String, Value)> {
@@ -802,19 +822,15 @@ pub fn contract_home(path: &Path) -> PathBuf {
 }
 
 impl EmbeddingsConfig {
-    /// Surface-level validation: model id non-empty and dim divisible by 8.
-    /// The dim/model mismatch is the load-time check inside `CandleEmbedder::load`,
-    /// which knows the model's `hidden_size`; what we can catch up front is the
-    /// IVF_PQ subspace stride (`dim / 8` in `embed::index_params`).
+    /// Surface-level validation: model id non-empty and dim positive. The
+    /// dim/model mismatch is the load-time check inside `CandleEmbedder::load`,
+    /// which knows the model's `hidden_size`.
     pub fn validate(&self) -> Result<()> {
         if self.model.trim().is_empty() {
             bail!("embeddings.model must be a non-empty HuggingFace model id");
         }
-        if self.dim == 0 || !self.dim.is_multiple_of(8) {
-            bail!(
-                "embeddings.dim = {} must be a positive multiple of 8 (IVF_PQ subspace stride)",
-                self.dim,
-            );
+        if self.dim == 0 {
+            bail!("embeddings.dim must be positive; got {}", self.dim);
         }
         Ok(())
     }
@@ -828,6 +844,38 @@ impl EmbeddingsConfig {
     }
 }
 
+/// Write `config.toml` with owner-only perms (0600). The file can carry a
+/// plaintext `secret_access_key` (inline `[creds.*]`), so it must never be
+/// group/world-readable - matching the AWS CLI's 0600 on its credentials file.
+/// Unix only; Windows is out of v1 scope. Order is truncate -> chmod -> write,
+/// so the secret is only ever written once perms are already 0600, even when
+/// repairing a pre-existing 0644 file.
+pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        // `.mode()` applies only on creation; chmod also repairs a pre-existing file.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // `result_large_err`: `figment::Jail` closures return `figment::Error`
@@ -837,6 +885,25 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        // A pre-existing world-readable file must be repaired, not left at 0644.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_file(&path, "[creds.default]\nsecret_access_key = \"x\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config with secrets must be owner-only");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("secret_access_key")
+        );
+    }
 
     #[test]
     fn validate_catches_empty_model_and_bad_dim() {
@@ -848,13 +915,14 @@ mod tests {
             dim: 768,
         };
         assert!(bad_model.validate().is_err());
-        // Dim must divide 8 (PQ subspace stride in `embed::index_params`).
-        let bad_dim = EmbeddingsConfig {
+        // Non-multiple-of-8 dims are accepted now: IVF_SQ has no subspace
+        // stride, so the old `dim % 8` requirement is gone.
+        let odd_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
         };
-        assert!(bad_dim.validate().is_err());
-        // Zero is rejected too (would divide-by-zero inside index_params).
+        assert!(odd_dim.validate().is_ok());
+        // Zero is still rejected.
         let zero_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,
@@ -980,18 +1048,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_sources_returns_one_or_all_or_errors() {
+    fn resolve_adapters_returns_one_or_all_or_errors() {
         let temp = TempDir::new().unwrap();
         let body = "\
-[sources.claude-code]
+[adapters.claude-code]
 enabled = true
 path = \"/srv/claude\"
 
-[sources.codex-cli]
+[adapters.codex-cli]
 enabled = true
 path = \"/srv/codex\"
 
-[sources.opencode]
+[adapters.opencode]
 enabled = false
 ";
         let path = temp.path().join("config.toml");
@@ -999,7 +1067,7 @@ enabled = false
         let config = Config::load(&path).unwrap();
 
         // None -> only enabled entries
-        let all = config.resolve_sources(None).unwrap();
+        let all = config.resolve_adapters(None).unwrap();
         assert_eq!(all.len(), 2);
         let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"claude-code"));
@@ -1010,7 +1078,7 @@ enabled = false
         }
 
         // Some(name) -> one entry, opaque JSON blob
-        let one = config.resolve_sources(Some("codex-cli")).unwrap();
+        let one = config.resolve_adapters(Some("codex-cli")).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].0, "codex-cli");
         assert_eq!(
@@ -1019,7 +1087,7 @@ enabled = false
         );
 
         // Disabled positional -> errors with the recovery hint baked in.
-        let disabled = config.resolve_sources(Some("opencode"));
+        let disabled = config.resolve_adapters(Some("opencode"));
         let err = disabled
             .expect_err("disabled adapter must error")
             .to_string();
@@ -1027,10 +1095,10 @@ enabled = false
         assert!(err.contains("pond sync opencode"), "got: {err}");
 
         // Unknown -> error
-        assert!(config.resolve_sources(Some("nope")).is_err());
+        assert!(config.resolve_adapters(Some("nope")).is_err());
 
-        // disabled_source_names lists exactly the off ones.
-        assert_eq!(config.disabled_source_names(), vec!["opencode"]);
+        // disabled_adapter_names lists exactly the off ones.
+        assert_eq!(config.disabled_adapter_names(), vec!["opencode"]);
     }
 
     #[test]
@@ -1132,6 +1200,16 @@ extra = { request_timeout = "60 seconds" }
     }
 
     #[test]
+    fn valid_creds_set_name_matches_env_mirror_charset() {
+        for ok in ["default", "work", "work2", "a", "abcdefghij123456"] {
+            assert!(valid_creds_set_name(ok), "{ok:?} should be valid");
+        }
+        for bad in ["", "Work", "my_set", "2fast", "abcdefghij1234567", "set-1"] {
+            assert!(!valid_creds_set_name(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
     fn legacy_storage_map_errors_with_the_rewrite_recipe() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
@@ -1185,6 +1263,22 @@ AWS_ENDPOINT = "https://ttq.nbg1.your-objectstorage.com"
                 err.contains("s3+https://ttq.nbg1.your-objectstorage.com/<bucket>/<prefix>"),
                 "got: {err}",
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_sources_block_errors_with_the_adapters_recipe() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[sources.claude-code]\nenabled = true\npath = \"/srv/claude\"\n",
+            )?;
+            let err = Config::load("config.toml")
+                .expect_err("legacy [sources.*] must error")
+                .to_string();
+            assert!(err.contains("[adapters.*]"), "names the new key: {err}");
+            assert!(err.contains("pond init"), "points at the fix: {err}");
             Ok(())
         });
     }

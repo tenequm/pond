@@ -10,8 +10,8 @@ rust-version = "1.95"
 license = "Apache-2.0"
 description = "Lossless storage and hybrid search for sessions from any AI agent client"
 repository = "https://github.com/tenequm/pond"
-homepage = "https://pond.cascade.fyi/"
-documentation = "https://pond.cascade.fyi/"
+homepage = "https://pond.locker/"
+documentation = "https://pond.locker/"
 readme = "README.md"
 keywords = ["agents", "mcp", "lance", "search", "session-logs"]
 categories = ["command-line-utilities", "database", "artificial-intelligence"]
@@ -55,6 +55,9 @@ path = "src/main.rs"
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
+# Lock-free read of the loaded `RowKeyMap` on the hot search path; replaced
+# atomically when `ensure_rowmap` rebuilds. Already in the tree via lance.
+arc-swap = "1"
 # ndjson export writer for `pond_sql_query` (already in the tree via the arrow
 # stack; named directly here for the `LineDelimitedWriter`).
 arrow-json = "58.3"
@@ -64,11 +67,17 @@ async-stream = "0.3.6"
 async-trait = "0.1"
 axum = "0.8.9"
 base64 = "0.22"
+# Stable filesystem-safe `store_key` (hex digest of the store URL) for the
+# row-key map's cache filename. Already in the tree via the candle stack.
+blake3 = "1"
+# Zero-copy cast of the mmap'd row-key map's fixed-size records (`src/rowmap.rs`).
+# Already in the tree via the candle/safetensors stack.
+bytemuck = { version = "1.25", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
 clap_complete = "4.6"
-# Clack-style prompt stack for `pond init` and the sync source picker; built on
+# Clack-style prompt stack for `pond init` and the sync adapter picker; built on
 # console + indicatif, both already in the tree.
 cliclack = "0.5"
 comfy-table = "7"
@@ -112,6 +121,10 @@ lance-io = "7.0.0"
 lance-linalg = "7.0.0"
 lance-namespace = "7.0.0"
 lance-namespace-impls = "7.0.0"
+# Memory-mapped, process-shareable row_id -> key map (`src/rowmap.rs`): the file
+# is mmap'd so the OS page cache holds one physical copy across pond instances.
+# Already in the tree via candle/safetensors.
+memmap2 = "0.9"
 # Already in the tree via lance-io; named directly so `pond storage check` can
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
@@ -121,6 +134,7 @@ object_store = { version = "0.13", default-features = false }
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+rlimit = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # `~` + `$VAR` expansion for user-supplied paths in config values.
@@ -137,6 +151,7 @@ tokio-stream = "0.1.18"
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1.44"
+tracing-indicatif = "0.3.14"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }
@@ -146,6 +161,7 @@ walkdir = "2.5"
 # fallible username/hostname/devicename lookups.
 whoami = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
@@ -154,13 +170,24 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Diagnostic only: enables lance-io per-request IO recording so the
+# serve_mem_bench `--io-trace` mode can attribute exact S3 GET counts/paths
+# per query. Never enabled for release builds; `read_iops`/`read_bytes` are
+# tracked without it, only the per-request path list needs `test-util`.
+io-trace = ["lance-io/test-util"]
 
 [dev-dependencies]
+assert_cmd = "2"
 # `Jail` for env-mirror tests: sandboxed env vars + cwd without `unsafe`
 # `std::env::set_var` in pond's own code (the crate denies unsafe).
 figment = { version = "0.10.19", features = ["test"] }
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
 lance-linalg = "7.0.0"
+# Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
+# inverted index under different tokenizers (ngram vs simple) via the raw lance
+# create_index API and measure the index-size / RAM / latency tradeoff.
+lance = { version = "7.0.0", features = ["protoc"] }
+lance-index = "7.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
@@ -197,7 +224,27 @@ name = "serve_mem_bench"
 harness = false
 
 [[bench]]
+name = "tokenizer_quality_bench"
+harness = false
+
+[[bench]]
 name = "multiwriter_bench"
+harness = false
+
+[[bench]]
+name = "copy_bench"
+harness = false
+
+[[bench]]
+name = "ops_bench"
+harness = false
+
+[[bench]]
+name = "sync_oracle_bench"
+harness = false
+
+[[bench]]
+name = "commands_bench"
 harness = false
 
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo

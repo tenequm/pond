@@ -10,8 +10,8 @@
 //! download that can land anywhere, so `probe_default` returns `None` (an
 //! opportunistic `~/Downloads` scan would silently latch onto a stale or wrong
 //! archive). Point the adapter at the file explicitly via
-//! `[sources.claude-ai-export]` config or
-//! `pond sync claude-ai-export --source-dir <export.zip>`. `open` accepts a
+//! `[adapters.claude-ai-export]` config or
+//! `pond sync claude-ai-export --path <export.zip>`. `open` accepts a
 //! `.zip`, an extracted directory, or a bare `conversations.json` path.
 //!
 //! Mapping (spec.md#model-*): `conversation.uuid` -> `Session.id`;
@@ -66,7 +66,7 @@ impl AdapterFactory for ClaudeAiExportFactory {
 
     fn probe_default(&self, _env: &Env) -> Option<Value> {
         // No canonical install path: the export is a manual download. The user
-        // points pond at it (config `path` or `pond sync ... --source-dir`).
+        // points pond at it (config `path` or `pond sync ... --path`).
         None
     }
 
@@ -151,12 +151,15 @@ impl Adapter for ClaudeAiExportAdapter {
                     });
                     continue;
                 }
-                // The conversation list is sorted by `updated_at`; skip a
-                // conversation whose latest edit predates our watermark.
-                if let Some(ingested) = oracle.last_ingested_at(&session_id)
-                    && let Some(updated) = rfc3339(&conv, "updated_at")
-                    && updated <= ingested
-                {
+                // Skip when the conversation's latest message timestamp is no
+                // newer than pond's watermark. The messages are chronological, so
+                // the last element is the latest; the whole export is already in
+                // memory, so this is a cheap slice access, not a file read.
+                let source_last_ts = messages_of(&conv)
+                    .last()
+                    .and_then(|message| rfc3339(message, "created_at"))
+                    .map(|timestamp| timestamp.timestamp_micros());
+                if crate::adapter::is_session_fresh(oracle, &session_id, source_last_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(session_id),
                         project: None,

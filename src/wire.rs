@@ -325,51 +325,38 @@ pub struct GetRequest {
     pub protocol_version: u16,
     #[serde(default)]
     pub namespace: Option<String>,
-    // Mutually exclusive scopes.
+    // Mutually exclusive scopes. The prefixed params self-document which scope
+    // they belong to (agents read names, not descriptions).
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub message_id: Option<String>,
-    /// `message_id` mode only: symmetric window radius, mirroring `grep -C`.
-    /// Returns up to `2*context_depth` siblings around the target. Ignored in
-    /// session mode.
-    #[serde(default)]
-    pub context_depth: usize,
+    /// Session scope: max messages per page.
     #[serde(default = "default_get_limit")]
-    pub limit: usize,
-    /// Session mode: how much of each message to materialize. Message mode:
-    /// which siblings fill the context window (conversational by default;
-    /// complete/verbatim include system/tool carriers). The target message
-    /// always returns its full parts regardless.
-    #[serde(default)]
-    pub response_mode: ResponseMode,
-    /// Exclusive continuation anchor: last `message_id` in session mode, last
-    /// `part_id` in message mode. The append-only invariant means one id is
-    /// enough state - no opaque cursor.
-    #[serde(default)]
-    pub after_id: Option<String>,
-    /// Session mode only: which end to read `limit` messages from - `start`
-    /// (oldest, default) or `end` (most recent). Results stay chronological;
-    /// ignored in message mode.
+    pub session_limit: usize,
+    /// Session scope: which end to read the first page from - `start` (oldest,
+    /// default) or `end` (most recent, e.g. post-compaction recovery). Pages
+    /// stay chronological. Ignored once an anchor below is set.
     #[serde(default)]
     pub session_from: SessionFrom,
+    /// Session scope: page forward - messages strictly after this id.
+    #[serde(default)]
+    pub session_after_message_id: Option<String>,
+    /// Session scope: page backward - messages strictly before this id.
+    #[serde(default)]
+    pub session_before_message_id: Option<String>,
+    /// Message scope: conversational sibling messages before the target
+    /// (mirrors `grep -B`).
+    #[serde(default = "default_context")]
+    pub message_context_before: usize,
+    /// Message scope: conversational sibling messages after the target
+    /// (mirrors `grep -A`).
+    #[serde(default = "default_context")]
+    pub message_context_after: usize,
 }
 
-/// How much of each message `pond_get` materializes (spec.md#protocol).
-/// Ignored when `message_id` is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseMode {
-    /// `search_text IS NOT NULL` conversational view + part summaries.
-    #[default]
-    Conversational,
-    /// All messages (including carriers) + part summaries.
-    Complete,
-    /// All messages + full parts inline (heaviest mode).
-    Verbatim,
-}
-
-/// Which end of a session `pond_get` reads its page from (spec.md#protocol).
+/// Which end of a session `pond_get` reads its first page from
+/// (spec.md#protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionFrom {
@@ -413,8 +400,10 @@ impl GetSession {
     }
 }
 
-/// Per-message view in a `pond_get` response. `parts_summary` is always
-/// present (possibly empty); `parts` is populated only in Verbatim mode.
+/// Per-message view in a `pond_get` response (spec.md#protocol). Always
+/// conversational: `text`/`content` plus one-line part summaries. Full part
+/// bodies ride `GetResult::Message.target_parts`, reached by `message_id`
+/// scope - a session view never inlines them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageView {
     pub id: String,
@@ -428,8 +417,6 @@ pub struct MessageView {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts_summary: Vec<PartSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parts: Option<Vec<ResponsePart>>,
 }
 
 /// Compact per-part descriptor (spec.md#protocol): enough to tell what a
@@ -452,9 +439,9 @@ impl PartSummary {
     ///
     /// `text` and `reasoning` return `None`: a text part's content already rides
     /// the message's `text`/`content` (a summary would duplicate it), and
-    /// reasoning is deliberately not surfaced by default (its full body is still
-    /// reachable in verbatim mode). The kinds that survive are exactly
-    /// [`SUMMARY_PART_TYPES`].
+    /// reasoning is deliberately not surfaced in the session/conversational view
+    /// (its full body is still rendered when a message is fetched by `message_id`
+    /// scope). The kinds that survive are exactly [`SUMMARY_PART_TYPES`].
     pub fn for_kind(kind: &PartKind) -> Option<Self> {
         let (label, call_id) = match kind {
             PartKind::Text { .. } | PartKind::Reasoning { .. } => return None,
@@ -544,13 +531,19 @@ impl ResponsePart {
 pub enum GetResult {
     Session {
         messages: Vec<MessageView>,
-        messages_remaining: usize,
+        /// Conversational messages before the emitted page (the top marker's
+        /// `session_before_message_id` cursor exists when this is > 0).
+        before_remaining: usize,
+        /// Conversational messages after the emitted page (the bottom marker's
+        /// `session_after_message_id` cursor exists when this is > 0).
+        after_remaining: usize,
     },
     Message {
         target: MessageView,
         target_parts: Vec<ResponsePart>,
         target_parts_remaining: usize,
-        /// Up to `2*context_depth` messages around the target (target excluded).
+        /// `message_context_before` + `message_context_after` conversational
+        /// messages around the target (target excluded).
         siblings: Vec<MessageView>,
     },
 }
@@ -577,29 +570,44 @@ pub struct SearchRequest {
     #[serde(default)]
     pub namespace: Option<String>,
     pub query: String,
-    // Server normally decides between hybrid and FTS-only from the embedder +
-    // embeddings-coverage state (spec.md#search); `mode_override` is the
-    // operator-tooling escape hatch. Production callers (MCP, HTTP agents)
-    // should leave it `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode_override: Option<SearchModeWire>,
+    /// Retrieval arm (spec.md#search). `vector` (default) matches on meaning;
+    /// `fts` matches exact whole words via BM25. The agent picks per query -
+    /// there is no server-side fusion. If `vector` is asked of a store with no
+    /// embeddings, the server falls back to `fts`.
+    #[serde(default)]
+    pub mode: SearchModeWire,
+    /// Result ordering. `relevance` (default) ranks by match strength (vector:
+    /// cosine + a gentle recency tiebreaker; fts: BM25); `recency` ranks
+    /// strictly newest-first. A recency-sorted response is labeled so the
+    /// caller does not misread rank-1 as the best match.
+    #[serde(default)]
+    pub sort_by: SortBy,
     #[serde(default)]
     pub filters: SearchFilters,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
 
-/// Wire-level retrieval mode override (spec.md#search). Not normally set on
-/// the wire - the server decides hybrid vs FTS-only from embedding
-/// availability. The variant exists so operator tooling (`pond search --mode`,
-/// the embeddings-benchmark harness) can force one arm without an env-var
-/// backdoor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Wire-level retrieval arm (spec.md#search). The agent chooses per query:
+/// `vector` for concepts/meaning (default), `fts` for known exact words
+/// (BM25). The old server-side hybrid fusion is gone - one arm per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchModeWire {
     Fts,
+    #[default]
     Vector,
-    Hybrid,
+}
+
+/// Result ordering for `pond_search` (spec.md#search).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortBy {
+    /// Match strength: vector = cosine + recency tiebreaker, fts = BM25.
+    #[default]
+    Relevance,
+    /// Strictly newest-first; the response is labeled as recency-sorted.
+    Recency,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -609,26 +617,18 @@ pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
-    /// Score floor; hits below it are dropped. Not an absence signal: present
-    /// and absent content score in overlapping bands (see
-    /// `docs/researches/embeddings.md`), so the default stays 0 and the
-    /// response's `searchable_in_scope` carries the honesty instead.
+    /// Raw-cosine score floor for `vector` mode; hits below it are dropped.
+    /// Not an absence signal: present and absent content score in overlapping
+    /// bands (see `docs/researches/embeddings.md`), so the default stays 0 and
+    /// the response's `searchable_in_scope` carries the honesty instead.
+    /// Disallowed in `fts` mode (BM25 is unbounded and not comparable across
+    /// queries) - the handler rejects a non-zero value there.
     // Skip the default 0.0 so an unfiltered request stays compact.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub min_score: f64,
-    /// Include subagent sessions (`source_agent` like `claude-code/<name>`).
-    /// Default false: a search targets the human-facing main sessions.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub include_subagents: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn is_zero_f64(value: &f64) -> bool {
@@ -744,6 +744,10 @@ pub fn default_namespace() -> String {
 
 fn default_get_limit() -> usize {
     20
+}
+
+fn default_context() -> usize {
+    3
 }
 
 pub fn validate_protocol(version: u16) -> Result<(), ErrorEnvelope> {

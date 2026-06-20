@@ -12,9 +12,12 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{CompactionOptions, commit_compaction, plan_compaction};
+pub use lance::dataset::write::merge_insert::MergeStats;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
-use lance::deps::arrow_array::{RecordBatch, RecordBatchIterator};
+use lance::dataset::{InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
+pub use lance::dataset::{WriteParams, WriteStats};
+use lance::deps::arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
+use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
 use lance::index::DatasetIndexInternalExt;
 use lance::index::vector::VectorIndexParams;
@@ -22,6 +25,8 @@ use lance::session::Session;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor, uri_to_url,
 };
@@ -38,33 +43,19 @@ use std::{
 use tokio::sync::{Mutex, OnceCell};
 use tokio_stream::StreamExt;
 use url::Url;
-/// Embedded-row count at which pond builds the IVF_PQ vector index on
+/// Embedded-row count at which pond builds the IVF_SQ vector index on
 /// `messages.vector` (spec.md#search). Below it, vector search runs a
 /// brute-force flat scan - exact and fast at small and medium scale, and
-/// IVF_PQ cannot train well on fewer vectors anyway.
+/// IVF_SQ cannot train well on fewer vectors anyway.
 pub const VECTOR_INDEX_ACTIVATION_ROWS: usize = 100_000;
 
-/// Default minimum unindexed-fragment count required before a per-intent
-/// append/rebuild step is admitted into `optimize_table_indices`. Lower
-/// values make each commit smaller and more frequent (bad on remote
-/// stores); higher values let fragments accumulate behind the brute-force
-/// fallback. 4 is the floor of the documented 4-8 band.
-pub const DEFAULT_INDEX_LAG_THRESHOLD: usize = 4;
-
-static INDEX_LAG_THRESHOLD_RUNTIME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Seed the process-wide index-lag threshold from `[maintenance].index_lag_threshold`.
-/// First call wins (mirrors `embed::init_model_id` / `sessions::init_embedding_dim`).
-pub fn init_index_lag_threshold(value: usize) {
-    INDEX_LAG_THRESHOLD_RUNTIME.get_or_init(|| value);
-}
-
-pub fn index_lag_threshold() -> usize {
-    INDEX_LAG_THRESHOLD_RUNTIME
-        .get()
-        .copied()
-        .unwrap_or(DEFAULT_INDEX_LAG_THRESHOLD)
-}
+/// Segment count at which an incremental index fold consolidates instead of
+/// appending. Each `optimize_indices(append)` writes a new same-name segment
+/// (lance `num_indices_to_merge=0`), and every vector/FTS query reads the
+/// probed partition or token postings from *every* segment - so unbounded
+/// delta growth multiplies per-query object-store round-trips. At this many
+/// segments pond folds with `merge` to collapse them back into one.
+pub const DELTA_MERGE_THRESHOLD: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Storage addresses (spec.md#storage-url-grammar)
@@ -658,7 +649,7 @@ fn strip_one_newline(mut text: String) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     #[error(
-        "authentication failed and no creds set matched this URL; define [creds.*] (or POND_CREDS_*), or provide ambient AWS_* credentials"
+        "authentication failed and no creds set matched this URL; add one with `pond creds add` (or set POND_CREDS_*), or provide ambient AWS_* credentials"
     )]
     NoCreds { source: anyhow::Error },
     #[error("authentication failed using creds set {set:?}; check its keys and scope")]
@@ -862,7 +853,10 @@ pub const COMPACTION_ABSORB_FACTOR: u64 = 4;
 /// in-progress guard still protects unverified files regardless of this value
 /// (`UNVERIFIED_THRESHOLD_DAYS` in lance/dataset/cleanup.rs).
 pub fn default_cleanup_older_than() -> chrono::Duration {
-    chrono::Duration::days(1)
+    // Toward Lance's 1 h floor: fewer retained manifest versions = cheaper
+    // remote open (spec.md#search). The append fast-path already curbs the
+    // version churn that earlier forced a wider window.
+    chrono::Duration::hours(1)
 }
 
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
@@ -957,7 +951,7 @@ fn keep_task(stats: &[FragmentStat], cap: usize, deletion_threshold: f32) -> boo
 }
 
 /// Declarative description of one index pond keeps on a table. Created when
-/// its trigger fires; folded forward by `pond index optimize`.
+/// its trigger fires; folded forward by `pond optimize`.
 #[derive(Debug, Clone)]
 pub struct IndexIntent {
     /// Stable on-disk name. Must match across runs so existence checks
@@ -968,7 +962,7 @@ pub struct IndexIntent {
     /// Condition evaluated against the live dataset before each cycle.
     pub trigger: IndexTrigger,
     /// How the params are built at create time. Some intents have static
-    /// params (FTS, scalars); IVF_PQ needs the row count to size partitions.
+    /// params (FTS, scalars); IVF_SQ needs the row count to size partitions.
     pub params: IndexParamsKind,
 }
 
@@ -979,7 +973,7 @@ pub enum IndexTrigger {
     /// indices: there is no training cost worth delaying.
     OnAnyRows,
     /// Build when `count(<column> IS NOT NULL) >= threshold`. Used for the
-    /// IVF_PQ vector index, which trains poorly on too few vectors.
+    /// IVF_SQ vector index, which trains poorly on too few vectors.
     OnNonNullCount {
         column: &'static str,
         threshold: usize,
@@ -993,19 +987,21 @@ pub enum IndexParamsKind {
     /// `BuiltinIndexType::BTree` -> [`IndexType::BTree`];
     /// `BuiltinIndexType::Bitmap` -> [`IndexType::Bitmap`]; etc.
     Scalar(BuiltinIndexType),
-    /// `InvertedIndexParams` with a character `ngram` tokenizer in the
-    /// `[min, max]` range and stemming / stop-words off
-    /// (spec.md#search-language-neutral-index).
-    InvertedFtsNgram { min: u32, max: u32 },
-    /// `VectorIndexParams::ivf_pq` with cosine metric (e5 vectors are
-    /// L2-normalized). `sub_vectors = embedding_dim / 8` and `num_bits = 8`
-    /// are pond's conventions; `max_iters` caps kmeans. Partitions follow
-    /// LanceDB's documented `num_rows // 4096` guidance, floored at one.
-    IvfPqCosine {
-        sub_vectors: usize,
-        num_bits: u8,
-        max_iters: usize,
-    },
+    /// `InvertedIndexParams` with the word-level `simple` tokenizer plus
+    /// English stemming, stop-words off (spec.md#search-language-neutral-index).
+    /// Word retrieval beats character ngram ~2x on the real corpus at ~4x less
+    /// index weight; substring/symbol lookup stays on the SQL `LIKE` /
+    /// `contains_tokens` path, not here.
+    InvertedFtsWord,
+    /// `VectorIndexParams::with_ivf_sq_params` with cosine metric (e5 vectors
+    /// are L2-normalized). 8-bit scalar quantization stores per-dimension codes
+    /// in the index itself, so kNN computes distances from the prewarmed
+    /// partition with no refine pass - PQ+refine instead re-reads ~k*factor
+    /// exact vectors from the data files as scattered per-row GETs, the
+    /// dominant per-query S3 request storm on a throttling remote store
+    /// (spec.md#search). `max_iters` caps kmeans; partitions follow LanceDB's
+    /// documented `num_rows // 4096` guidance, floored at one.
+    IvfSqCosine { num_bits: u16, max_iters: usize },
 }
 
 impl IndexTrigger {
@@ -1026,25 +1022,23 @@ impl IndexParamsKind {
     fn index_type(&self) -> IndexType {
         match self {
             Self::Scalar(BuiltinIndexType::Bitmap) => IndexType::Bitmap,
+            Self::Scalar(BuiltinIndexType::ZoneMap) => IndexType::ZoneMap,
             Self::Scalar(_) => IndexType::BTree,
-            Self::InvertedFtsNgram { .. } => IndexType::Inverted,
-            Self::IvfPqCosine { .. } => IndexType::Vector,
+            Self::InvertedFtsWord => IndexType::Inverted,
+            Self::IvfSqCosine { .. } => IndexType::Vector,
         }
     }
 
     async fn build(&self, dataset: &Dataset) -> Result<Box<dyn lance::index::IndexParams>> {
         match self {
             Self::Scalar(kind) => Ok(Box::new(ScalarIndexParams::for_builtin(kind.clone()))),
-            Self::InvertedFtsNgram { min, max } => Ok(Box::new(
+            Self::InvertedFtsWord => Ok(Box::new(
                 InvertedIndexParams::default()
-                    .base_tokenizer("ngram".to_owned())
-                    .ngram_min_length(*min)
-                    .ngram_max_length(*max)
-                    .stem(false)
+                    .base_tokenizer("simple".to_owned())
+                    .stem(true)
                     .remove_stop_words(false),
             )),
-            Self::IvfPqCosine {
-                sub_vectors,
+            Self::IvfSqCosine {
                 num_bits,
                 max_iters,
             } => {
@@ -1052,12 +1046,16 @@ impl IndexParamsKind {
                     .count_rows(Some("vector IS NOT NULL".to_owned()))
                     .await?;
                 let partitions = count.checked_div(4096).unwrap_or(0).max(1);
-                Ok(Box::new(VectorIndexParams::ivf_pq(
-                    partitions,
-                    *num_bits,
-                    *sub_vectors,
+                let mut ivf = IvfBuildParams::new(partitions);
+                ivf.max_iters = *max_iters;
+                let sq = SQBuildParams {
+                    num_bits: *num_bits,
+                    ..Default::default()
+                };
+                Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
                     MetricType::Cosine,
-                    *max_iters,
+                    ivf,
+                    sq,
                 )))
             }
         }
@@ -1143,6 +1141,18 @@ pub enum OptimizeEvent {
         phase: OptimizePhase,
         elapsed_ms: u64,
     },
+    /// Intra-index liveness, forwarded from Lance's `IndexBuildProgress`
+    /// callbacks (FTS tokenize/copy, IVF train/shuffle/merge, BTree/Bitmap
+    /// build stages). Fires many times per index between `PhaseStart` /
+    /// `PhaseDone`; the spinner just overwrites its message each tick.
+    IndexStage {
+        table: Table,
+        index: String,
+        stage: String,
+        completed: u64,
+        total: Option<u64>,
+        unit: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1166,11 +1176,132 @@ impl OptimizePhase {
     }
 }
 
-pub type OptimizeProgressFn = Box<dyn Fn(OptimizeEvent) + Send + Sync>;
+/// `Arc` rather than `Box` so the same callback can be cloned into the
+/// `PondIndexProgress` Arc that Lance's `IndexBuildProgress` builder demands -
+/// otherwise intra-index stage events have no path back to the CLI spinner.
+pub type OptimizeProgressFn = Arc<dyn Fn(OptimizeEvent) + Send + Sync>;
 
 fn emit(progress: Option<&OptimizeProgressFn>, event: OptimizeEvent) {
     if let Some(callback) = progress {
         callback(event);
+    }
+}
+
+/// Bridges Lance's `IndexBuildProgress` async callbacks (`stage_start`,
+/// `stage_progress`, `stage_complete`) into pond's `OptimizeEvent::IndexStage`
+/// stream so the CLI spinner can show "fts tokenize_docs 1.4M / 2M rows"
+/// instead of going dark for 10-20 minutes during a single `create_index` or
+/// `optimize_indices` call. Remembers the active stage's `total` / `unit` so
+/// `stage_progress` (which only carries `completed`) can render a full
+/// fraction. Emissions are throttled to one every 100ms; FTS's per-batch
+/// `stage_progress` calls would otherwise contend the spinner mutex.
+struct PondIndexProgress {
+    callback: OptimizeProgressFn,
+    table: Table,
+    index: String,
+    state: std::sync::Mutex<PondIndexStageState>,
+}
+
+// `IndexBuildProgress` requires `Debug`; the `callback` field is
+// `Arc<dyn Fn...>` which has no `Debug` impl, so derive doesn't apply.
+impl std::fmt::Debug for PondIndexProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PondIndexProgress")
+            .field("table", &self.table)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PondIndexStageState {
+    total: Option<u64>,
+    unit: String,
+    last_emit: Option<Instant>,
+}
+
+impl PondIndexProgress {
+    fn new(callback: OptimizeProgressFn, table: Table, index: String) -> Arc<Self> {
+        Arc::new(Self {
+            callback,
+            table,
+            index,
+            state: std::sync::Mutex::new(PondIndexStageState::default()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_index::progress::IndexBuildProgress for PondIndexProgress {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
+        if let Ok(mut state) = self.state.lock() {
+            state.total = total;
+            state.unit = unit.to_owned();
+            state.last_emit = Some(Instant::now());
+        }
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed: 0,
+            total,
+            unit: unit.to_owned(),
+        });
+        Ok(())
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
+        let (total, unit) = {
+            let Ok(mut state) = self.state.lock() else {
+                return Ok(());
+            };
+            let now = Instant::now();
+            if let Some(prev) = state.last_emit
+                && now.duration_since(prev) < Duration::from_millis(100)
+            {
+                return Ok(());
+            }
+            state.last_emit = Some(now);
+            (state.total, state.unit.clone())
+        };
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed,
+            total,
+            unit,
+        });
+        Ok(())
+    }
+
+    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
+        let (total, unit) = {
+            let Ok(state) = self.state.lock() else {
+                return Ok(());
+            };
+            (state.total, state.unit.clone())
+        };
+        (self.callback)(OptimizeEvent::IndexStage {
+            table: self.table,
+            index: self.index.clone(),
+            stage: stage.to_owned(),
+            completed: total.unwrap_or(0),
+            total,
+            unit,
+        });
+        Ok(())
+    }
+}
+
+fn lance_progress(
+    progress: Option<&OptimizeProgressFn>,
+    table: Table,
+    index: &str,
+) -> Arc<dyn lance_index::progress::IndexBuildProgress> {
+    match progress {
+        Some(callback) => PondIndexProgress::new(callback.clone(), table, index.to_owned()),
+        None => Arc::new(lance_index::progress::NoopIndexBuildProgress),
     }
 }
 
@@ -1376,8 +1507,11 @@ impl RuntimeCaps {
 /// default (see `benches/serve_mem_bench.rs --cap-sweep`).
 const LOCAL_INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const LOCAL_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
-/// Object-store defaults: latency to refill is per-page, so keep more in cache.
-const REMOTE_INDEX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Object-store defaults: latency to refill is per-page, so keep more in cache
+/// than local - but bounded above the warm working set, not Lance's 6 GiB.
+/// Post word-tokenizer FTS that set is ~450 MB (simple invert + IVF_SQ aux), so
+/// 1 GiB holds both indices warm with headroom while capping the RSS ceiling.
+const REMOTE_INDEX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 const REMOTE_METADATA_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 fn resolve_cache_caps(location: &Url, caps: RuntimeCaps) -> (usize, usize) {
@@ -1491,11 +1625,71 @@ impl CachedDataset {
         self.last_refresh = Instant::now();
     }
 }
+
+/// Outcome of one [`Handle::append_stream`] write. Lance's `execute_stream`
+/// returns only the new `Dataset` (no write summary), so these totals are
+/// captured from the cumulative `WriteStats` ticks plus pond's own OCC attempt
+/// counter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendStats {
+    pub rows: u64,
+    pub bytes_written: u64,
+    pub files_written: u64,
+    pub attempts: u32,
+}
+
+/// Monotonic high-water fold over the cumulative `WriteStats` ticks
+/// `append_stream` receives. Lance restarts a stream's cumulative counters from
+/// zero on each OCC retry, so `fetch_max` keeps the fold monotonic - a retry
+/// contributes nothing until it passes the prior mark, making `AppendStats`
+/// exact under retries.
+#[derive(Default)]
+struct WriteAccum {
+    rows: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    files: std::sync::atomic::AtomicU64,
+}
+
+impl WriteAccum {
+    fn observe(&self, stats: &WriteStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows.fetch_max(stats.rows_written, Relaxed);
+        self.bytes.fetch_max(stats.bytes_written, Relaxed);
+        self.files.fetch_max(stats.files_written as u64, Relaxed);
+    }
+    fn rows(&self) -> u64 {
+        self.rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn files(&self) -> u64 {
+        self.files.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Append-mode write params. Byte-sized fragments, not Lance's 90 GB default:
+/// kilobyte rows would otherwise pack multi-GiB fragments that compaction
+/// rewrites wholesale (see `TARGET_FRAGMENT_BYTES`). Reuses the create params so
+/// appended fragments match the table's storage version / row-id mode.
+fn append_write_params() -> WriteParams {
+    let mut params = sessions::write_params_for_create();
+    params.mode = WriteMode::Append;
+    params.max_bytes_per_file = TARGET_FRAGMENT_BYTES as usize;
+    params
+}
+
 impl Handle {
     /// Open without storage options or explicit cache caps. Backend-aware
     /// defaults from `[runtime]` apply.
     pub async fn open(location: &Url) -> Result<Self> {
         Self::open_with_options(location, HashMap::new(), RuntimeCaps::default()).await
+    }
+
+    /// Live size in bytes of the shared Lance session caches (index + metadata).
+    /// Walks the caches, so it is not cheap - bench/diagnostic use only.
+    pub fn lance_cache_bytes(&self) -> u64 {
+        self.session.size_bytes()
     }
 
     /// Open with object-store options handed through to Lance verbatim, plus
@@ -1698,6 +1892,21 @@ impl Handle {
         batch: RecordBatch,
         row_count: usize,
     ) -> Result<u64> {
+        self.merge_insert_stats(table, batch, row_count)
+            .await
+            .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
+    }
+
+    /// Insert-only merge that surfaces Lance's full `MergeStats`. Callers that
+    /// need bytes written, file count, or OCC retry count (e.g. `pond copy`'s
+    /// progress display) use this; the thin wrapper above keeps the
+    /// affected-rows return for everyone else.
+    pub(crate) async fn merge_insert_stats(
+        &self,
+        table: Table,
+        batch: RecordBatch,
+        row_count: usize,
+    ) -> Result<MergeStats> {
         self.merge(
             table,
             batch,
@@ -1726,11 +1935,40 @@ impl Handle {
             WhenNotMatched::DoNothing,
         )
         .await
+        .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
+    }
+
+    /// The OCC write-commit seam (spec.md#lance-chokepoints-write): every write -
+    /// `merge` and the append paths - runs through here. It takes the cached
+    /// handle's lock, hands `execute` the latest dataset, commits the dataset
+    /// `execute` returns, and keeps the cache coherent - all under retry.
+    /// `execute` builds the table-specific builder, runs it, and returns the new
+    /// dataset plus its own stats payload; it reruns per OCC attempt, so it owns
+    /// what it needs. Write-type specifics (params, stats, tracing) stay with the
+    /// caller.
+    async fn write_committed<E, Fut, P>(&self, table: Table, execute: E) -> Result<P>
+    where
+        E: Fn(Arc<Dataset>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Dataset, P)>>,
+    {
+        self.retry_lance(table.label(), || {
+            let execute = &execute;
+            async move {
+                let mut cached = self.cached(table).await?.lock().await;
+                let existing = cached.latest().await?;
+                let (dataset, payload) = execute(Arc::new(existing)).await?;
+                cached.replace(dataset);
+                Ok(payload)
+            }
+        })
+        .await
     }
 
     /// Shared merge path for [`Self::merge_insert`] and [`Self::merge_update`].
-    /// Returns the number of rows affected (inserted or updated, whichever the
-    /// behaviors produce).
+    /// Returns Lance's `MergeStats` verbatim so the progress layer can read
+    /// `bytes_written` / `num_files_written` / `num_attempts` without a second
+    /// round-trip; the thin wrappers above project to `u64` for callers that
+    /// only need the affected-rows count.
     async fn merge(
         &self,
         table: Table,
@@ -1739,38 +1977,41 @@ impl Handle {
         op: &'static str,
         when_matched: WhenMatched,
         when_not_matched: WhenNotMatched,
-    ) -> Result<u64> {
+    ) -> Result<MergeStats> {
         if row_count == 0 {
-            return Ok(0);
+            return Ok(MergeStats::default());
         }
         let started = Instant::now();
         let result = self
-            .retry_lance(table.label(), || async {
-                let mut cached = self.cached(table).await?.lock().await;
-                let existing = cached.latest().await?;
-                let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-                let mut builder = MergeInsertBuilder::try_new(Arc::new(existing), Vec::new())?;
-                builder.when_matched(when_matched.clone());
-                builder.when_not_matched(when_not_matched.clone());
-                // pond presents each PK at most once per batch; FirstSeen keeps
-                // the first occurrence rather than failing (Lance's default).
-                builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-                // Cleanup is operator-driven via `pond index optimize`; the
-                // per-commit auto hook would add a LIST per write on remote
-                // backends without changing the steady-state retention.
-                builder.skip_auto_cleanup(true);
-                let (dataset, stats) = builder
-                    .try_build()?
-                    .execute_reader(Box::new(reader))
-                    .await?;
-                cached.replace(dataset.as_ref().clone());
-                Ok((
-                    stats.num_inserted_rows + stats.num_updated_rows,
-                    stats.num_skipped_duplicates,
-                ))
+            .write_committed(table, |existing| {
+                let batch = batch.clone();
+                let when_matched = when_matched.clone();
+                let when_not_matched = when_not_matched.clone();
+                async move {
+                    let schema = batch.schema();
+                    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+                    let mut builder = MergeInsertBuilder::try_new(existing, Vec::new())?;
+                    builder.when_matched(when_matched);
+                    builder.when_not_matched(when_not_matched);
+                    // pond presents each PK at most once per batch; FirstSeen keeps
+                    // the first occurrence rather than failing (Lance's default).
+                    builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+                    // Cleanup is operator-driven via `pond optimize`; the per-commit
+                    // auto hook would add a LIST per write on remote backends without
+                    // changing the steady-state retention.
+                    builder.skip_auto_cleanup(true);
+                    let (dataset, stats) = builder
+                        .try_build()?
+                        .execute_reader(Box::new(reader))
+                        .await?;
+                    Ok((dataset.as_ref().clone(), stats))
+                }
             })
             .await;
-        let skipped = result.as_ref().map(|(_, s)| *s).unwrap_or(0);
+        let skipped = result
+            .as_ref()
+            .map(|s| s.num_skipped_duplicates)
+            .unwrap_or(0);
         tracing::info!(
             target: "pond::perf",
             op,
@@ -1780,12 +2021,124 @@ impl Handle {
             skipped,
             "merge",
         );
-        result.map(|(affected, _)| affected)
+        result
+    }
+
+    /// Append a streamed source into `table` under a single commit - the
+    /// bandwidth-bound counterpart to [`Self::merge`]. spec.md#session-durable-copy:
+    /// rows that cannot collide on the destination (absent sessions) take this
+    /// path. `Append` never joins or probes the target, so its cost is the
+    /// bytes written, not the per-batch commit + key-scan that `merge_insert`
+    /// pays - the fix for store-to-store copy being commit-latency-bound on
+    /// remote object stores.
+    ///
+    /// `make_source` is a *factory*, not a prebuilt stream: a Lance scan stream
+    /// is one-shot, so an OCC retry rebuilds it. A single per-call `WriteAccum`
+    /// (shared across attempts, NOT fresh per attempt) makes the row/byte/file
+    /// fold exact under retries.
+    pub(crate) async fn append_stream<F, Fut>(
+        &self,
+        table: Table,
+        make_source: F,
+    ) -> Result<AppendStats>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<SendableRecordBatchStream>>,
+    {
+        let cum = Arc::new(WriteAccum::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = Instant::now();
+        self.write_committed(table, |existing| {
+            let make_source = &make_source;
+            let cum = cum.clone();
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let stream = make_source().await?;
+                let dataset = InsertBuilder::new(existing)
+                    .with_params(&append_write_params())
+                    .progress(move |stats| cum.observe(&stats))
+                    .execute_stream(stream)
+                    .await?;
+                Ok((dataset, ()))
+            }
+        })
+        .await?;
+
+        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
+        let stats = AppendStats {
+            rows: cum.rows(),
+            bytes_written: cum.bytes(),
+            files_written: cum.files(),
+            attempts,
+        };
+        tracing::info!(
+            target: "pond::perf",
+            op = "append",
+            table = %table.label(),
+            rows = stats.rows,
+            files = stats.files_written,
+            attempts,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "append",
+        );
+        Ok(stats)
+    }
+
+    /// [`Self::append_stream`] for batches pond already holds in memory (the sync
+    /// write path) instead of a source-store scan. Row count is taken from the
+    /// batches - exact under OCC retry without depending on the progress tick.
+    pub(crate) async fn append_batches(
+        &self,
+        table: Table,
+        batches: Vec<RecordBatch>,
+    ) -> Result<AppendStats> {
+        let total_rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+        if total_rows == 0 {
+            return Ok(AppendStats::default());
+        }
+        let cum = Arc::new(WriteAccum::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = Instant::now();
+        self.write_committed(table, |existing| {
+            let cum = cum.clone();
+            let attempts = attempts.clone();
+            let batches = batches.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dataset = InsertBuilder::new(existing)
+                    .with_params(&append_write_params())
+                    .progress(move |stats| cum.observe(&stats))
+                    .execute(batches)
+                    .await?;
+                Ok((dataset, ()))
+            }
+        })
+        .await?;
+
+        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
+        let stats = AppendStats {
+            rows: total_rows,
+            bytes_written: cum.bytes(),
+            files_written: cum.files(),
+            attempts,
+        };
+        tracing::info!(
+            target: "pond::perf",
+            op = "append_batches",
+            table = %table.label(),
+            rows = stats.rows,
+            files = stats.files_written,
+            attempts,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "append",
+        );
+        Ok(stats)
     }
 
     /// Run the table-local maintenance cycle for the supplied index intents.
     /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
-    /// BTree combine bug; Bitmap, FTS, and IVF_PQ fold via append.
+    /// BTree combine bug; Bitmap, FTS, and IVF_SQ fold via append.
     ///
     /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
@@ -1811,7 +2164,8 @@ impl Handle {
         }
     }
 
-    /// Run only the indices phase for one table. Used by `pond embed`'s tail
+    /// Run only the indices phase for one table. Used by the optimize embed
+    /// stage's tail
     /// to fold newly written vectors into the indices without paying the
     /// compaction retry budget while embed itself may still be writing.
     pub async fn optimize_table_indices_only(
@@ -1873,15 +2227,56 @@ impl Handle {
         }
     }
 
-    pub async fn rebuild_index(&self, table: Table, intent: &IndexIntent) -> Result<()> {
-        self.retry_lance(table.label(), || async {
-            let mut guard = self.cached(table).await?.lock().await;
-            let mut dataset = guard.latest().await?;
-            rebuild_index(&mut dataset, intent).await?;
-            guard.replace(dataset);
-            Ok(())
-        })
-        .await
+    pub async fn rebuild_index(
+        &self,
+        table: Table,
+        intent: &IndexIntent,
+        progress: Option<&OptimizeProgressFn>,
+    ) -> Result<()> {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::IndexRebuild,
+                detail: Some(intent.name.to_owned()),
+            },
+        );
+        let started = Instant::now();
+        let result = self
+            .retry_lance(table.label(), || async {
+                let mut guard = self.cached(table).await?.lock().await;
+                let mut dataset = guard.latest().await?;
+                rebuild_index(&mut dataset, intent, progress, table).await?;
+                guard.replace(dataset);
+                Ok(())
+            })
+            .await;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::IndexRebuild,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+        result
+    }
+
+    /// Lance `cleanup_old_versions` for one table: reclaim files no manifest
+    /// within the retention window references. No compaction and no new commit -
+    /// it only deletes superseded files, so no OCC retry is needed.
+    pub async fn cleanup_table_versions(
+        &self,
+        table: Table,
+        older_than: chrono::Duration,
+    ) -> Result<()> {
+        let mut guard = self.cached(table).await?.lock().await;
+        let dataset = guard.latest().await?;
+        dataset
+            .cleanup_old_versions(older_than, Some(false), Some(false))
+            .await
+            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
+        Ok(())
     }
 
     pub async fn index_status(
@@ -1945,6 +2340,21 @@ impl Handle {
             .await
             .map_err(Into::into)
     }
+    /// Collect the primary-key (`id`) set for `table`. Storage verification
+    /// compares these sets across two stores: matching row counts can still
+    /// hide divergent membership, so proving a destination is a complete
+    /// superset of a source needs the ids, not the cardinalities
+    /// (spec.md#substrate, `lance-deterministic-pk`).
+    pub async fn collect_ids(&self, table: Table) -> Result<std::collections::HashSet<String>> {
+        let batch = self.scan_batch(table, None, &["id"]).await?;
+        let ids = batch
+            .column_by_name("id")
+            .context("scan projection dropped the id column")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("id column is not Utf8")?;
+        Ok(ids.iter().flatten().map(str::to_owned).collect())
+    }
     /// Names of every index on `messages` - the vector-index tests read this.
     #[cfg(test)]
     pub(crate) async fn messages_index_names(&self) -> Result<Vec<String>> {
@@ -1953,8 +2363,19 @@ impl Handle {
         Ok(indices.iter().map(|index| index.name.clone()).collect())
     }
 
+    /// Whether `messages` carries an index named `name`. Manifest-only and
+    /// cache-backed (`load_indices` hits the dataset index cache), so it is
+    /// cheap enough to gate `Scanner::fast_search` per query: fast-search
+    /// returns an empty plan when the index is absent, so the retrievers must
+    /// only opt in once it exists.
+    pub(crate) async fn messages_has_index(&self, name: &str) -> Result<bool> {
+        let dataset = self.dataset(Table::Messages).await?;
+        let indices = dataset.load_indices().await?;
+        Ok(indices.iter().any(|index| index.name == name))
+    }
+
     /// Count rows in `table` not yet covered by `index_name`. Manifest-only;
-    /// a missing index reports the whole table. Powers `pond index status`.
+    /// a missing index reports the whole table. Powers `pond status`.
     pub(crate) async fn unindexed_row_count(
         &self,
         table: Table,
@@ -1971,8 +2392,43 @@ impl Handle {
             .sum())
     }
 
-    /// Drop the named index. Used by the `pond embed --force` model-swap path
-    /// to retire an IVF_PQ whose centroids belong to the old distance
+    /// Which table owns the named index, if any. Used by
+    /// `pond optimize --drop-index <name>` to route the drop to the right
+    /// dataset without sequentially probing-and-swallowing errors (the prior
+    /// loop hid permission/network failures behind "no such index"). Runs the
+    /// three `load_indices` calls in parallel; an error here is a real I/O
+    /// failure and propagates with context.
+    pub(crate) async fn find_index_owner(&self, name: &str) -> Result<Option<Table>> {
+        let list = |table: Table| async move {
+            let dataset = self.dataset(table).await?;
+            let names: Vec<String> = dataset
+                .load_indices()
+                .await
+                .with_context(|| format!("load_indices failed for {}", table.label()))?
+                .iter()
+                .map(|index| index.name.clone())
+                .collect();
+            Ok::<_, anyhow::Error>(names)
+        };
+        let (sessions, messages, parts) = tokio::try_join!(
+            list(Table::Sessions),
+            list(Table::Messages),
+            list(Table::Parts),
+        )?;
+        for (table, names) in [
+            (Table::Sessions, sessions),
+            (Table::Messages, messages),
+            (Table::Parts, parts),
+        ] {
+            if names.iter().any(|n| n == name) {
+                return Ok(Some(table));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drop the named index. Used by the `pond optimize --force-embed` model-swap path
+    /// to retire an IVF_SQ whose centroids belong to the old distance
     /// space, before the next write re-bootstraps it over the new model's
     /// vectors. Errors when the index does not exist; callers may swallow
     /// that.
@@ -2007,7 +2463,7 @@ impl Handle {
     /// Whether the store holds synced data yet. `open` eagerly creates empty
     /// `sessions`/`messages` datasets, but `parts` opens lazily on first write
     /// (see `open_with_options`), so its presence is the "has been synced"
-    /// signal - letting read-only surfaces (`pond status`, `pond storage`)
+    /// signal - letting read-only surfaces (`pond status`)
     /// render an empty state instead of erroring on the first `parts` describe.
     pub async fn initialized(&self) -> Result<bool> {
         let request = DescribeTableRequest {
@@ -2309,6 +2765,11 @@ async fn optimize_table_compact(
         },
     );
     let started = Instant::now();
+    // Lance v7 `cleanup_old_versions` removes orphan files inside
+    // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
+    // index merges accumulate empty UUID dirs forever (one inode each).
+    // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
+    // here (spec.md#concurrency: Lance-native maintenance only).
     dataset
         .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
         .await
@@ -2364,13 +2825,10 @@ async fn optimize_table_indices(
             );
             let started = Instant::now();
             dataset
-                .create_index(
-                    &[intent.column],
-                    index_type,
-                    Some(intent.name.to_owned()),
-                    params.as_ref(),
-                    false,
-                )
+                .create_index_builder(&[intent.column], index_type, params.as_ref())
+                .name(intent.name.to_owned())
+                .replace(false)
+                .progress(lance_progress(progress, table, intent.name))
                 .await
                 .with_context(|| format!("failed to create index {}", intent.name))?;
             emit(
@@ -2385,14 +2843,13 @@ async fn optimize_table_indices(
             continue;
         }
 
+        // Fold every trailing fragment so the index is always current after an
+        // optimize - no lag threshold. A tiny tail (rows written between this
+        // fold and the next) stays invisible to `fast_search` queries until the
+        // next fold, and the `DELTA_MERGE_THRESHOLD` cadence keeps the per-fold
+        // segment from accumulating without bound (spec.md#search).
         let unindexed = dataset.unindexed_fragments(intent.name).await?;
         if unindexed.is_empty() {
-            continue;
-        }
-        // Lag guard: let fragments accumulate behind the brute-force fallback
-        // rather than firing a commit per tiny append. Threshold is operator-
-        // tunable via `[maintenance].index_lag_threshold`.
-        if unindexed.len() < index_lag_threshold() {
             continue;
         }
         match intent.params {
@@ -2415,13 +2872,10 @@ async fn optimize_table_indices(
                 );
                 let started = Instant::now();
                 dataset
-                    .create_index(
-                        &[intent.column],
-                        index_type,
-                        Some(intent.name.to_owned()),
-                        params.as_ref(),
-                        true,
-                    )
+                    .create_index_builder(&[intent.column], index_type, params.as_ref())
+                    .name(intent.name.to_owned())
+                    .replace(true)
+                    .progress(lance_progress(progress, table, intent.name))
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
                 emit(
@@ -2435,8 +2889,8 @@ async fn optimize_table_indices(
                 did_work = true;
             }
             IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
-            | IndexParamsKind::InvertedFtsNgram { .. }
-            | IndexParamsKind::IvfPqCosine { .. } => {
+            | IndexParamsKind::InvertedFtsWord
+            | IndexParamsKind::IvfSqCosine { .. } => {
                 append_indices.push(intent.name.to_owned());
             }
             IndexParamsKind::Scalar(_) => {
@@ -2451,13 +2905,14 @@ async fn optimize_table_indices(
                 );
                 let started = Instant::now();
                 dataset
-                    .create_index(
+                    .create_index_builder(
                         &[intent.column],
                         intent.params.index_type(),
-                        Some(intent.name.to_owned()),
                         params.as_ref(),
-                        true,
                     )
+                    .name(intent.name.to_owned())
+                    .replace(true)
+                    .progress(lance_progress(progress, table, intent.name))
                     .await
                     .with_context(|| format!("failed to rebuild index {}", intent.name))?;
                 emit(
@@ -2474,7 +2929,22 @@ async fn optimize_table_indices(
     }
 
     if !append_indices.is_empty() {
-        let to_append = append_indices.clone();
+        // Per-index segment count from the manifest loaded above (delta segments
+        // share the intent name). Indices that have piled up
+        // `DELTA_MERGE_THRESHOLD` segments fold with `merge` (collapse to one);
+        // the rest take the cheap append. Splitting keeps each query reading few
+        // segments without paying a consolidation on every tiny fold.
+        let segment_count = |name: &str| {
+            existing
+                .iter()
+                .filter(|index| index.name.as_str() == name)
+                .count()
+        };
+        let (to_merge, to_append): (Vec<String>, Vec<String>) = append_indices
+            .iter()
+            .cloned()
+            .partition(|name| segment_count(name) >= DELTA_MERGE_THRESHOLD);
+
         emit(
             progress,
             OptimizeEvent::PhaseStart {
@@ -2484,10 +2954,20 @@ async fn optimize_table_indices(
             },
         );
         let started = Instant::now();
-        dataset
-            .optimize_indices(&OptimizeOptions::append().index_names(to_append))
-            .await
-            .context("optimize_indices(append) failed during index optimize")?;
+        if !to_append.is_empty() {
+            dataset
+                .optimize_indices(&OptimizeOptions::append().index_names(to_append))
+                .await
+                .context("optimize_indices(append) failed during index optimize")?;
+        }
+        if !to_merge.is_empty() {
+            dataset
+                .optimize_indices(
+                    &OptimizeOptions::merge(DELTA_MERGE_THRESHOLD).index_names(to_merge),
+                )
+                .await
+                .context("optimize_indices(merge) failed during index optimize")?;
+        }
         emit(
             progress,
             OptimizeEvent::PhaseDone {
@@ -2499,7 +2979,7 @@ async fn optimize_table_indices(
         tracing::debug!(
             target: "pond::perf",
             indices = ?append_indices,
-            "appended trailing fragments into indices",
+            "folded trailing fragments into indices",
         );
         did_work = true;
     }
@@ -2507,19 +2987,25 @@ async fn optimize_table_indices(
     Ok(did_work)
 }
 
-async fn rebuild_index(dataset: &mut Dataset, intent: &IndexIntent) -> Result<()> {
+async fn rebuild_index(
+    dataset: &mut Dataset,
+    intent: &IndexIntent,
+    progress: Option<&OptimizeProgressFn>,
+    table: Table,
+) -> Result<()> {
     if !intent.trigger.should_create(dataset).await? {
         return Ok(());
     }
     let params = intent.params.build(dataset).await?;
     dataset
-        .create_index(
+        .create_index_builder(
             &[intent.column],
             intent.params.index_type(),
-            Some(intent.name.to_owned()),
             params.as_ref(),
-            true,
         )
+        .name(intent.name.to_owned())
+        .replace(true)
+        .progress(lance_progress(progress, table, intent.name))
         .await
         .with_context(|| format!("failed to rebuild index {}", intent.name))?;
     Ok(())
@@ -2581,6 +3067,35 @@ async fn index_status(
 /// wrap level and downcasts cleanly. Managed-versioning hookup (REST
 /// namespace external-manifest commits) is not wired here; v1 ships
 /// Directory v2 only.
+/// Diagnostic S3 IO tracing. Inert unless [`io_trace::enable`] is called
+/// before the store opens; then a shared `IOTracker` is injected as the
+/// object-store wrapper on every dataset read open, counting exactly how many
+/// GETs (and bytes, and - under the `io-trace` feature - which paths) each
+/// query issues against a remote store. Used by `serve_mem_bench --io-trace`
+/// to attribute the per-query S3 request load. Not a production code path.
+pub mod io_trace {
+    use lance_io::utils::tracking_store::{IOTracker, IoStats};
+    use std::sync::{Arc, OnceLock};
+
+    static TRACKER: OnceLock<IOTracker> = OnceLock::new();
+
+    /// Arm tracing. Must run before the store opens so the wrapper is applied
+    /// when the datasets' object store is built.
+    pub fn enable() {
+        let _ = TRACKER.set(IOTracker::default());
+    }
+
+    /// The shared tracker as an object-store wrapper, when armed.
+    pub(super) fn wrapper() -> Option<Arc<IOTracker>> {
+        TRACKER.get().map(|tracker| Arc::new(tracker.clone()))
+    }
+
+    /// Read and reset the IO accumulated since the last call.
+    pub fn take() -> Option<IoStats> {
+        TRACKER.get().map(IOTracker::incremental_stats)
+    }
+}
+
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
@@ -2601,8 +3116,23 @@ async fn open_or_create_via_ns(
                 format!("namespace returned no location for table {table_name}")
             })?;
             let mut builder = DatasetBuilder::from_uri(&location).with_session(session.clone());
-            if !storage_options.is_empty() {
-                builder = builder.with_storage_options(storage_options.clone());
+            match io_trace::wrapper() {
+                Some(wrapper) => {
+                    builder = builder.with_store_params(ObjectStoreParams {
+                        object_store_wrapper: Some(wrapper),
+                        storage_options_accessor: (!storage_options.is_empty()).then(|| {
+                            Arc::new(StorageOptionsAccessor::with_static_options(
+                                storage_options.clone(),
+                            ))
+                        }),
+                        ..Default::default()
+                    });
+                }
+                None => {
+                    if !storage_options.is_empty() {
+                        builder = builder.with_storage_options(storage_options.clone());
+                    }
+                }
             }
             let dataset = builder
                 .load()
@@ -2731,6 +3261,13 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     }
     set_default(options, &["pool_idle_timeout"], "300 seconds");
     set_default(options, &["connect_timeout"], "10 seconds");
+    // `request_timeout` bounds a single object-store request (one range GET/PUT),
+    // not a whole scan - a streaming read issues many small requests, each well
+    // under this. We keep it deliberately tight as a HARD BARRIER: a single
+    // request exceeding 60s means a design/infra problem to fix (chunk the read,
+    // use change-data-feed, fix the endpoint), never something to paper over with
+    // a longer timeout. An explicit `[storage]` override still wins.
+    set_default(options, &["request_timeout"], "60 seconds");
     let has_custom_endpoint = ["aws_endpoint", "endpoint"]
         .iter()
         .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)));

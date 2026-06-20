@@ -33,8 +33,10 @@ use anyhow::Result;
 use clap::Parser;
 use pond::{
     adapter::ClaudeCodeAdapter,
+    config::Config,
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::Store,
+    substrate::{RuntimeCaps, StorageUrl},
 };
 use tempfile::TempDir;
 use tracing::field::{Field, Visit};
@@ -54,6 +56,20 @@ struct Args {
     /// fixture corpus when none are given.
     #[arg(long, value_name = "PATH")]
     source_dir: Vec<PathBuf>,
+    /// Ingest into this REMOTE store (resolved through the config creds, like
+    /// the CLI) instead of a throwaway local TempDir. This is how you feel the
+    /// S3 cost of the write path - the per-table merge_insert breakdown over
+    /// the network is what exposes sync's inefficiency. Use a scratch prefix;
+    /// the store persists, so a fresh prefix gives a clean cold insert.
+    #[arg(long)]
+    url: Option<String>,
+    /// Ingest each corpus this many times into the SAME store. Pass 1 is the
+    /// cold insert; pass 2+ re-decode every body (NoopOracle skips nothing) and
+    /// re-`merge_insert` rows that already exist - the matched-heavy re-merge
+    /// cost that a sync of unchanged/grown sessions pays. The merge_insert
+    /// breakdown on pass 2 is the number the delta-write optimization targets.
+    #[arg(long, default_value_t = 1)]
+    passes: usize,
     /// Print the top reasons sessions get skipped or validator-rejected. Used
     /// to diagnose "why is my rejection rate so high?" without grepping the
     /// bar output (which indicatif suppresses on non-tty stderr).
@@ -83,74 +99,119 @@ async fn main() -> Result<()> {
         })
         .init();
 
+    // Only load config when targeting a remote store (it carries the creds).
+    let config = match &args.url {
+        Some(_) => {
+            let config_path = pond::config::default_config_path(
+                std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+                std::env::var_os("HOME").map(PathBuf::from),
+            );
+            Some(Config::load(&config_path)?)
+        }
+        None => None,
+    };
+
+    let passes = args.passes.max(1);
     for corpus in corpora {
-        capture.reset();
         let file_count = count_jsonl(&corpus);
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
+        // One store per corpus, reused across passes: pass 1 inserts, pass 2+
+        // re-merge already-present rows (the sync-of-unchanged re-merge cost).
+        // `_temp` keeps the local scratch dir alive for the whole corpus when
+        // not targeting a remote store.
+        let (store, _temp) = open_store(args.url.as_deref(), config.as_ref()).await?;
         let adapter = ClaudeCodeAdapter::new(&corpus);
 
-        let mut sync_skips = 0u64;
-        let mut sync_errors = 0u64;
-        // Bucket rejection reasons so we can show top causes per corpus. The
-        // key is the leading prefix of the reason (first line, first 120
-        // chars) so near-duplicate messages collapse onto one row.
-        let mut skip_reasons: HashMap<String, u64> = HashMap::new();
-        let mut error_reasons: HashMap<String, u64> = HashMap::new();
-        let started = Instant::now();
-        let mut sync_partial = 0u64;
-        let mut sync_partial_drops = 0u64;
-        let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
-            if let SyncEvent::SessionDone(outcome) = event {
-                match &outcome.status {
-                    SyncStatus::Skipped { reason } => {
-                        sync_skips += 1;
-                        *skip_reasons.entry(bucket_reason(reason)).or_default() += 1;
+        for pass in 1..=passes {
+            capture.reset();
+            let mut sync_skips = 0u64;
+            let mut sync_errors = 0u64;
+            // Bucket rejection reasons so we can show top causes per corpus. The
+            // key is the leading prefix of the reason (first line, first 120
+            // chars) so near-duplicate messages collapse onto one row.
+            let mut skip_reasons: HashMap<String, u64> = HashMap::new();
+            let mut error_reasons: HashMap<String, u64> = HashMap::new();
+            let started = Instant::now();
+            let mut sync_partial = 0u64;
+            let mut sync_partial_drops = 0u64;
+            let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
+                if let SyncEvent::SessionDone(outcome) = event {
+                    match &outcome.status {
+                        SyncStatus::Skipped { reason } => {
+                            sync_skips += 1;
+                            *skip_reasons.entry(bucket_reason(reason)).or_default() += 1;
+                        }
+                        SyncStatus::Rejected { reason } => {
+                            sync_errors += 1;
+                            *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
+                        }
+                        SyncStatus::Partial { dropped_events, .. } => {
+                            sync_partial += 1;
+                            sync_partial_drops += *dropped_events as u64;
+                        }
+                        SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty => {}
                     }
-                    SyncStatus::Rejected { reason } => {
-                        sync_errors += 1;
-                        *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
-                    }
-                    SyncStatus::Partial { dropped_events, .. } => {
-                        sync_partial += 1;
-                        sync_partial_drops += *dropped_events as u64;
-                    }
-                    SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty => {}
                 }
+            })
+            .await?;
+            let wall = started.elapsed();
+
+            report(Report {
+                corpus: &corpus,
+                pass,
+                passes,
+                files: file_count,
+                wall_ms: wall.as_millis() as u64,
+                inserted: summary.inserted as u64,
+                matched: summary.matched as u64,
+                dropped_events: summary.dropped_events as u64,
+                dropped_sessions: summary.dropped_sessions as u64,
+                skipped_files: summary.skipped_files as u64,
+                sync_skips,
+                sync_errors,
+                sync_partial,
+                sync_partial_drops,
+                capture: capture.snapshot(),
+            });
+
+            if args.show_rejections {
+                print_top_reasons("validator-error reasons", &error_reasons);
+                print_top_reasons("adapter-skip reasons", &skip_reasons);
+                // The `summary.drop_reasons` histogram (new in 2026-05-16) is
+                // the authoritative breakdown of WHY the `dropped_events +
+                // dropped_sessions` populations were dropped, including the
+                // Partial-event drops that `SyncEvent` couldn't reason about
+                // before. Surface it here so the bench's `--show-rejections`
+                // answers "why" not just "how many."
+                print_drop_reasons("summary.drop_reasons", &summary.drop_reasons);
             }
-        })
-        .await?;
-        let wall = started.elapsed();
-
-        report(Report {
-            corpus: &corpus,
-            files: file_count,
-            wall_ms: wall.as_millis() as u64,
-            inserted: summary.inserted as u64,
-            matched: summary.matched as u64,
-            dropped_events: summary.dropped_events as u64,
-            dropped_sessions: summary.dropped_sessions as u64,
-            skipped_files: summary.skipped_files as u64,
-            sync_skips,
-            sync_errors,
-            sync_partial,
-            sync_partial_drops,
-            capture: capture.snapshot(),
-        });
-
-        if args.show_rejections {
-            print_top_reasons("validator-error reasons", &error_reasons);
-            print_top_reasons("adapter-skip reasons", &skip_reasons);
-            // The `summary.drop_reasons` histogram (new in 2026-05-16) is
-            // the authoritative breakdown of WHY the `dropped_events +
-            // dropped_sessions` populations were dropped, including the
-            // Partial-event drops that `SyncEvent` couldn't reason about
-            // before. Surface it here so the bench's `--show-rejections`
-            // answers "why" not just "how many."
-            print_drop_reasons("summary.drop_reasons", &summary.drop_reasons);
         }
     }
     Ok(())
+}
+
+/// Open the ingest target: a remote store via config creds when `--url` is
+/// set (returns no TempDir), else a throwaway local store (returns the TempDir
+/// to keep alive). Mirrors the CLI's open path so remote numbers are faithful.
+async fn open_store(
+    url: Option<&str>,
+    config: Option<&Config>,
+) -> Result<(Store, Option<TempDir>)> {
+    match (url, config) {
+        (Some(url), Some(config)) => {
+            let storage = StorageUrl::parse(url)?;
+            let resolved = storage.resolve(&config.creds)?;
+            let caps = RuntimeCaps::from_config(&config.runtime);
+            let store =
+                Store::open_with_options(resolved.lance_url(), resolved.options.clone(), caps)
+                    .await?;
+            Ok((store, None))
+        }
+        _ => {
+            let temp = TempDir::new()?;
+            let store = Store::open_local(temp.path()).await?;
+            Ok((store, Some(temp)))
+        }
+    }
 }
 
 /// Collapse near-duplicate rejection reasons onto one key: drop trailing
@@ -364,6 +425,8 @@ impl Visit for FieldCollector {
 
 struct Report<'a> {
     corpus: &'a std::path::Path,
+    pass: usize,
+    passes: usize,
     files: u64,
     wall_ms: u64,
     inserted: u64,
@@ -379,7 +442,17 @@ struct Report<'a> {
 }
 
 fn report(r: Report<'_>) {
-    println!("=== {} ({} jsonl files) ===", r.corpus.display(), r.files);
+    let pass_tag = if r.passes > 1 {
+        format!(" [pass {}/{}]", r.pass, r.passes)
+    } else {
+        String::new()
+    };
+    println!(
+        "=== {} ({} jsonl files){} ===",
+        r.corpus.display(),
+        r.files,
+        pass_tag
+    );
     let wall_s = (r.wall_ms as f64) / 1000.0;
     println!("wall              {wall_s:>7.2} s");
     println!(

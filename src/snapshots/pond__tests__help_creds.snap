@@ -1,0 +1,44 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Manage URL-scoped credential sets in config.toml.
+
+`add` captures a set's keys (secret via hidden prompt) and writes `[creds.<name>]`; `list` shows configured sets with secrets redacted; `delete` removes one. Sets bind to storage URLs by scope match, never by activation (spec.md#creds-scope-match) - there is no "current" set.
+
+Usage: pond creds [OPTIONS] <COMMAND>
+
+Commands:
+  add     Add or replace a credential set (secret captured via a hidden prompt)
+  list    List configured credential sets (secrets redacted)
+  delete  Remove a credential set
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond creds add                            interactive: name (default), key, hidden secret
+  pond creds add work --scope s3+https://host/work
+  pond creds list
+  pond creds delete work

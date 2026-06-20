@@ -1,0 +1,32 @@
+# Quickstart
+
+Set up, ingest, ask.
+
+## 1. Set up
+
+```sh
+pond init                  # interactive
+pond init -y --every 5m    # non-interactive: enable every discovered adapter, sync every 5m
+```
+
+`init` walks storage, adapters, MCP registration, and an optional schedule, then writes `config.toml` in one pass. Idempotent - re-run to repair. `-y` takes defaults; `--every` is opt-in (`-y` alone never schedules).
+
+## 2. Ingest
+
+```sh
+pond sync   # import, embed, index - every enabled adapter
+```
+
+`sync` only ingests already-enabled adapters; it never enables on its own. Manage the set with `pond adapters list|discover|enable|disable`.
+
+## 3. Ask your agent
+
+It searches your history through pond:
+
+- "find how we fixed the OCC retry race"
+- "what did we decide about the storage substrate, and why?"
+- "pick up where we left off on the tokenizer experiment"
+
+Search spans every client - including sessions made in a different tool. Re-run `pond sync` (or let the schedule) to pick up new sessions.
+
+Next: [Connect your agents](/get-started/connect-your-agents).

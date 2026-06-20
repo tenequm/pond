@@ -31,7 +31,7 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl::{BoundedRow, JsonlTree, TAIL_CAP, jsonl_tree_discover, jsonl_tree_events, read_tail},
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -269,6 +269,29 @@ impl JsonlTree for CodexCliAdapter {
         } else {
             None
         }
+    }
+
+    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+        // Codex message ids are physical line numbers, not tail-recoverable on a
+        // multi-GB rollout, so freshness keys on the watermark timestamp instead.
+        // Pond stores the envelope `timestamp` only for `response_item` rows
+        // (`event_msg`/`turn_context` get the session-start default), so the
+        // session's max stored timestamp is its last response_item's. Scan a
+        // bounded tail backward for it - never the whole file.
+        let tail = read_tail(path, TAIL_CAP)?;
+        tail.split(|&byte| byte == b'\n')
+            .rev()
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .find(|row| row.get("type").and_then(Value::as_str) == Some("response_item"))
+            .and_then(|row| {
+                let text = row.get("timestamp").and_then(Value::as_str)?;
+                Some(
+                    DateTime::parse_from_rfc3339(text)
+                        .ok()?
+                        .with_timezone(&Utc)
+                        .timestamp_micros(),
+                )
+            })
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -533,16 +556,16 @@ fn message_events(
         .get("role")
         .and_then(Value::as_str)
         .ok_or_else(|| "message missing role".to_owned())?;
-    let content = payload
-        .get("content")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return Ok(vec![message_raw_carrier_event(
+            session_id, message_id, row, timestamp,
+        )]);
+    };
     // spec.md#model-part-provenance: a `developer` record is a harness instruction
     // block; a `user`-slot record whose body is `<environment_context>` or an
     // `# AGENTS.md instructions` blob is injected context, not a genuine
     // prompt. Everything else in a message record is conversation.
-    let provenance = message_provenance(role, &content);
+    let provenance = message_provenance(role, content);
     let mut parts = Vec::with_capacity(content.len());
     for (ordinal, item) in content.iter().enumerate() {
         // Faithful encoding of one content item: prefer the raw `text`
@@ -592,7 +615,11 @@ fn message_events(
             },
             true,
         ),
-        other => return Err(format!("unsupported codex-cli role {other}")),
+        _ => {
+            return Ok(vec![message_raw_carrier_event(
+                session_id, message_id, row, timestamp,
+            )]);
+        }
     };
 
     let mut events = Vec::with_capacity(parts.len() + 1);
@@ -601,6 +628,26 @@ fn message_events(
         events.extend(parts.into_iter().map(IngestEvent::Part));
     }
     Ok(events)
+}
+
+fn message_raw_carrier_event(
+    session_id: &str,
+    message_id: &str,
+    row: &Value,
+    timestamp: DateTime<Utc>,
+) -> IngestEvent {
+    IngestEvent::Message(Message::System {
+        id: message_id.to_owned(),
+        session_id: session_id.to_owned(),
+        timestamp,
+        content: row
+            .get("payload")
+            .and_then(|payload| payload.get("role"))
+            .or_else(|| row.get("role"))
+            .and_then(Value::as_str)
+            .and_then(|role| extract_self_str(&Value::String(role.to_owned()))),
+        options: row_options(row),
+    })
 }
 
 /// Provenance of a codex `message` record (spec.md#model-part-provenance). A
@@ -858,6 +905,33 @@ mod tests {
         )
     }
 
+    /// `peek_last_ts` is the freshness watermark for multi-GB rollouts where the
+    /// line-numbered message id is not tail-recoverable. It must read the last
+    /// `response_item`'s envelope timestamp - pond's stored max - and ignore the
+    /// trailing `event_msg` noise (whose stored timestamp is the session default),
+    /// scanning only the file tail.
+    #[test]
+    fn peek_last_ts_targets_last_response_item_ignoring_trailing_event_msg() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","timestamp":"2026-03-20T03:00:00.000Z","payload":{"id":"sess-x","timestamp":"2026-03-20T03:00:00.000Z"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-20T03:10:00.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-20T03:20:30.500Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yo"}]}}"#,
+            // Trailing token-count noise, later wall-clock but stored at the
+            // session default - must NOT be picked as the watermark.
+            r#"{"type":"event_msg","timestamp":"2026-03-20T03:59:59.000Z","payload":{"type":"token_count","info":{}}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let adapter = CodexCliAdapter::new(dir.path());
+        let expected = DateTime::parse_from_rfc3339("2026-03-20T03:20:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .timestamp_micros();
+        assert_eq!(adapter.peek_last_ts(&path), Some(expected));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
         let adapter = CodexCliAdapter::new(FIXTURES);
@@ -981,6 +1055,29 @@ mod tests {
         assert!(matches!(
             &events[1],
             IngestEvent::Part(part) if matches!(part.kind, PartKind::Text { .. }),
+        ));
+    }
+
+    #[test]
+    fn unknown_message_role_becomes_lossless_carrier() {
+        let ts = Utc::now();
+        let map: HashMap<String, Extracted<String>> = HashMap::new();
+        let row = json!({
+            "type": "response_item",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "future_role",
+                "content": [{"type": "input_text", "text": "keep me"}],
+            },
+        });
+
+        let events = events_from_row("s1", 4, &row, ts, &map).expect("carrier is valid");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            IngestEvent::Message(Message::System { id, content, .. })
+                if id == "s1:000004" && content.as_deref().map(String::as_str) == Some("future_role")
         ));
     }
 

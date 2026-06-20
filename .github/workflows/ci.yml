@@ -170,7 +170,7 @@ jobs:
 
           class Pond < Formula
             desc "Lossless storage and hybrid search for sessions from any AI agent client"
-            homepage "https://pond.cascade.fyi/"
+            homepage "https://pond.locker/"
             version "$V"
             license "Apache-2.0"
 
@@ -273,7 +273,7 @@ jobs:
 
             meta = {
               description = "Lossless storage and hybrid search for sessions from any AI agent client";
-              homepage = "https://pond.cascade.fyi/";
+              homepage = "https://pond.locker/";
               changelog = "https://github.com/tenequm/pond-nix/releases/tag/pond-v\${version}";
               license = lib.licenses.asl20;
               mainProgram = "pond";

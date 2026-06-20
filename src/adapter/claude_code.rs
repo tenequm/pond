@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -28,7 +29,9 @@ use super::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
+    jsonl::{
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_line, source_line,
+    },
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -41,8 +44,9 @@ use super::{
 /// 1. **Replay dedup.** Claude Code's `/resume` and `/compact` paths
 ///    occasionally re-emit byte-identical rows with the same `uuid` (the
 ///    stale-`messageSet`-cache bug in claude-code, see
-///    `utils/sessionStorage.ts`). The adapter dedupes here so the validator
-///    never sees the same PK twice; validator HashSet stays a safety net.
+///    `utils/sessionStorage.ts`). The adapter dedupes only byte-identical
+///    replays; same-uuid/different-content reaches the validator visibly
+///    (spec.md#adapter-integrity-dedup).
 ///
 /// 2. **`tool_use_id -> tool name` resolution.** The raw `tool_result` row
 ///    carries only `tool_use_id`, not the tool name; the name lives on the
@@ -54,11 +58,11 @@ use super::{
 ///    inventing a value.
 #[derive(Debug, Default)]
 pub(crate) struct FileState {
-    seen_uuids: HashSet<String>,
+    seen_records: HashSet<(String, u64)>,
     tool_call_names: HashMap<String, Extracted<String>>,
 }
 
-/// Stable adapter name. Surfaces as the `[sources.claude-code]` config key,
+/// Stable adapter name. Surfaces as the `[adapters.claude-code]` config key,
 /// the `pond sync claude-code` CLI arg, and `Session.source_agent` on every
 /// emitted row.
 const NAME: &str = "claude-code";
@@ -339,6 +343,14 @@ impl JsonlTree for ClaudeCodeAdapter {
         row.get("sessionId")?.as_str().map(ToOwned::to_owned)
     }
 
+    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+        // The transcript is append-ordered, so the last line is the latest
+        // message; its `timestamp` is the session watermark. A trailing row
+        // without one yields None and the file re-reads (safe).
+        let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
+        Some(parse_timestamp(&row).ok()?.timestamp_micros())
+    }
+
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
         session_from_rows(path, rows)
     }
@@ -350,7 +362,9 @@ impl JsonlTree for ClaudeCodeAdapter {
         state: &mut Self::State,
     ) -> Result<Vec<IngestEvent>, String> {
         if let Some(uuid) = row.value.get("uuid").and_then(Value::as_str)
-            && !state.seen_uuids.insert(uuid.to_owned())
+            && !state
+                .seen_records
+                .insert((uuid.to_owned(), source_record_hash(&row.value)))
         {
             return Ok(Vec::new());
         }
@@ -380,6 +394,33 @@ impl JsonlTree for ClaudeCodeAdapter {
         }
         None
     }
+}
+
+// spec.md#adapter-integrity-dedup: hash only semantic fields so noise-field
+// replays (timestamp, requestId, isMeta, gitBranch, version, ...) dedupe;
+// real content diffs still reach the validator.
+fn source_record_hash(value: &Value) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let pick = |path: &[&str]| -> &Value {
+        let mut cur = value;
+        for key in path {
+            match cur.get(*key) {
+                Some(next) => cur = next,
+                None => return &Value::Null,
+            }
+        }
+        cur
+    };
+    for path in [
+        &["type"][..],
+        &["parentUuid"][..],
+        &["message", "role"][..],
+        &["message", "content"][..],
+        &["toolUseResult"][..],
+    ] {
+        compact_json(pick(path)).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The Workflow runner writes `journal.jsonl` (its resume/cache journal of agent
@@ -823,9 +864,16 @@ fn message_events(
             content: Some(extract_compact_repr(message_value)),
             options: row_options(row, line),
         },
-        (other, _) => {
-            return Err(format!("unsupported message role {other}"));
-        }
+        // spec.md#adapters rule-3: a record that maps to no typed Message is
+        // carried whole as a system-role Message, not rejected, so an unknown or
+        // future role stays lossless (the full row lives in options.raw_record).
+        _ => Message::System {
+            id: uuid.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp,
+            content: Some(extract_compact_repr(message_value)),
+            options: row_options(row, line),
+        },
     };
 
     let mut events = Vec::with_capacity(parts.len() + 1);
@@ -1186,6 +1234,53 @@ mod tests {
         )
     }
 
+    /// `source_record_hash` must dedupe noise-field replays (whitespace,
+    /// `timestamp`, `requestId`) and let semantic-content differences through
+    /// so a same-uuid row with a different `message.content` still reaches
+    /// the validator (spec.md#adapter-integrity-dedup).
+    #[test]
+    fn source_record_hash_ignores_noise_keeps_semantic_diffs() {
+        let base = serde_json::json!({
+            "uuid": "u1",
+            "type": "user",
+            "parentUuid": null,
+            "message": {"role": "user", "content": "hi"},
+            "timestamp": "2026-06-17T00:00:00Z",
+            "requestId": "req-A",
+            "isMeta": false,
+            "gitBranch": "main",
+            "version": "2.1.56",
+        });
+        let noise_diff = serde_json::json!({
+            "uuid": "u1",
+            "type": "user",
+            "parentUuid": null,
+            "message": {"role": "user", "content": "hi"},
+            "timestamp": "2026-06-17T00:00:05Z",
+            "requestId": "req-B",
+            "isMeta": true,
+            "gitBranch": "feat/x",
+            "version": "2.1.57",
+        });
+        let content_diff = serde_json::json!({
+            "uuid": "u1",
+            "type": "user",
+            "parentUuid": null,
+            "message": {"role": "user", "content": "different"},
+            "timestamp": "2026-06-17T00:00:00Z",
+        });
+        assert_eq!(
+            source_record_hash(&base),
+            source_record_hash(&noise_diff),
+            "noise-field differences must dedupe",
+        );
+        assert_ne!(
+            source_record_hash(&base),
+            source_record_hash(&content_diff),
+            "semantic content differences must not dedupe",
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
         let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
@@ -1522,15 +1617,11 @@ mod tests {
     {
         struct ParentAlreadyFresh;
         impl crate::adapter::SkipOracle for ParentAlreadyFresh {
-            fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
-                // Far-future watermark: every source mtime is `<= ingested`, so a
-                // peeked id WOULD trip the freshness gate. The guard must keep the
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+                // Far-future watermark: the parent file WOULD trip the freshness
+                // gate (source ts <= watermark). The guard must keep the
                 // unrecognized file out of the gate regardless.
-                Some(
-                    DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
-                        .unwrap()
-                        .with_timezone(&Utc),
-                )
+                Some(i64::MAX)
             }
             fn is_empty(&self) -> bool {
                 false
@@ -1631,6 +1722,101 @@ mod tests {
                 .contains_key(crate::sessions::DROP_REASON_DUPLICATE_MESSAGE_ID),
             "duplicate_message_id bucket stays empty when adapter does its job"
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_uuid_different_content_is_visible_duplicate_not_adapter_drop()
+    -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let session_uuid = "33333333-3333-3333-3333-333333333334";
+        let dup_uuid = "u-shared-different";
+        let first = serde_json::json!({
+            "type": "user",
+            "uuid": dup_uuid,
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "message": {"role": "user", "content": "first content"},
+        });
+        let second = serde_json::json!({
+            "type": "user",
+            "uuid": dup_uuid,
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:01.000Z",
+            "message": {"role": "user", "content": "changed content"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{session_uuid}.jsonl")),
+            format!("{first}\n{second}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        assert_eq!(
+            summary
+                .drop_reasons
+                .get(crate::sessions::DROP_REASON_DUPLICATE_MESSAGE_ID)
+                .copied(),
+            Some(1),
+            "same uuid with changed content must reach the visible duplicate-id path",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_row_without_messages_does_not_fresh_skip_source() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let session_uuid = "33333333-3333-3333-3333-333333333335";
+        let row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-after-partial",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "message": {"role": "user", "content": "healed by replay"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{session_uuid}.jsonl")),
+            format!("{row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        store
+            .upsert_sessions(&[Session {
+                id: session_uuid.to_owned(),
+                parent_session_id: None,
+                parent_message_id: None,
+                source_agent: "claude-code".to_owned(),
+                created_at: DateTime::parse_from_rfc3339("2026-05-16T00:00:00.000Z")?
+                    .with_timezone(&Utc),
+                project: Extracted::from_test_value("/tmp/pond-test".to_owned()),
+                options: ProviderOptions::new(),
+            }])
+            .await?;
+
+        let last_ids = store.session_last_message_ids().await?;
+        assert!(
+            !last_ids.contains_key(session_uuid),
+            "a session row without messages must not produce a freshness key",
+        );
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(summary.skipped_fresh, 0);
+        let session = store
+            .get_session(session_uuid)
+            .await?
+            .expect("session row exists");
+        assert_eq!(session.messages.len(), 1, "replay must heal messages");
         Ok(())
     }
 
@@ -1868,6 +2054,57 @@ mod tests {
         }
         assert!(found, "orphan tool_result part must be present");
         // Sanity: even an orphan should not be reported as a drop.
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_message_role_becomes_lossless_carrier() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let session_uuid = "66666666-6666-6666-6666-666666666666";
+
+        // A role pond has no typed variant for must be carried whole, not
+        // rejected (spec.md#adapters rule-3).
+        let row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-future",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "message": {
+                "role": "future_role",
+                "content": "keep me",
+            },
+        });
+        std::fs::write(
+            project_dir.join(format!("{session_uuid}.jsonl")),
+            format!("{row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert!(
+            summary.drop_reasons.is_empty(),
+            "an unknown role must be carried, not dropped: {:?}",
+            summary.drop_reasons,
+        );
+        let session = store
+            .get_session(session_uuid)
+            .await?
+            .expect("session with the carried record ingests");
+        let carrier = session
+            .messages
+            .iter()
+            .find(|stored| stored.message.id() == "u-future")
+            .expect("the unknown-role record lands as a message");
+        assert!(
+            matches!(&carrier.message, Message::System { content, .. }
+                if content.as_deref().is_some_and(|c| c.contains("future_role"))),
+            "unmapped role must become a System carrier preserving the record",
+        );
         Ok(())
     }
 

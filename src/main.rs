@@ -11,9 +11,7 @@ use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
-use comfy_table::{
-    Attribute, Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, presets::NOTHING,
-};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
     PROTOCOL_VERSION, adapter,
@@ -21,21 +19,18 @@ use pond::{
     embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
-        AdapterStats, CorpusStats, EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport,
-        LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals,
-        Store,
+        EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport, LanceArchiveImport,
+        MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals, Store,
     },
     substrate::{
-        CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
+        self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
         OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
-        default_cleanup_older_than, index_lag_threshold,
+        VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than,
     },
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, GetResponse, GetResult, MessageView,
-        PartKind, PartSummary, ProjectFilter, ResponseMode, ResponsePart, SearchEnvelope,
-        SearchFilters, SearchModeWire, SearchRequest, SearchResponse, SearchResult, SearchSession,
-        SessionFrom,
+        self, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter, SearchEnvelope, SearchFilters,
+        SearchModeWire, SearchRequest, SessionFrom,
     },
 };
 
@@ -62,14 +57,19 @@ struct PondArchiveManifest {
 pub enum CliSearchMode {
     Fts,
     Vector,
-    Hybrid,
+}
+
+/// CLI surface for `pond search --sort-by`. Maps 1:1 to wire `SortBy`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSortBy {
+    Relevance,
+    Recency,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum SyncStage {
-    Import,
+enum OptimizeStage {
     Embed,
-    UpdateIndexes,
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -78,46 +78,29 @@ enum ServeTransport {
     Stdio,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ExportFormat {
-    Pond,
-    Jsonl,
-}
-
 impl From<CliSearchMode> for SearchModeWire {
     fn from(mode: CliSearchMode) -> Self {
         match mode {
             CliSearchMode::Fts => SearchModeWire::Fts,
             CliSearchMode::Vector => SearchModeWire::Vector,
-            CliSearchMode::Hybrid => SearchModeWire::Hybrid,
         }
     }
 }
 
-/// CLI surface for `pond get --response-mode`. Maps 1:1 to wire `ResponseMode`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliResponseMode {
-    Conversational,
-    Complete,
-    Verbatim,
-}
-
-impl From<CliResponseMode> for ResponseMode {
-    fn from(mode: CliResponseMode) -> Self {
-        match mode {
-            CliResponseMode::Conversational => ResponseMode::Conversational,
-            CliResponseMode::Complete => ResponseMode::Complete,
-            CliResponseMode::Verbatim => ResponseMode::Verbatim,
+impl From<CliSortBy> for wire::SortBy {
+    fn from(sort_by: CliSortBy) -> Self {
+        match sort_by {
+            CliSortBy::Relevance => wire::SortBy::Relevance,
+            CliSortBy::Recency => wire::SortBy::Recency,
         }
     }
 }
 
 /// CLI surface for `pond sql --format`. Maps to `sql::Mode` / `sql::Format`.
-/// Mirrors the MCP `pond_sql_query` `format` arg (text|json|parquet|ndjson).
+/// Mirrors the MCP `pond_sql_query` `format` arg (text|ndjson|parquet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSqlFormat {
     Text,
-    Json,
     Ndjson,
     Parquet,
 }
@@ -139,30 +122,45 @@ impl From<CliSessionFrom> for SessionFrom {
 }
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
 
-/// `SkipOracle` backed by a pre-loaded `Store::last_message_timestamps` map.
-struct StoredWatermarks {
-    map: HashMap<String, DateTime<Utc>>,
+/// The platform default local data dir (`$XDG_DATA_HOME/pond`, then
+/// `~/.local/share/pond`) as a `StorageUrl`. Backs both the no-config fallback
+/// and the `local` keyword so they resolve to exactly the same place.
+fn default_local_storage() -> anyhow::Result<StorageUrl> {
+    let url = pond::config::default_storage_path(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )?;
+    StorageUrl::parse(url.as_str())
 }
 
-impl StoredWatermarks {
-    fn new(map: HashMap<String, DateTime<Utc>>) -> Self {
-        Self { map }
-    }
-}
-
-impl pond::adapter::SkipOracle for StoredWatermarks {
-    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
-        self.map.get(session_id).copied()
-    }
+/// The search row meta map's cache dir. Resolved in this env-owning layer and
+/// passed into `prewarm` so `Store` stays env-agnostic.
+fn default_cache_dir() -> PathBuf {
+    pond::config::default_cache_path(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 
 /// Adapter clap can call to parse `--storage-path` / `POND_STORAGE_PATH`:
 /// bare paths, `~/...`, `file://`, and the remote URL grammar
-/// (spec.md#storage-url-grammar) including the fat `s3+https://` form.
+/// (spec.md#storage-url-grammar) including the fat `s3+https://` form. The bare
+/// keyword `local` (or `default`, case-insensitive) resolves to the platform
+/// default local data dir - so rolling back never needs the path memorized.
+/// A directory literally named `local` is still reachable as `./local`.
 fn parse_storage_path(input: &str) -> anyhow::Result<StorageUrl> {
+    if matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "local" | "default"
+    ) {
+        return default_local_storage();
+    }
     StorageUrl::parse(input)
 }
 
@@ -198,30 +196,81 @@ const STYLES: clap::builder::styling::Styles = clap::builder::styling::Styles::s
     .literal(anstyle::AnsiColor::Cyan.on_default())
     .placeholder(anstyle::Style::new().dimmed());
 
-/// `--version` detail line: crate version plus the release commit (stamped
-/// into release builds via `POND_BUILD_COMMIT`) and the build target. `-V`
-/// stays the short crate version.
-static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
-    match option_env!("POND_BUILD_COMMIT") {
-        Some(commit) if !commit.is_empty() => {
-            format!("{} ({commit} {target})", env!("CARGO_PKG_VERSION"))
-        }
-        _ => format!("{} ({target})", env!("CARGO_PKG_VERSION")),
+/// Displayed version. Debug builds (a local `cargo build`) carry a `-dev`
+/// suffix so a working binary is never mistaken for an installed release.
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    if cfg!(debug_assertions) {
+        format!("{}-dev", env!("CARGO_PKG_VERSION"))
+    } else {
+        env!("CARGO_PKG_VERSION").to_owned()
     }
 });
 
-/// Lossless storage and hybrid search for sessions from any AI agent client.
+/// `--version` detail line: [`VERSION`] plus the release commit (stamped into
+/// release builds via `POND_BUILD_COMMIT`) and the build target.
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+    match option_env!("POND_BUILD_COMMIT") {
+        Some(commit) if !commit.is_empty() => format!("{} ({commit} {target})", *VERSION),
+        _ => format!("{} ({target})", *VERSION),
+    }
+});
+
+/// Root `-h`/`--help` command list, hand-grouped into blocks with blank-line
+/// spacing. clap can't group or space subcommands natively (clap-rs/clap#1553;
+/// PR #6183 unmerged as of 4.6), so the visible list lives here while
+/// `{options}` and `{after-help}` render the rest. The
+/// `help_template_lists_every_subcommand` test fails if a verb is added to
+/// `Command` without a line here.
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}pond {version}
+
+{usage-heading} {usage}
+
+Commands:
+  Setup
+    init         Set up pond (idempotent: safe to re-run)
+    adapters     Choose which adapters pond sync ingests
+    storage      Probe and switch storage destinations
+    creds        Manage URL-scoped credential sets
+    schedule     Manage the automatic sync schedule
+    config       Inspect configuration
+
+  Data flow
+    sync         Make pond current: import, embed, index
+    optimize     Embed the backlog, then fold the indexes
+    copy         Copy data between stores, archives, JSONL
+
+  Query
+    search       Search stored messages
+    get          Fetch a session or message
+    sql          Run one read-only SQL query
+    status       Show pond health, data, and adapters
+
+  Serve
+    serve        Run the HTTP API server
+    mcp          Serve the MCP tools over stdio
+
+  Shell
+    completions  Generate shell completions
+    skill        Print the agent-onboarding SKILL.md
+    help         Print this message or a subcommand's help
+
+Options:
+{options}{after-help}";
+
+/// Lossless storage and semantic search for sessions from any AI agent client.
 #[derive(Debug, Parser)]
 #[command(
     name = "pond",
-    version,
+    version = VERSION.as_str(),
     long_version = LONG_VERSION.as_str(),
     styles = STYLES,
     max_term_width = 100,
+    help_template = HELP_TEMPLATE,
     after_long_help = "\
 Getting started:
-  pond init                                  set up storage, sources, MCP, and scheduling
+  pond init                                  set up storage, adapters, MCP, and scheduling
   pond sync                                  import new sessions, embed, update indexes
   pond search \"that auth refactor\"           find past work
   claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
@@ -231,22 +280,26 @@ Every command documents itself: `pond <command> --help` carries examples."
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    // `global = true` on these args, so they resolve at the root
+    // (`pond --storage-path X status`) and after any subcommand alike.
+    #[command(flatten)]
+    store: StoreArgs,
     #[command(flatten)]
     #[command(next_help_heading = "Global options")]
     verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::WarnLevel>,
 }
 
-/// Storage and config selectors shared by every data-touching command.
-/// Flattened LAST in each variant: the struct-level `next_help_heading`
-/// applies to every arg declared after the flatten point, so trailing it
-/// keeps the per-command flags under the default heading.
+/// Storage and config selectors. Flattened once into the root `Cli` with
+/// `global = true` args, so every subcommand inherits them and they parse
+/// before or after the subcommand name.
 #[derive(Debug, clap::Args)]
 #[command(next_help_heading = "Global options")]
 struct StoreArgs {
     /// Storage destination: a local path or remote URL.
     ///
     /// Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`,
-    /// `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default:
+    /// `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword
+    /// `local` (the platform default local data dir). Default:
     /// `[storage].path` from config, then the platform data dir
     /// (`~/.local/share/pond`).
     #[arg(
@@ -260,9 +313,9 @@ struct StoreArgs {
     storage_path: Option<StorageUrl>,
     /// Config file to read (default: `~/.config/pond/config.toml`).
     #[arg(
-        long,
+        long = "config-file",
         global = true,
-        env = "POND_CONFIG",
+        env = "POND_CONFIG_FILE",
         hide_env_values = true,
         value_name = "PATH"
     )]
@@ -276,7 +329,7 @@ struct StoreArgs {
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
     ///
-    /// Walks through storage, source adapters, MCP registration, and an
+    /// Walks through storage, adapters, MCP registration, and an
     /// optional sync schedule, then writes config.toml in one pass at the
     /// end. Re-running repairs or updates an existing setup; flags answer
     /// sections non-interactively.
@@ -285,76 +338,96 @@ enum Command {
   pond init --yes                             accept defaults, no prompts
   pond init --storage-path s3://bucket/pond   preset storage, prompt for the rest
   pond init --adapters claude-code,codex-cli --yes
-  pond init --schedule 1h --yes               also register an hourly sync")]
+  pond init --every 1h --yes                  also register an hourly sync")]
+    // The visible `-h` command list (grouping + blank-line spacing) is rendered
+    // by HELP_TEMPLATE, not by these display_order values - clap can't group or
+    // space subcommands itself. display_order is kept only as the fallback order
+    // if the template is ever removed.
+    #[command(display_order = 1)]
     Init(init::InitArgs),
     /// Make pond current: import, embed, update indexes.
     ///
     /// The everyday command: pulls fresh sessions from every enabled
-    /// `[sources.*]` entry (or one named adapter), embeds the backlog, and
-    /// folds new rows into the search indexes. With no sources configured it
-    /// probes the machine and offers to enable what it finds.
+    /// `[adapters.*]` entry (or one named adapter), embeds the backlog, and
+    /// folds new rows into the search indexes. It only ever syncs adapters you
+    /// have already enabled - enabling one is an explicit step (`pond adapters
+    /// enable` / `pond adapters discover` / `pond init`), never a side effect
+    /// of sync.
     #[command(after_long_help = "Examples:
-  pond sync                                  sync every enabled source
-  pond sync claude-code                      sync one adapter (re-enables it if declined)
-  pond sync codex-cli --source-dir ~/backup  one-off path override, config untouched
-  pond sync --only embed                     run a single stage
-  pond sync -y                               auto-accept newly detected sources")]
+  pond sync                                  sync every enabled adapter
+  pond sync claude-code                      sync one enabled adapter
+  pond sync codex-cli --path ~/backup        one-off path override, config untouched
+  pond sync --no-optimize                    import only; embed and index later
+  pond sync --verify                         full re-read; heal anything the skip missed")]
+    #[command(display_order = 7)]
     Sync {
-        /// Adapter name (claude-code, codex-cli, ...); default: every enabled source.
+        /// Adapter name (claude-code, codex-cli, ...); default: every enabled adapter.
         adapter: Option<String>,
         /// One-off source-path override (requires <ADAPTER>).
         ///
-        /// Bypasses `[sources.<adapter>]` and does not modify config.toml.
+        /// Bypasses `[adapters.<adapter>]` and does not modify config.toml.
         #[arg(long, value_name = "DIR")]
-        source_dir: Option<PathBuf>,
-        /// Run exactly one stage: import, embed, or update-indexes.
-        #[arg(long, value_enum)]
-        only: Option<SyncStage>,
-        /// Skip a stage. Can be passed multiple times.
-        #[arg(long, value_enum)]
-        skip: Vec<SyncStage>,
-        /// Re-embed stale rows after an embedding model change.
+        path: Option<PathBuf>,
+        /// Import only: skip the embed + index maintenance that normally runs
+        /// after the import. Catch up later with `pond optimize`.
         #[arg(long)]
-        force_embed: bool,
-        /// Auto-accept every probe prompt (for non-interactive runs).
-        #[arg(long, short = 'y')]
-        yes: bool,
-        #[command(flatten)]
-        store: StoreArgs,
+        no_optimize: bool,
+        /// Reconcile pass: bypass the freshness skip and re-read every source
+        /// body, re-ingesting through the idempotent merge. The skip compares
+        /// source mtime to pond's per-session ingest watermark; a session that
+        /// was partially flushed before the commit-row-last fix kept a frozen
+        /// watermark that mtime can never re-read past. This is the body-reading
+        /// tier that heals that historical damage (and audits completeness). It
+        /// is slower - every file is decoded - so it is opt-in, not the default.
+        #[arg(long)]
+        verify: bool,
     },
-    /// Show pond health, data, and source status.
+    /// Manage which adapters `pond sync` ingests (the `[adapters.*]` entries).
+    ///
+    /// Enabling an adapter is the explicit owner of adapter state: `list` shows
+    /// what is configured and what was detected, `discover` probes and enables
+    /// interactively, `enable`/`disable` flip one by name. `pond sync` reads
+    /// these but never writes them.
+    #[command(after_long_help = "Examples:
+  pond adapters list                         configured + detected adapters
+  pond adapters discover                     probe this machine, pick what to enable
+  pond adapters enable claude-code           enable one (discovers its path if needed)
+  pond adapters disable opencode             stop syncing one, keep it on record")]
+    #[command(display_order = 2)]
+    Adapters {
+        #[command(subcommand)]
+        command: AdaptersCmd,
+    },
+    /// Show pond health, data, and adapter status.
     ///
     /// Storage destination and size, row counts, index readiness, embedding
-    /// backlog, configured sources, and the sync schedule. Anything off
+    /// backlog, configured adapters, and the sync schedule. Anything off
     /// names its fix inline.
     #[command(after_long_help = "Examples:
-  pond status              the one-screen overview
-  pond status --adapters   per-adapter and per-project breakdown")]
+  pond status                       the one-screen overview
+  pond status --include-subagents   count each subagent as its own adapter")]
+    #[command(display_order = 13)]
     Status {
-        /// Show one section per adapter, with project tables and index detail.
-        ///
-        /// Implies `--include-subagents` so the rollup reconciles with the
-        /// storage row counts above.
-        #[arg(long)]
-        adapters: bool,
-        /// Break out sub-agent sessions (e.g. `claude-code/general-purpose`).
-        ///
-        /// Default rolls sessions up to the main agent only.
+        /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
+        /// as its own adapter. Default counts only main agents.
         #[arg(long)]
         include_subagents: bool,
-        #[command(flatten)]
-        store: StoreArgs,
+        /// Output format: `text` (human tables) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
     /// Search stored messages.
     ///
-    /// Hybrid retrieval (semantic + full-text) when embeddings exist,
-    /// full-text otherwise. Keep the query about concepts; scope with
+    /// `--mode vector` (default) matches on meaning; `--mode fts` matches exact
+    /// whole words (BM25). Keep the query about concepts; scope with
     /// `--project`, `--from-date`, and friends instead of putting names in
     /// the query.
     #[command(after_long_help = "Examples:
   pond search \"lance compaction tuning\"
   pond search \"auth retry\" --project pond --limit 5
+  pond search \"merge_insert\" --mode fts --sort-by recency
   pond search \"migration plan\" --from-date 2026-05-01 --format json")]
+    #[command(display_order = 10)]
     Search {
         /// Free-text query. Semantic concepts work best; project names belong
         /// in `--project`.
@@ -366,13 +439,14 @@ enum Command {
         /// Max sessions to return.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Operator-only retrieval mode override.
-        ///
-        /// Production callers should omit this and let the server pick
-        /// (hybrid when embeddings exist, FTS-only otherwise); benchmark and
-        /// ablation harnesses use it to force one arm against the same corpus.
+        /// Retrieval arm: `vector` (default - matches on meaning) or `fts`
+        /// (exact whole words, BM25). Falls back to `fts` when the store has no
+        /// embeddings.
         #[arg(long, value_enum)]
         mode: Option<CliSearchMode>,
+        /// Result order: `relevance` (default) or `recency` (newest first).
+        #[arg(long, value_enum)]
+        sort_by: Option<CliSortBy>,
         /// Project filter: substring match by default.
         ///
         /// `--project pond` -> contains "pond". Prefix with `re:` for regex
@@ -384,76 +458,55 @@ enum Command {
         /// possibly long, session.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Filter to one source agent, e.g. `claude-code` (or
-        /// `claude-code/general-purpose` for a subagent).
-        #[arg(long, value_name = "AGENT")]
-        source_agent: Option<String>,
-        /// Include subagent sessions (excluded by default).
-        #[arg(long)]
-        include_subagents: bool,
         /// ISO date (YYYY-MM-DD) lower bound, inclusive.
         #[arg(long)]
         from_date: Option<String>,
         /// ISO date (YYYY-MM-DD) upper bound, inclusive.
         #[arg(long)]
         to_date: Option<String>,
-        /// Server-side score threshold; hits below this are dropped.
-        ///
-        /// Not an absence signal: present and absent content score in
-        /// overlapping bands, so leave at 0 unless trimming an over-long tail.
+        /// Score floor on raw cosine (vector mode only); hits below it are
+        /// dropped. Rejected in fts mode (BM25 is unbounded). Not an absence
+        /// signal - present and absent content score in overlapping bands, so
+        /// leave at 0 unless trimming an over-long tail.
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
         /// Print Lance query plans instead of search results.
         #[arg(long)]
         explain: bool,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Fetch a session or message.
     ///
-    /// Returns readable transcripts by id: a whole session (`--session-id`)
-    /// or one message with optional surrounding context (`--message-id`).
-    /// Pagination cursors (`after-id:`) print at the end of truncated output.
+    /// `--session-id` returns the whole session as a conversational transcript
+    /// (user/assistant text + one-line tool/file refs). `--message-id` returns
+    /// that one message with its full parts (tool bodies included) plus
+    /// conversational neighbors. Params are prefixed by scope.
     #[command(after_long_help = "Examples:
   pond get --session-id 58a96901-4a4f-40be-a3c1-62419ec8c580
-  pond get --session-id <ID> --session-from end      most recent messages first
-  pond get --message-id <ID> --context-depth 3       a hit plus its neighbors
-  pond get --session-id <ID> --response-mode verbatim --format json")]
+  pond get --session-id <ID> --session-from end                 most recent messages
+  pond get --session-id <ID> --session-after-message-id <ID>    page down
+  pond get --message-id <ID> --message-context-before 3 --message-context-after 3")]
     #[command(group(ArgGroup::new("get_selector")
         .required(true)
         .args(["session_id", "message_id"])))]
+    #[command(display_order = 11)]
     Get {
         /// Fetch an entire session by id. Mutually exclusive with `--message-id`.
         #[arg(long, value_name = "ID")]
         session_id: Option<String>,
-        /// Fetch a single message by id. Mutually exclusive with `--session-id`.
+        /// Fetch a single message by id (with its full parts). Mutually
+        /// exclusive with `--session-id`.
         #[arg(long, value_name = "ID")]
         message_id: Option<String>,
         /// Tenant namespace. The personal pond has exactly one; leave at the
         /// default.
         #[arg(long, default_value = "local")]
         namespace: String,
-        /// For `--message-id` mode: include this many sibling messages on each
-        /// side (grep -C style). Ignored in session mode.
-        #[arg(long, default_value_t = 0)]
-        context_depth: usize,
-        /// Cap on returned messages (session mode) or parts (message mode).
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Depth: conversational, complete, or verbatim.
-        ///
-        /// conversational = text + part summaries; complete = all messages +
-        /// summaries; verbatim = full parts inline. With `--message-id` it
-        /// selects which siblings fill the context window.
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = CliResponseMode::Conversational,
-        )]
-        response_mode: CliResponseMode,
-        /// Session mode only: which end to read from.
+        /// Session scope: max messages per page.
+        #[arg(long, default_value_t = 20, conflicts_with = "message_id")]
+        session_limit: usize,
+        /// Session scope: which end to read the first page from.
         ///
         /// start = oldest first (default); end = most recent, e.g. to recover
         /// context after compaction.
@@ -464,14 +517,22 @@ enum Command {
             conflicts_with = "message_id"
         )]
         session_from: CliSessionFrom,
-        /// Continuation anchor from a prior response: last message id (session)
-        /// or last part id (message). Exclusive lower bound.
-        #[arg(long, value_name = "ID")]
-        after_id: Option<String>,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        /// Session scope: page forward - messages after this id (from a prior
+        /// page's bottom marker).
+        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
+        session_after_message_id: Option<String>,
+        /// Session scope: page backward - messages before this id (from a prior
+        /// page's top marker).
+        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
+        session_before_message_id: Option<String>,
+        /// Message scope: conversational siblings before the target (grep -B).
+        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
+        message_context_before: usize,
+        /// Message scope: conversational siblings after the target (grep -A).
+        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
+        message_context_after: usize,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Run one read-only SQL query over the corpus.
     ///
@@ -484,23 +545,22 @@ enum Command {
   pond sql \"SELECT count(*) FROM sessions\"
   pond sql \"SELECT session_id, ts, role FROM messages WHERE contains_tokens(search_text, 'occ retry') LIMIT 20\"
   pond sql \"SELECT * FROM messages\" --format parquet -o messages.parquet")]
+    #[command(display_order = 12)]
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
-        /// Output format. text/json/ndjson go to stdout; parquet requires
-        /// `--output-file` (binary).
+        /// Output format. text/ndjson go to stdout; parquet requires
+        /// `--output-file` (binary). ndjson is the machine-readable JSON path.
         #[arg(long, value_enum, default_value_t = CliSqlFormat::Text)]
         format: CliSqlFormat,
-        /// Inline row cap for text/json output. Default 100, max 1000.
-        /// Ignored for ndjson/parquet (which return every row).
+        /// Inline row cap for text output. Default 100, max 1000. Ignored for
+        /// ndjson/parquet (which return every row).
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Write the export bytes here instead of stdout (required for
-        /// `--format parquet`; optional for ndjson). Ignored for text/json.
+        /// `--format parquet`; optional for ndjson). Ignored for text.
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Run the HTTP API server (or MCP over stdio with --transport stdio).
     ///
@@ -511,6 +571,7 @@ enum Command {
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`")]
+    #[command(display_order = 14)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
         #[arg(long, value_enum, default_value_t = ServeTransport::Http)]
@@ -531,8 +592,6 @@ enum Command {
             default_value_t = 9797
         )]
         port: u16,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -542,10 +601,8 @@ enum Command {
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    Mcp {
-        #[command(flatten)]
-        store: StoreArgs,
-    },
+    #[command(display_order = 15)]
+    Mcp {},
     /// Manage the automatic sync schedule.
     ///
     /// Registers `pond sync -q` with the OS scheduler: launchd on macOS,
@@ -557,57 +614,83 @@ enum Command {
   pond schedule status
   pond schedule logs
   pond schedule stop")]
+    #[command(display_order = 5)]
     Schedule {
         #[command(subcommand)]
         command: schedule::ScheduleCmd,
     },
-    /// Inspect, probe, and switch storage destinations.
+    /// Probe and switch storage destinations.
     ///
-    /// Bare `pond storage` shows the resolved destination, its creds
-    /// binding, and per-table sizes. Subcommands probe a destination
-    /// (check), switch with guided migration (use), and copy between
-    /// destinations (migrate).
+    /// `check` probes a destination end-to-end; `use` switches the
+    /// configured destination - a pointer change that moves no data. To copy
+    /// data between stores use `pond copy`; to see where data lives and
+    /// how big it is use `pond status`.
     #[command(after_long_help = "Examples:
-  pond storage                                     where data lives, and how big
   pond storage check s3+https://host/bucket/pond   probe a destination end-to-end
-  pond storage use s3+https://host/bucket/pond     migrate to it and switch config")]
+  pond storage use s3+https://host/bucket/pond     probe, then switch the destination")]
+    #[command(display_order = 3)]
     Storage {
         #[command(subcommand)]
-        command: Option<StorageCmd>,
-        #[command(flatten)]
-        store: StoreArgs,
+        command: StorageCmd,
     },
-    /// Export a compact restorable .pond archive.
+    /// Manage URL-scoped credential sets in config.toml.
     ///
-    /// A .pond file is a zip of the canonical datasets plus a manifest;
-    /// `pond import` restores it losslessly. `--format jsonl` streams the
-    /// wire representation instead.
+    /// `add` captures a set's keys (secret via hidden prompt) and writes
+    /// `[creds.<name>]`; `list` shows configured sets with secrets redacted;
+    /// `delete` removes one. Sets bind to storage URLs by scope match, never
+    /// by activation (spec.md#creds-scope-match) - there is no "current" set.
     #[command(after_long_help = "Examples:
-  pond export                          writes pond-export.pond
-  pond export -o backup/$(date +%F).pond
-  pond export --format jsonl | jq .    stream the wire form")]
-    Export {
-        /// Output path. Default: `pond-export.pond` for archive format, stdout for JSONL.
-        #[arg(long, short = 'o')]
-        out: Option<PathBuf>,
-        /// Archive format: a compact .pond file, or the JSONL wire stream.
-        #[arg(long, value_enum, default_value_t = ExportFormat::Pond)]
-        format: ExportFormat,
-        #[command(flatten)]
-        store: StoreArgs,
+  pond creds add                            interactive: name (default), key, hidden secret
+  pond creds add work --scope s3+https://host/work
+  pond creds list
+  pond creds delete work")]
+    #[command(display_order = 4)]
+    Creds {
+        #[command(subcommand)]
+        command: CredsCmd,
     },
-    /// Restore a .pond archive.
+    /// Copy canonical data between pond stores, `.pond` archives, and the JSONL
+    /// wire stream.
     ///
-    /// Idempotent union merge into the current destination: re-running the
-    /// same archive inserts nothing new, and a populated destination unions
-    /// rather than clobbers.
+    /// Both `--from` and `--to` are required. Each endpoint is sniffed by
+    /// suffix: `*.pond` is a compact restorable archive, `*.jsonl` (or `-` for
+    /// stdout) is the JSONL wire stream and is export-only, anything else is a
+    /// pond store URL - `local` is the local default dir, `@` is your configured
+    /// store (the one every other command uses). Store-to-store copies are an
+    /// idempotent union merge (`lance-deterministic-pk` + merge-insert):
+    /// re-runnable, resumable, incremental (a re-run transfers only the sessions
+    /// absent or grown on the destination), valid onto a populated destination,
+    /// never deletes or modifies the source; they rebuild the destination
+    /// indexes, verify
+    /// every row landed, and exit 6 if any are missing. `--verify-only` runs
+    /// just the read-only membership check (store-to-store only). This is the
+    /// durable-corpus copy path, distinct from `pond sync` which re-reads your
+    /// client tools (spec.md#session-durable-copy).
     #[command(after_long_help = "Examples:
-  pond import backup/2026-06-01.pond")]
-    Import {
-        /// Path to the .pond archive to restore.
-        archive: PathBuf,
-        #[command(flatten)]
-        store: StoreArgs,
+  pond copy --from local --to s3+https://host/bucket/pond          migrate the local store to a bucket
+  pond copy --from @ --to backup/2026-06-16.pond                   snapshot the configured store to an archive
+  pond copy --from backup/2026-06-16.pond --to @                   restore an archive into the configured store
+  pond copy --from @ --to s3://bucket/pond --verify-only           re-check membership, copy nothing
+  pond copy --from @ --to - | jq .                                 stream the configured store as JSONL")]
+    #[command(display_order = 9)]
+    Copy {
+        /// Source endpoint: a store URL, `local` (local default dir), `@`
+        /// (configured store), or a `*.pond` archive.
+        #[arg(long, value_name = "URL|FILE")]
+        from: String,
+        /// Destination endpoint: a store URL, `local`, `@`, a `*.pond` archive,
+        /// a `*.jsonl` file, or `-` for stdout.
+        #[arg(long, value_name = "URL|FILE")]
+        to: String,
+        /// Only verify the destination already contains the source - copy
+        /// nothing, rebuild no indexes. Read-only; store-to-store only.
+        #[arg(long, conflicts_with = "no_optimize")]
+        verify_only: bool,
+        /// Skip the post-copy index rebuild (store-to-store and archive
+        /// restore, for very large stores you will index later). Build indexes
+        /// after with `pond optimize --only index --storage-path <to>`.
+        #[arg(long)]
+        no_optimize: bool,
     },
     /// Inspect configuration.
     ///
@@ -617,6 +700,7 @@ enum Command {
     #[command(after_long_help = "Examples:
   pond config show                 every setting, its value, and where it came from
   pond config schema > ~/.config/pond/config.toml   start from the annotated template")]
+    #[command(display_order = 6)]
     Config {
         #[command(subcommand)]
         command: ConfigCmd,
@@ -630,92 +714,137 @@ enum Command {
   fish:  pond completions fish > ~/.config/fish/completions/pond.fish
 
 Homebrew and nix packages ship these pre-installed.")]
+    #[command(display_order = 16)]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// Embed the backlog of un-embedded messages (spec.md#search). Idempotent:
-    /// the backlog is every message with a null `vector`, so a re-run picks up
-    /// exactly where the last one stopped. A model swap (rows embedded under
-    /// a different model id) requires `--force`, which clears those rows and
-    /// drops the IVF_PQ before the new vectors land.
-    #[command(hide = true)]
-    Embed {
-        /// Optional cap on messages embedded this run (mostly for benchmarks).
+    /// Print the bundled SKILL.md - the agent-onboarding pointer for pond.
+    ///
+    /// The same file an agent loads as a skill, emitted to stdout so it stays in
+    /// lockstep with the binary (no separate copy to drift).
+    #[command(display_order = 17)]
+    Skill,
+    /// Keep the lake queryable: embed the backlog, then fold the search indexes.
+    ///
+    /// The maintenance verb. `embed` fills vectors for every message with a null
+    /// `vector` (idempotent: a re-run resumes exactly where it stopped); `index`
+    /// folds trailing fragments into the text + semantic indexes and runs the
+    /// `[maintenance]` compaction / version-cleanup pass. `pond sync` runs both
+    /// by default; this is the on-demand and post-`--no-optimize` catch-up.
+    #[command(after_long_help = "Examples:
+  pond optimize                    embed the backlog, then fold indexes
+  pond optimize --only index       fold indexes only (e.g. after `pond copy --no-optimize`)
+  pond optimize --only embed       embed only
+  pond optimize --force-embed      re-embed stale rows after a model change")]
+    #[command(display_order = 8)]
+    Optimize {
+        /// Run exactly one stage: embed or index.
+        #[arg(long, value_enum)]
+        only: Option<OptimizeStage>,
+        /// Skip a stage. Can be passed multiple times.
+        #[arg(long, value_enum)]
+        skip: Vec<OptimizeStage>,
+        /// Re-embed rows whose stored `embedding_model` does not match the
+        /// configured model (a model swap), dropping the IVF_SQ first. Without
+        /// this, such rows abort the run with a typed error so a swap is never
+        /// silent.
         #[arg(long)]
-        limit: Option<usize>,
-        /// Allow re-embedding rows whose stored `embedding_model` does not
-        /// match the configured model. Without this flag, such rows abort the
-        /// run with a typed error so a model swap is never silent.
-        #[arg(long)]
-        force: bool,
-        #[command(flatten)]
-        store: StoreArgs,
-    },
-    /// Inspect and maintain Lance indexes.
-    #[command(hide = true)]
-    Index {
-        #[command(subcommand)]
-        command: IndexCommand,
-        #[command(flatten)]
-        store: StoreArgs,
+        force_embed: bool,
+        /// Recovery: rebuild every index from scratch via
+        /// `create_index(replace=true)`. Use this when normal optimize errors
+        /// with "<N> delta segments; run `pond optimize --rebuild`". Skips
+        /// embed and the incremental index-fold; runs only the rebuild.
+        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "drop_index"])]
+        rebuild: bool,
+        /// One-shot orphan cleanup: drop a single named index from whichever
+        /// table owns it. Used after renaming an intent (the old name is
+        /// orphaned in the manifest until dropped). Tries every table in turn;
+        /// errors when no table has an index by that name.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["only", "skip", "force_embed", "rebuild"])]
+        drop_index: Option<String>,
     },
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum StorageCmd {
     /// Probe a destination end-to-end.
     ///
     /// Parse, creds resolution, conditional put (the OCC primitive Lance's
     /// commit handler relies on), read-back, delete. Exit codes: 0 ok,
-    /// 2 parse error, 3 no creds, 4 auth failed, 5 OCC unsupported.
+    /// 1 I/O error (network/DNS/bucket unreachable), 2 parse error,
+    /// 3 no creds, 4 auth failed, 5 OCC unsupported.
     #[command(after_long_help = "Examples:
   pond storage check                                  probe the configured destination
   pond storage check s3+https://host/bucket/prefix    probe a candidate before switching")]
     Check {
         /// Destination URL. Defaults to the configured storage path.
         url: Option<String>,
+        /// Output format: `text` (human lines) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
-    /// Switch the configured destination, with guided migration.
+    /// Switch the configured destination. Moves no data.
     ///
-    /// Probes the destination first, offers to copy existing data, verifies
-    /// row counts reconcile, and only then updates `[storage].path` in
-    /// config.toml. The previous destination is never modified.
+    /// Probes the destination end-to-end, then flips `[storage].path` in
+    /// config.toml. Nothing is copied: switching to a different storage, or
+    /// rolling back to a previous one, is a pointer change that leaves every
+    /// store untouched. To copy data into a destination, run `pond copy`
+    /// first - it is always a separate, explicit step.
     #[command(after_long_help = "Examples:
-  pond storage use s3+https://host/bucket/pond      probe, offer migration, switch
-  pond storage use ~/pond-data --migrate -y         non-interactive: copy, verify, switch
-  pond storage use s3://bucket/pond --no-migrate    switch without copying")]
+  pond storage use s3+https://host/bucket/pond      probe, then switch the active destination
+  pond storage use local                            roll back to the default local store")]
     Use {
-        /// The new destination URL.
+        /// The new destination URL, or `local` for the default local store.
         url: String,
-        /// Copy existing data to the destination before switching.
-        #[arg(long, conflicts_with = "no_migrate")]
-        migrate: bool,
-        /// Switch without copying existing data.
-        #[arg(long)]
-        no_migrate: bool,
-        /// Skip the confirmation prompt (copies data unless --no-migrate).
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
-    /// Copy canonical data between two storages.
-    ///
-    /// Idempotent union merge: re-runnable, resumable, valid onto a
-    /// populated destination. Never deletes the source. `pond storage use`
-    /// wraps this with a config switch; reach for migrate directly for
-    /// one-off copies.
-    #[command(after_long_help = "Examples:
-  pond storage migrate --from ~/.local/share/pond --to s3://bucket/pond")]
-    Migrate {
-        /// Source storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        from: StorageUrl,
-        /// Destination storage URL.
-        #[arg(long, value_parser = parse_storage_path)]
-        to: StorageUrl,
+}
+
+#[derive(Debug, Subcommand)]
+enum CredsCmd {
+    /// Add or replace a credential set (secret captured via a hidden prompt).
+    Add {
+        /// Set name. Omit to be prompted, with `default` as the default.
+        name: Option<String>,
+        /// Bind only to URLs under this prefix. Omit for the catch-all set.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Region override (S3-compatible stores ignore the SigV4 region).
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// List configured credential sets (secrets redacted).
+    List {
+        /// Output format: `text` (human table) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Remove a credential set.
+    Delete {
+        /// Name of the set to remove.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdaptersCmd {
+    /// List configured adapters (enabled state, path) and detected-but-unconfigured adapters.
+    List {
+        /// Output format: `text` (human table) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Probe this machine for adapters and interactively enable the ones you pick.
+    Discover,
+    /// Enable an adapter, discovering its default path if it has no config entry yet.
+    Enable {
+        /// Adapter name (claude-code, codex-cli, ...).
+        name: String,
+    },
+    /// Disable an adapter so `pond sync` skips it (kept as `enabled = false`).
+    Disable {
+        /// Adapter name to disable.
+        name: String,
     },
 }
 
@@ -728,38 +857,11 @@ enum ConfigCmd {
     ///
     /// Redacted values, per-field source (cli/env/file/default), and the
     /// active URL's creds binding.
-    Show {
-        #[command(flatten)]
-        store: StoreArgs,
-    },
+    Show {},
     /// Print the path of the config file pond loads.
-    Path {
-        /// Config file to read (default: `~/.config/pond/config.toml`).
-        #[arg(long, env = "POND_CONFIG", hide_env_values = true, value_name = "PATH")]
-        config: Option<PathBuf>,
-    },
+    Path,
     /// Print the fully-annotated config.toml template.
     Schema,
-}
-
-#[derive(Debug, Subcommand)]
-enum IndexCommand {
-    Status,
-    Optimize {
-        #[arg(long)]
-        wait: bool,
-        /// Override the manifest-retention window for this run. Accepts
-        /// `Ns`/`Nm`/`Nh`/`Nd` (default: the configured `[maintenance]
-        /// .cleanup_older_than`, or `1d`). The cleanup pass stays safe
-        /// (`delete_unverified=false`), so this is OCC-coordinated and
-        /// safe to run while the cron is active; `0s` reclaims every
-        /// verified dead version up to the latest committed manifest.
-        #[arg(long, value_parser = parse_retention)]
-        cleanup_older_than: Option<chrono::Duration>,
-    },
-    Rebuild {
-        intent: Option<String>,
-    },
 }
 
 fn parse_retention(raw: &str) -> Result<chrono::Duration, String> {
@@ -798,14 +900,107 @@ fn parse_project_filter(input: &str) -> Result<ProjectFilter, String> {
     }
 }
 
-/// Output mode for `pond search` and `pond get`. Pretty is the human default;
+/// Output mode for `pond search` and `pond get`. Text is the human default;
 /// Json emits the wire envelope verbatim (including error envelopes), so
 /// scripts can `--format json | jq ...` against the same surface as the HTTP
 /// transport.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
-    Pretty,
+    Text,
     Json,
+}
+
+/// Lance's DataFusion `FairSpillPool` defaults to 100 MiB total
+/// (`lance-datafusion::exec::DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION`), which
+/// the multi-consumer fair-share splits below the working set of BTree
+/// `SortExec` over ~2M-row tables and crashes `create_index` with
+/// `ExternalSorterMerge` reservation failures. Lance offers no programmatic
+/// `MemoryPool` injection in 7.0.0; the env var is the only lever, and the
+/// session-context cache resolves it at first use, so setting it here (before
+/// any Lance call) is sufficient.
+fn raise_lance_mem_pool() {
+    if std::env::var_os("LANCE_MEM_POOL_SIZE").is_some() {
+        return;
+    }
+    // Process-wide, set once at startup before tokio spawns Lance work. Safe
+    // here per Rust 2024's set_var contract (no other threads reading env).
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("LANCE_MEM_POOL_SIZE", "1073741824");
+    }
+    tracing::debug!("LANCE_MEM_POOL_SIZE defaulted to 1 GiB");
+}
+
+/// Bound the per-scan readahead buffer for the long-lived read servers
+/// (`pond mcp` / `pond serve`). Lance's `LANCE_DEFAULT_IO_BUFFER_SIZE` defaults
+/// to 2 GiB, which lets a single scan balloon RSS; 256 MiB keeps a warm server
+/// inside a fixed budget while still feeding the IO threads for the small
+/// result sets reads return (spec.md#search). Set only in server processes -
+/// throughput-bound `copy`/`sync` run in their own processes and keep the
+/// default. Index/metadata caches are bounded separately in `resolve_cache_caps`.
+fn cap_serve_io_buffer() {
+    if std::env::var_os("LANCE_DEFAULT_IO_BUFFER_SIZE").is_some() {
+        return;
+    }
+    // Process-wide, set once before opening the store. Safe per Rust 2024's
+    // set_var contract (no other threads reading env yet).
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
+    }
+    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB for serving");
+}
+
+/// How often a serving process re-ensures the resident meta map after the
+/// initial prewarm. A poll is a cheap version check; an actual rebuild only
+/// fires when sync / remote writers have advanced the messages version.
+const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Warm the search indices in the background at server startup (spec.md#search).
+/// The cold S3 index load (175-442 s) is paid once here, off the request path,
+/// so the first user query is fast instead of catastrophic. Best effort:
+/// serving starts immediately and a failure is logged, not fatal. After warming,
+/// the task stays alive refreshing the resident meta map so a long-running
+/// server tracks new data instead of decaying to the take_rows fallback.
+fn spawn_prewarm(store: Arc<Store>) {
+    let cache_dir = default_cache_dir();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        tracing::info!("prewarm: warming search indices");
+        match store.prewarm(&cache_dir).await {
+            Ok(()) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "prewarm: search indices warm"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "prewarm: failed; first query will pay the cold load");
+            }
+        }
+        loop {
+            tokio::time::sleep(ROWMAP_REFRESH_INTERVAL).await;
+            if let Err(error) = store.ensure_rowmap(&cache_dir).await {
+                tracing::debug!(%error, "rowmap refresh skipped");
+            }
+        }
+    });
+}
+
+fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
+    use rlimit::{Resource, getrlimit, setrlimit};
+
+    let (soft, hard) = getrlimit(Resource::NOFILE).context("getrlimit(RLIMIT_NOFILE)")?;
+    let new_soft = target.min(hard);
+    if new_soft <= soft {
+        return Ok(());
+    }
+    setrlimit(Resource::NOFILE, new_soft, hard).context("setrlimit(RLIMIT_NOFILE)")?;
+    tracing::info!(
+        target: "pond::perf",
+        soft = new_soft,
+        hard,
+        "raised RLIMIT_NOFILE to clear the FTS index-merge EMFILE class"
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -814,125 +1009,190 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     init_tracing(cli.verbose.tracing_level_filter());
+    if let Err(error) = try_raise_fd_limit(65_536) {
+        tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
+    }
+    raise_lance_mem_pool();
+    // `-v` opts default `pond status` into the embedding probe, which scans the
+    // `vector` and `search_text` columns on the 2M-row messages table - tens of
+    // seconds on a cold remote store, because Lance v2 has no per-column
+    // null_count metadata (lance 7.0.0 forces a data-page read for any filter).
+    let verbose = cli.verbose.tracing_level_filter() >= tracing::level_filters::LevelFilter::INFO;
+    // Root-global selectors, bound once so every arm reads the same locals it
+    // did when each variant flattened its own copy.
+    let StoreArgs {
+        storage_path,
+        config,
+    } = cli.store;
 
     match cli.command {
-        Command::Init(args) => init::run(args).await?,
+        Command::Init(args) => init::run(args, storage_path, config).await?,
         Command::Status {
-            adapters,
             include_subagents,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
+            format,
         } => {
-            // --adapters needs sub-agents broken out so the per-adapter
-            // rollup reconciles with the storage row counts above.
-            let include_subagents = include_subagents || adapters;
             let loaded = Config::load(config_path(config))?;
             let (resolved, store) = open_store(storage_path, &loaded, false).await?;
             if !store.initialized().await? {
-                render_empty_status("pond status", &resolved)?;
-                output(&crate::schedule::status_line())?;
+                match format {
+                    OutputFormat::Json => output(&status_json_empty(&resolved)?)?,
+                    OutputFormat::Text => {
+                        render_empty_status("pond status", &resolved)?;
+                        output(&crate::schedule::status_line())?;
+                    }
+                }
             } else {
-                let (sizes, stats, index_status, embedding) = tokio::try_join!(
+                // Default status never scans the 2M-row `messages` table:
+                // totals come from manifest metadata (`row_counts`), adapter
+                // count from a scan of the small `sessions` table, and the
+                // embedding probe (which DOES scan messages) only runs under
+                // `-v`. Skipping it drops a cold-S3 status from ~43s to ~3s.
+                let embedding_fut = async {
+                    if verbose {
+                        store.embedding_progress().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let (sizes, (sessions, messages, parts), names, index_status, embedding) = tokio::try_join!(
                     store.table_sizes(),
-                    store.corpus_stats(include_subagents),
+                    store.row_counts(),
+                    store.adapter_names(include_subagents),
                     store.index_status(),
-                    store.embedding_progress(),
+                    embedding_fut,
                 )?;
-                render_status_header("pond status", &resolved, &sizes, &stats.totals)?;
-                render_status_checks(&stats, &index_status, embedding, adapters)?;
-                let probes = adapter::probe_unconfigured(&loaded.sources);
-                if !probes.is_empty() {
-                    let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
-                    output_err(&pond::output::paint(
-                        &format!(
-                            "hint     {} unconfigured adapter(s): {} - run `pond sync` to enable",
-                            probes.len(),
-                            names.join(", "),
-                        ),
-                        pond::output::dim(),
-                    ))?;
+                let totals = RowTotals {
+                    sessions: sessions as u64,
+                    messages: messages as u64,
+                    parts: parts as u64,
+                };
+                let adapter_count = names.len();
+                match format {
+                    OutputFormat::Json => {
+                        output(&status_json(
+                            &resolved,
+                            &sizes,
+                            &totals,
+                            adapter_count,
+                            &index_status,
+                            embedding,
+                        )?)?;
+                    }
+                    OutputFormat::Text => {
+                        render_status_header("pond status", &resolved, &sizes, &totals)?;
+                        render_status_checks(&totals, adapter_count, &index_status, embedding)?;
+                        let probes = adapter::probe_unconfigured(&loaded.adapters);
+                        if !probes.is_empty() {
+                            let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
+                            output_err(&pond::output::paint(
+                                &format!(
+                                    "hint     {} unconfigured adapter(s): {} - run `pond sync` to enable",
+                                    probes.len(),
+                                    names.join(", "),
+                                ),
+                                pond::output::dim(),
+                            ))?;
+                        }
+                    }
                 }
             }
         }
         Command::Sync {
             adapter,
-            source_dir,
-            only,
-            skip,
-            force_embed,
-            yes,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
+            path,
+            no_optimize,
+            verify,
         } => {
             let config_file = config_path(config);
-            let mut loaded = Config::load(&config_file)?;
+            let loaded = Config::load(&config_file)?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
-            let stages = SyncStages::resolve(only, &skip)?;
-            let mut summary = SyncRunSummary::default();
-            // `--source-dir` is an explicit one-off bypass of `[sources.<name>]`
-            // (resolve_sync_sources honors it directly), so skip the config-based
-            // re-enable - otherwise a probe-less adapter with no config entry
-            // (e.g. claude-ai-export) errors before the override is applied.
-            if stages.import
-                && source_dir.is_none()
-                && let Some(name) = adapter.as_deref()
-            {
-                maybe_reenable_positional(&mut loaded, &config_file, name, yes).await?;
-            }
-            if stages.import {
-                summary.ingest = Some(
-                    run_import_stage(&store, &loaded, &config_file, adapter.clone(), source_dir)
-                        .await?,
-                );
-            }
-            if stages.import && adapter.is_none() {
-                let extra = handle_probe_prompt(&store, &mut loaded, &config_file, yes).await?;
-                match summary.ingest.as_mut() {
-                    Some(existing) => existing.merge(&extra),
-                    None => summary.ingest = Some(extra),
-                }
-            }
-            if stages.embed {
-                run_embed_stage(&store, force_embed).await?;
-            }
-            if stages.update_indexes {
+            let import_summary =
+                run_import_stage(&store, &loaded, &config_file, adapter.clone(), path, verify)
+                    .await?;
+            let any_new_rows = import_summary.inserted > 0;
+            let summary = SyncRunSummary {
+                ingest: Some(import_summary),
+            };
+            // Optimize stages gated on `any_new_rows`: cleanup_old_versions
+            // walks the version log on every call (real work even when "caught
+            // up"), so an idempotent no-op sync should not pay it. Catch up an
+            // accumulated backlog with `pond optimize` (the verb that exists
+            // precisely for this) or the scheduled maintenance run.
+            if !no_optimize && any_new_rows {
+                // Same finalize seam as `pond optimize` and `pond copy`. sync
+                // has no --force-embed; finalize's embed points a model swap at
+                // the command that does.
                 let policy = configured_maintenance_policy(&loaded, None)?;
-                run_update_indexes_stage(&store, &policy).await?;
+                finalize_indexes(&store, &policy, false).await?;
             }
             render_sync_summary(&store, &summary).await?;
         }
-        Command::Embed {
-            limit,
-            force,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
+        Command::Optimize {
+            only,
+            skip,
+            force_embed,
+            rebuild,
+            drop_index,
         } => {
-            let config = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &config, true).await?;
-            let summary = run_embed_stage_with_limit(&store, force, limit, "--force").await?;
-            if !summary.cancelled && summary.messages > 0 {
-                let policy = configured_maintenance_policy(&config, None)?;
-                let outcome = run_update_indexes_stage(&store, &policy).await?;
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, true).await?;
+            if let Some(name) = drop_index {
+                store
+                    .drop_index_by_name(&name)
+                    .await
+                    .with_context(|| format!("drop_index({name}) failed"))?;
+                output(&format!("optimize: dropped index {name}"))?;
+            } else if rebuild {
+                // Migration path: bring the store to the regular-optimize end
+                // state (embed + fold + compaction + cleanup), then rebuild
+                // every index from scratch so it adopts current params, then
+                // reclaim the segments the rebuild superseded.
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let outcome = finalize_indexes(&store, &policy, force_embed).await?;
                 if outcome.any_indices_failed() {
                     std::process::exit(1);
                 }
+                let (progress, bar) = optimize_progress_bar();
+                let result = store.rebuild_indices(None, Some(progress)).await;
+                bar.finish_and_clear();
+                result.context("rebuild_indices failed")?;
+                store
+                    .cleanup_old_versions(policy.cleanup_older_than)
+                    .await
+                    .context("cleanup after rebuild failed")?;
+                output("optimize: indexes rebuilt, old segments reclaimed")?;
+            } else {
+                let stages = OptimizeStages::resolve(only, &skip)?;
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let outcome = if stages.embed && stages.index {
+                    // Full optimize: the same finalize seam sync and copy use.
+                    Some(finalize_indexes(&store, &policy, force_embed).await?)
+                } else {
+                    if stages.embed {
+                        run_embed_stage(&store, force_embed).await?;
+                    }
+                    if stages.index {
+                        Some(run_update_indexes_stage(&store, &policy).await?)
+                    } else {
+                        None
+                    }
+                };
+                if outcome.is_some_and(|outcome| outcome.any_indices_failed()) {
+                    std::process::exit(1);
+                }
             }
+        }
+        Command::Adapters { command } => {
+            let config_file = config_path(config);
+            let loaded = Config::load(&config_file)?;
+            run_adapters(command, &config_file, &loaded)?;
         }
         Command::Serve {
             transport,
             host,
             port,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
+            cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             let embedder = Arc::new(LazyEmbedder::candle());
@@ -941,6 +1201,7 @@ async fn main() -> anyhow::Result<()> {
                 embedder,
                 search: config.search.clone(),
             };
+            spawn_prewarm(state.store.clone());
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
@@ -952,18 +1213,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Mcp {
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        Command::Mcp {} => {
+            cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
             let store = Arc::new(open_store(storage_path, &config, true).await?.1);
             // Lazy: idle `pond mcp` instances in every Claude Code session
             // stay light. The model load only happens once per process on the
-            // first `pond_search` tool call that needs hybrid retrieval.
+            // first `pond_search` tool call that runs the vector arm.
             let embedder = Arc::new(LazyEmbedder::candle());
+            spawn_prewarm(store.clone());
             transport::mcp::serve_stdio(AppState {
                 store,
                 embedder,
@@ -976,19 +1234,14 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             limit,
             mode,
+            sort_by,
             project,
             session_id,
-            source_agent,
-            include_subagents,
             from_date,
             to_date,
             min_score,
             explain,
             format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
@@ -997,15 +1250,14 @@ async fn main() -> anyhow::Result<()> {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
                 query,
-                mode_override: mode.map(SearchModeWire::from),
+                mode: mode.map(SearchModeWire::from).unwrap_or_default(),
+                sort_by: sort_by.map(wire::SortBy::from).unwrap_or_default(),
                 filters: SearchFilters {
                     project,
                     session_id,
-                    source_agent,
                     from_date,
                     to_date,
                     min_score,
-                    include_subagents,
                 },
                 limit,
             };
@@ -1014,64 +1266,23 @@ async fn main() -> anyhow::Result<()> {
                 output(&plans)?;
                 return Ok(());
             }
-            let envelope = handlers::pond_search(&store, &embedder, request, &loaded.search).await;
-            if !render_search_envelope(format, &envelope)? {
+            let envelope =
+                handlers::pond_search(&store, &embedder, request.clone(), &loaded.search).await;
+            if !render_search_envelope(format, &envelope, &request)? {
                 std::process::exit(1);
-            }
-        }
-        Command::Index {
-            command,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
-            let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
-            match command {
-                IndexCommand::Status => {
-                    let statuses = store.index_status().await?;
-                    render_index_status(&statuses)?;
-                }
-                IndexCommand::Optimize {
-                    wait,
-                    cleanup_older_than,
-                } => {
-                    let policy = configured_maintenance_policy(&loaded, cleanup_older_than)?;
-                    let (progress, bar) = optimize_progress_bar();
-                    let outcome = store.optimize_indices(Some(progress), &policy).await?;
-                    bar.finish_and_clear();
-                    render_optimize_outcome(&outcome)?;
-                    if wait {
-                        wait_for_index_catchup(&store).await?;
-                    }
-                    let statuses = store.index_status().await?;
-                    render_index_status(&statuses)?;
-                    if outcome.any_indices_failed() {
-                        std::process::exit(1);
-                    }
-                }
-                IndexCommand::Rebuild { intent } => {
-                    store.rebuild_indices(intent.as_deref()).await?;
-                    let statuses = store.index_status().await?;
-                    render_index_status(&statuses)?;
-                }
             }
         }
         Command::Get {
             session_id,
             message_id,
             namespace,
-            context_depth,
-            limit,
-            response_mode,
+            session_limit,
             session_from,
-            after_id,
+            session_after_message_id,
+            session_before_message_id,
+            message_context_before,
+            message_context_after,
             format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false).await?;
@@ -1080,113 +1291,61 @@ async fn main() -> anyhow::Result<()> {
                 namespace: Some(namespace),
                 session_id,
                 message_id,
-                context_depth,
-                limit,
-                response_mode: ResponseMode::from(response_mode),
+                session_limit,
                 session_from: SessionFrom::from(session_from),
-                after_id,
+                session_after_message_id,
+                session_before_message_id,
+                message_context_before,
+                message_context_after,
             };
-            let view_from = request.session_from;
-            let envelope = handlers::pond_get(&store, request).await;
-            if !render_get_envelope(format, &envelope, view_from)? {
+            let envelope = handlers::pond_get(&store, request.clone()).await;
+            // Spawn-only subagents are their own sessions (spec.md#datasets);
+            // surface them on a session's first page so the CLI matches the MCP
+            // transcript. Best-effort: a lookup failure just omits the footer.
+            let mut subagents_footer = String::new();
+            if let GetEnvelope::Success(response) = &envelope
+                && request.message_id.is_none()
+                && request.session_after_message_id.is_none()
+                && request.session_before_message_id.is_none()
+                && let Ok(children) = store.child_sessions(&response.session.id).await
+                && !children.is_empty()
+            {
+                subagents_footer = pond::render::render_subagents_footer(&children);
+            }
+            if !render_get_envelope(format, &envelope, &request, &subagents_footer)? {
                 std::process::exit(1);
             }
         }
-        Command::Config { command } => run_config_command(command).await?,
+        Command::Config { command } => {
+            run_config_command(command, storage_path, config).await?;
+        }
         Command::Schedule { command } => schedule::run(command)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }
-        Command::Storage {
-            command,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => run_storage_command(command, storage_path, config).await?,
-        Command::Export {
-            out,
-            format,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
-            let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
-            match format {
-                ExportFormat::Pond => {
-                    let path = out.unwrap_or_else(|| PathBuf::from("pond-export.pond"));
-                    let summary = export_pond_archive(&store, &path).await?;
-                    output(&format!(
-                        "{} {}  sessions={} messages={} parts={}",
-                        pond::output::paint("export:", pond::output::dim()),
-                        path.display(),
-                        summary.rows.sessions,
-                        summary.rows.messages,
-                        summary.rows.parts,
-                    ))?;
-                }
-                ExportFormat::Jsonl => {
-                    let summary = match out {
-                        Some(path) => {
-                            let file = tokio::fs::File::create(&path)
-                                .await
-                                .with_context(|| format!("failed to open {}", path.display()))?;
-                            let mut writer = tokio::io::BufWriter::new(file);
-                            let summary = handlers::pond_export(&store, None, &mut writer).await?;
-                            writer.flush().await.context("export: flush")?;
-                            summary
-                        }
-                        None => {
-                            let mut stdout = tokio::io::stdout();
-                            handlers::pond_export(&store, None, &mut stdout).await?
-                        }
-                    };
-                    output(&format!(
-                        "{} jsonl sessions={} messages={} parts={}",
-                        pond::output::paint("export:", pond::output::dim()),
-                        summary.sessions,
-                        summary.messages,
-                        summary.parts,
-                    ))?;
-                }
-            }
+        Command::Skill => {
+            use std::io::Write;
+            io::stdout().write_all(include_str!("../SKILL.md").as_bytes())?;
         }
-        Command::Import {
-            archive,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
+        Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
+        Command::Creds { command } => {
+            let config_file = config_path(config);
+            let loaded = Config::load(&config_file)?;
+            run_creds(command, &config_file, &loaded)?;
+        }
+        Command::Copy {
+            from,
+            to,
+            verify_only,
+            no_optimize,
         } => {
-            let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
-            let summary = import_pond_archive(&store, &archive).await?;
-            output(&format!(
-                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
-                pond::output::paint("import:", pond::output::dim()),
-                summary.rows.sessions,
-                summary.rows.messages,
-                summary.rows.parts,
-                summary.inserted.sessions,
-                summary.inserted.messages,
-                summary.inserted.parts,
-            ))?;
-            output(&format!(
-                "{} run `pond sync --only update-indexes` to rebuild search indexes",
-                pond::output::paint("hint", pond::output::dim()),
-            ))?;
+            run_copy(from, to, verify_only, no_optimize, storage_path, config).await?;
         }
         Command::Sql {
             sql,
             format,
             limit,
             output_file,
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
         } => {
             if matches!(format, CliSqlFormat::Parquet) && output_file.is_none() {
                 bail!(
@@ -1197,15 +1356,32 @@ async fn main() -> anyhow::Result<()> {
             let (_, store) = open_store(storage_path, &loaded, false).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
-                CliSqlFormat::Json => pond::sql::Mode::InlineJson,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
             let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            // Open only the tables the query names (spec.md#search); the slow
+            // `parts.lance` open is waste for the common messages-only query.
+            use pond::substrate::Table;
             let (sessions, messages, parts) = tokio::try_join!(
-                store.dataset(pond::substrate::Table::Sessions),
-                store.dataset(pond::substrate::Table::Messages),
-                store.dataset(pond::substrate::Table::Parts),
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "sessions") {
+                        true => Some(store.dataset(Table::Sessions).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "messages") {
+                        true => Some(store.dataset(Table::Messages).await?),
+                        false => None,
+                    })
+                },
+                async {
+                    anyhow::Ok(match pond::sql::mentions_table(&sql, "parts") {
+                        true => Some(store.dataset(Table::Parts).await?),
+                        false => None,
+                    })
+                },
             )?;
             let tables = pond::sql::Tables {
                 sessions,
@@ -1215,11 +1391,6 @@ async fn main() -> anyhow::Result<()> {
             match pond::sql::run(&tables, &sql, mode, inline_rows).await {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
-                }
-                Ok(pond::sql::Outcome::InlineJson(value)) => {
-                    // Pretty-print for the CLI - the structured payload is for
-                    // agents over MCP; humans reading stdout want it readable.
-                    output(&serde_json::to_string_pretty(&value)?)?;
                 }
                 Ok(pond::sql::Outcome::Export {
                     bytes,
@@ -1261,7 +1432,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
-    // Lance's IVF_PQ builder warns once per empty centroid during merge
+    // Lance's IVF_SQ builder warns once per empty centroid during merge
     // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
     // It already handles the case - records a zero-sized partition and continues -
     // so the warning is benign log noise during index maintenance.
@@ -1278,7 +1449,19 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
             "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error"
         ))
     });
-    fmt().with_env_filter(filter).with_writer(io::stderr).init();
+    // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)
+    // and the fmt log writer through a shared draw target, so log lines
+    // never clobber an active progress bar. Today no pond span requests a
+    // bar, so the layer is essentially a "safe stderr writer for fmt that
+    // coexists with future bar-rendering spans"; the migration cost when we
+    // do start instrumenting spans (e.g. ingest, optimize) is zero.
+    let indicatif_layer = IndicatifLayer::new();
+    let fmt_layer = fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(indicatif_layer)
+        .init();
 }
 
 #[allow(clippy::print_stdout)]
@@ -1288,122 +1471,6 @@ fn output(message: &str) -> anyhow::Result<()> {
 
 fn output_err(message: &str) -> anyhow::Result<()> {
     pond::output::line_err(message)
-}
-
-/// Partition `outcomes` into accepts/declines, persist both, and refresh
-/// `loaded` from disk. Shared between the post-import probe sweep and the
-/// positional re-enable path.
-fn apply_outcomes(
-    loaded: &mut Config,
-    config_file: &Path,
-    outcomes: &[adapter::PromptOutcome],
-) -> anyhow::Result<usize> {
-    let accepts: Vec<adapter::Candidate> = outcomes
-        .iter()
-        .filter(|o| o.enable)
-        .map(|o| o.candidate.clone())
-        .collect();
-    let declines: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| !o.enable)
-        .map(|o| o.candidate.name.as_str())
-        .collect();
-    if !accepts.is_empty() {
-        adapter::persist_accept(config_file, &accepts)?;
-    }
-    if !declines.is_empty() {
-        adapter::persist_decline(config_file, &declines)?;
-    }
-    if !accepts.is_empty() || !declines.is_empty() {
-        *loaded = Config::load(config_file)?;
-    }
-    Ok(accepts.len())
-}
-
-/// `pond sync <name>` positional override. When `<name>` is currently
-/// absent or `enabled = false`, re-probe just that one adapter and prompt
-/// (or auto-accept on `--yes`). Used to re-enable a previously-declined
-/// adapter without editing `config.toml` by hand.
-async fn maybe_reenable_positional(
-    loaded: &mut Config,
-    config_file: &Path,
-    name: &str,
-    auto_accept: bool,
-) -> anyhow::Result<()> {
-    use serde_json::Value;
-    use std::io::IsTerminal;
-    let present = loaded.sources.get(name);
-    let is_enabled = present
-        .and_then(|b| b.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(false);
-    if is_enabled {
-        return Ok(());
-    }
-    let candidates = adapter::discover(Some(name));
-    if candidates.is_empty() {
-        bail!("no `[sources.{name}]` and probe returned nothing; add the entry manually");
-    }
-    if !auto_accept && !std::io::stdin().is_terminal() {
-        bail!(
-            "source [{name}] is disabled and stdin is not a terminal; pass --yes or re-run on a TTY"
-        );
-    }
-    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
-    let accepted = apply_outcomes(loaded, config_file, &outcomes)?;
-    if accepted == 0 {
-        bail!("declined; nothing to sync");
-    }
-    Ok(())
-}
-
-/// After `pond sync`'s import stage, prompt the operator about any
-/// freshly-detectable adapter that has no `[sources.<name>]` section yet.
-/// `enabled = true`/`enabled = false` is persisted either way so the
-/// decision sticks; only the positional `pond sync <name>` re-prompts a
-/// previously-declined adapter. Non-TTY runs (and `--yes` runs without a
-/// TTY) emit a one-line stderr hint and continue without writing - the
-/// operator can re-run on a TTY to opt in/out.
-async fn handle_probe_prompt(
-    store: &Store,
-    loaded: &mut Config,
-    config_file: &Path,
-    auto_accept: bool,
-) -> anyhow::Result<IngestSummary> {
-    use std::io::IsTerminal;
-    let mut accumulated = IngestSummary::default();
-    let candidates = adapter::probe_unconfigured(&loaded.sources);
-    if candidates.is_empty() {
-        return Ok(accumulated);
-    }
-    let interactive = std::io::stdin().is_terminal();
-    if !interactive && !auto_accept {
-        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
-        output_err(&pond::output::paint(
-            &format!(
-                "hint     {} unconfigured adapter(s): {} - run `pond sync` on a TTY to enable",
-                candidates.len(),
-                names.join(", "),
-            ),
-            pond::output::dim(),
-        ))?;
-        return Ok(accumulated);
-    }
-    let outcomes = adapter::prompt_each(&candidates, auto_accept)?;
-    apply_outcomes(loaded, config_file, &outcomes)?;
-    for outcome in &outcomes {
-        if outcome.enable && outcome.sync_now {
-            let summary = run_import_stage(
-                store,
-                loaded,
-                config_file,
-                Some(outcome.candidate.name.clone()),
-                None,
-            )
-            .await?;
-            accumulated.merge(&summary);
-        }
-    }
-    Ok(accumulated)
 }
 
 /// Open the store with an indicatif spinner ticking while
@@ -1444,11 +1511,7 @@ fn resolve_storage_location(
     if let Some(path) = &loaded.storage.path {
         return StorageUrl::parse(path).context("invalid [storage].path in config");
     }
-    let url = pond::config::default_storage_path(
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )?;
-    StorageUrl::parse(url.as_str())
+    default_local_storage()
 }
 
 /// Resolve creds for the destination and open the store. One chokepoint so
@@ -1493,7 +1556,7 @@ fn warn_unmatched_sets(resolved: &[&ResolvedStorage], loaded: &Config) -> anyhow
     Ok(())
 }
 
-/// The config path: an explicit `--config` (or `POND_CONFIG`) wins; otherwise
+/// The config path: an explicit `--config-file` (or `POND_CONFIG_FILE`) wins; otherwise
 /// `$XDG_CONFIG_HOME/pond/config.toml` (default `~/.config/pond/config.toml`),
 /// regardless of where the storage path points. Config and data are different
 /// XDG categories - they always live in different directories, even when both
@@ -1508,17 +1571,16 @@ fn config_path(explicit: Option<PathBuf>) -> PathBuf {
     )
 }
 
-async fn run_config_command(command: ConfigCmd) -> anyhow::Result<()> {
+async fn run_config_command(
+    command: ConfigCmd,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     match command {
         ConfigCmd::Schema => output(DEFAULT_CONFIG_TOML.trim_end()),
-        ConfigCmd::Path { config } => output(&config_path(config).display().to_string()),
-        ConfigCmd::Show {
-            store: StoreArgs {
-                storage_path,
-                config,
-            },
-        } => {
+        ConfigCmd::Path => output(&config_path(config).display().to_string()),
+        ConfigCmd::Show {} => {
             let path = config_path(config);
             let (loaded, figment) = Config::load_with_provenance(&path)?;
             // Contracted like every other human-facing path (`pond config
@@ -1603,6 +1665,38 @@ fn check_failure_exit_code(failure: &CheckFailure) -> i32 {
     }
 }
 
+/// Machine-readable failure class for `pond storage check --format json`,
+/// parallel to [`check_failure_exit_code`]'s exit-code mapping.
+fn check_failure_class(failure: &CheckFailure) -> &'static str {
+    match failure {
+        CheckFailure::NoCreds { .. } => "no_creds",
+        CheckFailure::Auth { .. } => "auth",
+        CheckFailure::OccUnsupported { .. } => "occ_unsupported",
+        CheckFailure::Io { .. } => "io",
+    }
+}
+
+/// One `pond storage check --format json` document. `failure` is the
+/// `(class, message)` pair on a non-zero outcome, `None` on success.
+fn storage_check_json(
+    url: &str,
+    binding: Option<&str>,
+    exit_code: i32,
+    failure: Option<(&str, String)>,
+) -> anyhow::Result<String> {
+    let doc = serde_json::json!({
+        "url": url,
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "binding": binding,
+        "failure": failure.map(|(class, message)| serde_json::json!({
+            "class": class,
+            "message": message,
+        })),
+    });
+    serde_json::to_string_pretty(&doc).context("serialize storage check as JSON")
+}
+
 /// One dim `cause:` line under a probe failure's fix-naming lead. The full
 /// untruncated chain stays reachable via `RUST_LOG=debug`.
 fn render_check_cause(failure: &CheckFailure) -> anyhow::Result<()> {
@@ -1617,7 +1711,7 @@ fn render_check_cause(failure: &CheckFailure) -> anyhow::Result<()> {
 }
 
 async fn run_storage_command(
-    command: Option<StorageCmd>,
+    command: StorageCmd,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1625,119 +1719,431 @@ async fn run_storage_command(
     let config_file = config_path(config);
     let loaded = Config::load(&config_file)?;
     match command {
-        // Bare `pond storage`: where the data lives, under which creds, and
-        // how big - the storage slice of `pond status`.
-        None => {
-            let (resolved, store) = open_store(storage_path, &loaded, false).await?;
-            if !store.initialized().await? {
-                render_empty_status("pond storage", &resolved)?;
-            } else {
-                let (sizes, stats) =
-                    tokio::try_join!(store.table_sizes(), store.corpus_stats(false))?;
-                render_status_header("pond storage", &resolved, &sizes, &stats.totals)?;
-            }
-            warn_unmatched_sets(&[&resolved], &loaded)?;
-        }
-        Some(StorageCmd::Check { url }) => {
+        StorageCmd::Check { url, format } => {
             let storage = match url {
-                Some(raw) => match StorageUrl::parse(&raw) {
+                Some(raw) => match parse_storage_path(&raw) {
                     Ok(parsed) => parsed,
-                    Err(error) => {
-                        output_err(&format!("check: parse error: {error:#}"))?;
-                        std::process::exit(2);
-                    }
+                    Err(error) => match format {
+                        OutputFormat::Json => {
+                            output(&storage_check_json(
+                                &raw,
+                                None,
+                                2,
+                                Some(("parse", format!("{error:#}"))),
+                            )?)?;
+                            std::process::exit(2);
+                        }
+                        OutputFormat::Text => {
+                            output_err(&format!("check: parse error: {error:#}"))?;
+                            std::process::exit(2);
+                        }
+                    },
                 },
                 None => resolve_storage_location(storage_path, &loaded)?,
             };
             let resolved = storage.resolve(&loaded.creds)?;
-            output(&format!(
-                "{}  {}",
-                resolved.display(),
-                paint(&format!("[{}]", resolved.binding.describe()), dim()),
-            ))?;
-            warn_unmatched_sets(&[&resolved], &loaded)?;
-            match pond::substrate::storage_check(&resolved).await {
-                Ok(()) => {
-                    output(
-                        "check: ok - conditional put (OCC), read-back, and delete all succeeded",
-                    )?;
+            match format {
+                OutputFormat::Json => {
+                    let url = resolved.display();
+                    let binding = resolved.binding.describe();
+                    match pond::substrate::storage_check(&resolved).await {
+                        Ok(()) => output(&storage_check_json(&url, Some(&binding), 0, None)?)?,
+                        Err(failure) => {
+                            let code = check_failure_exit_code(&failure);
+                            output(&storage_check_json(
+                                &url,
+                                Some(&binding),
+                                code,
+                                Some((check_failure_class(&failure), failure.to_string())),
+                            )?)?;
+                            std::process::exit(code);
+                        }
+                    }
                 }
-                Err(failure) => {
-                    // Distinct exit codes (documented in --help) so cron and
-                    // CI can branch on the failure class.
-                    output_err(&format!("check: {failure}"))?;
-                    render_check_cause(&failure)?;
-                    std::process::exit(check_failure_exit_code(&failure));
+                OutputFormat::Text => {
+                    output(&format!(
+                        "{}  {}",
+                        resolved.display(),
+                        paint(&format!("[{}]", resolved.binding.describe()), dim()),
+                    ))?;
+                    warn_unmatched_sets(&[&resolved], &loaded)?;
+                    match pond::substrate::storage_check(&resolved).await {
+                        Ok(()) => {
+                            output(
+                                "check: ok - conditional put (OCC), read-back, and delete all succeeded",
+                            )?;
+                        }
+                        Err(failure) => {
+                            // Distinct exit codes (documented in --help) so cron and
+                            // CI can branch on the failure class.
+                            output_err(&format!("check: {failure}"))?;
+                            render_check_cause(&failure)?;
+                            std::process::exit(check_failure_exit_code(&failure));
+                        }
+                    }
                 }
             }
         }
-        Some(StorageCmd::Use {
-            url,
-            migrate,
-            no_migrate,
-            yes,
-        }) => {
-            run_storage_use(
-                &loaded,
-                &config_file,
-                storage_path,
-                &url,
-                migrate,
-                no_migrate,
-                yes,
-            )
-            .await?;
-        }
-        Some(StorageCmd::Migrate { from, to }) => {
-            let from_resolved = from.resolve(&loaded.creds)?;
-            let to_resolved = to.resolve(&loaded.creds)?;
-            warn_unmatched_sets(&[&from_resolved, &to_resolved], &loaded)?;
-            // Per-URL binding lines before any work: a wrong scope match must
-            // be visible immediately, not after an auth error.
-            let dim = pond::output::dim();
-            output(&format!(
-                "{} {}  {}",
-                pond::output::paint("from:", dim),
-                from_resolved.display(),
-                pond::output::paint(&format!("[{}]", from_resolved.binding.describe()), dim),
-            ))?;
-            output(&format!(
-                "{}   {}  {}",
-                pond::output::paint("to:", dim),
-                to_resolved.display(),
-                pond::output::paint(&format!("[{}]", to_resolved.binding.describe()), dim),
-            ))?;
-            let from_store = Store::open_with_options(
-                from_resolved.lance_url(),
-                from_resolved.options.clone(),
-                runtime_caps(&loaded),
-            )
-            .await?;
-            let to_store = Store::open_with_options(
-                to_resolved.lance_url(),
-                to_resolved.options.clone(),
-                runtime_caps(&loaded),
-            )
-            .await?;
-            let imported = migrate_between_stores(&from_store, &to_store).await?;
-            output(&format!(
-                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
-                pond::output::paint("migrate:", dim),
-                imported.rows.sessions,
-                imported.rows.messages,
-                imported.rows.parts,
-                imported.inserted.sessions,
-                imported.inserted.messages,
-                imported.inserted.parts,
-            ))?;
-            output(&format!(
-                "{} the source was not modified; run `pond sync --only update-indexes --storage-path {}` to build destination indexes",
-                pond::output::paint("hint", dim),
-                to_resolved.display(),
-            ))?;
+        StorageCmd::Use { url } => {
+            run_storage_use(&loaded, &config_file, storage_path, &url).await?;
         }
     }
     Ok(())
+}
+
+/// A `pond copy` endpoint after the suffix sniff: a pond store, a `.pond`
+/// archive, or the JSONL wire stream (a `.jsonl` file or `-` for stdio).
+// Built once, matched once, immediately consumed - the StorageUrl-vs-PathBuf
+// size spread has no runtime cost.
+#[allow(clippy::large_enum_variant)]
+enum CopyEndpoint {
+    Store(StorageUrl),
+    Archive(PathBuf),
+    Jsonl(Option<PathBuf>),
+}
+
+fn describe_endpoint(endpoint: &CopyEndpoint) -> String {
+    match endpoint {
+        CopyEndpoint::Store(url) => url.display(),
+        CopyEndpoint::Archive(path) => format!("{} (archive)", path.display()),
+        CopyEndpoint::Jsonl(Some(path)) => format!("{} (jsonl)", path.display()),
+        CopyEndpoint::Jsonl(None) => "- (jsonl)".to_owned(),
+    }
+}
+
+/// Strict suffix sniff for a `--from`/`--to` value (the converge-cli-surface
+/// decision): `*.pond` -> archive, `*.jsonl` or `-` (stdio) -> JSONL wire
+/// stream, anything else -> a pond store URL.
+fn sniff_copy_endpoint(raw: &str) -> anyhow::Result<CopyEndpoint> {
+    if raw == "-" {
+        return Ok(CopyEndpoint::Jsonl(None));
+    }
+    if raw.ends_with(".pond") {
+        return Ok(CopyEndpoint::Archive(PathBuf::from(raw)));
+    }
+    if raw.ends_with(".jsonl") {
+        return Ok(CopyEndpoint::Jsonl(Some(PathBuf::from(raw))));
+    }
+    Ok(CopyEndpoint::Store(parse_storage_path(raw)?))
+}
+
+/// Sniff a `--from`/`--to` value into an endpoint, resolving the `@` keyword to
+/// the configured store (what every other command defaults to). `@` needs the
+/// config and `--storage-path`, so - unlike the config-free `local` keyword - it
+/// can't be a value-parser keyword and is resolved here instead. A directory
+/// literally named `@` is still reachable as `./@`.
+fn resolve_copy_endpoint(
+    raw: &str,
+    storage_path: &Option<StorageUrl>,
+    loaded: &Config,
+) -> anyhow::Result<CopyEndpoint> {
+    if raw == "@" {
+        return Ok(CopyEndpoint::Store(resolve_storage_location(
+            storage_path.clone(),
+            loaded,
+        )?));
+    }
+    sniff_copy_endpoint(raw)
+}
+
+/// `pond copy`: move canonical data between pond stores, `.pond` archives, and
+/// the JSONL wire stream. Both endpoints are required; the verb routes on the
+/// sniffed endpoint kinds (spec.md#session-durable-copy).
+async fn run_copy(
+    from: String,
+    to: String,
+    verify_only: bool,
+    no_optimize: bool,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let loaded = Config::load(config_path(config))?;
+    let from_ep = resolve_copy_endpoint(&from, &storage_path, &loaded)?;
+    let to_ep = resolve_copy_endpoint(&to, &storage_path, &loaded)?;
+    // A mistyped local `--from` would otherwise open as an empty store and
+    // "copy" zero rows with a success exit; fail loudly on a missing source.
+    if let CopyEndpoint::Store(url) = &from_ep
+        && let Some(path) = pond::config::local_path(url.canonical())
+        && !path.exists()
+    {
+        bail!(
+            "source store {} does not exist; check --from",
+            url.display()
+        );
+    }
+    match (from_ep, to_ep) {
+        (CopyEndpoint::Store(from), CopyEndpoint::Store(to)) => {
+            run_store_to_store_copy(from, to, verify_only, no_optimize, &loaded).await
+        }
+        _ if verify_only => bail!("--verify-only applies to store-to-store copies only"),
+        (CopyEndpoint::Store(from), CopyEndpoint::Archive(path)) => {
+            copy_store_to_archive(from, &path, &loaded).await
+        }
+        (CopyEndpoint::Store(from), CopyEndpoint::Jsonl(path)) => {
+            copy_store_to_jsonl(from, path, &loaded).await
+        }
+        (CopyEndpoint::Archive(path), CopyEndpoint::Store(to)) => {
+            copy_archive_to_store(&path, to, no_optimize, &loaded).await
+        }
+        (CopyEndpoint::Jsonl(_), CopyEndpoint::Store(_)) => bail!(
+            "jsonl is an export-only target: restore from a `.pond` archive or copy from a store URL instead"
+        ),
+        (from_ep, to_ep) => bail!(
+            "unsupported copy {} -> {}: at least one endpoint must be a pond store",
+            describe_endpoint(&from_ep),
+            describe_endpoint(&to_ep),
+        ),
+    }
+}
+
+/// Store-to-store copy: the durable union merge, an index rebuild (unless
+/// `--no-optimize`), and an id-set membership check. Exit 6 when the
+/// destination is missing source rows; `--verify-only` runs just the read-only
+/// check. Distinct from `pond sync`, which re-reads adapters - copy moves the
+/// durable record (spec.md#session-durable-copy).
+async fn run_store_to_store_copy(
+    from: StorageUrl,
+    to: StorageUrl,
+    verify_only: bool,
+    no_optimize: bool,
+    loaded: &Config,
+) -> anyhow::Result<()> {
+    if from.canonical() == to.canonical() {
+        bail!(
+            "--from and --to resolve to the same store ({}); nothing to copy",
+            from.display(),
+        );
+    }
+    let (from_resolved, from_store, to_resolved, to_store) =
+        resolve_and_open_pair(&from, &to, loaded).await?;
+    if verify_only {
+        let verify = verify_stores(&from_store, &to_store).await?;
+        ensure_source_not_empty(&verify, &from_resolved.display())?;
+        if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced
+        {
+            std::process::exit(6);
+        }
+        return Ok(());
+    }
+
+    let dim = pond::output::dim();
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+
+    spinner.set_message("plan  comparing source <-> destination");
+    let plan_started = std::time::Instant::now();
+    // Incremental: transfer only the sessions absent or grown on the
+    // destination, detected by a data-intrinsic per-session message-count key
+    // (spec.md#session-durable-copy). A re-run after a small delta moves and
+    // indexes only that delta, never the whole corpus.
+    let plan = to_store.plan_incremental_from(&from_store).await?;
+    let plan_elapsed = plan_started.elapsed();
+    // A 0-row source almost always means a mistyped `--from`: a remote store
+    // auto-vivifies empty, so the copy would otherwise "succeed" having moved
+    // nothing. Bail before touching the destination.
+    if plan.source_sessions == 0 {
+        spinner.finish_and_clear();
+        bail!(
+            "source store {} has 0 sessions; check --from (a mistyped source opens as an empty store)",
+            from_resolved.display(),
+        );
+    }
+    let new_sessions = plan.new_sessions();
+    let grown_sessions = plan.total().saturating_sub(new_sessions);
+    spinner.println(format!(
+        "{} {} sessions to copy ({} new + {} grown, {} on source)  {:.1}s",
+        pond::output::paint("plan", dim),
+        plan.total(),
+        new_sessions,
+        grown_sessions,
+        plan.source_sessions,
+        plan_elapsed.as_secs_f64(),
+    ));
+
+    if plan.is_empty() {
+        spinner.println(format!(
+            "{} destination already up to date (0 sessions copied)",
+            pond::output::paint("copy:", dim),
+        ));
+    } else {
+        spinner.set_message(format!(
+            "stream  copying {} sessions to destination",
+            plan.total(),
+        ));
+        let stream_started = std::time::Instant::now();
+        let imported = to_store.copy_delta_from(&from_store, &plan).await?;
+        let stream_elapsed = stream_started.elapsed();
+        spinner.println(format!(
+            "{} sessions {} ({} new)  messages {} ({} new)  parts {} ({} new)  {:.1}s",
+            pond::output::paint("stream", dim),
+            imported.rows.sessions,
+            imported.inserted.sessions,
+            imported.rows.messages,
+            imported.inserted.messages,
+            imported.rows.parts,
+            imported.inserted.parts,
+            stream_elapsed.as_secs_f64(),
+        ));
+    }
+
+    // The index stage draws its own progress bar; clear ours first so two
+    // indicatif renderers never fight over the cursor.
+    spinner.finish_and_clear();
+
+    // Fold destination indexes even on an empty stream plan: an interrupted
+    // previous copy can leave data complete but index creation missing.
+    // spec.md#lance-index-maintenance.
+    let indexes_started = std::time::Instant::now();
+    if no_optimize {
+        output(&format!(
+            "{} skipped (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
+            pond::output::paint("indexes", dim),
+            to_resolved.display(),
+        ))?;
+    } else {
+        let policy = configured_maintenance_policy(loaded, None)?;
+        // Same finalize seam as optimize/sync. The embed pass no-ops because the
+        // copied rows arrive already embedded from the source.
+        finalize_indexes(&to_store, &policy, false).await?;
+        output(&format!(
+            "{} rebuilt text + semantic on destination  {:.1}s",
+            pond::output::paint("indexes", dim),
+            indexes_started.elapsed().as_secs_f64(),
+        ))?;
+    }
+
+    let verify = verify_stores(&from_store, &to_store).await?;
+    if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced {
+        std::process::exit(6);
+    }
+
+    // `pond copy` always closes with the id-set proof; `--verify-only` runs
+    // just this read-only check.
+    if no_optimize {
+        output(&format!(
+            "{} data copied; indexes pending (run `pond optimize --only index --storage-path {}`)",
+            pond::output::paint("done -", dim),
+            to_resolved.display(),
+        ))?;
+    } else {
+        output(&format!(
+            "{} destination is ready to query",
+            pond::output::paint("done -", dim),
+        ))?;
+    }
+    Ok(())
+}
+
+/// `pond copy --to <file>.pond`: write a compact restorable archive of the
+/// source store's canonical datasets.
+async fn copy_store_to_archive(
+    from: StorageUrl,
+    path: &Path,
+    loaded: &Config,
+) -> anyhow::Result<()> {
+    let (_, store) = open_store(Some(from), loaded, false).await?;
+    let summary = export_pond_archive(&store, path).await?;
+    output(&format!(
+        "{} {}  sessions={} messages={} parts={}",
+        pond::output::paint("copy:", pond::output::dim()),
+        path.display(),
+        summary.rows.sessions,
+        summary.rows.messages,
+        summary.rows.parts,
+    ))?;
+    Ok(())
+}
+
+/// `pond copy --to <file>.jsonl` (or `-`): stream the source store as the JSONL
+/// wire representation, one `IngestEvent` per line.
+async fn copy_store_to_jsonl(
+    from: StorageUrl,
+    path: Option<PathBuf>,
+    loaded: &Config,
+) -> anyhow::Result<()> {
+    let (_, store) = open_store(Some(from), loaded, false).await?;
+    let to_stdout = path.is_none();
+    let summary = match path {
+        Some(path) => {
+            let file = tokio::fs::File::create(&path)
+                .await
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            let mut writer = tokio::io::BufWriter::new(file);
+            let summary = handlers::pond_export(&store, None, &mut writer).await?;
+            writer.flush().await.context("copy: flush")?;
+            summary
+        }
+        None => {
+            let mut stdout = tokio::io::stdout();
+            handlers::pond_export(&store, None, &mut stdout).await?
+        }
+    };
+    let line = format!(
+        "{} jsonl sessions={} messages={} parts={}",
+        pond::output::paint("copy:", pond::output::dim()),
+        summary.sessions,
+        summary.messages,
+        summary.parts,
+    );
+    // With `--to -` the wire stream owns stdout; keep the summary off it so
+    // `pond copy --to - | jq` stays clean.
+    if to_stdout {
+        output_err(&line)?;
+    } else {
+        output(&line)?;
+    }
+    Ok(())
+}
+
+/// `pond copy --from <file>.pond`: restore an archive into the destination
+/// store via the idempotent union merge.
+async fn copy_archive_to_store(
+    path: &Path,
+    to: StorageUrl,
+    no_optimize: bool,
+    loaded: &Config,
+) -> anyhow::Result<()> {
+    let (_, store) = open_store(Some(to), loaded, false).await?;
+    let summary = import_pond_archive(&store, path).await?;
+    render_copy_import(&summary)?;
+    let dim = pond::output::dim();
+    // Leave the destination queryable, like a store-to-store copy: the archive
+    // carries embeddings as data columns, so this is index-build only, no re-embed.
+    if no_optimize {
+        output(&format!(
+            "{} indexes not rebuilt (--no-optimize); run `pond optimize --only index` before querying",
+            pond::output::paint("hint", dim),
+        ))?;
+    } else {
+        let policy = configured_maintenance_policy(loaded, None)?;
+        // Same finalize seam as optimize/sync; the archive carries embeddings as
+        // data columns, so finalize's embed pass no-ops.
+        finalize_indexes(&store, &policy, false).await?;
+        output(&format!(
+            "{} rebuilt text + semantic on destination",
+            pond::output::paint("indexes:", dim),
+        ))?;
+    }
+    Ok(())
+}
+
+/// The 7-field `copy:` import recap shared by store-to-store copy and archive
+/// restore - both land a `LanceArchiveImport` and report it identically.
+fn render_copy_import(import: &LanceArchiveImport) -> anyhow::Result<()> {
+    output(&format!(
+        "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
+        pond::output::paint("copy:", pond::output::dim()),
+        import.rows.sessions,
+        import.rows.messages,
+        import.rows.parts,
+        import.inserted.sessions,
+        import.inserted.messages,
+        import.inserted.parts,
+    ))
 }
 
 /// The string `[storage].path` should carry for `url`: the display form
@@ -1769,22 +2175,19 @@ fn set_storage_path(doc: &mut toml_edit::DocumentMut, path_value: &str) {
     }
 }
 
-/// `pond storage use`: validate-then-activate. The destination is probed
-/// end-to-end and (optionally) populated + verified BEFORE `[storage].path`
-/// flips, so a typo or auth failure can never strand the config pointing at
-/// a broken destination.
+/// `pond storage use`: switch-only. Probe the destination end-to-end, then flip
+/// `[storage].path`. It copies nothing - moving data into a destination is
+/// `pond copy`, always a separate explicit step - so switching
+/// stores, or rolling back to a previous one, never touches any store's data.
 async fn run_storage_use(
     loaded: &Config,
     config_file: &Path,
     storage_path: Option<StorageUrl>,
     url: &str,
-    migrate: bool,
-    no_migrate: bool,
-    yes: bool,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
-    let dest = match StorageUrl::parse(url) {
+    let dest = match parse_storage_path(url) {
         Ok(parsed) => parsed,
         Err(error) => {
             output_err(&format!("use: parse error: {error:#}"))?;
@@ -1799,7 +2202,8 @@ async fn run_storage_use(
     ))?;
     warn_unmatched_sets(&[&dest_resolved], loaded)?;
 
-    // 1. End-to-end probe first - same classes and exit codes as `check`.
+    // Probe before any config change - same exit codes as `check`, so a typo or
+    // auth failure can never strand the config pointing at a broken destination.
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.green} probing destination... [{elapsed_precise}]")
@@ -1817,7 +2221,6 @@ async fn run_storage_use(
     }
     output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
 
-    // 2. Offer to copy existing data before the switch.
     let current = resolve_storage_location(storage_path, loaded)?;
     let already_configured = loaded.storage.path.as_deref() == Some(dest.canonical().as_str())
         || loaded.storage.path.as_deref().is_some_and(|path| {
@@ -1833,100 +2236,438 @@ async fn run_storage_use(
         ))?;
         return Ok(());
     }
-    let current_resolved = current.resolve(&loaded.creds)?;
-    let from_store = Store::open_with_options(
-        current_resolved.lance_url(),
-        current_resolved.options.clone(),
-        runtime_caps(loaded),
-    )
-    .await?;
-    let from_totals = from_store.corpus_stats(false).await?.totals;
-    if from_totals.sessions > 0 && !no_migrate {
-        let copy = if migrate || yes {
-            true
-        } else if io::stdin().is_terminal() {
-            cliclack::confirm(format!(
-                "Copy existing data ({} sessions) from {} first?",
-                format_thousands(from_totals.sessions),
-                current.display(),
-            ))
-            .initial_value(true)
-            .interact()
-            .context("migration prompt failed")?
-        } else {
-            bail!(
-                "current storage has data and stdin is not a terminal; pass --migrate to copy it or --no-migrate to switch without copying"
-            );
-        };
-        if copy {
-            let to_store = Store::open_with_options(
-                dest_resolved.lance_url(),
-                dest_resolved.options.clone(),
-                runtime_caps(loaded),
-            )
-            .await?;
-            let imported = migrate_between_stores(&from_store, &to_store).await?;
-            output(&format!(
-                "{} sessions={} messages={} parts={} inserted_sessions={} inserted_messages={} inserted_parts={}",
-                paint("migrate:", dim()),
-                imported.rows.sessions,
-                imported.rows.messages,
-                imported.rows.parts,
-                imported.inserted.sessions,
-                imported.inserted.messages,
-                imported.inserted.parts,
-            ))?;
-            let policy = configured_maintenance_policy(loaded, None)?;
-            run_update_indexes_stage(&to_store, &policy).await?;
-            // 3. Verify the copy reconciles BEFORE flipping config.
-            let dest_totals = to_store.corpus_stats(false).await?.totals;
-            if dest_totals.sessions < from_totals.sessions
-                || dest_totals.messages < from_totals.messages
-                || dest_totals.parts < from_totals.parts
-            {
-                bail!(
-                    "destination row counts do not reconcile (source {}/{}/{} vs destination {}/{}/{} sessions/messages/parts); config not changed - rerun `pond storage use` to retry the copy",
-                    from_totals.sessions,
-                    from_totals.messages,
-                    from_totals.parts,
-                    dest_totals.sessions,
-                    dest_totals.messages,
-                    dest_totals.parts,
-                );
-            }
-        }
-    }
 
-    // 4. Flip `[storage].path`, preserving the rest of the file verbatim.
-    let existing = if config_file.exists() {
-        fs::read_to_string(config_file)
-            .with_context(|| format!("failed to read {}", config_file.display()))?
-    } else {
-        String::new()
-    };
-    let mut doc: toml_edit::DocumentMut = existing
-        .parse()
-        .with_context(|| format!("failed to parse {} as TOML", config_file.display()))?;
+    let mut doc = read_config_doc(config_file)?;
     let path_value = storage_config_value(&dest);
     set_storage_path(&mut doc, &path_value);
-    if let Some(parent) = config_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(config_file, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_file.display()))?;
+    write_config_doc(config_file, &doc)?;
     output(&format!(
         "{} [storage].path = {} written to {}",
         paint("use:", dim()),
         path_value,
         config::display(&config::url_for_path(config_file)?),
     ))?;
+    // `use` reads no store but the destination probe above - so it names the
+    // explicit copy step with both URLs filled in, rather than counting rows to
+    // guess whether a copy is wanted. Moving the old data over is one paste away.
     output(&format!(
-        "{} previous data at {} is untouched; verify with `pond storage check` and `pond status`",
+        "{} previous data at {} is untouched; copy it over with `pond copy --from {} --to {}`",
         paint("hint", dim()),
         current.display(),
+        current.display(),
+        dest.display(),
     ))?;
     Ok(())
+}
+
+/// Read `config_file` into an editable TOML document, preserving formatting and
+/// comments; an absent file parses as empty.
+fn read_config_doc(config_file: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let existing = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .with_context(|| format!("failed to read {}", config_file.display()))?
+    } else {
+        String::new()
+    };
+    existing
+        .parse()
+        .with_context(|| format!("failed to parse {} as TOML", config_file.display()))
+}
+
+/// Write an edited TOML document back to `config_file`, creating its directory.
+fn write_config_doc(config_file: &Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    pond::config::write_config_file(config_file, &doc.to_string())
+}
+
+/// `pond creds {add,list,delete}`: manage the `[creds.<name>]` sets in
+/// config.toml. Sets bind to URLs by scope match, never activation - there is
+/// no "current" set to select (spec.md#creds-scope-match).
+fn run_creds(command: CredsCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+    match command {
+        CredsCmd::Add {
+            name,
+            scope,
+            region,
+        } => creds_add(config_file, name, scope, region),
+        CredsCmd::List { format } => creds_list(loaded, format),
+        CredsCmd::Delete { name } => creds_delete(config_file, name),
+    }
+}
+
+fn creds_add(
+    config_file: &Path,
+    name: Option<String>,
+    scope: Option<String>,
+    region: Option<String>,
+) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+
+    // The secret is captured via a hidden prompt, which needs a real terminal.
+    // Non-interactive callers use POND_CREDS_<NAME>_* or a hand-written set.
+    if !io::stdin().is_terminal() {
+        bail!(
+            "`pond creds add` needs a terminal for hidden secret entry; in non-interactive runs set POND_CREDS_<NAME>_ACCESS_KEY_ID / POND_CREDS_<NAME>_SECRET_ACCESS_KEY or add [creds.<name>] to config.toml"
+        );
+    }
+
+    let name = match name {
+        Some(name) => name,
+        None => cliclack::input("Credential set name")
+            .default_input("default")
+            .interact()
+            .context("credential prompt failed; nothing written")?,
+    };
+    if !config::valid_creds_set_name(&name) {
+        bail!(config::creds_set_name_error(&name));
+    }
+
+    // Replacing an existing set (rotating keys) is legitimate, but it overwrites
+    // a stored secret - gate it on an explicit confirm, never a silent clobber.
+    // Checked against the file, since only a file-defined set is what `add`
+    // overwrites; confirm before prompting for keys so a decline costs nothing.
+    let mut doc = read_config_doc(config_file)?;
+    let exists = doc
+        .get("creds")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|creds| creds.contains_key(&name));
+    if exists
+        && !cliclack::confirm(format!("Replace existing credential set [creds.{name}]?"))
+            .initial_value(false)
+            .interact()
+            .context("credential prompt failed; nothing written")?
+    {
+        output(&format!(
+            "{} kept existing [creds.{}]; nothing written",
+            paint("creds:", dim()),
+            name,
+        ))?;
+        return Ok(());
+    }
+
+    let access_key_id: String = cliclack::input("Access key ID")
+        .interact()
+        .context("credential prompt failed; nothing written")?;
+    let secret_access_key: String = cliclack::password("Secret access key")
+        .mask('*')
+        .interact()
+        .context("credential prompt failed; nothing written")?;
+
+    // Build and validate the result in memory; only a config that parses and
+    // passes the [creds.*] structural rules is written, so a bad set can't land.
+    set_creds_set(
+        &mut doc,
+        &name,
+        &access_key_id,
+        &secret_access_key,
+        scope.as_deref(),
+        region.as_deref(),
+    );
+    Config::load_str(&doc.to_string())
+        .context("the resulting config would be invalid; nothing written")?;
+    write_config_doc(config_file, &doc)?;
+
+    output(&format!(
+        "{} [creds.{}] written to {} (secret redacted)",
+        paint("creds:", dim()),
+        name,
+        config::display(&config::url_for_path(config_file)?),
+    ))?;
+    output(&format!(
+        "{} verify it binds with `pond storage check <url>`",
+        paint("hint", dim()),
+    ))?;
+    Ok(())
+}
+
+/// The redacted access-key / secret display strings shared by the table and
+/// the JSON document - a real secret must never reach either surface.
+fn creds_display_fields(set: &config::CredsSet) -> (String, String) {
+    let access = match (&set.access_key_id, &set.access_key_id_file) {
+        (Some(_), _) => "********".to_owned(),
+        (None, Some(path)) => format!("file:{}", path.display()),
+        (None, None) => "-".to_owned(),
+    };
+    let secret = if set.secret_access_key.is_some() {
+        "********".to_owned()
+    } else if let Some(path) = &set.secret_access_key_file {
+        format!("file:{}", path.display())
+    } else if let Some(command) = &set.secret_access_key_command {
+        format!("command:{command}")
+    } else {
+        "-".to_owned()
+    };
+    (access, secret)
+}
+
+/// The `pond creds list --format json` document: one entry per set, with
+/// `access_key`/`secret` carrying the same redacted display strings the table
+/// shows - never a real secret.
+fn creds_list_json(loaded: &Config) -> anyhow::Result<String> {
+    let sets: Vec<serde_json::Value> = loaded
+        .creds
+        .iter()
+        .map(|(name, set)| {
+            let (access, secret) = creds_display_fields(set);
+            serde_json::json!({
+                "name": name,
+                "scope": set.scope,
+                "access_key": access,
+                "secret": secret,
+                "region": set.region,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&sets).context("serialize creds list as JSON")
+}
+
+fn creds_list(loaded: &Config, format: OutputFormat) -> anyhow::Result<()> {
+    if let OutputFormat::Json = format {
+        output(&creds_list_json(loaded)?)?;
+        return Ok(());
+    }
+    if loaded.creds.is_empty() {
+        output(
+            "no credential sets configured - add one with `pond creds add`, or set POND_CREDS_<NAME>_* in the environment",
+        )?;
+        return Ok(());
+    }
+    let mut table = new_table();
+    table.set_header(vec!["set", "scope", "access key", "secret", "region"]);
+    for (name, set) in &loaded.creds {
+        let scope = set
+            .scope
+            .clone()
+            .unwrap_or_else(|| "(catch-all)".to_owned());
+        let (access, secret) = creds_display_fields(set);
+        let region = set.region.clone().unwrap_or_else(|| "-".to_owned());
+        table.add_row(vec![name.clone(), scope, access, secret, region]);
+    }
+    output(&table.to_string())?;
+    Ok(())
+}
+
+fn creds_delete(config_file: &Path, name: String) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+
+    let mut doc = read_config_doc(config_file)?;
+    let removed = doc
+        .get_mut("creds")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .is_some_and(|creds| creds.remove(&name).is_some());
+    if !removed {
+        bail!(
+            "no [creds.{name}] set in {}",
+            config::display(&config::url_for_path(config_file)?)
+        );
+    }
+    if doc
+        .get("creds")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(toml_edit::TableLike::is_empty)
+    {
+        doc.remove("creds");
+    }
+    write_config_doc(config_file, &doc)?;
+    output(&format!(
+        "{} [creds.{}] removed",
+        paint("creds:", dim()),
+        name
+    ))?;
+
+    // Rotation must never silently strand the default store: if removing the
+    // set leaves the active storage URL matching nothing, say so.
+    if let Ok(reloaded) = Config::load(config_file)
+        && let Some(path) = reloaded.storage.path.as_deref()
+        && let Ok(url) = StorageUrl::parse(path)
+        && let Ok(resolved) = url.resolve(&reloaded.creds)
+        && matches!(resolved.binding, CredsBinding::Ambient)
+    {
+        output(&format!(
+            "{} active storage {} now matches no creds set; it will fall back to the ambient cloud chain",
+            paint("note:", dim()),
+            url.display(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Write `[creds.<name>]` into `doc`, replacing any existing set of that name.
+/// Only the captured fields are emitted; `scope`/`region` only when provided.
+fn set_creds_set(
+    doc: &mut toml_edit::DocumentMut,
+    name: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    scope: Option<&str>,
+    region: Option<&str>,
+) {
+    use toml_edit::{Item, Table, value};
+    let mut set = Table::new();
+    if let Some(scope) = scope {
+        set.insert("scope", value(scope));
+    }
+    set.insert("access_key_id", value(access_key_id));
+    set.insert("secret_access_key", value(secret_access_key));
+    if let Some(region) = region {
+        set.insert("region", value(region));
+    }
+    match doc.get_mut("creds").and_then(Item::as_table_like_mut) {
+        Some(creds) => {
+            creds.insert(name, Item::Table(set));
+        }
+        None => {
+            let mut parent = Table::new();
+            // Implicit so the file renders `[creds.<name>]`, not a bare `[creds]`.
+            parent.set_implicit(true);
+            parent.insert(name, Item::Table(set));
+            doc.insert("creds", Item::Table(parent));
+        }
+    }
+}
+
+/// `pond adapters {list,discover,enable,disable}`: the explicit owner of
+/// `[adapters.*]` state. `pond sync` reads these entries but never writes them.
+fn run_adapters(command: AdaptersCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
+    match command {
+        AdaptersCmd::List { format } => adapters_list(loaded, format),
+        AdaptersCmd::Discover => adapters_discover(config_file),
+        AdaptersCmd::Enable { name } => adapters_enable(config_file, &name),
+        AdaptersCmd::Disable { name } => adapters_disable(config_file, &name),
+    }
+}
+
+/// The `pond adapters list --format json` document: configured adapters
+/// (enabled state, home-contracted path or null) plus detected-but-unconfigured
+/// ones, sharing the exact `path` contraction the text table applies.
+fn adapters_list_json(loaded: &Config) -> anyhow::Result<String> {
+    let detected = adapter::probe_unconfigured(&loaded.adapters);
+    let configured: Vec<serde_json::Value> = loaded
+        .adapters
+        .iter()
+        .map(|(name, blob)| {
+            let enabled = blob
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let path = blob
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|p| config::contract_home(Path::new(p)).display().to_string());
+            serde_json::json!({ "name": name, "enabled": enabled, "path": path })
+        })
+        .collect();
+    let detected_json: Vec<serde_json::Value> = detected
+        .iter()
+        .map(|c| serde_json::json!({ "name": c.name, "hint": c.hint }))
+        .collect();
+    let doc = serde_json::json!({ "configured": configured, "detected": detected_json });
+    serde_json::to_string_pretty(&doc).context("serialize adapters list as JSON")
+}
+
+fn adapters_list(loaded: &Config, format: OutputFormat) -> anyhow::Result<()> {
+    if let OutputFormat::Json = format {
+        output(&adapters_list_json(loaded)?)?;
+        return Ok(());
+    }
+    let detected = adapter::probe_unconfigured(&loaded.adapters);
+    if loaded.adapters.is_empty() && detected.is_empty() {
+        output(
+            "no adapters configured and none detected - run `pond adapters discover` (or `pond init`)",
+        )?;
+        return Ok(());
+    }
+    let mut table = new_table();
+    table.set_header(vec!["adapter", "enabled", "path"]);
+    for (name, blob) in &loaded.adapters {
+        let enabled = blob
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let path = blob
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|p| config::contract_home(Path::new(p)).display().to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let state = if enabled { "yes" } else { "no" }.to_owned();
+        table.add_row(vec![name.clone(), state, path]);
+    }
+    for candidate in &detected {
+        table.add_row(vec![
+            candidate.name.clone(),
+            "detected".to_owned(),
+            candidate.hint.clone(),
+        ]);
+    }
+    output(&table.to_string())?;
+    Ok(())
+}
+
+fn adapters_discover(config_file: &Path) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let candidates = adapter::discover(None);
+    let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
+    let names: Vec<&str> = picks.iter().map(|c| c.name.as_str()).collect();
+    output(&format!(
+        "{} enabled {} adapter(s): {}",
+        paint("adapters:", dim()),
+        picks.len(),
+        names.join(", "),
+    ))?;
+    Ok(())
+}
+
+fn adapters_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let known = adapter::known_names();
+    if !known.contains(&name) {
+        bail!("unknown adapter {name:?}; known: {}", known.join(", "));
+    }
+    // Already configured: flip enabled = true in place, keeping its path/options.
+    if adapter::set_adapter_enabled(config_file, name, true)? {
+        output(&format!(
+            "{} [adapters.{}] enabled = true",
+            paint("adapters:", dim()),
+            name,
+        ))?;
+        return Ok(());
+    }
+    // Not configured: discover its default path, then persist enabled = true.
+    let candidate = adapter::discover(Some(name))
+        .into_iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "adapter {name:?} was not detected on this machine; add an [adapters.{name}] entry with its path manually, or run `pond sync {name} --path <path>` for a one-off"
+            )
+        })?;
+    adapter::persist_accept(config_file, &[candidate])?;
+    output(&format!(
+        "{} [adapters.{}] enabled = true (discovered)",
+        paint("adapters:", dim()),
+        name,
+    ))?;
+    Ok(())
+}
+
+fn adapters_disable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    if adapter::set_adapter_enabled(config_file, name, false)? {
+        output(&format!(
+            "{} [adapters.{}] enabled = false",
+            paint("adapters:", dim()),
+            name,
+        ))?;
+        Ok(())
+    } else {
+        bail!(
+            "no [adapters.{name}] entry to disable in {}",
+            config_file.display()
+        );
+    }
 }
 
 /// Map a figment provenance lookup onto the source column vocabulary.
@@ -1987,67 +2728,248 @@ fn redact_config_value(key: &str, value: &str) -> String {
     value.to_owned()
 }
 
-/// `pond storage migrate` core: export the source's clean datasets into local
-/// staging, then merge-import into the destination. Idempotency comes from
+/// Store-to-store `pond copy` core: export the source's clean datasets into
+/// local staging, then merge-import into the destination. Idempotency comes from
 /// `lance-deterministic-pk` + merge-insert: a rerun inserts nothing, and a
 /// populated destination unions rather than clobbers.
-async fn migrate_between_stores(from: &Store, to: &Store) -> anyhow::Result<LanceArchiveImport> {
-    let staging = tempfile::Builder::new()
-        .prefix("pond-migrate-")
-        .tempdir()
-        .context("failed to create migrate staging dir")?;
-    let data_dir = staging.path().join("data");
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(120));
-    spinner.set_message("migrate: copying from source...");
-    let _exported = from.export_clean_lance_datasets(&data_dir).await?;
-    spinner.set_message("migrate: merging into destination...");
-    let imported = to.import_clean_lance_datasets(&data_dir).await;
-    spinner.finish_and_clear();
-    imported
+/// Resolve both URLs against the loaded creds, print the from/to binding
+/// lines (a wrong scope match must surface before any work, not after an auth
+/// error), and open both stores. Shared by store-to-store copy and verify.
+async fn resolve_and_open_pair(
+    from: &StorageUrl,
+    to: &StorageUrl,
+    loaded: &Config,
+) -> anyhow::Result<(ResolvedStorage, Store, ResolvedStorage, Store)> {
+    let from_resolved = from.resolve(&loaded.creds)?;
+    let to_resolved = to.resolve(&loaded.creds)?;
+    warn_unmatched_sets(&[&from_resolved, &to_resolved], loaded)?;
+    let dim = pond::output::dim();
+    output(&format!(
+        "{} {}  {}",
+        pond::output::paint("from:", dim),
+        from_resolved.display(),
+        pond::output::paint(&format!("[{}]", from_resolved.binding.describe()), dim),
+    ))?;
+    output(&format!(
+        "{}   {}  {}",
+        pond::output::paint("to:", dim),
+        to_resolved.display(),
+        pond::output::paint(&format!("[{}]", to_resolved.binding.describe()), dim),
+    ))?;
+    let from_store = Store::open_with_options(
+        from_resolved.lance_url(),
+        from_resolved.options.clone(),
+        runtime_caps(loaded),
+    )
+    .await?;
+    let to_store = Store::open_with_options(
+        to_resolved.lance_url(),
+        to_resolved.options.clone(),
+        runtime_caps(loaded),
+    )
+    .await?;
+    Ok((from_resolved, from_store, to_resolved, to_store))
+}
+
+/// Per-table membership: `missing` = source ids absent from the destination,
+/// the count that must be zero for the destination to fully contain the
+/// source. A destination may legitimately hold more (copy never deletes),
+/// so a surplus is not a failure and is not surfaced.
+struct TableVerify {
+    table: substrate::Table,
+    source_rows: usize,
+    missing: usize,
+}
+
+struct StorageVerify {
+    tables: Vec<TableVerify>,
+    dest_indexes: IndexCoverage,
+}
+
+impl StorageVerify {
+    fn synced(&self) -> bool {
+        self.tables.iter().all(|t| t.missing == 0)
+    }
+    fn total_missing(&self) -> usize {
+        self.tables.iter().map(|t| t.missing).sum()
+    }
+    fn total_source_rows(&self) -> usize {
+        self.tables.iter().map(|t| t.source_rows).sum()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexCoverage {
+    fts_present: bool,
+    vector_present_or_below_activation: bool,
+}
+
+impl IndexCoverage {
+    fn ready(self) -> bool {
+        self.fts_present && self.vector_present_or_below_activation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifyOutcome {
+    synced: bool,
+}
+
+/// Compare the `id` set of every table across two stores - read-only on both
+/// sides. Matching row counts can hide divergent membership, so verification
+/// keys on the deterministic per-row id, not the cardinalities. Drives
+/// `pond copy`'s closing check and `pond copy --verify-only`.
+async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify> {
+    use substrate::Table;
+    // Per table, materialize only the destination id set and stream the source
+    // ids against it (the source side is never held as a set) - half the peak
+    // memory of holding both sides for all three tables, which matters on a
+    // multi-million-row store. The three tables still verify concurrently, so
+    // the remote round-trip parallelism is preserved. Counts are per source row
+    // (bare `id` is not unique - it repeats across the composite pk), matching
+    // this function's per-row contract; `missing == 0` is identical either way.
+    let verify_table = |table: Table| async move {
+        let dest = to.collect_ids(table).await?;
+        let (source_rows, missing) = from.id_diff_against(table, &dest).await?;
+        anyhow::Ok(TableVerify {
+            table,
+            source_rows,
+            missing,
+        })
+    };
+    let (sessions, messages, parts, dest_index_status, dest_embedding) = tokio::try_join!(
+        verify_table(Table::Sessions),
+        verify_table(Table::Messages),
+        verify_table(Table::Parts),
+        to.index_status(),
+        to.embedding_progress(),
+    )?;
+    let tables = vec![sessions, messages, parts];
+    let fts_present = dest_index_status
+        .iter()
+        .any(|status| status.intent_name == MESSAGES_FTS_INDEX && status.exists);
+    let vector_present = dest_index_status
+        .iter()
+        .any(|status| status.intent_name == MESSAGES_VECTOR_INDEX && status.exists);
+    let dest_indexes = IndexCoverage {
+        fts_present,
+        vector_present_or_below_activation: vector_present
+            || dest_embedding.embedded < VECTOR_INDEX_ACTIVATION_ROWS,
+    };
+    Ok(StorageVerify {
+        tables,
+        dest_indexes,
+    })
+}
+
+/// A 0-row source almost always means a mistyped `--from`: a remote store
+/// auto-vivifies empty, so the copy would otherwise "succeed" having moved
+/// nothing. The `run_copy` guard catches a missing local path; this catches
+/// the remote/empty case for parity (spec.md#session-durable-copy).
+fn ensure_source_not_empty(verify: &StorageVerify, from_display: &str) -> anyhow::Result<()> {
+    if verify.total_source_rows() == 0 {
+        bail!(
+            "source store {from_display} has 0 rows; check --from (a mistyped source opens as an empty store)"
+        );
+    }
+    Ok(())
+}
+
+/// One-line SYNCED / FAILED verdict so the user never guesses whether a copy
+/// fully landed. On failure it names the short tables and the exact
+/// idempotent re-run.
+fn render_storage_verify(
+    verify: &StorageVerify,
+    from_display: &str,
+    to_display: &str,
+) -> anyhow::Result<VerifyOutcome> {
+    use pond::output::{dim, paint};
+    if verify.synced() {
+        let detail = verify
+            .tables
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} {}",
+                    t.table.as_str(),
+                    format_thousands(t.source_rows as u64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        output(&format!(
+            "{} SYNCED - destination contains all {} source rows ({})",
+            paint("verify:", dim()),
+            format_thousands(verify.total_source_rows() as u64),
+            detail,
+        ))?;
+        if !verify.dest_indexes.ready() {
+            output(&format!(
+                "{} data copied; indexes pending - run `pond optimize --only index --storage-path {to_display}` before querying",
+                paint("verify:", dim()),
+            ))?;
+        }
+        Ok(VerifyOutcome { synced: true })
+    } else {
+        let short = verify
+            .tables
+            .iter()
+            .filter(|t| t.missing > 0)
+            .map(|t| {
+                format!(
+                    "{} {}",
+                    t.table.as_str(),
+                    format_thousands(t.missing as u64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        output_err(&format!(
+            "{} FAILED - {} source rows missing from destination ({})",
+            paint("verify:", dim()),
+            format_thousands(verify.total_missing() as u64),
+            short,
+        ))?;
+        output_err(&paint(
+            &format!(
+                "  fix: re-run `pond copy --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
+            ),
+            dim(),
+        ))?;
+        Ok(VerifyOutcome { synced: false })
+    }
 }
 
 #[derive(Debug, Default)]
-struct SyncStages {
-    import: bool,
+struct OptimizeStages {
     embed: bool,
-    update_indexes: bool,
+    index: bool,
 }
 
-impl SyncStages {
-    fn resolve(only: Option<SyncStage>, skip: &[SyncStage]) -> anyhow::Result<Self> {
+impl OptimizeStages {
+    fn resolve(only: Option<OptimizeStage>, skip: &[OptimizeStage]) -> anyhow::Result<Self> {
         let mut stages = match only {
-            Some(SyncStage::Import) => Self {
-                import: true,
-                ..Self::default()
-            },
-            Some(SyncStage::Embed) => Self {
+            Some(OptimizeStage::Embed) => Self {
                 embed: true,
                 ..Self::default()
             },
-            Some(SyncStage::UpdateIndexes) => Self {
-                update_indexes: true,
+            Some(OptimizeStage::Index) => Self {
+                index: true,
                 ..Self::default()
             },
             None => Self {
-                import: true,
                 embed: true,
-                update_indexes: true,
+                index: true,
             },
         };
         for stage in skip {
             match stage {
-                SyncStage::Import => stages.import = false,
-                SyncStage::Embed => stages.embed = false,
-                SyncStage::UpdateIndexes => stages.update_indexes = false,
+                OptimizeStage::Embed => stages.embed = false,
+                OptimizeStage::Index => stages.index = false,
             }
         }
-        if !(stages.import || stages.embed || stages.update_indexes) {
-            bail!("no sync stages selected");
+        if !(stages.embed || stages.index) {
+            bail!("no optimize stages selected");
         }
         Ok(stages)
     }
@@ -2066,20 +2988,21 @@ async fn run_import_stage(
     loaded: &Config,
     config_file: &Path,
     adapter: Option<String>,
-    source_dir: Option<PathBuf>,
+    path: Option<PathBuf>,
+    verify: bool,
 ) -> anyhow::Result<IngestSummary> {
-    let sources = resolve_sync_sources(loaded, config_file, adapter.as_deref(), source_dir)?;
-    if sources.is_empty() {
-        let disabled = loaded.disabled_source_names();
+    let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), path)?;
+    if adapters.is_empty() {
+        let disabled = loaded.disabled_adapter_names();
         let label = pond::output::paint("import:", pond::output::dim());
         if disabled.is_empty() {
             output(&format!(
-                "{label} no sources configured. Run `pond sync` on a TTY to detect adapters, or add `[sources.<name>]` blocks to {}.",
+                "{label} no adapters configured. Run `pond adapters discover` (or `pond init`) to detect and enable adapters, or add `[adapters.<name>]` blocks to {}.",
                 config_file.display(),
             ))?;
         } else {
             output(&format!(
-                "{label} no enabled sources. Found {} disabled: {}. Add `enabled = true` to the section in {}, or re-enable interactively with `pond sync <name>`.",
+                "{label} no enabled adapters. Found {} disabled: {}. Enable one with `pond adapters enable <name>` (or add `enabled = true` to its section in {}).",
                 disabled.len(),
                 disabled.join(", "),
                 config_file.display(),
@@ -2087,10 +3010,42 @@ async fn run_import_stage(
         }
         return Ok(IngestSummary::default());
     }
-    let watermarks = StoredWatermarks::new(store.session_last_ingested_at().await?);
+    // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
+    // watermark, so every source body is re-decoded and re-ingested through the
+    // idempotent merge. This is the only path that heals historical M1 damage -
+    // a session partially flushed before the commit-row-last fix keeps a frozen
+    // watermark that mtime can never re-read past (spec.md#session-movement-complete).
+    let noop = pond::adapter::NoopOracle;
+    let rowmap_oracle;
+    let oracle: &dyn pond::adapter::SkipOracle = if verify {
+        output(&pond::output::paint(
+            "import: --verify: re-reading every source body, bypassing the freshness skip",
+            pond::output::yellow(),
+        ))?;
+        &noop
+    } else {
+        // Freshness key from the resident meta map: a cold sync builds it with one
+        // sequential scan, a warm sync delta-extends it - never the per-manifest
+        // version-resolution storm that throttled remote syncs to a stall. A
+        // missing/stale map yields no key, so the session simply re-reads (safe).
+        if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
+            tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
+        }
+        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        &rowmap_oracle
+    };
+    // One MultiProgress owns every adapter's bar as a single continuously
+    // redrawn block: on a terminal resize it desyncs for at most one tick and
+    // then repaints, instead of leaving each independently-finished bar rotting
+    // in scrollback. `stderr_with_hz(8)` lowers the redraw rate so reflows have
+    // time to settle. Scroll-back lines go through `mp.println` so they land
+    // above the live block.
+    let mp = indicatif::MultiProgress::with_draw_target(
+        indicatif::ProgressDrawTarget::stderr_with_hz(8),
+    );
     let mut total = IngestSummary::default();
-    for (name, blob) in sources {
-        let summary = sync_with_progress(store, &name, blob, &watermarks).await?;
+    for (name, blob) in adapters {
+        let summary = sync_with_progress(store, &mp, &name, blob, oracle).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -2118,7 +3073,7 @@ async fn run_embed_stage_with_limit(
         }
         output(&pond::output::paint(
             &format!(
-                "embed: --force: re-embedding {} stale-model row(s) after dropping IVF_PQ",
+                "embed: --force-embed: re-embedding {} stale-model row(s) after dropping IVF_SQ",
                 format_thousands(stale as u64),
             ),
             pond::output::yellow(),
@@ -2126,8 +3081,7 @@ async fn run_embed_stage_with_limit(
         store.drop_vector_index().await?;
     }
 
-    let progress = store.embedding_progress().await?;
-    let backlog = progress.total.saturating_sub(progress.embedded);
+    let backlog = store.embed_backlog_count().await?;
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
         None => backlog,
@@ -2144,12 +3098,10 @@ async fn run_embed_stage_with_limit(
         Some(bar_total as u64),
         indicatif::ProgressDrawTarget::stderr_with_hz(8),
     );
+    // `{wide_msg}`-only: the full line (built in the progress callback) rides
+    // the one template segment indicatif truncates to width, so it never wraps.
     bar.set_style(
-        ProgressStyle::with_template(
-            "semantic embedding [{elapsed_precise}] [{bar:24}] {pos}/{len} messages  {wide_msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-"),
+        ProgressStyle::with_template("{wide_msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     bar.enable_steady_tick(Duration::from_millis(120));
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2168,10 +3120,16 @@ async fn run_embed_stage_with_limit(
     let mut worker = EmbedWorker::new(store, &embedder)
         .with_cancel(cancel)
         .with_progress(move |progress: BatchProgress| {
+            let pos = progress.total_messages as u64;
+            let len = bar_for_callback.length().unwrap_or(0);
             let secs = started.elapsed().as_secs_f64().max(0.001);
             let rate = progress.total_messages as f64 / secs;
-            bar_for_callback.set_position(progress.total_messages as u64);
-            bar_for_callback.set_message(format!("{rate:.0} msgs/s"));
+            bar_for_callback.set_position(pos);
+            bar_for_callback.set_message(format!(
+                "semantic embedding [{}] [{}] {pos}/{len} messages  {rate:.0} msgs/s",
+                elapsed_hms(started.elapsed()),
+                progress_glyphs(pos, len, 24),
+            ));
         });
     if force {
         worker = worker.include_stale();
@@ -2246,15 +3204,27 @@ async fn run_update_indexes_stage(
     Ok(outcome)
 }
 
+/// The shared index-finalize stage for a full `pond optimize`, `pond sync`, and
+/// `pond copy`: embed the backlog - a no-op when every row is already embedded,
+/// as with a same-model copy - then fold every trailing fragment into the
+/// indexes and run the compaction + version-cleanup pass. One seam so the three
+/// entry points can't drift in what "indexes up to date" means.
+async fn finalize_indexes(
+    store: &Store,
+    policy: &MaintenancePolicy,
+    force_embed: bool,
+) -> anyhow::Result<OptimizeOutcome> {
+    run_embed_stage(store, force_embed).await?;
+    run_update_indexes_stage(store, policy).await
+}
+
 /// Final recap of a `pond sync` run. Three-line shape:
 ///
 /// ```text
 ///
 /// indexes   text + semantic ready
 /// added     +44 sessions, +2,337 messages
-/// stored    8,460 sessions, 172,710 messages
-///
-/// (messages = searchable text rows; use -v for full counts)
+/// stored    8,460 sessions, 172,710 searchable messages
 /// ```
 ///
 /// `added` is suppressed when both deltas are zero (a no-op sync still
@@ -2272,12 +3242,12 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
         None => (0, 0),
     };
 
-    let (index_status, embedding, stats) = tokio::try_join!(
+    let (index_status, embedding, (stored_sessions, _, _)) = tokio::try_join!(
         store.index_status(),
         store.embedding_progress(),
-        store.corpus_stats(false),
+        store.row_counts(),
     )?;
-    let health = classify_index_health(&index_status, index_lag_threshold(), &embedding);
+    let health = classify_index_health(&index_status, Some(&embedding));
 
     output("")?;
     output(&render_indexes_line(&health))?;
@@ -2290,15 +3260,10 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
         ))?;
     }
     output(&format!(
-        "{}    {} sessions, {} messages",
+        "{}    {} sessions, {} searchable messages",
         paint("stored", dim()),
-        format_thousands(stats.totals.sessions),
+        format_thousands(stored_sessions as u64),
         format_thousands(embedding.total as u64),
-    ))?;
-    output_err("")?;
-    output_err(&paint(
-        "(messages = searchable text rows; use -v for full counts)",
-        dim(),
     ))?;
     Ok(())
 }
@@ -2438,32 +3403,31 @@ fn unzip_archive(source: &Path, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
+/// Read-only over config - enabling an adapter is `pond adapters` / `pond init`,
+/// never a side effect of sync (spec.md#cli-verbs).
 ///
 /// Precedence:
-/// 1. `--source-dir <path>` with `<adapter>` set: one-off run, no config writes.
-/// 2. `<adapter>` set, `[sources.<adapter>].path` present: use that.
-/// 3. `<adapter>` set, no config entry: run per-adapter discovery (one
-///    candidate), prompt to add it, persist, then use it.
-/// 4. No `<adapter>`, `[sources]` non-empty: sync every entry.
-/// 5. No `<adapter>`, empty `[sources]`: discover across every adapter,
-///    prompt, persist, then sync the picks.
-fn resolve_sync_sources(
+/// 1. `--path <dir>` with `<adapter>` set: one-off run, no config writes.
+/// 2. `<adapter>` set, `[adapters.<adapter>]` present: use that.
+/// 3. `<adapter>` set, no config entry: error pointing at `pond adapters enable`.
+/// 4. No `<adapter>`, `[adapters]` non-empty: sync every enabled entry.
+/// 5. No `<adapter>`, empty `[adapters]`: error pointing at `pond adapters discover`.
+fn resolve_sync_adapters(
     config: &Config,
-    config_file: &Path,
     name: Option<&str>,
-    source_dir: Option<PathBuf>,
+    path: Option<PathBuf>,
 ) -> anyhow::Result<Vec<(String, Value)>> {
-    if let Some(source_dir) = source_dir {
+    if let Some(path) = path {
         let name = name.ok_or_else(|| {
-            anyhow::anyhow!("--source-dir requires an explicit <adapter> positional argument")
+            anyhow::anyhow!("--path requires an explicit <adapter> positional argument")
         })?;
         let known = adapter::known_names();
         if !known.contains(&name) {
             bail!("unknown adapter {name:?}; known: {}", known.join(", "));
         }
-        // `--source-dir` is a filesystem-shaped override. Adapters that need
+        // `--path` is a filesystem-shaped override. Adapters that need
         // a richer config blob can't use this path; they must edit config.toml.
-        return Ok(vec![(name.to_owned(), json!({ "path": source_dir }))]);
+        return Ok(vec![(name.to_owned(), json!({ "path": path }))]);
     }
 
     if let Some(name) = name {
@@ -2471,27 +3435,30 @@ fn resolve_sync_sources(
         if !known.contains(&name) {
             bail!("unknown adapter {name:?}; known: {}", known.join(", "));
         }
-        if let Some(blob) = config.sources.get(name) {
-            return Ok(vec![(name.to_owned(), blob.clone())]);
+        if config.adapters.contains_key(name) {
+            // spec.md#cli-verbs: sync only ingests already-enabled adapters and
+            // never enables. resolve_adapters strips `enabled` and refuses a
+            // disabled entry, pointing the user at `pond adapters enable`.
+            return config.resolve_adapters(Some(name));
         }
-        let candidates = adapter::discover(Some(name));
-        let picks =
-            adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
-        return Ok(picks.into_iter().map(|c| (c.name, c.config)).collect());
+        bail!(
+            "adapter {name:?} has no [adapters.{name}] entry; enable it with `pond adapters enable {name}` (or `pond init`), then re-run `pond sync`"
+        );
     }
 
-    if !config.sources.is_empty() {
-        return config.resolve_sources(None);
+    if !config.adapters.is_empty() {
+        return config.resolve_adapters(None);
     }
-    let candidates = adapter::discover(None);
-    let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
-    Ok(picks.into_iter().map(|c| (c.name, c.config)).collect())
+    bail!(
+        "no adapters configured; run `pond adapters discover` (or `pond init`) to detect and enable adapters, then re-run `pond sync`"
+    );
 }
 
 /// Run one adapter's ingest pass into `store` with a live progress bar and
 /// one greppable log line per finished (or skipped) session.
 async fn sync_with_progress(
     store: &Store,
+    mp: &indicatif::MultiProgress,
     name: &str,
     config: Value,
     oracle: &dyn pond::adapter::SkipOracle,
@@ -2504,23 +3471,16 @@ async fn sync_with_progress(
     })?;
     let adapter = factory.open(config)?;
 
-    // `stderr_with_hz(8)` (indicatif 0.18.4) lowers the redraw rate from the
-    // 20Hz default so SIGWINCH-triggered terminal reflows have time to
-    // settle between renders. `{wide_msg}` truncates the (variable-length)
-    // message instead of wrapping past the column count, which would leave
-    // the previous render's tail orphaned in scrollback when the user
-    // resizes mid-run (indicatif#144, #695, microsoft/terminal#6932).
-    let bar =
-        ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::stderr_with_hz(8));
+    // Template is `{wide_msg}`-only and the whole status line is built into the
+    // message (see `sync_status_line`): `{wide_msg}` is the one segment
+    // indicatif truncates to width, so every line is exactly one terminal row
+    // and never wraps. The bar is owned by the shared `MultiProgress`, which
+    // redraws all adapter bars as one block.
+    let bar = mp.add(ProgressBar::new(0));
     bar.set_style(
-        ProgressStyle::with_template(
-            "sync {prefix} [{elapsed_precise}] [{bar:12}] {pos}/{len} sessions  {wide_msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-"),
+        ProgressStyle::with_template("{wide_msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
-    // Pad to the widest adapter name so stacked bars align.
-    bar.set_prefix(format!("{name:<12}"));
+    bar.set_message(sync_status_line(name, 0, 0, Duration::ZERO, "starting..."));
     bar.enable_steady_tick(Duration::from_millis(250));
 
     let mut messages: u64 = 0;
@@ -2599,7 +3559,7 @@ async fn sync_with_progress(
                 outcome.status,
                 SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
             ) {
-                bar_ref.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
+                let _ = mp.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
             }
             match optional_reason.as_deref() {
                 None => tracing::info!(
@@ -2628,18 +3588,44 @@ async fn sync_with_progress(
                 // Empty already shrunk `len`; ticking `pos` would over-count.
                 bar_ref.inc(1);
             }
-            bar_ref.set_message(format_bar_message(
-                messages,
-                drops,
-                errors,
+            let tail = format_bar_message(messages, drops, errors, started.elapsed());
+            bar_ref.set_message(sync_status_line(
+                name,
+                bar_ref.position(),
+                bar_ref.length().unwrap_or(0),
                 started.elapsed(),
+                &tail,
+            ));
+        }
+        SyncEvent::SkippedBulk { status, count } => {
+            match status {
+                SyncStatus::Empty => {
+                    let len = bar_ref.length().unwrap_or(0);
+                    bar_ref.set_length(len.saturating_sub(count as u64));
+                }
+                _ => bar_ref.inc(count as u64),
+            }
+            let tail = format_bar_message(messages, drops, errors, started.elapsed());
+            bar_ref.set_message(sync_status_line(
+                name,
+                bar_ref.position(),
+                bar_ref.length().unwrap_or(0),
+                started.elapsed(),
+                &tail,
             ));
         }
     })
     .await?;
 
     let tail = format_sync_outcome(&summary, drops, errors);
-    bar.finish_with_message(tail);
+    let final_line = sync_status_line(
+        name,
+        bar.position(),
+        bar.length().unwrap_or(0),
+        started.elapsed(),
+        &tail,
+    );
+    bar.finish_with_message(final_line);
     Ok(summary)
 }
 
@@ -2723,6 +3709,45 @@ fn format_bar_message(messages: u64, drops: u64, errors: u64, elapsed: Duration)
     out
 }
 
+/// `HH:MM:SS`, matching indicatif's `{elapsed_precise}` key.
+fn elapsed_hms(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// An uncolored `#`/`-` progress bar of `width` cells. pond's templates never
+/// styled `{bar}` (no `.cyan/blue`), so rendering the glyphs by hand is visually
+/// identical - and lets the whole status line ride `{wide_msg}`, the only
+/// template segment indicatif truncates to the terminal width. Fixed template
+/// text cannot shrink, so it wraps on a narrow or resized terminal; combined
+/// with finished bars frozen in scrollback, that corrupts the render until the
+/// run ends. A single-row line removes wrapping as a variable entirely.
+fn progress_glyphs(pos: u64, len: u64, width: usize) -> String {
+    let filled = if len == 0 {
+        0
+    } else {
+        ((u128::from(pos.min(len)) * width as u128) / u128::from(len)) as usize
+    };
+    (0..width)
+        .map(|cell| if cell < filled { '#' } else { '-' })
+        .collect()
+}
+
+/// One single-row sync line built whole, pushed through a `{wide_msg}`-only
+/// template so it is always exactly one terminal row regardless of width.
+fn sync_status_line(name: &str, pos: u64, len: u64, elapsed: Duration, tail: &str) -> String {
+    format!(
+        "sync {name:<12} [{}] [{}] {pos}/{len} sessions  {tail}",
+        elapsed_hms(elapsed),
+        progress_glyphs(pos, len, 12),
+    )
+}
+
 /// Render an integer with thousands separators (`12_345_678` -> `"12,345,678"`).
 fn format_thousands(value: u64) -> String {
     let raw = value.to_string();
@@ -2770,20 +3795,6 @@ async fn explain_search(
         .map_err(|envelope| anyhow::anyhow!("{envelope:?}"))
 }
 
-async fn wait_for_index_catchup(store: &Store) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
-    loop {
-        let statuses = store.index_status().await?;
-        if statuses.iter().all(|status| status.unindexed_rows == 0) {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for indexes to catch up");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
 /// Build the spinner + progress callback pair for index maintenance.
 /// `PhaseStart` updates the spinner so the operator sees what's running live;
 /// per-phase timing lands at `-vv` (debug) verbosity rather than the default
@@ -2796,7 +3807,7 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
     );
     bar.enable_steady_tick(Duration::from_millis(120));
     let bar_for_callback = bar.clone();
-    let callback: OptimizeProgressFn = Box::new(move |event| match event {
+    let callback: OptimizeProgressFn = Arc::new(move |event| match event {
         OptimizeEvent::PhaseStart {
             table,
             phase,
@@ -2821,24 +3832,33 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
                 "index phase done"
             );
         }
+        OptimizeEvent::IndexStage {
+            table,
+            index,
+            stage,
+            completed,
+            total,
+            unit,
+        } => {
+            // Live intra-index progress, fired from Lance's IndexBuildProgress
+            // callbacks. Re-render the spinner suffix every tick. Total may be
+            // absent during init phases (Lance doesn't always know the count
+            // upfront); show just the completed count then.
+            let progress = match total {
+                Some(t) if t > 0 => format!("{completed}/{t} {unit}"),
+                _ => format!("{completed} {unit}"),
+            };
+            bar_for_callback.set_message(format!(
+                "{} {} ({}): {} {}",
+                table.as_str(),
+                "index-build",
+                index,
+                stage,
+                progress.trim_end(),
+            ));
+        }
     });
     (callback, bar)
-}
-
-fn render_optimize_outcome(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
-    use pond::output::{bold, paint};
-    let mut table = new_table();
-    table.set_header(vec!["table", "indices", "compaction"]);
-    for entry in &outcome.tables {
-        table.add_row(vec![
-            Cell::new(entry.table.as_str()),
-            phase_cell(&entry.indices, "indices"),
-            phase_cell(&entry.compaction, "compaction"),
-        ]);
-    }
-    output(&paint("index maintenance", bold()))?;
-    output(&table.to_string())?;
-    render_optimize_hints(outcome)
 }
 
 /// Deferral and failure lines only, no per-table table. Used by `pond sync`,
@@ -2872,55 +3892,88 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn phase_cell(outcome: &PhaseOutcome, _phase: &str) -> Cell {
-    use pond::output::{dim, paint, red, yellow};
-    match outcome {
-        PhaseOutcome::Ok => Cell::new("ok"),
-        PhaseOutcome::Noop => Cell::new(paint("-", dim())),
-        PhaseOutcome::NotAttempted => Cell::new(paint("-", dim())),
-        PhaseOutcome::SkippedConflict => Cell::new(paint("skipped (conflict)", yellow())),
-        PhaseOutcome::Failed(_) => Cell::new(paint("failed", red())),
-    }
-}
-
-fn render_index_status(statuses: &[IndexStatus]) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint, yellow};
-    let mut table = new_table();
-    table.set_header(vec![
-        "table",
-        "intent",
-        "exists",
-        "fragments",
-        "unindexed rows",
-    ]);
-    for status in statuses {
-        let unindexed = format_thousands(status.unindexed_rows as u64);
-        let unindexed_cell = if status.unindexed_rows == 0 {
-            Cell::new(unindexed)
-        } else {
-            Cell::new(paint(&unindexed, yellow()))
-        };
-        table.add_row(vec![
-            Cell::new(status.table.as_str()),
-            Cell::new(&status.intent_name),
-            Cell::new(if status.exists { "yes" } else { "no" }),
-            Cell::new(status.fragments_covered.to_string()),
-            unindexed_cell.set_alignment(CellAlignment::Right),
-        ]);
-    }
-    output(&paint("index status", bold()))?;
-    output(&table.to_string())?;
-    if statuses.iter().any(|status| status.unindexed_rows > 0) {
-        output(&format!(
-            "{}  run `pond sync --only update-indexes` to fold trailing fragments",
-            paint("hint", dim()),
-        ))?;
-    }
-    Ok(())
-}
-
 /// Title + storage-destination line, shared by the populated header and the
-/// empty-store render so both `pond status` and `pond storage` open the same way.
+/// empty-store render so `pond status` opens the same way in either state.
+/// Per-index status word for `pond status --format json`, mirroring the
+/// existence/backlog split the text `index detail` block surfaces.
+fn index_status_label(status: &IndexStatus) -> &'static str {
+    if !status.exists {
+        "not_built"
+    } else if status.unindexed_rows == 0 {
+        "ready"
+    } else {
+        "pending"
+    }
+}
+
+/// `pond status --format json` for a configured-but-never-synced store: just
+/// the storage destination, no corpus/indexes/embedding (spec parity with the
+/// text path's "no data yet" line).
+fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
+    let doc = serde_json::json!({
+        "storage": {
+            "url": resolved.display(),
+            "binding": resolved.binding.describe(),
+        },
+        "initialized": false,
+    });
+    serde_json::to_string_pretty(&doc).context("serialize status as JSON")
+}
+
+/// `pond status --format json` for an initialized store: the same numbers the
+/// text tables show, as one machine-readable document.
+fn status_json(
+    resolved: &ResolvedStorage,
+    sizes: &TableSizes,
+    totals: &RowTotals,
+    adapter_count: usize,
+    index_status: &[IndexStatus],
+    embedding: Option<EmbeddingProgress>,
+) -> anyhow::Result<String> {
+    let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
+    let indexes: Vec<serde_json::Value> = index_status
+        .iter()
+        .map(|status| {
+            serde_json::json!({
+                "name": format!("{}.{}", status.table.as_str(), status.intent_name),
+                "status": index_status_label(status),
+            })
+        })
+        .collect();
+    // null on default `pond status`; populated under `-v` (skipping the
+    // 2M-row messages scan keeps default JSON status cheap on cold S3).
+    let embedding_doc = embedding.map(|e| {
+        serde_json::json!({
+            "embedded": e.embedded,
+            "eligible": e.total,
+            "backlog": e.backlog,
+        })
+    });
+    let doc = serde_json::json!({
+        "storage": {
+            "url": resolved.display(),
+            "binding": resolved.binding.describe(),
+            "total_bytes": total_bytes,
+            "tables": {
+                "sessions": { "bytes": sizes.sessions, "rows": totals.sessions },
+                "messages": { "bytes": sizes.messages, "rows": totals.messages },
+                "parts": { "bytes": sizes.parts, "rows": totals.parts },
+            },
+        },
+        "corpus": {
+            "sessions": totals.sessions,
+            "messages": totals.messages,
+            "parts": totals.parts,
+        },
+        "indexes": indexes,
+        "embedding": embedding_doc,
+        "adapters": adapter_count,
+        "schedule": crate::schedule::status_line(),
+        "initialized": true,
+    });
+    serde_json::to_string_pretty(&doc).context("serialize status as JSON")
+}
+
 fn render_status_storage_line(title: &str, resolved: &ResolvedStorage) -> anyhow::Result<()> {
     use pond::output::{bold, dim, paint};
     output(&paint(title, bold()))?;
@@ -3006,73 +4059,41 @@ fn render_status_header(
 /// Render the checks that can take longer on a large corpus. The command
 /// prints storage first, then calls this once the bounded scans finish.
 fn render_status_checks(
-    stats: &CorpusStats,
+    totals: &RowTotals,
+    adapter_count: usize,
     index_status: &[IndexStatus],
-    embedding: EmbeddingProgress,
-    adapters: bool,
+    embedding: Option<EmbeddingProgress>,
 ) -> anyhow::Result<()> {
-    use pond::output::{dim, paint, yellow};
+    use pond::output::{dim, paint};
 
     output("")?;
-    let health = classify_index_health(index_status, index_lag_threshold(), &embedding);
+    let health = classify_index_health(index_status, embedding.as_ref());
     output(&render_indexes_line(&health))?;
+    // Default: `stored` shows the manifest row count (cheap); under `-v` the
+    // embedding probe ran, so swap in the searchable subset and report it.
+    let messages_label = match &embedding {
+        Some(e) => format!("{} searchable messages", format_thousands(e.total as u64)),
+        None => format!("{} messages", format_thousands(totals.messages)),
+    };
     output(&format!(
-        "{}    {} sessions, {} messages",
+        "{}    {} sessions, {}",
         paint("stored", dim()),
-        format_thousands(stats.totals.sessions),
-        format_thousands(embedding.total as u64),
+        format_thousands(totals.sessions),
+        messages_label,
     ))?;
-    if adapters {
-        output("")?;
-        output(&paint("index detail", dim()))?;
-        for status in index_status {
-            let line = format!(
-                "  {}.{}  exists={}  fragments={}  unindexed={}",
-                status.table.as_str(),
-                status.intent_name,
-                if status.exists { "yes" } else { "no" },
-                status.fragments_covered,
-                format_thousands(status.unindexed_rows as u64),
-            );
-            if status.unindexed_rows == 0 {
-                output(&line)?;
-            } else {
-                output(&paint(&line, yellow()))?;
-            }
-        }
-    }
-
-    if !adapters {
-        output(&format!(
-            "{}    {} adapter(s); pass `--adapters` for project tables",
-            paint("sources", dim()),
-            stats.adapters.len(),
-        ))?;
-        output(&crate::schedule::status_line())?;
-    } else {
-        // Render adapters in registry order so the layout matches the discovery
-        // picker; adapters present in the data but not in the registry append at
-        // the bottom (defensive: catches deleted adapters whose data is still on
-        // disk).
-        let mut by_name: std::collections::HashMap<&str, &AdapterStats> = stats
-            .adapters
-            .iter()
-            .map(|stat| (stat.adapter.as_str(), stat))
-            .collect();
-        for factory in adapter::registry() {
-            if let Some(stat) = by_name.remove(factory.name()) {
-                render_adapter_block(stat)?;
-            }
-        }
-        for stat in by_name.values() {
-            render_adapter_block(stat)?;
-        }
-    }
+    output(&format!(
+        "{}  {} adapter(s)",
+        paint("adapters", dim()),
+        adapter_count,
+    ))?;
+    output(&crate::schedule::status_line())?;
     output_err("")?;
-    output_err(&paint(
-        "(messages = searchable text rows; use -v for full counts)",
-        dim(),
-    ))?;
+    if embedding.is_none() {
+        output_err(&paint(
+            "(use -v for searchable message count + embedding backlog)",
+            dim(),
+        ))?;
+    }
     Ok(())
 }
 
@@ -3094,16 +4115,18 @@ struct IndexHealth {
 /// means the trailing fragment count crossed the threshold and a fold is owed.
 fn classify_index_health(
     statuses: &[IndexStatus],
-    lag_threshold: usize,
-    embedding: &EmbeddingProgress,
+    embedding: Option<&EmbeddingProgress>,
 ) -> IndexHealth {
     use IndexHealthState::*;
 
-    fn classify_one(status: &IndexStatus, lag_threshold: usize) -> IndexHealthState {
+    // `pond optimize` folds every trailing fragment (no lag threshold), so an
+    // index is current only when nothing is unindexed; any tail means a fold is
+    // still owed (e.g. after `--no-optimize`).
+    fn classify_one(status: &IndexStatus) -> IndexHealthState {
         if !status.exists {
             return NotBuilt;
         }
-        if status.unindexed_rows == 0 || status.unindexed_fragments < lag_threshold {
+        if status.unindexed_rows == 0 {
             Ready
         } else {
             Pending(status.unindexed_rows as u64)
@@ -3114,16 +4137,23 @@ fn classify_index_health(
     let mut semantic = NotBuilt;
     for status in statuses {
         match status.intent_name.as_str() {
-            MESSAGES_FTS_INDEX => text = classify_one(status, lag_threshold),
-            MESSAGES_VECTOR_INDEX => semantic = classify_one(status, lag_threshold),
+            MESSAGES_FTS_INDEX => text = classify_one(status),
+            MESSAGES_VECTOR_INDEX => semantic = classify_one(status),
             _ => {}
         }
     }
-    // Semantic search misses unembedded rows even when IVF_PQ's own
-    // unindexed-fragments check passes.
-    let embed_backlog = embedding.total.saturating_sub(embedding.embedded);
-    if embed_backlog > 0 && matches!(semantic, Ready) {
-        semantic = Pending(embed_backlog as u64);
+    // Semantic search misses unembedded rows even when IVF_SQ's own
+    // unindexed-fragments check passes. Without the embedding probe (default
+    // `pond status`), this correction is skipped: the IVF_SQ fragment-lag
+    // check still flags indexed-but-unfolded rows; only unembedded ones hide.
+    // `backlog` is the live un-embedded count, not `total - embedded`: the
+    // latter mixed the FTS `num_docs` (over-counts deleted docs) with a live
+    // row count and reported a phantom pending that never cleared.
+    if let Some(progress) = embedding
+        && progress.backlog > 0
+        && matches!(semantic, Ready)
+    {
+        semantic = Pending(progress.backlog as u64);
     }
     IndexHealth { text, semantic }
 }
@@ -3157,55 +4187,6 @@ fn render_indexes_line(health: &IndexHealth) -> String {
     format!("{label}   {body}")
 }
 
-fn render_adapter_block(stat: &AdapterStats) -> anyhow::Result<()> {
-    use pond::output::{bold, cyan, paint};
-
-    output("")?;
-    output(&format!(
-        "{}  {} sessions  {} messages  {} projects",
-        paint(&stat.adapter, cyan().bold()),
-        paint(&format_thousands(stat.sessions), bold()),
-        paint(&format_thousands(stat.messages), bold()),
-        paint(&format_thousands(stat.projects.len() as u64), bold()),
-    ))?;
-    if stat.projects.is_empty() {
-        return Ok(());
-    }
-    let mut table = new_table();
-    table.set_header(vec![
-        Cell::new("project")
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-        Cell::new("sessions")
-            .set_alignment(CellAlignment::Right)
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-        Cell::new("messages")
-            .set_alignment(CellAlignment::Right)
-            .add_attribute(Attribute::Bold)
-            .add_attribute(Attribute::Dim),
-    ]);
-    for project in &stat.projects {
-        let label = project.project.as_str();
-        table.add_row(vec![
-            Cell::new(label),
-            Cell::new(format_thousands(project.sessions)).set_alignment(CellAlignment::Right),
-            Cell::new(format_thousands(project.messages)).set_alignment(CellAlignment::Right),
-        ]);
-    }
-    // Let the project column flex; right-size the numeric columns to their
-    // content so the long path takes the remaining width and truncates with
-    // an ellipsis on narrow terminals.
-    if let Some(col) = table.column_mut(1) {
-        col.set_constraint(ColumnConstraint::ContentWidth);
-    }
-    if let Some(col) = table.column_mut(2) {
-        col.set_constraint(ColumnConstraint::ContentWidth);
-    }
-    output(&table.to_string())?;
-    Ok(())
-}
-
 /// House style for `pond status` tables: borderless, dynamic-width, no inner
 /// rules. Centralized so future tabular commands match without copy-paste.
 fn new_table() -> Table {
@@ -3219,9 +4200,13 @@ fn new_table() -> Table {
 /// Dispatch an envelope through the chosen format. Returns `true` when the
 /// envelope was a `Success` (callers exit non-zero on `false`). JSON mode
 /// always emits the envelope to stdout so scripts can pipe both success and
-/// error bodies through `jq`; pretty mode routes errors to stderr so stdout
+/// error bodies through `jq`; text mode routes errors to stderr so stdout
 /// stays parseable.
-fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> anyhow::Result<bool> {
+fn render_search_envelope(
+    format: OutputFormat,
+    envelope: &SearchEnvelope,
+    request: &SearchRequest,
+) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
             output(
@@ -3230,9 +4215,11 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
             )?;
             Ok(matches!(envelope, SearchEnvelope::Success(_)))
         }
-        OutputFormat::Pretty => match envelope {
+        OutputFormat::Text => match envelope {
             SearchEnvelope::Success(response) => {
-                render_search_pretty(response)?;
+                // One canonical transcript shared with the MCP tool.
+                let transcript = pond::render::render_search_transcript(response, request);
+                output(transcript.trim_end_matches('\n'))?;
                 Ok(true)
             }
             SearchEnvelope::Error(error) => {
@@ -3246,7 +4233,8 @@ fn render_search_envelope(format: OutputFormat, envelope: &SearchEnvelope) -> an
 fn render_get_envelope(
     format: OutputFormat,
     envelope: &GetEnvelope,
-    session_from: SessionFrom,
+    request: &GetRequest,
+    subagents_footer: &str,
 ) -> anyhow::Result<bool> {
     match format {
         OutputFormat::Json => {
@@ -3256,9 +4244,11 @@ fn render_get_envelope(
             )?;
             Ok(matches!(envelope, GetEnvelope::Success(_)))
         }
-        OutputFormat::Pretty => match envelope {
+        OutputFormat::Text => match envelope {
             GetEnvelope::Success(response) => {
-                render_get_pretty(response, session_from)?;
+                let transcript = pond::render::render_get_transcript(response, request);
+                let combined = format!("{transcript}{subagents_footer}");
+                output(combined.trim_end_matches('\n'))?;
                 Ok(true)
             }
             GetEnvelope::Error(error) => {
@@ -3267,362 +4257,6 @@ fn render_get_envelope(
             }
         },
     }
-}
-
-fn render_search_pretty(response: &SearchResponse) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    output(&format!(
-        "{} {} matched {}  {} returned {}  {} {} searchable in scope",
-        paint("search:", dim()),
-        paint(&format_thousands(response.matched_total as u64), bold()),
-        if response.matched_total == 1 {
-            "message"
-        } else {
-            "messages"
-        },
-        paint(&format_thousands(response.sessions.len() as u64), bold()),
-        if response.sessions.len() == 1 {
-            "session"
-        } else {
-            "sessions"
-        },
-        paint("of", dim()),
-        paint(
-            &format_thousands(response.searchable_in_scope as u64),
-            bold()
-        ),
-    ))?;
-    if response.sessions.is_empty() {
-        // spec.md#search-absence-honesty: name the recovery when the scope
-        // itself is empty - the filters, not the query, produced the zero.
-        if response.searchable_in_scope == 0 {
-            output(
-                "scope is empty: the filters exclude every searchable message; widen or drop \
-                 project/date filters",
-            )?;
-        }
-        return Ok(());
-    }
-    for (idx, session) in response.sessions.iter().enumerate() {
-        output("")?;
-        render_search_session(idx + 1, session)?;
-    }
-    Ok(())
-}
-
-fn render_search_session(rank: usize, session: &SearchSession) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    let best_score = session
-        .matches
-        .first()
-        .map(|hit| hit.score)
-        .unwrap_or_default();
-    output(&format!(
-        "{}  best={}  {}/{} matched",
-        paint(&format!("[{rank}]"), dim()),
-        paint(&format!("{best_score:.4}"), bold()),
-        paint(
-            &format_thousands(session.matched_message_count as u64),
-            bold(),
-        ),
-        paint(
-            &format_thousands(session.session_messages_count as u64),
-            bold(),
-        ),
-    ))?;
-    output(&format!(
-        "    {}  {}  {}",
-        paint(&session.project, dim()),
-        paint(&session.source_agent, dim()),
-        paint(&session.session_id, dim()),
-    ))?;
-    for hit in &session.matches {
-        render_search_match(hit)?;
-    }
-    Ok(())
-}
-
-fn render_search_match(hit: &SearchResult) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-    output(&format!(
-        "    {}  {}  {}  {}",
-        paint(
-            &hit.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-        paint_role(hit.role.as_str()),
-        paint(&format!("{:.4}", hit.score), bold()),
-        paint(&hit.message_id, dim()),
-    ))?;
-    render_hit_text(&hit.text)?;
-    Ok(())
-}
-
-fn render_hit_text(text: &str) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-    let prefix = paint(">", dim());
-    for line in text.lines() {
-        output(&format!("    {prefix} {line}"))?;
-    }
-    Ok(())
-}
-
-fn render_session_header(session: &pond::wire::GetSession) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-    output(&format!(
-        "{} {}  source={}  project={}",
-        paint("session", dim()),
-        paint(&session.id, bold()),
-        session.source_agent,
-        session.project.as_str(),
-    ))?;
-    output(&format!(
-        "{} {}",
-        paint("created:", dim()),
-        paint(
-            &session.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-    ))
-}
-
-fn render_get_pretty(response: &GetResponse, session_from: SessionFrom) -> anyhow::Result<()> {
-    use pond::output::{bold, dim, paint};
-
-    render_session_header(&response.session)?;
-    match &response.result {
-        GetResult::Session {
-            messages,
-            messages_remaining,
-        } => {
-            for (idx, message) in messages.iter().enumerate() {
-                output("")?;
-                let parts = message.parts.as_deref().unwrap_or(&[]);
-                render_message_view(idx + 1, message, parts, false)?;
-            }
-            output("")?;
-            // Tail page: the remaining messages are *earlier*, before this page;
-            // after_id only pages forward, so label them "earlier" and omit the
-            // dead-end cursor (the start path keeps the forward after-id cursor).
-            let tail = matches!(session_from, SessionFrom::End);
-            let mut footer = format!(
-                "{} {} messages",
-                paint("(total:", dim()),
-                paint(&format_thousands(messages.len() as u64), bold()),
-            );
-            if *messages_remaining > 0 {
-                footer.push_str(&format!(
-                    " {} {}",
-                    paint(&format_thousands(*messages_remaining as u64), bold()),
-                    paint(if tail { "earlier" } else { "remaining [more]" }, dim()),
-                ));
-            }
-            footer.push_str(&paint(")", dim()));
-            output(&footer)?;
-            if *messages_remaining > 0 {
-                if tail {
-                    output(&paint(
-                        "session-from: start to read from the beginning",
-                        dim(),
-                    ))?;
-                } else if let Some(last) = messages.last() {
-                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
-                }
-            }
-        }
-        GetResult::Message {
-            target,
-            target_parts,
-            target_parts_remaining,
-            siblings,
-        } => {
-            // Interleave the target with its siblings in timestamp order so the
-            // thread reads top-to-bottom; the target carries its full parts.
-            let mut thread: Vec<(&MessageView, bool)> =
-                siblings.iter().map(|view| (view, false)).collect();
-            thread.push((target, true));
-            thread.sort_by_key(|(view, _)| view.timestamp);
-            for (idx, (view, is_target)) in thread.iter().enumerate() {
-                output("")?;
-                let parts = if *is_target {
-                    target_parts.as_slice()
-                } else {
-                    &[]
-                };
-                render_message_view(idx + 1, view, parts, *is_target)?;
-            }
-            if *target_parts_remaining > 0 {
-                output("")?;
-                output(&format!(
-                    "{} {} parts remaining {}",
-                    paint("(target:", dim()),
-                    paint(&format_thousands(*target_parts_remaining as u64), bold()),
-                    paint("[more])", dim()),
-                ))?;
-                if let Some(last) = target_parts.last() {
-                    output(&format!("{} {}", paint("after-id:", dim()), last.id))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Render one message view: header, text/content, then either full parts (when
-/// supplied - verbatim session parts or a message-mode target) or the compact
-/// part summaries otherwise.
-fn render_message_view(
-    rank: usize,
-    view: &MessageView,
-    full_parts: &[ResponsePart],
-    is_target: bool,
-) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-
-    let marker = if is_target {
-        paint("  <- target", dim())
-    } else {
-        String::new()
-    };
-    output(&format!(
-        "{}  {}  {}  {}{marker}",
-        paint(&format!("[{rank}]"), dim()),
-        paint(
-            &view.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            dim(),
-        ),
-        paint_role(view.role.as_str()),
-        paint(&view.id, dim()),
-    ))?;
-    // When full parts are present they are the complete content; rendering
-    // `text` (a search_text projection of those same parts) too would just
-    // double the body.
-    if full_parts.is_empty() {
-        if let Some(text) = &view.text {
-            render_hit_text(text)?;
-        }
-        if let Some(content) = &view.content {
-            render_hit_text(content)?;
-        }
-        for summary in &view.parts_summary {
-            render_part_summary(summary)?;
-        }
-    } else {
-        for part in full_parts {
-            render_part(part)?;
-        }
-    }
-    Ok(())
-}
-
-fn render_part_summary(summary: &PartSummary) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
-    let mut line = format!("[{}]", summary.kind);
-    if let Some(label) = &summary.label {
-        line.push(' ');
-        line.push_str(label);
-    }
-    if let Some(call_id) = &summary.call_id {
-        line.push_str(&format!(" call_id={call_id}"));
-    }
-    output(&format!("    {}", paint(&line, dim())))
-}
-
-fn render_part(part: &ResponsePart) -> anyhow::Result<()> {
-    use pond::output::{dim, paint, yellow};
-
-    let prefix = paint(">", dim());
-    match &part.kind {
-        // `Option<String>`: render only what's there. A `None` text part
-        // means the source row carried no text field; printing nothing is
-        // the faithful representation - no "<unresolved>" placeholder.
-        PartKind::Text { text } => {
-            if let Some(text) = text {
-                for line in text.lines() {
-                    output(&format!("    {prefix} {line}"))?;
-                }
-            }
-        }
-        PartKind::Reasoning { text } => {
-            let tag = paint("[reasoning]", dim());
-            if let Some(text) = text {
-                for line in text.lines() {
-                    output(&format!("    {tag} {prefix} {line}"))?;
-                }
-            }
-        }
-        PartKind::File {
-            media_type,
-            file_name,
-            ..
-        } => {
-            output(&format!(
-                "    {} media_type={} file_name={}",
-                paint("[file]", yellow()),
-                media_type.as_deref().unwrap_or("-"),
-                file_name.as_deref().unwrap_or("-"),
-            ))?;
-        }
-        // For tool_call / tool_result: omit the field entirely when None.
-        // Concretely: a tool_result with no resolvable name prints as
-        // `[tool_result] call_id=toolu_01...` (no name token), not
-        // `[tool_result] unknown call_id=toolu_01...` (which lied) and
-        // not `[tool_result] - call_id=toolu_01...` (which translates).
-        PartKind::ToolCall { call_id, name, .. } => {
-            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
-            let call_id_token = call_id
-                .as_deref()
-                .map(|id| format!(" call_id={id}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {}{name_token}{call_id_token}",
-                paint("[tool_call]", yellow()),
-            ))?;
-        }
-        PartKind::ToolResult {
-            call_id,
-            name,
-            is_failure,
-            ..
-        } => {
-            let name_token = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
-            let call_id_token = call_id
-                .as_deref()
-                .map(|id| format!(" call_id={id}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {}{name_token}{call_id_token}{}",
-                paint("[tool_result]", yellow()),
-                if *is_failure { " (failure)" } else { "" },
-            ))?;
-        }
-        PartKind::ToolApprovalRequest {
-            approval_id,
-            tool_call_id,
-        } => {
-            output(&format!(
-                "    {} approval_id={approval_id} tool_call_id={tool_call_id}",
-                paint("[approval_request]", yellow()),
-            ))?;
-        }
-        PartKind::ToolApprovalResponse {
-            approval_id,
-            approved,
-            reason,
-        } => {
-            let suffix = reason
-                .as_deref()
-                .map(|r| format!(" reason={r}"))
-                .unwrap_or_default();
-            output(&format!(
-                "    {} approval_id={approval_id} approved={approved}{suffix}",
-                paint("[approval_response]", yellow()),
-            ))?;
-        }
-    }
-    Ok(())
 }
 
 fn render_error_pretty(error: &ErrorEnvelope) {
@@ -3656,17 +4290,6 @@ fn render_error_pretty(error: &ErrorEnvelope) {
             paint(&format!("  details: {}", error.error.details), dim()),
         );
     }
-}
-
-fn paint_role(role: &str) -> String {
-    use pond::output::{cyan, dim, green, paint, yellow};
-    let style = match role {
-        "user" => green(),
-        "assistant" => cyan(),
-        "tool" => yellow(),
-        _ => dim(),
-    };
-    paint(role, style)
 }
 
 #[cfg(test)]
@@ -3737,10 +4360,166 @@ mod tests {
     }
 
     #[test]
+    fn parse_storage_path_local_keyword_resolves_to_the_default_dir() {
+        // `local`/`default` (case-insensitive) resolve to the same place the
+        // no-config fallback uses, so a rollback never needs the path typed out.
+        let keyword = parse_storage_path("local").unwrap();
+        assert!(keyword.is_local());
+        assert_eq!(
+            keyword.canonical(),
+            default_local_storage().unwrap().canonical(),
+        );
+        assert_eq!(
+            parse_storage_path("DEFAULT").unwrap().canonical(),
+            keyword.canonical(),
+        );
+        // A directory literally named `local` is the relative path, not the keyword.
+        let literal = parse_storage_path("./local").unwrap();
+        assert_ne!(literal.canonical(), keyword.canonical());
+    }
+
+    #[test]
     fn cli_parses_and_subcommands_are_wired() {
         // The canonical clap derive self-check: catches conflicting flags,
         // broken groups, and missing value parsers at test time.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn set_creds_set_round_trips_through_config() {
+        let mut doc: toml_edit::DocumentMut =
+            "[storage]\npath = \"/tmp/p\"\n".parse().expect("parse");
+        set_creds_set(&mut doc, "default", "AKIA", "shh", None, None);
+        set_creds_set(
+            &mut doc,
+            "work",
+            "AKIB",
+            "shh2",
+            Some("s3+https://host/work"),
+            Some("fsn1"),
+        );
+        let config = Config::load_str(&doc.to_string()).expect("valid config");
+        let default = &config.creds["default"];
+        assert_eq!(default.access_key_id.as_deref(), Some("AKIA"));
+        assert_eq!(default.secret_access_key.as_deref(), Some("shh"));
+        assert!(default.scope.is_none());
+        let work = &config.creds["work"];
+        assert_eq!(work.scope.as_deref(), Some("s3+https://host/work"));
+        assert_eq!(work.region.as_deref(), Some("fsn1"));
+
+        // Re-adding a name replaces in place; the single catch-all is preserved.
+        set_creds_set(&mut doc, "default", "AKIC", "shh3", None, None);
+        let config = Config::load_str(&doc.to_string()).expect("valid after replace");
+        assert_eq!(config.creds.len(), 2);
+        assert_eq!(
+            config.creds["default"].access_key_id.as_deref(),
+            Some("AKIC")
+        );
+    }
+
+    #[test]
+    fn creds_delete_removes_set_drops_empty_parent_and_errors_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_file = dir.path().join("config.toml");
+        let mut doc: toml_edit::DocumentMut = String::new().parse().expect("parse empty");
+        set_creds_set(&mut doc, "default", "AKIA", "shh", None, None);
+        write_config_doc(&config_file, &doc).expect("write");
+
+        assert!(
+            creds_delete(&config_file, "missing".to_owned()).is_err(),
+            "deleting an absent set must error"
+        );
+        creds_delete(&config_file, "default".to_owned()).expect("delete present set");
+        let body = std::fs::read_to_string(&config_file).expect("read back");
+        assert!(
+            !body.contains("creds"),
+            "emptied [creds] parent removed: {body:?}"
+        );
+    }
+
+    #[test]
+    fn adapters_list_json_carries_configured_and_detected_keys() {
+        let config =
+            Config::load_str("[adapters.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
+                .expect("configured");
+        let json = adapters_list_json(&config).expect("json builds");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(value.get("configured").is_some(), "configured key present");
+        assert!(value.get("detected").is_some(), "detected key present");
+        let first = &value["configured"][0];
+        assert_eq!(first["name"], "claude-code");
+        assert_eq!(first["enabled"], true);
+        assert_eq!(first["path"], "/tmp/cc");
+    }
+
+    #[test]
+    fn creds_list_json_redacts_the_secret() {
+        let config = Config::load_str(
+            "[creds.work]\naccess_key_id = \"AKIASECRETKEY\"\nsecret_access_key = \"topsecretvalue\"\n",
+        )
+        .expect("configured");
+        let json = creds_list_json(&config).expect("json builds");
+        assert!(
+            !json.contains("topsecretvalue"),
+            "real secret must never appear: {json}"
+        );
+        assert!(
+            !json.contains("AKIASECRETKEY"),
+            "real access key must never appear: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value[0]["name"], "work");
+        assert_eq!(value[0]["access_key"], "********");
+        assert_eq!(value[0]["secret"], "********");
+    }
+
+    #[test]
+    fn resolve_sync_adapters_errors_point_at_the_adapters_commands() {
+        // Empty config: sync names `pond adapters discover`, never enables.
+        let empty = Config::load_str("").expect("empty config");
+        let err = resolve_sync_adapters(&empty, None, None).expect_err("empty must error");
+        assert!(
+            err.to_string().contains("pond adapters discover"),
+            "empty error should name discover: {err}"
+        );
+
+        // Named-but-unconfigured: sync names `pond adapters enable <name>`.
+        let err = resolve_sync_adapters(&empty, Some("claude-code"), None)
+            .expect_err("unconfigured named must error");
+        assert!(
+            err.to_string().contains("pond adapters enable claude-code"),
+            "named error should name enable: {err}"
+        );
+
+        // Configured adapter resolves without touching config, and the
+        // `enabled` discriminator is stripped before it reaches the factory.
+        let configured =
+            Config::load_str("[adapters.claude-code]\nenabled = true\npath = \"/tmp/cc\"\n")
+                .expect("configured");
+        let resolved =
+            resolve_sync_adapters(&configured, Some("claude-code"), None).expect("resolves");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "claude-code");
+        assert!(
+            resolved[0].1.get("enabled").is_none(),
+            "enabled discriminator must not reach the factory blob",
+        );
+
+        // Configured-but-disabled: sync refuses and names the enable verb,
+        // never silently syncing a disabled adapter (spec.md#cli-verbs).
+        let disabled =
+            Config::load_str("[adapters.claude-code]\nenabled = false\npath = \"/tmp/cc\"\n")
+                .expect("disabled config");
+        let err = resolve_sync_adapters(&disabled, Some("claude-code"), None)
+            .expect_err("disabled named must error");
+        assert!(
+            err.to_string().contains("disabled"),
+            "disabled error should say disabled: {err}"
+        );
+        assert!(
+            err.to_string().contains("pond adapters enable claude-code"),
+            "disabled error should name the enable verb: {err}"
+        );
     }
 
     // Long-help snapshots for the root and every visible subcommand. The
@@ -3754,7 +4533,12 @@ mod tests {
     fn help_snapshots() {
         let mut root = Cli::command();
         root.build();
-        insta::assert_snapshot!("help_root", root.render_long_help().to_string());
+        // Normalize the version so a release bump doesn't churn the snapshot.
+        let root_help = root
+            .render_long_help()
+            .to_string()
+            .replace(VERSION.as_str(), "[VERSION]");
+        insta::assert_snapshot!("help_root", root_help);
         let visible: Vec<String> = root
             .get_subcommands()
             .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
@@ -3766,5 +4550,69 @@ mod tests {
                 .expect("visible subcommand exists");
             insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
         }
+    }
+
+    // HELP_TEMPLATE hand-lists the root commands (clap can't group or space
+    // them), so a new verb on `Command` would silently miss the `-h` list - the
+    // help_root snapshot can't catch it, since the template text is literal and
+    // doesn't change when a variant is added. This does.
+    #[test]
+    fn help_template_lists_every_subcommand() {
+        let mut root = Cli::command();
+        root.build();
+        let help = root.render_long_help().to_string();
+        for sub in root.get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                help.contains(name),
+                "subcommand `{name}` is missing from HELP_TEMPLATE - add a line for it",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_endpoint_at_keyword_resolves_to_the_configured_store() {
+        let mut loaded = Config::default();
+        loaded.storage.path = Some("s3://from-config/p".to_owned());
+        // `@` follows the same ladder as every other command (flag > config >
+        // default); `local` stays the config-free local default dir.
+        let from_config = resolve_copy_endpoint("@", &None, &loaded).unwrap();
+        assert!(
+            matches!(&from_config, CopyEndpoint::Store(url) if url.lance_url().as_str() == "s3://from-config/p"),
+        );
+        let flag = StorageUrl::parse("s3://from-flag/p").unwrap();
+        let from_flag = resolve_copy_endpoint("@", &Some(flag), &loaded).unwrap();
+        assert!(
+            matches!(&from_flag, CopyEndpoint::Store(url) if url.lance_url().as_str() == "s3://from-flag/p"),
+        );
+        assert!(matches!(
+            resolve_copy_endpoint("local", &None, &loaded).unwrap(),
+            CopyEndpoint::Store(url) if url.is_local()
+        ));
+    }
+
+    #[test]
+    fn ensure_source_not_empty_rejects_a_zero_row_source() {
+        let table = |source_rows| TableVerify {
+            table: substrate::Table::Sessions,
+            source_rows,
+            missing: 0,
+        };
+        let empty = StorageVerify {
+            tables: vec![table(0)],
+            dest_indexes: IndexCoverage {
+                fts_present: false,
+                vector_present_or_below_activation: true,
+            },
+        };
+        assert!(ensure_source_not_empty(&empty, "s3://typo/bucket").is_err());
+        let populated = StorageVerify {
+            tables: vec![table(3)],
+            dest_indexes: IndexCoverage {
+                fts_present: false,
+                vector_present_or_below_activation: true,
+            },
+        };
+        assert!(ensure_source_not_empty(&populated, "local").is_ok());
     }
 }

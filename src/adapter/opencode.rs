@@ -118,29 +118,31 @@ impl Adapter for OpencodeAdapter {
                 Err(join) => { yield Err(join_error(join)); return; }
             };
 
-            // Subtree mtime walks happen ONLY when the oracle has a watermark
-            // for this session - on a first ingest (or NoopOracle) every walk
-            // is wasted work since there's nothing to compare against.
+            // Subtree walks happen ONLY when the oracle has entries - on a first
+            // ingest (or NoopOracle) every walk is wasted work since there's
+            // nothing to compare against. The walk also yields the session's
+            // newest stored timestamp (last message + its tool parts) for the
+            // freshness gate.
             let mut survivors = Vec::with_capacity(files.len());
             for mut file in files {
-                if let Some(ingested) = oracle.last_ingested_at(&file.session_id) {
-                    let walk = {
+                if !oracle.is_empty() {
+                    let walked = {
                         let root = adapter.root.clone();
                         let session_path = file.path.clone();
                         let session_id = file.session_id.clone();
                         tokio::task::spawn_blocking(move || {
-                            walk_session_subtree(&root, &session_path, &session_id)
+                            let walk = walk_session_subtree(&root, &session_path, &session_id)?;
+                            let last_ts = newest_message_ts(&walk);
+                            Ok::<_, AdapterError>((walk, last_ts))
                         })
                         .await
                     };
-                    let walk = match walk {
-                        Ok(Ok(walk)) => walk,
+                    let (walk, last_ts) = match walked {
+                        Ok(Ok(pair)) => pair,
                         Ok(Err(error)) => { yield Err(error); return; }
                         Err(join) => { yield Err(join_error(join)); return; }
                     };
-                    if let Some(mtime) = walk.newest_mtime
-                        && mtime <= ingested
-                    {
+                    if crate::adapter::is_session_fresh(oracle, &file.session_id, last_ts) {
                         yield Ok(AdapterYield::Skipped {
                             session_id: Some(file.session_id.clone()),
                             project: None,
@@ -187,11 +189,10 @@ struct SessionFile {
     cached_subtree: Option<SubtreeWalk>,
 }
 
-/// Result of one subtree walk: the newest mtime across session+messages+parts
-/// (for the freshness check) and the directory listings (so the read pass
-/// doesn't redo them).
+/// Result of one subtree walk: the message and part directory listings (so the
+/// read pass doesn't redo them). The last `message_files` entry is the session's
+/// latest message id for the freshness check.
 struct SubtreeWalk {
-    newest_mtime: Option<DateTime<Utc>>,
     message_files: Vec<PathBuf>,
     /// One entry per message file, in the same order; each is the sorted list
     /// of part files for that message. Empty vec = message has no parts.
@@ -249,20 +250,19 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
     Ok(out)
 }
 
-/// Walk one session's full subtree: the session file, every message file under
-/// `message/<sid>/`, every part file under `part/<mid>/`. Returns the newest
-/// mtime seen plus the cached listings so the read pass can reuse them.
+/// Walk one session's full subtree: the message files under `message/<sid>/` and
+/// every part file under `part/<mid>/`, returning the listings so the read pass
+/// can reuse them. `session_path` is unused now that freshness keys on the latest
+/// message id rather than a subtree mtime.
 fn walk_session_subtree(
     root: &Path,
-    session_path: &Path,
+    _session_path: &Path,
     session_id: &str,
 ) -> Result<SubtreeWalk, AdapterError> {
-    let mut newest = json_mtime(session_path);
     let message_dir = root.join("message").join(session_id);
     let message_files = list_json_sorted(&message_dir)?;
     let mut part_files_by_message = Vec::with_capacity(message_files.len());
     for message_path in &message_files {
-        newest = newest.max(json_mtime(message_path));
         let Some(message_id) = message_path.file_stem().and_then(|stem| stem.to_str()) else {
             part_files_by_message.push(Vec::new());
             continue;
@@ -275,23 +275,34 @@ fn walk_session_subtree(
         )?;
         let part_dir = root.join("part").join(message_id);
         let parts = list_json_sorted(&part_dir)?;
-        for part_path in &parts {
-            newest = newest.max(json_mtime(part_path));
-        }
         part_files_by_message.push(parts);
     }
     Ok(SubtreeWalk {
-        newest_mtime: newest,
         message_files,
         part_files_by_message,
     })
 }
 
-fn json_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .map(DateTime::<Utc>::from)
+/// Watermark for the freshness gate: the session's max stored message timestamp.
+/// That is the last message's `time.created` or any of its tool parts'
+/// `state.time.end` (a tool result completing after the message was created);
+/// earlier messages' events all precede the last message, so its subtree
+/// suffices. `None` on an empty session or unreadable last message -> safe
+/// re-read. Reads only the last message and its parts (a handful of small files).
+fn newest_message_ts(walk: &SubtreeWalk) -> Option<i64> {
+    let message_path = walk.message_files.last()?;
+    let message = read_json(message_path).ok()?;
+    let mut newest = millis_at(&message, &["time", "created"])?;
+    if let Some(parts) = walk.part_files_by_message.last() {
+        for part_path in parts {
+            if let Ok(part) = read_json(part_path)
+                && let Some(end) = millis_at(&part, &["state", "time", "end"])
+            {
+                newest = newest.max(end);
+            }
+        }
+    }
+    Some(newest.timestamp_micros())
 }
 
 fn read_sessions(
@@ -994,12 +1005,12 @@ mod tests {
 
     struct FixedOracle {
         session_id: &'static str,
-        ingested_at: DateTime<Utc>,
+        watermark_micros: i64,
     }
 
     impl crate::adapter::SkipOracle for FixedOracle {
-        fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
-            (session_id == self.session_id).then_some(self.ingested_at)
+        fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+            (session_id == self.session_id).then_some(self.watermark_micros)
         }
     }
 
@@ -1023,24 +1034,27 @@ mod tests {
         .await
     }
 
+    /// `append_fresh_opencode_turn` writes its message at this `time.created`
+    /// (millis); the freshness gate keys on it in micros.
+    const FRESH_TURN_MICROS: i64 = 1_759_859_999_000 * 1_000;
+
+    /// A session whose latest message is newer than the watermark is re-read, and
+    /// the appended turn lands.
     #[tokio::test(flavor = "multi_thread")]
-    async fn freshness_uses_message_and_part_file_mtimes() -> anyhow::Result<()> {
+    async fn freshness_re_reads_a_session_that_gained_a_newer_message() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
         copy_dir(std::path::Path::new(FIXTURES), &source)?;
 
-        let store_dir = temp.path().join("store");
-        let store = Store::open_local(&store_dir).await?;
+        let store = Store::open_local(temp.path().join("store")).await?;
         let adapter = OpencodeAdapter::new(&source);
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
-        let watermark = Utc::now();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         append_fresh_opencode_turn(&source)?;
-
+        // Watermark sits just below the appended message's timestamp.
         let oracle = FixedOracle {
             session_id: FRESH_SESSION_ID,
-            ingested_at: watermark,
+            watermark_micros: FRESH_TURN_MICROS - 1,
         };
         ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
 
@@ -1052,13 +1066,51 @@ mod tests {
             .messages
             .iter()
             .find(|stored| stored.message.id() == FRESH_MESSAGE_ID)
-            .expect("message added after the session file mtime must land");
+            .expect("message newer than the watermark must land");
         assert!(
             fresh.parts.iter().any(|part| matches!(
                 &part.kind,
                 PartKind::Text { text } if text.as_deref().map(|value| value.as_str()) == Some("fresh opencode text")
             )),
             "fresh message part must land with the re-read session",
+        );
+        Ok(())
+    }
+
+    /// A session whose latest message is no newer than the watermark is skipped as
+    /// `Fresh` - the appended turn is NOT re-read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn freshness_skips_a_session_not_newer_than_the_watermark() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("storage");
+        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let adapter = OpencodeAdapter::new(&source);
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        append_fresh_opencode_turn(&source)?;
+        // Watermark at/above the appended timestamp: the session is fresh.
+        let oracle = FixedOracle {
+            session_id: FRESH_SESSION_ID,
+            watermark_micros: FRESH_TURN_MICROS,
+        };
+        let summary = ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
+
+        assert!(
+            summary.skipped_fresh >= 1,
+            "the unchanged-vs-watermark session must be skipped, got {summary:?}",
+        );
+        let session = store
+            .get_session(FRESH_SESSION_ID)
+            .await?
+            .expect("fixture session round-trips");
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|stored| stored.message.id() == FRESH_MESSAGE_ID),
+            "a skipped session must not re-read the appended turn",
         );
         Ok(())
     }

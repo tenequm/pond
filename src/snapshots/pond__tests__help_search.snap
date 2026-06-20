@@ -1,10 +1,11 @@
 ---
 source: src/main.rs
+assertion_line: 4822
 expression: sub.render_long_help().to_string()
 ---
 Search stored messages.
 
-Hybrid retrieval (semantic + full-text) when embeddings exist, full-text otherwise. Keep the query about concepts; scope with `--project`, `--from-date`, and friends instead of putting names in the query.
+`--mode vector` (default) matches on meaning; `--mode fts` matches exact whole words (BM25). Keep the query about concepts; scope with `--project`, `--from-date`, and friends instead of putting names in the query.
 
 Usage: pond search [OPTIONS] <QUERY>
 
@@ -24,11 +25,14 @@ Options:
           [default: 10]
 
       --mode <MODE>
-          Operator-only retrieval mode override.
+          Retrieval arm: `vector` (default - matches on meaning) or `fts` (exact whole words, BM25). Falls back to `fts` when the store has no embeddings
           
-          Production callers should omit this and let the server pick (hybrid when embeddings exist, FTS-only otherwise); benchmark and ablation harnesses use it to force one arm against the same corpus.
+          [possible values: fts, vector]
+
+      --sort-by <SORT_BY>
+          Result order: `relevance` (default) or `recency` (newest first)
           
-          [possible values: fts, vector, hybrid]
+          [possible values: relevance, recency]
 
       --project <PROJECT>
           Project filter: substring match by default.
@@ -38,12 +42,6 @@ Options:
       --session-id <ID>
           Filter to one session (exact match) - search within a single, possibly long, session
 
-      --source-agent <AGENT>
-          Filter to one source agent, e.g. `claude-code` (or `claude-code/general-purpose` for a subagent)
-
-      --include-subagents
-          Include subagent sessions (excluded by default)
-
       --from-date <FROM_DATE>
           ISO date (YYYY-MM-DD) lower bound, inclusive
 
@@ -51,9 +49,7 @@ Options:
           ISO date (YYYY-MM-DD) upper bound, inclusive
 
       --min-score <MIN_SCORE>
-          Server-side score threshold; hits below this are dropped.
-          
-          Not an absence signal: present and absent content score in overlapping bands, so leave at 0 unless trimming an over-long tail.
+          Score floor on raw cosine (vector mode only); hits below it are dropped. Rejected in fts mode (BM25 is unbounded). Not an absence signal - present and absent content score in overlapping bands, so leave at 0 unless trimming an over-long tail
           
           [default: 0]
 
@@ -61,8 +57,8 @@ Options:
           Print Lance query plans instead of search results
 
       --format <FORMAT>
-          [default: pretty]
-          [possible values: pretty, json]
+          [default: text]
+          [possible values: text, json]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -71,14 +67,14 @@ Global options:
       --storage-path <URL>
           Storage destination: a local path or remote URL.
           
-          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, or `az://`. Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
           
           [env: POND_STORAGE_PATH]
 
-      --config <PATH>
+      --config-file <PATH>
           Config file to read (default: `~/.config/pond/config.toml`)
           
-          [env: POND_CONFIG]
+          [env: POND_CONFIG_FILE]
 
   -v, --verbose...
           Increase logging verbosity
@@ -89,4 +85,5 @@ Global options:
 Examples:
   pond search "lance compaction tuning"
   pond search "auth retry" --project pond --limit 5
+  pond search "merge_insert" --mode fts --sort-by recency
   pond search "migration plan" --from-date 2026-05-01 --format json

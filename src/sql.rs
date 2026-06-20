@@ -45,7 +45,6 @@ use lance_datafusion::udf::register_functions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::parser::from_json;
 use parquet::arrow::ArrowWriter;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 /// Per-query memory ceiling for the DataFusion runtime. Not enforced on every
 /// operator (datafusion caveat), so the timeout below is the hard backstop.
@@ -92,32 +91,37 @@ impl Format {
 pub enum Mode {
     /// Render a row-capped table into the tool result.
     Inline,
-    /// Return a row-capped JSON payload; the MCP layer surfaces it through
-    /// `structuredContent` (with a stringified text fallback for clients that
-    /// do not surface the structured channel). Empirically validated on Claude
-    /// Code 2.1.165: when both channels carry the same payload, the agent reads
-    /// the structured one and the text block is a soft-landing for other
-    /// clients (spec 2025-11-25 server SHOULD).
-    InlineJson,
     /// Write the full result to a file and return a `pond-sql-export://` link.
     Export(Format),
 }
 
-/// The three Lance datasets, fetched fresh per call so each query sees a
-/// current snapshot (the handle freshness gate runs on each `Store::dataset`).
+/// The Lance datasets a query references, fetched fresh per call so each query
+/// sees a current snapshot (the handle freshness gate runs on each
+/// `Store::dataset`). A field is `None` when the query never names that table -
+/// the caller skips opening it, avoiding the slow `parts.lance` open on the
+/// common messages-only query (spec.md#search). See [`mentions_table`].
 pub struct Tables {
-    pub sessions: Arc<Dataset>,
-    pub messages: Arc<Dataset>,
-    pub parts: Arc<Dataset>,
+    pub sessions: Option<Arc<Dataset>>,
+    pub messages: Option<Arc<Dataset>>,
+    pub parts: Option<Arc<Dataset>>,
+}
+
+/// Whether `sql` references the table named `table`. A DataFusion query can
+/// only reach a registered table by writing its name literally - no alias hides
+/// the base name - so this lowercase word-boundary scan never yields a false
+/// negative. At worst it matches the name inside a string or column literal and
+/// opens a table the query won't touch: a cheap, safe false positive. Lets the
+/// caller open only the datasets a query needs.
+pub fn mentions_table(sql: &str, table: &str) -> bool {
+    sql.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|token| token == table)
 }
 
 /// Result of a successful `run`.
 pub enum Outcome {
     /// A rendered, row-capped table (already includes the metrics footer).
     Inline(String),
-    /// A row-capped JSON payload with metadata fields (`total_rows`,
-    /// `shown_rows`, `truncated`, `elapsed_ms`, `columns`, `rows`).
-    InlineJson(JsonValue),
     /// Encoded export bytes plus metadata for the caller's summary/resource.
     Export {
         bytes: Vec<u8>,
@@ -230,8 +234,8 @@ pub async fn run(
         vec![displayable(&RecordBatch::new_empty(result_schema)).map_err(infra)?]
     } else {
         collected
-            .iter()
-            .map(displayable)
+            .into_iter()
+            .map(|batch| displayable(&batch))
             .collect::<Result<_, _>>()
             .map_err(infra)?
     };
@@ -240,11 +244,6 @@ pub async fn run(
         Mode::Inline => Ok(Outcome::Inline(
             render_inline(&display, inline_rows, elapsed).map_err(infra)?,
         )),
-        Mode::InlineJson => Ok(Outcome::InlineJson(render_inline_json(
-            &display,
-            inline_rows,
-            elapsed,
-        )?)),
         Mode::Export(format) => {
             let rows = display.iter().map(RecordBatch::num_rows).sum();
             let columns = display
@@ -551,6 +550,7 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
         ("sessions", &tables.sessions),
         ("messages", &tables.messages),
     ] {
+        let Some(dataset) = dataset else { continue };
         // LanceTableProvider (not the bare Dataset impl) so WHERE/projection/
         // limit push into Lance's indexed scan; (false, false) hides _rowid /
         // _rowaddr from the SQL schema. The view applies `renamed_key`
@@ -566,31 +566,35 @@ fn register(ctx: &SessionContext, tables: &Tables) -> Result<(), SqlError> {
     // columns scan as `{position, size}` descriptor structs, so any SQL touch
     // dies in the planner with an opaque CAST error. The view inlines at plan
     // time - filters still push into the Lance scan underneath.
-    let provider = LanceTableProvider::new(tables.parts.clone(), false, false);
-    let keep: Vec<_> = tables
-        .parts
-        .schema()
-        .fields
-        .iter()
-        .filter(|field| field.name != "data")
-        .map(|field| col(field.name.as_str()))
-        .collect();
-    let plan = LogicalPlanBuilder::scan("parts", provider_as_source(Arc::new(provider)), None)
-        .and_then(|builder| builder.project(keep))
-        .and_then(LogicalPlanBuilder::build)
-        .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
-    ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
-        .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
+    if let Some(parts) = &tables.parts {
+        let provider = LanceTableProvider::new(parts.clone(), false, false);
+        let keep: Vec<_> = parts
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.name != "data")
+            .map(|field| col(field.name.as_str()))
+            .collect();
+        let plan = LogicalPlanBuilder::scan("parts", provider_as_source(Arc::new(provider)), None)
+            .and_then(|builder| builder.project(keep))
+            .and_then(LogicalPlanBuilder::build)
+            .map_err(|error| SqlError::Infra(anyhow!("build parts view: {error}")))?;
+        ctx.register_table("parts", Arc::new(ViewTable::new(plan, None)))
+            .map_err(|error| SqlError::Infra(anyhow!("register table parts: {error}")))?;
+    }
     // `fts('messages', '{...}')` BM25 search-in-SQL (vendored provider with a
     // declared `_score` column - see `ScoredFtsUdtf`), and lance's JSON /
-    // contains_tokens UDFs for filtering inside the JSON columns.
-    let fts = ScoredFtsUdtf {
-        datasets: HashMap::from([
-            ("sessions".to_owned(), tables.sessions.clone()),
-            ("messages".to_owned(), tables.messages.clone()),
-            ("parts".to_owned(), tables.parts.clone()),
-        ]),
-    };
+    // contains_tokens UDFs for filtering inside the JSON columns. Only the
+    // referenced tables are present, matching the registered views above.
+    let datasets = [
+        ("sessions", &tables.sessions),
+        ("messages", &tables.messages),
+        ("parts", &tables.parts),
+    ]
+    .into_iter()
+    .filter_map(|(name, dataset)| dataset.clone().map(|d| (name.to_owned(), d)))
+    .collect();
+    let fts = ScoredFtsUdtf { datasets };
     ctx.register_udtf("fts", Arc::new(fts));
     register_functions(ctx);
     // Shadow lance's strict json_get_* by name: the strict versions abort the
@@ -1198,101 +1202,6 @@ fn render_inline(
     Ok(out)
 }
 
-/// JSON sibling of `render_inline`: same row cap and byte-budget shrinking,
-/// returned as a `JsonValue` so the MCP layer can hand it to
-/// `CallToolResult::structured` (text fallback + structured channel in one
-/// call, see [`Mode::InlineJson`]).
-fn render_inline_json(
-    display: &[RecordBatch],
-    max_rows: usize,
-    elapsed: Duration,
-) -> Result<JsonValue, SqlError> {
-    let total: usize = display.iter().map(RecordBatch::num_rows).sum();
-    let columns: Vec<String> = display
-        .first()
-        .map(|batch| {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-
-    if total == 0 {
-        return Ok(json!({
-            "total_rows": 0,
-            "shown_rows": 0,
-            "truncated": false,
-            "elapsed_ms": elapsed_ms,
-            "columns": columns,
-            "rows": [],
-        }));
-    }
-
-    let mut shown = total.min(max_rows);
-    let mut rows = batches_to_json_rows(&limit_batches(display, shown))?;
-    let mut serialized = serde_json::to_string(&rows)
-        .map_err(|error| SqlError::Infra(anyhow!("json serialize: {error}")))?;
-    while serialized.len() > INLINE_BUDGET_BYTES && shown > 1 {
-        shown = (shown / 2).max(1);
-        rows = batches_to_json_rows(&limit_batches(display, shown))?;
-        serialized = serde_json::to_string(&rows)
-            .map_err(|error| SqlError::Infra(anyhow!("json serialize: {error}")))?;
-    }
-
-    let mut payload = JsonMap::new();
-    payload.insert("total_rows".to_owned(), json!(total));
-    payload.insert("shown_rows".to_owned(), json!(shown));
-    payload.insert("truncated".to_owned(), json!(shown < total));
-    payload.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
-    payload.insert("columns".to_owned(), json!(columns));
-    payload.insert("rows".to_owned(), JsonValue::Array(rows));
-    if shown < total {
-        payload.insert(
-            "next_steps".to_owned(),
-            json!(format!(
-                "{} row(s) omitted; ORDER BY + keyset (`WHERE (col, message_id) < \
-                 (<last_col>, <last_message_id>)`) to page, or format=parquet|ndjson for \
-                 the full set. See schema://pond-sql.",
-                total - shown
-            )),
-        );
-    }
-    Ok(JsonValue::Object(payload))
-}
-
-/// Convert RecordBatches to a JSON array of row objects via the existing
-/// NDJSON writer (handles all Arrow types, including the decoded JSON columns
-/// that come out of `displayable`).
-fn batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<JsonValue>, SqlError> {
-    if batches.iter().all(|batch| batch.num_rows() == 0) {
-        return Ok(Vec::new());
-    }
-    let mut buffer = Vec::new();
-    {
-        let mut writer = LineDelimitedWriter::new(&mut buffer);
-        let refs: Vec<&RecordBatch> = batches.iter().collect();
-        writer
-            .write_batches(&refs)
-            .map_err(|error| SqlError::Infra(anyhow!("ndjson encode: {error}")))?;
-        writer
-            .finish()
-            .map_err(|error| SqlError::Infra(anyhow!("ndjson finish: {error}")))?;
-    }
-    let text = String::from_utf8(buffer)
-        .map_err(|error| SqlError::Infra(anyhow!("ndjson not utf-8: {error}")))?;
-    text.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<JsonValue>(line)
-                .map_err(|error| SqlError::Infra(anyhow!("ndjson parse: {error}")))
-        })
-        .collect()
-}
-
 fn limit_batches(batches: &[RecordBatch], max_rows: usize) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     let mut remaining = max_rows;
@@ -1364,6 +1273,34 @@ mod tests {
             ),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn mentions_table_is_sound_for_open_pruning() {
+        // Referenced => must be detected (no false negative, else a valid query
+        // breaks). Case-insensitive: DataFusion lowercases identifiers.
+        assert!(mentions_table("SELECT * FROM messages", "messages"));
+        assert!(mentions_table("select * from MESSAGES", "messages"));
+        assert!(mentions_table(
+            "SELECT s.id FROM sessions s JOIN parts p ON s.id = p.session_id",
+            "parts",
+        ));
+        assert!(mentions_table(
+            "SELECT * FROM fts('messages', '{\"match\":{}}')",
+            "messages",
+        ));
+        assert!(mentions_table(
+            "WITH x AS (SELECT * FROM sessions) SELECT * FROM x",
+            "sessions",
+        ));
+        // Not referenced => skip the open. Word boundary: a longer identifier
+        // that merely contains the name is not a reference.
+        assert!(!mentions_table("SELECT * FROM messages", "parts"));
+        assert!(!mentions_table("SELECT * FROM messages", "sessions"));
+        assert!(!mentions_table(
+            "SELECT counterparts FROM messages",
+            "parts"
+        ));
     }
 
     #[test]

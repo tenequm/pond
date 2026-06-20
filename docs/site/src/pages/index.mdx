@@ -1,0 +1,35 @@
+---
+title: Why pond?
+description: Lossless storage and search for AI agent sessions, across every agentic client.
+---
+
+# Why pond? [One searchable archive of every AI session, restorable into any client]
+
+One Rust binary. It ingests sessions from your agentic clients into a canonical Session / Message / Part interlingua, stores them in Lance (local disk or object storage), and serves search over HTTP and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not just the one that made it.
+
+:::tip
+Install, `pond init`, `pond sync`. -> [Quickstart](/get-started/quickstart).
+:::
+
+## The problem
+
+Agent history is your most valuable byproduct - decisions, dead ends, the command that worked - yet it's siloed per client, in per-tool formats, and disposable: rotate a machine or hit a retention window and it's gone. No cross-tool search, no continuing a Claude Code thread in Codex.
+
+pond's premise: a session should outlive the tool that made it. Three rules follow:
+
+- **Interchange, not storage.** The canonical schema is a format-neutral interlingua. Adapters parse client formats in and serialize them back out, so any session restores into any client. That schema is the product.
+- **Lossless = value-complete.** Every value round-trips as an equal value. Restore is rederivation, not byte replay - incidental encoding isn't data; nothing that is data is dropped.
+- **Preservation over convenience.** When preserving a session fights readability or size, preservation wins.
+
+## Two audiences, one source
+
+- **Humans:** one binary, one searchable archive across every client; ask any agent about your past work. Backend switches and rollbacks are one command; the local copy stays as a backup.
+- **Agents:** pond is an MCP server - `pond_search` / `pond_get` / `pond_sql_query` over the user's full cross-client history, no per-client integration. Every command is exit-code-gated for CI.
+
+## Next
+
+- [Install](/get-started/install) - Homebrew, Nix, Cargo (macOS, Linux)
+- [Quickstart](/get-started/quickstart) - init -> sync -> ask
+- [Connect your agents](/get-started/connect-your-agents) - register the MCP server
+- [Remote storage](/guides/remote-storage) - S3, R2, B2, GCS
+- [Specification](/specification) - the v1 contract

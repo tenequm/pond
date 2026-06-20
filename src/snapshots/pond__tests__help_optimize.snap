@@ -1,0 +1,58 @@
+---
+source: src/main.rs
+assertion_line: 4771
+expression: sub.render_long_help().to_string()
+---
+Keep the lake queryable: embed the backlog, then fold the search indexes.
+
+The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` runs both by default; this is the on-demand and post-`--no-optimize` catch-up.
+
+Usage: pond optimize [OPTIONS]
+
+Options:
+      --only <ONLY>
+          Run exactly one stage: embed or index
+          
+          [possible values: embed, index]
+
+      --skip <SKIP>
+          Skip a stage. Can be passed multiple times
+          
+          [possible values: embed, index]
+
+      --force-embed
+          Re-embed rows whose stored `embedding_model` does not match the configured model (a model swap), dropping the IVF_SQ first. Without this, such rows abort the run with a typed error so a swap is never silent
+
+      --rebuild
+          Recovery: rebuild every index from scratch via `create_index(replace=true)`. Use this when normal optimize errors with "<N> delta segments; run `pond optimize --rebuild`". Skips embed and the incremental index-fold; runs only the rebuild
+
+      --drop-index <NAME>
+          One-shot orphan cleanup: drop a single named index from whichever table owns it. Used after renaming an intent (the old name is orphaned in the manifest until dropped). Tries every table in turn; errors when no table has an index by that name
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond optimize                    embed the backlog, then fold indexes
+  pond optimize --only index       fold indexes only (e.g. after `pond copy --no-optimize`)
+  pond optimize --only embed       embed only
+  pond optimize --force-embed      re-embed stale rows after a model change

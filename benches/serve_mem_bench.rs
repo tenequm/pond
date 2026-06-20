@@ -3,31 +3,37 @@
 #![allow(unsafe_code)]
 #![allow(unreachable_pub, dead_code)]
 
-//! Read-only memory bench for `pond mcp` / `pond serve`. Opens an existing
-//! `~/.local/share/pond/` corpus, drives realistic `pond_search` / `pond_get`
-//! workloads, and reports peak RSS per phase against a 500 MiB default target.
+//! Read-path bench for `pond mcp` / `pond serve`. Opens an existing
+//! `~/.local/share/pond/` corpus and measures *pond's own* steady-state read
+//! path: the resident meta cache we build, the two retrieval arms (vector
+//! default, fts), and `pond_get` hydration - with the cache loaded, the way the
+//! server actually serves.
 //!
-//! No ingest, no embed-worker, no index build - this measures *only* the
-//! steady-state read path that a stdio MCP serves. The candle embedder
-//! loads lazily on the first hybrid query, matching production behavior.
+//! It reports total memory at every phase and breaks it into parts - store
+//! open, resident meta cache, Lance caches, candle E5 model - so you can see
+//! what costs what, nothing omitted. The load-bearing check is the idle floor
+//! (`idle_drained`: candle model unloaded the way `pond mcp` idle-unloads it,
+//! resident cache still mapped), which must stay under 500 MiB; the serving
+//! peak (model resident) only needs to stay under 2 GiB.
 //!
 //! Phases (sequential, matches MCP's stdio request serialization):
-//!   - cold_open    : RSS right after `Store::open_local`
-//!   - fts_warm     : a few FTS queries to settle metadata cache
-//!   - fts_steady   : N FTS-only queries (no embedder loaded)
-//!   - first_hybrid : the model-load spike (cold E5 -> Metal/CUDA/CPU)
-//!   - hybrid_warm  : a few hybrid queries to settle index cache
-//!   - hybrid_steady: N hybrid queries (worst-case steady RAM)
-//!   - get_calls    : N `pond_get` calls on previous hits
-//!   - idle         : sleep N seconds to see if RSS drains
+//!   - cold_open     : RSS/PF right after `Store::open`
+//!   - build_rowmap  : `ensure_rowmap` builds + mmaps the resident meta cache
+//!   - fts_steady    : N fts-arm queries (no embedder) - pond's core read path
+//!   - vector_first  : first vector query (the cold E5 model-load spike)
+//!   - vector_steady : N vector-arm queries (default arm; needs the embedder)
+//!   - get_steady    : N `pond_get` hydration calls on prior hits
+//!   - sql_steady    : N `pond_sql_query` calls (the analytic tool)
+//!   - idle/drained  : resting footprint; drained drops the model (cache stays)
 //!
 //! Run:
 //!   cargo bench --bench serve_mem_bench
-//!   cargo bench --bench serve_mem_bench -- --queries 50 --target-mib 500
-//!   cargo bench --bench serve_mem_bench -- --data-dir ~/.local/share/pond --skip-idle
+//!   cargo bench --bench serve_mem_bench -- --queries 50 --skip-idle
+//!   cargo bench --bench serve_mem_bench -- --attribute   # per-arm latency
+//!   cargo bench --bench serve_mem_bench -- --io-trace    # S3 GETs per arm
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -41,11 +47,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pond::{
     PROTOCOL_VERSION,
-    config::SearchConfig,
-    embed::{CandleEmbedder, Embedder, LazyEmbedder},
+    config::{Config, SearchConfig},
+    embed::LazyEmbedder,
     handlers::{pond_get, pond_search},
     sessions::Store,
-    substrate::RuntimeCaps,
+    sql::{self, Mode, Tables},
+    substrate::{Predicate, ResolvedStorage, RuntimeCaps, StorageUrl, Table},
     wire::{
         GetEnvelope, GetRequest, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
         SearchResponse,
@@ -53,8 +60,8 @@ use pond::{
 };
 
 /// Realistic queries against a Claude-Code conversation history corpus. Mix of
-/// short single-term, multi-term technical, and project-name-ish queries so
-/// the FTS path exercises both rare and common postings.
+/// short single-term, multi-term technical, and project-name-ish queries so the
+/// arms exercise both rare and common postings.
 const QUERIES: &[&str] = &[
     "rust async tokio",
     "Lance dataset write",
@@ -78,13 +85,39 @@ const QUERIES: &[&str] = &[
     "schema evolution add column",
 ];
 
+/// `pond_sql_query` workload: one metadata-only count (manifest, no data read),
+/// two column scans, a token filter (FTS-accelerated), and a group-by. Mirrors
+/// the analytic shapes the MCP tool actually serves.
+const SQL_QUERIES: &[&str] = &[
+    "SELECT COUNT(*) FROM messages",
+    "SELECT MIN(timestamp), MAX(timestamp) FROM messages",
+    "SELECT COUNT(*) FROM messages WHERE project LIKE '%pond%'",
+    "SELECT message_id FROM messages WHERE contains_tokens(search_text, 'storage') LIMIT 10",
+    "SELECT source_agent, COUNT(*) AS n FROM messages GROUP BY source_agent ORDER BY n DESC LIMIT 5",
+];
+
 #[derive(Parser)]
-#[command(about = "pond mcp/serve read-only memory bench: peak RSS per phase vs target ceiling")]
+#[command(about = "pond mcp/serve read-path bench: resident cache + per-arm search latency/memory")]
 struct Args {
     /// Pond data directory to open read-only. Defaults to `~/.local/share/pond`
     /// when present.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Remote storage URL (e.g. `s3+https://host/bucket/prefix`). When set, the
+    /// bench opens the remote store with creds resolved from the pond config
+    /// instead of `--data-dir` - this is how we measure real S3 read cost.
+    #[arg(long)]
+    storage_path: Option<String>,
+    /// Config file for creds (default `~/.config/pond/config.toml`). Only used
+    /// with `--storage-path`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Override the Lance index cache cap (MiB). Default: remote 1024, local 256.
+    #[arg(long)]
+    index_cache_mib: Option<u64>,
+    /// Override the Lance metadata cache cap (MiB). Default: remote 512, local 128.
+    #[arg(long)]
+    metadata_cache_mib: Option<u64>,
     /// Queries per steady-state phase.
     #[arg(long, default_value_t = 30)]
     queries: usize,
@@ -94,45 +127,56 @@ struct Args {
     /// RSS sampling interval in ms. Lower = tighter peak detection, higher CPU.
     #[arg(long, default_value_t = 100)]
     rss_interval_ms: u64,
-    /// Memory budget in MiB. Used only for the PASS/FAIL line; doesn't enforce.
+    /// Idle-footprint ceiling (MiB) for `idle_drained` - the production `pond
+    /// mcp` idle state (resident cache mapped, candle model unloaded). The
+    /// load-bearing budget: idle pond must sit under this.
     #[arg(long, default_value_t = 500)]
-    target_mib: u64,
+    idle_target_mib: u64,
+    /// Serving-peak ceiling (MiB). The peak (model resident) only needs to stay
+    /// under this looser bound.
+    #[arg(long, default_value_t = 2048)]
+    peak_target_mib: u64,
     /// Per-query result limit (mirrors `pond mcp` defaults).
     #[arg(long, default_value_t = 10)]
     limit: usize,
-    /// Skip the hybrid phases (no E5 load). Useful to see the FTS-only floor.
+    /// IVF `nprobes` for the vector arm. Unset lets Lance probe up to every
+    /// partition (num_rows/4096), which on a remote store is one S3 read per
+    /// partition - the dominant cost of an unbounded vector scan.
     #[arg(long)]
-    skip_hybrid: bool,
+    nprobes: Option<usize>,
+    /// Attribution mode: time the retrieval arms in isolation -
+    /// `searchable_in_scope` (the per-query IsNotNull(search_text) count),
+    /// `fts_search`, and `vector_search` - over the query set, printing p50/p95
+    /// per arm. Pinpoints which one is the real steady-state floor instead of
+    /// only seeing max(arms) through the full `pond_search`. Runs after the
+    /// cache build and exits before the normal phases.
+    #[arg(long)]
+    attribute: bool,
+    /// S3 IO attribution: count the exact GETs (read_iops), bytes, and - built
+    /// with `--features io-trace` - the per-request paths each warm query issues
+    /// against the remote store, broken out by component (scope count / fts /
+    /// vector / get). Answers "how much and why are we hitting S3 per query".
+    /// Runs after the cache build and exits before the normal phases.
+    #[arg(long)]
+    io_trace: bool,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
     /// Idle drain duration in seconds.
     #[arg(long, default_value_t = 10)]
     idle_seconds: u64,
-    /// Probe-only mode: skip Store/search and trace the E5 model's RSS
-    /// footprint across load, embed, and drop. Used to verify whether the
-    /// FP32 staging RAM lingers in candle's Metal buffer pool (see
-    /// metal_backend/device.rs:44-57).
-    #[arg(long)]
-    probe_embedder: bool,
-    /// Sweep the workload across a fixed grid of `(metadata_cache_bytes,
-    /// index_cache_bytes)` pairs, printing peak RSS and p50/p95 hybrid latency
-    /// for each. Used to calibrate the `[runtime]` defaults (`docs/plans/mcp-
-    /// memory-budget.md` Q5).
-    #[arg(long)]
-    cap_sweep: bool,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
     bench: bool,
 }
 
-/// macOS phys_footprint accessors (`proc_pid_rusage(RUSAGE_INFO_V4)`). This
-/// is what Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read
-/// and the only metric the kernel's Jetsam OOM-killer cares about. RSS is
-/// wrong in both directions on macOS - overcounts shared dyld pages,
-/// undercounts compressed pages. We sample both for one or two runs to
-/// quantify the gap, then drop RSS.
+/// macOS phys_footprint accessors (`proc_pid_rusage(RUSAGE_INFO_V4)`). This is
+/// what Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read and the
+/// only metric the kernel's Jetsam OOM-killer cares about. RSS is wrong in both
+/// directions on macOS - overcounts shared dyld pages, undercounts compressed
+/// pages. We sample both: RSS shows the resident cache's mmap pages, PF shows
+/// they don't count against the memory budget.
 #[cfg(target_os = "macos")]
 mod footprint {
     // Mirror of `<sys/resource.h>` `rusage_info_v4` (Apple's stable layout).
@@ -259,9 +303,9 @@ fn reset_footprint_interval() {}
 /// Background sampler: tracks both `ps -o rss=` (the classic RSS, overcounts
 /// shared libs on macOS) and macOS `phys_footprint` (the private-memory-cost
 /// metric Activity Monitor uses, excludes shared libs). `peak_kb` is the
-/// running max since `start()`; `phase_peak_kb` is reset by
-/// `mark_phase_start`. All `*_kb` fields are tracked in parallel for both
-/// metrics, suffixed `_pf` for phys_footprint.
+/// running max since `start()`; `phase_peak_kb` is reset by `mark_phase_start`.
+/// All `*_kb` fields are tracked in parallel for both metrics, suffixed `_pf`
+/// for phys_footprint.
 struct RssSampler {
     peak_kb: Arc<AtomicU64>,
     phase_peak_kb: Arc<AtomicU64>,
@@ -344,8 +388,8 @@ impl RssSampler {
         let now = self.current_kb.load(Ordering::Relaxed);
         self.phase_peak_kb.store(now, Ordering::Relaxed);
         reset_footprint_interval();
-        // Mirror the same reset on the userspace pf atomic so any sampler
-        // reads between reset and the next sample don't carry stale values.
+        // Mirror the same reset on the userspace pf atomic so any sampler reads
+        // between reset and the next sample don't carry stale values.
         let now_pf = self.current_pf_kb.load(Ordering::Relaxed);
         self.phase_peak_pf_kb.store(now_pf, Ordering::Relaxed);
     }
@@ -355,8 +399,8 @@ impl RssSampler {
     }
 
     /// Kernel-tracked interval peak for phys_footprint since the last
-    /// `mark_phase_start`. Falls back to the userspace-sampled peak on
-    /// non-macOS or if the syscall failed.
+    /// `mark_phase_start`. Falls back to the userspace-sampled peak on non-macOS
+    /// or if the syscall failed.
     fn phase_peak_pf_kb(&self) -> u64 {
         footprint_interval_peak_kb()
             .unwrap_or_else(|| self.phase_peak_pf_kb.load(Ordering::Relaxed))
@@ -379,12 +423,13 @@ fn sample_rss_kb(pid: &str) -> Option<u64> {
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
-fn search_request(query: &str, mode: Option<SearchModeWire>, limit: usize) -> SearchRequest {
+fn search_request(query: &str, mode: SearchModeWire, limit: usize) -> SearchRequest {
     SearchRequest {
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode_override: mode,
+        mode,
+        sort_by: pond::wire::SortBy::Relevance,
         filters: SearchFilters::default(),
         limit,
     }
@@ -396,11 +441,12 @@ fn get_request(message_id: String) -> GetRequest {
         namespace: Some("local".to_owned()),
         session_id: None,
         message_id: Some(message_id),
-        context_depth: 0,
-        limit: 50,
-        response_mode: pond::wire::ResponseMode::Conversational,
+        session_limit: 20,
         session_from: pond::wire::SessionFrom::Start,
-        after_id: None,
+        session_after_message_id: None,
+        session_before_message_id: None,
+        message_context_before: 3,
+        message_context_after: 3,
     }
 }
 
@@ -443,6 +489,27 @@ fn percentile(values: &[u128], p: f64) -> u128 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Classify an S3 object path into a coarse bucket so the io-trace request
+/// histogram shows *what* each GET is for: a specific index file (FTS posting
+/// segment, IVF partition store), a data fragment, the manifest, or the
+/// transaction log.
+#[cfg(feature = "io-trace")]
+fn io_bucket(path: &str) -> String {
+    if let Some(pos) = path.find("/_indices/") {
+        let after = &path[pos + "/_indices/".len()..];
+        let file = after.rsplit('/').next().unwrap_or(after);
+        format!("index/{file}")
+    } else if path.contains("/data/") {
+        "data".to_string()
+    } else if path.contains("manifest") || path.contains("/_versions/") {
+        "manifest".to_string()
+    } else if path.contains("_transactions") {
+        "txn".to_string()
+    } else {
+        path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+}
+
 fn first_hit_message_id(response: &SearchResponse) -> Option<String> {
     response
         .sessions
@@ -451,13 +518,30 @@ fn first_hit_message_id(response: &SearchResponse) -> Option<String> {
         .map(|hit| hit.message_id.clone())
 }
 
+/// Sum of `rowmetamap-*.rmm` segment sizes in the cache dir - the on-disk size
+/// of the resident meta cache (base + any deltas).
+fn rowmap_file_bytes(cache_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("rowmetamap-") && name.ends_with(".rmm")
+        })
+        .filter_map(|entry| entry.metadata().ok().map(|m| m.len()))
+        .sum()
+}
+
 struct SearchPhase<'a> {
     name: &'static str,
     store: &'a Store,
     embedder: &'a LazyEmbedder,
     cfg: &'a SearchConfig,
     sampler: &'a RssSampler,
-    mode: Option<SearchModeWire>,
+    mode: SearchModeWire,
     queries: &'a [&'a str],
     limit: usize,
     record_hits: bool,
@@ -555,6 +639,111 @@ async fn run_get_phase(
     })
 }
 
+async fn run_sql_phase(
+    name: &'static str,
+    store: &Store,
+    sampler: &RssSampler,
+    queries: &[&str],
+) -> Result<PhaseStats> {
+    let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
+    sampler.mark_phase_start();
+    let mut elapsed_ms: Vec<u128> = Vec::with_capacity(queries.len());
+
+    for q in queries {
+        // Mirror the MCP tool exactly: build `Tables` fresh per call (the
+        // try_join of the three dataset() freshness gates) then run one
+        // read-only query. The dataset handles are cached in the shared Session,
+        // so this isn't a reopen - it's the same per-request shape
+        // `transport.rs` serves.
+        let t = Instant::now();
+        let tables = Tables {
+            sessions: Some(store.dataset(Table::Sessions).await?),
+            messages: Some(store.dataset(Table::Messages).await?),
+            parts: Some(store.dataset(Table::Parts).await?),
+        };
+        match sql::run(&tables, q, Mode::Inline, sql::DEFAULT_INLINE_ROWS).await {
+            Ok(_) => {}
+            Err(error) => anyhow::bail!("{name}: sql {q:?} failed: {error:?}"),
+        }
+        elapsed_ms.push(t.elapsed().as_millis());
+    }
+
+    Ok(PhaseStats {
+        name,
+        queries: queries.len(),
+        elapsed_ms,
+        rss_start_kb,
+        rss_end_kb: sampler.current_kb(),
+        rss_phase_peak_kb: sampler.phase_peak_kb(),
+        rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: String::new(),
+    })
+}
+
+/// Where the bench opens its store. `Local` keeps the original
+/// `~/.local/share/pond` behavior; `Remote` carries a creds-resolved S3
+/// destination so we can measure real object-store read cost.
+enum OpenTarget {
+    Local(PathBuf),
+    Remote(Box<ResolvedStorage>),
+}
+
+fn target_label(target: &OpenTarget) -> String {
+    match target {
+        OpenTarget::Local(path) => format!("local  {}", path.display()),
+        OpenTarget::Remote(resolved) => format!("remote {}", resolved.lance_url()),
+    }
+}
+
+fn load_bench_config(args: &Args) -> Result<Config> {
+    let path = args.config.clone().unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        home.join(".config").join("pond").join("config.toml")
+    });
+    Config::load(&path).with_context(|| format!("load config {}", path.display()))
+}
+
+/// Explicit cache caps from CLI; `None` lets the substrate pick its
+/// backend-aware default (remote 2 GiB/512 MiB, local 256/128 MiB).
+fn bench_caps(args: &Args) -> RuntimeCaps {
+    RuntimeCaps {
+        index_cache_bytes: args.index_cache_mib.map(|m| (m as usize) * 1024 * 1024),
+        metadata_cache_bytes: args.metadata_cache_mib.map(|m| (m as usize) * 1024 * 1024),
+    }
+}
+
+fn resolve_open_target(args: &Args) -> Result<OpenTarget> {
+    if let Some(storage_path) = &args.storage_path {
+        let config = load_bench_config(args)?;
+        let url = StorageUrl::parse(storage_path).context("parse --storage-path")?;
+        let resolved = url
+            .resolve(&config.creds)
+            .context("resolve creds for --storage-path")?;
+        Ok(OpenTarget::Remote(Box::new(resolved)))
+    } else {
+        Ok(OpenTarget::Local(resolve_data_dir(args.data_dir.clone())?))
+    }
+}
+
+async fn open_bench_store(target: &OpenTarget, caps: RuntimeCaps) -> Result<Store> {
+    match target {
+        OpenTarget::Local(dir) => {
+            let url = pond::config::url_for_path(dir)?;
+            Store::open_with_options(&url, std::collections::HashMap::new(), caps).await
+        }
+        OpenTarget::Remote(resolved) => {
+            Store::open_with_options(resolved.lance_url(), resolved.options.clone(), caps).await
+        }
+    }
+}
+
 fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -567,10 +756,10 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
 
 fn print_phase_header() {
     // rss_*: macOS `ps -o rss=` - overcounts shared dyld pages, undercounts
-    // compressed pages. Reported for one-or-two-run side-by-side comparison.
-    // pf_*: macOS `task_vm_info.phys_footprint` (kernel's own ledger; what
-    // Activity Monitor, Jetsam, footprint(1) all use). This is the
-    // load-bearing memory-budget metric.
+    // compressed pages, but DOES count the resident cache's mmap pages. pf_*:
+    // macOS `phys_footprint` (kernel's own ledger; what Activity Monitor,
+    // Jetsam, footprint(1) use) - the load-bearing memory-budget metric, and
+    // ~excludes the cache's clean file-backed pages (they're reclaimable).
     println!(
         "{:<14}  {:>4}  {:>6}  {:>6}  {:>6}  {:>6}  {:>5}  {:>5}",
         "phase", "n", "rssEnd", "rssPk", "pfEnd", "pfPk", "p50", "p95",
@@ -599,215 +788,72 @@ fn print_phase_row(stat: &PhaseStats) {
     }
 }
 
-/// Probe the embedder lifecycle in isolation for the selected backend:
-/// load, run a few embed() calls, drop, idle, reload. Tracks RSS at each
-/// step so we can quantify the candle/Metal buffer pool retention that
-/// shows up in `phys_footprint` (see docs/researches/embeddings.md).
-fn probe_embedder(sampler: &RssSampler, idle_seconds: u64) -> Result<Vec<PhaseStats>> {
-    let mut phases = Vec::new();
-
-    let load_backend = || -> Result<CandleEmbedder> { CandleEmbedder::load() };
-
-    // --- baseline ---
-    thread::sleep(Duration::from_millis(300));
-    let baseline = sampler.current_kb();
-    let baseline_pf = sampler.current_pf_kb();
-
-    // --- load ---
-    sampler.mark_phase_start();
-    let load_start = Instant::now();
-    let embedder = load_backend()?;
-    let load_ms = load_start.elapsed().as_millis();
-    thread::sleep(Duration::from_millis(400));
-    phases.push(PhaseStats {
-        name: "load",
-        queries: 0,
-        elapsed_ms: vec![load_ms],
-        rss_start_kb: baseline,
-        rss_end_kb: sampler.current_kb(),
-        rss_phase_peak_kb: sampler.phase_peak_kb(),
-        rss_global_peak_kb: sampler.peak_kb(),
-        pf_start_kb: baseline_pf,
-        pf_end_kb: sampler.current_pf_kb(),
-        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-        pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: format!("candle::load() = {load_ms} ms"),
-    });
-
-    // --- embed warm + flush ---
-    sampler.mark_phase_start();
-    let rss_start_kb = sampler.current_kb();
-    let pf_start_kb = sampler.current_pf_kb();
-    let mut elapsed_ms = Vec::new();
-    let texts: Vec<String> = (0..8).map(|i| format!("query: probe pass {i}")).collect();
-    for round in 0..6 {
-        let t = Instant::now();
-        let _ = embedder.embed(&texts)?;
-        elapsed_ms.push(t.elapsed().as_millis());
-        if round == 0 {
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
-    thread::sleep(Duration::from_millis(400));
-    phases.push(PhaseStats {
-        name: "embed_warm",
-        queries: texts.len() * 6,
-        elapsed_ms,
-        rss_start_kb,
-        rss_end_kb: sampler.current_kb(),
-        rss_phase_peak_kb: sampler.phase_peak_kb(),
-        rss_global_peak_kb: sampler.peak_kb(),
-        pf_start_kb,
-        pf_end_kb: sampler.current_pf_kb(),
-        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-        pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: "6 rounds * 8 texts".to_owned(),
-    });
-
-    // --- drop + idle ---
-    sampler.mark_phase_start();
-    let rss_start_kb = sampler.current_kb();
-    let pf_start_kb = sampler.current_pf_kb();
-    drop(embedder);
-    thread::sleep(Duration::from_secs(idle_seconds.max(2)));
-    phases.push(PhaseStats {
-        name: "post_drop",
-        queries: 0,
-        elapsed_ms: vec![idle_seconds.saturating_mul(1000) as u128],
-        rss_start_kb,
-        rss_end_kb: sampler.current_kb(),
-        rss_phase_peak_kb: sampler.phase_peak_kb(),
-        rss_global_peak_kb: sampler.peak_kb(),
-        pf_start_kb,
-        pf_end_kb: sampler.current_pf_kb(),
-        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-        pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: format!("embedder dropped; slept {idle_seconds}s"),
-    });
-
-    // --- reload to surface allocator fragmentation ---
-    sampler.mark_phase_start();
-    let rss_start_kb = sampler.current_kb();
-    let pf_start_kb = sampler.current_pf_kb();
-    let reload_start = Instant::now();
-    let embedder2 = load_backend()?;
-    let reload_ms = reload_start.elapsed().as_millis();
-    thread::sleep(Duration::from_millis(400));
-    phases.push(PhaseStats {
-        name: "reload",
-        queries: 0,
-        elapsed_ms: vec![reload_ms],
-        rss_start_kb,
-        rss_end_kb: sampler.current_kb(),
-        rss_phase_peak_kb: sampler.phase_peak_kb(),
-        rss_global_peak_kb: sampler.peak_kb(),
-        pf_start_kb,
-        pf_end_kb: sampler.current_pf_kb(),
-        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-        pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: format!("candle::load() #2 = {reload_ms} ms"),
-    });
-    drop(embedder2);
-
-    Ok(phases)
+fn find_phase<'a>(phases: &'a [PhaseStats], name: &str) -> Option<&'a PhaseStats> {
+    phases.iter().find(|p| p.name == name)
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.probe_embedder {
-        println!("=== pond serve-mem bench: --probe-embedder ===");
-        println!("(no Store, no search; isolates the candle embedder's RSS footprint)");
-        println!();
-        let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
-        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-        let baseline_kb = sampler.current_kb();
-        println!(
-            "baseline RSS     {:.1} MiB (this process before load)",
-            baseline_kb as f64 / 1024.0,
-        );
-        println!();
-        let idle = args.idle_seconds;
-        let phases = tokio::task::spawn_blocking(move || probe_embedder(&sampler, idle)).await??;
-        print_phase_header();
-        for phase in &phases {
-            print_phase_row(phase);
-        }
-        let json_phases: Vec<_> = phases
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "phase": p.name,
-                    "n": p.queries,
-                    "rss_start_mib": p.rss_start_kb as f64 / 1024.0,
-                    "rss_end_mib": p.rss_end_kb as f64 / 1024.0,
-                    "rss_phase_peak_mib": p.rss_phase_peak_kb as f64 / 1024.0,
-                    "rss_global_peak_mib": p.rss_global_peak_kb as f64 / 1024.0,
-                    "p50_ms": p.p50(),
-                    "p95_ms": p.p95(),
-                    "max_ms": p.max(),
-                    "notes": p.notes,
-                })
-            })
-            .collect();
-        let json = serde_json::json!({
-            "mode": "probe_embedder",
-            "baseline_mib": baseline_kb as f64 / 1024.0,
-            "phases": json_phases,
-        });
-        println!();
-        println!("JSON {json}");
-        return Ok(());
-    }
-
-    let data_dir = resolve_data_dir(args.data_dir.clone())?;
-    if !data_dir.join("sessions.lance").exists() {
+    let target = resolve_open_target(&args)?;
+    if let OpenTarget::Local(dir) = &target
+        && !dir.join("sessions.lance").exists()
+    {
         anyhow::bail!(
-            "no Lance datasets under {} - pass --data-dir to a populated pond",
-            data_dir.display(),
+            "no Lance datasets under {} - pass --data-dir or --storage-path",
+            dir.display(),
         );
     }
 
-    if args.cap_sweep {
-        return run_cap_sweep(&args, &data_dir).await;
-    }
-
-    let cfg = SearchConfig::default();
+    let cfg = SearchConfig {
+        nprobes: args.nprobes,
+    };
     let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
     let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
 
-    println!("=== pond serve-mem bench (read-only) ===");
-    println!("data_dir         {}", data_dir.display());
+    println!("=== pond serve read-path bench (resident cache + per-arm search) ===");
+    println!("store            {}", target_label(&target));
+    println!(
+        "caps             index={} metadata={} (None = backend default)",
+        args.index_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+        args.metadata_cache_mib
+            .map_or_else(|| "default".to_owned(), |m| format!("{m} MiB")),
+    );
     println!(
         "queries          {} per phase, warmup={}, limit={}",
         args.queries, args.warmup, args.limit,
     );
-    println!("target_budget    {} MiB", args.target_mib);
     println!();
 
     let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
-    // One pre-open sample so `cold_open` `start_M` is the pre-pond baseline.
+    // One pre-open sample so `cold_open` `start` is the pre-pond baseline.
     thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
     let baseline_kb = sampler.current_kb();
     let baseline_pf_kb = sampler.current_pf_kb();
     println!(
-        "baseline RSS     {:.1} MiB    PF {:.1} MiB    (this process before pond)",
+        "baseline         RSS {:.1} MiB  PF {:.1} MiB  (this process before pond)",
         baseline_kb as f64 / 1024.0,
         baseline_pf_kb as f64 / 1024.0,
     );
     println!();
 
+    // Arm S3 IO tracing before the store opens so the tracker is injected as the
+    // object-store wrapper on every dataset read open.
+    if args.io_trace {
+        pond::substrate::io_trace::enable();
+    }
+
     // ---- Phase: cold_open ----
     let mut phases: Vec<PhaseStats> = Vec::new();
     sampler.mark_phase_start();
     let t = Instant::now();
-    let store = Store::open_local(&data_dir).await?;
+    let store = open_bench_store(&target, bench_caps(&args)).await?;
     let open_ms = t.elapsed().as_millis();
-    // Give the sampler one tick to catch any post-open allocation.
     thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
     let (sessions, messages, parts) = store.row_counts().await?;
-    let mut cold = PhaseStats {
+    phases.push(PhaseStats {
         name: "cold_open",
         queries: 0,
         elapsed_ms: vec![open_ms],
@@ -819,14 +865,254 @@ async fn main() -> Result<()> {
         pf_end_kb: sampler.current_pf_kb(),
         pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
         pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: format!("sessions={sessions} messages={messages} parts={parts} open_ms={open_ms}",),
-    };
-    // For cold_open, latency stats use the one open() call.
-    cold.elapsed_ms = vec![open_ms];
-    phases.push(cold);
+        notes: format!("sessions={sessions} messages={messages} parts={parts} open_ms={open_ms}"),
+    });
 
-    // LazyEmbedder created but NOT loaded - matches `pond mcp` lazy behavior.
-    let embedder = LazyEmbedder::candle();
+    // ---- Phase: build_rowmap (the resident meta cache - our code) ----
+    // `ensure_rowmap` does one sequential scan of `messages`, builds the
+    // dict-encoded + block-zstd segment, and mmaps it. The mmap is demand-paged,
+    // so the RSS/PF deltas captured here are just the build's transient buffers
+    // plus the header - the body faults in as the search phases hydrate hits.
+    let cache = tempfile::tempdir()?;
+    sampler.mark_phase_start();
+    let rss_before = sampler.current_kb();
+    let pf_before = sampler.current_pf_kb();
+    let t = Instant::now();
+    store.ensure_rowmap(cache.path()).await?;
+    let build_ms = t.elapsed().as_millis();
+    thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+    println!(
+        "[probe] lance cache after build: {:.1} MiB",
+        store.lance_cache_bytes() as f64 / 1024.0 / 1024.0
+    );
+    let rmm_mib = rowmap_file_bytes(cache.path()) as f64 / 1024.0 / 1024.0;
+    let rss_delta = sampler.current_kb().saturating_sub(rss_before) as f64 / 1024.0;
+    let pf_delta = sampler.current_pf_kb().saturating_sub(pf_before) as f64 / 1024.0;
+    phases.push(PhaseStats {
+        name: "build_rowmap",
+        queries: 0,
+        elapsed_ms: vec![build_ms],
+        rss_start_kb: rss_before,
+        rss_end_kb: sampler.current_kb(),
+        rss_phase_peak_kb: sampler.phase_peak_kb(),
+        rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb: pf_before,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: format!(
+            "{rmm_mib:.1} MiB .rmm on disk, build {build_ms}ms; mmap demand-paged (+{rss_delta:.1} MiB RSS / +{pf_delta:.1} MiB PF so far, file-backed -> reclaimable)"
+        ),
+    });
+
+    // LazyEmbedder: created but NOT loaded. Only the vector arm touches it; the
+    // fts phases run without it, which is what isolates pond's core footprint
+    // from the candle model. Idle threshold MAX keeps it resident once loaded,
+    // until we explicitly drop it for `idle_drained`.
+    let embedder = LazyEmbedder::candle().with_idle_threshold(Duration::MAX);
+
+    // ---- Attribution: isolate the retrieval arms ----
+    // pond_search runs `searchable_in_scope` (an IsNotNull(search_text) count)
+    // concurrently with the arms via try_join!, so the observed latency is
+    // max(scope_count, fts, vector). Time each alone to see the real floor.
+    // Exits before the normal phases.
+    if args.attribute {
+        let empty = Predicate::And(Vec::new());
+        let backend = embedder.get().await?;
+        // Warm each path once so steady-state cache state matches the phases.
+        store.searchable_in_scope(&empty).await?;
+        store.fts_search(QUERIES[0], 100, &empty).await?;
+        let warm_vec = backend.embed(&[QUERIES[0].to_string()])?;
+        store
+            .vector_search(
+                warm_vec.first().context("no warm vec")?,
+                100,
+                &empty,
+                Some(&cfg),
+            )
+            .await?;
+
+        let mut scope_ms = Vec::new();
+        let mut fts_ms = Vec::new();
+        let mut vec_ms = Vec::new();
+        for q in &queries {
+            let t = Instant::now();
+            store.searchable_in_scope(&empty).await?;
+            scope_ms.push(t.elapsed().as_millis());
+
+            let t = Instant::now();
+            store.fts_search(q, 100, &empty).await?;
+            fts_ms.push(t.elapsed().as_millis());
+
+            let v = backend.embed(&[(*q).to_string()])?;
+            let t = Instant::now();
+            store
+                .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                .await?;
+            vec_ms.push(t.elapsed().as_millis());
+        }
+        println!("\n=== attribution (isolated arm latency, ms) ===");
+        println!("{:<22}{:>8}{:>8}", "component", "p50", "p95");
+        for (name, v) in [
+            ("searchable_in_scope", &scope_ms),
+            ("fts_search", &fts_ms),
+            ("vector_search", &vec_ms),
+        ] {
+            println!(
+                "{name:<22}{:>8}{:>8}",
+                percentile(v, 0.5),
+                percentile(v, 0.95)
+            );
+        }
+        println!("raw scope_ms={scope_ms:?}");
+        println!("raw fts_ms={fts_ms:?}");
+        println!("raw vec_ms={vec_ms:?}");
+        return Ok(());
+    }
+
+    // ---- IO attribution: exact S3 GETs per warm query, per component ----
+    if args.io_trace {
+        use pond::substrate::io_trace;
+        let empty = Predicate::And(Vec::new());
+        let backend = embedder.get().await?;
+        // Warm every path so we measure a warm server's steady-state IO, not the
+        // one-time cold index/metadata load.
+        store.searchable_in_scope(&empty).await?;
+        store.fts_search(QUERIES[0], 100, &empty).await?;
+        let wv = backend.embed(&[QUERIES[0].to_string()])?;
+        store
+            .vector_search(wv.first().context("no warm vec")?, 100, &empty, Some(&cfg))
+            .await?;
+        let warm_hits = store.fts_search(QUERIES[0], 1, &empty).await?;
+        let get_id = warm_hits.first().map(|hit| hit.key.message_id.clone());
+        if let Some(id) = &get_id {
+            let _ = pond_get(&store, get_request(id.clone())).await;
+        }
+        let _ = pond_search(
+            &store,
+            &embedder,
+            search_request(QUERIES[0], SearchModeWire::Vector, args.limit),
+            &cfg,
+        )
+        .await;
+        io_trace::take(); // discard warm IO
+
+        let labels = [
+            "scope_count",
+            "fts_search",
+            "vector_search",
+            "pond_get",
+            "pond_search",
+        ];
+        let mut iops: [Vec<u128>; 5] = Default::default();
+        let mut rbytes: [Vec<u128>; 5] = Default::default();
+        #[cfg(feature = "io-trace")]
+        let mut hist: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new();
+
+        macro_rules! meas {
+            ($idx:expr, $body:expr) => {{
+                io_trace::take();
+                $body;
+                let s = io_trace::take().unwrap_or_default();
+                iops[$idx].push(u128::from(s.read_iops));
+                rbytes[$idx].push(u128::from(s.read_bytes));
+                #[cfg(feature = "io-trace")]
+                for r in &s.requests {
+                    let key = format!(
+                        "{:<14}{:>11}  {}",
+                        labels[$idx],
+                        r.method,
+                        io_bucket(&r.path.to_string())
+                    );
+                    let entry = hist.entry(key).or_insert((0u64, 0u64));
+                    entry.0 += 1;
+                    entry.1 += r.range.as_ref().map_or(0, |x| x.end - x.start);
+                }
+            }};
+        }
+
+        for q in &queries {
+            meas!(0, store.searchable_in_scope(&empty).await?);
+            meas!(1, store.fts_search(q, 100, &empty).await?);
+            let v = backend.embed(&[(*q).to_string()])?;
+            meas!(
+                2,
+                store
+                    .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                    .await?
+            );
+            if let Some(id) = &get_id {
+                meas!(3, {
+                    let _ = pond_get(&store, get_request(id.clone())).await;
+                });
+            }
+            // Full request: scope + arm + hydration. Hydration GETs are the
+            // remainder once the separately-measured arms are subtracted.
+            meas!(4, {
+                let _ = pond_search(
+                    &store,
+                    &embedder,
+                    search_request(q, SearchModeWire::Vector, args.limit),
+                    &cfg,
+                )
+                .await;
+            });
+        }
+
+        println!("\n=== S3 IO per warm query (component isolated) ===");
+        println!(
+            "{:<16}{:>10}{:>10}{:>13}{:>13}",
+            "component", "iops_p50", "iops_p95", "bytes_p50", "bytes_p95"
+        );
+        for i in 0..labels.len() {
+            if iops[i].is_empty() {
+                continue;
+            }
+            println!(
+                "{:<16}{:>10}{:>10}{:>13}{:>13}",
+                labels[i],
+                percentile(&iops[i], 0.5),
+                percentile(&iops[i], 0.95),
+                percentile(&rbytes[i], 0.5),
+                percentile(&rbytes[i], 0.95),
+            );
+        }
+        // Hydration = the full pond_search request minus its arms (scope_count +
+        // fts + vector); the remainder is message-meta + per-session-count reads.
+        // Derived from p50s (GET counts are additive per request, so the
+        // subtraction is exact at each percentile).
+        let hydration = |p: f64| {
+            percentile(&iops[4], p) as i128
+                - percentile(&iops[0], p) as i128
+                - percentile(&iops[1], p) as i128
+                - percentile(&iops[2], p) as i128
+        };
+        if !iops[4].is_empty() {
+            println!(
+                "{:<16}{:>10}{:>10}    (derived: pond_search - scope - fts - vector)",
+                "  hydration",
+                hydration(0.5),
+                hydration(0.95),
+            );
+        }
+        #[cfg(feature = "io-trace")]
+        {
+            println!(
+                "\n=== request breakdown (component / method / path-bucket -> reqs, bytes), summed over {} queries ===",
+                queries.len()
+            );
+            let mut rows: Vec<(String, (u64, u64))> = hist.into_iter().collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
+            for (key, (count, bytes)) in rows.into_iter().take(50) {
+                println!("{count:>6} reqs  {bytes:>11} B   {key}");
+            }
+        }
+        #[cfg(not(feature = "io-trace"))]
+        println!("(build with --features io-trace for the per-request path breakdown)");
+        return Ok(());
+    }
+
     let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // ---- Phase: fts_warm ----
@@ -836,7 +1122,7 @@ async fn main() -> Result<()> {
         embedder: &embedder,
         cfg: &cfg,
         sampler: &sampler,
-        mode: Some(SearchModeWire::Fts),
+        mode: SearchModeWire::Fts,
         queries: &warmup,
         limit: args.limit,
         record_hits: false,
@@ -845,14 +1131,14 @@ async fn main() -> Result<()> {
     .await
     .map(|s| phases.push(s))?;
 
-    // ---- Phase: fts_steady ----
+    // ---- Phase: fts_steady (pond's core read path - no embedder) ----
     run_search_phase(SearchPhase {
         name: "fts_steady",
         store: &store,
         embedder: &embedder,
         cfg: &cfg,
         sampler: &sampler,
-        mode: Some(SearchModeWire::Fts),
+        mode: SearchModeWire::Fts,
         queries: &queries,
         limit: args.limit,
         record_hits: true,
@@ -861,80 +1147,66 @@ async fn main() -> Result<()> {
     .await
     .map(|s| phases.push(s))?;
 
-    if !args.skip_hybrid {
-        // ---- Phase: first_hybrid ----
-        sampler.mark_phase_start();
-        let rss_start_kb = sampler.current_kb();
-        let pf_start_kb = sampler.current_pf_kb();
-        let request = search_request(QUERIES[0], Some(SearchModeWire::Hybrid), args.limit);
-        let t = Instant::now();
-        let envelope = pond_search(&store, &embedder, request, &cfg).await;
-        let first_ms = t.elapsed().as_millis();
-        if let SearchEnvelope::Error(error) = envelope {
-            anyhow::bail!("first_hybrid failed: {error:?}");
-        }
-        // Let the sampler catch the post-load steady state.
-        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-        phases.push(PhaseStats {
-            name: "first_hybrid",
-            queries: 1,
-            elapsed_ms: vec![first_ms],
-            rss_start_kb,
-            rss_end_kb: sampler.current_kb(),
-            rss_phase_peak_kb: sampler.phase_peak_kb(),
-            rss_global_peak_kb: sampler.peak_kb(),
-            pf_start_kb,
-            pf_end_kb: sampler.current_pf_kb(),
-            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-            pf_global_peak_kb: sampler.peak_pf_kb(),
-            notes: format!("first_call_ms={first_ms} (includes E5 model load)"),
-        });
-
-        // ---- Phase: hybrid_warm ----
-        run_search_phase(SearchPhase {
-            name: "hybrid_warm",
-            store: &store,
-            embedder: &embedder,
-            cfg: &cfg,
-            sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
-            queries: &warmup,
-            limit: args.limit,
-            record_hits: false,
-            hit_sink: &hit_sink,
-        })
-        .await
-        .map(|s| phases.push(s))?;
-
-        // ---- Phase: hybrid_steady ----
-        run_search_phase(SearchPhase {
-            name: "hybrid_steady",
-            store: &store,
-            embedder: &embedder,
-            cfg: &cfg,
-            sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
-            queries: &queries,
-            limit: args.limit,
-            record_hits: true,
-            hit_sink: &hit_sink,
-        })
-        .await
-        .map(|s| phases.push(s))?;
+    // ---- Phase: vector_first (the cold E5 model-load spike) ----
+    sampler.mark_phase_start();
+    let rss_start_kb = sampler.current_kb();
+    let pf_start_kb = sampler.current_pf_kb();
+    let request = search_request(QUERIES[0], SearchModeWire::Vector, args.limit);
+    let t = Instant::now();
+    let envelope = pond_search(&store, &embedder, request, &cfg).await;
+    let first_ms = t.elapsed().as_millis();
+    if let SearchEnvelope::Error(error) = envelope {
+        anyhow::bail!("vector_first failed: {error:?}");
     }
+    thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+    phases.push(PhaseStats {
+        name: "vector_first",
+        queries: 1,
+        elapsed_ms: vec![first_ms],
+        rss_start_kb,
+        rss_end_kb: sampler.current_kb(),
+        rss_phase_peak_kb: sampler.phase_peak_kb(),
+        rss_global_peak_kb: sampler.peak_kb(),
+        pf_start_kb,
+        pf_end_kb: sampler.current_pf_kb(),
+        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+        pf_global_peak_kb: sampler.peak_pf_kb(),
+        notes: format!("first_call_ms={first_ms} (includes E5 model load + vector index)"),
+    });
 
-    // ---- Phase: get_calls ----
+    // ---- Phase: vector_steady (the default arm) ----
+    run_search_phase(SearchPhase {
+        name: "vector_steady",
+        store: &store,
+        embedder: &embedder,
+        cfg: &cfg,
+        sampler: &sampler,
+        mode: SearchModeWire::Vector,
+        queries: &queries,
+        limit: args.limit,
+        record_hits: true,
+        hit_sink: &hit_sink,
+    })
+    .await
+    .map(|s| phases.push(s))?;
+
+    // ---- Phase: get_steady (pond_get hydration on prior hits) ----
     let ids: Vec<String> = {
         let guard = hit_sink.lock().unwrap();
         guard.iter().take(args.queries).cloned().collect()
     };
     if !ids.is_empty() {
-        run_get_phase("get_calls", &store, &sampler, &ids)
+        run_get_phase("get_steady", &store, &sampler, &ids)
             .await
             .map(|s| phases.push(s))?;
     }
 
-    // ---- Phase: idle ----
+    // ---- Phase: sql_steady (the pond_sql_query analytic tool) ----
+    run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
+        .await
+        .map(|s| phases.push(s))?;
+
+    // ---- Phase: idle / idle_drained ----
     if !args.skip_idle {
         sampler.mark_phase_start();
         let rss_start_kb = sampler.current_kb();
@@ -952,29 +1224,120 @@ async fn main() -> Result<()> {
             pf_end_kb: sampler.current_pf_kb(),
             pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
             pf_global_peak_kb: sampler.peak_pf_kb(),
-            notes: format!("slept {}s with no requests", args.idle_seconds),
+            notes: format!(
+                "slept {}s with no requests (model resident)",
+                args.idle_seconds
+            ),
+        });
+
+        // Drop the embedder to simulate `pond mcp`'s idle-unload of the candle
+        // model; the resident cache (mmap) stays. This is the resting floor a
+        // server settles to between bursts - pond's own footprint, model gone.
+        println!(
+            "[probe] lance cache at idle: {:.1} MiB",
+            store.lance_cache_bytes() as f64 / 1024.0 / 1024.0
+        );
+        drop(embedder);
+        sampler.mark_phase_start();
+        let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
+        thread::sleep(Duration::from_secs(args.idle_seconds));
+        phases.push(PhaseStats {
+            name: "idle_drained",
+            queries: 0,
+            elapsed_ms: vec![(args.idle_seconds * 1000) as u128],
+            rss_start_kb,
+            rss_end_kb: sampler.current_kb(),
+            rss_phase_peak_kb: sampler.phase_peak_kb(),
+            rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
+            notes: "embedder dropped; cache stays resident (pond resting floor)".to_owned(),
         });
     }
 
-    let global_peak_kb = sampler.finish();
-    let global_peak_mib = global_peak_kb as f64 / 1024.0;
-    #[allow(clippy::cast_precision_loss)]
-    let target_mib = args.target_mib as f64;
-    let pass = global_peak_mib <= target_mib;
+    let peak_rss = sampler.peak_kb() as f64 / 1024.0;
+    let peak_pf = sampler.peak_pf_kb() as f64 / 1024.0;
+    sampler.finish();
 
     println!();
     print_phase_header();
     for phase in &phases {
         print_phase_row(phase);
     }
+
+    // ---- Total memory, attributed by part (nothing subtracted away) ----
+    // PF (phys_footprint) is the macOS "Memory" number Jetsam enforces; RSS also
+    // counts the resident cache's file-backed mmap pages (reclaimable, so they
+    // are real RSS but ~free in PF). We report both at every line.
+    let mib = |kb: u64| kb as f64 / 1024.0;
+    let cold = find_phase(&phases, "cold_open");
+    let idle_model = find_phase(&phases, "idle");
+    let idle_drained = find_phase(&phases, "idle_drained");
+    let idle_floor_pf = idle_drained.map(|p| mib(p.pf_end_kb));
+
     println!();
     println!(
-        "PEAK RSS  {:.1} MiB   target {:.0} MiB   {}  (headroom: {:+.1} MiB)",
-        global_peak_mib,
-        target_mib,
-        if pass { "PASS" } else { "FAIL" },
-        target_mib - global_peak_mib,
+        "=== memory attribution (PF = macOS \"Memory\"/Jetsam; RSS also counts the cache mmap) ==="
     );
+    println!(
+        "  baseline (pre-pond)          PF {:>7.1}   RSS {:>7.1} MiB",
+        mib(baseline_pf_kb),
+        mib(baseline_kb),
+    );
+    if let Some(c) = cold {
+        println!(
+            "  + store open                 PF {:>+7.1}   RSS {:>+7.1} MiB",
+            mib(c.pf_end_kb) - mib(baseline_pf_kb),
+            mib(c.rss_end_kb) - mib(baseline_kb),
+        );
+    }
+    println!(
+        "  + resident meta cache        {rmm_mib:.1} MiB .rmm on disk, built {build_ms}ms (mmap; pages file-backed -> reclaimable, ~0 PF)"
+    );
+    if let Some(d) = idle_drained {
+        println!(
+            "  = idle floor (model off)     PF {:>7.1}   RSS {:>7.1} MiB   <- idle `pond mcp`",
+            mib(d.pf_end_kb),
+            mib(d.rss_end_kb),
+        );
+    }
+    if let (Some(i), Some(d)) = (idle_model, idle_drained) {
+        println!(
+            "  + candle E5 model (serving)  PF {:>+7.1}   RSS {:>+7.1} MiB   (lazy; vector arm only)",
+            mib(i.pf_end_kb) - mib(d.pf_end_kb),
+            mib(i.rss_end_kb) - mib(d.rss_end_kb),
+        );
+    }
+    println!("  = serving peak               PF {peak_pf:>7.1}   RSS {peak_rss:>7.1} MiB");
+
+    println!();
+    let idle_pass = match idle_floor_pf {
+        Some(floor) => {
+            let ok = floor <= args.idle_target_mib as f64;
+            println!(
+                "  idle target  < {:>4} MiB PF   {}   (idle floor {floor:.1} MiB, headroom {:+.1})",
+                args.idle_target_mib,
+                if ok { "PASS" } else { "FAIL" },
+                args.idle_target_mib as f64 - floor,
+            );
+            ok
+        }
+        None => {
+            println!("  idle target  skipped (--skip-idle; no idle floor measured)");
+            true
+        }
+    };
+    let peak_pass = peak_pf <= args.peak_target_mib as f64;
+    println!(
+        "  peak target  < {:>4} MiB PF   {}   (peak {peak_pf:.1} MiB, headroom {:+.1})",
+        args.peak_target_mib,
+        if peak_pass { "PASS" } else { "FAIL" },
+        args.peak_target_mib as f64 - peak_pf,
+    );
+    let pass = idle_pass && peak_pass;
 
     // JSON one-liner for diffing across runs.
     let json_phases: Vec<_> = phases
@@ -983,10 +1346,10 @@ async fn main() -> Result<()> {
             serde_json::json!({
                 "phase": p.name,
                 "n": p.queries,
-                "rss_start_mib": p.rss_start_kb as f64 / 1024.0,
                 "rss_end_mib": p.rss_end_kb as f64 / 1024.0,
                 "rss_phase_peak_mib": p.rss_phase_peak_kb as f64 / 1024.0,
-                "rss_global_peak_mib": p.rss_global_peak_kb as f64 / 1024.0,
+                "pf_end_mib": p.pf_end_kb as f64 / 1024.0,
+                "pf_phase_peak_mib": p.pf_phase_peak_kb as f64 / 1024.0,
                 "p50_ms": p.p50(),
                 "p95_ms": p.p95(),
                 "max_ms": p.max(),
@@ -995,119 +1358,23 @@ async fn main() -> Result<()> {
         })
         .collect();
     let json = serde_json::json!({
-        "data_dir": data_dir.display().to_string(),
+        "store": target_label(&target),
         "queries_per_phase": args.queries,
-        "target_mib": args.target_mib,
-        "baseline_mib": baseline_kb as f64 / 1024.0,
-        "peak_mib": global_peak_mib,
+        "rowmap_mib": rmm_mib,
+        "build_rowmap_ms": build_ms,
+        "idle_floor_pf_mib": idle_floor_pf,
+        "peak_pf_mib": peak_pf,
+        "peak_rss_mib": peak_rss,
+        "idle_target_mib": args.idle_target_mib,
+        "peak_target_mib": args.peak_target_mib,
         "pass": pass,
         "phases": json_phases,
     });
+    println!();
     println!("JSON {json}");
 
     if !pass {
         std::process::exit(1);
     }
-    Ok(())
-}
-
-/// Sweep `(metadata, index)` Lance cache caps across a fixed MiB grid and
-/// print peak RSS + p50 / p95 hybrid latency for each. Used to calibrate the
-/// `[runtime]` defaults against a real corpus (`docs/plans/mcp-memory-budget.md`
-/// Q5). The E5 embedder loads once and is reused across grid points so the
-/// model-load spike is not double-counted.
-async fn run_cap_sweep(args: &Args, data_dir: &std::path::Path) -> Result<()> {
-    const SWEEP_MIB: &[u64] = &[32, 64, 128, 256, 512, 1024];
-
-    println!("=== pond serve-mem bench: --cap-sweep ===");
-    println!("data_dir         {}", data_dir.display());
-    println!(
-        "queries/phase    {} (warmup={}, limit={})",
-        args.queries, args.warmup, args.limit
-    );
-    println!();
-    println!(
-        "{:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}",
-        "meta_MiB", "index_MiB", "peak_MiB", "steady_MiB", "p50_ms", "p95_ms",
-    );
-    println!("{}", "-".repeat(70));
-
-    let cfg = SearchConfig::default();
-    let queries: Vec<&str> = QUERIES.iter().copied().take(args.queries).collect();
-    let warmup: Vec<&str> = QUERIES.iter().copied().cycle().take(args.warmup).collect();
-    let embedder = LazyEmbedder::candle();
-    let hit_sink: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-
-    for &mib in SWEEP_MIB {
-        let bytes = (mib as usize) * 1024 * 1024;
-        let caps = RuntimeCaps {
-            index_cache_bytes: Some(bytes),
-            metadata_cache_bytes: Some(bytes),
-        };
-
-        let sampler = RssSampler::start(Duration::from_millis(args.rss_interval_ms));
-        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-        let url = pond::config::url_for_path(data_dir)?;
-        let store = Store::open_with_options(&url, Default::default(), caps).await?;
-
-        run_search_phase(SearchPhase {
-            name: "warm",
-            store: &store,
-            embedder: &embedder,
-            cfg: &cfg,
-            sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
-            queries: &warmup,
-            limit: args.limit,
-            record_hits: false,
-            hit_sink: &hit_sink,
-        })
-        .await?;
-        let steady = run_search_phase(SearchPhase {
-            name: "steady",
-            store: &store,
-            embedder: &embedder,
-            cfg: &cfg,
-            sampler: &sampler,
-            mode: Some(SearchModeWire::Hybrid),
-            queries: &queries,
-            limit: args.limit,
-            record_hits: false,
-            hit_sink: &hit_sink,
-        })
-        .await?;
-
-        let peak_mib = sampler.peak_kb() as f64 / 1024.0;
-        let steady_mib = steady.rss_end_kb as f64 / 1024.0;
-        sampler.finish();
-        drop(store);
-
-        println!(
-            "{:>10}  {:>10}  {:>10.1}  {:>10.1}  {:>8}  {:>8}",
-            mib,
-            mib,
-            peak_mib,
-            steady_mib,
-            steady.p50(),
-            steady.p95(),
-        );
-        rows.push(serde_json::json!({
-            "metadata_mib": mib,
-            "index_mib": mib,
-            "peak_mib": peak_mib,
-            "steady_mib": steady_mib,
-            "p50_ms": steady.p50(),
-            "p95_ms": steady.p95(),
-        }));
-    }
-
-    let json = serde_json::json!({
-        "mode": "cap_sweep",
-        "data_dir": data_dir.display().to_string(),
-        "rows": rows,
-    });
-    println!();
-    println!("JSON {json}");
     Ok(())
 }

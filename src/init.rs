@@ -1,6 +1,6 @@
 //! `pond init`: the idempotent setup-and-repair wizard.
 //!
-//! One pass over four sections - storage, sources, MCP registration, sync
+//! One pass over four sections - storage, adapters, MCP registration, sync
 //! schedule - then a single `config.toml` write at the end. Every section is
 //! answerable by a flag for non-interactive use; re-running against an
 //! existing setup proposes only what would change. Bin-only module: the
@@ -21,18 +21,11 @@ use crate::schedule::{self, ScheduleEvery};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InitArgs {
-    /// Storage destination to write into config (skips the storage prompt).
-    ///
-    /// Unlike other commands, `POND_STORAGE_PATH` is not read here: init
-    /// writes config, and folding the env var in would silently persist
-    /// ephemeral state.
-    #[arg(long, value_parser = crate::parse_storage_path, value_name = "URL")]
-    storage_path: Option<StorageUrl>,
-    /// Comma-separated adapter names to enable (skips the source picker).
+    /// Comma-separated adapter names to enable (skips the adapter picker).
     #[arg(long, value_delimiter = ',', value_name = "NAMES")]
     adapters: Option<Vec<String>>,
     /// Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules.
-    #[arg(long, value_enum, value_name = "EVERY")]
+    #[arg(long = "every", value_enum, value_name = "EVERY")]
     schedule: Option<ScheduleEvery>,
     /// Skip MCP registration.
     #[arg(long)]
@@ -43,9 +36,6 @@ pub(crate) struct InitArgs {
     /// Ignore existing config values and start from built-in defaults.
     #[arg(long)]
     force: bool,
-    /// Config file to write (default: `~/.config/pond/config.toml`).
-    #[arg(long, env = "POND_CONFIG", hide_env_values = true, value_name = "PATH")]
-    config: Option<PathBuf>,
 }
 
 /// The stock clack theme, except a cancelled prompt's footer renders as a
@@ -83,17 +73,27 @@ fn wiz<T>(result: std::io::Result<T>) -> Result<T> {
     }
 }
 
-pub(crate) async fn run(args: InitArgs) -> Result<()> {
-    let config_file = crate::config_path(args.config.clone());
+pub(crate) async fn run(
+    args: InitArgs,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> Result<()> {
+    let config_file = crate::config_path(config);
+    // init writes config, so an env-sourced storage path would silently persist
+    // ephemeral state. Honor `--storage-path` only when it came from argv, not
+    // from `POND_STORAGE_PATH` (the global flag's env mirror).
+    let storage_path = storage_path.filter(|_| {
+        std::env::args().any(|a| a == "--storage-path" || a.starts_with("--storage-path="))
+    });
     let interactive = std::io::stdin().is_terminal();
-    let any_flag = args.storage_path.is_some()
+    let any_flag = storage_path.is_some()
         || args.adapters.is_some()
         || args.schedule.is_some()
         || args.skip_mcp;
     if !interactive && !args.yes && !any_flag {
         bail!(
             "stdin is not a terminal; run `pond init --yes` to accept defaults, or answer \
-             sections with --storage-path / --adapters / --schedule"
+             sections with --storage-path / --adapters / --every"
         );
     }
     // With any flag (or --yes) present, unflagged sections take defaults
@@ -148,7 +148,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
                         "the old endpoint folds the bucket into the hostname; add the bucket and prefix to the URL below: s3+https://<host>/<bucket>/<prefix>",
                     )?;
                 }
-            } else if args.storage_path.is_none() && !usable {
+            } else if storage_path.is_none() && !usable {
                 // Non-interactive and the bucket can't be derived: bail with the
                 // fix instead of re-raising the recipe (which would point back at
                 // `pond init`, the command already running - a loop).
@@ -160,6 +160,15 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
         }
         None => None,
     };
+
+    // ---- repair: pre-rename [sources.*] adapter map -> [adapters.*] ---------
+    let migrated_adapters = rewrite_legacy_sources(&mut doc);
+    if !migrated_adapters.is_empty() {
+        cliclack::log::info(format!(
+            "migrated [sources.*] -> [adapters.*]: {}",
+            migrated_adapters.join(", "),
+        ))?;
+    }
 
     // ---- storage -----------------------------------------------------------
     let default_storage = if args.force {
@@ -176,7 +185,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
             })
             .unwrap_or_else(platform_default_storage)
     };
-    let chosen = pick_storage(&args, &doc, &default_storage, prompts).await?;
+    let chosen = pick_storage(storage_path.as_ref(), &mut doc, &default_storage, prompts).await?;
     let chosen_display = crate::storage_config_value(&chosen);
     let current_path = doc
         .get("storage")
@@ -190,9 +199,9 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
         crate::set_storage_path(&mut doc, &chosen_display);
     }
 
-    // ---- sources -----------------------------------------------------------
-    let rows = source_rows(&doc, args.force);
-    let picked = pick_sources(&args, &rows, prompts)?;
+    // ---- adapters ----------------------------------------------------------
+    let rows = adapter_rows(&doc, args.force);
+    let picked = pick_adapters(&args, &rows, prompts)?;
     let mut fresh_accepts: Vec<Candidate> = Vec::new();
     let mut fresh_declines: Vec<&str> = Vec::new();
     for row in &rows {
@@ -209,7 +218,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
             }
             RowState::Configured { enabled } => {
                 if *enabled != want {
-                    doc["sources"][row.name.as_str()]["enabled"] = value(want);
+                    doc["adapters"][row.name.as_str()]["enabled"] = value(want);
                 }
             }
         }
@@ -265,7 +274,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
         .map(|row| row.name.as_str())
         .collect();
     plan.push_str(&format!(
-        "\nsources    {}",
+        "\nadapters   {}",
         if enabled.is_empty() {
             "(none)".to_owned()
         } else {
@@ -297,8 +306,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        std::fs::write(&config_file, &new_text)
-            .with_context(|| format!("failed to write {}", config_file.display()))?;
+        crate::config::write_config_file(&config_file, &new_text)?;
     }
 
     // External side effects (MCP registration, OS-scheduler registration) run
@@ -376,17 +384,18 @@ fn structural_error(url: &StorageUrl) -> Option<String> {
 /// instead - a file collision is permanent, so it is a hard reject with no
 /// keep-anyway escape.
 async fn pick_storage(
-    args: &InitArgs,
-    doc: &DocumentMut,
+    storage_path: Option<&StorageUrl>,
+    doc: &mut DocumentMut,
     default: &str,
     prompts: bool,
 ) -> Result<StorageUrl> {
     // Creds for the probe come from the in-progress document (plus the
-    // POND_* env mirror) - nothing has been written yet.
-    let creds = Config::load_str(&doc.to_string())
+    // POND_* env mirror) - nothing has been written yet. Mutable because an
+    // inline capture below can add `[creds.default]` and re-probe.
+    let mut creds = Config::load_str(&doc.to_string())
         .map(|config| config.creds)
         .unwrap_or_default();
-    if let Some(chosen) = args.storage_path.clone() {
+    if let Some(chosen) = storage_path.cloned() {
         if let Some(reason) = structural_error(&chosen) {
             bail!(
                 "--storage-path {}: {reason}; pick a directory",
@@ -396,10 +405,30 @@ async fn pick_storage(
         if !chosen.is_local()
             && let Err(reason) = probe_destination(&chosen, &creds).await
         {
-            bail!(
-                "--storage-path {} failed the end-to-end check: {reason}; fix the creds (define [creds.default] or POND_CREDS_DEFAULT_*) or pick another destination",
-                chosen.display(),
-            );
+            // On a TTY, offer to capture credentials inline and re-probe - so
+            // `pond init --storage-path <bucket>` is one-command remote setup
+            // rather than a bail telling you to add creds elsewhere first.
+            if prompts
+                && wiz(cliclack::confirm(format!(
+                    "{} failed the check ({reason}). Enter credentials for it now?",
+                    chosen.display()
+                ))
+                .initial_value(true)
+                .interact())?
+            {
+                creds = capture_default_creds(doc)?;
+                if let Err(reason) = probe_destination(&chosen, &creds).await {
+                    bail!(
+                        "--storage-path {} still failed after entering credentials: {reason}",
+                        chosen.display()
+                    );
+                }
+            } else {
+                bail!(
+                    "--storage-path {} failed the end-to-end check: {reason}; add credentials with `pond creds add` (or POND_CREDS_DEFAULT_*), then re-run",
+                    chosen.display(),
+                );
+            }
         }
         return Ok(chosen);
     }
@@ -493,6 +522,11 @@ async fn pick_storage(
                 ))?;
                 let action = wiz(cliclack::select("What now?")
                     .item(
+                        'c',
+                        "Enter credentials for this destination",
+                        "saved as [creds.default]",
+                    )
+                    .item(
                         'l',
                         format!("Store locally instead ({local})"),
                         "safe default",
@@ -505,6 +539,18 @@ async fn pick_storage(
                     )
                     .interact())?;
                 match action {
+                    'c' => {
+                        creds = capture_default_creds(doc)?;
+                        match probe_destination(&chosen, &creds).await {
+                            Ok(()) => return Ok(chosen),
+                            Err(reason) => {
+                                cliclack::log::warning(format!(
+                                    "still failing with those credentials: {reason}"
+                                ))?;
+                                prefill = Some(text);
+                            }
+                        }
+                    }
                     'l' => {
                         return StorageUrl::parse(&local).with_context(|| {
                             format!("platform default storage path {local:?} does not parse")
@@ -516,6 +562,27 @@ async fn pick_storage(
             }
         }
     }
+}
+
+/// Capture an access key + hidden secret and write them as `[creds.default]`
+/// (the catch-all set) into the in-progress doc, returning the refreshed creds
+/// map for an immediate re-probe. init's one inline credential path - the
+/// secret comes from a masked prompt, never argv (spec.md#storage-redaction).
+fn capture_default_creds(doc: &mut DocumentMut) -> Result<BTreeMap<String, CredsSet>> {
+    let access_key_id: String = wiz(cliclack::input("Access key ID").interact())?;
+    let secret_access_key: String =
+        wiz(cliclack::password("Secret access key").mask('*').interact())?;
+    crate::set_creds_set(
+        doc,
+        "default",
+        &access_key_id,
+        &secret_access_key,
+        None,
+        None,
+    );
+    Ok(Config::load_str(&doc.to_string())
+        .map(|config| config.creds)
+        .unwrap_or_default())
 }
 
 /// End-to-end probe (same primitive as `pond storage check`) with a wizard
@@ -551,19 +618,19 @@ enum RowState {
     Fresh(Candidate),
 }
 
-struct SourceRow {
+struct AdapterRow {
     name: String,
     hint: String,
     state: RowState,
     preselected: bool,
 }
 
-/// Union of configured `[sources.*]` entries and fresh probe candidates, in
+/// Union of configured `[adapters.*]` entries and fresh probe candidates, in
 /// registry order (configured-but-unknown names append at the end so they
 /// are never silently dropped). `force` resets preselection to "what the
 /// probe detects", ignoring saved enables/declines.
-fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
-    let configured = doc.get("sources").and_then(Item::as_table_like);
+fn adapter_rows(doc: &DocumentMut, force: bool) -> Vec<AdapterRow> {
+    let configured = doc.get("adapters").and_then(Item::as_table_like);
     let candidates = adapter::discover(None);
     let candidate_for = |name: &str| candidates.iter().find(|c| c.name == name);
     let mut rows = Vec::new();
@@ -586,14 +653,14 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
                     .map(|path| config::contract_home(Path::new(path)).display().to_string())
                     .or_else(|| candidate.map(|c| c.hint.clone()))
                     .unwrap_or_default();
-                rows.push(SourceRow {
+                rows.push(AdapterRow {
                     name: name.to_owned(),
                     hint,
                     state: RowState::Configured { enabled },
                     preselected: if force { candidate.is_some() } else { enabled },
                 });
             }
-            (None, Some(candidate)) => rows.push(SourceRow {
+            (None, Some(candidate)) => rows.push(AdapterRow {
                 name: name.to_owned(),
                 hint: candidate.hint.clone(),
                 state: RowState::Fresh(candidate.clone()),
@@ -612,7 +679,7 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
                 .and_then(|t| t.get("enabled"))
                 .and_then(Item::as_bool)
                 .unwrap_or(false);
-            rows.push(SourceRow {
+            rows.push(AdapterRow {
                 name: name.to_owned(),
                 hint: "(unknown adapter)".to_owned(),
                 state: RowState::Configured { enabled },
@@ -623,10 +690,10 @@ fn source_rows(doc: &DocumentMut, force: bool) -> Vec<SourceRow> {
     rows
 }
 
-/// Resolve the sources section: `--adapters` list (validated against known
+/// Resolve the adapters section: `--adapters` list (validated against known
 /// names and against what is actually detectable) > interactive multiselect
 /// (zero picks allowed) > the preselection defaults.
-fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Vec<String>> {
+fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<Vec<String>> {
     if let Some(requested) = &args.adapters {
         let known = adapter::known_names();
         for name in requested {
@@ -635,14 +702,14 @@ fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Ve
             }
             if !rows.iter().any(|row| &row.name == name) {
                 bail!(
-                    "adapter {name:?} was not detected on this machine and has no [sources.{name}] entry; pass a path via `pond sync {name} --source-dir <path>` or add the section manually"
+                    "adapter {name:?} was not detected on this machine and has no [adapters.{name}] entry; pass a path via `pond sync {name} --path <path>` or add the section manually"
                 );
             }
         }
         return Ok(requested.clone());
     }
     if rows.is_empty() {
-        cliclack::log::info("sources: none detected - add [sources.<adapter>] entries manually")?;
+        cliclack::log::info("adapters: none detected - add [adapters.<adapter>] entries manually")?;
         return Ok(Vec::new());
     }
     if !prompts {
@@ -652,7 +719,7 @@ fn pick_sources(args: &InitArgs, rows: &[SourceRow], prompts: bool) -> Result<Ve
             .map(|row| row.name.clone())
             .collect());
     }
-    let mut picker = cliclack::multiselect("Which sources should pond sync?")
+    let mut picker = cliclack::multiselect("Which adapters should pond sync?")
         .required(false)
         .initial_values(
             rows.iter()
@@ -866,6 +933,43 @@ fn legacy_url_guess(legacy: &LegacyStorage) -> Option<String> {
     }
 }
 
+/// Repair: the adapter config map was renamed `[sources.*]` -> `[adapters.*]`.
+/// Move any legacy `[sources.<name>]` entry to `[adapters.<name>]`, preserving
+/// values and comments and never clobbering an already-migrated entry; drop the
+/// emptied `sources` table. Returns the moved names (empty when there is nothing
+/// to migrate). Transitional - delete once live configs have migrated.
+fn rewrite_legacy_sources(doc: &mut DocumentMut) -> Vec<String> {
+    let names: Vec<String> = match doc.get("sources").and_then(Item::as_table) {
+        Some(table) => table.iter().map(|(name, _)| name.to_owned()).collect(),
+        None => return Vec::new(),
+    };
+    if !doc.contains_key("adapters") {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        doc.insert("adapters", Item::Table(table));
+    }
+    let mut moved = Vec::new();
+    for name in names {
+        let already = doc
+            .get("adapters")
+            .and_then(Item::as_table)
+            .is_some_and(|table| table.contains_key(&name));
+        let entry = doc
+            .get_mut("sources")
+            .and_then(Item::as_table_mut)
+            .and_then(|table| table.remove(&name));
+        if let Some(entry) = entry
+            && !already
+            && let Some(adapters) = doc.get_mut("adapters").and_then(Item::as_table_mut)
+        {
+            adapters.insert(&name, entry);
+            moved.push(name);
+        }
+    }
+    doc.remove("sources");
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -875,7 +979,7 @@ mod tests {
     #[test]
     fn legacy_rewrite_moves_keys_and_prefills_the_url() {
         let mut doc: DocumentMut = r#"
-[sources.claude-code]
+[adapters.claude-code]
 enabled = true
 path = "/srv/claude"
 
@@ -891,7 +995,7 @@ AWS_ENDPOINT = "https://nbg1.example.com"
         let prefill = apply_legacy_rewrite(&mut doc, &legacy);
         assert_eq!(prefill.as_deref(), Some("s3+https://nbg1.example.com/"));
         let body = doc.to_string();
-        // Keys moved, region dropped, sources untouched.
+        // Keys moved, region dropped, adapters untouched.
         assert!(body.contains("[creds.default]"), "got: {body}");
         assert!(body.contains("access_key_id = \"AKIA123\""), "got: {body}");
         assert!(!body.contains("AWS_ACCESS_KEY_ID"), "got: {body}");
@@ -899,9 +1003,45 @@ AWS_ENDPOINT = "https://nbg1.example.com"
             !body.contains("nbg1\""),
             "region must not carry over: {body}"
         );
-        assert!(body.contains("[sources.claude-code]"), "got: {body}");
+        assert!(body.contains("[adapters.claude-code]"), "got: {body}");
         // The rewritten doc now loads under the new schema.
         Config::load_str(&body).expect("rewritten config loads");
+    }
+
+    #[test]
+    fn rewrite_legacy_sources_renames_the_adapter_map() {
+        let mut doc: DocumentMut = r#"
+[sources.claude-code]
+enabled = true
+path = "/srv/claude"
+
+[sources.codex-cli]
+enabled = false
+
+[storage]
+path = "/srv/pond"
+"#
+        .parse()
+        .unwrap();
+        let moved = rewrite_legacy_sources(&mut doc);
+        assert_eq!(moved, vec!["claude-code", "codex-cli"]);
+        let body = doc.to_string();
+        assert!(!body.contains("[sources."), "legacy block removed: {body}");
+        assert!(body.contains("[adapters.claude-code]"), "got: {body}");
+        assert!(body.contains("[adapters.codex-cli]"), "got: {body}");
+        // Values and untouched sections survive the move.
+        assert!(
+            body.contains("path = \"/srv/claude\""),
+            "values preserved: {body}"
+        );
+        assert!(
+            body.contains("[storage]"),
+            "other sections untouched: {body}"
+        );
+        // Idempotent: nothing left to migrate on a second pass.
+        assert!(rewrite_legacy_sources(&mut doc).is_empty());
+        // The migrated config loads under the new schema.
+        Config::load_str(&doc.to_string()).expect("migrated config loads");
     }
 
     #[test]

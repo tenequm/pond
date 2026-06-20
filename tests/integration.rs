@@ -7,12 +7,12 @@
 
 #[path = "integration/adapter/mod.rs"]
 mod adapter;
+#[path = "integration/copy.rs"]
+mod copy;
 #[path = "integration/embed.rs"]
 mod embed;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
-#[path = "integration/migrate.rs"]
-mod migrate;
 #[path = "integration/optimize_under_contention.rs"]
 mod optimize_under_contention;
 #[path = "integration/recovery.rs"]
@@ -29,6 +29,8 @@ mod session_scoped_pk;
 mod sql;
 #[path = "integration/store_concurrency.rs"]
 mod store_concurrency;
+#[path = "integration/sync.rs"]
+mod sync;
 #[path = "integration/transport_http.rs"]
 mod transport_http;
 #[path = "integration/transport_mcp.rs"]
