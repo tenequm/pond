@@ -18,7 +18,9 @@
 //! [DictEntry; agent] | [DictEntry; role] | [BlockEntry] | blob`. Records are
 //! sorted by `row_id` (binary search); a row's block is `record_index /
 //! BLOCK_ROWS`. The blob holds the compressed `search_text` blocks, then per-row
-//! `{32-byte header + message_id}`, then the dict value bytes.
+//! `{32-byte header + message_id}`, then per-session `session_id` bytes, then the
+//! dict value bytes. Each session entry also carries its max message timestamp,
+//! the watermark the `pond sync` skip oracle compares against the source.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -30,7 +32,7 @@ use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
 use memmap2::Mmap;
 
-const MAGIC: [u8; 8] = *b"PONDRMM4";
+const MAGIC: [u8; 8] = *b"PONDRMM5";
 const BLOCK_ROWS: usize = 256;
 const ZSTD_LEVEL: i32 = 3;
 
@@ -70,6 +72,7 @@ struct Record {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SessionEntry {
     sid_off: u64,
+    max_ts_micros: i64,
     sid_len: u32,
     count: u32,
 }
@@ -160,13 +163,24 @@ impl RowMetaMap {
     pub fn build(path: &Path, version: u64, mut entries: Vec<RowMetaEntry>) -> Result<()> {
         entries.sort_unstable_by_key(|entry| entry.row_id);
 
-        let mut session_counts: HashMap<&str, u32> = HashMap::new();
+        // Per session: message count plus the max message timestamp - the
+        // watermark the sync skip oracle compares against the source's latest
+        // message timestamp (spec.md#adapters; deterministic, rebuilt from the
+        // store, no local cursor).
+        let mut session_agg: HashMap<&str, (u32, i64)> = HashMap::new();
         for entry in &entries {
-            *session_counts.entry(entry.session_id.as_str()).or_default() += 1;
+            let agg = session_agg
+                .entry(entry.session_id.as_str())
+                .or_insert((0, i64::MIN));
+            agg.0 += 1;
+            agg.1 = agg.1.max(entry.timestamp_micros);
         }
-        let mut sessions: Vec<(&str, u32)> = session_counts.into_iter().collect();
+        let mut sessions: Vec<(&str, u32, i64)> = session_agg
+            .into_iter()
+            .map(|(sid, (count, max_ts))| (sid, count, max_ts))
+            .collect();
         sessions.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        let session_index = index_of(sessions.iter().map(|(value, _)| *value));
+        let session_index = index_of(sessions.iter().map(|(value, _, _)| *value));
 
         let projects = distinct_sorted(entries.iter().map(|entry| entry.project.as_str()));
         let project_index = index_of(projects.iter().copied());
@@ -219,11 +233,12 @@ impl RowMetaMap {
 
         let session_entries = sessions
             .iter()
-            .map(|(sid, count)| {
+            .map(|(sid, count, max_ts_micros)| {
                 let off = blob.len() as u64;
                 blob.extend_from_slice(sid.as_bytes());
                 Ok(SessionEntry {
                     sid_off: off,
+                    max_ts_micros: *max_ts_micros,
                     sid_len: u32::try_from(sid.len()).context("session_id too long")?,
                     count: *count,
                 })
@@ -543,6 +558,17 @@ impl RowMetaMap {
         Some(entries[idx].count as usize)
     }
 
+    /// Max message timestamp (micros) stored for `session_id` - the watermark the
+    /// sync skip oracle compares against the source's latest message timestamp.
+    /// `None` if the session is not in this map.
+    pub fn lookup_max_ts(&self, session_id: &str) -> Option<i64> {
+        let entries = self.session_entries();
+        let idx = entries
+            .binary_search_by(|entry| self.blob_str(entry.sid_off, entry.sid_len).cmp(session_id))
+            .ok()?;
+        Some(entries[idx].max_ts_micros)
+    }
+
     /// Slice `len` UTF-8 bytes at `*at`, advancing `*at`. Checked so a corrupt
     /// map yields `None` (-> take fallback), not a panic.
     fn slice_str(&self, at: &mut usize, len: usize) -> Option<&str> {
@@ -648,6 +674,12 @@ impl RowMetaSet {
         self.segments.len().saturating_sub(1)
     }
 
+    /// No rows in any segment - the first-ingest hint that lets the sync oracle
+    /// short-circuit the per-session source last-id read.
+    pub fn is_empty(&self) -> bool {
+        self.segments.iter().all(RowMetaMap::is_empty)
+    }
+
     /// Newest segment wins (a row lives in exactly one segment).
     pub fn lookup(&self, row_id: u64) -> Option<(&str, &str)> {
         self.segments
@@ -705,6 +737,16 @@ impl RowMetaSet {
             }
         }
         found.then_some(total)
+    }
+
+    /// Max message timestamp (micros) for `session_id` across the chain - the max
+    /// over every segment that holds it (a session's rows can be split across
+    /// base and deltas). `None` if no segment has it.
+    pub fn lookup_max_ts(&self, session_id: &str) -> Option<i64> {
+        self.segments
+            .iter()
+            .filter_map(|seg| seg.lookup_max_ts(session_id))
+            .max()
     }
 
     /// Every row across all segments, newest-segment-wins on `row_id`
@@ -821,6 +863,26 @@ mod tests {
         assert_eq!(map.lookup_count("sess-a"), Some(2));
         assert_eq!(map.lookup_count("sess-b/agent-x"), Some(1));
         assert_eq!(map.lookup_count("missing"), None);
+
+        // Watermark = max timestamp: sess-a's msg-3 (ts 3000) over msg-1.
+        assert_eq!(map.lookup_max_ts("sess-a"), Some(3_000));
+        assert_eq!(map.lookup_max_ts("sess-b/agent-x"), Some(2_000));
+        assert_eq!(map.lookup_max_ts("missing"), None);
+    }
+
+    #[test]
+    fn max_ts_is_the_session_high_water_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = RowMetaMap::path_for(dir.path(), "ts", 1);
+        // Out-of-row-order timestamps: the max wins regardless of row order.
+        let entries = vec![
+            entry(1, "s", "msg-a", 5_000, "a"),
+            entry(2, "s", "msg-b", 9_000, "b"),
+            entry(3, "s", "msg-c", 7_000, "c"),
+        ];
+        RowMetaMap::build(&path, 1, entries).unwrap();
+        let map = RowMetaMap::open(&path).unwrap();
+        assert_eq!(map.lookup_max_ts("s"), Some(9_000));
     }
 
     #[test]
@@ -894,6 +956,12 @@ mod tests {
         assert_eq!(set.lookup_count("sess-c"), Some(1));
         assert_eq!(set.lookup_count("missing"), None);
 
+        // Max timestamp across segments: sess-a spans base (ts<=2) + delta (ts 4).
+        assert_eq!(set.lookup_max_ts("sess-a"), Some(4));
+        assert_eq!(set.lookup_max_ts("sess-b"), Some(3));
+        assert_eq!(set.lookup_max_ts("sess-c"), Some(5));
+        assert_eq!(set.lookup_max_ts("missing"), None);
+
         // Compaction input: all 5 distinct rows reconstructed.
         let mut merged = set.merged_entries();
         merged.sort_by_key(|entry| entry.row_id);
@@ -913,5 +981,6 @@ mod tests {
         assert_eq!(map.lookup(0), None);
         assert!(map.lookup_meta(0, &mut None).is_none());
         assert_eq!(map.lookup_count("anything"), None);
+        assert_eq!(map.lookup_max_ts("anything"), None);
     }
 }

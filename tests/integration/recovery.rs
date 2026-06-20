@@ -136,17 +136,16 @@ async fn verify_bypasses_the_freshness_skip_and_re_reads_every_session() -> anyh
     .await?;
     assert!(first.sessions_inserted > 0, "fixtures must yield sessions");
 
-    // Skip-everything oracle: claim pond wrote every session in the far
-    // future, newer than any source mtime, so a normal sync skips them all.
-    let future = chrono::Utc::now() + chrono::Duration::days(3650);
-    let skip_all: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = store
-        .session_ids()
-        .await?
-        .into_iter()
-        .map(|id| (id, future))
-        .collect();
+    // Skip-everything oracle: a far-future watermark, newer than any source
+    // message timestamp, so a normal sync skips every session.
+    struct SkipAll;
+    impl pond::adapter::SkipOracle for SkipAll {
+        fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+            Some(i64::MAX)
+        }
+    }
     let skipped =
-        ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), &skip_all, |_| {}).await?;
+        ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), &SkipAll, |_| {}).await?;
     assert_eq!(
         skipped.sessions_inserted, 0,
         "a future watermark must insert nothing"

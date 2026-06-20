@@ -18,7 +18,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 
@@ -147,46 +146,56 @@ pub trait Adapter: Send + Sync {
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a>;
 }
 
-/// Per-session watermark lookup: when did pond last write this session?
-/// Backed by Lance's `_row_last_updated_at_version` joined to the manifest
-/// commit timestamp (spec.md#adapters). Adapter compares this to the source
-/// file's mtime to decide whether to re-decode.
+/// Store-side freshness watermark: the max message timestamp (micros) pond
+/// already holds for a session. Backed by the resident row-meta map (zero S3 -
+/// see [`crate::rowmap`]), which is itself rebuilt from the store, so the check
+/// is deterministic with no local cursor to desync. `None` means pond has never
+/// seen the session, or the resident map is behind the store - either way the
+/// caller re-reads.
+///
+/// The skip is sound because pond and every source are append-only: a session's
+/// max message timestamp only advances as it gains messages. The one residual is
+/// two messages sharing the exact micros across a sync boundary (negligible at
+/// sub-second precision, self-healing once any newer message arrives); `pond sync
+/// --verify` (which passes [`NoopOracle`]) is the full-re-read backstop.
 pub trait SkipOracle: Send + Sync {
-    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>>;
+    fn session_max_ts(&self, session_id: &str) -> Option<i64>;
 
-    /// Fast-path hint: the oracle has no watermarks at all (first ingest or
-    /// `NoopOracle`). Lets adapters skip the per-file work needed to ask
-    /// `last_ingested_at` - typically the JSONL header peek + driver parse.
-    /// Defaults to `false` so existing oracles stay correct without changes.
+    /// Fast-path hint: the oracle has no entries at all (first ingest or
+    /// `NoopOracle`). Lets adapters skip the per-session work needed to read the
+    /// source's latest message timestamp. Defaults to `false`.
     fn is_empty(&self) -> bool {
         false
     }
 }
 
-/// `SkipOracle` that always returns `None`. Used by tests and benches that
-/// don't want skip behavior interfering with their assertions.
+/// Seam decision rule - the only place the freshness comparison lives. A session
+/// is fresh (skip the re-decode) iff the source's latest message timestamp is no
+/// newer than pond's stored watermark. A missing signal on either side is never
+/// fresh.
+pub fn is_session_fresh(
+    oracle: &dyn SkipOracle,
+    session_id: &str,
+    source_last_ts_micros: Option<i64>,
+) -> bool {
+    matches!(
+        (oracle.session_max_ts(session_id), source_last_ts_micros),
+        (Some(stored), Some(source)) if source <= stored
+    )
+}
+
+/// `SkipOracle` that always returns `None`. Used by `--verify`, tests, and
+/// benches that want every source re-read.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopOracle;
 
 impl SkipOracle for NoopOracle {
-    fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
+    fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
         None
     }
 
     fn is_empty(&self) -> bool {
         true
-    }
-}
-
-/// `pond sync` passes the `Store::session_last_ingested_at` map straight in as
-/// the oracle - no wrapper struct, no second representation. The blanket
-/// `is_empty` short-circuits the per-file mtime stat on a fresh corpus.
-impl SkipOracle for std::collections::HashMap<String, DateTime<Utc>> {
-    fn last_ingested_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
-        self.get(session_id).copied()
-    }
-    fn is_empty(&self) -> bool {
-        Self::is_empty(self)
     }
 }
 

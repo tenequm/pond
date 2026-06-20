@@ -281,14 +281,16 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
     let rss_start = peak_rss_kb();
     let total_start = Instant::now();
     let store = timed("open_store", &mut phases, async { open(url, config).await }).await?;
-    let watermarks = timed("oracle (session_last_ingested_at)", &mut phases, async {
+    let cache_dir = std::env::temp_dir().join("pond-commands-bench-rowmap");
+    let oracle = timed("oracle (rowmap)", &mut phases, async {
         store
-            .session_last_ingested_at()
+            .ensure_rowmap(&cache_dir)
             .await
-            .context("session_last_ingested_at")
+            .context("ensure_rowmap")?;
+        Ok::<_, anyhow::Error>(pond::sessions::RowmapOracle(store.rowmap_snapshot()))
     })
     .await?;
-    detail(&mut phases, format!("keys={}", watermarks.len()));
+    detail(&mut phases, format!("map_present={}", oracle.0.is_some()));
 
     let resolved: Vec<(String, Value)> = config
         .resolve_adapters(args.adapter.as_deref())
@@ -310,7 +312,7 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
             handlers::ingest_adapter(
                 &store,
                 adapter_obj.as_ref(),
-                &watermarks as &dyn SkipOracle,
+                &oracle as &dyn SkipOracle,
                 |ev| match ev {
                     SyncEvent::Discovered { .. } => {}
                     SyncEvent::SessionDone(o) => match o.status {

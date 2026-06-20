@@ -53,7 +53,7 @@ use super::{
         Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::{RECORD_CAP, file_mtime},
+    jsonl::{RECORD_CAP, peek_last_line},
     jsonl_bytes, part_id, part_ordinal, raw_record, source_options,
 };
 
@@ -138,24 +138,19 @@ impl Adapter for ClaudeDesktopAppAdapter {
                 Err(join) => { yield Err(join_error(join)); return; }
             };
 
-            // Freshness pre-pass: an mtime stat only when the oracle actually
-            // has a watermark for this session - first ingest (or NoopOracle)
-            // has nothing to compare against, so the stat would be wasted.
+            // Freshness pre-pass: read the audit log's last-message timestamp (its
+            // tail line) and skip when it is no newer than pond's watermark. Only
+            // when the oracle has entries - a first ingest has nothing to compare.
             let mut survivors = Vec::with_capacity(files.len());
             for file in files {
-                if let Some(ingested) = oracle.last_ingested_at(&file.session_id) {
-                    let paths = (file.audit_path.clone(), file.meta_path.clone());
-                    let mtime = tokio::task::spawn_blocking(move || {
-                        file_mtime(&paths.0).max(file_mtime(&paths.1))
-                    })
-                    .await;
-                    let mtime = match mtime {
-                        Ok(mtime) => mtime,
-                        Err(join) => { yield Err(join_error(join)); return; }
-                    };
-                    if let Some(mtime) = mtime
-                        && mtime <= ingested
-                    {
+                if !oracle.is_empty() {
+                    let audit = file.audit_path.clone();
+                    let last_ts =
+                        match tokio::task::spawn_blocking(move || source_last_ts(&audit)).await {
+                            Ok(last_ts) => last_ts,
+                            Err(join) => { yield Err(join_error(join)); return; }
+                        };
+                    if crate::adapter::is_session_fresh(oracle, &file.session_id, last_ts) {
                         yield Ok(AdapterYield::Skipped {
                             session_id: Some(file.session_id.clone()),
                             project: None,
@@ -181,6 +176,18 @@ impl Adapter for ClaudeDesktopAppAdapter {
 
 /// A blocking-task panic is a pond bug, not bad source data, so it fails the
 /// whole run rather than skipping a session.
+/// Latest message timestamp (micros) for the freshness gate: the audit log's
+/// last record. The audit stream is append-ordered, so its tail line is the
+/// latest message; an unreadable file or a record without a timestamp yields
+/// `None` and the session re-reads (safe). The sibling metadata file is not
+/// consulted - pond never rewrites an existing session row, so a pure-metadata
+/// change is a no-op.
+fn source_last_ts(audit_path: &Path) -> Option<i64> {
+    let last_line = peek_last_line(audit_path)?;
+    let record: Value = serde_json::from_str(&last_line).ok()?;
+    Some(record_timestamp(&record)?.timestamp_micros())
+}
+
 fn join_error(join: tokio::task::JoinError) -> AdapterError {
     AdapterError::io(
         NAME,

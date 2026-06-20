@@ -14,7 +14,6 @@ use std::{
 };
 
 use async_stream::stream;
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 use tokio::{sync::mpsc, task::JoinError};
@@ -61,6 +60,12 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     /// Session id for the freshness gate, from a file's raw first non-empty
     /// line; `None` disables the skip for that file.
     fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String>;
+
+    /// Latest message timestamp (micros) for the freshness gate - the source-side
+    /// watermark compared against pond's stored max. The driver reads it from the
+    /// file tail (the last message line, or a bounded backward scan); `None`
+    /// disables the skip (the file re-reads).
+    fn peek_last_ts(&self, path: &Path) -> Option<i64>;
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError>;
 
@@ -151,9 +156,7 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
         let mut fresh_count = 0usize;
         for head in heads {
             if let Some(id) = &head.session_id
-                && let Some(mtime) = head.mtime
-                && let Some(ingested) = oracle.last_ingested_at(id)
-                && mtime <= ingested
+                && crate::adapter::is_session_fresh(oracle, id, head.last_ts)
             {
                 fresh_count += 1;
                 continue;
@@ -191,8 +194,8 @@ fn join_error(name: &'static str, join: JoinError) -> AdapterError {
 
 struct FileHead {
     path: PathBuf,
-    mtime: Option<DateTime<Utc>>,
     session_id: Option<String>,
+    last_ts: Option<i64>,
 }
 
 fn collect_heads<D: JsonlTree>(
@@ -204,33 +207,25 @@ fn collect_heads<D: JsonlTree>(
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
     let mut heads = Vec::with_capacity(files.len());
     for path in files {
-        let mtime = file_mtime(&path);
-        // Header peek + driver parse cost one open + bounded read + a JSON
-        // decode per file. On a first-time ingest (`NoopOracle` or any oracle
-        // with no watermarks) `last_ingested_at` always returns `None`, so the
-        // peeked session id would never feed the freshness check - skip it.
-        let session_id = if oracle_is_empty {
-            None
+        // The freshness peek (first line -> session id, file tail -> latest
+        // timestamp) costs bounded reads + JSON decodes per file. On a first-time
+        // ingest (`NoopOracle` or an empty map) there is nothing to compare
+        // against, so skip the peek entirely.
+        let (session_id, last_ts) = if oracle_is_empty {
+            (None, None)
         } else {
             let first_line = peek_first_line(&path).unwrap_or_default();
-            driver.peek_session_id(&path, &first_line)
+            let session_id = driver.peek_session_id(&path, &first_line);
+            let last_ts = session_id.as_ref().and_then(|_| driver.peek_last_ts(&path));
+            (session_id, last_ts)
         };
         heads.push(FileHead {
             path,
-            mtime,
             session_id,
+            last_ts,
         });
     }
     Ok(heads)
-}
-
-/// File mtime as a `DateTime<Utc>`; `None` on any io error. The freshness gate
-/// compares it against the per-session ingest watermark (spec.md#adapters).
-pub(crate) fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .map(DateTime::<Utc>::from)
 }
 
 /// First non-empty line of `path`, read bounded so a pathological first line
@@ -251,6 +246,40 @@ fn peek_first_line(path: &Path) -> Option<String> {
         }
         return Some(String::from_utf8_lossy(&buf).into_owned());
     }
+}
+
+/// Tail of `path`: the last `min(len, cap)` bytes, so a freshness peek stays
+/// cheap on multi-GB logs (codex rollouts reach several GB). The window may start
+/// mid-record, but the LAST line is always whole - appends write complete lines
+/// and the window runs to EOF. `None` on an empty file or any io error.
+pub(crate) fn read_tail(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let window = len.min(cap);
+    file.seek(SeekFrom::Start(len - window)).ok()?;
+    let mut buf = Vec::with_capacity(window as usize);
+    (&mut file).take(window).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Default tail window for the freshness peek. Big enough that the last record is
+/// whole on any realistic transcript; a single record larger than this yields a
+/// `None` peek and a safe re-read.
+pub(crate) const TAIL_CAP: u64 = 32 * 1024 * 1024;
+
+/// Last non-empty line of `path` from a bounded tail window. A record larger than
+/// the window, or any io error, yields `None` - the file then re-reads (safe).
+pub(crate) fn peek_last_line(path: &Path) -> Option<String> {
+    let buf = read_tail(path, TAIL_CAP)?;
+    buf.split(|&byte| byte == b'\n')
+        .rev()
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|line| String::from_utf8_lossy(line).into_owned())
 }
 
 fn read_files<D: JsonlTree>(

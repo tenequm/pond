@@ -29,7 +29,9 @@ use super::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
     },
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
+    jsonl::{
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_line, source_line,
+    },
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -339,6 +341,14 @@ impl JsonlTree for ClaudeCodeAdapter {
         }
         let row: Value = serde_json::from_str(first_line).ok()?;
         row.get("sessionId")?.as_str().map(ToOwned::to_owned)
+    }
+
+    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+        // The transcript is append-ordered, so the last line is the latest
+        // message; its `timestamp` is the session watermark. A trailing row
+        // without one yields None and the file re-reads (safe).
+        let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
+        Some(parse_timestamp(&row).ok()?.timestamp_micros())
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -1607,11 +1617,11 @@ mod tests {
     {
         struct ParentAlreadyFresh;
         impl crate::adapter::SkipOracle for ParentAlreadyFresh {
-            fn last_ingested_at(&self, _session_id: &str) -> Option<DateTime<Utc>> {
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
                 // Far-future watermark: the parent file WOULD trip the freshness
-                // gate (mtime <= ingested). The guard must keep the unrecognized
-                // file out of the gate regardless.
-                Some(DateTime::<Utc>::MAX_UTC)
+                // gate (source ts <= watermark). The guard must keep the
+                // unrecognized file out of the gate regardless.
+                Some(i64::MAX)
             }
             fn is_empty(&self) -> bool {
                 false

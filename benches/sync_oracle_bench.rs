@@ -186,18 +186,6 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    if run("ingested_at") {
-        println!(
-            "\n[M] ingested_at - Store::session_last_ingested_at (mtime oracle; distinct-version resolution, no versions() storm)"
-        );
-        let s = store.clone();
-        timed_pair("ingested_at", args.cold_only, move || {
-            let s = s.clone();
-            async move { s.session_last_ingested_at().await.map(|m| m.len()) }
-        })
-        .await;
-    }
-
     if run("messages_group_count") {
         println!(
             "\n[B] messages_group_count - SELECT session_id, COUNT(*) FROM messages GROUP BY session_id"

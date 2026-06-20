@@ -1216,104 +1216,6 @@ impl Store {
             .collect())
     }
 
-    /// Per-session ingest watermark: the manifest commit timestamp of the
-    /// version that last wrote each session row. The adapter freshness gate
-    /// compares it to the source file's mtime - `mtime <= ingested` => skip
-    /// (spec.md#adapters). Unchanged sessions are not rewritten
-    /// (`WhenMatched::DoNothing`), so their `_row_last_updated_at_version`
-    /// stays pinned to the commit that first wrote them.
-    ///
-    /// Resolves ONLY the distinct versions the session rows reference, one
-    /// manifest read each (`checkout_version`), never `Dataset::versions()` -
-    /// that enumerates every historical manifest, a per-object fetch storm
-    /// (79-133s on S3, measured). The version column itself is free: it is RLE
-    /// metadata held inline in the fragment list already loaded at open.
-    pub async fn session_last_ingested_at(&self) -> Result<HashMap<String, DateTime<Utc>>> {
-        use lance::deps::arrow_array::UInt64Array;
-
-        // One manifest read per distinct version; bound the in-flight fan-out.
-        // 64 is a moderate width: enough to hide S3 round-trip latency without
-        // tripping the object store's rate limiter into retry/backoff.
-        const RESOLVE_CONCURRENCY: usize = 64;
-
-        let dataset = self.handle.dataset(Table::Sessions).await?;
-
-        let scanner = self
-            .handle
-            .scan(
-                Table::Sessions,
-                ScanOpts::project_only(&["id", "_row_last_updated_at_version"]),
-            )
-            .await?;
-        let mut stream = scanner.try_into_stream().await?;
-        let mut session_version: Vec<(String, u64)> = Vec::new();
-        let mut wanted: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let version_array = batch
-                .column_by_name("_row_last_updated_at_version")
-                .context("missing _row_last_updated_at_version column")?
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .context("_row_last_updated_at_version is not UInt64")?;
-            for row in 0..batch.num_rows() {
-                let Some(id) = string(&batch, "id", row)? else {
-                    continue;
-                };
-                if version_array.is_null(row) {
-                    continue;
-                }
-                let version = version_array.value(row);
-                wanted.insert(version);
-                session_version.push((id, version));
-            }
-        }
-
-        let mut resolved: HashMap<u64, DateTime<Utc>> = HashMap::with_capacity(wanted.len());
-        let resolve = |version: u64| {
-            let dataset = dataset.clone();
-            async move {
-                dataset
-                    .checkout_version(version)
-                    .await
-                    .ok()
-                    .map(|snapshot| (version, snapshot.version().timestamp))
-            }
-        };
-        // Keep `RESOLVE_CONCURRENCY` manifest reads in flight continuously -
-        // spawn the next as each completes - so a slow read never barriers the
-        // rest (a fixed-chunk drain would idle the pool on every boundary).
-        let mut pending = wanted.into_iter();
-        let mut set = tokio::task::JoinSet::new();
-        for version in pending.by_ref().take(RESOLVE_CONCURRENCY) {
-            set.spawn(resolve(version));
-        }
-        while let Some(joined) = set.join_next().await {
-            if let Ok(Some((version, ts))) = joined {
-                resolved.insert(version, ts);
-            }
-            if let Some(version) = pending.next() {
-                set.spawn(resolve(version));
-            }
-        }
-
-        // `cleanup_old_versions` can prune a referenced version's manifest, so
-        // it no longer resolves. Such a row was ingested no later than the
-        // oldest version we DID resolve, so that bound keeps `mtime <= ingested`
-        // sound; if nothing resolved, the current manifest stamp (in RAM) is a
-        // safe upper bound for every row.
-        let fallback = resolved
-            .values()
-            .min()
-            .copied()
-            .unwrap_or_else(|| dataset.version().timestamp);
-
-        Ok(session_version
-            .into_iter()
-            .map(|(id, version)| (id, resolved.get(&version).copied().unwrap_or(fallback)))
-            .collect())
-    }
-
     /// Whole-session view for `pond_get` session scope (spec.md#protocol).
     /// Always the conversational view (`search_text IS NOT NULL`) with one-line
     /// part summaries - full part bodies are reached by `message_id` scope, not
@@ -1734,18 +1636,32 @@ impl Store {
             }
         }
 
-        // Re-check after acquiring: a sibling may have published `version`.
+        // Re-check after acquiring: a sibling may have published `version`. An
+        // open failure here (older MAGIC after an upgrade, or corruption) falls
+        // through to the purge+rebuild below rather than erroring.
         if let Some(chain) = discover_chain(cache_dir, store_key)
             && chain.version() == version
+            && let Ok(set) = RowMetaSet::open(&chain)
         {
-            return Ok(Some(RowMetaSet::open(&chain)?));
+            return Ok(Some(set));
         }
 
         // Holding the lock makes us the only builder, so every build temp is a
         // dead orphan from a crashed build - clear them before writing ours.
         Self::sweep_orphan_temps(cache_dir, store_key);
 
-        let chain = discover_chain(cache_dir, store_key);
+        // Validate any existing chain opens; an unreadable segment (an older
+        // MAGIC after a pond upgrade, or a corrupt file) is purged so the build
+        // below is a clean full rebuild instead of erroring forever or appending
+        // a fresh delta onto an unreadable base.
+        let mut chain = discover_chain(cache_dir, store_key);
+        if let Some(existing) = &chain
+            && let Err(error) = RowMetaSet::open(existing)
+        {
+            tracing::warn!(%error, store = store_key, "rowmap unreadable; purging and rebuilding");
+            Self::purge_rowmaps(cache_dir, store_key);
+            chain = None;
+        }
         // A pure-append delta scan (None on store compaction) decides the path.
         let delta = match &chain {
             Some(existing) => self.collect_row_metas_delta(existing.version()).await?,
@@ -1815,6 +1731,25 @@ impl Store {
         }
     }
 
+    /// Remove every segment file (`-v{V}` / `-d{V}`) for this store regardless of
+    /// version - used when a discovered chain is unreadable (older MAGIC after an
+    /// upgrade, or corruption) so the next build starts clean. Sound under the
+    /// build lock; POSIX keeps any inode a sibling still has mapped alive.
+    fn purge_rowmaps(cache_dir: &Path, store_key: &str) {
+        let prefix = format!("rowmetamap-{store_key}-");
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(&prefix)
+                && name.ends_with(".rmm")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     /// Remove abandoned build temp files (`*.tmp-*`) for this store. Best-effort,
     /// and only sound under the build lock - the holder is the sole builder, so
     /// any temp present is a crashed-build orphan, not a live write.
@@ -1835,6 +1770,13 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn rowmap_delta_count(&self) -> Option<usize> {
         self.rowmap.load_full().map(|set| set.delta_count())
+    }
+
+    /// The currently-installed resident meta map, if any. `pond sync` reads it
+    /// (via [`RowmapOracle`]) as the freshness oracle (max timestamp per
+    /// session); `None` falls back to re-reading every source.
+    pub fn rowmap_snapshot(&self) -> Option<Arc<RowMetaSet>> {
+        self.rowmap.load_full()
     }
 
     /// Resolve index-only `(row_id, score)` hits to keys via the map; row ids the
@@ -4848,6 +4790,24 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
     })
 }
 
+/// [`SkipOracle`](crate::adapter::SkipOracle) over the resident row-meta map:
+/// `pond sync` reads each session's stored max message timestamp from memory, so
+/// the staleness check costs zero S3 (the map is rebuilt from the store, so the
+/// check stays deterministic with no local cursor). A `None` map (never
+/// prewarmed, or the build failed) yields no watermark, so every source
+/// re-reads - safe, just slower.
+pub struct RowmapOracle(pub Option<Arc<RowMetaSet>>);
+
+impl crate::adapter::SkipOracle for RowmapOracle {
+    fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+        self.0.as_ref()?.lookup_max_ts(session_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|set| set.is_empty())
+    }
+}
+
 fn row_meta_entry(batch: &RecordBatch, row_id: u64, row: usize) -> Result<RowMetaEntry> {
     Ok(RowMetaEntry {
         row_id,
@@ -6258,95 +6218,6 @@ mod tests {
         assert!(
             !map.contains_key("messages-no-row"),
             "messages without a durable session row must not produce a freshness key",
-        );
-        Ok(())
-    }
-
-    /// M1 / commit-row-last: the mtime oracle's watermark is tied to the SESSION
-    /// ROW. A1 commits messages+parts, then the session row last, so a partial
-    /// first-flush that fails before the session commit leaves messages with no
-    /// session row -> no watermark -> the source re-ingests and heals. A
-    /// committed session row, by contrast, does carry a watermark.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_last_ingested_at_keys_on_session_row_so_partial_flush_reingests()
-    -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-
-        let complete = synthetic_session("complete");
-        store
-            .upsert_sessions(std::slice::from_ref(&complete))
-            .await?;
-
-        // Partial first-flush: messages committed, the session row never was.
-        let timestamp =
-            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
-        let orphan = synthetic_session("messages-no-row");
-        let orphan_message = Message::User {
-            id: "orphan-a".to_owned(),
-            session_id: orphan.id.clone(),
-            timestamp,
-            options: ProviderOptions::new(),
-        };
-        store
-            .upsert_messages(
-                &orphan,
-                &[MessageWrite {
-                    message: &orphan_message,
-                    parts: &[],
-                    search_text: Some("a"),
-                }],
-            )
-            .await?;
-
-        let map = store.session_last_ingested_at().await?;
-        assert!(
-            map.contains_key("complete"),
-            "a committed session row must carry an ingest watermark",
-        );
-        assert!(
-            !map.contains_key("messages-no-row"),
-            "messages without a session row must not produce a watermark, so a \
-             partial first-flush re-ingests rather than latching a frozen skip",
-        );
-        Ok(())
-    }
-
-    /// The mtime oracle resolves a per-session commit timestamp (each row's
-    /// distinct `_row_last_updated_at_version` -> manifest commit time) and PINS
-    /// it: a no-op re-ingest (`WhenMatched::DoNothing`) must not advance an
-    /// unchanged session's watermark, or `mtime <= ingested` would stop skipping
-    /// it and every sync would re-decode the file.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_last_ingested_at_resolves_per_commit_and_pins_unchanged() -> anyhow::Result<()>
-    {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let before = Utc::now();
-
-        // Two sessions in two separate commits -> two distinct row versions,
-        // exercising the distinct-version resolution path.
-        let a = synthetic_session("sess-a");
-        store.upsert_sessions(std::slice::from_ref(&a)).await?;
-        let b = synthetic_session("sess-b");
-        store.upsert_sessions(std::slice::from_ref(&b)).await?;
-
-        let first = store.session_last_ingested_at().await?;
-        let a_ts = *first.get("sess-a").expect("session a has a watermark");
-        let b_ts = *first.get("sess-b").expect("session b has a watermark");
-        assert!(a_ts >= before, "watermark is the real commit wall-clock");
-        assert!(
-            a_ts <= b_ts,
-            "a committed before b, so its watermark is <= b's"
-        );
-
-        // No-op re-ingest of an unchanged row must not move its watermark.
-        store.upsert_sessions(std::slice::from_ref(&a)).await?;
-        let second = store.session_last_ingested_at().await?;
-        assert_eq!(
-            second.get("sess-a").copied(),
-            Some(a_ts),
-            "an unchanged session's watermark must stay pinned to its first commit",
         );
         Ok(())
     }

@@ -31,7 +31,7 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events},
+    jsonl::{BoundedRow, JsonlTree, TAIL_CAP, jsonl_tree_discover, jsonl_tree_events, read_tail},
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -269,6 +269,29 @@ impl JsonlTree for CodexCliAdapter {
         } else {
             None
         }
+    }
+
+    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+        // Codex message ids are physical line numbers, not tail-recoverable on a
+        // multi-GB rollout, so freshness keys on the watermark timestamp instead.
+        // Pond stores the envelope `timestamp` only for `response_item` rows
+        // (`event_msg`/`turn_context` get the session-start default), so the
+        // session's max stored timestamp is its last response_item's. Scan a
+        // bounded tail backward for it - never the whole file.
+        let tail = read_tail(path, TAIL_CAP)?;
+        tail.split(|&byte| byte == b'\n')
+            .rev()
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .find(|row| row.get("type").and_then(Value::as_str) == Some("response_item"))
+            .and_then(|row| {
+                let text = row.get("timestamp").and_then(Value::as_str)?;
+                Some(
+                    DateTime::parse_from_rfc3339(text)
+                        .ok()?
+                        .with_timezone(&Utc)
+                        .timestamp_micros(),
+                )
+            })
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -880,6 +903,33 @@ mod tests {
             &CodexCliFactory,
             &[".codex", "sessions"],
         )
+    }
+
+    /// `peek_last_ts` is the freshness watermark for multi-GB rollouts where the
+    /// line-numbered message id is not tail-recoverable. It must read the last
+    /// `response_item`'s envelope timestamp - pond's stored max - and ignore the
+    /// trailing `event_msg` noise (whose stored timestamp is the session default),
+    /// scanning only the file tail.
+    #[test]
+    fn peek_last_ts_targets_last_response_item_ignoring_trailing_event_msg() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","timestamp":"2026-03-20T03:00:00.000Z","payload":{"id":"sess-x","timestamp":"2026-03-20T03:00:00.000Z"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-20T03:10:00.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-20T03:20:30.500Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yo"}]}}"#,
+            // Trailing token-count noise, later wall-clock but stored at the
+            // session default - must NOT be picked as the watermark.
+            r#"{"type":"event_msg","timestamp":"2026-03-20T03:59:59.000Z","payload":{"type":"token_count","info":{}}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let adapter = CodexCliAdapter::new(dir.path());
+        let expected = DateTime::parse_from_rfc3339("2026-03-20T03:20:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .timestamp_micros();
+        assert_eq!(adapter.peek_last_ts(&path), Some(expected));
     }
 
     #[tokio::test(flavor = "multi_thread")]

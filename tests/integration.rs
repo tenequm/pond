@@ -29,6 +29,8 @@ mod session_scoped_pk;
 mod sql;
 #[path = "integration/store_concurrency.rs"]
 mod store_concurrency;
+#[path = "integration/sync.rs"]
+mod sync;
 #[path = "integration/transport_http.rs"]
 mod transport_http;
 #[path = "integration/transport_mcp.rs"]

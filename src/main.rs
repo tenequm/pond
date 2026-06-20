@@ -3016,7 +3016,7 @@ async fn run_import_stage(
     // a session partially flushed before the commit-row-last fix keeps a frozen
     // watermark that mtime can never re-read past (spec.md#session-movement-complete).
     let noop = pond::adapter::NoopOracle;
-    let watermarks;
+    let rowmap_oracle;
     let oracle: &dyn pond::adapter::SkipOracle = if verify {
         output(&pond::output::paint(
             "import: --verify: re-reading every source body, bypassing the freshness skip",
@@ -3024,8 +3024,15 @@ async fn run_import_stage(
         ))?;
         &noop
     } else {
-        watermarks = store.session_last_ingested_at().await?;
-        &watermarks
+        // Freshness key from the resident meta map: a cold sync builds it with one
+        // sequential scan, a warm sync delta-extends it - never the per-manifest
+        // version-resolution storm that throttled remote syncs to a stall. A
+        // missing/stale map yields no key, so the session simply re-reads (safe).
+        if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
+            tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
+        }
+        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        &rowmap_oracle
     };
     // One MultiProgress owns every adapter's bar as a single continuously
     // redrawn block: on a terminal resize it desyncs for at most one tick and

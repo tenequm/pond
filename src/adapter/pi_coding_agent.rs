@@ -29,7 +29,9 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, source_line},
+    jsonl::{
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_line, source_line,
+    },
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -299,6 +301,24 @@ impl JsonlTree for PiCodingAgentAdapter {
         } else {
             None
         }
+    }
+
+    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+        // The `session` header is eventless; every other row is a message
+        // carrying its own `timestamp`. The transcript is append-ordered, so the
+        // last line is the latest message; a `session`-only or timestamp-less
+        // tail yields None and the file re-reads (safe).
+        let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
+        if row.get("type").and_then(Value::as_str) == Some("session") {
+            return None;
+        }
+        let text = row.get("timestamp").and_then(Value::as_str)?;
+        Some(
+            DateTime::parse_from_rfc3339(text)
+                .ok()?
+                .with_timezone(&Utc)
+                .timestamp_micros(),
+        )
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
