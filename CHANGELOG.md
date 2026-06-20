@@ -1,4 +1,11 @@
-# Changelog
+# Changelog## [0.10.1](https://github.com/tenequm/pond/compare/v0.10.0...v0.10.1) - 2026-06-20
+
+### <!-- 2 -->🐛 Bug Fixes
+- **sync:** rebuild rowmap when the base version's manifest was reclaimed
+- **schedule:** gate ScheduleEvery::secs/from_secs to Unix
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.10.0...v0.10.1
+
 ## [0.10.0](https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0) - 2026-06-20
 
 This release rebuilds the admin CLI, the retrieval model, and the sync/copy write path - and makes remote-S3 operation dramatically faster.
