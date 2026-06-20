@@ -2078,15 +2078,24 @@ impl Store {
     }
 
     /// Row metas for the fragments appended since `base_version` - the input to
-    /// a delta segment. `None` when a fragment present at `base_version` is gone
-    /// now (store compaction / deletion): the chain can't be extended by append,
-    /// so the caller rebuilds the base from a full scan instead.
+    /// a delta segment. `None` when the chain can't be extended by append, so the
+    /// caller rebuilds the base from a full scan instead: either a fragment
+    /// present at `base_version` is gone now (store compaction / deletion), or
+    /// `base_version`'s manifest was reclaimed by the cleanup retention window so
+    /// the version no longer resolves at all.
     async fn collect_row_metas_delta(
         &self,
         base_version: u64,
     ) -> Result<Option<Vec<RowMetaEntry>>> {
         let dataset = self.handle.dataset(Table::Messages).await?;
-        let old = dataset.checkout_version(base_version).await?;
+        // The cleanup retention window (spec.md#concurrency) can reclaim
+        // base_version's manifest after the chain was built. A base that no
+        // longer checks out is the compaction case below - rebuild from a full
+        // scan rather than letting the error nuke the whole oracle into
+        // re-reading every source on every sync.
+        let Ok(old) = dataset.checkout_version(base_version).await else {
+            return Ok(None);
+        };
         let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
         let current = dataset.get_fragments();
         let current_ids: HashSet<u64> = current.iter().map(|f| f.id() as u64).collect();
@@ -6311,6 +6320,100 @@ mod tests {
             .session_message_counts(&["session-new".to_owned()])
             .await?;
         assert_eq!(counts.get("session-new").copied(), Some(1));
+        Ok(())
+    }
+
+    /// Regression for the v0.10.0 sync death-spiral: the 1h cleanup retention can
+    /// reclaim the dataset version the on-disk chain was last built at. The delta
+    /// extender's `checkout_version(base)` then errored, the error nuked
+    /// `ensure_rowmap`, and the oracle silently fell back to re-reading every
+    /// source on every sync forever (the chain never advanced past the reclaimed
+    /// base). A reclaimed base must degrade to a full rebuild, like compaction.
+    #[tokio::test]
+    async fn ensure_rowmap_rebuilds_when_base_manifest_reclaimed() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+
+        // Build the chain at the current version, then snapshot the manifests
+        // that exist at-or-below it - these are exactly what cleanup reclaims.
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(store.rowmap_delta_count(), Some(0), "first build is a base");
+        let base_version = store.messages_version().await?;
+        let versions_dir = temp.path().join("messages.lance").join("_versions");
+        let base_manifests: Vec<_> = std::fs::read_dir(&versions_dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "manifest"))
+            .collect();
+        assert!(
+            !base_manifests.is_empty(),
+            "the base version has a manifest"
+        );
+
+        // A new session bumps the version, so the on-disk chain now trails the
+        // dataset and a refresh would normally delta from `base_version`.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: "session-after".to_owned(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/after".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: "m-after".to_owned(),
+                    session_id: "session-after".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-after".to_owned(),
+                    id: "m-after-part".to_owned(),
+                    message_id: "m-after".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("after the base".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+        assert!(
+            store.messages_version().await? > base_version,
+            "the new ingest advanced the dataset past the chain's base"
+        );
+
+        // Reclaim the base version's manifest exactly as `cleanup_old_versions`
+        // would: `checkout_version(base_version)` can no longer resolve.
+        for manifest in &base_manifests {
+            std::fs::remove_file(manifest)?;
+        }
+
+        // A fresh Store finds the trailing chain on disk, tries to delta from the
+        // reclaimed base, and must fall back to a full rebuild - Ok, not Err.
+        let reopened = Store::open_local(temp.path()).await?;
+        reopened.ensure_rowmap(&cache).await?;
+        assert!(
+            reopened.rowmap_snapshot().is_some(),
+            "map rebuilt after the base manifest was reclaimed"
+        );
+        assert_eq!(
+            reopened.rowmap_delta_count(),
+            Some(0),
+            "a reclaimed base forces a fresh full-scan base, not a stuck chain"
+        );
+
+        // The rebuilt base covers the post-base ingest, so the oracle is whole.
+        let counts = reopened
+            .session_message_counts(&["session-after".to_owned()])
+            .await?;
+        assert_eq!(counts.get("session-after").copied(), Some(1));
         Ok(())
     }
 
