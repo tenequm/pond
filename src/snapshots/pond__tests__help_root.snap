@@ -33,6 +33,7 @@ Commands:
 
   Shell
     completions  Generate shell completions
+    skill        Print the agent-onboarding SKILL.md
     help         Print this message or a subcommand's help
 
 Options:
