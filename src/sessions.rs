@@ -2235,6 +2235,28 @@ impl Store {
         Ok(batch.num_rows() > 0)
     }
 
+    /// One embedded row's model id, or `None` when nothing is embedded yet. A
+    /// `LIMIT 1` point read: the single-active-model invariant (see
+    /// `has_embeddings`) means any embedded row's model is representative, so a
+    /// model swap is detectable by comparing this to the configured model -
+    /// without the full-column `stale_embedding_count` scan that ran every sync.
+    pub async fn sample_embedded_model(&self) -> Result<Option<String>> {
+        let scope = Predicate::IsNotNull("embedding_model");
+        let mut scanner = self
+            .handle
+            .scan(
+                Table::Messages,
+                ScanOpts::with_predicate_and_projection(&scope, &["embedding_model"]),
+            )
+            .await?;
+        scanner.limit(Some(1), None)?;
+        let batch = scanner.try_into_batch().await?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        string(&batch, "embedding_model", 0)
+    }
+
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
     /// scalar predicate alone (spec.md#search-prefilter-pushdown) - see
     /// `embedded_scope` for why pond does NOT add `vector IS NOT NULL`. nprobes

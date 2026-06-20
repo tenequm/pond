@@ -3067,33 +3067,47 @@ async fn run_embed_stage_with_limit(
     limit: Option<usize>,
     force_hint: &'static str,
 ) -> anyhow::Result<EmbedSummary> {
-    let stale = store.stale_embedding_count().await?;
-    if stale > 0 {
+    // Model-swap detection via a LIMIT-1 read of any embedded row's model id,
+    // not the full-column `stale_embedding_count` scan that ran every sync (the
+    // single-active-model invariant makes one row representative).
+    let swapped = store
+        .sample_embedded_model()
+        .await?
+        .is_some_and(|model| model != pond::embed::model_id());
+    if swapped {
         if !force {
             bail!(
-                "{stale} message(s) embedded under a different model id; pass \
-                 `{force_hint}` to re-embed (the vector index will be rebuilt under \
-                 the configured model {:?})",
+                "messages embedded under a different model id; pass `{force_hint}` \
+                 to re-embed (the vector index will be rebuilt under the configured \
+                 model {:?})",
                 pond::embed::model_id(),
             );
         }
         output(&pond::output::paint(
-            &format!(
-                "embed: --force-embed: re-embedding {} stale-model row(s) after dropping IVF_SQ",
-                format_thousands(stale as u64),
-            ),
+            "embed: --force-embed: re-embedding stale-model rows after dropping IVF_SQ",
             pond::output::yellow(),
         ))?;
         store.drop_vector_index().await?;
     }
 
-    let backlog = store.embed_backlog_count().await?;
+    // Backlog gate. `unindexed_vector_backlog` is a manifest-only count of rows
+    // the IVF_SQ index has not folded yet; an embedded row is folded right after,
+    // so it upper-bounds the true embed backlog. Zero (with the index present)
+    // proves nothing is unembedded - skip without the full-column
+    // `embed_backlog_count` scan. It can only over-estimate (a wasted worker pass
+    // that finds nothing), never miss a row. A forced re-embed redoes every row,
+    // so it counts the live eligible set directly.
+    let backlog = if swapped {
+        store.embed_backlog_count().await?
+    } else {
+        store.unindexed_vector_backlog().await?
+    };
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
         None => backlog,
     };
-    if bar_total == 0 && stale == 0 {
-        // No backlog and no stale rows: stage is silent. The summary's
+    if bar_total == 0 && !swapped {
+        // Nothing unembedded and no model swap: stage is silent. The summary's
         // `indexes` line will confirm "semantic ready" downstream.
         return Ok(EmbedSummary::default());
     }
