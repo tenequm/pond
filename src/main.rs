@@ -985,6 +985,7 @@ fn spawn_prewarm(store: Arc<Store>) {
     });
 }
 
+#[cfg(unix)]
 fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
     use rlimit::{Resource, getrlimit, setrlimit};
 
@@ -1000,6 +1001,11 @@ fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
         hard,
         "raised RLIMIT_NOFILE to clear the FTS index-merge EMFILE class"
     );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn try_raise_fd_limit(_target: u64) -> anyhow::Result<()> {
     Ok(())
 }
 

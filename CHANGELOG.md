@@ -51,6 +51,7 @@ Search:
 ### <!-- 2 -->🐛 Bug Fixes
 - **cli:** phantom embed backlog, progress-bar wrapping, and verify memory
 - **sync:** restore the per-session staleness watermark from the row version
+- **build:** gate the `RLIMIT_NOFILE` bump to Unix so the `x86_64-pc-windows-gnu` release binary builds
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.9.0...v0.10.0
 
