@@ -18,7 +18,7 @@ pond <command> --help   # full flags for any command
 - `pond copy --from <x> --to <y>` - move data between stores, `.pond` archives, JSONL; `--verify-only`
 
 ## Query
-- `pond search <query>` - hybrid search; `--explain` for the query plan
+- `pond search <query>` - search (`--mode vector|fts`, `--sort-by relevance|recency`); `--explain` for the query plan
 - `pond get <--session-id|--message-id>` - fetch a session or message
 - `pond sql <query>` - one read-only SQL query over the corpus
 - `pond status` - health, row counts, embedding coverage, schedule state
@@ -27,6 +27,7 @@ pond <command> --help   # full flags for any command
 - `pond serve --transport http|stdio` - run the API (HTTP default)
 - `pond mcp` - alias for `pond serve --transport stdio`
 - `pond completions <shell>` - shell completion scripts
+- `pond skill` - print the bundled agent-onboarding SKILL.md
 
 ## Copy endpoints
 `local` local default dir · `@` configured store · `*.pond` archive · `*.jsonl` or `-` JSONL wire stream.

@@ -5,7 +5,7 @@
 [![docs](https://img.shields.io/badge/docs-pond.locker-blue?style=flat-square)](https://pond.locker/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
-Lossless storage and hybrid search for AI agent sessions, across every agentic client.
+Lossless storage and search for AI agent sessions, across every agentic client.
 
 **Quickstart.** Install, run guided setup, and ingest your local sessions:
 
@@ -22,7 +22,7 @@ claude mcp add -s user pond -- pond mcp   # Claude Code
 codex mcp add pond -- pond mcp            # Codex
 ```
 
-Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool - your history, your search, your sessions, independent of the agent vendor that made them. It is one Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves hybrid search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No extra database, no wrapper around Lance.
+Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool - your history, your search, your sessions, independent of the agent vendor that made them. It is one Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No extra database, no wrapper around Lance.
 
 Current automatically synced agent clients:
 - Claude Code CLI
@@ -39,9 +39,9 @@ Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking ch
 
 Every agentic CLI ships its own session format and its own search surface. Switching tools means losing history. Replaying a Claude Code session in another provider's tooling means re-translating the wire shape by hand. Hosted multi-tenant deployments rebuild the same storage layer from scratch.
 
-Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, hybrid search (BM25 + vector, score-normalized fusion), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
+Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, search (vector or BM25 full-text, one arm per query), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
 
-The v1 surface includes: full CLI, HTTP+JSON and MCP transports, hybrid search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration.
+The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration.
 
 ## Install
 
@@ -165,8 +165,8 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
 - **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `model-no-synthesis`, `model-schema-honesty`, and `adapter-provenance-required` are structural, not review rules.
 - **Index lifecycle decoupled from writes.** Writes commit data without folding indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
-- **Score-normalized hybrid fusion.** Per-arm shaping (max-norm BM25 for FTS, rank-norm for vector), min-max to [0, 1], then weighted sum. Session-root-keyed dedup so cross-arm agreement compounds at the conversation level.
-- **Language-neutral full-text.** Character `ngram` tokenizer (3-5), no monolingual stemmer - pond indexes sessions in any language alike.
+- **Single-arm retrieval.** Each query runs one retriever - `vector` (cosine, with a gentle recency tiebreaker) or `fts` (BM25) - chosen per query; no server-side fusion. The vector arm falls back to full-text when the store has no embeddings, and `--sort-by recency` returns newest-first. Results group to one summary per session, keyed on `session_root`.
+- **Language-neutral full-text.** Word-level `simple` tokenizer with English stemming (ascii-folding on); tokens the stemmer does not recognize pass through unchanged and stay exact-matchable, so pond indexes sessions in any language alike.
 - **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql_query` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
 - **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.

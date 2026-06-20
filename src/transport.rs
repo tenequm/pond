@@ -230,8 +230,8 @@ set was cut by `limit` or the byte budget - raise `limit` to see the rest.
 
 pond_search multilingual: pond's embedder (multilingual-e5-small) is trained \
 for cross-lingual retrieval, so a vector query in language A can match indexed \
-text in language B. fts is character-ngram-based and matches surface tokens \
-only, so it stays within one language.
+text in language B. fts is word-tokenized (the `simple` tokenizer with English \
+stemming) and matches surface words only, so it stays within one language.
 
 pond_get: message_id (the target message, marked `>`, plus message_context_before \
 / message_context_after conversational siblings each side, both default 3, like \
