@@ -5,35 +5,26 @@ description: Recall past AI agent sessions (Claude Code, Codex, opencode, and mo
 
 # pond
 
-pond stores every session your AI agent clients produce - losslessly, in
-Lance datasets on a local disk or any S3-compatible bucket - and makes them
-searchable: semantic (vector) and full-text (BM25) retrieval - the agent picks
-the arm per query - plus full-transcript fetch and read-only SQL.
+pond is your memory across every AI coding session you have run - stored
+losslessly, searchable. If a task needs context you lack, pond likely has it:
+recall first, then answer. Before you say "I don't know" or re-derive something
+that sounds prior, search pond.
 
-This file is a pointer, not a manual. pond is MCP-native: once registered,
-the MCP tool descriptions, resources (`schema://pond`, `schema://pond-sql`,
-`stats://pond`), and `pond --help` carry everything an agent needs.
+## Which tool
+
+- Past work, by meaning ("what did we decide", "last week", "that other repo")
+  -> `pond_search` (`mode=vector` default; `mode=fts` for exact words/symbols).
+- A known session or message -> `pond_get` (transcript, or one message in context).
+- Counts, filters, trends across sessions -> `pond_sql_query` (read-only SQL over
+  `sessions` / `messages` / `parts`).
+
+Params and response shapes live in each tool's MCP description and the
+`schema://pond`, `schema://pond-sql`, `stats://pond` resources - read them at
+call time, don't guess.
 
 ## Setup
 
-Install (any one):
-
-    brew install tenequm/tap/pond
-    cargo binstall pond-db
-    nix profile install github:tenequm/pond-nix#pond
-
-Initialize once (idempotent - re-run any time to repair or update):
-
-    pond init
-
-Register the MCP server in your client:
-
-    claude mcp add -s user pond -- pond mcp
-
-## Surfaces
-
-- MCP tools: `pond_search`, `pond_get`, `pond_sql_query`.
-- CLI: run `pond --help`; every command's `--help` carries copy-pasteable
-  examples (`pond sync`, `pond search`, `pond status`, `pond schedule`,
-  `pond copy`, ...).
-- Docs: https://pond.locker/
+`brew install tenequm/tap/pond` (or `cargo binstall pond-db`, or `nix profile
+install github:tenequm/pond-nix#pond`), then `pond init`, then `claude mcp add -s
+user pond -- pond mcp`. Keep current with `pond sync`; `pond --help` for the rest.
+Docs: https://pond.locker/
