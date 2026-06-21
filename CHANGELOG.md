@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.2](https://github.com/tenequm/pond/compare/v0.10.1...v0.10.2) - 2026-06-21
+
+A follow-up to the 0.10.1 sync work: the embed stage stops scanning wide columns to find its backlog.
+
+### Performance
+
+- **embed:** the per-sync backlog check no longer scans full columns - model-swap detection is a `LIMIT 1` read and the backlog gate is a manifest-only count (idle embed-only **2.24s -> 0.67s**).
+- **embed:** the worker's pending scan filters the co-set, ~50x narrower `embedding_model` column instead of decoding the 1.2 GB Float16 `vector` column to locate unembedded rows (a whole-table vector decode **-> 149 KB**).
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.10.1...v0.10.2
+
 ## [0.10.1](https://github.com/tenequm/pond/compare/v0.10.0...v0.10.1) - 2026-06-20
 
 A sync performance and correctness release: incremental `pond sync` no longer re-reads the whole corpus on every run.
