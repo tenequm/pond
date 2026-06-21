@@ -1906,8 +1906,13 @@ impl Store {
     /// set whose `vector` is null (spec.md#session-embed-from-canonical).
     pub fn pending_embedding_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
+            // Filter on `embedding_model IS NULL`, not `vector IS NULL`: the two
+            // are co-set (write_embeddings sets both, spec.md#session-embed-from-canonical),
+            // but evaluating the predicate over the narrow model-id column reads
+            // ~50x fewer bytes than scanning the Float16 vector column - the
+            // difference between a whole-table vector decode and a cheap scan.
             let filter = Predicate::And(vec![
-                Predicate::IsNull("vector"),
+                Predicate::IsNull("embedding_model"),
                 Predicate::IsNotNull("search_text"),
             ]);
             let projection: &[&str] = &["session_id", "id", "search_text"];
@@ -1943,10 +1948,13 @@ impl Store {
     /// equivalent to the conditional update in spec.md#session-embed-from-canonical.
     pub fn pending_or_stale_messages(&self) -> impl Stream<Item = Result<PendingMessage>> + '_ {
         try_stream! {
+            // `embedding_model IS NULL` (co-set with `vector IS NULL`, but a ~50x
+            // narrower column read) for the never-embedded rows, OR a model
+            // mismatch for the stale ones - both decided off the model-id column.
             let filter = Predicate::And(vec![
                 Predicate::IsNotNull("search_text"),
                 Predicate::Or(vec![
-                    Predicate::IsNull("vector"),
+                    Predicate::IsNull("embedding_model"),
                     Predicate::Ne("embedding_model", embed::model_id().into()),
                 ]),
             ]);
