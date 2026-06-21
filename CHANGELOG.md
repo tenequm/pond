@@ -1,4 +1,11 @@
 # Changelog
+## [0.10.2](https://github.com/tenequm/pond/compare/v0.10.1...v0.10.2) - 2026-06-21
+
+### <!-- 3 -->🚀 Performance
+- **embed:** scan the narrow embedding_model column for the embed backlog
+- **embed:** replace the embed stage's full-column scans with cheap checks
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.10.1...v0.10.2
 
 ## [0.10.1](https://github.com/tenequm/pond/compare/v0.10.0...v0.10.1) - 2026-06-20
 
