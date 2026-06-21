@@ -77,8 +77,14 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ## Process
 
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
-- Don't add or maintain changelog entries; pond has no changelog and doesn't need one.
-- pond is a pre-1.0 release-plz-managed crate. Mark breaking commits with `<type>!:` (or a `BREAKING CHANGE:` footer) so release-plz bumps `0.X.0` instead of patch. When squash-merging a breaking PR, pass the subject via `gh pr merge --squash -t "feat(scope)!: ..."` so the `!` survives the squash.
+- pond is a pre-1.0 release-plz-managed crate. Mark breaking commits with `<type>!:` (or a `BREAKING CHANGE:` footer) so release-plz bumps `0.X.0` instead of patch.
+
+### Releasing
+
+- Flow: commits land on `main` -> release-plz opens a `chore: release vX.Y.Z` PR -> **merge that PR** -> CI's `publish-release` job tags `vX.Y.Z` and publishes crates.io + the GitHub release + the 4 binaries + Homebrew.
+- **Always merge the release PR through GitHub** (`gh pr merge <N> --squash -t "chore: release vX.Y.Z"`; keep the `!` in the subject for a breaking release so it survives the squash). A release branch that looks like it's "missing my latest commits" is NOT a reason to do anything manual - the tag is cut on `main` *after* the merge, so it captures every commit. Check `gh pr view <N> --json mergeable,mergeStateStatus` and just merge.
+- Enrich the changelog before merging. release-plz auto-generates the `CHANGELOG.md` entry from commit *subjects* only (terse, occasionally a `# Changelog## [x.y.z]` missing-newline glitch). Hand-edit the entry on the release PR branch into a meaningful note: a one-line summary plus grouped bullets carrying the key measured numbers, matching the existing `0.10.x` entries.
+- Manual fallback ONLY when the PR is genuinely stuck (mergeable `UNKNOWN`; `gh pr merge` even with `--admin` returns "not mergeable" - happened once on v0.10.1): on `main`, `git merge --squash origin/<release-plz-branch>` (stages only `Cargo.*` + `CHANGELOG.md`), `git commit -m "chore: release vX.Y.Z"`, push; then close the now-duplicate release PR and delete stale `release-plz-*` branches. Do not reach for this by default.
 
 ## Minimalism
 
