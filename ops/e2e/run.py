@@ -29,6 +29,7 @@ pseudo-terminal (stdlib `pty`); everything else through plain subprocess.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import pty
@@ -224,6 +225,18 @@ def main() -> int:
     read = ["--storage-path", URL, "--config-file", CFG]
     workdir = Path(tempfile.mkdtemp(prefix="pond-e2e-"))
     print(f"sandbox root: {workdir}\nbinary: {B}\n")
+    # Run from inside the sandbox so any relative path a command resolves (e.g. a
+    # bare-string --storage-path that parses as a local path) materializes here,
+    # never in the repo root. Tear the sandbox down on exit; the S3 scratch
+    # prefixes are kept by design.
+    origin = Path.cwd()
+    os.chdir(workdir)
+
+    def _teardown():
+        os.chdir(origin)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    atexit.register(_teardown)
 
     # --- read-only on the real corpus (timed cold then warm) -------------------
     print("== reads on the real corpus ==")
