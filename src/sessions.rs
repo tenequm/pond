@@ -2975,17 +2975,6 @@ impl Store {
             .await
     }
 
-    /// Rows added or rewritten in `messages` since the IVF_SQ vector index
-    /// was last optimized. Below
-    /// [`VECTOR_INDEX_ACTIVATION_ROWS`] no index exists yet, so the caller
-    /// must read [`embedding_progress`](Self::embedding_progress) too and
-    /// distinguish "index not built yet" from "index trails data".
-    pub async fn unindexed_vector_backlog(&self) -> Result<usize> {
-        self.handle
-            .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
-            .await
-    }
-
     /// Embedding coverage: how many `messages` rows carry a vector and how
     /// many are still eligible. Drives the `pond status` embeddings line and
     /// the `pond optimize` progress bar's known total.

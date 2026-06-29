@@ -3875,18 +3875,15 @@ async fn run_embed_stage_with_limit(
         store.drop_vector_index().await?;
     }
 
-    // Backlog gate. `unindexed_vector_backlog` is a manifest-only count of rows
-    // the IVF_SQ index has not folded yet; an embedded row is folded right after,
-    // so it upper-bounds the true embed backlog. Zero (with the index present)
-    // proves nothing is unembedded - skip without the full-column
-    // `embed_backlog_count` scan. It can only over-estimate (a wasted worker pass
-    // that finds nothing), never miss a row. A forced re-embed redoes every row,
-    // so it counts the live eligible set directly.
-    let backlog = if swapped {
-        store.embed_backlog_count().await?
-    } else {
-        store.unindexed_vector_backlog().await?
-    };
+    // Backlog gate: the true eligible-unembedded count (search_text present,
+    // embedding_model null), read off the narrow model-id column. NOT the IVF
+    // index lag: `pond copy` injects already-embedded rows the index has not
+    // folded yet (projection: None carries the vector), so an index-lag count
+    // wildly over-states the embed backlog - on a fresh S3 copy it read 104,994
+    // unindexed against 0 actually-unembedded, turning a no-op into a progress
+    // bar that looks permanently hung. The narrow-column count is now cheap, so
+    // there is no perf reason to gate on anything coarser.
+    let backlog = store.embed_backlog_count().await?;
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
         None => backlog,
