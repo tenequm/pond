@@ -4,7 +4,7 @@
 
 A follow-up to the 0.10.1 sync work: the embed stage stops scanning wide columns to find its backlog.
 
-### Performance
+### <!-- 3 -->🚀 Performance
 
 - **embed:** the per-sync backlog check no longer scans full columns - model-swap detection is a `LIMIT 1` read and the backlog gate is a manifest-only count (idle embed-only **2.24s -> 0.67s**).
 - **embed:** the worker's pending scan filters the co-set, ~50x narrower `embedding_model` column instead of decoding the 1.2 GB Float16 `vector` column to locate unembedded rows (a whole-table vector decode **-> 149 KB**).
@@ -15,13 +15,13 @@ A follow-up to the 0.10.1 sync work: the embed stage stops scanning wide columns
 
 A sync performance and correctness release: incremental `pond sync` no longer re-reads the whole corpus on every run.
 
-### Performance
+### <!-- 3 -->🚀 Performance
 
 - **Incremental `pond sync` is dramatically faster.** Two compounding fixes to the freshness path:
   - Claude Code appends trailing metadata rows (`last-prompt`, `permission-mode`, `bridge-session`, ...) with no timestamp, so the watermark peek returned `None` and ~2,000 of ~9,800 sessions never fresh-skipped - re-decoding ~1.18M already-stored rows every sync. The peek now walks back to the last timestamped row. Measured on the real corpus: claude-code import **20.1s -> 1.76s**, rows re-decoded **1.18M -> 10.5k**, fresh-skips **7,863 -> 9,823**.
   - The resident rowmap now delta-extends across embedding's fragment rewrites (keyed on the stable row ids already enabled) instead of rewriting a full ~283 MB base every sync.
 
-### Bug Fixes
+### <!-- 2 -->🐛 Bug Fixes
 
 - **sync:** rebuild the rowmap when the base version's manifest was reclaimed by the cleanup retention window, instead of silently re-reading every source on every sync forever.
 - **build:** gate the `RLIMIT_NOFILE` bump to Unix so the Windows cross-build compiles.

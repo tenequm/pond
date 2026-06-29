@@ -18,3 +18,12 @@ if ! gitleaks git --staged --no-banner --redact -v; then
   echo "  false positive? add a narrow allowlist block to .gitleaks.toml" >&2
   exit 1
 fi
+
+# Block a staged CHANGELOG.md whose top section uses non-canonical headers - the
+# release body is that section verbatim and propagates to GitHub/homebrew/nix.
+if git diff --cached --name-only | grep -qx 'CHANGELOG.md'; then
+  if ! ops/scripts/check-changelog-headers.sh; then
+    echo "pre-commit: CHANGELOG.md headers off-taxonomy (above); keep the emoji form." >&2
+    exit 1
+  fi
+fi

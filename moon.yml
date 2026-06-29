@@ -23,6 +23,10 @@ tasks:
   test:
     command: 'cargo test --locked'
     inputs: ['@group(sources)', '@group(tests)']
+  check-changelog:
+    command: 'bash ops/scripts/check-changelog-headers.sh'
+    toolchains: 'system'
+    inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
 
   # One-time builder setup (pool is amd64 ccx43, isolated by nodeselector):
   #   docker buildx create --name pond-hetzner --driver kubernetes \

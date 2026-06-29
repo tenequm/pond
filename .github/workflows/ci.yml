@@ -34,6 +34,7 @@ jobs:
         with:
           fetch-depth: 0
           clean: false
+      - run: moon run pond:check-changelog
       - run: moon run pond:format
       - run: moon run pond:lint
       - run: moon run pond:test
