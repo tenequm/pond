@@ -2137,8 +2137,8 @@ impl Handle {
     }
 
     /// Run the table-local maintenance cycle for the supplied index intents.
-    /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
-    /// BTree combine bug; Bitmap, FTS, and IVF_SQ fold via append.
+    /// Every index family folds incrementally via `optimize_indices`; none is
+    /// rebuilt from scratch (spec.md#lance-index-maintenance).
     ///
     /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
@@ -2786,8 +2786,10 @@ async fn optimize_table_compact(
     Ok(())
 }
 
-/// Indices phase: per-intent create/rebuild + batched `optimize_indices(append)`
-/// for incremental families. Returns `true` if anything committed.
+/// Indices phase: create absent indexes, then fold trailing fragments into
+/// every existing index via batched `optimize_indices` (append, or merge once a
+/// family's delta segments reach `DELTA_MERGE_THRESHOLD`). Returns `true` if
+/// anything committed.
 async fn optimize_table_indices(
     dataset: &mut Dataset,
     intents: &[IndexIntent],
@@ -2852,80 +2854,13 @@ async fn optimize_table_indices(
         if unindexed.is_empty() {
             continue;
         }
-        match intent.params {
-            IndexParamsKind::Scalar(BuiltinIndexType::BTree) => {
-                let params = intent.params.build(dataset).await?;
-                let index_type = intent.params.index_type();
-                tracing::debug!(
-                    target: "pond::perf",
-                    index = intent.name,
-                    column = intent.column,
-                    "rebuilding Lance BTree index",
-                );
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseStart {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        detail: Some(intent.name.to_owned()),
-                    },
-                );
-                let started = Instant::now();
-                dataset
-                    .create_index_builder(&[intent.column], index_type, params.as_ref())
-                    .name(intent.name.to_owned())
-                    .replace(true)
-                    .progress(lance_progress(progress, table, intent.name))
-                    .await
-                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseDone {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                );
-                did_work = true;
-            }
-            IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
-            | IndexParamsKind::InvertedFtsWord
-            | IndexParamsKind::IvfSqCosine { .. } => {
-                append_indices.push(intent.name.to_owned());
-            }
-            IndexParamsKind::Scalar(_) => {
-                let params = intent.params.build(dataset).await?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseStart {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        detail: Some(intent.name.to_owned()),
-                    },
-                );
-                let started = Instant::now();
-                dataset
-                    .create_index_builder(
-                        &[intent.column],
-                        intent.params.index_type(),
-                        params.as_ref(),
-                    )
-                    .name(intent.name.to_owned())
-                    .replace(true)
-                    .progress(lance_progress(progress, table, intent.name))
-                    .await
-                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseDone {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                );
-                did_work = true;
-            }
-        }
+        // Every family folds incrementally via `optimize_indices` (the
+        // append/merge batch below) - no full rebuild. BTree and ZoneMap
+        // rewrite their index file by merging the existing sorted pages with
+        // only the new fragments' data; Bitmap/FTS/IVF_SQ accumulate delta
+        // segments. None re-scans already-indexed source
+        // (spec.md#lance-index-maintenance).
+        append_indices.push(intent.name.to_owned());
     }
 
     if !append_indices.is_empty() {

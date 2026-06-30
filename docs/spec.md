@@ -168,7 +168,8 @@ When retry is exhausted on a write, the substrate raises a typed conflict signal
 
 | Family | Fold on `pond optimize --only index` | Why |
 |---|---|---|
-| BTree (scalar) | `create_index(replace=true)` | Lance v7.0.0-beta.16's `optimize_indices` BTree path tripped `RowAddrTreeMap::from_sorted_iter` on column-update commits; rebuild from scratch avoids the bug. Switch to `optimize_indices(append)` once upstream is fixed. |
+| BTree (scalar) | `optimize_indices(append)` | Merges existing sorted index pages with only the new fragments' data; never re-scans already-indexed source. |
+| ZoneMap (scalar) | `optimize_indices(append)` | Trains zones over only the new data; `can_remap == false`, so a compaction row rewrite forces a rebuild. |
 | Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
 | Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
 | IVF_SQ (vector) | `optimize_indices(append)` | Stable-row-id IVF supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and per-dimension SQ ranges carry forward. |
