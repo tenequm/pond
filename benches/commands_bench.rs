@@ -82,10 +82,10 @@ struct Args {
     /// Runs per op. Run 0 is cold; runs 1+ inherit caches.
     #[arg(long, default_value_t = 3)]
     runs: usize,
-    /// Drop the post-import optimize+embed in sync (mirrors `pond sync --no-optimize`).
+    /// Drop the post-import optimize+embed in sync to isolate ingest timing.
     #[arg(long)]
     no_optimize: bool,
-    /// Drop the post-copy `optimize_indices` (mirrors `pond copy --no-optimize`).
+    /// Drop the post-copy `optimize_indices` to isolate copy timing.
     #[arg(long)]
     no_copy_optimize: bool,
     /// Print results as JSON (one object per run) instead of human tables.
@@ -359,6 +359,7 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
         let policy = MaintenancePolicy {
             compaction_fragment_cap: 0,
             cleanup_older_than: chrono::Duration::days(1),
+            cleanup_interval: 1,
         };
         timed("optimize (indices+cleanup+compact)", &mut phases, async {
             store

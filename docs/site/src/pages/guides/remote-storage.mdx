@@ -28,7 +28,7 @@ Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = 
 pond copy --from local --to s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Idempotent union merge: re-runnable, resumable, never touches the source. Rebuilds destination indexes and verifies every row landed - exit `0` synced, `6` missing rows (re-run; it converges).
+Idempotent union merge: re-runnable, resumable, never touches the source. Rebuilds destination indexes and verifies every row landed - exit `0` synced, `6` if rows are missing (re-run; it converges) or duplicated.
 
 ## 4. Switch
 

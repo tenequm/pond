@@ -21,6 +21,7 @@
 //!   cargo bench --bench copy_bench -- --sessions 2000 --messages 8
 //!   cargo bench --bench copy_bench -- --backend memory
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -32,7 +33,10 @@ use pond::{
     config::Config,
     handlers::ingest_events,
     sessions::{DeltaPlan, IngestEvent, IngestValidator, Store},
-    substrate::{MaintenancePolicy, RuntimeCaps, StorageUrl, Table},
+    substrate::{
+        DEFAULT_SYNC_CLEANUP_INTERVAL, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn,
+        RuntimeCaps, StorageUrl, Table,
+    },
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -96,10 +100,36 @@ struct Args {
     /// (the corpus arm documents the merge-vs-append-across-builds rationale).
     #[arg(long)]
     corpus: Option<PathBuf>,
+    /// Profile the optimize/index path's phase breakdown to a LOCAL dir (or
+    /// `--dest-url` S3 prefix `<base>-profile`). Seeds `--sessions` base rows,
+    /// runs optimize #1 (the from-scratch index BUILD), appends a `--grown`
+    /// tail, then runs optimize #2 (the incremental FOLD on this branch, full
+    /// REBUILD pre-change) - printing every phase (compact/cleanup/index-*) with
+    /// its elapsed_ms so the fold-vs-rebuild cost is visible per index.
+    #[arg(long)]
+    profile_optimize: Option<PathBuf>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
     bench: bool,
+}
+
+fn phase_printer(label: &'static str) -> OptimizeProgressFn {
+    Arc::new(move |event| {
+        if let OptimizeEvent::PhaseDone {
+            table,
+            phase,
+            elapsed_ms,
+        } = event
+        {
+            println!(
+                "  [{label}] {:9} {:13} {:>8} ms",
+                table.as_str(),
+                phase.label(),
+                elapsed_ms,
+            );
+        }
+    })
 }
 
 async fn open_configured(url: &str) -> Result<Store> {
@@ -318,10 +348,11 @@ async fn seed(store: &Store, sessions: usize, messages: usize) -> Result<()> {
     .await
 }
 
-/// New path: plan the delta, append absent sessions / merge grown ones into the
-/// destination. Also returns the destination `messages` version bump, i.e. the
-/// number of commits this copy added - the metric that proves the append
-/// collapses to one commit per table instead of one per scan batch.
+/// New path: plan the delta, then append absent sessions and filtered-append
+/// grown ones into the destination. Also returns the destination `messages`
+/// version bump, i.e. the number of commits this copy added - the metric that
+/// proves the append collapses to one commit per table instead of one per scan
+/// batch.
 async fn streaming_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let started = Instant::now();
@@ -344,11 +375,12 @@ async fn temp_staging_copy(from: &Store, to: &Store) -> Result<u128> {
 }
 
 /// C8 treatment: force every absent session through merge-insert instead of the
-/// append fast-path - what routing copy through the unified write seam
-/// (`upsert_session_batch`, `WhenMatched::DoNothing`) would do. Same inputs as
-/// `streaming_copy`; the only difference is append ids are moved into the merge
-/// bucket, so the destination pays a per-row target probe/join. The delta vs
-/// `streaming_copy` is the cost of dropping the append fast-path.
+/// append fast-path - the counterfactual cost of routing copy through a
+/// merge-insert seam (`WhenMatched::DoNothing`) rather than the filtered append
+/// it now uses. Same inputs as `streaming_copy`; the only difference is append
+/// ids are moved into the merge bucket, so the destination pays a per-row target
+/// probe/join. The delta vs `streaming_copy` is the cost of dropping the append
+/// fast-path.
 async fn merge_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let mut plan = to.plan_incremental_from(from).await?;
@@ -371,6 +403,67 @@ async fn main() -> Result<()> {
         "copy_bench: backend={} sessions={} messages/session={} (~{} message rows)\n",
         args.backend, args.sessions, args.messages, total_rows,
     );
+
+    if let Some(dir) = &args.profile_optimize {
+        let store = match &args.dest_url {
+            Some(base) => {
+                let url = format!("{base}-profile");
+                println!("store (scratch, clean up): {url}\n");
+                open_configured(&url).await?
+            }
+            None => {
+                std::fs::create_dir_all(dir)?;
+                Store::open_local(dir).await?
+            }
+        };
+        let policy = MaintenancePolicy::always_compact();
+        let t = Instant::now();
+        ingest_batched(
+            &store,
+            (0..args.sessions).map(|index| session_events(index, args.messages)),
+        )
+        .await?;
+        println!(
+            "seed base: {} sessions x {} msgs = {} rows  ({} ms)\n",
+            args.sessions,
+            args.messages,
+            args.sessions * args.messages,
+            t.elapsed().as_millis(),
+        );
+
+        println!("optimize #1 - from-scratch index BUILD over the whole base:");
+        let t1 = Instant::now();
+        store
+            .optimize_indices(Some(phase_printer("build")), &policy)
+            .await?;
+        println!("  build total: {} ms\n", t1.elapsed().as_millis());
+
+        let sync_policy = MaintenancePolicy::always_compact()
+            .with_cleanup_interval(DEFAULT_SYNC_CLEANUP_INTERVAL);
+        println!(
+            "optimize #2 - {} incremental folds at the sync cleanup interval ({}); each round \
+             appends a small tail and finalizes, like one cron sync. A round with NO `cleanup` \
+             line skipped the ~per-table version-log walk:",
+            args.grown, DEFAULT_SYNC_CLEANUP_INTERVAL,
+        );
+        for round in 0..args.grown {
+            ingest_batched(
+                &store,
+                std::iter::once(grow_events(round, args.messages, args.messages)),
+            )
+            .await?;
+            let version = store.dataset(Table::Messages).await?.version_id();
+            let started = Instant::now();
+            store
+                .optimize_indices(Some(phase_printer("fold")), &sync_policy)
+                .await?;
+            println!(
+                "  round {round:>2}  messages.v={version}  finalize total: {} ms",
+                started.elapsed().as_millis(),
+            );
+        }
+        return Ok(());
+    }
 
     if let Some(dir) = &args.prepare {
         std::fs::create_dir_all(dir.join("base"))?;

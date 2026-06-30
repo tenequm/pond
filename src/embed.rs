@@ -328,8 +328,7 @@ pub fn format_query(query: &str) -> String {
 }
 
 /// Format a document (one message's `search_text`) for the embedder - the
-/// `passage: ` half of the pair documented on [`format_query`]. Used by
-/// `EmbedWorker` when batching messages for `pond optimize`.
+/// `passage: ` half of the pair documented on [`format_query`].
 pub fn format_passage(text: &str) -> String {
     format!("passage: {text}")
 }
@@ -558,11 +557,9 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
         Ok(summary)
     }
 
-    /// One `merge_update` per window, not per 32-row batch: each
-    /// `merge_update` streams the target column once, so amortizing it over
-    /// a window-sized batch beats issuing it per model batch. The
-    /// length-sort clusters similar lengths because the tokenizer pads each
-    /// batch to its longest member. Empties `window`.
+    /// One `merge_update` per window: it streams the target column once, so
+    /// amortizing it over a window-sized batch beats issuing it per model batch
+    /// (`embed_passages` does the per-batch length-sort). Empties `window`.
     async fn drain_window(
         &self,
         window: &mut Vec<PendingMessage>,

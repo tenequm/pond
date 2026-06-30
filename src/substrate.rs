@@ -859,6 +859,14 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
     chrono::Duration::hours(1)
 }
 
+/// `pond sync` runs every few minutes; reclaiming old manifest versions on
+/// every run pays the full version-log walk over S3 (~9 s measured on the real
+/// corpus) to free roughly one version. Amortize by cleaning only when a
+/// table's manifest version is a multiple of this many commits. Explicit
+/// `pond optimize` and the one-shot `pond copy` keep interval 1 (clean every
+/// run) so maintenance and durability moves are never skipped.
+pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 16;
+
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
 /// `[maintenance]` (and any per-invocation CLI override) at the entry point;
 /// threaded down to `optimize_table_compact` so the substrate never re-reads
@@ -869,6 +877,11 @@ pub struct MaintenancePolicy {
     pub compaction_fragment_cap: usize,
     /// Manifest-retention window handed to `cleanup_old_versions`.
     pub cleanup_older_than: chrono::Duration,
+    /// Run `cleanup_old_versions` for a table only when its manifest version is
+    /// a multiple of this (`1` = every optimize). The frequent `pond sync` path
+    /// raises it so most syncs skip the version-log walk; see
+    /// [`DEFAULT_SYNC_CLEANUP_INTERVAL`].
+    pub cleanup_interval: u64,
 }
 
 impl MaintenancePolicy {
@@ -877,7 +890,16 @@ impl MaintenancePolicy {
         Self {
             compaction_fragment_cap: 0,
             cleanup_older_than: default_cleanup_older_than(),
+            cleanup_interval: 1,
         }
+    }
+
+    /// Amortize version cleanup over `interval` commits - the frequent
+    /// `pond sync` path uses this so most syncs skip the version-log walk.
+    #[must_use]
+    pub fn with_cleanup_interval(mut self, interval: u64) -> Self {
+        self.cleanup_interval = interval.max(1);
+        self
     }
 }
 
@@ -2814,34 +2836,52 @@ async fn optimize_table_compact(
     // Safe GC only. delete_unverified=false keeps Lance's 7-day in-progress
     // guard, so this never races a concurrent writer (spec.md#concurrency); GC
     // runs outside OCC, so the guard is what makes it safe on any backend.
-    emit(
-        progress,
-        OptimizeEvent::PhaseStart {
-            table,
-            phase: OptimizePhase::Cleanup,
-            detail: None,
-        },
-    );
-    let started = Instant::now();
-    // Lance v7 `cleanup_old_versions` removes orphan files inside
-    // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
-    // index merges accumulate empty UUID dirs forever (one inode each).
-    // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
-    // here (spec.md#concurrency: Lance-native maintenance only).
-    dataset
-        .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
-        .await
-        .context("cleanup_old_versions failed during index optimize")?;
-    emit(
-        progress,
-        OptimizeEvent::PhaseDone {
-            table,
-            phase: OptimizePhase::Cleanup,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-    );
+    //
+    // Gated: the walk over the version log is round-trip-bound on object stores
+    // (~9s measured on the real corpus) and reclaims ~one version per run, so
+    // the frequent `pond sync` path amortizes it over `cleanup_interval`
+    // commits rather than paying it every sync (`pond optimize`/`pond copy`
+    // keep interval 1). Skipping only delays reclaiming old versions - the next
+    // due cleanup sweeps the accumulated backlog - so it is always safe.
+    if cleanup_due(dataset.version_id(), policy.cleanup_interval) {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::Cleanup,
+                detail: None,
+            },
+        );
+        let started = Instant::now();
+        // Lance v7 `cleanup_old_versions` removes orphan files inside
+        // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
+        // index merges accumulate empty UUID dirs forever (one inode each).
+        // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
+        // here (spec.md#concurrency: Lance-native maintenance only).
+        dataset
+            .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
+            .await
+            .context("cleanup_old_versions failed during index optimize")?;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::Cleanup,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
 
     Ok(())
+}
+
+/// Gate for the version-cleanup walk: at interval `<= 1` it runs every optimize;
+/// otherwise only when the manifest `version` is a multiple of it. A run whose
+/// version steps past a multiple defers to the next one, so the gap between
+/// cleanups is bounded and - since version 0 is a multiple of every interval -
+/// cleanup always eventually fires; it is never skipped indefinitely.
+fn cleanup_due(version: u64, interval: u64) -> bool {
+    interval <= 1 || version.is_multiple_of(interval)
 }
 
 /// Indices phase: create absent indexes, then fold trailing fragments into
@@ -3783,6 +3823,21 @@ mod tests {
             64,
             0.1
         ));
+    }
+
+    #[test]
+    fn cleanup_due_gates_on_version_interval() {
+        // interval <= 1 always cleans (pond optimize / pond copy / tests).
+        assert!(cleanup_due(0, 1));
+        assert!(cleanup_due(7, 1));
+        assert!(cleanup_due(5, 0));
+        // interval N: only on multiples (the amortized pond sync path).
+        assert!(cleanup_due(0, 16));
+        assert!(cleanup_due(16, 16));
+        assert!(cleanup_due(48, 16));
+        assert!(!cleanup_due(15, 16));
+        assert!(!cleanup_due(17, 16));
+        assert!(!cleanup_due(31, 16));
     }
 
     #[test]

@@ -85,7 +85,8 @@ pub struct LanceArchiveImport {
 }
 
 /// One table's slice of a store-to-store copy plan: which sessions' rows for
-/// that table can be **appended** versus **merged** (spec.md#session-durable-copy).
+/// that table can be **appended** versus **filtered-appended** (the `merge`
+/// bucket, which despite the name appends too) (spec.md#session-durable-copy).
 /// The choice is made per table by row presence on the destination, because the
 /// three tables are written by separate commits and an interrupted copy can
 /// leave them in different states (e.g. the small `sessions` table committed but
@@ -549,12 +550,13 @@ impl Store {
 
     /// Plan an incremental store-to-store copy into `self` from `source`,
     /// deciding **per table** whether each source session's rows can be appended
-    /// (the destination has none, so they cannot collide) or must be merged (the
-    /// destination has some, source has more). Reads both id-sets plus
-    /// per-session message and part counts. Parts have their own data-derived
-    /// signal so a part added under an existing message routes through merge
-    /// instead of relying on the closing verify to catch it
-    /// (spec.md#session-movement-complete).
+    /// wholesale (the destination has none, so they cannot collide) or go to the
+    /// `merge` bucket - which the copy executes as a filtered append, keeping
+    /// only the rows still absent (the destination has some, source has more).
+    /// Reads both id-sets plus per-session message and part counts. Parts have
+    /// their own data-derived signal so a part added under an existing message
+    /// routes through the `merge` bucket instead of relying on the closing verify
+    /// to catch it (spec.md#session-movement-complete).
     pub async fn plan_incremental_from(&self, source: &Store) -> Result<DeltaPlan> {
         let (
             source_ids,
@@ -760,8 +762,7 @@ impl Store {
 
     /// Append source rows whose `filter_column` is in `values`. Absent rows
     /// can't collide, so append is safe where the count-based plan would merge
-    /// (spec.md#session-durable-copy). Drives the `copy_bench` append-vs-merge
-    /// regression guard.
+    /// (spec.md#session-durable-copy).
     pub async fn append_absent_rows(
         &self,
         source: &Store,

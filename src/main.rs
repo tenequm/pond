@@ -1130,8 +1130,12 @@ async fn main() -> anyhow::Result<()> {
                 // embed inline at ingest; finalize folds the new vectors into
                 // the indexes and heals any pre-inline un-embedded backlog. sync
                 // has no --force-embed; finalize's embed points a model swap at
-                // the command that does.
-                let policy = configured_maintenance_policy(&loaded, None)?;
+                // the command that does. Cleanup is amortized: a 5-min cron sync
+                // shouldn't pay the per-table version-log walk (~9s on S3) every
+                // run, so it cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL
+                // commits instead (`pond optimize` still cleans every run).
+                let policy = configured_maintenance_policy(&loaded, None)?
+                    .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL);
                 let indexes_started = std::time::Instant::now();
                 finalize_indexes(&store, &policy, false).await?;
                 output(&stage_line(
@@ -3269,6 +3273,10 @@ fn configured_maintenance_policy(
     Ok(MaintenancePolicy {
         compaction_fragment_cap,
         cleanup_older_than,
+        // Default: clean every run. The frequent `pond sync` path raises this
+        // via `with_cleanup_interval`; explicit `pond optimize` and one-shot
+        // `pond copy` keep it at 1 so maintenance/durability moves never skip.
+        cleanup_interval: 1,
     })
 }
 
