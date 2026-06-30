@@ -795,7 +795,7 @@ impl Store {
             .scan_batch(
                 Table::Messages,
                 Some(&Predicate::In("session_id", session_id_values.to_vec())),
-                &["session_id", "id"],
+                pk_columns(Table::Messages),
             )
             .await?;
         let mut set = HashSet::with_capacity(batch.num_rows());
@@ -821,7 +821,7 @@ impl Store {
             .scan_batch(
                 Table::Parts,
                 Some(&Predicate::In("session_id", session_id_values.to_vec())),
-                &["session_id", "message_id", "id"],
+                pk_columns(Table::Parts),
             )
             .await?;
         let mut set = HashSet::with_capacity(batch.num_rows());
@@ -836,8 +836,10 @@ impl Store {
 
     /// The filter-and-append write seam, shared by ingest and grown-session
     /// copy. Collects only the kept rows (the absent delta), so it never stages
-    /// a full copy; `append_batches` re-appends the owned kept rows on an OCC
-    /// retry.
+    /// a full copy. The terminal `append_batches` retries only a commit
+    /// conflict (not a transient post-commit fault), so a lost-ack retry cannot
+    /// re-append the same rows; an interrupted write heals on the next
+    /// re-planned re-run instead (spec.md#lance-deterministic-pk).
     async fn append_filtered<S, K>(&self, table: Table, mut batches: S, keep: K) -> Result<usize>
     where
         S: Stream<Item = std::result::Result<RecordBatch, DataFusionError>> + Unpin,
@@ -1643,32 +1645,48 @@ impl Store {
         self.handle.collect_ids(table).await
     }
 
-    /// Stream `table`'s `id` column and return `(rows_scanned, rows whose id is
-    /// absent from `present`)`. Streaming means the scanned side is never
-    /// materialized into a set, so a verify holds only the `present` (other)
-    /// side per table instead of both.
-    pub async fn id_diff_against(
+    /// This store's set of composite primary keys for `table`, plus the row
+    /// count. `rows - keys.len()` is the duplicate count - zero is the invariant
+    /// (the append path has no row-level dedup, so a non-zero count is a write
+    /// anomaly the copy verify reports rather than calling "synced"), and the
+    /// key set drives the verify's completeness membership. One scan over only
+    /// the PK columns yields both, holding a single composite-PK set per table.
+    pub async fn composite_pk_index(&self, table: Table) -> Result<(HashSet<Vec<String>>, usize)> {
+        let pk = pk_columns(table);
+        let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut keys: HashSet<Vec<String>> = HashSet::new();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                rows += 1;
+                keys.insert(composite_key(&batch, pk, row)?);
+            }
+        }
+        Ok((keys, rows))
+    }
+
+    /// Stream `table`'s composite primary keys and return `(rows_scanned, rows
+    /// whose key is absent from `present`)`. Composite-keyed, not bare `id`: a
+    /// message id replayed into a new session by a fork/compaction is matched
+    /// per session, so a wholly-absent replayed session whose ids collide with
+    /// present ones is counted missing - a bare-`id` check would false-negative
+    /// it as "present". Streams the scanned side, holding only `present`.
+    pub async fn composite_pk_diff_against(
         &self,
         table: Table,
-        present: &std::collections::HashSet<String>,
+        present: &HashSet<Vec<String>>,
     ) -> Result<(usize, usize)> {
-        let scanner = self
-            .handle
-            .scan(table, ScanOpts::project_only(&["id"]))
-            .await?;
+        let pk = pk_columns(table);
+        let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
         let mut stream = scanner.try_into_stream().await?;
         let (mut rows, mut absent) = (0usize, 0usize);
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            let ids = batch
-                .column_by_name("id")
-                .context("scan projection dropped the id column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("id column is not Utf8")?;
-            for id in ids.iter().flatten() {
+            for row in 0..batch.num_rows() {
                 rows += 1;
-                if !present.contains(id) {
+                if !present.contains(&composite_key(&batch, pk, row)?) {
                     absent += 1;
                 }
             }
@@ -4530,6 +4548,26 @@ async fn open_archive_table(table: Table, source: &Path) -> Result<Dataset> {
     Ok(dataset)
 }
 
+/// The composite primary-key columns each table's schema declares
+/// (spec.md#lance-table-creation-session-scoped-pk): a message/part id is
+/// unique only within its session, so the key leads with `session_id`. The one
+/// source of truth for the PK structure - kept beside the schemas it mirrors,
+/// not in the schema-agnostic substrate seam.
+pub(crate) fn pk_columns(table: Table) -> &'static [&'static str] {
+    match table {
+        Table::Sessions => &["id"],
+        Table::Messages => &["session_id", "id"],
+        Table::Parts => &["session_id", "message_id", "id"],
+    }
+}
+
+/// One scanned row's composite primary key as owned strings, in `pk` order.
+fn composite_key(batch: &RecordBatch, pk: &[&str], row: usize) -> Result<Vec<String>> {
+    pk.iter()
+        .map(|column| string(batch, column, row)?.with_context(|| format!("{column} is null")))
+        .collect()
+}
+
 pub(crate) fn session_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         primary_field("id", DataType::Utf8, false),
@@ -5520,6 +5558,59 @@ mod tests {
             backend.texts.load(std::sync::atomic::Ordering::SeqCst),
             5,
             "an idempotent re-sync embeds no already-present row",
+        );
+        Ok(())
+    }
+
+    /// The verify's duplicate count (`rows - distinct composite PKs` from
+    /// [`Store::composite_pk_index`]) keys on the composite PK, so the same
+    /// message id in two different sessions is NOT a duplicate (the bare-id
+    /// false-positive trap), while a genuinely doubled `(session_id, id)` row
+    /// counts as one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn composite_pk_index_counts_duplicates_by_composite_key() -> anyhow::Result<()> {
+        async fn duplicates(store: &Store, table: Table) -> anyhow::Result<usize> {
+            let (keys, rows) = store.composite_pk_index(table).await?;
+            Ok(rows - keys.len())
+        }
+        let store = Store::open(&Url::parse("shared-memory://pond-test-dupcount/")?).await?;
+        ingest_events(&store, conversational_events("01HXYDUP00000SESS1", 1)).await?;
+        ingest_events(&store, conversational_events("01HXYDUP00000SESS2", 1)).await?;
+        assert_eq!(
+            duplicates(&store, Table::Messages).await?,
+            0,
+            "the same message id in two sessions is not a duplicate (composite PK)",
+        );
+        assert_eq!(duplicates(&store, Table::Sessions).await?, 0);
+        assert_eq!(duplicates(&store, Table::Parts).await?, 0);
+
+        // Inject a real duplicate via the low-level append (no dedup) - the
+        // write anomaly the copy verify must catch.
+        let message = Message::User {
+            id: "dup-msg".to_owned(),
+            session_id: "01HXYDUP00000SESS1".to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let row = MessageBatchRow {
+            message: &message,
+            source_agent: "claude-code",
+            project: "/tmp",
+            search_text: None,
+        };
+        let batches = messages_batches(&[row], &[None])?;
+        store
+            .handle
+            .append_batches(Table::Messages, batches.clone())
+            .await?;
+        store
+            .handle
+            .append_batches(Table::Messages, batches)
+            .await?;
+        assert_eq!(
+            duplicates(&store, Table::Messages).await?,
+            1,
+            "the doubled (session_id, id) row is exactly one duplicate",
         );
         Ok(())
     }

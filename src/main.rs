@@ -2764,6 +2764,10 @@ struct TableVerify {
     table: substrate::Table,
     source_rows: usize,
     missing: usize,
+    /// Duplicate rows on the destination (`total - distinct(pk)`); zero is the
+    /// invariant. A non-zero count is a write anomaly, not a copy gap, so it
+    /// fails the verify even when nothing is missing.
+    dest_duplicates: usize,
 }
 
 struct StorageVerify {
@@ -2773,10 +2777,15 @@ struct StorageVerify {
 
 impl StorageVerify {
     fn synced(&self) -> bool {
-        self.tables.iter().all(|t| t.missing == 0)
+        self.tables
+            .iter()
+            .all(|t| t.missing == 0 && t.dest_duplicates == 0)
     }
     fn total_missing(&self) -> usize {
         self.tables.iter().map(|t| t.missing).sum()
+    }
+    fn total_duplicates(&self) -> usize {
+        self.tables.iter().map(|t| t.dest_duplicates).sum()
     }
     fn total_source_rows(&self) -> usize {
         self.tables.iter().map(|t| t.source_rows).sum()
@@ -2806,20 +2815,23 @@ struct VerifyOutcome {
 /// `pond copy`'s closing check and `pond copy --verify-only`.
 async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify> {
     use substrate::Table;
-    // Per table, materialize only the destination id set and stream the source
-    // ids against it (the source side is never held as a set) - half the peak
-    // memory of holding both sides for all three tables, which matters on a
-    // multi-million-row store. The three tables still verify concurrently, so
-    // the remote round-trip parallelism is preserved. Counts are per source row
-    // (bare `id` is not unique - it repeats across the composite pk), matching
-    // this function's per-row contract; `missing == 0` is identical either way.
+    // Per table, one composite-PK scan of the destination yields both the
+    // membership set (for completeness) and the row count - so `dest_duplicates
+    // = rows - keys.len()` is free, and the source side streams its keys against
+    // that set without ever materializing a second set (half the peak memory of
+    // holding both sides). Composite-keyed, not bare `id`: a lineage-replayed
+    // session (fork/compaction reuses the parent's message ids) verifies per
+    // session, so a wholly-absent replayed session is caught as missing where a
+    // bare-`id` check would false-negative it. Three tables verify concurrently.
     let verify_table = |table: Table| async move {
-        let dest = to.collect_ids(table).await?;
-        let (source_rows, missing) = from.id_diff_against(table, &dest).await?;
+        let (dest_keys, dest_rows) = to.composite_pk_index(table).await?;
+        let dest_duplicates = dest_rows - dest_keys.len();
+        let (source_rows, missing) = from.composite_pk_diff_against(table, &dest_keys).await?;
         anyhow::Ok(TableVerify {
             table,
             source_rows,
             missing,
+            dest_duplicates,
         })
     };
     let (sessions, messages, parts, dest_index_status, dest_embedding) = tokio::try_join!(
@@ -2896,33 +2908,42 @@ fn render_storage_verify(
         }
         Ok(VerifyOutcome { synced: true })
     } else {
-        let short = verify
-            .tables
-            .iter()
-            .filter(|t| t.missing > 0)
-            .map(|t| {
-                format!(
-                    "{} {}",
-                    t.table.as_str(),
-                    format_thousands(t.missing as u64)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        output_err(&format!(
-            "{} FAILED - {} source rows missing from destination ({})",
-            paint("verify:", dim()),
-            format_thousands(verify.total_missing() as u64),
-            short,
-        ))?;
-        output_err(&paint(
-            &format!(
-                "  fix: re-run `pond copy --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
-            ),
-            dim(),
-        ))?;
+        if verify.total_missing() > 0 {
+            output_err(&format!(
+                "{} FAILED - {} source rows missing from destination ({})",
+                paint("verify:", dim()),
+                format_thousands(verify.total_missing() as u64),
+                table_breakdown(verify, |t| t.missing),
+            ))?;
+            output_err(&paint(
+                &format!(
+                    "  fix: re-run `pond copy --from {from_display} --to {to_display}` (idempotent; copies only the missing rows)"
+                ),
+                dim(),
+            ))?;
+        }
+        if verify.total_duplicates() > 0 {
+            output_err(&format!(
+                "{} FAILED - {} duplicate rows on destination ({}) - a write anomaly, not a copy gap; investigate before querying (re-copy will not remove them)",
+                paint("verify:", dim()),
+                format_thousands(verify.total_duplicates() as u64),
+                table_breakdown(verify, |t| t.dest_duplicates),
+            ))?;
+        }
         Ok(VerifyOutcome { synced: false })
     }
+}
+
+/// `"<table> <count>, ..."` over the tables where `count` is nonzero - the
+/// per-table breakdown shared by the verify's missing and duplicate messages.
+fn table_breakdown(verify: &StorageVerify, count: impl Fn(&TableVerify) -> usize) -> String {
+    verify
+        .tables
+        .iter()
+        .filter(|t| count(t) > 0)
+        .map(|t| format!("{} {}", t.table.as_str(), format_thousands(count(t) as u64)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Default)]
@@ -4596,6 +4617,7 @@ mod tests {
             table: substrate::Table::Sessions,
             source_rows,
             missing: 0,
+            dest_duplicates: 0,
         };
         let empty = StorageVerify {
             tables: vec![table(0)],

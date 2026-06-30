@@ -1951,7 +1951,26 @@ impl Handle {
         E: Fn(Arc<Dataset>) -> Fut,
         Fut: std::future::Future<Output = Result<(Dataset, P)>>,
     {
-        self.retry_lance(table.label(), || {
+        self.write_committed_with(table, |_| true, execute).await
+    }
+
+    /// [`Self::write_committed`] with a retry gate (see
+    /// [`Self::retry_lance_filtered`]). `merge_insert` is idempotent on retry
+    /// (`WhenMatched::DoNothing` re-reads and no-ops), so it retries everything;
+    /// the bare `Append` path passes [`is_commit_conflict`] so a post-commit
+    /// transient fault surfaces rather than re-appending into a duplicate.
+    async fn write_committed_with<E, Fut, P, R>(
+        &self,
+        table: Table,
+        should_retry: R,
+        execute: E,
+    ) -> Result<P>
+    where
+        E: Fn(Arc<Dataset>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Dataset, P)>>,
+        R: Fn(&anyhow::Error) -> bool,
+    {
+        self.retry_lance_filtered(table.label(), should_retry, || {
             let execute = &execute;
             async move {
                 let mut cached = self.cached(table).await?.lock().await;
@@ -2036,6 +2055,14 @@ impl Handle {
     /// is one-shot, so an OCC retry rebuilds it. A single per-call `WriteAccum`
     /// (shared across attempts, NOT fresh per attempt) makes the row/byte/file
     /// fold exact under retries.
+    ///
+    /// Unlike [`Self::append_batches`] this keeps the retry-everything
+    /// `write_committed`: a transient fault during the large streamed upload
+    /// almost always precedes the manifest commit (the rebuilt source re-uploads
+    /// and the orphaned fragments are GC'd, no duplicate), so failing a full
+    /// bulk copy on every transient to close the narrow lost-ack-after-commit
+    /// window is the wrong trade. That rare window is surfaced by the copy
+    /// verify's duplicate check instead (spec.md#session-movement-complete).
     pub(crate) async fn append_stream<F, Fut>(
         &self,
         table: Table,
@@ -2088,6 +2115,13 @@ impl Handle {
     /// [`Self::append_stream`] for batches pond already holds in memory (the sync
     /// write path) instead of a source-store scan. Row count is taken from the
     /// batches - exact under OCC retry without depending on the progress tick.
+    ///
+    /// Retries only on a commit *conflict*, not on transient faults: `Append`
+    /// has no row-level idempotency, so re-running it after a manifest commit
+    /// that landed but whose ack was lost would duplicate the rows. A conflict
+    /// proves the commit did not land (re-append is safe); anything else
+    /// surfaces and the caller's re-plan-from-current-state re-run heals it
+    /// without doubling rows (spec.md#lance-deterministic-pk).
     pub(crate) async fn append_batches(
         &self,
         table: Table,
@@ -2100,7 +2134,7 @@ impl Handle {
         let cum = Arc::new(WriteAccum::default());
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let started = Instant::now();
-        self.write_committed(table, |existing| {
+        self.write_committed_with(table, is_commit_conflict, |existing| {
             let cum = cum.clone();
             let attempts = attempts.clone();
             let batches = batches.clone();
@@ -2602,17 +2636,41 @@ impl Handle {
             })
             .await
     }
-    async fn retry_lance<T, Fut, Op>(&self, label: &str, mut operation: Op) -> Result<T>
+    async fn retry_lance<T, Fut, Op>(&self, label: &str, operation: Op) -> Result<T>
     where
         Fut: std::future::Future<Output = Result<T>>,
         Op: FnMut() -> Fut,
+    {
+        // Default: retry every transient fault (spec.md#lance-retry-jitter).
+        self.retry_lance_filtered(label, |_| true, operation).await
+    }
+
+    /// Like [`Self::retry_lance`] but `should_retry` gates which errors are
+    /// retried. [`Self::append_batches`] passes [`is_commit_conflict`]: a commit
+    /// conflict means this writer's commit did NOT land, so re-running the
+    /// operation is safe; any other error (notably a transient fault that may
+    /// have arrived *after* the manifest commit landed - the lost-ack case) is
+    /// surfaced instead of retried, because `Append` has no row-level
+    /// idempotency and a blind re-append would duplicate. The caller's
+    /// operation re-plans from current state on its own re-run, which is the
+    /// idempotent recovery (spec.md#lance-deterministic-pk).
+    async fn retry_lance_filtered<T, Fut, Op, R>(
+        &self,
+        label: &str,
+        should_retry: R,
+        mut operation: Op,
+    ) -> Result<T>
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+        Op: FnMut() -> Fut,
+        R: Fn(&anyhow::Error) -> bool,
     {
         let mut attempt = 0u8;
         loop {
             attempt = attempt.saturating_add(1);
             match operation().await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < self.retry.attempts => {
+                Err(error) if attempt < self.retry.attempts && should_retry(&error) => {
                     let backoff = self.backoff(attempt);
                     // `{:#}` walks anyhow's cause chain inline; `%error` (Display)
                     // drops everything below the top-level message.
