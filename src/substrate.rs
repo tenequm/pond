@@ -3244,6 +3244,23 @@ pub mod index_cache {
         ) -> OsResult<GetResult> {
             let lock = self.flight_lock(location);
             let _guard = lock.lock().await;
+            let result = self.fetch_under_flight(location, options).await;
+            // Drop the entry so the map stays bounded as index versions churn.
+            // Unconditionally safe (singleflight idiom): any waiter already holds
+            // its own `lock` clone, and a later miss re-creates the entry but
+            // finds the file cached.
+            self.inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(location);
+            result
+        }
+
+        async fn fetch_under_flight(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> OsResult<GetResult> {
             if let Ok(result) = self.local.get_opts(location, local_opts(&options)).await {
                 return Ok(result);
             }
