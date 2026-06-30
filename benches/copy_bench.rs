@@ -69,6 +69,20 @@ struct Args {
     /// bias of running append-then-merge in sequence.
     #[arg(long)]
     only: Option<String>,
+    /// Append write-path commit-size sweep. For each comma-separated
+    /// rows-per-commit B, appends absent `messages` rows into a FRESH dest in
+    /// commits of B and reports rows/s, #commits, and ms/commit - the
+    /// per-commit latency floor (small B) vs the bandwidth ceiling (large B).
+    /// A trailing `bulk` point runs the wholesale single-commit copy path.
+    /// In `--dest-url` mode each B gets its own scratch prefix
+    /// `<base>-sweep-b<B>` (clean up after).
+    #[arg(long)]
+    append_sweep: Option<String>,
+    /// Cap the number of commits per sweep point so small-B runs stay bounded
+    /// on S3 (B=1 with a 50k-row corpus would otherwise be 50k round trips).
+    /// Rows appended per point = min(absent, cap * B); ms/commit is unbiased.
+    #[arg(long, default_value_t = 30)]
+    sweep_commits_cap: usize,
     /// Grown sessions to bake into the `grown` corpus (`--prepare`), or to
     /// expect when running `--corpus`. Each grows by `--messages` messages.
     #[arg(long, default_value_t = 0)]
@@ -124,6 +138,59 @@ async fn open_store(backend: &str, authority: &str) -> Result<StoreHandle> {
             })
         }
     }
+}
+
+/// Open a fresh destination for one sweep point: a scratch S3 prefix
+/// `<base>-<suffix>` when `--dest-url` is set, else a throwaway local store.
+async fn open_sweep_dest(args: &Args, suffix: &str) -> Result<StoreHandle> {
+    match &args.dest_url {
+        Some(base) => {
+            let url = format!("{base}-{suffix}");
+            println!("  dest (scratch, clean up): {url}");
+            Ok(StoreHandle {
+                store: open_configured(&url).await?,
+                _temp: None,
+            })
+        }
+        None => open_store(&args.backend, &format!("sweep-{suffix}")).await,
+    }
+}
+
+/// One sweep point: append absent `messages` rows into a fresh dest in commits
+/// of `batch` rows, capped at `commits_cap` commits. Returns (rows appended,
+/// commits issued, wall ms). `batch == 0` means the wholesale single-commit
+/// copy path (`copy_delta_from`), the fresh-bulk ceiling.
+async fn append_sweep_point(
+    source: &Store,
+    dest: &Store,
+    batch: usize,
+    commits_cap: usize,
+) -> Result<(usize, u64, u128)> {
+    let before = dest.dataset(Table::Messages).await?.version_id();
+    if batch == 0 {
+        let started = Instant::now();
+        let plan = dest.plan_incremental_from(source).await?;
+        dest.copy_delta_from(source, &plan).await?;
+        let ms = started.elapsed().as_millis();
+        let commits = dest.dataset(Table::Messages).await?.version_id() - before;
+        let (_, rows, _) = source.row_counts().await?;
+        return Ok((rows, commits, ms));
+    }
+    let all: Vec<String> = source
+        .collect_ids(Table::Messages)
+        .await?
+        .into_iter()
+        .collect();
+    let take = all.len().min(commits_cap.saturating_mul(batch));
+    let ids = &all[..take];
+    let started = Instant::now();
+    for slice in ids.chunks(batch) {
+        dest.append_absent_rows(source, Table::Messages, "id", slice)
+            .await?;
+    }
+    let ms = started.elapsed().as_millis();
+    let commits = dest.dataset(Table::Messages).await?.version_id() - before;
+    Ok((take, commits, ms))
 }
 
 async fn open_two_dests(args: &Args) -> Result<(StoreHandle, StoreHandle)> {
@@ -414,6 +481,52 @@ async fn main() -> Result<()> {
             source
         }
     };
+
+    if let Some(spec) = &args.append_sweep {
+        println!(
+            "\nappend write-path sweep (messages table, fresh dest per point, cap {} commits):",
+            args.sweep_commits_cap
+        );
+        println!(
+            "{:>6}  {:>8}  {:>9}  {:>9}  {:>11}",
+            "batch", "rows", "commits", "wall_ms", "ms/commit"
+        );
+        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let batch = if token.eq_ignore_ascii_case("bulk") {
+                0
+            } else {
+                token.parse::<usize>()?
+            };
+            let suffix = if batch == 0 {
+                "sweep-bulk".to_owned()
+            } else {
+                format!("sweep-b{batch}")
+            };
+            let dest = open_sweep_dest(&args, &suffix).await?;
+            let (rows, commits, ms) =
+                append_sweep_point(&source.store, &dest.store, batch, args.sweep_commits_cap)
+                    .await?;
+            let per_commit = if commits > 0 {
+                ms as f64 / commits as f64
+            } else {
+                0.0
+            };
+            let rate = if ms > 0 {
+                rows as f64 * 1000.0 / ms as f64
+            } else {
+                0.0
+            };
+            let label = if batch == 0 {
+                "bulk".to_owned()
+            } else {
+                batch.to_string()
+            };
+            println!(
+                "{label:>6}  {rows:>8}  {commits:>9}  {ms:>9}  {per_commit:>9.1}    ({rate:.0} rows/s)"
+            );
+        }
+        return Ok(());
+    }
 
     // Open the two dests: S3 scratch stores when --dest-url is set, else the
     // same backend as the source. The append dest carries [1]+[3]+[4]; the

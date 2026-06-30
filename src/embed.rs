@@ -385,6 +385,10 @@ pub struct EmbedWorker<'a, B: Embedder> {
     /// ([`DEFAULT_SORT_WINDOW`]); the benchmark sweeps it through
     /// [`EmbedWorker::with_sort_window`].
     sort_window: usize,
+    /// Messages per model-inference batch ([`DEFAULT_BATCH_SIZE`]); the
+    /// benchmark sweeps it through [`EmbedWorker::with_batch_size`] to size
+    /// the inference-throughput vs padding-waste trade-off.
+    batch_size: usize,
     /// Optional per-batch progress callback. Called once per `flush()` with
     /// the running totals; `pond optimize` wires this to an `indicatif` bar.
     progress: Option<ProgressFn>,
@@ -404,6 +408,7 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
             include_stale: false,
             limit: None,
             sort_window: DEFAULT_SORT_WINDOW,
+            batch_size: DEFAULT_BATCH_SIZE,
             progress: None,
             cancel: None,
         }
@@ -429,7 +434,17 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
     /// benchmark harness sweeps this to size the padding-waste vs. throughput
     /// trade-off; a window of [`DEFAULT_BATCH_SIZE`] disables sorting.
     pub fn with_sort_window(mut self, window: usize) -> Self {
-        self.sort_window = window.max(DEFAULT_BATCH_SIZE);
+        self.sort_window = window.max(self.batch_size);
+        self
+    }
+
+    /// Override the model-inference batch size (default [`DEFAULT_BATCH_SIZE`]).
+    /// The benchmark harness sweeps this to size inference throughput vs the
+    /// padded-attention memory transient; larger batches amortize per-call
+    /// overhead but pad more aggressively.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
+        self.sort_window = self.sort_window.max(self.batch_size);
         self
     }
 
@@ -513,11 +528,11 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
             return Ok(());
         }
         window.sort_unstable_by_key(|message| message.search_text.len());
-        let mut batch: Vec<PendingMessage> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut batch: Vec<PendingMessage> = Vec::with_capacity(self.batch_size);
         let mut accumulator: Vec<EmbeddedMessage> = Vec::with_capacity(window.len());
         for message in window.drain(..) {
             batch.push(message);
-            if batch.len() >= DEFAULT_BATCH_SIZE {
+            if batch.len() >= self.batch_size {
                 accumulator.extend(self.embed_batch(&mut batch, summary).await?);
             }
         }

@@ -37,7 +37,7 @@ use anyhow::Result;
 use clap::Parser;
 use pond::{
     adapter::ClaudeCodeAdapter,
-    embed::{CandleEmbedder, DEFAULT_SORT_WINDOW, EmbedWorker, Embedder},
+    embed::{CandleEmbedder, DEFAULT_BATCH_SIZE, DEFAULT_SORT_WINDOW, EmbedWorker, Embedder},
     handlers::ingest_adapter,
     sessions::Store,
 };
@@ -65,6 +65,11 @@ struct Args {
     /// batching. Omitted uses the worker default; `32` disables sorting.
     #[arg(long)]
     window: Option<usize>,
+    /// Model-inference batch size: messages per `embed()` call. Omitted uses
+    /// the worker default ([`DEFAULT_BATCH_SIZE`]). Swept to find the
+    /// throughput-optimal batch on this device.
+    #[arg(long)]
+    batch: Option<usize>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -267,6 +272,9 @@ async fn main() -> Result<()> {
     if args.limit > 0 {
         worker = worker.with_limit(args.limit);
     }
+    if let Some(batch) = args.batch {
+        worker = worker.with_batch_size(batch);
+    }
     if let Some(window) = args.window {
         worker = worker.with_sort_window(window);
     }
@@ -373,14 +381,16 @@ fn report(r: &Report<'_>) {
 
     println!("=== pond embedding bench ===");
     let window = r.args.window.unwrap_or(DEFAULT_SORT_WINDOW);
+    let batch = r.args.batch.unwrap_or(DEFAULT_BATCH_SIZE);
     println!(
-        "config        device={}  limit={}  sort-window={}",
+        "config        device={}  limit={}  batch={}  sort-window={}",
         r.device,
         if r.args.limit > 0 {
             r.args.limit.to_string()
         } else {
             "none".to_owned()
         },
+        batch,
         window,
     );
     println!(
@@ -427,6 +437,7 @@ fn report(r: &Report<'_>) {
     let json = serde_json::json!({
         "device": r.device,
         "limit": r.args.limit,
+        "batch_size": batch,
         "sort_window": window,
         "messages": r.embedded,
         "batches": r.batches,
