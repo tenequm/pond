@@ -1,11 +1,10 @@
 ---
 source: src/main.rs
-assertion_line: 4771
 expression: sub.render_long_help().to_string()
 ---
 Keep the lake queryable: embed the backlog, then fold the search indexes.
 
-The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` runs both by default; this is the on-demand and post-`--no-optimize` catch-up.
+The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds inline and folds by default; this is the on-demand maintenance run and the model-swap re-embed (`--force-embed`).
 
 Usage: pond optimize [OPTIONS]
 
@@ -52,7 +51,7 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond optimize                    embed the backlog, then fold indexes
-  pond optimize --only index       fold indexes only (e.g. after `pond copy --no-optimize`)
+  pond optimize                    embed any backlog, then fold indexes
+  pond optimize --only index       fold indexes only
   pond optimize --only embed       embed only
   pond optimize --force-embed      re-embed stale rows after a model change

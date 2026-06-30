@@ -9,16 +9,19 @@ use std::{
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
+use arrow_select::filter::filter_record_batch;
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
 use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
+use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
-    Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    TimestampMicrosecondArray, UInt64Array, new_null_array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
+use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
@@ -48,6 +51,11 @@ pub struct Store {
     /// data-projection scan and hydration to `take_rows`. `ArcSwap` so a
     /// version-bump rebuild swaps it under concurrent searches.
     rowmap: ArcSwapOption<RowMetaSet>,
+    /// Resident embedder for inline embed-at-ingest. `None` keeps ingest
+    /// writing null vectors (tests, search-only stores); the CLI write paths
+    /// attach one via [`Store::with_embedder`]. Lazy, so a store that never
+    /// ingests an embeddable row never loads the model.
+    embedder: Option<Arc<crate::embed::LazyEmbedder>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +85,8 @@ pub struct LanceArchiveImport {
 }
 
 /// One table's slice of a store-to-store copy plan: which sessions' rows for
-/// that table can be **appended** versus **merged** (spec.md#session-durable-copy).
+/// that table can be **appended** versus **filtered-appended** (the `merge`
+/// bucket, which despite the name appends too) (spec.md#session-durable-copy).
 /// The choice is made per table by row presence on the destination, because the
 /// three tables are written by separate commits and an interrupted copy can
 /// leave them in different states (e.g. the small `sessions` table committed but
@@ -86,7 +95,7 @@ pub struct LanceArchiveImport {
 ///   so they cannot collide -> append (no merge join, no target probe; the
 ///   bandwidth-bound fast path).
 /// - `merge`: the destination already has *some* rows but the source has more ->
-///   merge to dedup the rows already there (`WhenMatched::DoNothing`).
+///   append only the rows still absent (filtered against the destination's PKs).
 #[derive(Debug, Clone, Default)]
 pub struct TablePlan {
     pub append: Vec<String>,
@@ -285,7 +294,18 @@ impl Store {
         Ok(Self {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
+            embedder: None,
         })
+    }
+
+    /// Attach a resident embedder so [`Store::upsert_session_batch`] embeds
+    /// eligible messages inline, in the same append commit as the rows
+    /// (spec.md#session-embed-from-canonical). The CLI write paths set this;
+    /// every other open leaves it `None` and writes null vectors as before.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<crate::embed::LazyEmbedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Live byte size of the shared Lance session caches (index + metadata).
@@ -307,6 +327,7 @@ impl Store {
         Ok(Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
+            embedder: None,
         })
     }
 
@@ -327,6 +348,7 @@ impl Store {
             )
             .await?,
             rowmap: ArcSwapOption::empty(),
+            embedder: None,
         })
     }
 
@@ -549,12 +571,13 @@ impl Store {
 
     /// Plan an incremental store-to-store copy into `self` from `source`,
     /// deciding **per table** whether each source session's rows can be appended
-    /// (the destination has none, so they cannot collide) or must be merged (the
-    /// destination has some, source has more). Reads both id-sets plus
-    /// per-session message and part counts. Parts have their own data-derived
-    /// signal so a part added under an existing message routes through merge
-    /// instead of relying on the closing verify to catch it
-    /// (spec.md#session-movement-complete).
+    /// wholesale (the destination has none, so they cannot collide) or go to the
+    /// `merge` bucket - which the copy executes as a filtered append, keeping
+    /// only the rows still absent (the destination has some, source has more).
+    /// Reads both id-sets plus per-session message and part counts. Parts have
+    /// their own data-derived signal so a part added under an existing message
+    /// routes through the `merge` bucket instead of relying on the closing verify
+    /// to catch it (spec.md#session-movement-complete).
     pub async fn plan_incremental_from(&self, source: &Store) -> Result<DeltaPlan> {
         let (
             source_ids,
@@ -608,9 +631,9 @@ impl Store {
     /// scan straight into the destination - no local staging copy. Each table
     /// picks its primitive per session from its [`TablePlan`]
     /// (spec.md#session-durable-copy): **append** the sessions whose rows are
-    /// absent here (cannot collide; one commit per scan, bandwidth-bound) then
-    /// **merge** the partially-present ones (`WhenMatched::DoNothing` dedups the
-    /// rows already there). Append-only storage is what makes the append safe: a
+    /// absent here (cannot collide; one commit per scan, bandwidth-bound), then
+    /// for the grown ones append just their absent rows after filtering out the
+    /// ones already present. Append-only storage is what makes the append safe: a
     /// re-run re-plans from current destination state, so an
     /// interrupted-then-resumed copy never double-appends (landed rows are no
     /// longer absent).
@@ -660,11 +683,10 @@ impl Store {
         })
     }
 
-    /// Copy one table's slice of the plan: append the sessions whose rows are
-    /// absent here, then merge the ones whose rows are partially present.
-    /// Sequential within a table (one write lock); `copy_delta_from` runs the
-    /// three tables in parallel. Returns (rows transferred, rows inserted) -
-    /// equal for the append portion, which never dedups.
+    /// Copy one table's slice of the plan: append the absent sessions, then
+    /// append the grown sessions' absent rows. Sequential within a table (one
+    /// write lock); `copy_delta_from` runs the three tables in parallel. Returns
+    /// (rows, inserted), equal since both paths append and neither dedups.
     async fn copy_table(
         &self,
         source: &Store,
@@ -688,29 +710,31 @@ impl Store {
             )
             .await?;
 
-        // Sessions with rows already on the destination take the merge path to
-        // skip the rows already there. Chunk the `IN` list so each chunk pushes
-        // down to the key column's btree index.
-        let mut merged_rows = 0usize;
-        let mut merged_inserted = 0usize;
+        // `Sessions` never reaches here: its row is immutable, so a present
+        // session is identical and routes to neither append nor merge.
+        let mut grown = 0usize;
         for chunk in table_plan.merge.chunks(COPY_SESSION_IN_CHUNK) {
-            let predicate = in_predicate(key_column, chunk);
-            let scanner = source
-                .handle
-                .scan(
-                    table,
-                    ScanOpts {
-                        predicate: Some(&predicate),
-                        projection: None,
-                    },
-                )
-                .await?;
-            let (r, i) = self.merge_scanner(table, scanner, "copy").await?;
-            merged_rows += r;
-            merged_inserted += i;
+            let values: Vec<ScalarValue> = chunk
+                .iter()
+                .map(|id| ScalarValue::String(id.clone()))
+                .collect();
+            let predicate = Predicate::In("session_id", values.clone());
+            let stream = Self::source_scan(source, table, Some(&predicate)).await?;
+            grown += match table {
+                Table::Messages => {
+                    let present = Arc::new(self.present_message_pks(&values).await?);
+                    self.append_filtered(table, stream, Self::message_keep(present))
+                        .await?
+                }
+                Table::Parts => {
+                    let present = Arc::new(self.present_part_pks(&values).await?);
+                    self.append_filtered(table, stream, Self::part_keep(present))
+                        .await?
+                }
+                Table::Sessions => 0,
+            };
         }
-
-        Ok((appended + merged_rows, appended + merged_inserted))
+        Ok((appended + grown, appended + grown))
     }
 
     /// Append one table's slice for the listed sessions. A from-empty or resumed
@@ -752,33 +776,14 @@ impl Store {
         table: Table,
         predicate: Option<&Predicate>,
     ) -> Result<usize> {
-        let make_source = || async {
-            let mut scanner = source
-                .handle
-                .scan(
-                    table,
-                    ScanOpts {
-                        predicate,
-                        projection: None,
-                    },
-                )
-                .await?;
-            scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
-            let stream: SendableRecordBatchStream = scanner
-                .try_into_stream()
-                .await
-                .with_context(|| format!("failed to scan {} for copy", table.as_str()))?
-                .into();
-            Ok(stream)
-        };
+        let make_source = || Self::source_scan(source, table, predicate);
         let stats = self.handle.append_stream(table, make_source).await?;
         Ok(stats.rows as usize)
     }
 
     /// Append source rows whose `filter_column` is in `values`. Absent rows
     /// can't collide, so append is safe where the count-based plan would merge
-    /// (spec.md#session-durable-copy). Drives the `copy_bench` append-vs-merge
-    /// regression guard.
+    /// (spec.md#session-durable-copy).
     pub async fn append_absent_rows(
         &self,
         source: &Store,
@@ -798,6 +803,138 @@ impl Store {
         Ok(rows)
     }
 
+    /// Stored message PKs for the given sessions. On the full `(session_id, id)`
+    /// PK, not `id` alone: a message id is unique only within its session.
+    async fn present_message_pks(
+        &self,
+        session_id_values: &[ScalarValue],
+    ) -> Result<HashSet<(String, String)>> {
+        if session_id_values.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::In("session_id", session_id_values.to_vec())),
+                pk_columns(Table::Messages),
+            )
+            .await?;
+        let mut set = HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(&batch, "id", row)?.context("message id is null")?;
+            set.insert((sid, mid));
+        }
+        Ok(set)
+    }
+
+    /// Stored part PKs for the given sessions, on the full
+    /// `(session_id, message_id, id)` PK (see [`Self::present_message_pks`]).
+    async fn present_part_pks(
+        &self,
+        session_id_values: &[ScalarValue],
+    ) -> Result<HashSet<(String, String, String)>> {
+        if session_id_values.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Parts,
+                Some(&Predicate::In("session_id", session_id_values.to_vec())),
+                pk_columns(Table::Parts),
+            )
+            .await?;
+        let mut set = HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(&batch, "message_id", row)?.context("message_id is null")?;
+            let pid = string(&batch, "id", row)?.context("part id is null")?;
+            set.insert((sid, mid, pid));
+        }
+        Ok(set)
+    }
+
+    /// The filter-and-append write seam, shared by ingest and grown-session
+    /// copy. Collects only the kept rows (the absent delta), so it never stages
+    /// a full copy. The terminal `append_batches` retries only a commit
+    /// conflict (not a transient post-commit fault), so a lost-ack retry cannot
+    /// re-append the same rows; an interrupted write heals on the next
+    /// re-planned re-run instead (spec.md#lance-deterministic-pk).
+    async fn append_filtered<S, K>(&self, table: Table, mut batches: S, keep: K) -> Result<usize>
+    where
+        S: Stream<Item = std::result::Result<RecordBatch, DataFusionError>> + Unpin,
+        K: Fn(&RecordBatch, usize) -> Result<bool>,
+    {
+        let mut kept_batches: Vec<RecordBatch> = Vec::new();
+        let mut kept = 0usize;
+        while let Some(batch) = batches.next().await {
+            let batch = batch?;
+            let mut mask = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                mask.push(keep(&batch, row)?);
+            }
+            let selected = filter_record_batch(&batch, &BooleanArray::from(mask))?;
+            if selected.num_rows() > 0 {
+                kept += selected.num_rows();
+                kept_batches.push(selected);
+            }
+        }
+        self.handle.append_batches(table, kept_batches).await?;
+        Ok(kept)
+    }
+
+    /// One-shot source scan with blob bytes materialized (`AllBinary`) so the
+    /// appended rows are self-contained.
+    async fn source_scan(
+        source: &Store,
+        table: Table,
+        predicate: Option<&Predicate>,
+    ) -> Result<SendableRecordBatchStream> {
+        let mut scanner = source
+            .handle
+            .scan(
+                table,
+                ScanOpts {
+                    predicate,
+                    projection: None,
+                },
+            )
+            .await?;
+        scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
+        Ok(scanner
+            .try_into_stream()
+            .await
+            .with_context(|| format!("failed to scan {} for copy", table.as_str()))?
+            .into())
+    }
+
+    /// `append_filtered` keep for `messages`: a row survives iff its
+    /// `(session_id, id)` PK is absent from `present`.
+    fn message_keep(
+        present: Arc<HashSet<(String, String)>>,
+    ) -> impl Fn(&RecordBatch, usize) -> Result<bool> {
+        move |batch, row| {
+            let sid = string(batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(batch, "id", row)?.context("message id is null")?;
+            Ok(!present.contains(&(sid, mid)))
+        }
+    }
+
+    /// `append_filtered` keep for `parts`, on the full
+    /// `(session_id, message_id, id)` PK.
+    fn part_keep(
+        present: Arc<HashSet<(String, String, String)>>,
+    ) -> impl Fn(&RecordBatch, usize) -> Result<bool> {
+        move |batch, row| {
+            let sid = string(batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(batch, "message_id", row)?.context("message_id is null")?;
+            let pid = string(batch, "id", row)?.context("part id is null")?;
+            Ok(!present.contains(&(sid, mid, pid)))
+        }
+    }
+
     /// Flat write path. Per-row insert/match truth is not synthesized here -
     /// honest outcomes come from the pre-existence scan on
     /// [`Self::upsert_session_batch`]; the CLI sync and wire ingest paths use
@@ -809,6 +946,52 @@ impl Store {
         let batches = sessions_batches(sessions)?;
         merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
         Ok(())
+    }
+
+    /// Embeddings aligned to `rows` so they ride the rows' birth append. A row
+    /// is embedded iff it has `search_text` and is absent from `present` (an
+    /// idempotent re-sync re-embeds nothing the append would drop); otherwise,
+    /// and whenever no embedder is attached, the slot is `None` and the batch
+    /// writes a null vector for `pond optimize` to fill later.
+    async fn embed_message_rows(
+        &self,
+        rows: &[MessageBatchRow<'_>],
+        present: &HashSet<(String, String)>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut out = vec![None; rows.len()];
+        let Some(embedder) = &self.embedder else {
+            return Ok(out);
+        };
+        let targets: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.search_text.is_some()
+                    && !present.contains(&(
+                        row.message.session_id().to_owned(),
+                        row.message.id().to_owned(),
+                    ))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if targets.is_empty() {
+            return Ok(out);
+        }
+        let backend = embedder.get().await?;
+        let texts: Vec<&str> = targets
+            .iter()
+            .map(|&index| rows[index].search_text.unwrap_or_default())
+            .collect();
+        let vectors = crate::embed::embed_passages(
+            backend.as_ref(),
+            &texts,
+            crate::embed::DEFAULT_BATCH_SIZE,
+            |_| {},
+        )?;
+        for (&index, vector) in targets.iter().zip(vectors) {
+            out[index] = Some(vector);
+        }
+        Ok(out)
     }
 
     /// Batched write path used by the adapter ingest loop and by the wire
@@ -943,45 +1126,8 @@ impl Store {
                 }
                 map
             };
-        let existing_message_pks: HashSet<(String, String)> = if session_id_values.is_empty() {
-            HashSet::new()
-        } else {
-            let batch = self
-                .handle
-                .scan_batch(
-                    Table::Messages,
-                    Some(&Predicate::In("session_id", session_id_values.clone())),
-                    &["session_id", "id"],
-                )
-                .await?;
-            let mut set = HashSet::with_capacity(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
-                let mid = string(&batch, "id", row)?.context("message id is null")?;
-                set.insert((sid, mid));
-            }
-            set
-        };
-        let existing_part_pks: HashSet<(String, String, String)> = if session_id_values.is_empty() {
-            HashSet::new()
-        } else {
-            let batch = self
-                .handle
-                .scan_batch(
-                    Table::Parts,
-                    Some(&Predicate::In("session_id", session_id_values)),
-                    &["session_id", "message_id", "id"],
-                )
-                .await?;
-            let mut set = HashSet::with_capacity(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
-                let mid = string(&batch, "message_id", row)?.context("message_id is null")?;
-                let pid = string(&batch, "id", row)?.context("part id is null")?;
-                set.insert((sid, mid, pid));
-            }
-            set
-        };
+        let existing_message_pks = Arc::new(self.present_message_pks(&session_id_values).await?);
+        let existing_part_pks = Arc::new(self.present_part_pks(&session_id_values).await?);
 
         let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
         for substream in merged {
@@ -1018,9 +1164,8 @@ impl Store {
             .iter()
             .map(|substream| substream.session.clone())
             .collect();
-        // Append only rows absent from the pre-existence sweep; present rows are
-        // merge no-ops (spec.md#adapter-integrity-additive-sync). `seen_*` carries
-        // the in-batch dedup floor (spec.md#adapter-integrity-dedup).
+        // Drop only in-batch duplicates here (spec.md#adapter-integrity-dedup);
+        // `append_filtered` drops the rows already present on the destination.
         let mut seen_messages: HashSet<(String, String)> = HashSet::new();
         let message_rows: Vec<MessageBatchRow<'_>> = writeable
             .iter()
@@ -1033,11 +1178,10 @@ impl Store {
                 })
             })
             .filter(|row| {
-                let key = (
+                seen_messages.insert((
                     row.message.session_id().to_owned(),
                     row.message.id().to_owned(),
-                );
-                !existing_message_pks.contains(&key) && seen_messages.insert(key)
+                ))
             })
             .collect();
         let mut seen_parts: HashSet<(String, String, String)> = HashSet::new();
@@ -1052,22 +1196,42 @@ impl Store {
                 })
             })
             .filter(|part| {
-                let key = (
+                seen_parts.insert((
                     part.session_id.clone(),
                     part.message_id.clone(),
                     part.id.clone(),
-                );
-                !existing_part_pks.contains(&key) && seen_parts.insert(key)
+                ))
             })
             .collect();
 
-        let session_batches = sessions_batches(&sessions_owned)?;
-        let message_batches = messages_batches(&message_rows)?;
-        let part_batches = parts_batches(&part_rows)?;
+        // Embed before the append so the vector rides the message rows' birth
+        // commit (spec.md#session-durable-copy: one append, no extra commit).
+        let message_vectors = self
+            .embed_message_rows(&message_rows, &existing_message_pks)
+            .await?;
 
+        let session_batches = sessions_batches(&sessions_owned)?;
+        let message_stream = tokio_stream::iter(
+            messages_batches(&message_rows, &message_vectors)?
+                .into_iter()
+                .map(Ok::<_, DataFusionError>),
+        );
+        let part_stream = tokio_stream::iter(
+            parts_batches(&part_rows)?
+                .into_iter()
+                .map(Ok::<_, DataFusionError>),
+        );
         let (_messages_appended, _parts_appended) = tokio::try_join!(
-            self.handle.append_batches(Table::Messages, message_batches),
-            self.handle.append_batches(Table::Parts, part_batches),
+            self.append_filtered(
+                Table::Messages,
+                message_stream,
+                Self::message_keep(existing_message_pks.clone()),
+            ),
+            self.append_filtered(
+                Table::Parts,
+                part_stream,
+                Self::part_keep(existing_part_pks.clone()),
+            ),
         )?;
         let _sessions_inserted =
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;
@@ -1106,7 +1270,7 @@ impl Store {
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
-        let batches = messages_batches(&rows)?;
+        let batches = messages_batches(&rows, &vec![None; rows.len()])?;
         merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
         Ok(())
     }
@@ -1503,32 +1667,48 @@ impl Store {
         self.handle.collect_ids(table).await
     }
 
-    /// Stream `table`'s `id` column and return `(rows_scanned, rows whose id is
-    /// absent from `present`)`. Streaming means the scanned side is never
-    /// materialized into a set, so a verify holds only the `present` (other)
-    /// side per table instead of both.
-    pub async fn id_diff_against(
+    /// This store's set of composite primary keys for `table`, plus the row
+    /// count. `rows - keys.len()` is the duplicate count - zero is the invariant
+    /// (the append path has no row-level dedup, so a non-zero count is a write
+    /// anomaly the copy verify reports rather than calling "synced"), and the
+    /// key set drives the verify's completeness membership. One scan over only
+    /// the PK columns yields both, holding a single composite-PK set per table.
+    pub async fn composite_pk_index(&self, table: Table) -> Result<(HashSet<Vec<String>>, usize)> {
+        let pk = pk_columns(table);
+        let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut keys: HashSet<Vec<String>> = HashSet::new();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                rows += 1;
+                keys.insert(composite_key(&batch, pk, row)?);
+            }
+        }
+        Ok((keys, rows))
+    }
+
+    /// Stream `table`'s composite primary keys and return `(rows_scanned, rows
+    /// whose key is absent from `present`)`. Composite-keyed, not bare `id`: a
+    /// message id replayed into a new session by a fork/compaction is matched
+    /// per session, so a wholly-absent replayed session whose ids collide with
+    /// present ones is counted missing - a bare-`id` check would false-negative
+    /// it as "present". Streams the scanned side, holding only `present`.
+    pub async fn composite_pk_diff_against(
         &self,
         table: Table,
-        present: &std::collections::HashSet<String>,
+        present: &HashSet<Vec<String>>,
     ) -> Result<(usize, usize)> {
-        let scanner = self
-            .handle
-            .scan(table, ScanOpts::project_only(&["id"]))
-            .await?;
+        let pk = pk_columns(table);
+        let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
         let mut stream = scanner.try_into_stream().await?;
         let (mut rows, mut absent) = (0usize, 0usize);
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            let ids = batch
-                .column_by_name("id")
-                .context("scan projection dropped the id column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("id column is not Utf8")?;
-            for id in ids.iter().flatten() {
+            for row in 0..batch.num_rows() {
                 rows += 1;
-                if !present.contains(id) {
+                if !present.contains(&composite_key(&batch, pk, row)?) {
                     absent += 1;
                 }
             }
@@ -4438,6 +4618,26 @@ async fn open_archive_table(table: Table, source: &Path) -> Result<Dataset> {
     Ok(dataset)
 }
 
+/// The composite primary-key columns each table's schema declares
+/// (spec.md#lance-table-creation-session-scoped-pk): a message/part id is
+/// unique only within its session, so the key leads with `session_id`. The one
+/// source of truth for the PK structure - kept beside the schemas it mirrors,
+/// not in the schema-agnostic substrate seam.
+pub(crate) fn pk_columns(table: Table) -> &'static [&'static str] {
+    match table {
+        Table::Sessions => &["id"],
+        Table::Messages => &["session_id", "id"],
+        Table::Parts => &["session_id", "message_id", "id"],
+    }
+}
+
+/// One scanned row's composite primary key as owned strings, in `pk` order.
+fn composite_key(batch: &RecordBatch, pk: &[&str], row: usize) -> Result<Vec<String>> {
+    pk.iter()
+        .map(|column| string(batch, column, row)?.with_context(|| format!("{column} is null")))
+        .collect()
+}
+
 pub(crate) fn session_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         primary_field("id", DataType::Utf8, false),
@@ -4469,7 +4669,8 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
         // The message's derived embedding (spec.md#session-embed-from-canonical):
-        // both null until `pond optimize` fills them, set together thereafter.
+        // filled inline at ingest when embedding is on, else null until a later
+        // `pond optimize` embed pass; `vector` and `embedding_model` set together.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
         json_field("options", false),
@@ -4544,6 +4745,52 @@ fn embedding_update_schema() -> Arc<Schema> {
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
     ]))
+}
+
+/// The `messages` `vector` + `embedding_model` columns for an inline-embed
+/// batch: `Some` rows carry the embedding and the current model id, `None` rows
+/// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
+fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
+    let dim = embedding_dim();
+    // The common case (no embedder, or every row already present) is all-null:
+    // build both columns with one bulk allocation instead of dim per-row appends.
+    if vectors.iter().all(Option::is_none) {
+        return Ok((
+            new_null_array(&embedding_vector_type(), vectors.len()),
+            new_null_array(&DataType::Utf8, vectors.len()),
+        ));
+    }
+    let mut builder = FixedSizeListBuilder::new(
+        Float16Builder::with_capacity(vectors.len() * dim),
+        dim as i32,
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float16, true)));
+    let mut models: Vec<Option<&str>> = Vec::with_capacity(vectors.len());
+    for vector in vectors {
+        match vector {
+            Some(values) => {
+                if values.len() != dim {
+                    anyhow::bail!("inline embedding has dim {}, expected {dim}", values.len());
+                }
+                for value in values {
+                    builder.values().append_value(half::f16::from_f32(*value));
+                }
+                builder.append(true);
+                models.push(Some(embed::model_id()));
+            }
+            None => {
+                for _ in 0..dim {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+                models.push(None);
+            }
+        }
+    }
+    Ok((
+        Arc::new(builder.finish()) as ArrayRef,
+        Arc::new(StringArray::from(models)) as ArrayRef,
+    ))
 }
 
 /// Build the merge-update source batch for [`Store::write_embeddings`]: one row
@@ -4713,7 +4960,13 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
-pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<RecordBatch>> {
+/// `vectors` is aligned to `rows` (same length): `Some` carries the inline
+/// embedding for that row, `None` writes a null `vector`/`embedding_model`.
+pub(crate) fn messages_batches(
+    rows: &[MessageBatchRow<'_>],
+    vectors: &[Option<Vec<f32>>],
+) -> Result<Vec<RecordBatch>> {
+    debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
     let options = rows
         .iter()
         .map(|row| json_bytes(row.message.options()))
@@ -4737,12 +4990,23 @@ pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<Recor
     }
     chunk_ranges(&cells)
         .into_iter()
-        .map(|range| messages_chunk(&rows[range.clone()], &options[range]))
+        .map(|range| {
+            messages_chunk(
+                &rows[range.clone()],
+                &options[range.clone()],
+                &vectors[range],
+            )
+        })
         .collect()
 }
 
-fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<RecordBatch> {
+fn messages_chunk(
+    rows: &[MessageBatchRow<'_>],
+    options: &[Vec<u8>],
+    vectors: &[Option<Vec<f32>>],
+) -> Result<RecordBatch> {
     let schema = message_schema();
+    let (vector_column, embedding_model) = embedding_columns(vectors)?;
     RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -4781,11 +5045,12 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<R
             Arc::new(StringArray::from(
                 rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
             )),
-            // `vector` / `embedding_model` are written null at ingest; every
-            // message starts un-embedded and `pond optimize` fills them later
+            // `vector` / `embedding_model` carry the inline embedding when one
+            // was produced for the row, null otherwise (embedder disabled, or a
+            // non-embeddable row); `pond optimize` fills any remaining nulls
             // (spec.md#session-embed-from-canonical).
-            new_null_array(&embedding_vector_type(), rows.len()),
-            new_null_array(&DataType::Utf8, rows.len()),
+            vector_column,
+            embedding_model,
             Arc::new(LargeBinaryArray::from_iter_values(
                 options.iter().map(Vec::as_slice),
             )),
@@ -5274,6 +5539,150 @@ mod tests {
             project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
+    }
+
+    /// Counts the texts handed to the backend so a test can assert how many rows
+    /// were embedded.
+    #[derive(Default)]
+    struct CountingEmbedder {
+        texts: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::embed::Embedder for CountingEmbedder {
+        fn device(&self) -> &str {
+            "test"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.texts
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0_f32; embedding_dim()])
+                .collect())
+        }
+    }
+
+    /// A session with `count` conversational user messages, each carrying a text
+    /// part so its `search_text` is non-null (hence embeddable).
+    fn conversational_events(session_id: &str, count: usize) -> Vec<IngestEvent> {
+        let mut events = vec![IngestEvent::Session(synthetic_session(session_id))];
+        for index in 0..count {
+            events.push(IngestEvent::Message(Message::User {
+                id: format!("msg-{index}"),
+                session_id: session_id.to_owned(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(IngestEvent::Part(Part {
+                session_id: session_id.to_owned(),
+                id: format!("msg-{index}:0001"),
+                message_id: format!("msg-{index}"),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(format!("body {index}"))),
+                },
+            }));
+        }
+        events
+    }
+
+    /// Inline embed-at-ingest: with an embedder attached the vectors are filled
+    /// in the message rows' birth append (no extra embed commit - the version
+    /// matches a plain ingest), and a re-sync embeds no already-present row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_embeds_inline_in_the_birth_commit() -> anyhow::Result<()> {
+        let plain = Store::open(&Url::parse("shared-memory://pond-test-inline-plain/")?).await?;
+        ingest_events(&plain, conversational_events("01HXYINLINE000PLAIN", 5)).await?;
+        assert!(
+            !plain.has_embeddings().await?,
+            "no embedder attached -> every vector null",
+        );
+        let plain_version = plain.messages_version().await?;
+
+        let backend = Arc::new(CountingEmbedder::default());
+        let embedder = Arc::new(crate::embed::LazyEmbedder::from_loaded(
+            backend.clone() as Arc<dyn crate::embed::Embedder>
+        ));
+        let store = Store::open(&Url::parse("shared-memory://pond-test-inline-embed/")?)
+            .await?
+            .with_embedder(embedder);
+        ingest_events(&store, conversational_events("01HXYINLINE000EMBED", 5)).await?;
+        assert!(
+            store.has_embeddings().await?,
+            "embedder attached -> vectors filled at ingest",
+        );
+        assert_eq!(
+            backend.texts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "every conversational message embedded once",
+        );
+        assert_eq!(
+            store.messages_version().await?,
+            plain_version,
+            "inline embed must ride the append, not add a separate commit",
+        );
+
+        ingest_events(&store, conversational_events("01HXYINLINE000EMBED", 5)).await?;
+        assert_eq!(
+            backend.texts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "an idempotent re-sync embeds no already-present row",
+        );
+        Ok(())
+    }
+
+    /// The verify's duplicate count (`rows - distinct composite PKs` from
+    /// [`Store::composite_pk_index`]) keys on the composite PK, so the same
+    /// message id in two different sessions is NOT a duplicate (the bare-id
+    /// false-positive trap), while a genuinely doubled `(session_id, id)` row
+    /// counts as one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn composite_pk_index_counts_duplicates_by_composite_key() -> anyhow::Result<()> {
+        async fn duplicates(store: &Store, table: Table) -> anyhow::Result<usize> {
+            let (keys, rows) = store.composite_pk_index(table).await?;
+            Ok(rows - keys.len())
+        }
+        let store = Store::open(&Url::parse("shared-memory://pond-test-dupcount/")?).await?;
+        ingest_events(&store, conversational_events("01HXYDUP00000SESS1", 1)).await?;
+        ingest_events(&store, conversational_events("01HXYDUP00000SESS2", 1)).await?;
+        assert_eq!(
+            duplicates(&store, Table::Messages).await?,
+            0,
+            "the same message id in two sessions is not a duplicate (composite PK)",
+        );
+        assert_eq!(duplicates(&store, Table::Sessions).await?, 0);
+        assert_eq!(duplicates(&store, Table::Parts).await?, 0);
+
+        // Inject a real duplicate via the low-level append (no dedup) - the
+        // write anomaly the copy verify must catch.
+        let message = Message::User {
+            id: "dup-msg".to_owned(),
+            session_id: "01HXYDUP00000SESS1".to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let row = MessageBatchRow {
+            message: &message,
+            source_agent: "claude-code",
+            project: "/tmp",
+            search_text: None,
+        };
+        let batches = messages_batches(&[row], &[None])?;
+        store
+            .handle
+            .append_batches(Table::Messages, batches.clone())
+            .await?;
+        store
+            .handle
+            .append_batches(Table::Messages, batches)
+            .await?;
+        assert_eq!(
+            duplicates(&store, Table::Messages).await?,
+            1,
+            "the doubled (session_id, id) row is exactly one duplicate",
+        );
+        Ok(())
     }
 
     #[test]

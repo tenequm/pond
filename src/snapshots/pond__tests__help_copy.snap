@@ -18,9 +18,6 @@ Options:
       --verify-only
           Only verify the destination already contains the source - copy nothing, rebuild no indexes. Read-only; store-to-store only
 
-      --no-optimize
-          Skip the post-copy index rebuild (store-to-store and archive restore, for very large stores you will index later). Build indexes after with `pond optimize --only index --storage-path <to>`
-
   -h, --help
           Print help (see a summary with '-h')
 
