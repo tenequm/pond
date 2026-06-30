@@ -9,16 +9,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
+use arrow_select::filter::filter_record_batch;
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
 use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
 use lance::deps::arrow_array::{
-    Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
-    UInt64Array, new_null_array,
+    Array, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    TimestampMicrosecondArray, UInt64Array, new_null_array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
+use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
@@ -86,7 +88,7 @@ pub struct LanceArchiveImport {
 ///   so they cannot collide -> append (no merge join, no target probe; the
 ///   bandwidth-bound fast path).
 /// - `merge`: the destination already has *some* rows but the source has more ->
-///   merge to dedup the rows already there (`WhenMatched::DoNothing`).
+///   append only the rows still absent (filtered against the destination's PKs).
 #[derive(Debug, Clone, Default)]
 pub struct TablePlan {
     pub append: Vec<String>,
@@ -588,9 +590,9 @@ impl Store {
     /// scan straight into the destination - no local staging copy. Each table
     /// picks its primitive per session from its [`TablePlan`]
     /// (spec.md#session-durable-copy): **append** the sessions whose rows are
-    /// absent here (cannot collide; one commit per scan, bandwidth-bound) then
-    /// **merge** the partially-present ones (`WhenMatched::DoNothing` dedups the
-    /// rows already there). Append-only storage is what makes the append safe: a
+    /// absent here (cannot collide; one commit per scan, bandwidth-bound), then
+    /// for the grown ones append just their absent rows after filtering out the
+    /// ones already present. Append-only storage is what makes the append safe: a
     /// re-run re-plans from current destination state, so an
     /// interrupted-then-resumed copy never double-appends (landed rows are no
     /// longer absent).
@@ -640,11 +642,10 @@ impl Store {
         })
     }
 
-    /// Copy one table's slice of the plan: append the sessions whose rows are
-    /// absent here, then merge the ones whose rows are partially present.
-    /// Sequential within a table (one write lock); `copy_delta_from` runs the
-    /// three tables in parallel. Returns (rows transferred, rows inserted) -
-    /// equal for the append portion, which never dedups.
+    /// Copy one table's slice of the plan: append the absent sessions, then
+    /// append the grown sessions' absent rows. Sequential within a table (one
+    /// write lock); `copy_delta_from` runs the three tables in parallel. Returns
+    /// (rows, inserted), equal since both paths append and neither dedups.
     async fn copy_table(
         &self,
         source: &Store,
@@ -668,29 +669,31 @@ impl Store {
             )
             .await?;
 
-        // Sessions with rows already on the destination take the merge path to
-        // skip the rows already there. Chunk the `IN` list so each chunk pushes
-        // down to the key column's btree index.
-        let mut merged_rows = 0usize;
-        let mut merged_inserted = 0usize;
+        // `Sessions` never reaches here: its row is immutable, so a present
+        // session is identical and routes to neither append nor merge.
+        let mut grown = 0usize;
         for chunk in table_plan.merge.chunks(COPY_SESSION_IN_CHUNK) {
-            let predicate = in_predicate(key_column, chunk);
-            let scanner = source
-                .handle
-                .scan(
-                    table,
-                    ScanOpts {
-                        predicate: Some(&predicate),
-                        projection: None,
-                    },
-                )
-                .await?;
-            let (r, i) = self.merge_scanner(table, scanner, "copy").await?;
-            merged_rows += r;
-            merged_inserted += i;
+            let values: Vec<ScalarValue> = chunk
+                .iter()
+                .map(|id| ScalarValue::String(id.clone()))
+                .collect();
+            let predicate = Predicate::In("session_id", values.clone());
+            let stream = Self::source_scan(source, table, Some(&predicate)).await?;
+            grown += match table {
+                Table::Messages => {
+                    let present = Arc::new(self.present_message_pks(&values).await?);
+                    self.append_filtered(table, stream, Self::message_keep(present))
+                        .await?
+                }
+                Table::Parts => {
+                    let present = Arc::new(self.present_part_pks(&values).await?);
+                    self.append_filtered(table, stream, Self::part_keep(present))
+                        .await?
+                }
+                Table::Sessions => 0,
+            };
         }
-
-        Ok((appended + merged_rows, appended + merged_inserted))
+        Ok((appended + grown, appended + grown))
     }
 
     /// Append one table's slice for the listed sessions. A from-empty or resumed
@@ -732,25 +735,7 @@ impl Store {
         table: Table,
         predicate: Option<&Predicate>,
     ) -> Result<usize> {
-        let make_source = || async {
-            let mut scanner = source
-                .handle
-                .scan(
-                    table,
-                    ScanOpts {
-                        predicate,
-                        projection: None,
-                    },
-                )
-                .await?;
-            scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
-            let stream: SendableRecordBatchStream = scanner
-                .try_into_stream()
-                .await
-                .with_context(|| format!("failed to scan {} for copy", table.as_str()))?
-                .into();
-            Ok(stream)
-        };
+        let make_source = || Self::source_scan(source, table, predicate);
         let stats = self.handle.append_stream(table, make_source).await?;
         Ok(stats.rows as usize)
     }
@@ -776,6 +761,136 @@ impl Store {
             rows += self.append_scanner(source, table, Some(&predicate)).await?;
         }
         Ok(rows)
+    }
+
+    /// Stored message PKs for the given sessions. On the full `(session_id, id)`
+    /// PK, not `id` alone: a message id is unique only within its session.
+    async fn present_message_pks(
+        &self,
+        session_id_values: &[ScalarValue],
+    ) -> Result<HashSet<(String, String)>> {
+        if session_id_values.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Messages,
+                Some(&Predicate::In("session_id", session_id_values.to_vec())),
+                &["session_id", "id"],
+            )
+            .await?;
+        let mut set = HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(&batch, "id", row)?.context("message id is null")?;
+            set.insert((sid, mid));
+        }
+        Ok(set)
+    }
+
+    /// Stored part PKs for the given sessions, on the full
+    /// `(session_id, message_id, id)` PK (see [`Self::present_message_pks`]).
+    async fn present_part_pks(
+        &self,
+        session_id_values: &[ScalarValue],
+    ) -> Result<HashSet<(String, String, String)>> {
+        if session_id_values.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let batch = self
+            .handle
+            .scan_batch(
+                Table::Parts,
+                Some(&Predicate::In("session_id", session_id_values.to_vec())),
+                &["session_id", "message_id", "id"],
+            )
+            .await?;
+        let mut set = HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(&batch, "message_id", row)?.context("message_id is null")?;
+            let pid = string(&batch, "id", row)?.context("part id is null")?;
+            set.insert((sid, mid, pid));
+        }
+        Ok(set)
+    }
+
+    /// The filter-and-append write seam, shared by ingest and grown-session
+    /// copy. Collects only the kept rows (the absent delta), so it never stages
+    /// a full copy; `append_batches` re-appends the owned kept rows on an OCC
+    /// retry.
+    async fn append_filtered<S, K>(&self, table: Table, mut batches: S, keep: K) -> Result<usize>
+    where
+        S: Stream<Item = std::result::Result<RecordBatch, DataFusionError>> + Unpin,
+        K: Fn(&RecordBatch, usize) -> Result<bool>,
+    {
+        let mut kept_batches: Vec<RecordBatch> = Vec::new();
+        let mut kept = 0usize;
+        while let Some(batch) = batches.next().await {
+            let batch = batch?;
+            let mut mask = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                mask.push(keep(&batch, row)?);
+            }
+            let selected = filter_record_batch(&batch, &BooleanArray::from(mask))?;
+            if selected.num_rows() > 0 {
+                kept += selected.num_rows();
+                kept_batches.push(selected);
+            }
+        }
+        self.handle.append_batches(table, kept_batches).await?;
+        Ok(kept)
+    }
+
+    /// One-shot source scan with blob bytes materialized (`AllBinary`) so the
+    /// appended rows are self-contained.
+    async fn source_scan(
+        source: &Store,
+        table: Table,
+        predicate: Option<&Predicate>,
+    ) -> Result<SendableRecordBatchStream> {
+        let mut scanner = source
+            .handle
+            .scan(
+                table,
+                ScanOpts {
+                    predicate,
+                    projection: None,
+                },
+            )
+            .await?;
+        scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
+        Ok(scanner
+            .try_into_stream()
+            .await
+            .with_context(|| format!("failed to scan {} for copy", table.as_str()))?
+            .into())
+    }
+
+    /// `append_filtered` keep for `messages`: a row survives iff its
+    /// `(session_id, id)` PK is absent from `present`.
+    fn message_keep(
+        present: Arc<HashSet<(String, String)>>,
+    ) -> impl Fn(&RecordBatch, usize) -> Result<bool> {
+        move |batch, row| {
+            let sid = string(batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(batch, "id", row)?.context("message id is null")?;
+            Ok(!present.contains(&(sid, mid)))
+        }
+    }
+
+    /// `append_filtered` keep for `parts`, on the full
+    /// `(session_id, message_id, id)` PK.
+    fn part_keep(
+        present: Arc<HashSet<(String, String, String)>>,
+    ) -> impl Fn(&RecordBatch, usize) -> Result<bool> {
+        move |batch, row| {
+            let sid = string(batch, "session_id", row)?.context("session_id is null")?;
+            let mid = string(batch, "message_id", row)?.context("message_id is null")?;
+            let pid = string(batch, "id", row)?.context("part id is null")?;
+            Ok(!present.contains(&(sid, mid, pid)))
+        }
     }
 
     /// Flat write path. Per-row insert/match truth is not synthesized here -
@@ -923,45 +1038,8 @@ impl Store {
                 }
                 map
             };
-        let existing_message_pks: HashSet<(String, String)> = if session_id_values.is_empty() {
-            HashSet::new()
-        } else {
-            let batch = self
-                .handle
-                .scan_batch(
-                    Table::Messages,
-                    Some(&Predicate::In("session_id", session_id_values.clone())),
-                    &["session_id", "id"],
-                )
-                .await?;
-            let mut set = HashSet::with_capacity(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
-                let mid = string(&batch, "id", row)?.context("message id is null")?;
-                set.insert((sid, mid));
-            }
-            set
-        };
-        let existing_part_pks: HashSet<(String, String, String)> = if session_id_values.is_empty() {
-            HashSet::new()
-        } else {
-            let batch = self
-                .handle
-                .scan_batch(
-                    Table::Parts,
-                    Some(&Predicate::In("session_id", session_id_values)),
-                    &["session_id", "message_id", "id"],
-                )
-                .await?;
-            let mut set = HashSet::with_capacity(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                let sid = string(&batch, "session_id", row)?.context("session_id is null")?;
-                let mid = string(&batch, "message_id", row)?.context("message_id is null")?;
-                let pid = string(&batch, "id", row)?.context("part id is null")?;
-                set.insert((sid, mid, pid));
-            }
-            set
-        };
+        let existing_message_pks = Arc::new(self.present_message_pks(&session_id_values).await?);
+        let existing_part_pks = Arc::new(self.present_part_pks(&session_id_values).await?);
 
         let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
         for substream in merged {
@@ -998,9 +1076,8 @@ impl Store {
             .iter()
             .map(|substream| substream.session.clone())
             .collect();
-        // Append only rows absent from the pre-existence sweep; present rows are
-        // merge no-ops (spec.md#adapter-integrity-additive-sync). `seen_*` carries
-        // the in-batch dedup floor (spec.md#adapter-integrity-dedup).
+        // Drop only in-batch duplicates here (spec.md#adapter-integrity-dedup);
+        // `append_filtered` drops the rows already present on the destination.
         let mut seen_messages: HashSet<(String, String)> = HashSet::new();
         let message_rows: Vec<MessageBatchRow<'_>> = writeable
             .iter()
@@ -1013,11 +1090,10 @@ impl Store {
                 })
             })
             .filter(|row| {
-                let key = (
+                seen_messages.insert((
                     row.message.session_id().to_owned(),
                     row.message.id().to_owned(),
-                );
-                !existing_message_pks.contains(&key) && seen_messages.insert(key)
+                ))
             })
             .collect();
         let mut seen_parts: HashSet<(String, String, String)> = HashSet::new();
@@ -1032,22 +1108,36 @@ impl Store {
                 })
             })
             .filter(|part| {
-                let key = (
+                seen_parts.insert((
                     part.session_id.clone(),
                     part.message_id.clone(),
                     part.id.clone(),
-                );
-                !existing_part_pks.contains(&key) && seen_parts.insert(key)
+                ))
             })
             .collect();
 
         let session_batches = sessions_batches(&sessions_owned)?;
-        let message_batches = messages_batches(&message_rows)?;
-        let part_batches = parts_batches(&part_rows)?;
-
+        let message_stream = tokio_stream::iter(
+            messages_batches(&message_rows)?
+                .into_iter()
+                .map(Ok::<_, DataFusionError>),
+        );
+        let part_stream = tokio_stream::iter(
+            parts_batches(&part_rows)?
+                .into_iter()
+                .map(Ok::<_, DataFusionError>),
+        );
         let (_messages_appended, _parts_appended) = tokio::try_join!(
-            self.handle.append_batches(Table::Messages, message_batches),
-            self.handle.append_batches(Table::Parts, part_batches),
+            self.append_filtered(
+                Table::Messages,
+                message_stream,
+                Self::message_keep(existing_message_pks.clone()),
+            ),
+            self.append_filtered(
+                Table::Parts,
+                part_stream,
+                Self::part_keep(existing_part_pks.clone()),
+            ),
         )?;
         let _sessions_inserted =
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;

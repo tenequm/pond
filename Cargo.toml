@@ -61,6 +61,10 @@ arc-swap = "1"
 # ndjson export writer for `pond_sql_query` (already in the tree via the arrow
 # stack; named directly here for the `LineDelimitedWriter`).
 arrow-json = "58.3"
+# Already in the tree via the arrow stack; named directly for
+# `filter_record_batch`, used to drop already-present rows from a grown-session
+# copy scan before appending (composite-PK filter, src/sessions.rs).
+arrow-select = "58.3"
 async-stream = "0.3.6"
 # Already in the tree via datafusion; named directly for the vendored fts()
 # TableProvider in `src/sql.rs` (datafusion's TableProvider trait needs it).
