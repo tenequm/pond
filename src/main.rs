@@ -348,16 +348,15 @@ enum Command {
     /// Make pond current: import, embed, update indexes.
     ///
     /// The everyday command: pulls fresh sessions from every enabled
-    /// `[adapters.*]` entry (or one named adapter), embeds the backlog, and
-    /// folds new rows into the search indexes. It only ever syncs adapters you
-    /// have already enabled - enabling one is an explicit step (`pond adapters
-    /// enable` / `pond adapters discover` / `pond init`), never a side effect
-    /// of sync.
+    /// `[adapters.*]` entry (or one named adapter), embedding each message
+    /// inline as it is written, and folds new rows into the search indexes. It
+    /// only ever syncs adapters you have already enabled - enabling one is an
+    /// explicit step (`pond adapters enable` / `pond adapters discover` / `pond
+    /// init`), never a side effect of sync.
     #[command(after_long_help = "Examples:
   pond sync                                  sync every enabled adapter
   pond sync claude-code                      sync one enabled adapter
   pond sync codex-cli --path ~/backup        one-off path override, config untouched
-  pond sync --no-optimize                    import only; embed and index later
   pond sync --verify                         full re-read; heal anything the skip missed")]
     #[command(display_order = 7)]
     Sync {
@@ -368,10 +367,6 @@ enum Command {
         /// Bypasses `[adapters.<adapter>]` and does not modify config.toml.
         #[arg(long, value_name = "DIR")]
         path: Option<PathBuf>,
-        /// Import only: skip the embed + index maintenance that normally runs
-        /// after the import. Catch up later with `pond optimize`.
-        #[arg(long)]
-        no_optimize: bool,
         /// Reconcile pass: bypass the freshness skip and re-read every source
         /// body, re-ingesting through the idempotent merge. The skip compares
         /// source mtime to pond's per-session ingest watermark; a session that
@@ -684,13 +679,8 @@ enum Command {
         to: String,
         /// Only verify the destination already contains the source - copy
         /// nothing, rebuild no indexes. Read-only; store-to-store only.
-        #[arg(long, conflicts_with = "no_optimize")]
-        verify_only: bool,
-        /// Skip the post-copy index rebuild (store-to-store and archive
-        /// restore, for very large stores you will index later). Build indexes
-        /// after with `pond optimize --only index --storage-path <to>`.
         #[arg(long)]
-        no_optimize: bool,
+        verify_only: bool,
     },
     /// Inspect configuration.
     ///
@@ -730,11 +720,12 @@ Homebrew and nix packages ship these pre-installed.")]
     /// The maintenance verb. `embed` fills vectors for every message with a null
     /// `vector` (idempotent: a re-run resumes exactly where it stopped); `index`
     /// folds trailing fragments into the text + semantic indexes and runs the
-    /// `[maintenance]` compaction / version-cleanup pass. `pond sync` runs both
-    /// by default; this is the on-demand and post-`--no-optimize` catch-up.
+    /// `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds
+    /// inline and folds by default; this is the on-demand maintenance run and
+    /// the model-swap re-embed (`--force-embed`).
     #[command(after_long_help = "Examples:
-  pond optimize                    embed the backlog, then fold indexes
-  pond optimize --only index       fold indexes only (e.g. after `pond copy --no-optimize`)
+  pond optimize                    embed any backlog, then fold indexes
+  pond optimize --only index       fold indexes only
   pond optimize --only embed       embed only
   pond optimize --force-embed      re-embed stale rows after a model change")]
     #[command(display_order = 8)]
@@ -1106,12 +1097,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Sync {
             adapter,
             path,
-            no_optimize,
             verify,
         } => {
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
+            // sync ingests through `upsert_session_batch`, which embeds inline;
+            // it has no query path, so this is its own resident embedder.
             let (_, store) = open_store(storage_path, &loaded, true).await?;
+            let store = store.with_embedder(Arc::new(LazyEmbedder::candle()));
             let import_summary =
                 run_import_stage(&store, &loaded, &config_file, adapter.clone(), path, verify)
                     .await?;
@@ -1124,8 +1117,10 @@ async fn main() -> anyhow::Result<()> {
             // up"), so an idempotent no-op sync should not pay it. Catch up an
             // accumulated backlog with `pond optimize` (the verb that exists
             // precisely for this) or the scheduled maintenance run.
-            if !no_optimize && any_new_rows {
-                // Same finalize seam as `pond optimize` and `pond copy`. sync
+            if any_new_rows {
+                // Same finalize seam as `pond optimize` and `pond copy`. Rows
+                // embed inline at ingest; finalize folds the new vectors into
+                // the indexes and heals any pre-inline un-embedded backlog. sync
                 // has no --force-embed; finalize's embed points a model swap at
                 // the command that does.
                 let policy = configured_maintenance_policy(&loaded, None)?;
@@ -1200,8 +1195,15 @@ async fn main() -> anyhow::Result<()> {
         } => {
             cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
-            let store = Arc::new(open_store(storage_path, &config, true).await?.1);
+            // One resident embedder shared by the query arm (AppState) and the
+            // inline embed-at-ingest path (the store), so the model loads once.
             let embedder = Arc::new(LazyEmbedder::candle());
+            let store = Arc::new(
+                open_store(storage_path, &config, true)
+                    .await?
+                    .1
+                    .with_embedder(embedder.clone()),
+            );
             let state = AppState {
                 store,
                 embedder,
@@ -1222,11 +1224,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Mcp {} => {
             cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
-            let store = Arc::new(open_store(storage_path, &config, true).await?.1);
-            // Lazy: idle `pond mcp` instances in every Claude Code session
-            // stay light. The model load only happens once per process on the
-            // first `pond_search` tool call that runs the vector arm.
+            // Lazy: idle `pond mcp` instances in every Claude Code session stay
+            // light. The model load happens once per process - on the first
+            // vector-arm `pond_search` or the first embeddable ingested row -
+            // and the one instance is shared by the query arm and the store's
+            // inline embed-at-ingest path.
             let embedder = Arc::new(LazyEmbedder::candle());
+            let store = Arc::new(
+                open_store(storage_path, &config, true)
+                    .await?
+                    .1
+                    .with_embedder(embedder.clone()),
+            );
             spawn_prewarm(store.clone());
             transport::mcp::serve_stdio(AppState {
                 store,
@@ -1343,9 +1352,8 @@ async fn main() -> anyhow::Result<()> {
             from,
             to,
             verify_only,
-            no_optimize,
         } => {
-            run_copy(from, to, verify_only, no_optimize, storage_path, config).await?;
+            run_copy(from, to, verify_only, storage_path, config).await?;
         }
         Command::Sql {
             sql,
@@ -1859,7 +1867,6 @@ async fn run_copy(
     from: String,
     to: String,
     verify_only: bool,
-    no_optimize: bool,
     storage_path: Option<StorageUrl>,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1879,7 +1886,7 @@ async fn run_copy(
     }
     match (from_ep, to_ep) {
         (CopyEndpoint::Store(from), CopyEndpoint::Store(to)) => {
-            run_store_to_store_copy(from, to, verify_only, no_optimize, &loaded).await
+            run_store_to_store_copy(from, to, verify_only, &loaded).await
         }
         _ if verify_only => bail!("--verify-only applies to store-to-store copies only"),
         (CopyEndpoint::Store(from), CopyEndpoint::Archive(path)) => {
@@ -1889,7 +1896,7 @@ async fn run_copy(
             copy_store_to_jsonl(from, path, &loaded).await
         }
         (CopyEndpoint::Archive(path), CopyEndpoint::Store(to)) => {
-            copy_archive_to_store(&path, to, no_optimize, &loaded).await
+            copy_archive_to_store(&path, to, &loaded).await
         }
         (CopyEndpoint::Jsonl(_), CopyEndpoint::Store(_)) => bail!(
             "jsonl is an export-only target: restore from a `.pond` archive or copy from a store URL instead"
@@ -1902,16 +1909,15 @@ async fn run_copy(
     }
 }
 
-/// Store-to-store copy: the durable union merge, an index rebuild (unless
-/// `--no-optimize`), and an id-set membership check. Exit 6 when the
-/// destination is missing source rows; `--verify-only` runs just the read-only
-/// check. Distinct from `pond sync`, which re-reads adapters - copy moves the
-/// durable record (spec.md#session-durable-copy).
+/// Store-to-store copy: the durable union merge, an index fold, and an id-set
+/// membership check. Exit 6 when the destination is missing source rows;
+/// `--verify-only` runs just the read-only check. Distinct from `pond sync`,
+/// which re-reads adapters - copy moves the durable record
+/// (spec.md#session-durable-copy).
 async fn run_store_to_store_copy(
     from: StorageUrl,
     to: StorageUrl,
     verify_only: bool,
-    no_optimize: bool,
     loaded: &Config,
 ) -> anyhow::Result<()> {
     if from.canonical() == to.canonical() {
@@ -2004,23 +2010,17 @@ async fn run_store_to_store_copy(
     // previous copy can leave data complete but index creation missing.
     // spec.md#lance-index-maintenance.
     let indexes_started = std::time::Instant::now();
-    if no_optimize {
-        output(&format!(
-            "{} skipped (--no-optimize); run `pond optimize --only index --storage-path {}` before querying",
-            pond::output::paint("indexes", dim),
-            to_resolved.display(),
-        ))?;
-    } else {
-        let policy = configured_maintenance_policy(loaded, None)?;
-        // Same finalize seam as optimize/sync. The embed pass no-ops because the
-        // copied rows arrive already embedded from the source.
-        finalize_indexes(&to_store, &policy, false).await?;
-        output(&format!(
-            "{} rebuilt text + semantic on destination  {:.1}s",
-            pond::output::paint("indexes", dim),
-            indexes_started.elapsed().as_secs_f64(),
-        ))?;
-    }
+    let policy = configured_maintenance_policy(loaded, None)?;
+    // Same finalize seam as optimize/sync: the embed pass no-ops when the source
+    // carried vectors, or fills the backlog when it did not (copy never embeds
+    // itself - it copies the `vector` column verbatim, so an unembedded source
+    // arrives unembedded and this pass is the catch-up).
+    finalize_indexes(&to_store, &policy, false).await?;
+    output(&format!(
+        "{} rebuilt text + semantic on destination  {:.1}s",
+        pond::output::paint("indexes", dim),
+        indexes_started.elapsed().as_secs_f64(),
+    ))?;
 
     let verify = verify_stores(&from_store, &to_store).await?;
     if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced {
@@ -2029,18 +2029,10 @@ async fn run_store_to_store_copy(
 
     // `pond copy` always closes with the id-set proof; `--verify-only` runs
     // just this read-only check.
-    if no_optimize {
-        output(&format!(
-            "{} data copied; indexes pending (run `pond optimize --only index --storage-path {}`)",
-            pond::output::paint("done -", dim),
-            to_resolved.display(),
-        ))?;
-    } else {
-        output(&format!(
-            "{} destination is ready to query",
-            pond::output::paint("done -", dim),
-        ))?;
-    }
+    output(&format!(
+        "{} destination is ready to query",
+        pond::output::paint("done -", dim),
+    ))?;
     Ok(())
 }
 
@@ -2107,33 +2099,20 @@ async fn copy_store_to_jsonl(
 
 /// `pond copy --from <file>.pond`: restore an archive into the destination
 /// store via the idempotent union merge.
-async fn copy_archive_to_store(
-    path: &Path,
-    to: StorageUrl,
-    no_optimize: bool,
-    loaded: &Config,
-) -> anyhow::Result<()> {
+async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> anyhow::Result<()> {
     let (_, store) = open_store(Some(to), loaded, false).await?;
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();
-    // Leave the destination queryable, like a store-to-store copy: the archive
-    // carries embeddings as data columns, so this is index-build only, no re-embed.
-    if no_optimize {
-        output(&format!(
-            "{} indexes not rebuilt (--no-optimize); run `pond optimize --only index` before querying",
-            pond::output::paint("hint", dim),
-        ))?;
-    } else {
-        let policy = configured_maintenance_policy(loaded, None)?;
-        // Same finalize seam as optimize/sync; the archive carries embeddings as
-        // data columns, so finalize's embed pass no-ops.
-        finalize_indexes(&store, &policy, false).await?;
-        output(&format!(
-            "{} rebuilt text + semantic on destination",
-            pond::output::paint("indexes:", dim),
-        ))?;
-    }
+    let policy = configured_maintenance_policy(loaded, None)?;
+    // Same finalize seam as optimize/sync; the archive carries embeddings as
+    // data columns, so finalize's embed pass no-ops (or fills the backlog if the
+    // archive was made from an unembedded store).
+    finalize_indexes(&store, &policy, false).await?;
+    output(&format!(
+        "{} rebuilt text + semantic on destination",
+        pond::output::paint("indexes:", dim),
+    ))?;
     Ok(())
 }
 
@@ -4141,7 +4120,7 @@ fn classify_index_health(
 
     // `pond optimize` folds every trailing fragment (no lag threshold), so an
     // index is current only when nothing is unindexed; any tail means a fold is
-    // still owed (e.g. after `--no-optimize`).
+    // still owed (e.g. an interrupted sync or copy).
     fn classify_one(status: &IndexStatus) -> IndexHealthState {
         if !status.exists {
             return NotBuilt;

@@ -194,6 +194,14 @@ pub struct LazyEmbedder {
     idle_threshold: Duration,
 }
 
+impl std::fmt::Debug for LazyEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyEmbedder")
+            .field("idle_threshold", &self.idle_threshold)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LazyEmbedder {
     /// candle XLM-RoBERTa FP16 (Metal on macOS / CUDA with `--features cuda`
     /// / CPU otherwise). The pond default for every entry point.
@@ -324,6 +332,42 @@ pub fn format_query(query: &str) -> String {
 /// `EmbedWorker` when batching messages for `pond optimize`.
 pub fn format_passage(text: &str) -> String {
     format!("passage: {text}")
+}
+
+/// Embed `texts` as documents, returning one vector per input in input order.
+/// Length-sorts before chunking into `batch_size` model calls so each padded
+/// batch clusters similar lengths (the tokenizer pads to the batch's longest
+/// member); `on_batch` fires once per model call with that call's size. Shared
+/// by [`EmbedWorker`] (backlog) and the ingest write path (inline embed) so a
+/// vector is byte-identical whichever path produced it.
+pub(crate) fn embed_passages(
+    backend: &dyn Embedder,
+    texts: &[&str],
+    batch_size: usize,
+    mut on_batch: impl FnMut(usize),
+) -> Result<Vec<Vec<f32>>> {
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_unstable_by_key(|&index| texts[index].len());
+    let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
+    for chunk in order.chunks(batch_size.max(1)) {
+        let batch = chunk
+            .iter()
+            .map(|&index| format_passage(texts[index]))
+            .collect::<Vec<_>>();
+        let vectors = backend.embed(&batch)?;
+        if vectors.len() != chunk.len() {
+            return Err(anyhow!(
+                "backend returned {} vectors for {} messages",
+                vectors.len(),
+                chunk.len(),
+            ));
+        }
+        for (&index, vector) in chunk.iter().zip(vectors) {
+            out[index] = vector;
+        }
+        on_batch(chunk.len());
+    }
+    Ok(out)
 }
 
 /// The embedding seam (spec.md#search): text in, vectors out. The real
@@ -527,47 +571,22 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
         if window.is_empty() {
             return Ok(());
         }
-        window.sort_unstable_by_key(|message| message.search_text.len());
-        let mut batch: Vec<PendingMessage> = Vec::with_capacity(self.batch_size);
-        let mut accumulator: Vec<EmbeddedMessage> = Vec::with_capacity(window.len());
-        for message in window.drain(..) {
-            batch.push(message);
-            if batch.len() >= self.batch_size {
-                accumulator.extend(self.embed_batch(&mut batch, summary).await?);
-            }
-        }
-        accumulator.extend(self.embed_batch(&mut batch, summary).await?);
-        if !accumulator.is_empty() {
-            self.store.write_embeddings(&accumulator).await?;
-        }
-        Ok(())
-    }
-
-    /// Run one model batch; return the rows. Store write is batched in
-    /// [`drain_window`](Self::drain_window), one `merge_update` per window.
-    async fn embed_batch(
-        &self,
-        batch: &mut Vec<PendingMessage>,
-        summary: &mut EmbedSummary,
-    ) -> Result<Vec<EmbeddedMessage>> {
-        if batch.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pending = std::mem::take(batch);
-        // Apply e5's `passage: ` document prefix at the model boundary; the
-        // stored `search_text` keeps its uncapped, unprefixed form for FTS.
+        let pending = std::mem::take(window);
         let texts = pending
             .iter()
-            .map(|message| format_passage(&message.search_text))
+            .map(|message| message.search_text.as_str())
             .collect::<Vec<_>>();
-        let vectors = self.backend.embed(&texts)?;
-        if vectors.len() != pending.len() {
-            return Err(anyhow!(
-                "backend returned {} vectors for {} messages",
-                vectors.len(),
-                pending.len(),
-            ));
-        }
+        let vectors = embed_passages(self.backend, &texts, self.batch_size, |batch_messages| {
+            summary.messages += batch_messages;
+            summary.batches += 1;
+            if let Some(progress) = &self.progress {
+                progress(BatchProgress {
+                    batch_messages,
+                    total_messages: summary.messages,
+                    total_batches: summary.batches,
+                });
+            }
+        })?;
         let rows = pending
             .into_iter()
             .zip(vectors)
@@ -577,17 +596,10 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
                 vector,
             })
             .collect::<Vec<_>>();
-        let batch_messages = rows.len();
-        summary.messages += batch_messages;
-        summary.batches += 1;
-        if let Some(progress) = &self.progress {
-            progress(BatchProgress {
-                batch_messages,
-                total_messages: summary.messages,
-                total_batches: summary.batches,
-            });
+        if !rows.is_empty() {
+            self.store.write_embeddings(&rows).await?;
         }
-        Ok(rows)
+        Ok(())
     }
 }
 

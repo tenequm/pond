@@ -14,8 +14,9 @@ use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
 use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
+use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
-    Array, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
     LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
     TimestampMicrosecondArray, UInt64Array, new_null_array,
 };
@@ -50,6 +51,11 @@ pub struct Store {
     /// data-projection scan and hydration to `take_rows`. `ArcSwap` so a
     /// version-bump rebuild swaps it under concurrent searches.
     rowmap: ArcSwapOption<RowMetaSet>,
+    /// Resident embedder for inline embed-at-ingest. `None` keeps ingest
+    /// writing null vectors (tests, search-only stores); the CLI write paths
+    /// attach one via [`Store::with_embedder`]. Lazy, so a store that never
+    /// ingests an embeddable row never loads the model.
+    embedder: Option<Arc<crate::embed::LazyEmbedder>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +293,18 @@ impl Store {
         Ok(Self {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
+            embedder: None,
         })
+    }
+
+    /// Attach a resident embedder so [`Store::upsert_session_batch`] embeds
+    /// eligible messages inline, in the same append commit as the rows
+    /// (spec.md#session-embed-from-canonical). The CLI write paths set this;
+    /// every other open leaves it `None` and writes null vectors as before.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<crate::embed::LazyEmbedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Live byte size of the shared Lance session caches (index + metadata).
@@ -309,6 +326,7 @@ impl Store {
         Ok(Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
+            embedder: None,
         })
     }
 
@@ -906,6 +924,52 @@ impl Store {
         Ok(())
     }
 
+    /// Embeddings aligned to `rows` so they ride the rows' birth append. A row
+    /// is embedded iff it has `search_text` and is absent from `present` (an
+    /// idempotent re-sync re-embeds nothing the append would drop); otherwise,
+    /// and whenever no embedder is attached, the slot is `None` and the batch
+    /// writes a null vector for `pond optimize` to fill later.
+    async fn embed_message_rows(
+        &self,
+        rows: &[MessageBatchRow<'_>],
+        present: &HashSet<(String, String)>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut out = vec![None; rows.len()];
+        let Some(embedder) = &self.embedder else {
+            return Ok(out);
+        };
+        let targets: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.search_text.is_some()
+                    && !present.contains(&(
+                        row.message.session_id().to_owned(),
+                        row.message.id().to_owned(),
+                    ))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if targets.is_empty() {
+            return Ok(out);
+        }
+        let backend = embedder.get().await?;
+        let texts: Vec<&str> = targets
+            .iter()
+            .map(|&index| rows[index].search_text.unwrap_or_default())
+            .collect();
+        let vectors = crate::embed::embed_passages(
+            backend.as_ref(),
+            &texts,
+            crate::embed::DEFAULT_BATCH_SIZE,
+            |_| {},
+        )?;
+        for (&index, vector) in targets.iter().zip(vectors) {
+            out[index] = Some(vector);
+        }
+        Ok(out)
+    }
+
     /// Batched write path used by the adapter ingest loop and by the wire
     /// handler's final flush. Receives N completed substreams from the
     /// validator and:
@@ -1116,9 +1180,15 @@ impl Store {
             })
             .collect();
 
+        // Embed before the append so the vector rides the message rows' birth
+        // commit (spec.md#session-durable-copy: one append, no extra commit).
+        let message_vectors = self
+            .embed_message_rows(&message_rows, &existing_message_pks)
+            .await?;
+
         let session_batches = sessions_batches(&sessions_owned)?;
         let message_stream = tokio_stream::iter(
-            messages_batches(&message_rows)?
+            messages_batches(&message_rows, &message_vectors)?
                 .into_iter()
                 .map(Ok::<_, DataFusionError>),
         );
@@ -1176,7 +1246,7 @@ impl Store {
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
-        let batches = messages_batches(&rows)?;
+        let batches = messages_batches(&rows, &vec![None; rows.len()])?;
         merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
         Ok(())
     }
@@ -4568,6 +4638,52 @@ fn embedding_update_schema() -> Arc<Schema> {
     ]))
 }
 
+/// The `messages` `vector` + `embedding_model` columns for an inline-embed
+/// batch: `Some` rows carry the embedding and the current model id, `None` rows
+/// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
+fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
+    let dim = embedding_dim();
+    // The common case (no embedder, or every row already present) is all-null:
+    // build both columns with one bulk allocation instead of dim per-row appends.
+    if vectors.iter().all(Option::is_none) {
+        return Ok((
+            new_null_array(&embedding_vector_type(), vectors.len()),
+            new_null_array(&DataType::Utf8, vectors.len()),
+        ));
+    }
+    let mut builder = FixedSizeListBuilder::new(
+        Float16Builder::with_capacity(vectors.len() * dim),
+        dim as i32,
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float16, true)));
+    let mut models: Vec<Option<&str>> = Vec::with_capacity(vectors.len());
+    for vector in vectors {
+        match vector {
+            Some(values) => {
+                if values.len() != dim {
+                    anyhow::bail!("inline embedding has dim {}, expected {dim}", values.len());
+                }
+                for value in values {
+                    builder.values().append_value(half::f16::from_f32(*value));
+                }
+                builder.append(true);
+                models.push(Some(embed::model_id()));
+            }
+            None => {
+                for _ in 0..dim {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+                models.push(None);
+            }
+        }
+    }
+    Ok((
+        Arc::new(builder.finish()) as ArrayRef,
+        Arc::new(StringArray::from(models)) as ArrayRef,
+    ))
+}
+
 /// Build the merge-update source batch for [`Store::write_embeddings`]: one row
 /// per embedded message carrying `(session_id, id, vector, embedding_model)`.
 pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordBatch> {
@@ -4735,7 +4851,13 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
-pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<RecordBatch>> {
+/// `vectors` is aligned to `rows` (same length): `Some` carries the inline
+/// embedding for that row, `None` writes a null `vector`/`embedding_model`.
+pub(crate) fn messages_batches(
+    rows: &[MessageBatchRow<'_>],
+    vectors: &[Option<Vec<f32>>],
+) -> Result<Vec<RecordBatch>> {
+    debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
     let options = rows
         .iter()
         .map(|row| json_bytes(row.message.options()))
@@ -4759,12 +4881,23 @@ pub(crate) fn messages_batches(rows: &[MessageBatchRow<'_>]) -> Result<Vec<Recor
     }
     chunk_ranges(&cells)
         .into_iter()
-        .map(|range| messages_chunk(&rows[range.clone()], &options[range]))
+        .map(|range| {
+            messages_chunk(
+                &rows[range.clone()],
+                &options[range.clone()],
+                &vectors[range],
+            )
+        })
         .collect()
 }
 
-fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<RecordBatch> {
+fn messages_chunk(
+    rows: &[MessageBatchRow<'_>],
+    options: &[Vec<u8>],
+    vectors: &[Option<Vec<f32>>],
+) -> Result<RecordBatch> {
     let schema = message_schema();
+    let (vector_column, embedding_model) = embedding_columns(vectors)?;
     RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -4803,11 +4936,12 @@ fn messages_chunk(rows: &[MessageBatchRow<'_>], options: &[Vec<u8>]) -> Result<R
             Arc::new(StringArray::from(
                 rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
             )),
-            // `vector` / `embedding_model` are written null at ingest; every
-            // message starts un-embedded and `pond optimize` fills them later
+            // `vector` / `embedding_model` carry the inline embedding when one
+            // was produced for the row, null otherwise (embedder disabled, or a
+            // non-embeddable row); `pond optimize` fills any remaining nulls
             // (spec.md#session-embed-from-canonical).
-            new_null_array(&embedding_vector_type(), rows.len()),
-            new_null_array(&DataType::Utf8, rows.len()),
+            vector_column,
+            embedding_model,
             Arc::new(LargeBinaryArray::from_iter_values(
                 options.iter().map(Vec::as_slice),
             )),
@@ -5296,6 +5430,97 @@ mod tests {
             project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
+    }
+
+    /// Counts the texts handed to the backend so a test can assert how many rows
+    /// were embedded.
+    #[derive(Default)]
+    struct CountingEmbedder {
+        texts: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::embed::Embedder for CountingEmbedder {
+        fn device(&self) -> &str {
+            "test"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.texts
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0_f32; embedding_dim()])
+                .collect())
+        }
+    }
+
+    /// A session with `count` conversational user messages, each carrying a text
+    /// part so its `search_text` is non-null (hence embeddable).
+    fn conversational_events(session_id: &str, count: usize) -> Vec<IngestEvent> {
+        let mut events = vec![IngestEvent::Session(synthetic_session(session_id))];
+        for index in 0..count {
+            events.push(IngestEvent::Message(Message::User {
+                id: format!("msg-{index}"),
+                session_id: session_id.to_owned(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(IngestEvent::Part(Part {
+                session_id: session_id.to_owned(),
+                id: format!("msg-{index}:0001"),
+                message_id: format!("msg-{index}"),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(format!("body {index}"))),
+                },
+            }));
+        }
+        events
+    }
+
+    /// Inline embed-at-ingest: with an embedder attached the vectors are filled
+    /// in the message rows' birth append (no extra embed commit - the version
+    /// matches a plain ingest), and a re-sync embeds no already-present row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_embeds_inline_in_the_birth_commit() -> anyhow::Result<()> {
+        let plain = Store::open(&Url::parse("shared-memory://pond-test-inline-plain/")?).await?;
+        ingest_events(&plain, conversational_events("01HXYINLINE000PLAIN", 5)).await?;
+        assert!(
+            !plain.has_embeddings().await?,
+            "no embedder attached -> every vector null",
+        );
+        let plain_version = plain.messages_version().await?;
+
+        let backend = Arc::new(CountingEmbedder::default());
+        let embedder = Arc::new(crate::embed::LazyEmbedder::from_loaded(
+            backend.clone() as Arc<dyn crate::embed::Embedder>
+        ));
+        let store = Store::open(&Url::parse("shared-memory://pond-test-inline-embed/")?)
+            .await?
+            .with_embedder(embedder);
+        ingest_events(&store, conversational_events("01HXYINLINE000EMBED", 5)).await?;
+        assert!(
+            store.has_embeddings().await?,
+            "embedder attached -> vectors filled at ingest",
+        );
+        assert_eq!(
+            backend.texts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "every conversational message embedded once",
+        );
+        assert_eq!(
+            store.messages_version().await?,
+            plain_version,
+            "inline embed must ride the append, not add a separate commit",
+        );
+
+        ingest_events(&store, conversational_events("01HXYINLINE000EMBED", 5)).await?;
+        assert_eq!(
+            backend.texts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "an idempotent re-sync embeds no already-present row",
+        );
+        Ok(())
     }
 
     #[test]
