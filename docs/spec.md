@@ -381,8 +381,9 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 |---|---|
 | `session_id`, `id` | composite primary key; clustered on `(session_id, timestamp)` |
 | `timestamp` | canonical ordering key |
-| `role` | scalar-indexed |
-| `source_agent`, `project` | denormalized; the scalar-indexed filter-pushdown surface |
+| `role` | message role |
+| `source_agent` | denormalized; scalar-indexed filter-pushdown surface |
+| `project` | denormalized filter column |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
 | `vector` | Float16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |

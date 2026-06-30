@@ -1540,8 +1540,8 @@ async fn open_store(
     let resolved = storage.resolve(&loaded.creds)?;
     warn_unmatched_sets(&[&resolved], loaded)?;
     // The disk index cache is scoped to the read-serving commands (serve, mcp,
-    // search) - the ones that repeatedly pay the cold index load. Write/admin
-    // commands skip it: caching their index reads buys nothing and would
+    // search) - the ones that repeatedly pay the cold index load. Every other
+    // command skips it: caching their index reads buys nothing and would
     // populate a cache they never GC (GC runs in the server's prewarm loop).
     let index_cache_dir = index_cache.then(default_cache_dir);
     let store = if spinner {

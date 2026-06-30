@@ -53,7 +53,7 @@ Critical path: **T0 -> #8 -> #1**. The rest of P0 is independent and parallel.
 
 - **#5. Drop `messages_project_btree`** - unused (project filter is substring/regex only).
 - **#6. Drop `messages_role_bitmap`** - unused (`role` never filtered).
-- **#7. Verify then maybe drop `messages_timestamp_zonemap`** - `analyze_plan` a date-range query on the corpus; if zones do not prune (timestamps are not clustered by sync-append order), drop it. The fallback is a scan of a small i64 column, usually over an already-narrowed candidate set.
+- **#7. Verify then maybe drop `messages_timestamp_zonemap`** - **(DONE, dropped in #75:** the ZoneMap mis-prunes the tz-aware column and returned empty date filters; bounds now run as a refine over the candidate set.) `analyze_plan` a date-range query on the corpus; if zones do not prune (timestamps are not clustered by sync-append order), drop it. The fallback is a scan of a small i64 column, usually over an already-narrowed candidate set.
 
 Removed indexes are reaped on the next `pond optimize`; `enable_stable_row_ids` makes the drop a metadata change with no remap.
 

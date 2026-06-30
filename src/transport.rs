@@ -301,10 +301,10 @@ Join keys: messages.session_id = sessions.session_id; parts.session_id = \
 messages.session_id AND parts.message_id = messages.message_id. Subagents are \
 sessions whose source_agent matches '%/%' (e.g. 'claude-code/general-purpose').
 
-Indexed (fast) filter columns: messages.project / session_id / timestamp / role / \
-source_agent / message_id; parts.session_id / message_id; sessions.session_id. \
+Indexed (fast) filter columns: messages.session_id / source_agent; \
+parts.session_id / message_id; sessions.session_id. \
 Prefer equality/range predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
-on bitmap-indexed columns (messages.source_agent, messages.role) with \"LIKE \
+on bitmap-indexed columns (messages.source_agent) with \"LIKE \
 prefix queries are not supported for bitmap indexes\". Workarounds: equality, \
 split_part(source_agent, '/', 1) = 'claude-code', or an infix pattern \
 (LIKE '%/%' is fine - leading-wildcard patterns are not pushed to the index).

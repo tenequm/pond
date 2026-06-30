@@ -1557,12 +1557,12 @@ pub struct Handle {
     /// to display where the bytes live and to decide whether to walk a local
     /// directory or issue a remote `LIST` for sizing.
     location: Url,
-    /// Cached `parts.lance` open metadata, used the first time a caller asks
-    /// for parts. Holds the namespace probe shape so the lazy open re-uses the
-    /// same `lance-chokepoints-catalog` path as the eager opens for sessions/messages.
-    parts_refresh_after: Duration,
+    /// Freshness window applied to the lazily-opened `sessions` and `parts`
+    /// datasets when they first open, matching the eager `messages` open's
+    /// scheme-keyed `refresh_after`.
+    lazy_refresh_after: Duration,
     /// Object-store wrapper (index disk cache + io-trace) applied on every
-    /// dataset open, including the lazy parts open and any re-open.
+    /// dataset open, including the lazy sessions/parts opens and any re-open.
     index_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 }
 
@@ -1600,7 +1600,10 @@ impl Table {
 }
 #[derive(Debug)]
 struct DatasetSet {
-    sessions: Mutex<CachedDataset>,
+    /// `sessions.lance` opens lazily, like `parts`: the search request path
+    /// reads only `messages`. Writers (ingest), `pond status`, restore, and the
+    /// daemon's background index-cache GC open it on first use.
+    sessions: OnceCell<Mutex<CachedDataset>>,
     messages: Mutex<CachedDataset>,
     /// `parts.lance` opens lazily on the first read or write that needs it:
     /// any `pond_get` (every mode reads parts to build summaries), grouped
@@ -1618,6 +1621,13 @@ struct CachedDataset {
     refresh_after: Duration,
 }
 impl CachedDataset {
+    fn new(dataset: Dataset, refresh_after: Duration) -> Self {
+        Self {
+            dataset,
+            last_refresh: Instant::now(),
+            refresh_after,
+        }
+    }
     async fn latest(&mut self) -> Result<Dataset> {
         if self.last_refresh.elapsed() >= self.refresh_after {
             self.dataset.checkout_latest().await?;
@@ -1701,7 +1711,8 @@ impl Handle {
     /// the resolved `[runtime]` cache caps. Object-store keys are the
     /// `object_store` crate's standard config names; pond does not parse them.
     /// Opening datasets never performs index work; index lifecycle lives under
-    /// `Handle::optimize_table`. `parts.lance` opens lazily on first use.
+    /// `Handle::optimize_table`. `sessions.lance` and `parts.lance` open lazily
+    /// on first use.
     pub async fn open_with_options(
         location: &Url,
         storage_options: HashMap<String, String>,
@@ -1773,22 +1784,9 @@ impl Handle {
         let index_wrapper = index_store_wrapper(location, index_cache_dir.as_deref());
         let handle = Self {
             datasets: DatasetSet {
-                sessions: Mutex::new(CachedDataset {
-                    dataset: open_or_create_via_ns(
-                        &nm,
-                        &nm_ident,
-                        sessions::SESSIONS,
-                        sessions::session_schema(),
-                        &session,
-                        &storage_options,
-                        index_wrapper.clone(),
-                    )
-                    .await?,
-                    last_refresh: Instant::now(),
-                    refresh_after,
-                }),
-                messages: Mutex::new(CachedDataset {
-                    dataset: open_or_create_via_ns(
+                sessions: OnceCell::new(),
+                messages: Mutex::new(CachedDataset::new(
+                    open_or_create_via_ns(
                         &nm,
                         &nm_ident,
                         sessions::MESSAGES,
@@ -1798,9 +1796,8 @@ impl Handle {
                         index_wrapper.clone(),
                     )
                     .await?,
-                    last_refresh: Instant::now(),
                     refresh_after,
-                }),
+                )),
                 parts: OnceCell::new(),
             },
             retry: RetryPolicy::default(),
@@ -1809,7 +1806,7 @@ impl Handle {
             nm_ident,
             storage_options,
             location: location.clone(),
-            parts_refresh_after: refresh_after,
+            lazy_refresh_after: refresh_after,
             index_wrapper,
         };
         Ok(handle)
@@ -2506,11 +2503,11 @@ impl Handle {
             .with_context(|| format!("namespace returned no location for table {table_name}"))
     }
 
-    /// Whether the store holds synced data yet. `open` eagerly creates empty
-    /// `sessions`/`messages` datasets, but `parts` opens lazily on first write
-    /// (see `open_with_options`), so its presence is the "has been synced"
-    /// signal - letting read-only surfaces (`pond status`)
-    /// render an empty state instead of erroring on the first `parts` describe.
+    /// Whether the store holds synced data yet. `open` eagerly creates only the
+    /// `messages` dataset; `sessions` and `parts` open lazily on first use
+    /// (see `open_with_options`), so `parts`' presence is the "has been synced"
+    /// signal - letting read-only surfaces (`pond status`) render an empty state
+    /// instead of erroring on the first `parts` describe.
     pub async fn initialized(&self) -> Result<bool> {
         let request = DescribeTableRequest {
             id: Some(self.nm_ident.as_table_id(sessions::PARTS)),
@@ -2619,35 +2616,58 @@ impl Handle {
     }
     async fn cached(&self, table: Table) -> Result<&Mutex<CachedDataset>> {
         match table {
-            Table::Sessions => Ok(&self.datasets.sessions),
+            Table::Sessions => self.sessions_cached().await,
             Table::Messages => Ok(&self.datasets.messages),
             Table::Parts => self.parts_cached().await,
         }
     }
 
+    /// Open `sessions.lance` on first use (spec.md#datasets). The search request
+    /// path reads only `messages`; the daemon's background index-cache GC
+    /// (`prune_index_cache`) opens this on a `serve`/`mcp` process. Single-flight
+    /// via `OnceCell`, like `parts`.
+    async fn sessions_cached(&self) -> Result<&Mutex<CachedDataset>> {
+        self.lazy_cached(
+            &self.datasets.sessions,
+            sessions::SESSIONS,
+            sessions::session_schema,
+        )
+        .await
+    }
+
     /// Open `parts.lance` on first use (spec.md#datasets). Single-flight via
     /// `OnceCell`; once initialized, behaves identically to the other two.
     async fn parts_cached(&self) -> Result<&Mutex<CachedDataset>> {
-        self.datasets
-            .parts
-            .get_or_try_init(|| async {
-                let dataset = open_or_create_via_ns(
-                    &self.nm,
-                    &self.nm_ident,
-                    sessions::PARTS,
-                    sessions::part_schema(),
-                    &self.session,
-                    &self.storage_options,
-                    self.index_wrapper.clone(),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>(Mutex::new(CachedDataset {
-                    dataset,
-                    last_refresh: Instant::now(),
-                    refresh_after: self.parts_refresh_after,
-                }))
-            })
+        self.lazy_cached(&self.datasets.parts, sessions::PARTS, sessions::part_schema)
             .await
+    }
+
+    /// Shared lazy-open path for the `sessions`/`parts` `OnceCell`s. `schema` is a
+    /// thunk so the (local-CPU) schema build happens only on the cold init, not
+    /// on every cache hit.
+    async fn lazy_cached<'a>(
+        &self,
+        cell: &'a OnceCell<Mutex<CachedDataset>>,
+        table_name: &str,
+        schema: fn() -> lance::deps::arrow_schema::SchemaRef,
+    ) -> Result<&'a Mutex<CachedDataset>> {
+        cell.get_or_try_init(|| async {
+            let dataset = open_or_create_via_ns(
+                &self.nm,
+                &self.nm_ident,
+                table_name,
+                schema(),
+                &self.session,
+                &self.storage_options,
+                self.index_wrapper.clone(),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
+                dataset,
+                self.lazy_refresh_after,
+            )))
+        })
+        .await
     }
     async fn retry_lance<T, Fut, Op>(&self, label: &str, mut operation: Op) -> Result<T>
     where
