@@ -1,4 +1,17 @@
 # Changelog
+## [0.11.0](https://github.com/tenequm/pond/compare/v0.10.2...v0.11.0) - 2026-06-30
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] append-only write path - incremental indexes, grown-session copy append, inline embed at ingest
+
+### <!-- 5 -->📚 Documentation
+- add remote read-path cold-start plan and drop stale prewarm comment figures
+
+### <!-- 6 -->🧹 Chores
+- bench batch/commit sweeps, append-only write-path plan, AIMD hands-off rule
+- enforce changelog header taxonomy (pre-commit + moon + CI); backfill 0.10.1/0.10.2
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.10.2...v0.11.0
 
 ## [0.10.2](https://github.com/tenequm/pond/compare/v0.10.1...v0.10.2) - 2026-06-21
 
