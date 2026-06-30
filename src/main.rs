@@ -1099,19 +1099,27 @@ async fn main() -> anyhow::Result<()> {
             path,
             verify,
         } => {
+            let cmd_started = std::time::Instant::now();
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
             // sync ingests through `upsert_session_batch`, which embeds inline;
             // it has no query path, so this is its own resident embedder.
             let (_, store) = open_store(storage_path, &loaded, true).await?;
             let store = store.with_embedder(Arc::new(LazyEmbedder::candle()));
+            let import_started = std::time::Instant::now();
             let import_summary =
                 run_import_stage(&store, &loaded, &config_file, adapter.clone(), path, verify)
                     .await?;
             let any_new_rows = import_summary.inserted > 0;
-            let summary = SyncRunSummary {
-                ingest: Some(import_summary),
-            };
+            output(&stage_line(
+                import_started.elapsed(),
+                "import",
+                &format!(
+                    "+{} sessions, +{} messages",
+                    format_thousands(import_summary.sessions_inserted as u64),
+                    format_thousands(import_summary.messages_inserted_searchable as u64),
+                ),
+            ))?;
             // Optimize stages gated on `any_new_rows`: cleanup_old_versions
             // walks the version log on every call (real work even when "caught
             // up"), so an idempotent no-op sync should not pay it. Catch up an
@@ -1124,9 +1132,20 @@ async fn main() -> anyhow::Result<()> {
                 // has no --force-embed; finalize's embed points a model swap at
                 // the command that does.
                 let policy = configured_maintenance_policy(&loaded, None)?;
+                let indexes_started = std::time::Instant::now();
                 finalize_indexes(&store, &policy, false).await?;
+                output(&stage_line(
+                    indexes_started.elapsed(),
+                    "indexes",
+                    "embed + fold complete",
+                ))?;
             }
-            render_sync_summary(&store, &summary).await?;
+            render_sync_summary(&store).await?;
+            output(&format!(
+                "{} sync complete in {}",
+                pond::output::paint("done -", pond::output::dim()),
+                elapsed_hms(cmd_started.elapsed()),
+            ))?;
         }
         Command::Optimize {
             only,
@@ -1135,6 +1154,7 @@ async fn main() -> anyhow::Result<()> {
             rebuild,
             drop_index,
         } => {
+            let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, true).await?;
             if let Some(name) = drop_index {
@@ -1167,13 +1187,29 @@ async fn main() -> anyhow::Result<()> {
                 let policy = configured_maintenance_policy(&loaded, None)?;
                 let outcome = if stages.embed && stages.index {
                     // Full optimize: the same finalize seam sync and copy use.
-                    Some(finalize_indexes(&store, &policy, force_embed).await?)
+                    let started = std::time::Instant::now();
+                    let outcome = finalize_indexes(&store, &policy, force_embed).await?;
+                    output(&stage_line(
+                        started.elapsed(),
+                        "indexes",
+                        "embed + fold complete",
+                    ))?;
+                    Some(outcome)
                 } else {
                     if stages.embed {
+                        let started = std::time::Instant::now();
                         run_embed_stage(&store, force_embed).await?;
+                        output(&stage_line(started.elapsed(), "embed", "backlog complete"))?;
                     }
                     if stages.index {
-                        Some(run_update_indexes_stage(&store, &policy).await?)
+                        let started = std::time::Instant::now();
+                        let outcome = run_update_indexes_stage(&store, &policy).await?;
+                        output(&stage_line(
+                            started.elapsed(),
+                            "fold",
+                            "indexes folded + compacted",
+                        ))?;
+                        Some(outcome)
                     } else {
                         None
                     }
@@ -1182,6 +1218,11 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+            output(&format!(
+                "{} optimize complete in {}",
+                pond::output::paint("done -", pond::output::dim()),
+                elapsed_hms(cmd_started.elapsed()),
+            ))?;
         }
         Command::Adapters { command } => {
             let config_file = config_path(config);
@@ -1938,6 +1979,7 @@ async fn run_store_to_store_copy(
         return Ok(());
     }
 
+    let cmd_started = std::time::Instant::now();
     let dim = pond::output::dim();
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -1966,14 +2008,16 @@ async fn run_store_to_store_copy(
     }
     let new_sessions = plan.new_sessions();
     let grown_sessions = plan.total().saturating_sub(new_sessions);
-    spinner.println(format!(
-        "{} {} sessions to copy ({} new + {} grown, {} on source)  {:.1}s",
-        pond::output::paint("plan", dim),
-        plan.total(),
-        new_sessions,
-        grown_sessions,
-        plan.source_sessions,
-        plan_elapsed.as_secs_f64(),
+    spinner.println(stage_line(
+        plan_elapsed,
+        "plan",
+        &format!(
+            "{} sessions to copy ({} new + {} grown, {} on source)",
+            plan.total(),
+            new_sessions,
+            grown_sessions,
+            plan.source_sessions,
+        ),
     ));
 
     if plan.is_empty() {
@@ -1989,16 +2033,18 @@ async fn run_store_to_store_copy(
         let stream_started = std::time::Instant::now();
         let imported = to_store.copy_delta_from(&from_store, &plan).await?;
         let stream_elapsed = stream_started.elapsed();
-        spinner.println(format!(
-            "{} sessions {} ({} new)  messages {} ({} new)  parts {} ({} new)  {:.1}s",
-            pond::output::paint("stream", dim),
-            imported.rows.sessions,
-            imported.inserted.sessions,
-            imported.rows.messages,
-            imported.inserted.messages,
-            imported.rows.parts,
-            imported.inserted.parts,
-            stream_elapsed.as_secs_f64(),
+        spinner.println(stage_line(
+            stream_elapsed,
+            "stream",
+            &format!(
+                "sessions {} ({} new)  messages {} ({} new)  parts {} ({} new)",
+                imported.rows.sessions,
+                imported.inserted.sessions,
+                imported.rows.messages,
+                imported.inserted.messages,
+                imported.rows.parts,
+                imported.inserted.parts,
+            ),
         ));
     }
 
@@ -2016,22 +2062,38 @@ async fn run_store_to_store_copy(
     // itself - it copies the `vector` column verbatim, so an unembedded source
     // arrives unembedded and this pass is the catch-up).
     finalize_indexes(&to_store, &policy, false).await?;
-    output(&format!(
-        "{} rebuilt text + semantic on destination  {:.1}s",
-        pond::output::paint("indexes", dim),
-        indexes_started.elapsed().as_secs_f64(),
+    output(&stage_line(
+        indexes_started.elapsed(),
+        "indexes",
+        "text + semantic rebuilt on destination",
     ))?;
 
+    // `pond copy` always closes with the id-set + duplicate proof. On success
+    // print the tidy timed row; on failure fall through to the detailed
+    // missing/duplicate breakdown (render_storage_verify) and exit 6.
+    let verify_started = std::time::Instant::now();
     let verify = verify_stores(&from_store, &to_store).await?;
-    if !render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?.synced {
+    let verify_elapsed = verify_started.elapsed();
+    if verify.synced() {
+        output(&stage_line(
+            verify_elapsed,
+            "verify",
+            &format!(
+                "SYNCED - {} source rows, {} duplicates",
+                format_thousands(verify.total_source_rows() as u64),
+                verify.total_duplicates(),
+            ),
+        ))?;
+    } else {
+        output(&stage_line(verify_elapsed, "verify", "FAILED"))?;
+        render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?;
         std::process::exit(6);
     }
 
-    // `pond copy` always closes with the id-set proof; `--verify-only` runs
-    // just this read-only check.
     output(&format!(
-        "{} destination is ready to query",
+        "{} copy complete in {}",
         pond::output::paint("done -", dim),
+        elapsed_hms(cmd_started.elapsed()),
     ))?;
     Ok(())
 }
@@ -2100,6 +2162,7 @@ async fn copy_store_to_jsonl(
 /// `pond copy --from <file>.pond`: restore an archive into the destination
 /// store via the idempotent union merge.
 async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> anyhow::Result<()> {
+    let cmd_started = std::time::Instant::now();
     let (_, store) = open_store(Some(to), loaded, false).await?;
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
@@ -2108,10 +2171,17 @@ async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> 
     // Same finalize seam as optimize/sync; the archive carries embeddings as
     // data columns, so finalize's embed pass no-ops (or fills the backlog if the
     // archive was made from an unembedded store).
+    let indexes_started = std::time::Instant::now();
     finalize_indexes(&store, &policy, false).await?;
+    output(&stage_line(
+        indexes_started.elapsed(),
+        "indexes",
+        "text + semantic rebuilt on destination",
+    ))?;
     output(&format!(
-        "{} rebuilt text + semantic on destination",
-        pond::output::paint("indexes:", dim),
+        "{} restore complete in {}",
+        pond::output::paint("done -", dim),
+        elapsed_hms(cmd_started.elapsed()),
     ))?;
     Ok(())
 }
@@ -2981,14 +3051,6 @@ impl OptimizeStages {
     }
 }
 
-/// Only the import recap survives to `render_sync_summary`; embed and index
-/// each print their own line as they finish, so their outcomes aren't threaded
-/// back here.
-#[derive(Debug, Default)]
-struct SyncRunSummary {
-    ingest: Option<IngestSummary>,
-}
-
 async fn run_import_stage(
     store: &Store,
     loaded: &Config,
@@ -3243,24 +3305,14 @@ async fn finalize_indexes(
 /// ```text
 ///
 /// indexes   text + semantic ready
-/// added     +44 sessions, +2,337 messages
 /// stored    8,460 sessions, 172,710 searchable messages
 /// ```
 ///
-/// `added` is suppressed when both deltas are zero (a no-op sync still
-/// always prints the `stored` line so an operator can confirm corpus
-/// state without re-running `pond status`). The trailing disclaimer
-/// goes to stderr per the rust-cli/book result-vs-meta discipline.
-async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow::Result<()> {
+/// The per-run delta is the timed `import` row the command already printed;
+/// this recap is corpus state, always shown (even on a no-op sync) so an
+/// operator can confirm it without re-running `pond status`.
+async fn render_sync_summary(store: &Store) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
-
-    let (sessions_added, messages_added) = match &summary.ingest {
-        Some(ingest) => (
-            ingest.sessions_inserted as u64,
-            ingest.messages_inserted_searchable as u64,
-        ),
-        None => (0, 0),
-    };
 
     let (index_status, embedding, (stored_sessions, _, _)) = tokio::try_join!(
         store.index_status(),
@@ -3271,14 +3323,8 @@ async fn render_sync_summary(store: &Store, summary: &SyncRunSummary) -> anyhow:
 
     output("")?;
     output(&render_indexes_line(&health))?;
-    if sessions_added + messages_added > 0 {
-        output(&format!(
-            "{}     +{} sessions, +{} messages",
-            paint("added", dim()),
-            format_thousands(sessions_added),
-            format_thousands(messages_added),
-        ))?;
-    }
+    // The per-run delta (`+N sessions, +N messages`) is the timed `import` row;
+    // this recap is corpus state.
     output(&format!(
         "{}    {} sessions, {} searchable messages",
         paint("stored", dim()),
@@ -3738,6 +3784,14 @@ fn elapsed_hms(elapsed: Duration) -> String {
         (secs % 3600) / 60,
         secs % 60
     )
+}
+
+/// One timed write-stage row: a dim `[HH:MM:SS]` prefix (that stage's own
+/// duration) + an aligned `label` + `detail`. The write verbs close with a
+/// separate `done - <verb> complete in HH:MM:SS` grand total.
+fn stage_line(elapsed: Duration, label: &str, detail: &str) -> String {
+    let ts = pond::output::paint(&format!("[{}]", elapsed_hms(elapsed)), pond::output::dim());
+    format!("{ts} {label:8}{detail}")
 }
 
 /// An uncolored `#`/`-` progress bar of `width` cells. pond's templates never
