@@ -310,6 +310,26 @@ impl Store {
         })
     }
 
+    /// Like [`Self::open_with_options`], plus the on-disk `_indices/*` cache
+    /// rooted at `index_cache_dir` (see [`Handle::open_with_options_cached`]).
+    pub async fn open_with_options_cached(
+        location: &Url,
+        storage_options: std::collections::HashMap<String, String>,
+        caps: crate::substrate::RuntimeCaps,
+        index_cache_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            handle: Handle::open_with_options_cached(
+                location,
+                storage_options,
+                caps,
+                index_cache_dir,
+            )
+            .await?,
+            rowmap: ArcSwapOption::empty(),
+        })
+    }
+
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
     /// a `file://...` URL via [`config::url_for_path`] before opening. Routes
     /// through [`Store::open_with_options`] so the production policy is
@@ -1550,14 +1570,20 @@ impl Store {
         {
             tracing::debug!(%error, "fts index prewarm skipped");
         }
+        self.prune_index_cache(cache_dir).await;
         Ok(())
+    }
+
+    /// Reclaim disk-index-cache entries for index versions the store has moved
+    /// past (see `Handle::prune_index_cache`). Best-effort.
+    pub async fn prune_index_cache(&self, cache_dir: &Path) {
+        self.handle.prune_index_cache(cache_dir).await;
     }
 
     /// Stable filesystem-safe cache key: same store URL -> same key, so sibling
     /// pond processes share one map file and distinct stores never collide.
     fn store_key(&self) -> String {
-        let digest = blake3::hash(self.handle.location().as_str().as_bytes());
-        digest.to_hex()[..16].to_owned()
+        crate::substrate::store_key(self.handle.location())
     }
 
     /// Max delta segments before the chain is compacted into a fresh base.

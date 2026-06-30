@@ -28,7 +28,8 @@ use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexPara
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor, uri_to_url,
+    ChainedWrappingObjectStore, ObjectStore, ObjectStoreParams, ObjectStoreRegistry,
+    StorageOptionsAccessor, WrappingObjectStore, uri_to_url,
 };
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
@@ -37,6 +38,7 @@ use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
 use std::{
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -1559,6 +1561,9 @@ pub struct Handle {
     /// for parts. Holds the namespace probe shape so the lazy open re-uses the
     /// same `lance-chokepoints-catalog` path as the eager opens for sessions/messages.
     parts_refresh_after: Duration,
+    /// Object-store wrapper (index disk cache + io-trace) applied on every
+    /// dataset open, including the lazy parts open and any re-open.
+    index_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -1699,8 +1704,20 @@ impl Handle {
     /// `Handle::optimize_table`. `parts.lance` opens lazily on first use.
     pub async fn open_with_options(
         location: &Url,
+        storage_options: HashMap<String, String>,
+        caps: RuntimeCaps,
+    ) -> Result<Self> {
+        Self::open_with_options_cached(location, storage_options, caps, None).await
+    }
+
+    /// Like [`Self::open_with_options`], plus an `_indices/*` disk cache rooted
+    /// at `index_cache_dir` (caller supplies it, mirroring `ensure_rowmap`) so a
+    /// fresh process skips the cold index load. Ignored for local-FS stores.
+    pub async fn open_with_options_cached(
+        location: &Url,
         mut storage_options: HashMap<String, String>,
         caps: RuntimeCaps,
+        index_cache_dir: Option<PathBuf>,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
             tokio::fs::create_dir_all(&path).await.with_context(|| {
@@ -1753,6 +1770,7 @@ impl Handle {
         } else {
             Duration::from_secs(5)
         };
+        let index_wrapper = index_store_wrapper(location, index_cache_dir.as_deref());
         let handle = Self {
             datasets: DatasetSet {
                 sessions: Mutex::new(CachedDataset {
@@ -1763,6 +1781,7 @@ impl Handle {
                         sessions::session_schema(),
                         &session,
                         &storage_options,
+                        index_wrapper.clone(),
                     )
                     .await?,
                     last_refresh: Instant::now(),
@@ -1776,6 +1795,7 @@ impl Handle {
                         sessions::message_schema(),
                         &session,
                         &storage_options,
+                        index_wrapper.clone(),
                     )
                     .await?,
                     last_refresh: Instant::now(),
@@ -1790,6 +1810,7 @@ impl Handle {
             storage_options,
             location: location.clone(),
             parts_refresh_after: refresh_after,
+            index_wrapper,
         };
         Ok(handle)
     }
@@ -2374,6 +2395,31 @@ impl Handle {
         Ok(indices.iter().any(|index| index.name == name))
     }
 
+    /// Reclaim cached `_indices/<uuid>` dirs no longer referenced by any table's
+    /// manifest. No-op for local stores or a never-populated cache. Best-effort:
+    /// a new index version naturally re-fetches, so an over-eager prune only
+    /// costs one re-download.
+    pub(crate) async fn prune_index_cache(&self, cache_dir: &std::path::Path) {
+        if config::is_local(&self.location) {
+            return;
+        }
+        let root = cache_dir.join(store_key(&self.location)).join("indices");
+        if !root.exists() {
+            return;
+        }
+        let mut keep = std::collections::HashSet::new();
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            let Ok(dataset) = self.dataset(table).await else {
+                return;
+            };
+            let Ok(indices) = dataset.load_indices().await else {
+                return;
+            };
+            keep.extend(indices.iter().map(|index| index.uuid.to_string()));
+        }
+        prune_stale_uuid_dirs(&root, &keep);
+    }
+
     /// Count rows in `table` not yet covered by `index_name`. Manifest-only;
     /// a missing index reports the whole table. Powers `pond status`.
     pub(crate) async fn unindexed_row_count(
@@ -2592,6 +2638,7 @@ impl Handle {
                     sessions::part_schema(),
                     &self.session,
                     &self.storage_options,
+                    self.index_wrapper.clone(),
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(Mutex::new(CachedDataset {
@@ -3096,6 +3143,329 @@ pub mod io_trace {
     }
 }
 
+/// On-disk cache for `_indices/*` so a fresh process serves the IVF + FTS index
+/// from local disk instead of re-loading it from the object store on every
+/// cold-start (spec.md#search). Scoped to `_indices/*` because those files are
+/// immutable and UUID-addressed, so a hit is always correct and a new index is
+/// an automatic miss; data (served by the rowmap) and manifests (need freshness)
+/// pass through. A `WrappingObjectStore`, so it stays inside the object-store
+/// layer rather than reaching around it.
+pub mod index_cache {
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
+    };
+    use std::collections::HashMap;
+    use std::ops::Range;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use lance_io::object_store::WrappingObjectStore;
+
+    fn is_index_path(location: &ObjPath) -> bool {
+        AsRef::<str>::as_ref(location).contains("_indices/")
+    }
+
+    /// Drop conditional headers (etag/if-modified): they reference the remote
+    /// object and would spuriously fail against the local cache copy.
+    fn local_opts(options: &GetOptions) -> GetOptions {
+        GetOptions {
+            range: options.range.clone(),
+            head: options.head,
+            ..Default::default()
+        }
+    }
+
+    /// `WrappingObjectStore` factory: holds the per-store cache root and hands a
+    /// `CachingStore` to every dataset open on this store.
+    #[derive(Debug)]
+    pub struct IndexDiskCache {
+        local: Arc<LocalFileSystem>,
+        inflight: Arc<Mutex<HashMap<ObjPath, Arc<tokio::sync::Mutex<()>>>>>,
+    }
+
+    impl IndexDiskCache {
+        /// `LocalFileSystem` requires the prefix to exist, so create it first.
+        pub fn new(root: PathBuf) -> std::io::Result<Self> {
+            std::fs::create_dir_all(&root)?;
+            Ok(Self {
+                local: Arc::new(LocalFileSystem::new_with_prefix(&root)?),
+                inflight: Arc::new(Mutex::new(HashMap::new())),
+            })
+        }
+    }
+
+    impl WrappingObjectStore for IndexDiskCache {
+        fn wrap(&self, _store_prefix: &str, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(CachingStore {
+                inner,
+                local: self.local.clone(),
+                inflight: self.inflight.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CachingStore {
+        inner: Arc<dyn ObjectStore>,
+        local: Arc<LocalFileSystem>,
+        inflight: Arc<Mutex<HashMap<ObjPath, Arc<tokio::sync::Mutex<()>>>>>,
+    }
+
+    impl std::fmt::Display for CachingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CachingStore({})", self.inner)
+        }
+    }
+
+    impl CachingStore {
+        fn flight_lock(&self, location: &ObjPath) -> Arc<tokio::sync::Mutex<()>> {
+            self.inflight
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .entry(location.clone())
+                .or_default()
+                .clone()
+        }
+
+        /// Fetch the whole object once, write it (`LocalFileSystem::put` stages +
+        /// renames atomically), then serve the requested range from the copy. The
+        /// per-path single-flight coalesces a process's concurrent first reads of
+        /// one file into a single fetch; cross-process writes race safely since
+        /// the bytes are identical and the rename is atomic.
+        async fn populate_and_serve(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> OsResult<GetResult> {
+            let lock = self.flight_lock(location);
+            let _guard = lock.lock().await;
+            if let Ok(result) = self.local.get_opts(location, local_opts(&options)).await {
+                return Ok(result);
+            }
+            let bytes = self.inner.get(location).await?.bytes().await?;
+            if self
+                .local
+                .put(location, PutPayload::from_bytes(bytes))
+                .await
+                .is_ok()
+                && let Ok(result) = self.local.get_opts(location, local_opts(&options)).await
+            {
+                return Ok(result);
+            }
+            // Cache write or re-read failed (e.g. disk full): serve from origin.
+            self.inner.get_opts(location, options).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CachingStore {
+        async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> OsResult<GetResult> {
+            if !is_index_path(location) {
+                return self.inner.get_opts(location, options).await;
+            }
+            match self.local.get_opts(location, local_opts(&options)).await {
+                Ok(result) => Ok(result),
+                Err(object_store::Error::NotFound { .. }) => {
+                    self.populate_and_serve(location, options).await
+                }
+                Err(_) => self.inner.get_opts(location, options).await,
+            }
+        }
+
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjPath,
+            ranges: &[Range<u64>],
+        ) -> OsResult<Vec<Bytes>> {
+            if is_index_path(location) {
+                // Through get_opts so the first touch caches the whole object.
+                let mut out = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    let opts = GetOptions {
+                        range: Some(range.clone().into()),
+                        ..Default::default()
+                    };
+                    out.push(self.get_opts(location, opts).await?.bytes().await?);
+                }
+                return Ok(out);
+            }
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OsResult<ObjPath>>,
+        ) -> BoxStream<'static, OsResult<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjPath>,
+            offset: &ObjPath,
+        ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &ObjPath, to: &ObjPath, opts: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        use object_store::memory::InMemory;
+
+        async fn read(store: &Arc<dyn ObjectStore>, path: &ObjPath) -> Option<Vec<u8>> {
+            store
+                .get(path)
+                .await
+                .ok()?
+                .bytes()
+                .await
+                .ok()
+                .map(|b| b.to_vec())
+        }
+
+        #[tokio::test]
+        async fn caches_index_files_and_passes_data_through() {
+            let temp = tempfile::tempdir().unwrap();
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let index_path = ObjPath::from("d/messages.lance/_indices/uuid1/index.idx");
+            let data_path = ObjPath::from("d/messages.lance/data/x.lance");
+            inner
+                .put(&index_path, PutPayload::from_static(b"INDEX"))
+                .await
+                .unwrap();
+            inner
+                .put(&data_path, PutPayload::from_static(b"DATA"))
+                .await
+                .unwrap();
+
+            let cache = IndexDiskCache::new(temp.path().join("indices")).unwrap();
+            let store = cache.wrap("test", inner.clone());
+
+            assert_eq!(
+                read(&store, &index_path).await.as_deref(),
+                Some(&b"INDEX"[..])
+            );
+            assert_eq!(
+                read(&store, &data_path).await.as_deref(),
+                Some(&b"DATA"[..])
+            );
+
+            // Delete both from the origin. The index file is served from the
+            // local cache; the data file (never cached) is now gone.
+            inner.delete(&index_path).await.unwrap();
+            inner.delete(&data_path).await.unwrap();
+            assert_eq!(
+                read(&store, &index_path).await.as_deref(),
+                Some(&b"INDEX"[..])
+            );
+            assert_eq!(read(&store, &data_path).await, None);
+
+            // A range read of the cached index slices the local copy.
+            let slice = store.get_range(&index_path, 1..4).await.unwrap();
+            assert_eq!(slice.as_ref(), b"NDE");
+        }
+    }
+}
+
+/// Stable filesystem-safe key for a store URL: same URL -> same key, so sibling
+/// pond processes share one on-disk cache and distinct stores never collide.
+/// Shared by the rowmap (`sessions.rs`) and the index disk cache.
+pub(crate) fn store_key(location: &Url) -> String {
+    blake3::hash(location.as_str().as_bytes()).to_hex()[..16].to_owned()
+}
+
+/// Reclaim cached `_indices/<uuid>` dirs whose UUID is not in `keep`. Recurses
+/// to each `_indices` dir (the bucket prefix varies) and prunes its dead UUID
+/// children. Best-effort; unlink-safe (POSIX keeps an in-flight reader's inode).
+fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "_indices" {
+            let Ok(children) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                if child.path().is_dir()
+                    && !keep.contains(child.file_name().to_string_lossy().as_ref())
+                {
+                    let _ = std::fs::remove_dir_all(child.path());
+                }
+            }
+        } else {
+            prune_stale_uuid_dirs(&path, keep);
+        }
+    }
+}
+
+/// The object-store wrapper applied to every dataset open: the `_indices/*`
+/// disk cache (remote stores only, when a cache dir is supplied) chained with
+/// the diagnostic io-trace wrapper. `None` when neither is active.
+fn index_store_wrapper(
+    location: &Url,
+    index_cache_dir: Option<&std::path::Path>,
+) -> Option<Arc<dyn WrappingObjectStore>> {
+    let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
+    if let Some(dir) = index_cache_dir
+        && !config::is_local(location)
+    {
+        let root = dir.join(store_key(location)).join("indices");
+        match index_cache::IndexDiskCache::new(root) {
+            Ok(cache) => wrappers.push(Arc::new(cache)),
+            Err(error) => tracing::warn!(%error, "index disk cache disabled; reads hit the store"),
+        }
+    }
+    if let Some(tracker) = io_trace::wrapper() {
+        wrappers.push(tracker);
+    }
+    match wrappers.len() {
+        0 => None,
+        1 => Some(wrappers.remove(0)),
+        _ => Some(Arc::new(ChainedWrappingObjectStore::new(wrappers))),
+    }
+}
+
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
@@ -3103,6 +3473,7 @@ async fn open_or_create_via_ns(
     schema: lance::deps::arrow_schema::SchemaRef,
     session: &Arc<Session>,
     storage_options: &HashMap<String, String>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
     let table_id = nm_ident.as_table_id(table_name);
 
@@ -3116,7 +3487,7 @@ async fn open_or_create_via_ns(
                 format!("namespace returned no location for table {table_name}")
             })?;
             let mut builder = DatasetBuilder::from_uri(&location).with_session(session.clone());
-            match io_trace::wrapper() {
+            match wrapper {
                 Some(wrapper) => {
                     builder = builder.with_store_params(ObjectStoreParams {
                         object_store_wrapper: Some(wrapper),
@@ -3298,6 +3669,20 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn prune_keeps_live_uuid_dirs_and_drops_dead_ones() {
+        let temp = TempDir::new().unwrap();
+        let indices = temp.path().join("bkt/messages.lance/_indices");
+        for uuid in ["live", "dead"] {
+            std::fs::create_dir_all(indices.join(uuid)).unwrap();
+            std::fs::write(indices.join(uuid).join("index.idx"), b"x").unwrap();
+        }
+        let keep = std::collections::HashSet::from(["live".to_owned()]);
+        prune_stale_uuid_dirs(temp.path(), &keep);
+        assert!(indices.join("live").exists());
+        assert!(!indices.join("dead").exists());
+    }
 
     fn set(scope: Option<&str>) -> CredsSet {
         CredsSet {
