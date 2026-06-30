@@ -1524,13 +1524,12 @@ impl Store {
     }
 
     /// Page the heavy search indices in from storage so the first user query
-    /// after process start never eats the 175-442 s cold S3 load
-    /// (spec.md#search). Vector via `prewarm_index` (loads the IVF_SQ partition
-    /// storage). FTS is warmed with one synthetic query: Lance's full FTS
-    /// `prewarm_index` loads *every* token's posting list, which resident-sets
-    /// the whole inverted index (~1.7 GiB on the 2M-row corpus) and blows the
-    /// server RAM budget - so we settle the term dictionary + a hot token
-    /// instead and let real queries page their own postings. Best effort: a
+    /// after process start never eats the cold S3 index load (spec.md#search).
+    /// Vector via `prewarm_index` (loads the IVF_SQ partition storage). FTS is
+    /// warmed with one synthetic query rather than Lance's full FTS
+    /// `prewarm_index`, which would resident-set the whole inverted index and
+    /// blow the server RAM budget - so we settle the term dictionary + a hot
+    /// token and let real queries page their own postings. Best effort: a
     /// missing index (IVF_SQ below activation, or no FTS yet on an empty store)
     /// is logged, not fatal.
     pub async fn prewarm(&self, cache_dir: &Path) -> Result<()> {
