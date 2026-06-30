@@ -108,10 +108,9 @@ Ask structured questions with read-only SQL (the same surface as the `pond_sql_q
 pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DESC"
 ```
 
-Import alone, then run maintenance stages independently when needed:
+Run maintenance on demand (sync already embeds inline and folds indexes every run):
 
 ```sh
-pond sync --no-optimize
 pond optimize --only embed
 pond optimize --only index
 ```

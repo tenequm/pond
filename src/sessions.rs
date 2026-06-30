@@ -4561,7 +4561,8 @@ pub(crate) fn message_schema() -> Arc<Schema> {
         Field::new("content", DataType::Utf8, true),
         Field::new("search_text", DataType::Utf8, true),
         // The message's derived embedding (spec.md#session-embed-from-canonical):
-        // both null until `pond optimize` fills them, set together thereafter.
+        // filled inline at ingest when embedding is on, else null until a later
+        // `pond optimize` embed pass; `vector` and `embedding_model` set together.
         Field::new("vector", embedding_vector_type(), true),
         Field::new("embedding_model", DataType::Utf8, true),
         json_field("options", false),
