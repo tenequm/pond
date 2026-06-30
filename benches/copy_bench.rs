@@ -21,6 +21,7 @@
 //!   cargo bench --bench copy_bench -- --sessions 2000 --messages 8
 //!   cargo bench --bench copy_bench -- --backend memory
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -31,8 +32,11 @@ use std::path::PathBuf;
 use pond::{
     config::Config,
     handlers::ingest_events,
-    sessions::{DeltaPlan, IngestEvent, Store},
-    substrate::{MaintenancePolicy, RuntimeCaps, StorageUrl, Table},
+    sessions::{DeltaPlan, IngestEvent, IngestValidator, Store},
+    substrate::{
+        DEFAULT_SYNC_CLEANUP_INTERVAL, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn,
+        RuntimeCaps, StorageUrl, Table,
+    },
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use tempfile::TempDir;
@@ -91,15 +95,41 @@ struct Args {
     /// exit. Reused by `--corpus` so measurements never re-seed.
     #[arg(long)]
     prepare: Option<PathBuf>,
-    /// Run the grown-delta comparison from a `--prepare`d corpus: baseline-copy
-    /// `base` into each dest, then copy the `grown` delta via count+merge vs
-    /// id-diff+append, each followed by `optimize_indices`. Reports both stages.
+    /// Measure the grown-delta copy from a `--prepare`d corpus through the real
+    /// product path: `plan_incremental_from` + `copy_delta_from` + index fold
+    /// (the corpus arm documents the merge-vs-append-across-builds rationale).
     #[arg(long)]
     corpus: Option<PathBuf>,
+    /// Profile the optimize/index path's phase breakdown to a LOCAL dir (or
+    /// `--dest-url` S3 prefix `<base>-profile`). Seeds `--sessions` base rows,
+    /// runs optimize #1 (the from-scratch index BUILD), appends a `--grown`
+    /// tail, then runs optimize #2 (the incremental FOLD on this branch, full
+    /// REBUILD pre-change) - printing every phase (compact/cleanup/index-*) with
+    /// its elapsed_ms so the fold-vs-rebuild cost is visible per index.
+    #[arg(long)]
+    profile_optimize: Option<PathBuf>,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
     bench: bool,
+}
+
+fn phase_printer(label: &'static str) -> OptimizeProgressFn {
+    Arc::new(move |event| {
+        if let OptimizeEvent::PhaseDone {
+            table,
+            phase,
+            elapsed_ms,
+        } = event
+        {
+            println!(
+                "  [{label}] {:9} {:13} {:>8} ms",
+                table.as_str(),
+                phase.label(),
+                elapsed_ms,
+            );
+        }
+    })
 }
 
 async fn open_configured(url: &str) -> Result<Store> {
@@ -193,30 +223,6 @@ async fn append_sweep_point(
     Ok((take, commits, ms))
 }
 
-async fn open_two_dests(args: &Args) -> Result<(StoreHandle, StoreHandle)> {
-    match &args.dest_url {
-        Some(base) => {
-            let append_url = format!("{base}-c8append");
-            let merge_url = format!("{base}-c8merge");
-            println!("dests (scratch, clean up):\n  A: {merge_url}\n  B: {append_url}\n");
-            Ok((
-                StoreHandle {
-                    store: open_configured(&merge_url).await?,
-                    _temp: None,
-                },
-                StoreHandle {
-                    store: open_configured(&append_url).await?,
-                    _temp: None,
-                },
-            ))
-        }
-        None => Ok((
-            open_store(&args.backend, "dest-a").await?,
-            open_store(&args.backend, "dest-b").await?,
-        )),
-    }
-}
-
 fn base_ts() -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts")
 }
@@ -307,17 +313,46 @@ fn grow_events(index: usize, from_m: usize, count: usize) -> Vec<IngestEvent> {
     events
 }
 
-async fn seed(store: &Store, sessions: usize, messages: usize) -> Result<()> {
-    for index in 0..sessions {
-        ingest_events(store, session_events(index, messages)).await?;
+/// Mirror `ingest_adapter`'s flush cadence (`handlers::ADAPTER_FLUSH_BATCH`).
+const SEED_FLUSH_BATCH: usize = 100;
+
+/// Seed/grow through the real batched ingest path - the same `IngestValidator`
+/// push/flush/finish cycle `ingest_adapter` drives in production - so the
+/// fixture's commit/fragment shape matches a real sync. One `ingest_events` per
+/// session would instead commit per session, turning a tiny corpus into GBs of
+/// O(n^2) manifest churn (each commit rewrites the growing manifest).
+async fn ingest_batched(
+    store: &Store,
+    sessions: impl IntoIterator<Item = Vec<IngestEvent>>,
+) -> Result<()> {
+    let mut validator = IngestValidator::default();
+    let mut index = 0usize;
+    for events in sessions {
+        for event in events {
+            validator.push(store, index, event).await?;
+            index += 1;
+        }
+        if validator.pending_substreams() >= SEED_FLUSH_BATCH {
+            validator.flush(store).await?;
+        }
     }
+    validator.finish(store).await?;
     Ok(())
 }
 
-/// New path: plan the delta, append absent sessions / merge grown ones into the
-/// destination. Also returns the destination `messages` version bump, i.e. the
-/// number of commits this copy added - the metric that proves the append
-/// collapses to one commit per table instead of one per scan batch.
+async fn seed(store: &Store, sessions: usize, messages: usize) -> Result<()> {
+    ingest_batched(
+        store,
+        (0..sessions).map(|index| session_events(index, messages)),
+    )
+    .await
+}
+
+/// New path: plan the delta, then append absent sessions and filtered-append
+/// grown ones into the destination. Also returns the destination `messages`
+/// version bump, i.e. the number of commits this copy added - the metric that
+/// proves the append collapses to one commit per table instead of one per scan
+/// batch.
 async fn streaming_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let started = Instant::now();
@@ -340,11 +375,12 @@ async fn temp_staging_copy(from: &Store, to: &Store) -> Result<u128> {
 }
 
 /// C8 treatment: force every absent session through merge-insert instead of the
-/// append fast-path - what routing copy through the unified write seam
-/// (`upsert_session_batch`, `WhenMatched::DoNothing`) would do. Same inputs as
-/// `streaming_copy`; the only difference is append ids are moved into the merge
-/// bucket, so the destination pays a per-row target probe/join. The delta vs
-/// `streaming_copy` is the cost of dropping the append fast-path.
+/// append fast-path - the counterfactual cost of routing copy through a
+/// merge-insert seam (`WhenMatched::DoNothing`) rather than the filtered append
+/// it now uses. Same inputs as `streaming_copy`; the only difference is append
+/// ids are moved into the merge bucket, so the destination pays a per-row target
+/// probe/join. The delta vs `streaming_copy` is the cost of dropping the append
+/// fast-path.
 async fn merge_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let mut plan = to.plan_incremental_from(from).await?;
@@ -368,6 +404,67 @@ async fn main() -> Result<()> {
         args.backend, args.sessions, args.messages, total_rows,
     );
 
+    if let Some(dir) = &args.profile_optimize {
+        let store = match &args.dest_url {
+            Some(base) => {
+                let url = format!("{base}-profile");
+                println!("store (scratch, clean up): {url}\n");
+                open_configured(&url).await?
+            }
+            None => {
+                std::fs::create_dir_all(dir)?;
+                Store::open_local(dir).await?
+            }
+        };
+        let policy = MaintenancePolicy::always_compact();
+        let t = Instant::now();
+        ingest_batched(
+            &store,
+            (0..args.sessions).map(|index| session_events(index, args.messages)),
+        )
+        .await?;
+        println!(
+            "seed base: {} sessions x {} msgs = {} rows  ({} ms)\n",
+            args.sessions,
+            args.messages,
+            args.sessions * args.messages,
+            t.elapsed().as_millis(),
+        );
+
+        println!("optimize #1 - from-scratch index BUILD over the whole base:");
+        let t1 = Instant::now();
+        store
+            .optimize_indices(Some(phase_printer("build")), &policy)
+            .await?;
+        println!("  build total: {} ms\n", t1.elapsed().as_millis());
+
+        let sync_policy = MaintenancePolicy::always_compact()
+            .with_cleanup_interval(DEFAULT_SYNC_CLEANUP_INTERVAL);
+        println!(
+            "optimize #2 - {} incremental folds at the sync cleanup interval ({}); each round \
+             appends a small tail and finalizes, like one cron sync. A round with NO `cleanup` \
+             line skipped the ~per-table version-log walk:",
+            args.grown, DEFAULT_SYNC_CLEANUP_INTERVAL,
+        );
+        for round in 0..args.grown {
+            ingest_batched(
+                &store,
+                std::iter::once(grow_events(round, args.messages, args.messages)),
+            )
+            .await?;
+            let version = store.dataset(Table::Messages).await?.version_id();
+            let started = Instant::now();
+            store
+                .optimize_indices(Some(phase_printer("fold")), &sync_policy)
+                .await?;
+            println!(
+                "  round {round:>2}  messages.v={version}  finalize total: {} ms",
+                started.elapsed().as_millis(),
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(dir) = &args.prepare {
         std::fs::create_dir_all(dir.join("base"))?;
         std::fs::create_dir_all(dir.join("grown"))?;
@@ -383,9 +480,11 @@ async fn main() -> Result<()> {
         let grown = Store::open_local(&dir.join("grown")).await?;
         let t2 = Instant::now();
         seed(&grown, args.sessions, args.messages).await?;
-        for index in 0..args.grown {
-            ingest_events(&grown, grow_events(index, args.messages, args.messages)).await?;
-        }
+        ingest_batched(
+            &grown,
+            (0..args.grown).map(|index| grow_events(index, args.messages, args.messages)),
+        )
+        .await?;
         println!(
             "seed grown (+{} sessions x {} msgs): {} ms",
             args.grown,
@@ -399,69 +498,50 @@ async fn main() -> Result<()> {
     if let Some(dir) = &args.corpus {
         let base = Store::open_local(&dir.join("base")).await?;
         let grown = Store::open_local(&dir.join("grown")).await?;
-        let (dh_a, dh_b) = open_two_dests(&args).await?;
-        let (dest_a, dest_b) = (&dh_a.store, &dh_b.store);
-        streaming_copy(&base, dest_a).await?;
-        streaming_copy(&base, dest_b).await?;
+        // The grown-delta copy through the real product path (`plan_incremental_from`
+        // + `copy_delta_from`) plus the index fold. The write primitive is whatever
+        // the linked library ships: merge_insert on the pre-change build, filtered
+        // append on the new one - so running this same bench against each build is
+        // the honest merge-vs-append (and full-rebuild-vs-incremental-fold) A/B.
+        let dest_handle = match &args.dest_url {
+            Some(base_url) => {
+                let url = format!("{base_url}-corpus");
+                println!("dest (scratch, clean up): {url}\n");
+                StoreHandle {
+                    store: open_configured(&url).await?,
+                    _temp: None,
+                }
+            }
+            None => open_store(&args.backend, "dest-corpus").await?,
+        };
+        let dest = &dest_handle.store;
+        streaming_copy(&base, dest).await?;
 
-        let before_a = dest_a.dataset(Table::Messages).await?.version_id();
+        let before = dest.dataset(Table::Messages).await?.version_id();
         let t = Instant::now();
-        let plan_a = dest_a.plan_incremental_from(&grown).await?;
+        let plan = dest.plan_incremental_from(&grown).await?;
         let plan_ms = t.elapsed().as_millis();
         let t2 = Instant::now();
-        dest_a.copy_delta_from(&grown, &plan_a).await?;
+        dest.copy_delta_from(&grown, &plan).await?;
         let copy_ms = t2.elapsed().as_millis();
-        let commits_a = dest_a.dataset(Table::Messages).await?.version_id() - before_a;
+        let commits = dest.dataset(Table::Messages).await?.version_id() - before;
         let t3 = Instant::now();
-        dest_a
-            .optimize_indices(None, &MaintenancePolicy::always_compact())
+        dest.optimize_indices(None, &MaintenancePolicy::always_compact())
             .await?;
-        let opt_a = t3.elapsed().as_millis();
+        let opt = t3.elapsed().as_millis();
         println!(
-            "[A] count+merge   : plan {plan_ms:>5} + copy {copy_ms:>6} + optimize {opt_a:>7} = {:>7} ms | msg merge={} commits={commits_a}",
-            plan_ms + copy_ms + opt_a,
-            plan_a.messages.merge.len(),
+            "grown delta (copy_delta_from): plan {plan_ms:>5} + copy {copy_ms:>6} + optimize {opt:>7} = {:>7} ms | grown sessions={} msg commits={commits}",
+            plan_ms + copy_ms + opt,
+            plan.messages.merge.len(),
         );
 
-        let before_b = dest_b.dataset(Table::Messages).await?.version_id();
-        let t4 = Instant::now();
-        let (s_sess, d_sess, s_msg, d_msg) = tokio::try_join!(
-            grown.collect_ids(Table::Sessions),
-            dest_b.collect_ids(Table::Sessions),
-            grown.collect_ids(Table::Messages),
-            dest_b.collect_ids(Table::Messages),
-        )?;
-        let sess_absent: Vec<String> = s_sess.difference(&d_sess).cloned().collect();
-        let msg_absent: Vec<String> = s_msg.difference(&d_msg).cloned().collect();
-        let diff_ms = t4.elapsed().as_millis();
-        let t5 = Instant::now();
-        tokio::try_join!(
-            dest_b.append_absent_rows(&grown, Table::Sessions, "id", &sess_absent),
-            dest_b.append_absent_rows(&grown, Table::Messages, "id", &msg_absent),
-            dest_b.append_absent_rows(&grown, Table::Parts, "message_id", &msg_absent),
-        )?;
-        let append_ms = t5.elapsed().as_millis();
-        let commits_b = dest_b.dataset(Table::Messages).await?.version_id() - before_b;
-        let t6 = Instant::now();
-        dest_b
-            .optimize_indices(None, &MaintenancePolicy::always_compact())
-            .await?;
-        let opt_b = t6.elapsed().as_millis();
-        println!(
-            "[B] id-diff+append: diff {diff_ms:>5} + append {append_ms:>6} + optimize {opt_b:>7} = {:>7} ms | msg appended={} commits={commits_b}",
-            diff_ms + append_ms + opt_b,
-            msg_absent.len(),
-        );
-
-        for (label, dest) in [("A count+merge", dest_a), ("B id-diff", dest_b)] {
-            let mut missing = 0usize;
-            for table in [Table::Sessions, Table::Messages, Table::Parts] {
-                let s = grown.collect_ids(table).await?;
-                let d = dest.collect_ids(table).await?;
-                missing += s.difference(&d).count();
-            }
-            println!("  {label} missing source rows: {missing} (expect 0)");
+        let mut missing = 0usize;
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            let s = grown.collect_ids(table).await?;
+            let d = dest.collect_ids(table).await?;
+            missing += s.difference(&d).count();
         }
+        println!("  missing source rows: {missing} (expect 0)");
         return Ok(());
     }
 

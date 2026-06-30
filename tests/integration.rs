@@ -11,6 +11,8 @@ mod adapter;
 mod copy;
 #[path = "integration/embed.rs"]
 mod embed;
+#[path = "integration/index_fold.rs"]
+mod index_fold;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
 #[path = "integration/optimize_under_contention.rs"]

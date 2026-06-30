@@ -6469,6 +6469,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow-json",
+ "arrow-select",
  "assert_cmd",
  "async-stream",
  "async-trait",

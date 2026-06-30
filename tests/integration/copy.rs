@@ -290,8 +290,8 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
 
     // The copy inserts only the new rows: the added session row, the added
     // message, and the grown session's one new message - nothing for the
-    // unchanged session, and the already-present rows of the grown session are
-    // merge-skipped.
+    // unchanged session, and the grown session's already-present rows are
+    // filtered out before the append.
     let delta = dest.copy_delta_from(&source, &plan).await?;
     assert_eq!(delta.inserted.sessions, 1, "only the added session is new");
     assert_eq!(
@@ -311,13 +311,13 @@ async fn incremental_copy_moves_only_absent_or_grown_sessions() -> anyhow::Resul
         );
     }
 
-    // Grown still dedups: the destination row counts equal the source's
-    // exactly - the grown session's already-present message was merge-skipped,
-    // not re-inserted (an append would have duplicated it).
+    // The destination row counts equal the source's exactly: the grown
+    // session's already-present message was filtered out before the append, so
+    // the delta landed without duplicating it.
     assert_eq!(
         dest.row_counts().await?,
         source.row_counts().await?,
-        "destination must equal source exactly (grown rows deduped, not doubled)",
+        "destination must equal source exactly (delta appended, not doubled)",
     );
 
     // A third copy with no further source changes is a pure no-op plan.
@@ -374,6 +374,46 @@ async fn incremental_copy_moves_parts_only_growth_with_other_message_growth() ->
             table.as_str(),
         );
     }
+    Ok(())
+}
+
+/// A grown session's new rows append in a single commit per table - the old
+/// merge path committed once per scan batch. Grow a session, then assert the
+/// destination `messages` version advances by exactly one across the re-copy,
+/// and the destination still equals the source (delta appended, not doubled).
+#[tokio::test(flavor = "multi_thread")]
+async fn grown_session_appends_delta_in_one_commit() -> anyhow::Result<()> {
+    let source = Store::open(&Url::parse("shared-memory://pond-test-grown-commit-src/")?).await?;
+    let grown = "01HXYGROWNCOMMIT1";
+    ingest_at(&source, events_at(grown, ts(0), 1, ts(0))).await?;
+
+    let dest = Store::open(&Url::parse("shared-memory://pond-test-grown-commit-dst/")?).await?;
+    copy(&source, &dest).await?;
+
+    for n in 2..=6 {
+        ingest_at(&source, events_at(grown, ts(0), n, ts(0))).await?;
+    }
+
+    let before = dest.dataset(Table::Messages).await?.version_id();
+    let plan = dest.plan_incremental_from(&source).await?;
+    assert_eq!(
+        plan.messages.merge,
+        vec![grown.to_owned()],
+        "the grown session routes to the merge slice",
+    );
+    dest.copy_delta_from(&source, &plan).await?;
+    let after = dest.dataset(Table::Messages).await?.version_id();
+
+    assert_eq!(
+        after - before,
+        1,
+        "grown append must be a single commit, not one per batch (before={before}, after={after})",
+    );
+    assert_eq!(
+        dest.row_counts().await?,
+        source.row_counts().await?,
+        "destination equals source: the five new messages appended, the present one was not",
+    );
     Ok(())
 }
 

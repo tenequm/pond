@@ -859,6 +859,14 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
     chrono::Duration::hours(1)
 }
 
+/// `pond sync` runs every few minutes; reclaiming old manifest versions on
+/// every run pays the full version-log walk over S3 (~9 s measured on the real
+/// corpus) to free roughly one version. Amortize by cleaning only when a
+/// table's manifest version is a multiple of this many commits. Explicit
+/// `pond optimize` and the one-shot `pond copy` keep interval 1 (clean every
+/// run) so maintenance and durability moves are never skipped.
+pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 16;
+
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
 /// `[maintenance]` (and any per-invocation CLI override) at the entry point;
 /// threaded down to `optimize_table_compact` so the substrate never re-reads
@@ -869,6 +877,11 @@ pub struct MaintenancePolicy {
     pub compaction_fragment_cap: usize,
     /// Manifest-retention window handed to `cleanup_old_versions`.
     pub cleanup_older_than: chrono::Duration,
+    /// Run `cleanup_old_versions` for a table only when its manifest version is
+    /// a multiple of this (`1` = every optimize). The frequent `pond sync` path
+    /// raises it so most syncs skip the version-log walk; see
+    /// [`DEFAULT_SYNC_CLEANUP_INTERVAL`].
+    pub cleanup_interval: u64,
 }
 
 impl MaintenancePolicy {
@@ -877,7 +890,16 @@ impl MaintenancePolicy {
         Self {
             compaction_fragment_cap: 0,
             cleanup_older_than: default_cleanup_older_than(),
+            cleanup_interval: 1,
         }
+    }
+
+    /// Amortize version cleanup over `interval` commits - the frequent
+    /// `pond sync` path uses this so most syncs skip the version-log walk.
+    #[must_use]
+    pub fn with_cleanup_interval(mut self, interval: u64) -> Self {
+        self.cleanup_interval = interval.max(1);
+        self
     }
 }
 
@@ -1951,7 +1973,26 @@ impl Handle {
         E: Fn(Arc<Dataset>) -> Fut,
         Fut: std::future::Future<Output = Result<(Dataset, P)>>,
     {
-        self.retry_lance(table.label(), || {
+        self.write_committed_with(table, |_| true, execute).await
+    }
+
+    /// [`Self::write_committed`] with a retry gate (see
+    /// [`Self::retry_lance_filtered`]). `merge_insert` is idempotent on retry
+    /// (`WhenMatched::DoNothing` re-reads and no-ops), so it retries everything;
+    /// the bare `Append` path passes [`is_commit_conflict`] so a post-commit
+    /// transient fault surfaces rather than re-appending into a duplicate.
+    async fn write_committed_with<E, Fut, P, R>(
+        &self,
+        table: Table,
+        should_retry: R,
+        execute: E,
+    ) -> Result<P>
+    where
+        E: Fn(Arc<Dataset>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Dataset, P)>>,
+        R: Fn(&anyhow::Error) -> bool,
+    {
+        self.retry_lance_filtered(table.label(), should_retry, || {
             let execute = &execute;
             async move {
                 let mut cached = self.cached(table).await?.lock().await;
@@ -2036,6 +2077,14 @@ impl Handle {
     /// is one-shot, so an OCC retry rebuilds it. A single per-call `WriteAccum`
     /// (shared across attempts, NOT fresh per attempt) makes the row/byte/file
     /// fold exact under retries.
+    ///
+    /// Unlike [`Self::append_batches`] this keeps the retry-everything
+    /// `write_committed`: a transient fault during the large streamed upload
+    /// almost always precedes the manifest commit (the rebuilt source re-uploads
+    /// and the orphaned fragments are GC'd, no duplicate), so failing a full
+    /// bulk copy on every transient to close the narrow lost-ack-after-commit
+    /// window is the wrong trade. That rare window is surfaced by the copy
+    /// verify's duplicate check instead (spec.md#session-movement-complete).
     pub(crate) async fn append_stream<F, Fut>(
         &self,
         table: Table,
@@ -2088,6 +2137,13 @@ impl Handle {
     /// [`Self::append_stream`] for batches pond already holds in memory (the sync
     /// write path) instead of a source-store scan. Row count is taken from the
     /// batches - exact under OCC retry without depending on the progress tick.
+    ///
+    /// Retries only on a commit *conflict*, not on transient faults: `Append`
+    /// has no row-level idempotency, so re-running it after a manifest commit
+    /// that landed but whose ack was lost would duplicate the rows. A conflict
+    /// proves the commit did not land (re-append is safe); anything else
+    /// surfaces and the caller's re-plan-from-current-state re-run heals it
+    /// without doubling rows (spec.md#lance-deterministic-pk).
     pub(crate) async fn append_batches(
         &self,
         table: Table,
@@ -2100,7 +2156,7 @@ impl Handle {
         let cum = Arc::new(WriteAccum::default());
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let started = Instant::now();
-        self.write_committed(table, |existing| {
+        self.write_committed_with(table, is_commit_conflict, |existing| {
             let cum = cum.clone();
             let attempts = attempts.clone();
             let batches = batches.clone();
@@ -2137,8 +2193,8 @@ impl Handle {
     }
 
     /// Run the table-local maintenance cycle for the supplied index intents.
-    /// BTree is rebuilt from scratch to dodge Lance v7.0.0-beta.16's flat
-    /// BTree combine bug; Bitmap, FTS, and IVF_SQ fold via append.
+    /// Every index family folds incrementally via `optimize_indices`; none is
+    /// rebuilt from scratch (spec.md#lance-index-maintenance).
     ///
     /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
@@ -2602,17 +2658,41 @@ impl Handle {
             })
             .await
     }
-    async fn retry_lance<T, Fut, Op>(&self, label: &str, mut operation: Op) -> Result<T>
+    async fn retry_lance<T, Fut, Op>(&self, label: &str, operation: Op) -> Result<T>
     where
         Fut: std::future::Future<Output = Result<T>>,
         Op: FnMut() -> Fut,
+    {
+        // Default: retry every transient fault (spec.md#lance-retry-jitter).
+        self.retry_lance_filtered(label, |_| true, operation).await
+    }
+
+    /// Like [`Self::retry_lance`] but `should_retry` gates which errors are
+    /// retried. [`Self::append_batches`] passes [`is_commit_conflict`]: a commit
+    /// conflict means this writer's commit did NOT land, so re-running the
+    /// operation is safe; any other error (notably a transient fault that may
+    /// have arrived *after* the manifest commit landed - the lost-ack case) is
+    /// surfaced instead of retried, because `Append` has no row-level
+    /// idempotency and a blind re-append would duplicate. The caller's
+    /// operation re-plans from current state on its own re-run, which is the
+    /// idempotent recovery (spec.md#lance-deterministic-pk).
+    async fn retry_lance_filtered<T, Fut, Op, R>(
+        &self,
+        label: &str,
+        should_retry: R,
+        mut operation: Op,
+    ) -> Result<T>
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+        Op: FnMut() -> Fut,
+        R: Fn(&anyhow::Error) -> bool,
     {
         let mut attempt = 0u8;
         loop {
             attempt = attempt.saturating_add(1);
             match operation().await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < self.retry.attempts => {
+                Err(error) if attempt < self.retry.attempts && should_retry(&error) => {
                     let backoff = self.backoff(attempt);
                     // `{:#}` walks anyhow's cause chain inline; `%error` (Display)
                     // drops everything below the top-level message.
@@ -2756,38 +2836,58 @@ async fn optimize_table_compact(
     // Safe GC only. delete_unverified=false keeps Lance's 7-day in-progress
     // guard, so this never races a concurrent writer (spec.md#concurrency); GC
     // runs outside OCC, so the guard is what makes it safe on any backend.
-    emit(
-        progress,
-        OptimizeEvent::PhaseStart {
-            table,
-            phase: OptimizePhase::Cleanup,
-            detail: None,
-        },
-    );
-    let started = Instant::now();
-    // Lance v7 `cleanup_old_versions` removes orphan files inside
-    // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
-    // index merges accumulate empty UUID dirs forever (one inode each).
-    // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
-    // here (spec.md#concurrency: Lance-native maintenance only).
-    dataset
-        .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
-        .await
-        .context("cleanup_old_versions failed during index optimize")?;
-    emit(
-        progress,
-        OptimizeEvent::PhaseDone {
-            table,
-            phase: OptimizePhase::Cleanup,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-    );
+    //
+    // Gated: the walk over the version log is round-trip-bound on object stores
+    // (~9s measured on the real corpus) and reclaims ~one version per run, so
+    // the frequent `pond sync` path amortizes it over `cleanup_interval`
+    // commits rather than paying it every sync (`pond optimize`/`pond copy`
+    // keep interval 1). Skipping only delays reclaiming old versions - the next
+    // due cleanup sweeps the accumulated backlog - so it is always safe.
+    if cleanup_due(dataset.version_id(), policy.cleanup_interval) {
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::Cleanup,
+                detail: None,
+            },
+        );
+        let started = Instant::now();
+        // Lance v7 `cleanup_old_versions` removes orphan files inside
+        // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
+        // index merges accumulate empty UUID dirs forever (one inode each).
+        // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
+        // here (spec.md#concurrency: Lance-native maintenance only).
+        dataset
+            .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
+            .await
+            .context("cleanup_old_versions failed during index optimize")?;
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::Cleanup,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
 
     Ok(())
 }
 
-/// Indices phase: per-intent create/rebuild + batched `optimize_indices(append)`
-/// for incremental families. Returns `true` if anything committed.
+/// Gate for the version-cleanup walk: at interval `<= 1` it runs every optimize;
+/// otherwise only when the manifest `version` is a multiple of it. A run whose
+/// version steps past a multiple defers to the next one, so the gap between
+/// cleanups is bounded and - since version 0 is a multiple of every interval -
+/// cleanup always eventually fires; it is never skipped indefinitely.
+fn cleanup_due(version: u64, interval: u64) -> bool {
+    interval <= 1 || version.is_multiple_of(interval)
+}
+
+/// Indices phase: create absent indexes, then fold trailing fragments into
+/// every existing index via batched `optimize_indices` (append, or merge once a
+/// family's delta segments reach `DELTA_MERGE_THRESHOLD`). Returns `true` if
+/// anything committed.
 async fn optimize_table_indices(
     dataset: &mut Dataset,
     intents: &[IndexIntent],
@@ -2852,80 +2952,13 @@ async fn optimize_table_indices(
         if unindexed.is_empty() {
             continue;
         }
-        match intent.params {
-            IndexParamsKind::Scalar(BuiltinIndexType::BTree) => {
-                let params = intent.params.build(dataset).await?;
-                let index_type = intent.params.index_type();
-                tracing::debug!(
-                    target: "pond::perf",
-                    index = intent.name,
-                    column = intent.column,
-                    "rebuilding Lance BTree index",
-                );
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseStart {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        detail: Some(intent.name.to_owned()),
-                    },
-                );
-                let started = Instant::now();
-                dataset
-                    .create_index_builder(&[intent.column], index_type, params.as_ref())
-                    .name(intent.name.to_owned())
-                    .replace(true)
-                    .progress(lance_progress(progress, table, intent.name))
-                    .await
-                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseDone {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                );
-                did_work = true;
-            }
-            IndexParamsKind::Scalar(BuiltinIndexType::Bitmap)
-            | IndexParamsKind::InvertedFtsWord
-            | IndexParamsKind::IvfSqCosine { .. } => {
-                append_indices.push(intent.name.to_owned());
-            }
-            IndexParamsKind::Scalar(_) => {
-                let params = intent.params.build(dataset).await?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseStart {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        detail: Some(intent.name.to_owned()),
-                    },
-                );
-                let started = Instant::now();
-                dataset
-                    .create_index_builder(
-                        &[intent.column],
-                        intent.params.index_type(),
-                        params.as_ref(),
-                    )
-                    .name(intent.name.to_owned())
-                    .replace(true)
-                    .progress(lance_progress(progress, table, intent.name))
-                    .await
-                    .with_context(|| format!("failed to rebuild index {}", intent.name))?;
-                emit(
-                    progress,
-                    OptimizeEvent::PhaseDone {
-                        table,
-                        phase: OptimizePhase::IndexRebuild,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                );
-                did_work = true;
-            }
-        }
+        // Every family folds incrementally via `optimize_indices` (the
+        // append/merge batch below) - no full rebuild. BTree and ZoneMap
+        // rewrite their index file by merging the existing sorted pages with
+        // only the new fragments' data; Bitmap/FTS/IVF_SQ accumulate delta
+        // segments. None re-scans already-indexed source
+        // (spec.md#lance-index-maintenance).
+        append_indices.push(intent.name.to_owned());
     }
 
     if !append_indices.is_empty() {
@@ -3790,6 +3823,21 @@ mod tests {
             64,
             0.1
         ));
+    }
+
+    #[test]
+    fn cleanup_due_gates_on_version_interval() {
+        // interval <= 1 always cleans (pond optimize / pond copy / tests).
+        assert!(cleanup_due(0, 1));
+        assert!(cleanup_due(7, 1));
+        assert!(cleanup_due(5, 0));
+        // interval N: only on multiples (the amortized pond sync path).
+        assert!(cleanup_due(0, 16));
+        assert!(cleanup_due(16, 16));
+        assert!(cleanup_due(48, 16));
+        assert!(!cleanup_due(15, 16));
+        assert!(!cleanup_due(17, 16));
+        assert!(!cleanup_due(31, 16));
     }
 
     #[test]
