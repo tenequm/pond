@@ -1639,6 +1639,27 @@ impl Store {
         Ok(())
     }
 
+    /// Install an already-published rowmap chain for the current version if a
+    /// sibling built one, without building it (no full scan, no build flock).
+    /// For one-shot read commands (`pond search`): a warm sibling makes
+    /// hydration resident; with no chain, search falls back to take_rows for
+    /// that single invocation.
+    pub async fn load_rowmap_if_present(&self, cache_dir: &Path) -> Result<()> {
+        let version = self.messages_version().await?;
+        if let Some(current) = self.rowmap.load_full()
+            && current.version() == version
+        {
+            return Ok(());
+        }
+        if let Some(chain) = discover_chain(cache_dir, &self.store_key())
+            && chain.version() == version
+            && let Ok(set) = RowMetaSet::open(&chain)
+        {
+            self.rowmap.store(Some(Arc::new(set)));
+        }
+        Ok(())
+    }
+
     /// Extend the chain to `version` under the build `flock` (spec: lock the
     /// build only; atomic rename already prevents corruption). `None` when
     /// another local process holds the lock - this caller keeps its current map
@@ -6329,6 +6350,26 @@ mod tests {
         // authoritative backlog - never derived from FTS num_docs.
         assert_eq!(full.backlog, 0);
         assert_eq!(full.backlog, store.embed_backlog_count().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_rowmap_if_present_installs_published_chain_without_building() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+
+        // No chain published yet: a load-only reader installs nothing and does
+        // not build one.
+        let reader = Store::open_local(temp.path()).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_none());
+
+        // A sibling publishes the chain; the reader then installs it as-is.
+        builder.ensure_rowmap(&cache).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_some());
         Ok(())
     }
 

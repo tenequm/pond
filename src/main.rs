@@ -1273,6 +1273,11 @@ async fn main() -> anyhow::Result<()> {
                 output(&plans)?;
                 return Ok(());
             }
+            // A warm sibling's rowmap makes hydration resident; absent one,
+            // search falls back to take_rows for this one-shot invocation.
+            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+                tracing::debug!(%error, "rowmap load skipped; hydration uses take_rows");
+            }
             let envelope =
                 handlers::pond_search(&store, &embedder, request.clone(), &loaded.search).await;
             if !render_search_envelope(format, &envelope, &request)? {
