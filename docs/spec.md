@@ -380,7 +380,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | Column | Notes |
 |---|---|
 | `session_id`, `id` | composite primary key; clustered on `(session_id, timestamp)` |
-| `timestamp` | scalar-indexed; canonical ordering key |
+| `timestamp` | canonical ordering key |
 | `role` | scalar-indexed |
 | `source_agent`, `project` | denormalized; the scalar-indexed filter-pushdown surface |
 | `content` | non-null only for system messages |

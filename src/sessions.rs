@@ -4108,22 +4108,15 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// `embedding_model`: pond's invariant is one active model at a time (a model
 /// swap goes through `pond optimize --force-embed` which drops the IVF_SQ,
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
-/// `vector IS NOT NULL`. `id` lookups are rare and full-scan.
+/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. Do NOT add a
+/// ZoneMap on `timestamp`: it prunes every zone for the tz-aware column, so
+/// date filters return empty (#75) - an upstream `safe_coerce_scalar` tz drop
+/// no literal form escapes. Date bounds run as a refine over the arm pool.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
         BuiltinIndexType::BTree,
         "messages_session_id_btree",
-    ),
-    // Range-only column (`from_date`/`to_date` -> `timestamp >=` / `<=`,
-    // never exact-equality, never `ORDER BY` against the index). ZoneMap's
-    // per-fragment min/max prunes those filters with no recall loss (measured:
-    // 258 zones -> ~6, ~42x fewer rows scanned on the real S3 corpus), and
-    // skips the global ExternalSort that a BTree would pay during build.
-    (
-        "timestamp",
-        BuiltinIndexType::ZoneMap,
-        "messages_timestamp_zonemap",
     ),
     (
         "source_agent",

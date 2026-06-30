@@ -228,6 +228,18 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     request.filters.from_date = Some("2099-01-01".to_owned());
     assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
 
+    // #75: a far-past lower bound must keep every hit, not prune the corpus.
+    let unfiltered =
+        hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
+            .len();
+    let mut request = search_request(&phrase);
+    request.filters.from_date = Some("2000-01-01".to_owned());
+    request.filters.to_date = Some("2099-12-31".to_owned());
+    assert_eq!(
+        hits_of(pond_search(&store, &embedder, request, &search_config()).await).len(),
+        unfiltered,
+    );
+
     // project (contains): every hit is scoped to the requested project.
     let project =
         hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
