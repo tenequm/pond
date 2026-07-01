@@ -1105,8 +1105,10 @@ async fn main() -> anyhow::Result<()> {
             let loaded = Config::load(&config_file)?;
             // sync ingests through `upsert_session_batch`, which embeds inline;
             // it has no query path, so this is its own resident embedder.
+            let open_started = std::time::Instant::now();
             let (_, store) = open_store(storage_path, &loaded, true, false).await?;
             let store = store.with_embedder(Arc::new(LazyEmbedder::candle()));
+            tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
             let import_started = std::time::Instant::now();
             let import_summary =
                 run_import_stage(&store, &loaded, &config_file, adapter.clone(), path, verify)
@@ -1127,30 +1129,41 @@ async fn main() -> anyhow::Result<()> {
             // accumulated backlog with `pond optimize` (the verb that exists
             // precisely for this) or the scheduled maintenance run.
             if any_new_rows {
-                // Same finalize seam as `pond optimize` and `pond copy`. Rows
-                // embed inline at ingest; finalize folds the new vectors into
-                // the indexes and heals any pre-inline un-embedded backlog. sync
-                // has no --force-embed; finalize's embed points a model swap at
-                // the command that does. Cleanup is amortized: a 5-min cron sync
-                // shouldn't pay the per-table version-log walk (~9s on S3) every
-                // run, so it cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL
-                // commits instead (`pond optimize` still cleans every run). The
-                // scalar-index fold is amortized the same way: Lance 7.0.0
-                // rewrites the whole BTree/bitmap file per fold, so most syncs
-                // defer it and let the unindexed tail accrue (see
-                // DEFAULT_SYNC_SCALAR_FOLD_ROWS).
+                // Sync embeds inline at ingest (the `with_embedder` above), so
+                // every new searchable row already carries its vector and a flush
+                // that fails to embed aborts without writing - sync can never
+                // leave a searchable row un-embedded. The finalize *embed worker*
+                // would therefore only full-scan `messages` over S3 to discover
+                // there is nothing to embed (measured 20-81s of pure waste on the
+                // remote store), so sync skips it and keeps only the cheap
+                // LIMIT-1 model-swap guard. A genuine pre-inline / wire-ingest
+                // backlog is healed by `pond optimize` (which keeps the full
+                // embed pass). Cleanup is amortized: a 5-min cron sync shouldn't
+                // pay the per-table version-log walk (~9s on S3) every run, so it
+                // cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL commits instead
+                // (`pond optimize` still cleans every run). The scalar-index fold
+                // is amortized the same way: Lance 7.0.0 rewrites the whole
+                // BTree/bitmap file per fold, so most syncs defer it and let the
+                // unindexed tail accrue (see DEFAULT_SYNC_SCALAR_FOLD_ROWS). The
+                // FTS + vector fold is batched too (DEFAULT_SYNC_INDEX_FOLD_ROWS):
+                // each fold is an S3 round-trip storm, and the deferred tail stays
+                // searchable because the retrievers flat-scan it.
+                guard_embedding_model_unchanged(&store).await?;
                 let policy = configured_maintenance_policy(&loaded, None)?
                     .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL)
-                    .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS);
+                    .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS)
+                    .with_index_fold_row_threshold(pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS);
                 let indexes_started = std::time::Instant::now();
-                finalize_indexes(&store, &policy, false).await?;
+                run_update_indexes_stage(&store, &policy).await?;
                 output(&stage_line(
                     indexes_started.elapsed(),
                     "indexes",
-                    "embed + fold complete",
+                    "fold complete",
                 ))?;
             }
+            let summary_started = std::time::Instant::now();
             render_sync_summary(&store).await?;
+            tracing::debug!(target: "pond::perf", stage = "render_summary", elapsed_ms = summary_started.elapsed().as_millis() as u64, "sync stage");
             output(&format!(
                 "{} sync complete in {}",
                 pond::output::paint("done -", pond::output::dim()),
@@ -3120,9 +3133,11 @@ async fn run_import_stage(
         // sequential scan, a warm sync delta-extends it - never the per-manifest
         // version-resolution storm that throttled remote syncs to a stall. A
         // missing/stale map yields no key, so the session simply re-reads (safe).
+        let rowmap_started = std::time::Instant::now();
         if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
             tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
         }
+        tracing::debug!(target: "pond::perf", stage = "ensure_rowmap", elapsed_ms = rowmap_started.elapsed().as_millis() as u64, "sync stage");
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
@@ -3143,6 +3158,21 @@ async fn run_import_stage(
     Ok(total)
 }
 
+/// Cheap (LIMIT-1) model-swap guard for the sync path, which embeds inline and
+/// so skips the finalize embed worker entirely. Folding new-model vectors into
+/// an index whose centroids belong to a different model corrupts search, so a
+/// swap must abort and route the user at the command that can re-embed.
+async fn guard_embedding_model_unchanged(store: &Store) -> anyhow::Result<()> {
+    if store.embedding_model_swapped().await? {
+        bail!(
+            "messages embedded under a different model id; run `pond optimize --force-embed` \
+             to re-embed under the configured model {:?}",
+            pond::embed::model_id(),
+        );
+    }
+    Ok(())
+}
+
 async fn run_embed_stage(store: &Store, force: bool) -> anyhow::Result<EmbedSummary> {
     run_embed_stage_with_limit(store, force, None, "--force-embed").await
 }
@@ -3156,10 +3186,7 @@ async fn run_embed_stage_with_limit(
     // Model-swap detection via a LIMIT-1 read of any embedded row's model id,
     // not the full-column `stale_embedding_count` scan that ran every sync (the
     // single-active-model invariant makes one row representative).
-    let swapped = store
-        .sample_embedded_model()
-        .await?
-        .is_some_and(|model| model != pond::embed::model_id());
+    let swapped = store.embedding_model_swapped().await?;
     if swapped {
         if !force {
             bail!(
@@ -3301,6 +3328,10 @@ fn configured_maintenance_policy(
         // `with_scalar_fold_row_threshold`; optimize/copy keep 0 so a
         // durability move always lands a complete index.
         scalar_fold_row_threshold: 0,
+        // Default: fold FTS + vector every run. `pond sync` raises this via
+        // `with_index_fold_row_threshold`; optimize/copy keep 0 so a durability
+        // move always lands a complete index.
+        index_fold_row_threshold: 0,
     })
 }
 
@@ -3328,8 +3359,13 @@ async fn finalize_indexes(
     policy: &MaintenancePolicy,
     force_embed: bool,
 ) -> anyhow::Result<OptimizeOutcome> {
+    let embed_started = std::time::Instant::now();
     run_embed_stage(store, force_embed).await?;
-    run_update_indexes_stage(store, policy).await
+    tracing::debug!(target: "pond::perf", stage = "embed", elapsed_ms = embed_started.elapsed().as_millis() as u64, "sync stage");
+    let optimize_started = std::time::Instant::now();
+    let outcome = run_update_indexes_stage(store, policy).await;
+    tracing::debug!(target: "pond::perf", stage = "optimize", elapsed_ms = optimize_started.elapsed().as_millis() as u64, "sync stage");
+    outcome
 }
 
 /// Final recap of a `pond sync` run. Three-line shape:
@@ -3337,7 +3373,7 @@ async fn finalize_indexes(
 /// ```text
 ///
 /// indexes   text + semantic ready
-/// stored    8,460 sessions, 172,710 searchable messages
+/// stored    8,460 sessions, 172,710 messages
 /// ```
 ///
 /// The per-run delta is the timed `import` row the command already printed;
@@ -3346,22 +3382,32 @@ async fn finalize_indexes(
 async fn render_sync_summary(store: &Store) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
-    let (index_status, embedding, (stored_sessions, _, _)) = tokio::try_join!(
-        store.index_status(),
-        store.embedding_progress(),
-        store.row_counts(),
-    )?;
-    let health = classify_index_health(&index_status, Some(&embedding));
+    // Cheap manifest reads only. `index_status` (unindexed-fragment metadata) and
+    // `row_counts` (`count_rows(None)`) are served from the manifest / local index
+    // cache; the exact searchable/embedded breakdown is a full `embedding_model`
+    // column scan (6-27s on the remote store) that a 5-min cron sync should not
+    // pay - `pond status` runs it on demand. Health here reflects index/fold
+    // state (the cheap path); the embedding-backlog correction is skipped
+    // (`None`), which is exact for sync because it embeds inline (no backlog it
+    // could create). A legacy pre-inline / foreign-writer embed backlog is NOT
+    // surfaced here - it shows via `pond status -v` and heals via `pond optimize`.
+    let (index_status, (stored_sessions, stored_messages, _)) =
+        tokio::try_join!(store.index_status(), store.row_counts())?;
+    let health = classify_index_health(
+        &index_status,
+        None,
+        pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
+    );
 
     output("")?;
     output(&render_indexes_line(&health))?;
     // The per-run delta (`+N sessions, +N messages`) is the timed `import` row;
     // this recap is corpus state.
     output(&format!(
-        "{}    {} sessions, {} searchable messages",
+        "{}    {} sessions, {} messages",
         paint("stored", dim()),
         format_thousands(stored_sessions as u64),
-        format_thousands(embedding.total as u64),
+        format_thousands(stored_messages as u64),
     ))?;
     Ok(())
 }
@@ -3953,7 +3999,7 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
             elapsed_ms,
         } => {
             tracing::debug!(
-                target: "pond::sync",
+                target: "pond::perf",
                 table = table.as_str(),
                 phase = phase.label(),
                 elapsed_ms,
@@ -4195,7 +4241,11 @@ fn render_status_checks(
     use pond::output::{dim, paint};
 
     output("")?;
-    let health = classify_index_health(index_status, embedding.as_ref());
+    let health = classify_index_health(
+        index_status,
+        embedding.as_ref(),
+        pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
+    );
     output(&render_indexes_line(&health))?;
     // Default: `stored` shows the manifest row count (cheap); under `-v` the
     // embedding probe ran, so swap in the searchable subset and report it.
@@ -4244,17 +4294,20 @@ struct IndexHealth {
 fn classify_index_health(
     statuses: &[IndexStatus],
     embedding: Option<&EmbeddingProgress>,
+    fold_threshold: u64,
 ) -> IndexHealth {
     use IndexHealthState::*;
 
-    // `pond optimize` folds every trailing fragment (no lag threshold), so an
-    // index is current only when nothing is unindexed; any tail means a fold is
-    // still owed (e.g. an interrupted sync or copy).
-    fn classify_one(status: &IndexStatus) -> IndexHealthState {
+    // A tail below `fold_threshold` is expected between batched folds and stays
+    // fully searchable (the retrievers flat-scan it), so it is Ready, not Pending.
+    // Only a tail that has outgrown the threshold - a fold that isn't keeping up,
+    // e.g. an interrupted sync - is Pending. `fold_threshold` 0 (optimize/copy,
+    // which fold every run) collapses this to "any tail is pending".
+    fn classify_one(status: &IndexStatus, fold_threshold: u64) -> IndexHealthState {
         if !status.exists {
             return NotBuilt;
         }
-        if status.unindexed_rows == 0 {
+        if (status.unindexed_rows as u64) < fold_threshold.max(1) {
             Ready
         } else {
             Pending(status.unindexed_rows as u64)
@@ -4265,8 +4318,8 @@ fn classify_index_health(
     let mut semantic = NotBuilt;
     for status in statuses {
         match status.intent_name.as_str() {
-            MESSAGES_FTS_INDEX => text = classify_one(status),
-            MESSAGES_VECTOR_INDEX => semantic = classify_one(status),
+            MESSAGES_FTS_INDEX => text = classify_one(status, fold_threshold),
+            MESSAGES_VECTOR_INDEX => semantic = classify_one(status, fold_threshold),
             _ => {}
         }
     }

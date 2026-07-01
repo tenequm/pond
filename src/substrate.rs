@@ -881,6 +881,17 @@ pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 16;
 /// unaffected. `pond optimize`/`pond copy` fold every run (threshold `0`).
 pub const DEFAULT_SYNC_SCALAR_FOLD_ROWS: usize = 50_000;
 
+/// Defer the FTS + vector (IVF) index fold until the unindexed tail reaches this
+/// many rows; `0` folds every run. Unlike the scalar fold (deferred because Lance
+/// rewrites the whole index file), FTS/vector fold via a cheap delta append - the
+/// reason to batch them is the per-sync S3 round-trip + commit storm, not a
+/// rewrite. Between folds the tail stays fully searchable: the retrievers drop
+/// `fast_search` whenever an unindexed tail exists, so Lance index-probes the
+/// folded rows and flat-scans the (threshold-bounded) tail (fts.md "Index
+/// Maintenance"). The cap bounds that tail-scan cost. `pond optimize`/`pond copy`
+/// fold every run (threshold `0`).
+pub const DEFAULT_SYNC_INDEX_FOLD_ROWS: usize = 5_000;
+
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
 /// `[maintenance]` (and any per-invocation CLI override) at the entry point;
 /// threaded down to `optimize_table_compact` so the substrate never re-reads
@@ -901,6 +912,12 @@ pub struct MaintenancePolicy {
     /// it so most syncs skip the full scalar-index rewrite Lance 7.0.0 does on
     /// every fold; see [`DEFAULT_SYNC_SCALAR_FOLD_ROWS`].
     pub scalar_fold_row_threshold: usize,
+    /// Defer the FTS + vector (IVF) index fold until its unindexed tail reaches
+    /// this many rows; `0` folds every run. The frequent `pond sync` path raises
+    /// it so most syncs skip the per-fold S3 round-trip storm; recall stays
+    /// complete because the retrievers flat-scan the deferred tail. See
+    /// [`DEFAULT_SYNC_INDEX_FOLD_ROWS`].
+    pub index_fold_row_threshold: usize,
 }
 
 impl MaintenancePolicy {
@@ -911,6 +928,7 @@ impl MaintenancePolicy {
             cleanup_older_than: default_cleanup_older_than(),
             cleanup_interval: 1,
             scalar_fold_row_threshold: 0,
+            index_fold_row_threshold: 0,
         }
     }
 
@@ -930,6 +948,32 @@ impl MaintenancePolicy {
         self.scalar_fold_row_threshold = threshold;
         self
     }
+
+    /// Amortize the FTS + vector fold over its unindexed tail - the frequent
+    /// `pond sync` path uses this so most syncs skip the per-fold S3 round-trip
+    /// storm; recall stays complete via the retrievers' tail flat-scan.
+    #[must_use]
+    pub fn with_index_fold_row_threshold(mut self, threshold: usize) -> Self {
+        self.index_fold_row_threshold = threshold;
+        self
+    }
+
+    /// The two per-family fold thresholds bundled for the indices phase, so the
+    /// two same-typed `usize`s can't be swapped at a call site.
+    fn fold_thresholds(&self) -> FoldThresholds {
+        FoldThresholds {
+            scalar: self.scalar_fold_row_threshold,
+            index: self.index_fold_row_threshold,
+        }
+    }
+}
+
+/// Per-index-family fold-deferral thresholds (rows); `0` folds that family every
+/// run. Bundled so the indices phase takes one param, not two swappable `usize`s.
+#[derive(Debug, Clone, Copy)]
+struct FoldThresholds {
+    scalar: usize,
+    index: usize,
 }
 
 struct FragmentStat {
@@ -2265,7 +2309,7 @@ impl Handle {
             .run_optimize_compact_phase(table, progress, policy)
             .await;
         let indices = self
-            .run_optimize_indices_phase(table, intents, progress, policy.scalar_fold_row_threshold)
+            .run_optimize_indices_phase(table, intents, progress, policy.fold_thresholds())
             .await;
         TableOptimizeOutcome {
             table,
@@ -2284,10 +2328,19 @@ impl Handle {
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
     ) -> PhaseOutcome {
-        // Threshold 0: this tail-fold path always folds scalar indexes; only
-        // `pond sync` batches them (`with_scalar_fold_row_threshold`).
-        self.run_optimize_indices_phase(table, intents, progress, 0)
-            .await
+        // Thresholds 0: this tail-fold path always folds every index; only
+        // `pond sync` batches them (`with_scalar_fold_row_threshold` /
+        // `with_index_fold_row_threshold`).
+        self.run_optimize_indices_phase(
+            table,
+            intents,
+            progress,
+            FoldThresholds {
+                scalar: 0,
+                index: 0,
+            },
+        )
+        .await
     }
 
     async fn run_optimize_indices_phase(
@@ -2295,7 +2348,7 @@ impl Handle {
         table: Table,
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
-        scalar_fold_row_threshold: usize,
+        folds: FoldThresholds,
     ) -> PhaseOutcome {
         if intents.is_empty() {
             return PhaseOutcome::Noop;
@@ -2304,14 +2357,8 @@ impl Handle {
             .retry_lance(table.label(), || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
-                let did_work = optimize_table_indices(
-                    &mut dataset,
-                    intents,
-                    table,
-                    progress,
-                    scalar_fold_row_threshold,
-                )
-                .await?;
+                let did_work =
+                    optimize_table_indices(&mut dataset, intents, table, progress, folds).await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(did_work)
             })
@@ -2491,6 +2538,29 @@ impl Handle {
         let dataset = self.dataset(Table::Messages).await?;
         let indices = dataset.load_indices().await?;
         Ok(indices.iter().any(|index| index.name == name))
+    }
+
+    /// Whether `messages` index `name` covers every row - it exists and has no
+    /// unindexed tail - so `fast_search` (index-only) is complete. When a
+    /// deferred fold has left a tail, the retrievers must omit `fast_search` so
+    /// Lance index-probes the folded rows and flat-scans the tail, keeping recall
+    /// complete (spec.md#search, fts.md "Index Maintenance"). Manifest-only and
+    /// cache-backed, so it is cheap enough to gate `fast_search` per query.
+    pub(crate) async fn messages_fast_search_ready(&self, name: &str) -> Result<bool> {
+        let dataset = self.dataset(Table::Messages).await?;
+        if !dataset
+            .load_indices()
+            .await?
+            .iter()
+            .any(|index| index.name == name)
+        {
+            return Ok(false);
+        }
+        let unindexed = dataset
+            .unindexed_fragments(name)
+            .await
+            .with_context(|| format!("unindexed_fragments failed for {name}"))?;
+        Ok(unindexed.is_empty())
     }
 
     /// Reclaim cached `_indices/<uuid>` dirs no longer referenced by any table's
@@ -3010,7 +3080,7 @@ async fn optimize_table_indices(
     intents: &[IndexIntent],
     table: Table,
     progress: Option<&OptimizeProgressFn>,
-    scalar_fold_row_threshold: usize,
+    folds: FoldThresholds,
 ) -> Result<bool> {
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
@@ -3061,37 +3131,40 @@ async fn optimize_table_indices(
             continue;
         }
 
-        // Fold every trailing fragment so the index is always current after an
-        // optimize - no lag threshold. A tiny tail (rows written between this
-        // fold and the next) stays invisible to `fast_search` queries until the
-        // next fold, and the `DELTA_MERGE_THRESHOLD` cadence keeps the per-fold
-        // segment from accumulating without bound (spec.md#search).
+        // A trailing tail (rows written since the last fold) stays fully
+        // searchable while deferred: the retrievers drop `fast_search` whenever
+        // an index has an unindexed tail, so Lance index-probes the folded rows
+        // and flat-scans the tail (spec.md#search, fts.md "Index Maintenance").
+        // `DELTA_MERGE_THRESHOLD` keeps the per-fold segment count bounded.
         let unindexed = dataset.unindexed_fragments(intent.name).await?;
         if unindexed.is_empty() {
             continue;
         }
-        // Batch scalar folds: Lance 7.0.0 ignores `append()` for scalar and
-        // rewrites the whole BTree/bitmap file on every fold (O(index size),
-        // not O(delta)), so folding on every tiny sync is near-pure waste.
-        // Defer until the unindexed tail is worth one rewrite. get/count/sql
-        // read the deferred tail via scan (correct, only slower, bounded by the
-        // threshold); vector/FTS below always fold, so search recall is
-        // unaffected (spec.md#search). `pond optimize`/`pond copy` pass 0.
-        if scalar_fold_row_threshold > 0 && matches!(intent.params, IndexParamsKind::Scalar(_)) {
-            let tail_rows: usize = unindexed
-                .iter()
-                .map(|fragment| fragment.num_rows().unwrap_or(0))
-                .sum();
-            if tail_rows < scalar_fold_row_threshold {
-                tracing::debug!(
-                    target: "pond::perf",
-                    index = intent.name,
-                    tail_rows,
-                    threshold = scalar_fold_row_threshold,
-                    "deferring scalar index fold (unindexed tail below threshold)",
-                );
-                continue;
-            }
+        let tail_rows: usize = unindexed
+            .iter()
+            .map(|fragment| fragment.num_rows().unwrap_or(0))
+            .sum();
+        // Batch folds per family so a tiny sync doesn't pay a per-fold cost that
+        // dwarfs the delta. Scalar (BTree/bitmap): Lance 7.0.0 rewrites the whole
+        // index file per fold (O(index size)); defer until the tail is worth one
+        // rewrite - get/count/sql read the deferred tail via scan. FTS + vector
+        // (IVF): the fold is a cheap delta append, but each is an S3 round-trip +
+        // commit storm; defer until the tail is worth one fold - search
+        // flat-scans the deferred tail so recall stays complete either way.
+        // `pond optimize`/`pond copy` pass 0 (fold every run).
+        let fold_threshold = match intent.params {
+            IndexParamsKind::Scalar(_) => folds.scalar,
+            IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. } => folds.index,
+        };
+        if fold_threshold > 0 && tail_rows < fold_threshold {
+            tracing::debug!(
+                target: "pond::perf",
+                index = intent.name,
+                tail_rows,
+                threshold = fold_threshold,
+                "deferring index fold (unindexed tail below threshold)",
+            );
+            continue;
         }
         // Every family folds incrementally via `optimize_indices` (the
         // append/merge batch below) - no full rebuild. BTree rewrites its index
