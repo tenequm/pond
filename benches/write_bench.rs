@@ -550,6 +550,7 @@ async fn main() -> Result<()> {
             cleanup_older_than: default_cleanup_older_than(),
             cleanup_interval: DEFAULT_SYNC_CLEANUP_INTERVAL,
             scalar_fold_row_threshold: 0,
+            index_fold_row_threshold: 0,
         };
         let before_policy = base;
         let after_policy = base.with_scalar_fold_row_threshold(DEFAULT_SYNC_SCALAR_FOLD_ROWS);

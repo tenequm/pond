@@ -200,11 +200,13 @@ mod ingest_handler {
         // Discovery is best-effort: a failure (no read perm, bad config)
         // still lets the bar run as a rolling counter. We surface the count
         // upfront when we can; otherwise the bar uses `set_length(0)`.
+        let discover_started = std::time::Instant::now();
         let total = adapter
             .discover()
             .await
             .map_err(|error| tracing::debug!(%error, "adapter discover failed"))
             .ok();
+        tracing::debug!(target: "pond::perf", stage = "discover", elapsed_ms = discover_started.elapsed().as_millis() as u64, total = total.unwrap_or(0), "sync stage");
         on_event(SyncEvent::Discovered { total });
 
         let mut events = adapter.events_with(oracle);

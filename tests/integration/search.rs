@@ -6,6 +6,7 @@
 //! `src/sessions.rs::tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use chrono::Utc;
 use pond::{
     adapter::ClaudeCodeAdapter,
     config::SearchConfig,
@@ -13,11 +14,12 @@ use pond::{
     handlers::ingest_adapter,
     handlers::pond_get,
     handlers::pond_search,
-    sessions::{Store, embedding_dim},
+    sessions::{IngestEvent, Store, embedding_dim},
     substrate::MaintenancePolicy,
     wire::{
-        GetEnvelope, GetRequest, GetResult, ProjectFilter, SearchEnvelope, SearchFilters,
-        SearchModeWire, SearchRequest, SortBy,
+        GetEnvelope, GetRequest, GetResult, Message, Part, PartKind, ProjectFilter, Provenance,
+        ProviderOptions, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest, Session,
+        SortBy,
     },
 };
 use std::sync::Arc;
@@ -566,6 +568,79 @@ async fn message_context_siblings_are_conversational() -> anyhow::Result<()> {
     assert!(
         siblings.iter().all(|m| m.text.is_some()),
         "the context window must hold only conversational siblings"
+    );
+    Ok(())
+}
+
+/// f3 recall guard: sync batches the FTS/vector fold, so between folds an
+/// unindexed tail exists. Recall must stay complete - the retrievers drop
+/// `fast_search` when an index has a tail and flat-scan it. A term that lives
+/// only in the unfolded tail must still be found, and stays found after the fold.
+#[tokio::test(flavor = "multi_thread")]
+async fn fts_search_covers_the_unindexed_tail() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, embedder) = searchable_corpus(&temp).await?; // fixtures ingested + folded (tail = 0)
+
+    // A distinctive term absent from the fixtures, ingested WITHOUT a fold so it
+    // lives only in the unindexed tail.
+    let marker = "quokkanaut";
+    let session_id = "01HXYTAILRECALL0000000000";
+    let events = vec![
+        IngestEvent::Session(Session {
+            id: session_id.to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: pond::adapter::extract_str(&serde_json::json!({"x": "/tmp/tail"}), "x")
+                .unwrap(),
+            options: ProviderOptions::new(),
+        }),
+        IngestEvent::Message(Message::User {
+            id: "tail-msg".to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        }),
+        IngestEvent::Part(Part {
+            session_id: session_id.to_owned(),
+            id: "tail-msg:0001".to_owned(),
+            message_id: "tail-msg".to_owned(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: pond::adapter::extract_str(
+                    &serde_json::json!({"x": format!("the {marker} appeared at dawn")}),
+                    "x",
+                ),
+            },
+        }),
+    ];
+    pond::handlers::ingest_events(&store, events).await?;
+
+    let fts = |q: &str| SearchRequest {
+        mode: SearchModeWire::Fts,
+        ..search_request(q)
+    };
+
+    // Deferred fold: the marker is only in the tail. `fast_search` would miss it;
+    // the retriever must drop `fast_search` and flat-scan the tail.
+    let hits = hits_of(pond_search(&store, &embedder, fts(marker), &search_config()).await);
+    assert!(
+        hits.iter().any(|h| h.session_id == session_id),
+        "tail-only term must be found while the fold is deferred (complete recall)",
+    );
+
+    // After folding, the same term is served from the index.
+    store
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
+    let hits = hits_of(pond_search(&store, &embedder, fts(marker), &search_config()).await);
+    assert!(
+        hits.iter().any(|h| h.session_id == session_id),
+        "tail term still found after the fold",
     );
     Ok(())
 }

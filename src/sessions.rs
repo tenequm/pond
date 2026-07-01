@@ -2244,7 +2244,8 @@ impl Store {
     }
 
     /// Shared FTS-scan setup: scope filter, the `search_text` full-text query,
-    /// `fast_search` when indexed, and `limit`. Callers set only their projection.
+    /// `fast_search` only when the index has no unindexed tail (else Lance
+    /// index-probes + flat-scans the tail), and `limit`. Callers set the projection.
     async fn fts_scanner(
         &self,
         query: &str,
@@ -2255,7 +2256,11 @@ impl Store {
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
-        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
+        if self
+            .handle
+            .messages_fast_search_ready(MESSAGES_FTS_INDEX)
+            .await?
+        {
             scanner.fast_search();
         }
         // Lance ships an autoprojection that silently appends `_score` to FTS
@@ -2502,6 +2507,17 @@ impl Store {
         string(&batch, "embedding_model", 0)
     }
 
+    /// Whether `messages` were embedded under a model id other than the
+    /// configured one - a swap that requires re-embedding under the new model.
+    /// One `LIMIT 1` read via [`Self::sample_embedded_model`]; the shared check
+    /// behind the sync swap guard and the optimize embed stage.
+    pub async fn embedding_model_swapped(&self) -> Result<bool> {
+        Ok(self
+            .sample_embedded_model()
+            .await?
+            .is_some_and(|model| model != crate::embed::model_id()))
+    }
+
     /// Vector kNN retriever over `messages.vector`, prefiltered by the caller's
     /// scalar predicate alone (spec.md#search-prefilter-pushdown) - see
     /// `embedded_scope` for why pond does NOT add `vector IS NOT NULL`. nprobes
@@ -2555,7 +2571,7 @@ impl Store {
         apply_vector_search_knobs(&mut scanner, search);
         if self
             .handle
-            .messages_has_index(MESSAGES_VECTOR_INDEX)
+            .messages_fast_search_ready(MESSAGES_VECTOR_INDEX)
             .await?
         {
             scanner.fast_search();
@@ -2621,18 +2637,10 @@ impl Store {
         filter: &Predicate,
         search: Option<&config::SearchConfig>,
     ) -> Result<String> {
-        let scope = embedded_scope(filter);
-        let mut scanner = self.handle.scanner(Table::Messages, Some(&scope)).await?;
-        let key = Float32Array::from(query.to_vec());
-        scanner.nearest("vector", &key, limit)?;
-        apply_vector_search_knobs(&mut scanner, search);
-        if self
-            .handle
-            .messages_has_index(MESSAGES_VECTOR_INDEX)
-            .await?
-        {
-            scanner.fast_search();
-        }
+        // Reuse the real retriever's builder so the explained plan can never
+        // drift from what a query actually runs - notably the fast_search vs
+        // flat-tail gate (`messages_fast_search_ready`).
+        let scanner = self.vector_scanner(query, limit, filter, search).await?;
         scanner
             .explain_plan(true)
             .await
@@ -2645,15 +2653,9 @@ impl Store {
         limit: usize,
         filter: &Predicate,
     ) -> Result<String> {
-        let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
-        scanner.full_text_search(
-            FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
-        )?;
-        if self.handle.messages_has_index(MESSAGES_FTS_INDEX).await? {
-            scanner.fast_search();
-        }
+        // Same builder as `fts_search` so the explained plan matches execution.
+        let mut scanner = self.fts_scanner(query, limit, filter).await?;
         scanner.project(&["session_id", "id"])?;
-        scanner.limit(Some(i64::try_from(limit).unwrap_or(i64::MAX)), None)?;
         scanner
             .explain_plan(true)
             .await
@@ -6814,6 +6816,96 @@ mod tests {
                 .await?,
             0,
             "a threshold-0 fold must consolidate the deferred tail",
+        );
+        Ok(())
+    }
+
+    /// f3 recall guard for the vector arm: with the FTS/vector fold batched, a
+    /// row can sit in an unindexed tail. `vector_search` must still return it -
+    /// the retriever drops `fast_search` when a tail exists so Lance ANN-probes
+    /// the indexed base AND brute-forces the tail. (The FTS arm is covered by
+    /// `tests/integration/search.rs::fts_search_covers_the_unindexed_tail`.)
+    #[tokio::test]
+    async fn vector_search_covers_the_unindexed_tail() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
+                .await?,
+            0,
+            "the IVF must cover the whole base after the fold",
+        );
+
+        // Append one embedded row without folding -> an unindexed vector tail.
+        let tail = MessageKey {
+            session_id: "session-tail".to_owned(),
+            message_id: "tail-msg".to_owned(),
+        };
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: tail.session_id.clone(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/tail".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: tail.message_id.clone(),
+                    session_id: tail.session_id.clone(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: tail.session_id.clone(),
+                    id: format!("{}-part", tail.message_id),
+                    message_id: tail.message_id.clone(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("tail body".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+        let tail_vector = synthetic_vector(9999);
+        store
+            .write_embeddings(&[EmbeddedMessage {
+                session_id: tail.session_id.clone(),
+                id: tail.message_id.clone(),
+                vector: tail_vector.clone(),
+            }])
+            .await?;
+        assert!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
+                .await?
+                > 0,
+            "the appended row must be an unindexed vector tail (no fold ran)",
+        );
+
+        // Querying with the tail's own vector: fast_search is dropped (tail
+        // present), so the brute-force over the tail surfaces the exact match.
+        // Under the old index-only gate this row would be invisible.
+        let hits = store
+            .vector_search(&tail_vector, 10, &Predicate::And(Vec::new()), None)
+            .await?;
+        assert!(
+            hits.iter().any(|hit| hit.key == tail),
+            "the unindexed tail row must be reachable via vector search (complete recall)",
         );
         Ok(())
     }
