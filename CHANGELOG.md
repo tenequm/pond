@@ -1,4 +1,17 @@
 # Changelog
+## [0.11.1](https://github.com/tenequm/pond/compare/v0.11.0...v0.11.1) - 2026-07-01
+
+### <!-- 3 -->🚀 Performance
+- **sync:** cut remote sync from ~80-520s to ~44s
+- **sync:** eliminate compaction churn + batch scalar folds + live progress
+
+### <!-- 4 -->🚜 Refactor
+- **bench:** rename copy_bench -> write_bench, add write-path profiler
+
+### <!-- 5 -->📚 Documentation
+- add logo to README
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.11.0...v0.11.1
 
 ## [0.11.0](https://github.com/tenequm/pond/compare/v0.10.2...v0.11.0) - 2026-07-01
 
