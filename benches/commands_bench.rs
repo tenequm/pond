@@ -324,6 +324,7 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
                         SyncStatus::Fresh => fresh += count,
                         _ => other += count,
                     },
+                    SyncEvent::Flushing { .. } => {}
                 },
             )
             .await
@@ -360,6 +361,7 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
             compaction_fragment_cap: 0,
             cleanup_older_than: chrono::Duration::days(1),
             cleanup_interval: 1,
+            scalar_fold_row_threshold: 0,
         };
         timed("optimize (indices+cleanup+compact)", &mut phases, async {
             store

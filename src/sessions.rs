@@ -2977,6 +2977,25 @@ impl Store {
         Ok(OptimizeOutcome { tables })
     }
 
+    #[cfg(test)]
+    async fn optimize_indices_with_scalar_fold_threshold(
+        &self,
+        scalar_fold_row_threshold: usize,
+    ) -> Result<OptimizeOutcome> {
+        let intents = pond_index_intents();
+        let policy = MaintenancePolicy::always_compact()
+            .with_scalar_fold_row_threshold(scalar_fold_row_threshold);
+        let mut tables = Vec::with_capacity(3);
+        for (table, intents) in intents.all() {
+            let outcome = self
+                .handle
+                .optimize_table(table, intents, None, &policy)
+                .await;
+            tables.push(outcome);
+        }
+        Ok(OptimizeOutcome { tables })
+    }
+
     /// Reclaim superseded data/index files across every indexed table (Lance
     /// `cleanup_old_versions`), without compaction. `pond optimize --rebuild`
     /// runs this after the rebuild so the index segments it just replaced are
@@ -4372,7 +4391,7 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
         BuiltinIndexType::BTree,
-        "messages_session_id_btree",
+        MESSAGES_SESSION_ID_INDEX,
     ),
     (
         "source_agent",
@@ -4457,6 +4476,10 @@ fn apply_vector_search_knobs(
 pub(crate) const SESSIONS: &str = "sessions";
 pub(crate) const MESSAGES: &str = "messages";
 pub(crate) const PARTS: &str = "parts";
+
+/// BTree index name on `messages.session_id` (spec.md#datasets). Stable so
+/// index creation, status, and the scalar-fold gate name the same index.
+pub const MESSAGES_SESSION_ID_INDEX: &str = "messages_session_id_btree";
 
 /// FTS index name on `messages.search_text`. Stable so status and index
 /// creation name the same index.
@@ -6689,6 +6712,108 @@ mod tests {
         assert!(
             hits.iter().any(|hit| hit.key == keys[0]),
             "an embedded row is retrievable via the index",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scalar_fold_batching_defers_tail_without_losing_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 300).await?;
+
+        // Threshold 0 folds every family: the scalar index covers all 300 rows.
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_SESSION_ID_INDEX)
+                .await?,
+            0,
+            "threshold 0 must fold the scalar index over every row",
+        );
+
+        // Append one small session -> a new unindexed fragment on messages.
+        let new_messages = 5usize;
+        let mut events = vec![IngestEvent::Session(Session {
+            id: "session-new".to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Extracted::from_test_value("/proj/new".to_owned()),
+            options: ProviderOptions::new(),
+        })];
+        for i in 0..new_messages {
+            let message_id = format!("new-msg-{i}");
+            events.push(IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: "session-new".to_owned(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(IngestEvent::Part(Part {
+                session_id: "session-new".to_owned(),
+                id: format!("{message_id}-part"),
+                message_id,
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(format!("new text {i}"))),
+                },
+            }));
+        }
+        ingest_events(&store, events).await?;
+
+        // A threshold far above the delta defers the scalar fold; FTS (not
+        // scalar) still folds every run.
+        store
+            .optimize_indices_with_scalar_fold_threshold(1_000_000)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_SESSION_ID_INDEX)
+                .await?,
+            new_messages,
+            "the scalar fold must be deferred, leaving the delta tail unindexed",
+        );
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
+                .await?,
+            0,
+            "FTS must fold every run regardless of the scalar threshold",
+        );
+
+        // The deferred rows are still fully retrievable - get scans the tail.
+        let session = store
+            .get_session("session-new")
+            .await?
+            .expect("deferred session must still be retrievable");
+        assert_eq!(
+            session.messages.len(),
+            new_messages,
+            "get must read the unindexed scalar tail via scan",
+        );
+
+        // A later threshold-0 fold consolidates the deferred tail.
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_SESSION_ID_INDEX)
+                .await?,
+            0,
+            "a threshold-0 fold must consolidate the deferred tail",
         );
         Ok(())
     }

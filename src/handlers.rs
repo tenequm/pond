@@ -81,6 +81,10 @@ mod ingest_handler {
         SessionDone(SessionOutcome),
         /// Aggregate skip: one callback for N files (typically `Fresh`).
         SkippedBulk { status: SyncStatus, count: usize },
+        /// A flush batch of `pending` staged sessions is about to embed + write:
+        /// the slow phase during which no `SessionDone` fires. Lets the bar show
+        /// the commit is in progress instead of freezing between drains.
+        Flushing { pending: usize },
     }
 
     /// What happened to one session in an adapter-driven sync.
@@ -345,6 +349,9 @@ mod ingest_handler {
                     // close a substream; once it hits the batch threshold we
                     // commit them in one parallel 3-table merge_insert.
                     if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH {
+                        on_event(SyncEvent::Flushing {
+                            pending: validator.pending_substreams(),
+                        });
                         let flush_start = std::time::Instant::now();
                         let (flush_outcomes, flush_counts) = validator.flush(store).await?;
                         validator_total += flush_start.elapsed();
@@ -406,6 +413,11 @@ mod ingest_handler {
                 dropped_events: prev.dropped_events,
                 first_drop_reason: prev.first_drop_reason,
                 session_index: prev.session_index,
+            });
+        }
+        if validator.pending_substreams() > 0 {
+            on_event(SyncEvent::Flushing {
+                pending: validator.pending_substreams(),
             });
         }
         let validator_start = std::time::Instant::now();

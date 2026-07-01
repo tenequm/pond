@@ -1134,9 +1134,14 @@ async fn main() -> anyhow::Result<()> {
                 // the command that does. Cleanup is amortized: a 5-min cron sync
                 // shouldn't pay the per-table version-log walk (~9s on S3) every
                 // run, so it cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL
-                // commits instead (`pond optimize` still cleans every run).
+                // commits instead (`pond optimize` still cleans every run). The
+                // scalar-index fold is amortized the same way: Lance 7.0.0
+                // rewrites the whole BTree/bitmap file per fold, so most syncs
+                // defer it and let the unindexed tail accrue (see
+                // DEFAULT_SYNC_SCALAR_FOLD_ROWS).
                 let policy = configured_maintenance_policy(&loaded, None)?
-                    .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL);
+                    .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL)
+                    .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS);
                 let indexes_started = std::time::Instant::now();
                 finalize_indexes(&store, &policy, false).await?;
                 output(&stage_line(
@@ -3292,6 +3297,10 @@ fn configured_maintenance_policy(
         // via `with_cleanup_interval`; explicit `pond optimize` and one-shot
         // `pond copy` keep it at 1 so maintenance/durability moves never skip.
         cleanup_interval: 1,
+        // Default: fold scalar indexes every run. `pond sync` raises this via
+        // `with_scalar_fold_row_threshold`; optimize/copy keep 0 so a
+        // durability move always lands a complete index.
+        scalar_fold_row_threshold: 0,
     })
 }
 
@@ -3703,10 +3712,25 @@ async fn sync_with_progress(
                 &tail,
             ));
         }
+        SyncEvent::Flushing { pending } => {
+            // The flush embeds + writes this staged batch - the slow phase with
+            // no per-session events (SessionDone drains only after it). Show it
+            // so the bar reflects work in flight instead of a frozen counter.
+            bar_ref.set_message(sync_status_line(
+                name,
+                bar_ref.position(),
+                bar_ref.length().unwrap_or(0),
+                started.elapsed(),
+                &format!(
+                    "committing {} sessions (embedding + writing)...",
+                    format_thousands(pending as u64)
+                ),
+            ));
+        }
     })
     .await?;
 
-    let tail = format_sync_outcome(&summary, drops, errors);
+    let tail = format_sync_outcome(&summary, drops, errors, started.elapsed());
     let final_line = sync_status_line(
         name,
         bar.position(),
@@ -3718,21 +3742,28 @@ async fn sync_with_progress(
     Ok(summary)
 }
 
-/// Frozen per-adapter bar tail after `sync_with_progress` finishes. Replaces
-/// the in-flight throughput display (`N msgs / X msgs/s`) with the outcome
-/// counts so scroll-back tells the story of what landed, not what was
-/// decoded. Empty/sidecar files are intentionally not surfaced here -
+/// Frozen per-adapter bar tail after `sync_with_progress` finishes. Reports the
+/// outcome counts (what landed, not what was decoded) and keeps the overall
+/// throughput (`in <hms>  <rate> msgs/s`) so the in-flight `msgs/s` isn't lost
+/// at completion. Empty/sidecar files are intentionally not surfaced here -
 /// per design they are part of normal operation, not a signal to the user.
-fn format_sync_outcome(summary: &IngestSummary, drops: u64, errors: u64) -> String {
+fn format_sync_outcome(
+    summary: &IngestSummary,
+    drops: u64,
+    errors: u64,
+    elapsed: Duration,
+) -> String {
     let new_sessions = summary.sessions_inserted as u64;
     let new_messages = summary.messages_inserted_searchable as u64;
     let mut tail = if new_sessions == 0 && new_messages == 0 {
         "up to date".to_owned()
     } else {
         format!(
-            "+{} sessions (+{} messages)",
+            "+{} sessions (+{} messages) in {}  {:.0} msgs/s",
             format_thousands(new_sessions),
             format_thousands(new_messages),
+            elapsed_hms(elapsed),
+            new_messages as f64 / elapsed.as_secs_f64().max(0.001),
         )
     };
     if drops > 0 {
