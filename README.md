@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/site/assets/logo.png" alt="pond" width="200">
+</p>
+
 # pond
 
 [![CI](https://img.shields.io/github/actions/workflow/status/tenequm/pond/ci.yml?branch=main&style=flat-square)](https://github.com/tenequm/pond/actions/workflows/ci.yml)
