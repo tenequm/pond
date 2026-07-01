@@ -1,11 +1,15 @@
 # Changelog
+
 ## [0.11.0](https://github.com/tenequm/pond/compare/v0.10.2...v0.11.0) - 2026-07-01
 
+The write path becomes append-only - incremental index folds, inline embed at ingest, and delta-only copy - and remote `pond_search` drops from ~8s to sub-second.
+
 ### <!-- 0 -->🛠 Breaking Changes
-- [**breaking**] append-only write path - incremental indexes, grown-session copy append, inline embed at ingest
+- **Append-only write path.** `pond sync` now embeds each message inline in its ingest commit, and both sync and copy fold the scalar indexes incrementally (`optimize_indices(append)`) instead of a full `create_index(replace=true)` rebuild - so the whole-source-column index rebuild that dominated each sync/copy tail (~520s on the real corpus) is gone. `pond copy` carries only absent-or-grown sessions and appends a grown session's delta rows through the shared ingest write path (append, not merge-insert), keeping remote copies bandwidth-bound rather than commit-latency-bound.
 
 ### <!-- 3 -->🚀 Performance
-- **search:** warm remote search ~8s -> sub-second; fix #75 date filters
+- **search:** warm remote `pond_search` drops from **~7.9s to sub-second** (best 224ms) on the full S3 corpus (11,788 sessions / 2.14M messages). Two stages did work the query never needed. `has_embeddings` answered "does this store have embeddings?" with an `IsNotNull(vector)` scan of the entire vector column (**6.8-11.7s per query**); it now reads the manifest (index presence, ~0ms) and only falls back to a `LIMIT 1` probe when no index exists. Per-hit part summaries fetched file blobs from S3 and scanned `parts` once per session sequentially; they now skip the blob (the label rides `variant_data` metadata) and run concurrently. The real retrieval - embed + IVF probe + hydrate - is ~0.1s.
+- **search (#75):** `from_date`/`to_date` returned empty on remote stores because the `messages_timestamp_zonemap` mis-prunes the tz-aware `timestamp` column (`ScalarValue::partial_cmp` across the tz mismatch prunes every zone). The index is dropped and date bounds run as a refine over the candidate set. Stores that already built it: run `pond optimize --drop-index messages_timestamp_zonemap` once, or date filters stay empty there.
 
 ### <!-- 5 -->📚 Documentation
 - add remote read-path cold-start plan and drop stale prewarm comment figures
