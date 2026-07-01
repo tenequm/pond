@@ -240,7 +240,7 @@ name = "multiwriter_bench"
 harness = false
 
 [[bench]]
-name = "copy_bench"
+name = "write_bench"
 harness = false
 
 [[bench]]

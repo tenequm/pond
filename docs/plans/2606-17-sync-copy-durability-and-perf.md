@@ -8,7 +8,7 @@ Do not re-run the investigations. Every number below was measured on the real co
 
 ## Delivery constraint (hard requirement)
 
-All changes from this plan MUST land as ONE chunk and ONE commit. Do not split into multiple commits. The single commit also subsumes the already-present uncommitted working-tree artifacts from the investigation (see "Current working-tree state" at the end): the `AGENTS.md` notes and the `benches/sync_oracle_bench.rs` + `benches/copy_bench.rs` extensions. Mark the commit breaking if it changes the oracle/skip wire or copy semantics (`<type>!:`), per the repo's release-plz convention.
+All changes from this plan MUST land as ONE chunk and ONE commit. Do not split into multiple commits. The single commit also subsumes the already-present uncommitted working-tree artifacts from the investigation (see "Current working-tree state" at the end): the `AGENTS.md` notes and the `benches/sync_oracle_bench.rs` + `benches/write_bench.rs` extensions. Mark the commit breaking if it changes the oracle/skip wire or copy semantics (`<type>!:`), per the repo's release-plz convention.
 
 ## Decision update (2026-06-17): mtime oracle retained; `versions()` made cheap (supersedes B6/B7)
 
@@ -124,7 +124,7 @@ Source-side skip, real `~/.claude/projects` (9,383 files / 5.7 GiB), warm (`/tmp
 - header peek (current): 0.165 s (17.6 us/file).
 - header + tail (B7): 0.319 s (34 us/file). Marginal tail cost +0.154 s. Cold is unmeasured but bounded: 89% of files are < 1 MB so OS read-ahead from the head read likely covers the tail; estimated < 2 s, once, post-reboot. This was accepted as negligible.
 
-Copy append vs merge (C8), full real corpus local-source -> S3 scratch, clean cold each (`cargo bench --bench copy_bench -- --source-url <store> --dest-url <s3-base> --only append|merge`):
+Copy append vs merge (C8), full real corpus local-source -> S3 scratch, clean cold each (`cargo bench --bench write_bench -- --source-url <store> --dest-url <s3-base> --only append|merge`):
 
 - append: 13.8 min, 1 commit per table, 62 objects.
 - merge: 75.7 min, 354 commits, 2,685 objects. 5.47x slower.
@@ -137,7 +137,7 @@ Adapter dedup hash (A4), full corpus, 1.59M records (`/tmp/dedup_hash_probe.rs`)
 - M1: a test that a session whose messages commit was skipped/failed does NOT get permanently skipped - i.e. after a partial first-ingest, a re-sync ingests the messages. Probe A pattern: assert the watermark/visibility is tied to message presence under the commit-row-last ordering.
 - Copy parts-only-growth: Probe C as a real test - session A gains a part on an existing message while session B gains a message; assert the destination ends with all parts (the verify catches it / the parts signal routes it). Put it in `tests/integration/copy.rs`.
 - Oracle/skip: a test that the messages-based oracle yields a correct per-session key and that the tail-peek skip never skips a grown file.
-- C8 guard: `benches/copy_bench.rs --only append|merge` is the standing guard; reference it in the seam code comment so a future change that drops append-for-absent is caught.
+- C8 guard: `benches/write_bench.rs --only append|merge` is the standing guard; reference it in the seam code comment so a future change that drops append-for-absent is caught.
 
 ## Part 6: What NOT to do
 
@@ -166,6 +166,6 @@ Uncommitted artifacts already produced by the investigation, to be included in t
 
 - `AGENTS.md`: added "Sync change-detection oracle (S3 perf, measured)" and "Copy write path: the append fast-path is load-bearing" sections. Also a `session_last_ingested_at` doc-comment correction.
 - `benches/sync_oracle_bench.rs`: added `parts_group_count` (A3) and `verify_collect_ids_all` (A2) candidates.
-- `benches/copy_bench.rs`: added `merge_copy`, `--dest-url` (S3 dest via config creds), `--source-url` (use an existing store as source, no seed), and `--only append|merge` (cold-isolated runs).
+- `benches/write_bench.rs`: added `merge_copy`, `--dest-url` (S3 dest via config creds), `--source-url` (use an existing store as source, no seed), and `--only append|merge` (cold-isolated runs).
 - This doc.
 - Note: `7a6601e` is already committed on the branch; B6 supersedes its oracle. The throwaway `/tmp/tailpeek_probe.rs` and `/tmp/dedup_hash_probe.rs` are outside the repo and need not be kept.

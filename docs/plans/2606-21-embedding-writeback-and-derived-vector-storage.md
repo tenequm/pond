@@ -27,7 +27,7 @@ The naive "just move vectors to their own dataset" answer collides with a delibe
 ### C - separate append-only vector dataset
 Vectors live in their own Lance dataset keyed by `(session_id, id)`; the IVF_SQ index moves there; embedding is an `append_stream` (bandwidth-bound, no join, no fragment rewrite). Search's vector arm runs kNN there, returns keys, hydrates metadata via the row-key map that already exists.
 
-- Pro: kills the merge join AND the rowmap churn AND removes the 1.2 GB column from `messages` (cheaper message scans). Best fit for the imminent S3 backend - the copy benchmark already shows append is bandwidth-bound while merge is commit-latency-bound on S3 (5.47x; memory `project_pond_s3_imminent`, `copy_bench`).
+- Pro: kills the merge join AND the rowmap churn AND removes the 1.2 GB column from `messages` (cheaper message scans). Best fit for the imminent S3 backend - the copy benchmark already shows append is bandwidth-bound while merge is commit-latency-bound on S3 (5.47x; memory `project_pond_s3_imminent`, `write_bench`).
 - Con: breaks prefilter pushdown unless the 4 narrow filter columns (`session_id`, `project`, `source_agent`, `timestamp`) are **denormalized** into the vector store. They are cheap (no `search_text`, no vector), so duplicating them keeps pushdown at a small write cost. Touches schema, embed write path, search vector arm, and IVF index location. Largest change.
 
 ### D - embed at ingest
@@ -50,7 +50,7 @@ Decide against two facts: **(a)** how soon the S3 backend lands, **(b)** whether
 - If you want the smallest safe step that kills the cost today and S3 is not imminent: **E**, gated on a benchmark proving the index path nets out ahead of the BTree maintenance it adds.
 - Avoid **B (batch the writeback)** as anything but a stopgap: it trades embedding-freshness semantics to hide a write-path bug.
 
-Do not ship any of C/D/E as a hot patch. Each is a schema/spec change; land it with a `spec.md` amendment, a `copy_bench`/embed micro-benchmark for the write path, and tests that the vector arm + prefilter still return identical results.
+Do not ship any of C/D/E as a hot patch. Each is a schema/spec change; land it with a `spec.md` amendment, a `write_bench`/embed micro-benchmark for the write path, and tests that the vector arm + prefilter still return identical results.
 
 ## Not in scope / keep
 

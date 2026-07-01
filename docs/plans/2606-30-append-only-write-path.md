@@ -91,7 +91,7 @@ Concretely for copy: for grown sessions, fetch the dest's present message/part P
 
 ### Verify
 
-`cargo bench --bench copy_bench -- --only append|merge` (the existing regression guard) plus the new `--append-sweep` mode; a copy of grown sessions to S3 scratch must move only the delta rows in one commit per table and pass the closing verify.
+`cargo bench --bench write_bench -- --only append|merge` (the existing regression guard) plus the new `--append-sweep` mode; a copy of grown sessions to S3 scratch must move only the delta rows in one commit per table and pass the closing verify.
 
 ## 5. Workstream C - embed at ingest + remove `--no-optimize`
 
@@ -146,10 +146,10 @@ Harness edits for this work are ALREADY in the working tree (uncommitted as of t
 
 - `src/embed.rs` - a sweepable `batch_size` field + `EmbedWorker::with_batch_size()` (default 32, mirrors `with_sort_window()`/`with_limit()`).
 - `benches/embed_bench.rs` - `--batch <N>`.
-- `benches/copy_bench.rs` - `--append-sweep "<B,...,bulk>"` + `--sweep-commits-cap` (the S3 commit-floor sweep; first-class re-runnable mode).
+- `benches/write_bench.rs` - `--append-sweep "<B,...,bulk>"` + `--sweep-commits-cap` (the S3 commit-floor sweep; first-class re-runnable mode).
 
 Guards to run/keep green:
-- `copy_bench --only append|merge` and the new `--append-sweep` - prove append stays bandwidth-bound and grown-session copy moves only the delta.
+- `write_bench --only append|merge` and the new `--append-sweep` - prove append stays bandwidth-bound and grown-session copy moves only the delta.
 - `embed_bench --batch` - embed throughput per batch size.
 - `sync_oracle_bench` - the messages-based oracle stays fast (unaffected, but do not regress).
 
@@ -172,7 +172,7 @@ Guards to run/keep green:
 
 - S3 commit floor ~1.0 s, flat 1..512 rows/commit; bulk single-commit 7,387 rows/s (S3) / 61k/s (local).
 - Embed (metal, e5-small): ~75-85 msg/s aggregate (batch 8 optimal, default 32 fine; padding-bound); full backfill 292,064 embeddable msgs ~57-65 min.
-- Copy merge regression: 4 grown sessions, 6,044 msgs re-scanned for 10 new, ~463 s + OCC conflict; append vs merge = 62 vs 2,685 objects, 5.47x (full-corpus copy_bench).
+- Copy merge regression: 4 grown sessions, 6,044 msgs re-scanned for 10 new, ~463 s + OCC conflict; append vs merge = 62 vs 2,685 objects, 5.47x (full-corpus write_bench).
 - Index finalize: ~520 s full BTree/ZoneMap rebuild on a tiny delta (no tiny-delta guard); the cost is the full source-column scan, removed by the append fold.
 - Embedding writeback: 8 vectors = 6.36 s / 143 MiB composite-key locate scan (no single-column index acceleration on 7.0.0); write itself tiny.
 - Corpus shape: ~13.6% of messages embed (user/assistant w/ search_text); per session avg 25 / median 8 / p90 51 / max 3,013 embedded; total store ~2.14M messages / 11,773 sessions / 292k embeddable.
