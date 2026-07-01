@@ -11,7 +11,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::index::DatasetIndexRemapperOptions;
-use lance::dataset::optimize::{CompactionOptions, commit_compaction, plan_compaction};
+use lance::dataset::optimize::{
+    CompactionMode, CompactionOptions, commit_compaction, plan_compaction,
+};
 pub use lance::dataset::write::merge_insert::MergeStats;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
@@ -869,6 +871,16 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
 /// run) so maintenance and durability moves are never skipped.
 pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 16;
 
+/// `pond sync` defers a scalar (BTree/bitmap) index fold until its unindexed
+/// tail reaches this many rows. Lance 7.0.0 ignores `OptimizeOptions::append()`
+/// for scalar indexes and rewrites the whole index file on every fold
+/// (O(index size), not O(delta)), so folding on every tiny sync pays a full
+/// rewrite for a handful of new rows. Batching amortizes that rewrite; the
+/// deferred tail stays correct for get/count/sql (they scan it) with scan cost
+/// bounded by this cap, and vector/FTS still fold every run so search recall is
+/// unaffected. `pond optimize`/`pond copy` fold every run (threshold `0`).
+pub const DEFAULT_SYNC_SCALAR_FOLD_ROWS: usize = 50_000;
+
 /// Resolved per-call inputs to the storage-maintenance pass. Built from
 /// `[maintenance]` (and any per-invocation CLI override) at the entry point;
 /// threaded down to `optimize_table_compact` so the substrate never re-reads
@@ -884,6 +896,11 @@ pub struct MaintenancePolicy {
     /// raises it so most syncs skip the version-log walk; see
     /// [`DEFAULT_SYNC_CLEANUP_INTERVAL`].
     pub cleanup_interval: u64,
+    /// Defer a scalar (BTree/bitmap) index fold until its unindexed tail reaches
+    /// this many rows; `0` folds every run. The frequent `pond sync` path raises
+    /// it so most syncs skip the full scalar-index rewrite Lance 7.0.0 does on
+    /// every fold; see [`DEFAULT_SYNC_SCALAR_FOLD_ROWS`].
+    pub scalar_fold_row_threshold: usize,
 }
 
 impl MaintenancePolicy {
@@ -893,6 +910,7 @@ impl MaintenancePolicy {
             compaction_fragment_cap: 0,
             cleanup_older_than: default_cleanup_older_than(),
             cleanup_interval: 1,
+            scalar_fold_row_threshold: 0,
         }
     }
 
@@ -901,6 +919,15 @@ impl MaintenancePolicy {
     #[must_use]
     pub fn with_cleanup_interval(mut self, interval: u64) -> Self {
         self.cleanup_interval = interval.max(1);
+        self
+    }
+
+    /// Amortize the scalar-index fold over its unindexed tail - the frequent
+    /// `pond sync` path uses this so most syncs skip the full scalar-index
+    /// rewrite Lance 7.0.0 does on every fold.
+    #[must_use]
+    pub fn with_scalar_fold_row_threshold(mut self, threshold: usize) -> Self {
+        self.scalar_fold_row_threshold = threshold;
         self
     }
 }
@@ -932,7 +959,16 @@ fn fragment_stat(fragment: &lance::table::format::Fragment) -> FragmentStat {
     }
 }
 
-/// Rows per [`TARGET_FRAGMENT_BYTES`] at the table's average row size.
+/// Candidacy/merge target: HALF the rows a [`TARGET_FRAGMENT_BYTES`] fragment
+/// holds at the table's average row size. Compaction byte-caps every output
+/// fragment at [`TARGET_FRAGMENT_BYTES`] (`max_bytes_per_file`), so deriving the
+/// target at the FULL byte budget made `target == the largest fragment
+/// compaction can produce`: no output could ever satisfy `physical_rows >=
+/// target`, so the table was re-compacted every sync for a net-zero fragment
+/// change (measured ~100-120s/sync on the remote store, 30->30 fragments).
+/// Halving leaves 2x headroom so a byte-capped fragment lands comfortably above
+/// the target and FREEZES, making compaction productive (merge small -> freeze
+/// -> stop) instead of perpetual churn.
 fn derived_target_rows(stats: &[FragmentStat]) -> usize {
     let (mut bytes, mut rows) = (0u64, 0u64);
     for stat in stats {
@@ -947,7 +983,7 @@ fn derived_target_rows(stats: &[FragmentStat]) -> usize {
         return MAX_TARGET_ROWS_PER_FRAGMENT as usize;
     }
     let avg_row_bytes = (bytes / rows).max(1);
-    (TARGET_FRAGMENT_BYTES / avg_row_bytes)
+    (TARGET_FRAGMENT_BYTES / 2 / avg_row_bytes)
         .clamp(MIN_TARGET_ROWS_PER_FRAGMENT, MAX_TARGET_ROWS_PER_FRAGMENT) as usize
 }
 
@@ -2229,7 +2265,7 @@ impl Handle {
             .run_optimize_compact_phase(table, progress, policy)
             .await;
         let indices = self
-            .run_optimize_indices_phase(table, intents, progress)
+            .run_optimize_indices_phase(table, intents, progress, policy.scalar_fold_row_threshold)
             .await;
         TableOptimizeOutcome {
             table,
@@ -2248,7 +2284,9 @@ impl Handle {
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
     ) -> PhaseOutcome {
-        self.run_optimize_indices_phase(table, intents, progress)
+        // Threshold 0: this tail-fold path always folds scalar indexes; only
+        // `pond sync` batches them (`with_scalar_fold_row_threshold`).
+        self.run_optimize_indices_phase(table, intents, progress, 0)
             .await
     }
 
@@ -2257,6 +2295,7 @@ impl Handle {
         table: Table,
         intents: &[IndexIntent],
         progress: Option<&OptimizeProgressFn>,
+        scalar_fold_row_threshold: usize,
     ) -> PhaseOutcome {
         if intents.is_empty() {
             return PhaseOutcome::Noop;
@@ -2265,8 +2304,14 @@ impl Handle {
             .retry_lance(table.label(), || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
-                let did_work =
-                    optimize_table_indices(&mut dataset, intents, table, progress).await?;
+                let did_work = optimize_table_indices(
+                    &mut dataset,
+                    intents,
+                    table,
+                    progress,
+                    scalar_fold_row_threshold,
+                )
+                .await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(did_work)
             })
@@ -2840,6 +2885,11 @@ async fn optimize_table_compact(
         target_rows_per_fragment: derived_target_rows(&stats),
         max_bytes_per_file: Some(TARGET_FRAGMENT_BYTES as usize),
         defer_index_remap: false,
+        // Binary-copy eligible fragments (concatenate encoded pages, no
+        // decode/re-encode) and fall back to Reencode automatically for blob
+        // (parts), deletion-bearing, or schema-varied fragments. ~27% faster on
+        // the messages/sessions reencode path, safe everywhere else.
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
         ..CompactionOptions::default()
     };
 
@@ -2960,6 +3010,7 @@ async fn optimize_table_indices(
     intents: &[IndexIntent],
     table: Table,
     progress: Option<&OptimizeProgressFn>,
+    scalar_fold_row_threshold: usize,
 ) -> Result<bool> {
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
@@ -3018,6 +3069,29 @@ async fn optimize_table_indices(
         let unindexed = dataset.unindexed_fragments(intent.name).await?;
         if unindexed.is_empty() {
             continue;
+        }
+        // Batch scalar folds: Lance 7.0.0 ignores `append()` for scalar and
+        // rewrites the whole BTree/bitmap file on every fold (O(index size),
+        // not O(delta)), so folding on every tiny sync is near-pure waste.
+        // Defer until the unindexed tail is worth one rewrite. get/count/sql
+        // read the deferred tail via scan (correct, only slower, bounded by the
+        // threshold); vector/FTS below always fold, so search recall is
+        // unaffected (spec.md#search). `pond optimize`/`pond copy` pass 0.
+        if scalar_fold_row_threshold > 0 && matches!(intent.params, IndexParamsKind::Scalar(_)) {
+            let tail_rows: usize = unindexed
+                .iter()
+                .map(|fragment| fragment.num_rows().unwrap_or(0))
+                .sum();
+            if tail_rows < scalar_fold_row_threshold {
+                tracing::debug!(
+                    target: "pond::perf",
+                    index = intent.name,
+                    tail_rows,
+                    threshold = scalar_fold_row_threshold,
+                    "deferring scalar index fold (unindexed tail below threshold)",
+                );
+                continue;
+            }
         }
         // Every family folds incrementally via `optimize_indices` (the
         // append/merge batch below) - no full rebuild. BTree rewrites its index
@@ -4263,14 +4337,15 @@ mod tests {
 
     #[test]
     fn derived_target_rows_tracks_row_size_and_clamps() {
-        // ~1.3 KiB rows -> ~200k-row target.
+        // ~1.3 KiB rows -> ~100k-row target (half the byte budget, for freeze
+        // headroom over the 256 MiB output cap).
         let parts_like = [FragmentStat {
             bytes: Some(665_000_000),
             rows: 511_000,
             deleted_rows: 0,
         }];
         let target = derived_target_rows(&parts_like);
-        assert!((150_000..300_000).contains(&target), "{target}");
+        assert!((80_000..150_000).contains(&target), "{target}");
         // No usable sizes -> Lance default.
         let unknown = [FragmentStat {
             bytes: None,
