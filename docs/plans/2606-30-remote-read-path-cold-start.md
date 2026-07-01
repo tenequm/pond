@@ -41,6 +41,8 @@ Each is independently shippable. Validate every change with `cargo fmt --check` 
 
 ## 4. Workstream A - fix #75 (date filter returns empty)
 
+> **SUPERSEDED (shipped):** the fix dropped the `messages_timestamp_zonemap` index outright - the ZoneMap mis-prunes the tz-aware column (an upstream `safe_coerce_scalar` tz drop no literal escapes) - rather than fixing `date_bound`'s literal while preserving pushdown as drafted below. Date bounds now run as a refine over the candidate pool, so the "preserve pushdown" / `@messages_timestamp_zonemap` `--explain` steps below no longer apply.
+
 **Root cause:** `date_bound` (`src/handlers.rs:~1760`) emits a timezone-NAIVE literal:
 ```rust
 let time = if end_of_day { "23:59:59" } else { "00:00:00" };

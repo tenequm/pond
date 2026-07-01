@@ -1067,11 +1067,24 @@ mod search_handler {
         search: &crate::config::SearchConfig,
         clock: &dyn Clock,
     ) -> Result<SearchResponse, ErrorEnvelope> {
+        // Per-stage timing for the search hot path. `pond::perf=debug` surfaces
+        // it; off, each call is a no-op. Cumulative from request start.
+        let stage_start = std::time::Instant::now();
+        macro_rules! stage {
+            ($label:literal) => {
+                tracing::debug!(
+                    target: "pond::perf",
+                    stage = $label,
+                    elapsed_ms = stage_start.elapsed().as_millis() as u64,
+                );
+            };
+        }
         let mut plan = plan_search(request)?;
 
         // A `vector` request degrades to `fts` when the store has no
         // embeddings (nothing to match against); `fts` stays `fts`.
         plan.mode = resolve_effective_mode(store, plan.mode).await?;
+        stage!("resolve_mode");
 
         // `min_score` gates raw cosine, so it is meaningful only for `vector`.
         // BM25 is unbounded and not comparable across queries; reject a
@@ -1108,10 +1121,12 @@ mod search_handler {
                 SearchMode::Vector => {
                     let backend = load_embedder(embedder).await?;
                     let vector = embed_query(backend.as_ref(), &plan.query)?;
+                    stage!("embed_query(+model)");
                     let mut vector_raw = store
                         .vector_search(&vector, plan.vector_pool, &plan.filter, Some(search))
                         .await
                         .map_err(map_storage)?;
+                    stage!("vector_search");
                     retain_non_subagents(&mut vector_raw, plan.exclude_subagents);
                     Ok(normalize_vector(vector_raw))
                 }
@@ -1124,6 +1139,7 @@ mod search_handler {
                 .map_err(map_storage)
         };
         let (candidates, searchable_in_scope) = tokio::try_join!(candidates_fut, scope_fut)?;
+        stage!("arms+scope joined");
 
         if candidates.is_empty() {
             return Ok(empty_response(searchable_in_scope));
@@ -1165,6 +1181,7 @@ mod search_handler {
                     .map_err(map_storage)?
             }
         };
+        stage!("metas_hydrated");
         let meta_index = metas
             .iter()
             .map(|meta| ((meta.session_id.as_str(), meta.message_id.as_str()), meta))
@@ -1206,6 +1223,7 @@ mod search_handler {
         });
 
         let sessions = build_sessions(store, &scored, &plan.query).await?;
+        stage!("build_sessions(parts)");
         page_sessions(
             sessions,
             matched_total,
@@ -1601,13 +1619,19 @@ mod search_handler {
                     .push(hit.meta.message_id.clone());
             }
         }
+        // Per-session parts scans are independent S3 round trips - run them
+        // concurrently, not in a sequential await loop (latency would sum).
+        let summary_futs = user_ids_by_session
+            .iter()
+            .map(|(session_id, message_ids)| async move {
+                store
+                    .summary_parts_for_messages(session_id, message_ids)
+                    .await
+                    .map_err(map_storage)
+            });
         let mut summaries: HashMap<(String, String), Vec<PartSummary>> = HashMap::new();
-        for (session_id, message_ids) in &user_ids_by_session {
-            for (key, parts) in store
-                .summary_parts_for_messages(session_id, message_ids)
-                .await
-                .map_err(map_storage)?
-            {
+        for parts_by_message in futures::future::try_join_all(summary_futs).await? {
+            for (key, parts) in parts_by_message {
                 summaries.insert(
                     key,
                     parts

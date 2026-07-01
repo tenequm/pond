@@ -331,6 +331,27 @@ impl Store {
         })
     }
 
+    /// Like [`Self::open_with_options`], plus the on-disk `_indices/*` cache
+    /// rooted at `index_cache_dir` (see [`Handle::open_with_options_cached`]).
+    pub async fn open_with_options_cached(
+        location: &Url,
+        storage_options: std::collections::HashMap<String, String>,
+        caps: crate::substrate::RuntimeCaps,
+        index_cache_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            handle: Handle::open_with_options_cached(
+                location,
+                storage_options,
+                caps,
+                index_cache_dir,
+            )
+            .await?,
+            rowmap: ArcSwapOption::empty(),
+            embedder: None,
+        })
+    }
+
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
     /// a `file://...` URL via [`config::url_for_path`] before opening. Routes
     /// through [`Store::open_with_options`] so the production policy is
@@ -455,7 +476,7 @@ impl Store {
     async fn import_clean_table(&self, table: Table, dataset: Dataset) -> Result<(usize, usize)> {
         // Force the destination table into existence up front: an empty
         // archive table yields zero batches, so merge_insert alone would
-        // leave a lazily-created table (parts) missing on the destination.
+        // leave a lazily-created table (sessions or parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
         self.merge_scanner(table, dataset.scan(), "archive import")
             .await
@@ -675,8 +696,8 @@ impl Store {
         source_sessions: usize,
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front so a lazily
-        // created table (parts) is never left missing when its slice is empty -
-        // same reason as the archive import path.
+        // created table (sessions or parts) is never left missing when its slice
+        // is empty - same reason as the archive import path.
         let _ = self.handle.dataset(table).await?;
 
         let appended = self
@@ -1729,14 +1750,20 @@ impl Store {
         {
             tracing::debug!(%error, "fts index prewarm skipped");
         }
+        self.prune_index_cache(cache_dir).await;
         Ok(())
+    }
+
+    /// Reclaim disk-index-cache entries for index versions the store has moved
+    /// past (see `Handle::prune_index_cache`). Best-effort.
+    pub async fn prune_index_cache(&self, cache_dir: &Path) {
+        self.handle.prune_index_cache(cache_dir).await;
     }
 
     /// Stable filesystem-safe cache key: same store URL -> same key, so sibling
     /// pond processes share one map file and distinct stores never collide.
     fn store_key(&self) -> String {
-        let digest = blake3::hash(self.handle.location().as_str().as_bytes());
-        digest.to_hex()[..16].to_owned()
+        crate::substrate::store_key(self.handle.location())
     }
 
     /// Max delta segments before the chain is compacted into a fresh base.
@@ -1786,6 +1813,27 @@ impl Store {
         if let Some(set) = self
             .extend_rowmap_coordinated(cache_dir, &store_key, version)
             .await?
+        {
+            self.rowmap.store(Some(Arc::new(set)));
+        }
+        Ok(())
+    }
+
+    /// Install an already-published rowmap chain for the current version if a
+    /// sibling built one, without building it (no full scan, no build flock).
+    /// For one-shot read commands (`pond search`): a warm sibling makes
+    /// hydration resident; with no chain, search falls back to take_rows for
+    /// that single invocation.
+    pub async fn load_rowmap_if_present(&self, cache_dir: &Path) -> Result<()> {
+        let version = self.messages_version().await?;
+        if let Some(current) = self.rowmap.load_full()
+            && current.version() == version
+        {
+            return Ok(());
+        }
+        if let Some(chain) = discover_chain(cache_dir, &self.store_key())
+            && chain.version() == version
+            && let Ok(set) = RowMetaSet::open(&chain)
         {
             self.rowmap.store(Some(Arc::new(set)));
         }
@@ -2404,10 +2452,21 @@ impl Store {
     }
 
     /// Whether any `messages` row carries a vector (spec.md#search) - the
-    /// signal that lets the `vector` arm run instead of degrading to `fts`. The single-active-
-    /// model invariant (see `MESSAGE_SCALAR_INDICES`) means any non-null
-    /// vector belongs to the current model.
+    /// signal that lets the `vector` arm run instead of degrading to `fts`.
+    /// The IVF index exists only once embeddings cross the activation
+    /// threshold, so its presence proves embeddings exist via a resident
+    /// manifest read - NOT an `IsNotNull("vector")` scan, which Lance cannot
+    /// answer from stats and so reads the whole ~GB vector column from the
+    /// store on every query. Below the threshold (no index yet) fall back to
+    /// the prior `IsNotNull("vector")` `LIMIT 1` probe.
     pub async fn has_embeddings(&self) -> Result<bool> {
+        if self
+            .handle
+            .messages_has_index(MESSAGES_VECTOR_INDEX)
+            .await?
+        {
+            return Ok(true);
+        }
         let scope = Predicate::IsNotNull("vector");
         let mut scanner = self
             .handle
@@ -3112,7 +3171,11 @@ impl Store {
             ));
         }
         let predicate = Predicate::And(clauses);
-        let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
+        // Summary reads (search hits, conversational view) need only the part
+        // metadata in `variant_data` to build a `PartSummary` - never the file
+        // blob - so they skip the `_rowaddr` + `take_blobs` round trip. Only
+        // full-fidelity callers (restore/export/message-mode) read the blobs.
+        let summarizing = part_types.is_some();
         let mut scanner = self
             .handle
             .scan(
@@ -3132,35 +3195,49 @@ impl Store {
                 ),
             )
             .await?;
-        scanner.with_row_address();
-        let batch = scanner.try_into_batch().await.context("scan failed")?;
-        let row_addresses = uint64(&batch, "_rowaddr")?;
-        let mut file_payloads = BTreeMap::<usize, FileData>::new();
-        let mut file_rows = Vec::<(usize, u64, Vec<u8>)>::new();
-        for row in 0..batch.num_rows() {
-            if string(&batch, "type", row)?.as_deref() == Some("file") {
-                let variant_data =
-                    json_column(&batch, "variant_data", row)?.context("variant_data is null")?;
-                file_rows.push((row, row_addresses.value(row), variant_data));
-            }
+        if !summarizing {
+            scanner.with_row_address();
         }
-        if !file_rows.is_empty() {
-            let addresses = file_rows
-                .iter()
-                .map(|(_, address, _)| *address)
-                .collect::<Vec<_>>();
-            let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
-            for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
-                // Legacy blob (lance-encoding:blob): payload is bytes; the
-                // url variant stored its URL as UTF-8 bytes, recovered via
-                // `file_data_from_blob`'s `data_kind = "url"` branch.
-                let payload = file_data_from_blob(&variant_data, &blob.read().await?)?;
-                file_payloads.insert(row, payload);
+        let batch = scanner.try_into_batch().await.context("scan failed")?;
+        let mut file_payloads = BTreeMap::<usize, FileData>::new();
+        if !summarizing {
+            let dataset = std::sync::Arc::new(self.handle.dataset(Table::Parts).await?);
+            let row_addresses = uint64(&batch, "_rowaddr")?;
+            let mut file_rows = Vec::<(usize, u64, Vec<u8>)>::new();
+            for row in 0..batch.num_rows() {
+                if string(&batch, "type", row)?.as_deref() == Some("file") {
+                    let variant_data = json_column(&batch, "variant_data", row)?
+                        .context("variant_data is null")?;
+                    file_rows.push((row, row_addresses.value(row), variant_data));
+                }
+            }
+            if !file_rows.is_empty() {
+                let addresses = file_rows
+                    .iter()
+                    .map(|(_, address, _)| *address)
+                    .collect::<Vec<_>>();
+                let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
+                for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                    // Legacy blob (lance-encoding:blob): payload is bytes; the
+                    // url variant stored its URL as UTF-8 bytes, recovered via
+                    // `file_data_from_blob`'s `data_kind = "url"` branch.
+                    let payload = file_data_from_blob(&variant_data, &blob.read().await?)?;
+                    file_payloads.insert(row, payload);
+                }
             }
         }
         let mut parts_by_message = BTreeMap::<(String, String), Vec<Part>>::new();
         for row in 0..batch.num_rows() {
-            let part = part_from_batch(&batch, row, file_payloads.remove(&row))?;
+            // A summary discards file contents (`PartSummary::for_kind` reads
+            // only `file_name`/`media_type` from `variant_data`); pass an empty
+            // placeholder so `PartKind::File` still deserializes without a blob.
+            let file_data = if summarizing {
+                (string(&batch, "type", row)?.as_deref() == Some("file"))
+                    .then(|| FileData::Bytes(Vec::new()))
+            } else {
+                file_payloads.remove(&row)
+            };
+            let part = part_from_batch(&batch, row, file_data)?;
             parts_by_message
                 .entry((part.session_id.clone(), part.message_id.clone()))
                 .or_default()
@@ -4287,22 +4364,15 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// `embedding_model`: pond's invariant is one active model at a time (a model
 /// swap goes through `pond optimize --force-embed` which drops the IVF_SQ,
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
-/// `vector IS NOT NULL`. `id` lookups are rare and full-scan.
+/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. Do NOT add a
+/// ZoneMap on `timestamp`: it prunes every zone for the tz-aware column, so
+/// date filters return empty (#75) - an upstream `safe_coerce_scalar` tz drop
+/// that no literal form escapes. Date bounds run as a refine over the arm pool.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
         BuiltinIndexType::BTree,
         "messages_session_id_btree",
-    ),
-    // Range-only column (`from_date`/`to_date` -> `timestamp >=` / `<=`,
-    // never exact-equality, never `ORDER BY` against the index). ZoneMap's
-    // per-fragment min/max prunes those filters with no recall loss (measured:
-    // 258 zones -> ~6, ~42x fewer rows scanned on the real S3 corpus), and
-    // skips the global ExternalSort that a BTree would pay during build.
-    (
-        "timestamp",
-        BuiltinIndexType::ZoneMap,
-        "messages_timestamp_zonemap",
     ),
     (
         "source_agent",
@@ -5838,9 +5908,9 @@ mod tests {
 
     #[tokio::test]
     async fn initialized_flips_only_after_first_ingest() -> anyhow::Result<()> {
-        // `open` eagerly creates sessions/messages but `parts` is lazy, so a
-        // configured-but-never-synced store reports uninitialized - the signal
-        // `pond status` uses to render an empty state instead of
+        // `open` eagerly creates only `messages`; `sessions` and `parts` are
+        // lazy, so a configured-but-never-synced store reports uninitialized -
+        // the signal `pond status` uses to render an empty state instead of
         // erroring on the first parts describe.
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
@@ -5878,6 +5948,73 @@ mod tests {
         validator.finish(&store).await?;
 
         assert!(store.initialized().await?, "ingest creates the parts table");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summary_parts_label_a_file_without_reading_its_blob() -> anyhow::Result<()> {
+        // The summary path (search hits, conversational view) labels a file from
+        // `variant_data` (`file_name`/`media_type`) and must NOT fetch the blob -
+        // `scan_parts` substitutes an empty placeholder so `PartKind::File` still
+        // deserializes. The full path keeps reading the real bytes. Guards both.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("file-summary");
+        let message = Message::User {
+            id: "m1".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let blob = "file contents the summary must never read";
+        let part = Part {
+            session_id: session.id.clone(),
+            id: "m1-p0".to_owned(),
+            message_id: "m1".to_owned(),
+            ordinal: 0,
+            provenance: crate::wire::Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::File {
+                media_type: Some("text/plain".to_owned()),
+                file_name: Some("notes.txt".to_owned()),
+                data: FileData::String(blob.to_owned()),
+            },
+        };
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message))
+            .await?;
+        validator.push(&store, 2, IngestEvent::Part(part)).await?;
+        validator.finish(&store).await?;
+
+        let key = (session.id.clone(), "m1".to_owned());
+        let ids = ["m1".to_owned()];
+
+        let summarized = store.summary_parts_for_messages(&session.id, &ids).await?;
+        let summary_part = &summarized.get(&key).expect("file part summarized")[0];
+        let summary = crate::wire::PartSummary::for_kind(&summary_part.kind)
+            .expect("a file part yields a summary");
+        assert_eq!(summary.kind, "file");
+        assert_eq!(summary.label.as_deref(), Some("notes.txt"));
+        match &summary_part.kind {
+            PartKind::File { data, .. } => assert!(
+                matches!(data, FileData::Bytes(bytes) if bytes.is_empty()),
+                "summary must carry the empty placeholder, not the file blob",
+            ),
+            other => panic!("expected a file part, got {other:?}"),
+        }
+
+        let full = store.parts_for_messages(&session.id, &ids).await?;
+        match &full.get(&key).expect("file part")[0].kind {
+            PartKind::File {
+                data: FileData::String(bytes),
+                ..
+            } => assert_eq!(bytes, blob, "full path must still hydrate the real blob"),
+            other => panic!("expected a string-backed file part, got {other:?}"),
+        }
         Ok(())
     }
 
@@ -6718,6 +6855,26 @@ mod tests {
         // authoritative backlog - never derived from FTS num_docs.
         assert_eq!(full.backlog, 0);
         assert_eq!(full.backlog, store.embed_backlog_count().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_rowmap_if_present_installs_published_chain_without_building() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+
+        // No chain published yet: a load-only reader installs nothing and does
+        // not build one.
+        let reader = Store::open_local(temp.path()).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_none());
+
+        // A sibling publishes the chain; the reader then installs it as-is.
+        builder.ensure_rowmap(&cache).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_some());
         Ok(())
     }
 

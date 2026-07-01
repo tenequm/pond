@@ -5,6 +5,11 @@
 // at the same directory level need explicit `#[path]` to point inside the
 // `integration/` folder.
 
+// x86_64-linux trait-solving evaluates the `Send` bound on the create-table
+// future deeper than aarch64-darwin, overflowing the default limit of 128
+// (E0275) when this binary links the index-fold + search suites together.
+#![recursion_limit = "512"]
+
 #[path = "integration/adapter/mod.rs"]
 mod adapter;
 #[path = "integration/copy.rs"]

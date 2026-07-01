@@ -972,6 +972,7 @@ fn spawn_prewarm(store: Arc<Store>) {
             if let Err(error) = store.ensure_rowmap(&cache_dir).await {
                 tracing::debug!(%error, "rowmap refresh skipped");
             }
+            store.prune_index_cache(&cache_dir).await;
         }
     });
 }
@@ -1029,7 +1030,7 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (resolved, store) = open_store(storage_path, &loaded, false).await?;
+            let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             if !store.initialized().await? {
                 match format {
                     OutputFormat::Json => output(&status_json_empty(&resolved)?)?,
@@ -1104,7 +1105,7 @@ async fn main() -> anyhow::Result<()> {
             let loaded = Config::load(&config_file)?;
             // sync ingests through `upsert_session_batch`, which embeds inline;
             // it has no query path, so this is its own resident embedder.
-            let (_, store) = open_store(storage_path, &loaded, true).await?;
+            let (_, store) = open_store(storage_path, &loaded, true, false).await?;
             let store = store.with_embedder(Arc::new(LazyEmbedder::candle()));
             let import_started = std::time::Instant::now();
             let import_summary =
@@ -1160,7 +1161,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, true).await?;
+            let (_, store) = open_store(storage_path, &loaded, true, false).await?;
             if let Some(name) = drop_index {
                 store
                     .drop_index_by_name(&name)
@@ -1244,7 +1245,7 @@ async fn main() -> anyhow::Result<()> {
             // inline embed-at-ingest path (the store), so the model loads once.
             let embedder = Arc::new(LazyEmbedder::candle());
             let store = Arc::new(
-                open_store(storage_path, &config, true)
+                open_store(storage_path, &config, true, true)
                     .await?
                     .1
                     .with_embedder(embedder.clone()),
@@ -1276,7 +1277,7 @@ async fn main() -> anyhow::Result<()> {
             // inline embed-at-ingest path.
             let embedder = Arc::new(LazyEmbedder::candle());
             let store = Arc::new(
-                open_store(storage_path, &config, true)
+                open_store(storage_path, &config, true, true)
                     .await?
                     .1
                     .with_embedder(embedder.clone()),
@@ -1304,7 +1305,7 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             let embedder = LazyEmbedder::candle();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1326,6 +1327,11 @@ async fn main() -> anyhow::Result<()> {
                 output(&plans)?;
                 return Ok(());
             }
+            // A warm sibling's rowmap makes hydration resident; absent one,
+            // search falls back to take_rows for this one-shot invocation.
+            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+                tracing::debug!(%error, "rowmap load skipped; hydration uses take_rows");
+            }
             let envelope =
                 handlers::pond_search(&store, &embedder, request.clone(), &loaded.search).await;
             if !render_search_envelope(format, &envelope, &request)? {
@@ -1345,7 +1351,7 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
             let request = GetRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -1412,7 +1418,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
@@ -1539,6 +1545,7 @@ async fn open_store_with_spinner(
     location: &Url,
     storage: HashMap<String, String>,
     caps: pond::substrate::RuntimeCaps,
+    index_cache_dir: Option<PathBuf>,
 ) -> anyhow::Result<Store> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -1546,7 +1553,7 @@ async fn open_store_with_spinner(
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    let result = Store::open_with_options(location, storage, caps).await;
+    let result = Store::open_with_options_cached(location, storage, caps, index_cache_dir).await;
     spinner.finish_and_clear();
     result
 }
@@ -1580,22 +1587,30 @@ async fn open_store(
     explicit: Option<StorageUrl>,
     loaded: &Config,
     spinner: bool,
+    index_cache: bool,
 ) -> anyhow::Result<(ResolvedStorage, Store)> {
     let storage = resolve_storage_location(explicit, loaded)?;
     let resolved = storage.resolve(&loaded.creds)?;
     warn_unmatched_sets(&[&resolved], loaded)?;
+    // The disk index cache is scoped to the read-serving commands (serve, mcp,
+    // search) - the ones that repeatedly pay the cold index load. Every other
+    // command skips it: caching their index reads buys nothing and would
+    // populate a cache they never GC (GC runs in the server's prewarm loop).
+    let index_cache_dir = index_cache.then(default_cache_dir);
     let store = if spinner {
         open_store_with_spinner(
             resolved.lance_url(),
             resolved.options.clone(),
             runtime_caps(loaded),
+            index_cache_dir,
         )
         .await?
     } else {
-        Store::open_with_options(
+        Store::open_with_options_cached(
             resolved.lance_url(),
             resolved.options.clone(),
             runtime_caps(loaded),
+            index_cache_dir,
         )
         .await?
     };
@@ -2109,7 +2124,7 @@ async fn copy_store_to_archive(
     path: &Path,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false).await?;
     let summary = export_pond_archive(&store, path).await?;
     output(&format!(
         "{} {}  sessions={} messages={} parts={}",
@@ -2129,7 +2144,7 @@ async fn copy_store_to_jsonl(
     path: Option<PathBuf>,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false).await?;
     let to_stdout = path.is_none();
     let summary = match path {
         Some(path) => {
@@ -2167,7 +2182,7 @@ async fn copy_store_to_jsonl(
 /// store via the idempotent union merge.
 async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> anyhow::Result<()> {
     let cmd_started = std::time::Instant::now();
-    let (_, store) = open_store(Some(to), loaded, false).await?;
+    let (_, store) = open_store(Some(to), loaded, false, false).await?;
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();

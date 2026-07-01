@@ -56,7 +56,7 @@ Two open-source projects were examined as the nearest neighbors to pond. Neither
 - Contextual Retrieval - Anthropic engineering blog, 2024 (not on arXiv). BM25 + dense retrieval cuts top-20 retrieval failure ~49% versus dense alone, across code, prose, and structured documents. Empirical backing for pond's hybrid.
 - Dense X Retrieval (arXiv:2312.06648) - EMNLP 2024. A retrieval-granularity study: finer atomic units beat passage-level chunks. This is the empirical defense of message-granularity indexing - pond does not need to argue the choice, this paper already did.
 - Lost in the Middle (arXiv:2307.03172) - TACL 2024. Models barely use information in the middle of their context. Implication for pond: precision at rank 1-3 matters far more than recall at rank 20. Rank well and return few.
-- Toward Conversational Agents with Context- and Time-Sensitive Long-term Memory (arXiv:2406.00057). Pure semantic + BM25 retrieval fails on temporal and metadata queries ("what did I try last Tuesday"). pond's `search-prefilter-pushdown` plus a timestamp scalar index already addresses this - a seam to keep, not add.
+- Toward Conversational Agents with Context- and Time-Sensitive Long-term Memory (arXiv:2406.00057). Pure semantic + BM25 retrieval fails on temporal and metadata queries ("what did I try last Tuesday"). pond's `search-prefilter-pushdown` already addresses this - temporal and metadata bounds run pre-rank (a refine for `timestamp`, which is deliberately unindexed) - a seam to keep, not add.
 
 ### 3.2 Retrieval over agent sessions - pond's actual use case
 

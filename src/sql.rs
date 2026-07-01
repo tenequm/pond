@@ -1043,7 +1043,7 @@ fn enrich(message: &str) -> String {
         (
             "LIKE prefix queries are not supported for bitmap indexes",
             "prefix LIKE ('x%') and starts_with() fail on bitmap-indexed columns \
-             (messages.source_agent, messages.role). Use equality, \
+             (messages.source_agent). Use equality, \
              split_part(source_agent, '/', 1) = '...', or an infix pattern (LIKE '%x%').",
         ),
         (

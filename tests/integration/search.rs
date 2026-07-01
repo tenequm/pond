@@ -156,6 +156,71 @@ async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
     anyhow::bail!("no usable text in the fixture corpus")
 }
 
+/// A fresh process searching a remote store must serve `_indices/*` from the
+/// on-disk cache, not the store. A second `Store` over the same shared-memory
+/// bytes has an empty in-memory index cache, so its search reads the index
+/// files through the wrapper and populates the disk cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_disk_cache_populates_from_a_fresh_reader() -> anyhow::Result<()> {
+    fn has_cached_index(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                entry.file_name() == "_indices" || has_cached_index(&path)
+            } else {
+                false
+            }
+        })
+    }
+
+    let cache = TempDir::new()?;
+    let url = url::Url::parse("shared-memory://pond-test-index-disk-cache/")?;
+    let caps = pond::substrate::RuntimeCaps::default();
+
+    let writer = Store::open_with_options(&url, std::collections::HashMap::new(), caps).await?;
+    ingest_adapter(
+        &writer,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &pond::adapter::NoopOracle,
+        |_| {},
+    )
+    .await?;
+    EmbedWorker::new(&writer, &FakeBackend).run().await?;
+    writer
+        .optimize_indices(None, &MaintenancePolicy::always_compact())
+        .await?
+        .into_result()?;
+    let phrase = corpus_phrase(&writer).await?;
+
+    let reader = Store::open_with_options_cached(
+        &url,
+        std::collections::HashMap::new(),
+        caps,
+        Some(cache.path().to_path_buf()),
+    )
+    .await?;
+    let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn Embedder>);
+    let hits = hits_of(
+        pond_search(
+            &reader,
+            &embedder,
+            search_request(&phrase),
+            &search_config(),
+        )
+        .await,
+    );
+    assert!(!hits.is_empty(), "fresh reader must still return hits");
+    assert!(
+        has_cached_index(cache.path()),
+        "search through the wrapper must cache _indices files under {}",
+        cache.path().display(),
+    );
+    Ok(())
+}
+
 /// The default `vector` arm degrades to FTS-only when the store has no
 /// embeddings. Either way the corpus must yield scored, [0,1]-normalized hits.
 #[tokio::test(flavor = "multi_thread")]
@@ -227,6 +292,18 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     let mut request = search_request(&phrase);
     request.filters.from_date = Some("2099-01-01".to_owned());
     assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
+
+    // #75: a wide far-past..far-future window must keep every hit, not prune the corpus.
+    let unfiltered =
+        hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)
+            .len();
+    let mut request = search_request(&phrase);
+    request.filters.from_date = Some("2000-01-01".to_owned());
+    request.filters.to_date = Some("2099-12-31".to_owned());
+    assert_eq!(
+        hits_of(pond_search(&store, &embedder, request, &search_config()).await).len(),
+        unfiltered,
+    );
 
     // project (contains): every hit is scoped to the requested project.
     let project =

@@ -169,7 +169,6 @@ When retry is exhausted on a write, the substrate raises a typed conflict signal
 | Family | Fold on `pond optimize --only index` | Why |
 |---|---|---|
 | BTree (scalar) | `optimize_indices(append)` | Merges existing sorted index pages with only the new fragments' data; never re-scans already-indexed source. |
-| ZoneMap (scalar) | `optimize_indices(append)` | Trains zones over only the new data; `can_remap == false`, so a compaction row rewrite forces a rebuild. |
 | Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
 | Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
 | IVF_SQ (vector) | `optimize_indices(append)` | Stable-row-id IVF supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and per-dimension SQ ranges carry forward. |
@@ -373,7 +372,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `parent_session_id`, `parent_message_id` | nullable fork pointers |
 | `source_agent` | low cardinality; the scalar-indexed copy is the denormalized `messages.source_agent` (5.3) |
 | `created_at` | source-recorded |
-| `project` | the scalar-indexed copy is the denormalized `messages.project` (5.3) |
+| `project` | the denormalized copy is `messages.project` (5.3) |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
 
 `messages` - one row per Message:
@@ -381,9 +380,10 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | Column | Notes |
 |---|---|
 | `session_id`, `id` | composite primary key; clustered on `(session_id, timestamp)` |
-| `timestamp` | scalar-indexed; canonical ordering key |
-| `role` | scalar-indexed |
-| `source_agent`, `project` | denormalized; the scalar-indexed filter-pushdown surface |
+| `timestamp` | canonical ordering key |
+| `role` | message role |
+| `source_agent` | denormalized; scalar-indexed filter-pushdown surface |
+| `project` | denormalized filter column |
 | `content` | non-null only for system messages |
 | `search_text` | the indexed retrieval text (Section 8); full-text indexed |
 | `vector` | Float16 embedding of `search_text` (5.5, Section 8); nullable - null until embedded |
