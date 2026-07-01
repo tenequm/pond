@@ -1,25 +1,32 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
-//! Store-to-store `pond copy` microbenchmark. Proves the two properties the
-//! incremental copy path is supposed to have:
+//! pond write-path benchmark. Exercises and profiles every path that writes to
+//! a store - on local, in-memory, or a real S3 dest (`--dest-url`):
 //!
-//!   1. **Streaming beats temp-staging on a full copy.** The new path streams
-//!      the source scan straight into the destination - appending absent
-//!      sessions under one commit per table; the old path rewrote every row
-//!      into a local staging dataset first, then re-read it. Both are timed
-//!      back to back on identical inputs, and the new path's commit count is
-//!      printed to show it does not scale with scan batches.
+//!   1. **Full copy: streaming append beats temp-staging and merge-insert.**
+//!      Absent sessions stream straight in, appending under one commit per
+//!      table; the old path rewrote every row into a local staging dataset
+//!      first. `--only append|merge` isolates each as the first (cold) S3 op.
 //!   2. **A re-copy is delta-proportional.** After a full copy, a no-op re-copy
-//!      moves zero rows (detection only), and a one-session delta moves only
-//!      that session - not the whole corpus.
+//!      moves zero rows (detection only); a one-session delta moves only that
+//!      session - not the whole corpus.
+//!   3. **Append commit-size sweep** (`--append-sweep`): rows/s vs #commits vs
+//!      ms/commit - the per-commit latency floor vs the bandwidth ceiling.
+//!   4. **Optimize/finalize profiling** (`--profile-optimize`): the sync
+//!      finalize write path - per-table, per-phase (compact / index-append)
+//!      elapsed_ms plus fragment counts, so compaction churn and the
+//!      scalar/FTS/vector fold cost are visible. `--skip-build` profiles an
+//!      already-populated store (e.g. an s5cmd clone); `--no-grow` re-optimizes
+//!      static data to expose net-zero compaction churn.
 //!
-//! Wall times are printed per scenario; this is the harness that shows the
-//! optimization is real and stayed real.
+//! Wall times print per scenario; this is the harness that shows the write-path
+//! optimizations are real and stay real.
 //!
 //! Run:
-//!   cargo bench --bench copy_bench
-//!   cargo bench --bench copy_bench -- --sessions 2000 --messages 8
-//!   cargo bench --bench copy_bench -- --backend memory
+//!   cargo bench --bench write_bench
+//!   cargo bench --bench write_bench -- --sessions 2000 --messages 8
+//!   cargo bench --bench write_bench -- --only append --dest-url <s3-base>
+//!   cargo bench --bench write_bench -- --profile-optimize <dir> --dest-url <s3> --skip-build --grown 3
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,8 +41,9 @@ use pond::{
     handlers::ingest_events,
     sessions::{DeltaPlan, IngestEvent, IngestValidator, Store},
     substrate::{
-        DEFAULT_SYNC_CLEANUP_INTERVAL, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn,
-        RuntimeCaps, StorageUrl, Table,
+        DEFAULT_COMPACTION_FRAGMENT_CAP, DEFAULT_SYNC_CLEANUP_INTERVAL,
+        DEFAULT_SYNC_SCALAR_FOLD_ROWS, MaintenancePolicy, OptimizeEvent, OptimizeProgressFn,
+        RuntimeCaps, StorageUrl, Table, default_cleanup_older_than,
     },
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
@@ -44,7 +52,7 @@ use url::Url;
 
 #[derive(Parser)]
 #[command(
-    about = "pond store-to-store copy microbenchmark: streaming vs temp-staging, delta scaling"
+    about = "pond write-path benchmark: copy (append/merge/staging), append-sweep, optimize/compaction profiling"
 )]
 struct Args {
     /// Number of sessions to seed into the source store.
@@ -108,6 +116,23 @@ struct Args {
     /// its elapsed_ms so the fold-vs-rebuild cost is visible per index.
     #[arg(long)]
     profile_optimize: Option<PathBuf>,
+    /// `--profile-optimize` only: skip seed+build; the `--dest-url` store is
+    /// already populated and indexed (e.g. an s5cmd clone of a real store).
+    /// Opens `--dest-url` as-is (no `-profile` suffix) and goes straight to the
+    /// grown A/B fold rounds, so a prod-scale scalar fold can be measured
+    /// without paying the copy+build first.
+    #[arg(long)]
+    skip_build: bool,
+    /// `--profile-optimize` only: skip the per-round append and just re-run
+    /// optimize on static data. Proves whether compaction churns - re-compacts
+    /// the same fragments every run for a net-zero fragment-count change.
+    #[arg(long)]
+    no_grow: bool,
+    /// Dump the per-fragment row/byte/deletion distribution for all 3 tables of
+    /// the `--dest-url` (or `--source-url`) store, then exit. Manifest-only, no
+    /// writes - diagnoses why compaction keeps selecting the same fragments.
+    #[arg(long)]
+    frag_stats: bool,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -400,14 +425,75 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let total_rows = args.sessions * args.messages;
     println!(
-        "copy_bench: backend={} sessions={} messages/session={} (~{} message rows)\n",
+        "write_bench: backend={} sessions={} messages/session={} (~{} message rows)\n",
         args.backend, args.sessions, args.messages, total_rows,
     );
+
+    if args.frag_stats {
+        let url = args
+            .dest_url
+            .clone()
+            .or_else(|| args.source_url.clone())
+            .expect("--frag-stats needs --dest-url or --source-url");
+        let store = open_configured(&url).await?;
+        println!("fragment distribution for {url}\n");
+        for table in [Table::Messages, Table::Parts, Table::Sessions] {
+            let dataset = store.dataset(table).await?;
+            let mut stats: Vec<(u64, u64, u64)> = dataset
+                .get_fragments()
+                .iter()
+                .map(|f| {
+                    let m = f.metadata();
+                    let rows = m.physical_rows.unwrap_or(0) as u64;
+                    let bytes = m
+                        .files
+                        .iter()
+                        .try_fold(0u64, |t, file| Some(t + file.file_size_bytes.get()?.get()))
+                        .unwrap_or(0);
+                    let del = m
+                        .deletion_file
+                        .as_ref()
+                        .and_then(|d| d.num_deleted_rows)
+                        .unwrap_or(0) as u64;
+                    (rows, bytes, del)
+                })
+                .collect();
+            stats.sort();
+            let total_rows: u64 = stats.iter().map(|s| s.0).sum();
+            let total_bytes: u64 = stats.iter().map(|s| s.1).sum();
+            let with_del = stats.iter().filter(|s| s.2 > 0).count();
+            println!(
+                "{} - {} fragments, {} rows, {:.0} MB, {} with deletions:",
+                table.as_str(),
+                stats.len(),
+                total_rows,
+                total_bytes as f64 / 1e6,
+                with_del,
+            );
+            for (rows, bytes, del) in &stats {
+                let brow = if *rows > 0 {
+                    *bytes as f64 / *rows as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "  rows={rows:>8}  {:>7.1} MB  {brow:>6.0} B/row  deleted={del}",
+                    *bytes as f64 / 1e6,
+                );
+            }
+            println!();
+        }
+        return Ok(());
+    }
 
     if let Some(dir) = &args.profile_optimize {
         let store = match &args.dest_url {
             Some(base) => {
-                let url = format!("{base}-profile");
+                let url = if args.skip_build {
+                    base.clone()
+                } else {
+                    format!("{base}-profile")
+                };
                 println!("store (scratch, clean up): {url}\n");
                 open_configured(&url).await?
             }
@@ -416,49 +502,92 @@ async fn main() -> Result<()> {
                 Store::open_local(dir).await?
             }
         };
-        let policy = MaintenancePolicy::always_compact();
-        let t = Instant::now();
-        ingest_batched(
-            &store,
-            (0..args.sessions).map(|index| session_events(index, args.messages)),
-        )
-        .await?;
-        println!(
-            "seed base: {} sessions x {} msgs = {} rows  ({} ms)\n",
-            args.sessions,
-            args.messages,
-            args.sessions * args.messages,
-            t.elapsed().as_millis(),
-        );
+        if args.skip_build {
+            let (sessions, rows, _) = store.row_counts().await?;
+            println!(
+                "skip-build: pre-populated store, {sessions} sessions / {rows} message rows\n"
+            );
+        } else {
+            let policy = MaintenancePolicy::always_compact();
+            let t = Instant::now();
+            if let Some(src) = &args.source_url {
+                let source = open_configured(src).await?;
+                let (plan, _, _) = streaming_copy(&source, &store).await?;
+                let (_, rows, _) = store.row_counts().await?;
+                println!(
+                    "copy source {src}: {} sessions, {rows} message rows  ({} ms)\n",
+                    plan.total(),
+                    t.elapsed().as_millis(),
+                );
+            } else {
+                ingest_batched(
+                    &store,
+                    (0..args.sessions).map(|index| session_events(index, args.messages)),
+                )
+                .await?;
+                println!(
+                    "seed base: {} sessions x {} msgs = {} rows  ({} ms)\n",
+                    args.sessions,
+                    args.messages,
+                    args.sessions * args.messages,
+                    t.elapsed().as_millis(),
+                );
+            }
 
-        println!("optimize #1 - from-scratch index BUILD over the whole base:");
-        let t1 = Instant::now();
-        store
-            .optimize_indices(Some(phase_printer("build")), &policy)
-            .await?;
-        println!("  build total: {} ms\n", t1.elapsed().as_millis());
+            println!("optimize #1 - from-scratch index BUILD over the whole base:");
+            let t1 = Instant::now();
+            store
+                .optimize_indices(Some(phase_printer("build")), &policy)
+                .await?;
+            println!("  build total: {} ms\n", t1.elapsed().as_millis());
+        }
 
-        let sync_policy = MaintenancePolicy::always_compact()
-            .with_cleanup_interval(DEFAULT_SYNC_CLEANUP_INTERVAL);
+        // Match a real `pond sync`: compaction veto ON (cap 64) so a tiny append
+        // does not trigger a full-table fragment rewrite, cleanup amortized.
+        // before = fold scalar every sync (threshold 0); after = defer (50k).
+        let base = MaintenancePolicy {
+            compaction_fragment_cap: DEFAULT_COMPACTION_FRAGMENT_CAP,
+            cleanup_older_than: default_cleanup_older_than(),
+            cleanup_interval: DEFAULT_SYNC_CLEANUP_INTERVAL,
+            scalar_fold_row_threshold: 0,
+        };
+        let before_policy = base;
+        let after_policy = base.with_scalar_fold_row_threshold(DEFAULT_SYNC_SCALAR_FOLD_ROWS);
         println!(
-            "optimize #2 - {} incremental folds at the sync cleanup interval ({}); each round \
-             appends a small tail and finalizes, like one cron sync. A round with NO `cleanup` \
-             line skipped the ~per-table version-log walk:",
-            args.grown, DEFAULT_SYNC_CLEANUP_INTERVAL,
+            "optimize #2 - {} sync-like fold round(s), realistic policy (compaction veto on). \
+             Even rounds = before (fold scalar every sync); odd = after (defer scalar). The \
+             per-table index-append phase line is the scalar fold that batching removes:",
+            args.grown,
         );
+        let frag_counts = async |store: &Store| -> Result<(usize, usize, usize)> {
+            Ok((
+                store.dataset(Table::Messages).await?.get_fragments().len(),
+                store.dataset(Table::Parts).await?.get_fragments().len(),
+                store.dataset(Table::Sessions).await?.get_fragments().len(),
+            ))
+        };
         for round in 0..args.grown {
-            ingest_batched(
-                &store,
-                std::iter::once(grow_events(round, args.messages, args.messages)),
-            )
-            .await?;
+            if !args.no_grow {
+                ingest_batched(
+                    &store,
+                    std::iter::once(grow_events(round, args.messages, args.messages)),
+                )
+                .await?;
+            }
             let version = store.dataset(Table::Messages).await?.version_id();
+            let (label, policy) = if round % 2 == 0 {
+                ("before", &before_policy)
+            } else {
+                ("after ", &after_policy)
+            };
+            let (mb, pb, sb) = frag_counts(&store).await?;
             let started = Instant::now();
             store
-                .optimize_indices(Some(phase_printer("fold")), &sync_policy)
+                .optimize_indices(Some(phase_printer(label)), policy)
                 .await?;
+            let (ma, pa, sa) = frag_counts(&store).await?;
             println!(
-                "  round {round:>2}  messages.v={version}  finalize total: {} ms",
+                "  round {round:>2} [{label}] v={version}  total: {} ms  | fragments msgs {mb}->{ma}  parts {pb}->{pa}  sess {sb}->{sa}",
                 started.elapsed().as_millis(),
             );
         }
