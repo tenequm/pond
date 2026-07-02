@@ -105,6 +105,8 @@ jobs:
     # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
     # the /ci-cache PVC (release-plz runs `cargo publish` here).
     runs-on: pond-ci
+    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    timeout-minutes: 90
     permissions:
       contents: write   # `gh release upload` to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run

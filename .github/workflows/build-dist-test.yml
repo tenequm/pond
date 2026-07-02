@@ -17,7 +17,8 @@ jobs:
   # while that cron still exists.
   publish-release:
     runs-on: pond-ci
-    timeout-minutes: 60
+    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    timeout-minutes: 90
     env:
       BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
       CARGO_HOME: /ci-cache/cargo
