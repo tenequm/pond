@@ -15,7 +15,7 @@ permissions:
 jobs:
   publish-release:
     runs-on: pond-ci
-    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    # Cold 4-target dist build measured 56m; kache-served rebuild 24m.
     timeout-minutes: 90
     env:
       MOON_REMOTE_HOST: grpcs://bazel-remote.cascade.fyi:443
