@@ -44,3 +44,4 @@ mod transport_http;
 mod transport_mcp;
 
 // CI cache-buster: exercises a real compile on the ARC runner (attempt 4).
+// (2nd touch: measures warm-incremental compile timing on the ARC runner.)
