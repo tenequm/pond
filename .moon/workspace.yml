@@ -13,7 +13,8 @@ hasher:
     - '.agents/**/*'
 
 remote:
-  host: 'grpcs://bazel-remote.cascade.fyi:443'
+  # Enabled per-context via MOON_REMOTE_HOST (unset = remote cache off).
+  # Fork PRs get no secrets; an empty auth header hard-fails the task.
   auth:
     headers:
       Authorization: '${BAZEL_REMOTE_AUTH}'

@@ -88,8 +88,7 @@ tasks:
       target/dist/pond-x86_64-unknown-linux-gnu completions fish > completions/pond.fish
 
       # Package into the archive names brew/nix reference, `pond` at the root.
-      # rm first: the self-hosted runner persists dist/ across runs, so stale
-      # files (e.g. goreleaser-era leftovers) must not accumulate.
+      # rm first: moon can hydrate a previously cached dist/ into the tree.
       rm -rf dist
       mkdir -p dist
       for t in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
