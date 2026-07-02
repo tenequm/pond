@@ -156,6 +156,14 @@ jobs:
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
           docker buildx rm pond-hetzner 2>/dev/null || true
+          # A previous run's statefulset survives at replicas=0 (autoshutdown);
+          # buildx create waits on an existing statefulset without scaling it,
+          # so scale it up ourselves first (404 = none yet, buildx creates it).
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          curl -fsS --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" \
+            -X PATCH -H 'Content-Type: application/merge-patch+json' \
+            "https://kubernetes.default.svc/apis/apps/v1/namespaces/pond-buildkit/statefulsets/pond-hetzner0/scale" \
+            -d '{"spec":{"replicas":1}}' -o /dev/null || true
           # PVC -> StatefulSet so the RUN --mount=type=cache dirs survive autoshutdown
           # scale-to-0 (x402 buildkit-autoshutdown chart). Needs buildx >= v0.34.0.
           docker buildx create --name pond-hetzner --driver kubernetes \

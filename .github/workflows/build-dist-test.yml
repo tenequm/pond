@@ -67,6 +67,13 @@ jobs:
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
           docker buildx rm pond-hetzner 2>/dev/null || true
+          # Stale 0-replica statefulset from a previous run: buildx create
+          # waits on it without scaling, so scale it up ourselves (404 ok).
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          curl -fsS --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" \
+            -X PATCH -H 'Content-Type: application/merge-patch+json' \
+            "https://kubernetes.default.svc/apis/apps/v1/namespaces/pond-buildkit/statefulsets/pond-hetzner0/scale" \
+            -d '{"spec":{"replicas":1}}' -o /dev/null || true
           docker buildx create --name pond-hetzner --driver kubernetes \
             --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
             --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
