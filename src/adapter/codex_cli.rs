@@ -31,7 +31,7 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, TAIL_CAP, jsonl_tree_discover, jsonl_tree_events, read_tail},
+    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_mapped},
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -277,21 +277,18 @@ impl JsonlTree for CodexCliAdapter {
         // Pond stores the envelope `timestamp` only for `response_item` rows
         // (`event_msg`/`turn_context` get the session-start default), so the
         // session's max stored timestamp is its last response_item's. Scan a
-        // bounded tail backward for it - never the whole file.
-        let tail = read_tail(path, TAIL_CAP)?;
-        tail.split(|&byte| byte == b'\n')
-            .rev()
-            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-            .find(|row| row.get("type").and_then(Value::as_str) == Some("response_item"))
-            .and_then(|row| {
+        // bounded tail backward for it - never the whole file. The nested
+        // `Option` keeps the walk stopping at the newest response_item even
+        // when its timestamp fails to parse, exactly like the pre-seam walk.
+        peek_last_mapped(path, |line| {
+            let row: Value = serde_json::from_str(line).ok()?;
+            (row.get("type").and_then(Value::as_str) == Some("response_item")).then(|| {
                 let text = row.get("timestamp").and_then(Value::as_str)?;
-                Some(
-                    DateTime::parse_from_rfc3339(text)
-                        .ok()?
-                        .with_timezone(&Utc)
-                        .timestamp_micros(),
-                )
+                DateTime::parse_from_rfc3339(text)
+                    .ok()
+                    .map(|ts| ts.with_timezone(&Utc).timestamp_micros())
             })
+        })?
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
