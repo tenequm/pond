@@ -27,4 +27,7 @@ call time, don't guess.
 `brew install tenequm/tap/pond` (or `cargo binstall pond-db`, or `nix profile
 install github:tenequm/pond-nix#pond`), then `pond init`, then `claude mcp add -s
 user pond -- pond mcp`. Keep current with `pond sync`; `pond --help` for the rest.
+Claude.ai chats are not synced automatically - request a data export
+(claude.ai Settings -> Privacy -> Export data, arrives as an emailed `.zip`),
+then `pond sync claude-ai-export --path <export.zip>`.
 Docs: https://pond.locker/

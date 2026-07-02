@@ -1187,15 +1187,15 @@ async fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("drop_index({name}) failed"))?;
                 output(&format!("optimize: dropped index {name}"))?;
             } else if rebuild {
-                // Migration path: bring the store to the regular-optimize end
-                // state (embed + fold + compaction + cleanup), then rebuild
+                // Recovery/migration path: fill the embed backlog, rebuild
                 // every index from scratch so it adopts current params, then
-                // reclaim the segments the rebuild superseded.
+                // reclaim the segments the rebuild superseded. The incremental
+                // fold is deliberately not run first: the rebuild discards its
+                // output, and a structurally broken index - the fault
+                // --rebuild exists to repair - fails the fold, which would
+                // make the recovery path unreachable.
                 let policy = configured_maintenance_policy(&loaded, None)?;
-                let outcome = finalize_indexes(&store, &policy, force_embed).await?;
-                if outcome.any_indices_failed() {
-                    std::process::exit(1);
-                }
+                run_embed_stage(&store, force_embed).await?;
                 let (progress, bar) = optimize_progress_bar();
                 let result = store.rebuild_indices(None, Some(progress)).await;
                 bar.finish_and_clear();
@@ -4055,6 +4055,12 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
                 &format!("error  indices on {}: {error:#}", entry.table.as_str()),
                 red(),
             ))?;
+            if pond::substrate::is_index_error(error) {
+                output(&format!(
+                    "{}  structural index fault; recover with `pond optimize --rebuild`",
+                    paint("hint", dim()),
+                ))?;
+            }
         }
         if let PhaseOutcome::Failed(error) = &entry.compaction {
             output(&paint(
