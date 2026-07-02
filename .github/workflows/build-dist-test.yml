@@ -2,7 +2,12 @@
 # buildx -> cross-compile) without cutting a release. Delete before merging.
 name: build-dist-test
 
-on: workflow_dispatch
+# pull_request scoped to this file: dispatch would need the workflow on the
+# default branch; this way it runs inside the PR whenever this file changes.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/build-dist-test.yml']
 
 permissions:
   contents: read
