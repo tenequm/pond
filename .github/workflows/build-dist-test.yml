@@ -13,7 +13,10 @@ permissions:
   contents: read
 
 jobs:
-  build-dist:
+  # Named publish-release so buildkit-autoshutdown keeps the builder node up
+  # while it runs (the hourly cron scales to 0 unless a job with exactly this
+  # name is active - it killed the previous attempt mid-build).
+  publish-release:
     runs-on: pond-ci
     timeout-minutes: 60
     env:
