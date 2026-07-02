@@ -1,9 +1,12 @@
 # Import a Claude.ai export
 
-The `claude-ai-export` adapter ingests a Claude.ai data export. It's a manual download, so it isn't auto-discovered:
+Claude.ai conversations have no local session files, so they arrive via the official data export instead of `pond sync`'s auto-discovery:
+
+1. On claude.ai, open Settings -> Privacy -> Export data. The export arrives by email as a `.zip` link.
+2. Download it and run:
 
 ```sh
-pond sync claude-ai-export --path <path-to-export>
+pond sync claude-ai-export --path <path-to-export.zip>
 ```
 
-`--path` is a one-off override that bypasses config and writes nothing.
+`--path` accepts the `.zip` directly, an extracted directory, or a bare `conversations.json`; it is a one-off override that bypasses config and writes nothing. The import is idempotent - re-running with a newer export adds only what is new.

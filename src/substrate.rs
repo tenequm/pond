@@ -1429,6 +1429,15 @@ fn is_conflict_exhausted(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ConflictExhausted>())
 }
 
+/// True when the chain root is Lance's `Index` error class - a structural
+/// index fault (e.g. delta segments with mismatched posting tail codecs) that
+/// retry cannot clear and only a from-scratch rebuild repairs.
+pub fn is_index_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<lance::Error>()
+        .is_some_and(|err| matches!(err, lance::Error::Index { .. }))
+}
+
 /// On-disk byte totals for the three session datasets, plus everything else
 /// under the data-dir root. Sized by listing through Lance's object-store
 /// layer (spec.md#lance-chokepoints-storage) so `file://` and `s3://` behave alike.
@@ -3885,6 +3894,18 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn is_index_error_matches_lance_index_class_through_context() {
+        let index_fault = anyhow::Error::from(lance::Error::index(
+            "cannot merge inverted index segments with different posting tail codecs",
+        ))
+        .context("optimize_indices(merge) failed during index optimize");
+        assert!(is_index_error(&index_fault));
+
+        let io_fault = anyhow::anyhow!("connection reset").context("optimize_indices failed");
+        assert!(!is_index_error(&io_fault));
+    }
 
     #[test]
     fn prune_keeps_live_uuid_dirs_and_drops_dead_ones() {
