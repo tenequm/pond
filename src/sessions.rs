@@ -1160,9 +1160,19 @@ impl Store {
             return Ok((outcomes, counts));
         }
 
+        // The sessions merge is insert-only (`WhenMatched::DoNothing`), so a
+        // row already present would be probed and left untouched while still
+        // paying a commit - Lance 7 writes a new empty manifest version even
+        // when every row matches. Filter to the genuinely absent rows and skip
+        // the merge outright when none are new: the steady-state flush (grown
+        // sessions, no new ones) then commits 2 tables, not 3. Absent rows
+        // keep merge (not append): two writers can race the same new session
+        // id, and merge makes the loser's row a no-op instead of a duplicate.
         let sessions_owned: Vec<Session> = writeable
             .iter()
-            .map(|substream| substream.session.clone())
+            .map(|substream| &substream.session)
+            .filter(|session| !existing_sessions.contains_key(&session.id))
+            .cloned()
             .collect();
         // Drop only in-batch duplicates here (spec.md#adapter-integrity-dedup);
         // `append_filtered` drops the rows already present on the destination.
@@ -1210,7 +1220,6 @@ impl Store {
             .embed_message_rows(&message_rows, &existing_message_pks)
             .await?;
 
-        let session_batches = sessions_batches(&sessions_owned)?;
         let message_stream = tokio_stream::iter(
             messages_batches(&message_rows, &message_vectors)?
                 .into_iter()
@@ -1233,8 +1242,10 @@ impl Store {
                 Self::part_keep(existing_part_pks.clone()),
             ),
         )?;
-        let _sessions_inserted =
+        if !sessions_owned.is_empty() {
+            let session_batches = sessions_batches(&sessions_owned)?;
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;
+        }
 
         for substream in &writeable {
             outcomes.extend(success_outcomes_for_substream(
@@ -6833,6 +6844,35 @@ mod tests {
             0,
             "a threshold-0 fold must consolidate the deferred tail",
         );
+        Ok(())
+    }
+
+    /// A flush whose every session row already exists must not commit the
+    /// sessions table at all: the merge is insert-only, so the commit would
+    /// be an empty manifest version paid on every steady-state sync.
+    #[tokio::test]
+    async fn grown_session_flush_skips_the_sessions_merge() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_events(&store, conversational_events("session-grow", 1)).await?;
+        let sessions_before = store.handle.dataset(Table::Sessions).await?.version_id();
+        let messages_before = store.handle.dataset(Table::Messages).await?.version_id();
+
+        ingest_events(&store, conversational_events("session-grow", 2)).await?;
+        assert_eq!(
+            store.handle.dataset(Table::Sessions).await?.version_id(),
+            sessions_before,
+            "an all-present sessions batch must skip the merge commit",
+        );
+        assert!(
+            store.handle.dataset(Table::Messages).await?.version_id() > messages_before,
+            "the grown message rows must still commit",
+        );
+        let session = store
+            .get_session("session-grow")
+            .await?
+            .expect("session row must survive the skipped merge");
+        assert_eq!(session.messages.len(), 2);
         Ok(())
     }
 

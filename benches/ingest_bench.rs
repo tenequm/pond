@@ -70,6 +70,13 @@ struct Args {
     /// breakdown on pass 2 is the number the delta-write optimization targets.
     #[arg(long, default_value_t = 1)]
     passes: usize,
+    /// Skip oracle for pass 2+. `noop` (default) re-decodes every body -
+    /// the matched-heavy re-merge measurement above. `rowmap` builds the same
+    /// freshness oracle `pond sync` uses (ensure_rowmap + RowmapOracle), so
+    /// pass 2 measures the pure fresh-skip path - peek everything, ingest
+    /// nothing - the number the escalating peek window moves.
+    #[arg(long, value_enum, default_value_t = OracleKind::Noop)]
+    oracle: OracleKind,
     /// Print the top reasons sessions get skipped or validator-rejected. Used
     /// to diagnose "why is my rejection rate so high?" without grepping the
     /// bar output (which indicatif suppresses on non-tty stderr).
@@ -79,6 +86,12 @@ struct Args {
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
     bench: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OracleKind {
+    Noop,
+    Rowmap,
 }
 
 #[tokio::main]
@@ -120,6 +133,7 @@ async fn main() -> Result<()> {
         // not targeting a remote store.
         let (store, _temp) = open_store(args.url.as_deref(), config.as_ref()).await?;
         let adapter = ClaudeCodeAdapter::new(&corpus);
+        let rowmap_cache = TempDir::new()?;
 
         for pass in 1..=passes {
             capture.reset();
@@ -130,10 +144,21 @@ async fn main() -> Result<()> {
             // chars) so near-duplicate messages collapse onto one row.
             let mut skip_reasons: HashMap<String, u64> = HashMap::new();
             let mut error_reasons: HashMap<String, u64> = HashMap::new();
+            // Mirrors run_import_stage's oracle wiring: rowmap on pass 2+
+            // exercises the fresh-skip path (peek everything, ingest nothing).
+            let rowmap_oracle;
+            let oracle: &dyn pond::adapter::SkipOracle =
+                if args.oracle == OracleKind::Rowmap && pass > 1 {
+                    store.ensure_rowmap(rowmap_cache.path()).await?;
+                    rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+                    &rowmap_oracle
+                } else {
+                    &pond::adapter::NoopOracle
+                };
             let started = Instant::now();
             let mut sync_partial = 0u64;
             let mut sync_partial_drops = 0u64;
-            let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
+            let summary = ingest_adapter(&store, &adapter, oracle, |event| {
                 if let SyncEvent::SessionDone(outcome) = event {
                     match &outcome.status {
                         SyncStatus::Skipped { reason } => {
