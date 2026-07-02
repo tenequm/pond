@@ -1056,7 +1056,7 @@ async fn main() -> anyhow::Result<()> {
                     store.table_sizes(),
                     store.row_counts(),
                     store.adapter_names(include_subagents),
-                    store.index_status(),
+                    store.index_status_indexable(),
                     embedding_fut,
                 )?;
                 let totals = RowTotals {
