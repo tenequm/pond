@@ -3214,10 +3214,29 @@ async fn optimize_table_indices(
                 .filter(|index| index.name.as_str() == name)
                 .count()
         };
-        let (to_merge, to_append): (Vec<String>, Vec<String>) = append_indices
+        let (consolidate, to_append): (Vec<String>, Vec<String>) = append_indices
             .iter()
             .cloned()
             .partition(|name| segment_count(name) >= DELTA_MERGE_THRESHOLD);
+        // FTS delta segments are never merged: Lance 7.0.0's inverted merge
+        // has two reproducible defects on real segments - "different posting
+        // tail codecs" (a partitionless segment reports the derive-default
+        // codec) and an index-out-of-bounds panic in InnerBuilder::merge_from
+        // (token ids past the resized posting table; crashed the 5-min cron
+        // sync in a loop). At the same threshold a merge would fire, the FTS
+        // index instead rebuilds from scratch - the one consolidation path
+        // Lance executes correctly. Scalar and vector merges are unaffected.
+        let mut fts_rebuilds: Vec<&IndexIntent> = Vec::new();
+        let mut to_merge: Vec<String> = Vec::new();
+        for name in consolidate {
+            let fts_intent = intents.iter().find(|intent| {
+                intent.name == name && matches!(intent.params, IndexParamsKind::InvertedFtsWord)
+            });
+            match fts_intent {
+                Some(intent) => fts_rebuilds.push(intent),
+                None => to_merge.push(name),
+            }
+        }
 
         emit(
             progress,
@@ -3250,9 +3269,30 @@ async fn optimize_table_indices(
                 elapsed_ms: started.elapsed().as_millis() as u64,
             },
         );
+        for intent in &fts_rebuilds {
+            emit(
+                progress,
+                OptimizeEvent::PhaseStart {
+                    table,
+                    phase: OptimizePhase::IndexRebuild,
+                    detail: Some(intent.name.to_owned()),
+                },
+            );
+            let rebuild_started = Instant::now();
+            rebuild_index(dataset, intent, progress, table).await?;
+            emit(
+                progress,
+                OptimizeEvent::PhaseDone {
+                    table,
+                    phase: OptimizePhase::IndexRebuild,
+                    elapsed_ms: rebuild_started.elapsed().as_millis() as u64,
+                },
+            );
+        }
         tracing::debug!(
             target: "pond::perf",
             indices = ?append_indices,
+            rebuilt = ?fts_rebuilds,
             "folded trailing fragments into indices",
         );
         did_work = true;
