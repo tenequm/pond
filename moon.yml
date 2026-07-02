@@ -28,34 +28,51 @@ tasks:
     toolchains: 'system'
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
 
-  # One-time builder setup (pool is amd64 ccx43, isolated by nodeselector):
-  #   docker buildx create --name pond-hetzner --driver kubernetes \
-  #     --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit \
-  #     --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
-  #     --driver-opt persistent-volume-claim.requests.storage=100Gi \
-  #     --platform linux/amd64 --bootstrap
+  # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
+  # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
+  # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
+  # persistent CARGO_TARGET_DIR.
   build-dist:
     script: |
       set -euo pipefail
+      export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
+      TD="${CARGO_TARGET_DIR:-target}"
+
+      # `profile = "minimal"` + targets-in-toml does not reliably fetch
+      # rust-std for non-host targets.
+      rustup target add aarch64-apple-darwin x86_64-pc-windows-gnu \
+                        aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+
+      # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
+      # cold-start net for a fresh /ci-cache. No KACHE_REMOTE_TYPE env exists -
+      # the two-line config file is required to activate s3.
+      export RUSTC_WRAPPER=kache
+      mkdir -p ~/.config/kache
+      printf '[cache.remote]\ntype = "s3"\n' > ~/.config/kache/config.toml
+      kache sync --pull
+
+      # Cargo unifies features across all targets in one invocation, leaking
+      # cfg-gated deps across platforms. macOS and Windows each build alone:
+      # macOS pulls candle's macOS-only `metal`, and the two linux targets
+      # enable xet-data's `cfg(not(windows))` sha2 `asm` feature, which drags
+      # sha2-asm (a Windows compile_error!) into the Windows build.
+      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin
+      cargo zigbuild --locked --profile dist \
+        --target aarch64-unknown-linux-gnu \
+        --target x86_64-unknown-linux-gnu
+      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu
+      kache sync --push
+
       mkdir -p target/dist
-
-      BUCKET=ttq
-      # KACHE_S3_ENDPOINT is bucket-virtual-host (ttq.nbg1...); strip the bucket subdomain.
-      S3_ENDPOINT="${KACHE_S3_ENDPOINT/${BUCKET}./}"
-      BUILDX_PREFIX=pond-buildkit/multiarch
-
-      docker buildx build \
-        --progress=plain \
-        --platform linux/amd64 \
-        --build-arg POND_BUILD_COMMIT="$(git rev-parse --short HEAD)" \
-        --target output \
-        --cache-from "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY}" \
-        --cache-to   "type=s3,region=${KACHE_S3_REGION},bucket=${BUCKET},endpoint_url=${S3_ENDPOINT},name=pond-multiarch,blobs_prefix=${BUILDX_PREFIX}/blobs/,manifests_prefix=${BUILDX_PREFIX}/manifests/,access_key_id=${KACHE_S3_ACCESS_KEY},secret_access_key=${KACHE_S3_SECRET_KEY},mode=max,ignore-error=true" \
-        --secret "id=kache_s3_access_key,env=KACHE_S3_ACCESS_KEY" \
-        --secret "id=kache_s3_secret_key,env=KACHE_S3_SECRET_KEY" \
-        --output "type=local,dest=target/dist" \
-        -f ops/ci-build-docker-image/Dockerfile \
-        .
+      cp "$TD/aarch64-apple-darwin/dist/pond" target/dist/pond-aarch64-apple-darwin
+      # zig records LC_BUILD_VERSION sdk >= 26, which makes macOS 26 dyld
+      # reject its duplicate libobjc load command; rewrite the recorded sdk to
+      # 15.0 and ad-hoc re-sign (the byte-patch invalidates the signature).
+      python3 ops/scripts/patch-macos-sdk.py target/dist/pond-aarch64-apple-darwin
+      rcodesign --config-file /dev/null sign target/dist/pond-aarch64-apple-darwin
+      cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu
+      cp "$TD/x86_64-unknown-linux-gnu/dist/pond" target/dist/pond-x86_64-unknown-linux-gnu
+      cp "$TD/x86_64-pc-windows-gnu/dist/pond.exe" target/dist/pond-x86_64-pc-windows-gnu.exe
       ls -lh target/dist/
 
       # Completion scripts are target-independent, so one native run of the
@@ -88,8 +105,7 @@ tasks:
     inputs:
       - '@group(sources)'
       - '@group(tests)'
-      - 'ops/ci-build-docker-image/Dockerfile'
-      - 'ops/ci-build-docker-image/Dockerfile.dockerignore'
+      - 'ops/scripts/patch-macos-sdk.py'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'

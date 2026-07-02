@@ -131,47 +131,9 @@ jobs:
               | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
           fi
 
-      - name: Point buildx at the in-cluster buildkit
-        run: |
-          set -euo pipefail
-          # Kubeconfig from the runner pod's own SA (pond-ci-runner, RBAC'd
-          # into pond-buildkit) - no stored secret to rot when endpoints move.
-          cat > "$RUNNER_TEMP/kubeconfig" <<'EOF'
-          apiVersion: v1
-          kind: Config
-          clusters:
-            - name: in-cluster
-              cluster:
-                server: https://kubernetes.default.svc
-                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          users:
-            - name: sa
-              user:
-                tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-          contexts:
-            - name: in-cluster
-              context: { cluster: in-cluster, user: sa }
-          current-context: in-cluster
-          EOF
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
-          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
-          docker buildx rm pond-hetzner 2>/dev/null || true
-          # A previous run's statefulset survives at replicas=0 (autoshutdown);
-          # buildx create waits on an existing statefulset without scaling it,
-          # so scale it up ourselves first (404 = none yet, buildx creates it).
-          SA=/var/run/secrets/kubernetes.io/serviceaccount
-          curl -fsS --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" \
-            -X PATCH -H 'Content-Type: application/merge-patch+json' \
-            "https://kubernetes.default.svc/apis/apps/v1/namespaces/pond-buildkit/statefulsets/pond-hetzner0/scale" \
-            -d '{"spec":{"replicas":1}}' -o /dev/null || true
-          # PVC -> StatefulSet so the RUN --mount=type=cache dirs survive autoshutdown
-          # scale-to-0 (x402 buildkit-autoshutdown chart). Needs buildx >= v0.34.0.
-          docker buildx create --name pond-hetzner --driver kubernetes \
-            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
-            --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
-            --driver-opt persistent-volume-claim.requests.storage=100Gi \
-            --platform linux/amd64
-
+      # Machine cross-compile right on the runner (zig/zigbuild/SDK/rcodesign
+      # from the pond-runner image, incremental cache on /ci-cache) - no
+      # docker, no buildkit, no kubeconfig.
       - name: Build + package binaries
         run: moon run pond:build-dist
         env:
@@ -181,9 +143,9 @@ jobs:
           KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
           KACHE_S3_REGION: nbg1
-          # Bucket-virtual-host form; build-dist strips the bucket subdomain to
-          # derive the buildx S3 cache endpoint.
-          KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+          KACHE_S3_BUCKET: ttq
+          KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+          KACHE_S3_PREFIX: kache/pond
 
       - id: ver
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"

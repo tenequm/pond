@@ -1,5 +1,5 @@
-# TEMPORARY: validates the publish-release build path (ARC runner -> in-cluster
-# buildx -> cross-compile) without cutting a release. Delete before merging.
+# TEMPORARY: validates the publish-release build path (machine cross-compile
+# on the ARC runner) without cutting a release. Delete before merging.
 name: build-dist-test
 
 # pull_request scoped to this file: dispatch would need the workflow on the
@@ -13,9 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  # Named publish-release so buildkit-autoshutdown keeps the builder node up
-  # while it runs (the hourly cron scales to 0 unless a job with exactly this
-  # name is active - it killed the previous attempt mid-build).
+  # Named publish-release so buildkit-autoshutdown keeps ignoring it correctly
+  # while that cron still exists.
   publish-release:
     runs-on: pond-ci
     timeout-minutes: 60
@@ -27,7 +26,9 @@ jobs:
       KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
       KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
       KACHE_S3_REGION: nbg1
-      KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+      KACHE_S3_BUCKET: ttq
+      KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+      KACHE_S3_PREFIX: kache/pond
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with: { fetch-depth: 0 }
@@ -44,40 +45,10 @@ jobs:
             curl -fsSL https://github.com/moonrepo/moon/releases/download/v2.3.5/moon_cli-x86_64-unknown-linux-gnu.tar.xz \
               | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
           fi
-      - name: Point buildx at the in-cluster buildkit
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/kubeconfig" <<'EOF'
-          apiVersion: v1
-          kind: Config
-          clusters:
-            - name: in-cluster
-              cluster:
-                server: https://kubernetes.default.svc
-                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          users:
-            - name: sa
-              user:
-                tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-          contexts:
-            - name: in-cluster
-              context: { cluster: in-cluster, user: sa }
-          current-context: in-cluster
-          EOF
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
-          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
-          docker buildx rm pond-hetzner 2>/dev/null || true
-          # Stale 0-replica statefulset from a previous run: buildx create
-          # waits on it without scaling, so scale it up ourselves (404 ok).
-          SA=/var/run/secrets/kubernetes.io/serviceaccount
-          curl -fsS --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" \
-            -X PATCH -H 'Content-Type: application/merge-patch+json' \
-            "https://kubernetes.default.svc/apis/apps/v1/namespaces/pond-buildkit/statefulsets/pond-hetzner0/scale" \
-            -d '{"spec":{"replicas":1}}' -o /dev/null || true
-          docker buildx create --name pond-hetzner --driver kubernetes \
-            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
-            --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
-            --driver-opt persistent-volume-claim.requests.storage=100Gi \
-            --platform linux/amd64
+          if [ ! -x /ci-cache/bin/protoc ]; then
+            curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-x86_64.zip
+            unzip -oq /tmp/protoc.zip -d /ci-cache/protoc 'bin/protoc' 'include/*'
+            ln -sf /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
+          fi
       - run: moon run pond:build-dist
       - run: ls -lh dist/ && cd dist && sha256sum -c checksums.txt
