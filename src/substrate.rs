@@ -2458,9 +2458,10 @@ impl Handle {
         &self,
         table: Table,
         intents: &[IndexIntent],
+        indexable_only: bool,
     ) -> Result<Vec<IndexStatus>> {
         let dataset = self.dataset(table).await?;
-        index_status(table, &dataset, intents).await
+        index_status(table, &dataset, intents, indexable_only).await
     }
 
     pub(crate) async fn dataset(&self, table: Table) -> Result<Dataset> {
@@ -3175,6 +3176,24 @@ async fn optimize_table_indices(
             );
             continue;
         }
+        // FTS-only guard: folding a tail with zero non-null values writes an
+        // empty delta segment, which Lance 7.0.0 reads back with the wrong
+        // posting-tail codec (`Default` = VarintDelta vs the metadata-absent
+        // default Fixed32), deterministically failing every later merge. The
+        // probe is bounded: it reads only the tail fragments the fold itself
+        // would read, stops at the first non-null value, and runs only after
+        // the fold threshold already passed.
+        if matches!(intent.params, IndexParamsKind::InvertedFtsWord)
+            && !column_has_values(dataset, intent.column, &unindexed).await?
+        {
+            tracing::debug!(
+                target: "pond::perf",
+                index = intent.name,
+                tail_rows,
+                "skipping FTS fold (tail has no indexable values)",
+            );
+            continue;
+        }
         // Every family folds incrementally via `optimize_indices` (the
         // append/merge batch below) - no full rebuild. BTree rewrites its index
         // file by merging the existing sorted pages with only the new fragments'
@@ -3242,6 +3261,52 @@ async fn optimize_table_indices(
     Ok(did_work)
 }
 
+/// Fragment-scoped scanner over the non-null rows of `column` - the shared
+/// base of the existence probe and the indexable count below.
+fn non_null_scanner(
+    dataset: &Dataset,
+    column: &'static str,
+    fragments: &[lance::table::format::Fragment],
+) -> Result<lance::dataset::scanner::Scanner> {
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(fragments.to_vec());
+    scanner.filter(&Predicate::IsNotNull(column).to_lance())?;
+    Ok(scanner)
+}
+
+/// True when any row in `fragments` holds a non-null value for `column`.
+/// Existence probe for the FTS fold guard: scans only the given fragments,
+/// stops at the first hit (`limit 1`), so its read is a subset of what the
+/// fold it gates would read.
+async fn column_has_values(
+    dataset: &Dataset,
+    column: &'static str,
+    fragments: &[lance::table::format::Fragment],
+) -> Result<bool> {
+    let mut scanner = non_null_scanner(dataset, column, fragments)?;
+    scanner.project(&[column])?;
+    scanner.limit(Some(1), None)?;
+    let batch = scanner
+        .try_into_batch()
+        .await
+        .with_context(|| format!("non-null probe on {column} failed"))?;
+    Ok(batch.num_rows() > 0)
+}
+
+/// Count of rows in `fragments` holding a non-null value for `column`. Serves
+/// the indexable status view; fragment-scoped, so bounded by the tail.
+async fn column_value_count(
+    dataset: &Dataset,
+    column: &'static str,
+    fragments: &[lance::table::format::Fragment],
+) -> Result<usize> {
+    let count = non_null_scanner(dataset, column, fragments)?
+        .count_rows()
+        .await
+        .with_context(|| format!("non-null count on {column} failed"))?;
+    Ok(count as usize)
+}
+
 async fn rebuild_index(
     dataset: &mut Dataset,
     intent: &IndexIntent,
@@ -3270,6 +3335,7 @@ async fn index_status(
     table: Table,
     dataset: &Dataset,
     intents: &[IndexIntent],
+    indexable_only: bool,
 ) -> Result<Vec<IndexStatus>> {
     let existing = dataset.load_indices().await?;
     let existing_names: std::collections::HashSet<String> =
@@ -3295,10 +3361,26 @@ async fn index_status(
             .await
             .with_context(|| format!("unindexed_fragments failed for {}", table.label()))?;
         let unindexed_fragments = unindexed.len();
-        let unindexed_rows = unindexed
+        let mut unindexed_rows: usize = unindexed
             .iter()
             .map(|fragment| fragment.num_rows().unwrap_or(0))
             .sum();
+        // Content indexes (FTS, IVF) take in only non-null rows - most message
+        // rows carry a null `search_text`/`vector` (tool/system roles), so the
+        // raw fragment row count vastly overstates the actionable backlog and
+        // an all-null tail (which the FTS fold guard skips) would read as
+        // stuck. The indexable view counts what a fold could actually index;
+        // opt-in because the count scans the tail, which the per-sync summary
+        // must not pay.
+        if indexable_only
+            && unindexed_rows > 0
+            && matches!(
+                intent.params,
+                IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. }
+            )
+        {
+            unindexed_rows = column_value_count(dataset, intent.column, &unindexed).await?;
+        }
         statuses.push(IndexStatus {
             table,
             intent_name: intent.name.to_owned(),
