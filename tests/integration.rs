@@ -42,3 +42,5 @@ mod sync;
 mod transport_http;
 #[path = "integration/transport_mcp.rs"]
 mod transport_mcp;
+
+// CI cache-buster: exercises a real compile on the ARC runner (attempt 4).
