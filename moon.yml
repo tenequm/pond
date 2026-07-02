@@ -2,7 +2,6 @@ language: rust
 
 env:
   CARGO_TERM_COLOR: always
-  BUILDX_BUILDER: pond-hetzner
 
 fileGroups:
   sources:
@@ -45,11 +44,13 @@ tasks:
 
       # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
       # cold-start net for a fresh /ci-cache. No KACHE_REMOTE_TYPE env exists -
-      # the two-line config file is required to activate s3.
+      # the two-line config file is required to activate s3. Push on EXIT, not
+      # after success: crates compiled before a failure still warm the retry.
       export RUSTC_WRAPPER=kache
       mkdir -p ~/.config/kache
       printf '[cache.remote]\ntype = "s3"\n' > ~/.config/kache/config.toml
       kache sync --pull
+      trap 'kache sync --push || true' EXIT
 
       # Cargo unifies features across all targets in one invocation, leaking
       # cfg-gated deps across platforms. macOS and Windows each build alone:
@@ -61,7 +62,6 @@ tasks:
         --target aarch64-unknown-linux-gnu \
         --target x86_64-unknown-linux-gnu
       cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu
-      kache sync --push
 
       mkdir -p target/dist
       cp "$TD/aarch64-apple-darwin/dist/pond" target/dist/pond-aarch64-apple-darwin

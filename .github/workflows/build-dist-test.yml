@@ -30,6 +30,9 @@ jobs:
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
       KACHE_S3_PREFIX: kache/pond
+      KACHE_CACHE_EXECUTABLES: "true"
+      KACHE_CACHE_DIR: /ci-cache/kache
+      KACHE_MAX_SIZE: 20GiB
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with: { fetch-depth: 0 }

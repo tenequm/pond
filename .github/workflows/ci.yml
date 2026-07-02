@@ -34,9 +34,8 @@ jobs:
       RUSTUP_HOME: /ci-cache/rustup
       CARGO_TARGET_DIR: /ci-cache/target
     steps:
+      # Shallow: nothing here needs history (release-plz jobs fetch full).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       # Idempotent: everything lands on /ci-cache and short-circuits when
       # present, so warm runs only pay the PATH exports. rustup installs the
       # rust-toolchain.toml pin on first cargo use.
@@ -58,10 +57,9 @@ jobs:
             unzip -oq /tmp/protoc.zip -d /ci-cache/protoc 'bin/protoc' 'include/*'
             ln -sf /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
           fi
-      - run: moon run pond:check-changelog
-      - run: moon run pond:format
-      - run: moon run pond:lint
-      - run: moon run pond:test
+      # One moon session: independent tasks interleave (cargo serializes the
+      # heavy ones on its target-dir lock; format/changelog are instant).
+      - run: moon run pond:check-changelog pond:format pond:lint pond:test
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -132,6 +130,11 @@ jobs:
             curl -fsSL https://github.com/moonrepo/moon/releases/download/v2.3.5/moon_cli-x86_64-unknown-linux-gnu.tar.xz \
               | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
           fi
+          if [ ! -x /ci-cache/bin/protoc ]; then
+            curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-x86_64.zip
+            unzip -oq /tmp/protoc.zip -d /ci-cache/protoc 'bin/protoc' 'include/*'
+            ln -sf /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
+          fi
 
       # Machine cross-compile right on the runner (zig/zigbuild/SDK/rcodesign
       # from the pond-runner image, incremental cache on /ci-cache) - no
@@ -148,6 +151,12 @@ jobs:
           KACHE_S3_BUCKET: ttq
           KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
           KACHE_S3_PREFIX: kache/pond
+          # Cache the fat-LTO bin links too (off by default) - they dominate
+          # dist build time. Local store on the PVC so pods start warm and
+          # sync only moves deltas; cap it well below the 100Gi shared PVC.
+          KACHE_CACHE_EXECUTABLES: "true"
+          KACHE_CACHE_DIR: /ci-cache/kache
+          KACHE_MAX_SIZE: 20GiB
 
       - id: ver
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
