@@ -3051,10 +3051,26 @@ impl Store {
     }
 
     pub async fn index_status(&self) -> Result<Vec<IndexStatus>> {
+        self.index_status_with(false).await
+    }
+
+    /// Like [`Self::index_status`], but content indexes (FTS, IVF) report only
+    /// the non-null - actually indexable - rows of their unindexed tail. The
+    /// honest number for `pond status`; costs a tail-bounded scan, so the
+    /// per-sync summary stays on the cheap manifest-only variant.
+    pub async fn index_status_indexable(&self) -> Result<Vec<IndexStatus>> {
+        self.index_status_with(true).await
+    }
+
+    async fn index_status_with(&self, indexable_only: bool) -> Result<Vec<IndexStatus>> {
         let policy = pond_index_intents();
         let mut statuses = Vec::new();
         for (table, intents) in policy.all() {
-            statuses.extend(self.handle.index_status(table, intents).await?);
+            statuses.extend(
+                self.handle
+                    .index_status(table, intents, indexable_only)
+                    .await?,
+            );
         }
         Ok(statuses)
     }
@@ -6816,6 +6832,97 @@ mod tests {
                 .await?,
             0,
             "a threshold-0 fold must consolidate the deferred tail",
+        );
+        Ok(())
+    }
+
+    /// A tail whose every row has a null `search_text` (tool-call-only
+    /// messages) must not fold into the FTS index: Lance 7.0.0 writes an
+    /// empty delta segment for it and reads that segment back with a
+    /// mismatched posting-tail codec, deterministically failing every later
+    /// merge. The guard skips the fold; the rows stay in the flat-scanned
+    /// tail and get carried into the next fold that has real text.
+    #[tokio::test]
+    async fn fts_fold_skips_a_tail_with_no_indexable_text() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 300).await?;
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+
+        let tool_only_message = |i: usize| {
+            let message_id = format!("tool-msg-{i}");
+            [
+                IngestEvent::Message(Message::Assistant {
+                    id: message_id.clone(),
+                    session_id: "session-toolonly".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-toolonly".to_owned(),
+                    id: format!("{message_id}-part"),
+                    message_id,
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::ToolCall {
+                        call_id: Some(Extracted::from_test_value(format!("call-{i}"))),
+                        name: Some(Extracted::from_test_value("Bash".to_owned())),
+                        params: serde_json::json!({"command": "ls"}),
+                        provider_executed: false,
+                    },
+                }),
+            ]
+        };
+        let mut events = vec![IngestEvent::Session(synthetic_session("session-toolonly"))];
+        events.extend((0..3).flat_map(tool_only_message));
+        ingest_events(&store, events).await?;
+
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
+                .await?,
+            3,
+            "an all-null tail must not fold into the FTS index",
+        );
+        let fts_status = |statuses: Vec<crate::substrate::IndexStatus>| {
+            statuses
+                .into_iter()
+                .find(|status| status.intent_name == MESSAGES_FTS_INDEX)
+                .expect("FTS status present")
+        };
+        assert_eq!(
+            fts_status(store.index_status().await?).unindexed_rows,
+            3,
+            "the raw view counts uncovered rows",
+        );
+        assert_eq!(
+            fts_status(store.index_status_indexable().await?).unindexed_rows,
+            0,
+            "the indexable view treats an all-null tail as nothing pending",
+        );
+
+        // One real text row lands: the next fold indexes the whole tail,
+        // carrying the previously skipped rows - none are stranded.
+        ingest_events(&store, conversational_events("session-toolonly", 1)).await?;
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
+                .await?,
+            0,
+            "a fold with real text must consolidate the skipped rows too",
         );
         Ok(())
     }
