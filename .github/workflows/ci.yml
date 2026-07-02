@@ -18,26 +18,31 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Remote cache only when the secret exists: fork PRs get no secrets and
+  # moon hard-fails a configured remote with an empty auth header. Inert for
+  # jobs that don't run moon.
+  MOON_REMOTE_HOST: ${{ secrets.BAZEL_REMOTE_AUTH != '' && 'grpcs://bazel-remote.cascade.fyi:443' || '' }}
+  BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
 
 jobs:
   build-and-test:
-    runs-on: [self-hosted, linux, x64]
+    # In-cluster ARC ephemeral runner (scale set `pond-ci`). Toolchain, cargo
+    # registry, and target/ live on the runner's /ci-cache PVC, which persists
+    # across the ephemeral pods.
+    runs-on: pond-ci
     timeout-minutes: 60
     # A newer push to the same ref supersedes an in-flight build.
     concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
-    env:
-      BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
     steps:
-      # clean: false persists target/ + caches on the self-hosted disk between
-      # runs. moon, cargo/rustc, protoc, and kache are preinstalled on the runner.
+      # Full history: moon's vcs layer resolves vcs.defaultBranch, which a
+      # shallow PR checkout doesn't have (git exit 128).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          clean: false
-      - run: moon run pond:check-changelog
-      - run: moon run pond:format
-      - run: moon run pond:lint
-      - run: moon run pond:test
+      - uses: ./.github/actions/bootstrap
+      # One moon session: independent tasks interleave (cargo serializes the
+      # heavy ones on its target-dir lock; format/changelog are instant).
+      - run: moon run pond:check-changelog pond:format pond:lint pond:test
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -78,7 +83,11 @@ jobs:
   publish-release:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
-    runs-on: [self-hosted, linux, x64]
+    # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
+    # the /ci-cache PVC (release-plz runs `cargo publish` here).
+    runs-on: pond-ci
+    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    timeout-minutes: 90
     permissions:
       contents: write   # `gh release upload` to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
@@ -86,38 +95,25 @@ jobs:
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with: { fetch-depth: 0, clean: false, persist-credentials: false }
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: ./.github/actions/bootstrap
 
-      - name: Bootstrap cluster access + buildx builder
-        env:
-          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
-        run: |
-          export KUBECONFIG="$RUNNER_TEMP/.kube-cascade"
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
-          printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
-          chmod 600 "$KUBECONFIG"
-          docker buildx rm pond-hetzner 2>/dev/null || true
-          # PVC -> StatefulSet so the RUN --mount=type=cache dirs survive autoshutdown
-          # scale-to-0 (x402 buildkit-autoshutdown chart). Needs buildx >= v0.34.0.
-          docker buildx create --name pond-hetzner --driver kubernetes \
-            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
-            --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
-            --driver-opt persistent-volume-claim.requests.storage=100Gi \
-            --platform linux/amd64
-
+      # Machine cross-compile right on the runner (zig/zigbuild/SDK/rcodesign
+      # from the pond-runner image, incremental cache on /ci-cache) - no
+      # docker, no buildkit, no kubeconfig.
       - name: Build + package binaries
         run: moon run pond:build-dist
         env:
-          # moon's remote cache (bazel-remote gRPC) needs this here too; the
-          # build-and-test job scopes its own copy separately.
-          BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
           KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
           KACHE_S3_REGION: nbg1
-          # Bucket-virtual-host form; build-dist strips the bucket subdomain to
-          # derive the buildx S3 cache endpoint.
-          KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+          KACHE_S3_BUCKET: ttq
+          KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+          KACHE_S3_PREFIX: kache/pond
+          # Local store on the PVC so pods start warm and sync only moves
+          # deltas; cap it well below the 100Gi shared PVC.
+          KACHE_CACHE_DIR: /ci-cache/kache
+          KACHE_MAX_SIZE: 20GiB
 
       - id: ver
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
@@ -140,10 +136,8 @@ jobs:
       - name: Release binaries to homebrew-tap
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
-        # Explicit globs, not dist/*: the self-hosted runner persists dist/ and
-        # carries stale goreleaser-era files (incl a 0-byte digests.txt that
-        # GitHub rejects with "Bad Content-Length"). pond-* + checksums.txt is
-        # exactly our archives, signatures, and checksums.
+        # Explicit globs, not dist/*: moon can hydrate dist/ from cache, so
+        # only upload exactly our archives and checksums.
         # Notes mirror pond's own release body (release-plz changelog) so
         # downstream tap users see the changelog without a second lookup.
         run: |
@@ -160,8 +154,6 @@ jobs:
           set -euo pipefail
           base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
           sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
-          # Clone outside the workspace: a clone left in the working tree would
-          # persist (clean:false) and make `cargo publish` refuse a dirty tree.
           tap="$RUNNER_TEMP/tap"
           rm -rf "$tap"
           git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/homebrew-tap" "$tap"

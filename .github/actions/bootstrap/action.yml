@@ -1,0 +1,42 @@
+name: Bootstrap toolchain
+description: >
+  Idempotent toolchain bootstrap for pond-ci ARC runners. Everything lands on
+  the persistent /ci-cache PVC; warm runs only pay the version checks and
+  PATH/env exports. Root-required tools (zig, macOS SDK, rcodesign, gh) live
+  in the pond-runner image instead; user-space static binaries are pinned
+  HERE so pond controls their versions without an image rebuild. rustup
+  installs the rust-toolchain.toml pin on first cargo use.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        MOON_VERSION=2.3.5
+        PROTOC_VERSION=35.1
+        KACHE_VERSION=0.8.0
+        mkdir -p /ci-cache/bin
+        echo "/ci-cache/bin" >> "$GITHUB_PATH"
+        echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
+        {
+          echo "CARGO_HOME=/ci-cache/cargo"
+          echo "RUSTUP_HOME=/ci-cache/rustup"
+          echo "CARGO_TARGET_DIR=/ci-cache/target"
+        } >> "$GITHUB_ENV"
+        export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
+        if [ ! -x /ci-cache/cargo/bin/rustup ]; then
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
+        fi
+        if [ "$(/ci-cache/bin/moon --version 2>/dev/null)" != "moon $MOON_VERSION" ]; then
+          curl -fsSL "https://github.com/moonrepo/moon/releases/download/v$MOON_VERSION/moon_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+        fi
+        if [ "$(/ci-cache/bin/protoc --version 2>/dev/null)" != "libprotoc $PROTOC_VERSION" ]; then
+          curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+          unzip -oq /tmp/protoc.zip -d /ci-cache/protoc 'bin/protoc' 'include/*'
+          ln -sf /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
+        fi
+        if [ "$(/ci-cache/bin/kache --version 2>/dev/null)" != "kache $KACHE_VERSION" ]; then
+          curl -fsSL "https://github.com/kunobi-ninja/kache/releases/download/v$KACHE_VERSION/kache-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C /ci-cache/bin kache
+        fi
