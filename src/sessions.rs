@@ -6847,6 +6847,62 @@ mod tests {
         Ok(())
     }
 
+    /// At the delta-merge threshold the FTS index must REBUILD, never merge:
+    /// Lance 7.0.0's inverted merge fails two ways on real segments (posting
+    /// tail codec mismatch on empty segments; index-out-of-bounds panic in
+    /// `InnerBuilder::merge_from`), so consolidation routes FTS to the
+    /// from-scratch rebuild path. This drives real grow -> fold cycles past
+    /// the threshold and asserts an IndexRebuild phase fired, the segment
+    /// chain collapsed to one, and the rebuilt index covers everything.
+    #[tokio::test]
+    async fn fts_consolidation_rebuilds_instead_of_merging() -> anyhow::Result<()> {
+        use crate::substrate::{OptimizeEvent, OptimizePhase};
+
+        type PhaseLog = std::sync::Arc<std::sync::Mutex<Vec<(OptimizePhase, Option<String>)>>>;
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 300).await?;
+        let phases: PhaseLog = std::sync::Arc::default();
+        let sink = phases.clone();
+        let progress: crate::substrate::OptimizeProgressFn = std::sync::Arc::new(move |event| {
+            if let OptimizeEvent::PhaseStart { phase, detail, .. } = event {
+                sink.lock().unwrap().push((phase, detail));
+            }
+        });
+
+        for round in 0..=crate::substrate::DELTA_MERGE_THRESHOLD {
+            ingest_events(&store, conversational_events(&format!("grow-{round}"), 2)).await?;
+            store
+                .optimize_indices(Some(progress.clone()), &MaintenancePolicy::always_compact())
+                .await?
+                .into_result()?;
+        }
+
+        assert!(
+            phases.lock().unwrap().iter().any(|(phase, detail)| {
+                matches!(phase, OptimizePhase::IndexRebuild)
+                    && detail.as_deref() == Some(MESSAGES_FTS_INDEX)
+            }),
+            "crossing the threshold must rebuild the FTS index, not merge it",
+        );
+        let fts_segments = store
+            .handle
+            .messages_index_names()
+            .await?
+            .into_iter()
+            .filter(|name| name == MESSAGES_FTS_INDEX)
+            .count();
+        assert_eq!(fts_segments, 1, "the rebuild collapses the segment chain");
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_FTS_INDEX)
+                .await?,
+            0,
+            "the rebuilt index covers every fragment",
+        );
+        Ok(())
+    }
+
     /// A flush whose every session row already exists must not commit the
     /// sessions table at all: the merge is insert-only, so the commit would
     /// be an empty manifest version paid on every steady-state sync.
