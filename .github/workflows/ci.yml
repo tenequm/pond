@@ -102,25 +102,59 @@ jobs:
   publish-release:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
-    runs-on: [self-hosted, linux, x64]
+    # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
+    # the /ci-cache PVC (release-plz runs `cargo publish` here).
+    runs-on: pond-ci
     permissions:
       contents: write   # `gh release upload` to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
     # instead of killing it between release-plz tagging and the four publishes.
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
+    env:
+      CARGO_HOME: /ci-cache/cargo
+      RUSTUP_HOME: /ci-cache/rustup
+      CARGO_TARGET_DIR: /ci-cache/target
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with: { fetch-depth: 0, clean: false, persist-credentials: false }
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
-
-      - name: Bootstrap cluster access + buildx builder
-        env:
-          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_CASCADE }}
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Bootstrap toolchain (cached on /ci-cache)
         run: |
-          export KUBECONFIG="$RUNNER_TEMP/.kube-cascade"
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
-          printf '%s' "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
-          chmod 600 "$KUBECONFIG"
+          set -euo pipefail
+          mkdir -p /ci-cache/bin
+          echo "/ci-cache/bin" >> "$GITHUB_PATH"
+          echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x /ci-cache/cargo/bin/rustup ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
+          fi
+          if [ ! -x /ci-cache/bin/moon ]; then
+            curl -fsSL https://github.com/moonrepo/moon/releases/download/v2.3.5/moon_cli-x86_64-unknown-linux-gnu.tar.xz \
+              | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+          fi
+
+      - name: Point buildx at the in-cluster buildkit
+        run: |
+          set -euo pipefail
+          # Kubeconfig from the runner pod's own SA (pond-ci-runner, RBAC'd
+          # into pond-buildkit) - no stored secret to rot when endpoints move.
+          cat > "$RUNNER_TEMP/kubeconfig" <<'EOF'
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: in-cluster
+              cluster:
+                server: https://kubernetes.default.svc
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          users:
+            - name: sa
+              user:
+                tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          contexts:
+            - name: in-cluster
+              context: { cluster: in-cluster, user: sa }
+          current-context: in-cluster
+          EOF
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
           docker buildx rm pond-hetzner 2>/dev/null || true
           # PVC -> StatefulSet so the RUN --mount=type=cache dirs survive autoshutdown
           # scale-to-0 (x402 buildkit-autoshutdown chart). Needs buildx >= v0.34.0.

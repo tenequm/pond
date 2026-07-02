@@ -1,0 +1,68 @@
+# TEMPORARY: validates the publish-release build path (ARC runner -> in-cluster
+# buildx -> cross-compile) without cutting a release. Delete before merging.
+name: build-dist-test
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build-dist:
+    runs-on: pond-ci
+    timeout-minutes: 60
+    env:
+      BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
+      CARGO_HOME: /ci-cache/cargo
+      RUSTUP_HOME: /ci-cache/rustup
+      CARGO_TARGET_DIR: /ci-cache/target
+      KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+      KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+      KACHE_S3_REGION: nbg1
+      KACHE_S3_ENDPOINT: https://ttq.nbg1.your-objectstorage.com
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - name: Bootstrap toolchain (cached on /ci-cache)
+        run: |
+          set -euo pipefail
+          mkdir -p /ci-cache/bin
+          echo "/ci-cache/bin" >> "$GITHUB_PATH"
+          echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x /ci-cache/cargo/bin/rustup ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
+          fi
+          if [ ! -x /ci-cache/bin/moon ]; then
+            curl -fsSL https://github.com/moonrepo/moon/releases/download/v2.3.5/moon_cli-x86_64-unknown-linux-gnu.tar.xz \
+              | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+          fi
+      - name: Point buildx at the in-cluster buildkit
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/kubeconfig" <<'EOF'
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: in-cluster
+              cluster:
+                server: https://kubernetes.default.svc
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          users:
+            - name: sa
+              user:
+                tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          contexts:
+            - name: in-cluster
+              context: { cluster: in-cluster, user: sa }
+          current-context: in-cluster
+          EOF
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          docker buildx rm pond-hetzner 2>/dev/null || true
+          docker buildx create --name pond-hetzner --driver kubernetes \
+            --driver-opt namespace=pond-buildkit,replicas=1,nodeselector=workload=buildkit,timeout=10m \
+            --driver-opt requests.cpu=12,requests.memory=24Gi,limits.memory=48Gi \
+            --driver-opt persistent-volume-claim.requests.storage=100Gi \
+            --platform linux/amd64
+      - run: moon run pond:build-dist
+      - run: ls -lh dist/ && cd dist && sha256sum -c checksums.txt
