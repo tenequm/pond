@@ -23,11 +23,17 @@ semver_check = false
 # only for CHANGELOG.md structure. The `<!-- N -->` prefixes order the sections
 # (group_by sorts alphabetically; GitHub renders the HTML comments invisibly).
 [changelog]
+# Explicit header: new sections insert right after this exact text. Without it,
+# each release glues onto `# Changelog`, eating one newline per release
+# (0.11.1 lost the blank line; 0.11.2 lost the newline itself).
+header = """# Changelog
+
+"""
 body = """
 ## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
-{% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
+{% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/tenequm/pond/commit/{{ commit.id }}))
 {% endfor %}{% endfor %}{% if release_link %}
 **Full Changelog**: {{ release_link }}
 {% endif %}"""
