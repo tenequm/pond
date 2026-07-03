@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.12.0](https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0) - 2026-07-03
+
+Onboarding and multi-machine sync: a first run no longer looks like it hangs, the scheduled sync no longer races a manual one, and `pond status` finally reports this host's own relationship to the store. Verified end to end on a fresh install (macOS and Linux) plus cold-context first-run testing.
+
+### <!-- 0 -->🛠 Breaking Changes
+- **`pond status --format json` output shape changed** - the `adapters` field is renamed to `source_agents` (count of distinct source agents in the store), and `schedule` changes from a string to an object `{active, backend, every}`. A new top-level `pond_version` field carries the producing binary's version so consumers can pin the format going forward. Scripts parsing status JSON must update these keys. ([5e56aad](https://github.com/tenequm/pond/commit/5e56aad4cd95d0774b2ee6392bed9d5564e41f79))
+
+### <!-- 1 -->🎉 New Features
+- **sync:** per-host single-flight lock (a local flock in the state dir, never on the Lance store - cross-host writers stay pure OCC); a second sync waits and names the holder, `--no-wait` skips cleanly (exit 0) and is what the scheduled job passes so ticks never queue. Adds `--dry-run` (per-adapter freshness preview, writes nothing) and `--format json` (one summary document on stdout for every outcome, progress on stderr). Every long phase now has a live face - rowmap-build spinner, model-download stage line, per-adapter bar with a recent-rate ETA, inline-embed counter - plus a ~30s heartbeat off-TTY. `pond status` gains a local section (per-adapter sources + pending-sync counts, last sync outcome incl. a surfaced scheduled failure, next scheduled run) and `--hosts` fleet view; `pond init` runs the first sync in the foreground and registers the schedule only after it completes, so a fresh timer never races it. ([26a7c7a](https://github.com/tenequm/pond/commit/26a7c7a9ad84aec0313e0591f9e0d06142bd8067))
+- **nix:** canonical flake shipped in-repo; releases are the single binary host ([a4f5e09](https://github.com/tenequm/pond/commit/a4f5e095eec9c10ba52425a056a6c89297d9c6f0))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **cli:** first-run onboarding polish - the ~500 MB embedding-model download now announces itself before it starts (previously a silent multi-minute "hang"); `pond status` no longer fuses long adapter names with their counts and reads "semantic ready (brute-force; index builds at scale)" instead of the alarming "below activation threshold"; empty-store search points at `pond init` rather than blaming filters that were never set; no-adapters states name `pond adapters discover`; message deltas are labelled "searchable" so the searchable-vs-total gap stops reading as data loss. ([43d53f5](https://github.com/tenequm/pond/commit/43d53f50bdb9a820764cce63ee17513b82fc4455))
+- **cli:** `pond status --format json` emits a JSON error document on the store-open failure path instead of empty stdout (matching `sync --format json`); vector search reads "N nearest messages" with a `--mode fts` caveat so a gibberish query no longer looks like confident relevance; and `pond sql`/`pond search`/`pond get` error text renders CLI verbs instead of the shared module's MCP tool/resource names. ([9423535](https://github.com/tenequm/pond/commit/94235359d2db7b05b0d2f2824e7ae76ae6a351cb))
+
+### <!-- 4 -->🚜 Refactor
+- **sync:** address PR review findings - close the Ctrl-C window in `init` schedule registration, reject un-embeddable `XDG_STATE_HOME` paths, and DRY the shared status/heartbeat helpers ([29a4b3a](https://github.com/tenequm/pond/commit/29a4b3a2a76f8c9642781e04ff04a5ed4946dd96))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0
+
 ## [0.11.2](https://github.com/tenequm/pond/compare/v0.11.1...v0.11.2) - 2026-07-03
 
 ### <!-- 2 -->🐛 Bug Fixes
