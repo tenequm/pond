@@ -1,0 +1,30 @@
+# TEMPORARY: exports the dist artifacts for local prerelease execution checks.
+# Delete the branch after downloading; never merge.
+name: dist-artifact-check
+on:
+  pull_request:
+    paths: ['.github/workflows/dist-artifact-check.yml']
+permissions:
+  contents: read
+jobs:
+  publish-release:
+    runs-on: pond-ci
+    timeout-minutes: 90
+    env:
+      MOON_REMOTE_HOST: grpcs://bazel-remote.cascade.fyi:443
+      BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
+      KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+      KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+      KACHE_S3_REGION: nbg1
+      KACHE_S3_BUCKET: ttq
+      KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+      KACHE_S3_PREFIX: kache/pond
+      KACHE_CACHE_DIR: /ci-cache/kache
+      KACHE_MAX_SIZE: 20GiB
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - uses: ./.github/actions/bootstrap
+      - run: moon run pond:build-dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: dist, path: dist/ }
