@@ -220,7 +220,19 @@ mod unix {
         // record in a different state dir than manual syncs - splitting the
         // single-flight lock. Pin the registration-time resolution into the
         // job's environment (same precedent as the baked-in log path).
-        let state = state_home();
+        let state = crate::syncstate::state_root();
+        // The path is embedded verbatim in plist XML, a systemd quoted
+        // Environment= value, and a crontab line (where % means newline) -
+        // none of which this template escapes. Reject the exotic characters
+        // up front instead of writing a silently broken registration.
+        let state_str = state.display().to_string();
+        if state_str.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
+            bail!(
+                "state dir {state_str:?} contains characters that cannot be embedded in a \
+                 scheduler registration; unset or simplify XDG_STATE_HOME and re-run \
+                 `pond schedule start`"
+            );
+        }
         match std::env::consts::OS {
             "macos" => start_launchd(&bin, every, &log, &state),
             "linux" => {
@@ -338,13 +350,6 @@ mod unix {
     /// `$XDG_STATE_HOME/pond/sync.log`, default `~/.local/state/pond/sync.log`.
     fn log_path() -> PathBuf {
         crate::syncstate::pond_state_dir().join("sync.log")
-    }
-
-    /// The XDG_STATE_HOME value pinned into scheduler registrations: the
-    /// parent of `pond_state_dir()` (which appends `/pond`).
-    fn state_home() -> PathBuf {
-        let dir = crate::syncstate::pond_state_dir();
-        dir.parent().map(Path::to_path_buf).unwrap_or(dir)
     }
 
     /// Numeric uid for the `gui/<uid>` launchd domain. Shelled out to

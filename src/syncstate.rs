@@ -13,17 +13,23 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// `$XDG_STATE_HOME/pond` (default `~/.local/state/pond`): the scheduler log,
-/// the sync lock, and the last-sync record. State, not data or cache, per the
-/// XDG base-dir spec - operational state that survives cache wipes and never
-/// needs backup.
-pub(crate) fn pond_state_dir() -> PathBuf {
+/// The resolved `XDG_STATE_HOME` root. Also the value scheduler
+/// registrations pin into the job environment, so scheduled and manual syncs
+/// agree on one state dir even when the variable is set only in shell rc.
+pub(crate) fn state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from(".pond-state"))
-        .join("pond")
+}
+
+/// `$XDG_STATE_HOME/pond` (default `~/.local/state/pond`): the scheduler log,
+/// the sync lock, and the last-sync record. State, not data or cache, per the
+/// XDG base-dir spec - operational state that survives cache wipes and never
+/// needs backup.
+pub(crate) fn pond_state_dir() -> PathBuf {
+    state_root().join("pond")
 }
 
 /// Who holds the sync lock, written into the lock file on acquire so a

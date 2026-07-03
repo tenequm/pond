@@ -1107,29 +1107,35 @@ async fn main() -> anyhow::Result<()> {
                     messages: messages as u64,
                     parts: parts as u64,
                 };
-                let adapter_count = names.len();
+                let checks = StatusChecks {
+                    totals: &totals,
+                    adapter_count: names.len(),
+                    index_status: &index_status,
+                    embedding,
+                };
                 // One scheduler probe (a launchctl/systemctl spawn) serves
                 // both the rendered line and the next-run estimate.
-                let (schedule_line, active_every) = crate::schedule::status_snapshot();
-                let local = local_status(&loaded, &store, &store_key, active_every).await;
+                let local = local_status(
+                    &loaded,
+                    &store,
+                    &store_key,
+                    crate::schedule::status_snapshot(),
+                )
+                .await;
                 match format {
                     OutputFormat::Json => {
                         output(&status_json(
                             &resolved,
                             &sizes,
-                            &totals,
-                            adapter_count,
-                            &index_status,
-                            embedding,
+                            &checks,
                             &local,
                             host_activity.as_deref(),
-                            &schedule_line,
                         )?)?;
                     }
                     OutputFormat::Text => {
                         render_status_header("pond status", &resolved, &sizes, &totals)?;
-                        render_status_checks(&totals, adapter_count, &index_status, embedding)?;
-                        render_local_status(&local, &schedule_line)?;
+                        render_status_checks(&checks)?;
+                        render_local_status(&local)?;
                         if let Some(host_activity) = &host_activity {
                             render_host_activity(host_activity)?;
                         }
@@ -3474,17 +3480,7 @@ async fn run_sync_dry_run(
 
 fn describe_lock_holder(holder: Option<&syncstate::SyncLockHolder>) -> String {
     match holder {
-        Some(holder) => {
-            let running_for = Utc::now()
-                .signed_duration_since(holder.started_at)
-                .to_std()
-                .unwrap_or_default();
-            format!(
-                "pid {}, running for {}",
-                holder.pid,
-                brief_duration(running_for)
-            )
-        }
+        Some(holder) => format!("pid {}, running for {}", holder.pid, ago(holder.started_at)),
         None => "holder unknown".to_owned(),
     }
 }
@@ -3506,12 +3502,16 @@ async fn wait_for_sync_lock(
             "another pond sync is running ({}); waiting for it to finish - Ctrl-C to stop waiting, --no-wait to skip instead",
             describe_lock_holder(holder.as_ref()),
         ));
-        match syncstate::try_acquire_sync_lock(store_key)? {
-            syncstate::SyncLockState::Acquired(guard) => {
+        match syncstate::try_acquire_sync_lock(store_key) {
+            Ok(syncstate::SyncLockState::Acquired(guard)) => {
                 spinner.finish_and_clear();
                 return Ok(guard);
             }
-            syncstate::SyncLockState::Busy(current) => holder = current,
+            Ok(syncstate::SyncLockState::Busy(current)) => holder = current,
+            Err(error) => {
+                spinner.finish_and_clear();
+                return Err(error);
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -3601,15 +3601,31 @@ impl FlushHud {
                 format_thousands(total as u64),
             ),
         );
-        // Off-TTY the bar is invisible, and no sync events fire until the
-        // flush drains - keep the plain heartbeat alive through the embed
-        // phase too, or a multi-minute commit reads as a hang in cron logs.
-        if !slot.stderr_tty && slot.last_heartbeat.elapsed() >= SYNC_HEARTBEAT_EVERY {
-            let _ = output_err(&line);
-            slot.last_heartbeat = std::time::Instant::now();
-        }
+        // No sync events fire until the flush drains - keep the heartbeat
+        // alive through the embed phase too, or a multi-minute commit reads
+        // as a hang in cron logs.
+        heartbeat_line(slot.stderr_tty, &mut slot.last_heartbeat, &line);
         slot.bar.set_message(line);
     }
+}
+
+/// Off-TTY (where indicatif draws nothing) emit `line` as a plain log
+/// heartbeat, at most once per `SYNC_HEARTBEAT_EVERY`.
+fn heartbeat_line(stderr_tty: bool, last_heartbeat: &mut std::time::Instant, line: &str) {
+    if !stderr_tty && last_heartbeat.elapsed() >= SYNC_HEARTBEAT_EVERY {
+        let _ = output_err(line);
+        *last_heartbeat = std::time::Instant::now();
+    }
+}
+
+/// `brief_duration` since a past instant.
+fn ago(then: DateTime<Utc>) -> String {
+    brief_duration(
+        Utc::now()
+            .signed_duration_since(then)
+            .to_std()
+            .unwrap_or_default(),
+    )
 }
 
 /// Compact humanized duration: "42s", "12m", "3h 20m", "2d".
@@ -4203,10 +4219,7 @@ async fn sync_with_progress(
     // same line as a plain log heartbeat so the run is never silent.
     let paint_line =
         move |bar: &ProgressBar, line: String, last_heartbeat: &mut std::time::Instant| {
-            if !stderr_tty && last_heartbeat.elapsed() >= SYNC_HEARTBEAT_EVERY {
-                let _ = output_err(&line);
-                *last_heartbeat = std::time::Instant::now();
-            }
+            heartbeat_line(stderr_tty, last_heartbeat, &line);
             bar.set_message(line);
         };
 
@@ -4714,20 +4727,17 @@ fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
 
 /// `pond status --format json` for an initialized store: the same numbers the
 /// text tables show, as one machine-readable document.
-#[allow(clippy::too_many_arguments)]
 fn status_json(
     resolved: &ResolvedStorage,
     sizes: &TableSizes,
-    totals: &RowTotals,
-    adapter_count: usize,
-    index_status: &[IndexStatus],
-    embedding: Option<EmbeddingProgress>,
+    checks: &StatusChecks,
     local: &LocalStatus,
     hosts: Option<&[pond::sessions::HostActivity]>,
-    schedule_line: &str,
 ) -> anyhow::Result<String> {
     let total_bytes = sizes.sessions + sizes.messages + sizes.parts + sizes.other;
-    let indexes: Vec<serde_json::Value> = index_status
+    let totals = checks.totals;
+    let indexes: Vec<serde_json::Value> = checks
+        .index_status
         .iter()
         .map(|status| {
             serde_json::json!({
@@ -4738,7 +4748,7 @@ fn status_json(
         .collect();
     // null on default `pond status`; populated under `-v` (skipping the
     // 2M-row messages scan keeps default JSON status cheap on cold S3).
-    let embedding_doc = embedding.map(|e| {
+    let embedding_doc = checks.embedding.as_ref().map(|e| {
         serde_json::json!({
             "embedded": e.embedded,
             "eligible": e.total,
@@ -4787,7 +4797,7 @@ fn status_json(
         },
         "indexes": indexes,
         "embedding": embedding_doc,
-        "adapters": adapter_count,
+        "adapters": checks.adapter_count,
         "local": {
             "host": local.hostname,
             "adapters": local_adapters,
@@ -4801,7 +4811,7 @@ fn status_json(
             "next_scheduled_run_secs": local.next_run_secs,
         },
         "hosts": hosts_doc,
-        "schedule": schedule_line,
+        "schedule": local.schedule_line,
         "initialized": true,
     });
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
@@ -4889,41 +4899,45 @@ fn render_status_header(
     Ok(())
 }
 
+/// The bounded-scan results `pond status` renders twice - the text checks
+/// block and the JSON document - bundled so both surfaces read one shape.
+struct StatusChecks<'a> {
+    totals: &'a RowTotals,
+    adapter_count: usize,
+    index_status: &'a [IndexStatus],
+    embedding: Option<EmbeddingProgress>,
+}
+
 /// Render the checks that can take longer on a large corpus. The command
 /// prints storage first, then calls this once the bounded scans finish.
-fn render_status_checks(
-    totals: &RowTotals,
-    adapter_count: usize,
-    index_status: &[IndexStatus],
-    embedding: Option<EmbeddingProgress>,
-) -> anyhow::Result<()> {
+fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
 
     output("")?;
     let health = classify_index_health(
-        index_status,
-        embedding.as_ref(),
+        checks.index_status,
+        checks.embedding.as_ref(),
         pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
     );
     output(&render_indexes_line(&health))?;
     // Default: `stored` shows the manifest row count (cheap); under `-v` the
     // embedding probe ran, so swap in the searchable subset and report it.
-    let messages_label = match &embedding {
+    let messages_label = match &checks.embedding {
         Some(e) => format!("{} searchable messages", format_thousands(e.total as u64)),
-        None => format!("{} messages", format_thousands(totals.messages)),
+        None => format!("{} messages", format_thousands(checks.totals.messages)),
     };
     output(&format!(
         "{}    {} sessions, {}",
         paint("stored", dim()),
-        format_thousands(totals.sessions),
+        format_thousands(checks.totals.sessions),
         messages_label,
     ))?;
     output(&format!(
         "{}  {} adapter(s)",
         paint("adapters", dim()),
-        adapter_count,
+        checks.adapter_count,
     ))?;
-    if embedding.is_none() {
+    if checks.embedding.is_none() {
         output_err(&paint(
             "(use -v for searchable message count + embedding backlog)",
             dim(),
@@ -4947,6 +4961,9 @@ struct LocalStatus {
     /// that never synced) pending counts are unknown, never scanned for.
     pending_known: bool,
     last_sync: Option<syncstate::LastSyncRecord>,
+    /// The probed scheduler line, from the same single probe that supplied
+    /// the cadence behind `next_run_secs`.
+    schedule_line: String,
     /// Estimated seconds until the next scheduled sync (negative = overdue).
     /// `None` without an active schedule or a last-sync record to anchor on.
     next_run_secs: Option<i64>,
@@ -4960,8 +4977,9 @@ async fn local_status(
     loaded: &Config,
     store: &Store,
     store_key: &str,
-    active_every: Option<crate::schedule::ScheduleEvery>,
+    schedule: (String, Option<crate::schedule::ScheduleEvery>),
 ) -> LocalStatus {
+    let (schedule_line, active_every) = schedule;
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
     // last sync - exactly the baseline "pending since then" wants, and a
@@ -5009,11 +5027,12 @@ async fn local_status(
         adapters,
         pending_known,
         last_sync,
+        schedule_line,
         next_run_secs,
     }
 }
 
-fn render_local_status(local: &LocalStatus, schedule_line: &str) -> anyhow::Result<()> {
+fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
     use pond::output::{dim, green, paint, red};
 
     output("")?;
@@ -5060,12 +5079,7 @@ fn render_local_status(local: &LocalStatus, schedule_line: &str) -> anyhow::Resu
     let last_sync_line = match &local.last_sync {
         None => paint("never on this host - run `pond sync`", dim()),
         Some(record) => {
-            let ago = brief_duration(
-                Utc::now()
-                    .signed_duration_since(record.finished_at)
-                    .to_std()
-                    .unwrap_or_default(),
-            );
+            let ago = ago(record.finished_at);
             match record.outcome {
                 syncstate::SyncOutcome::Ok => format!(
                     "{ago} ago - {}: +{} sessions, +{} messages in {}",
@@ -5089,7 +5103,7 @@ fn render_local_status(local: &LocalStatus, schedule_line: &str) -> anyhow::Resu
         }
     };
     output(&format!("{} {last_sync_line}", paint("last sync", dim())))?;
-    let mut schedule_line = schedule_line.to_owned();
+    let mut schedule_line = local.schedule_line.clone();
     if let Some(next_run_secs) = local.next_run_secs {
         let suffix = if next_run_secs <= 0 {
             " - next run due now".to_owned()
@@ -5116,12 +5130,7 @@ fn render_host_activity(hosts: &[pond::sessions::HostActivity]) -> anyhow::Resul
     sorted.sort_by_key(|host| std::cmp::Reverse(host.last_message_at));
     let mut table = new_table();
     for host in sorted {
-        let ago = brief_duration(
-            Utc::now()
-                .signed_duration_since(host.last_message_at)
-                .to_std()
-                .unwrap_or_default(),
-        );
+        let ago = ago(host.last_message_at);
         table.add_row(vec![
             Cell::new(format!(
                 "  {}",

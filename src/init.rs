@@ -380,12 +380,15 @@ pub(crate) async fn run(
     };
     // Register the schedule even when the first sync failed: the scheduled
     // retry is the recovery path, and `pond status` now surfaces the failure.
-    let pending_schedule = PENDING_SCHEDULE
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.take());
-    if let Some(every) = pending_schedule {
-        match schedule::start(every) {
+    // take-and-register happens under one lock hold: the Ctrl-C handler
+    // blocks on this mutex, so an interrupt landing mid-registration waits
+    // for it to finish instead of exiting between the take and the start.
+    let registration = match PENDING_SCHEDULE.lock() {
+        Ok(mut pending) => pending.take().map(schedule::start),
+        Err(_) => None,
+    };
+    if let Some(outcome) = registration {
+        match outcome {
             Ok(()) => {
                 if !run_first_sync {
                     pond::output::line_err(&pond::output::paint(
