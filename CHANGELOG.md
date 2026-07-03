@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0](https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0) - 2026-07-03
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] add pond_version to status --format json ([5e56aad](https://github.com/tenequm/pond/commit/5e56aad4cd95d0774b2ee6392bed9d5564e41f79))
+
+### <!-- 1 -->🎉 New Features
+- **sync:** single-flight lock, live progress, dry-run, and per-host status ([26a7c7a](https://github.com/tenequm/pond/commit/26a7c7a9ad84aec0313e0591f9e0d06142bd8067))
+- **nix:** canonical flake in-repo; single binary host on pond releases ([a4f5e09](https://github.com/tenequm/pond/commit/a4f5e095eec9c10ba52425a056a6c89297d9c6f0))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **cli:** surface-correct search/sql wording and status JSON errors ([9423535](https://github.com/tenequm/pond/commit/94235359d2db7b05b0d2f2824e7ae76ae6a351cb))
+- **cli:** polish onboarding output, help, and docs for launch ([43d53f5](https://github.com/tenequm/pond/commit/43d53f50bdb9a820764cce63ee17513b82fc4455))
+
+### <!-- 4 -->🚜 Refactor
+- **sync:** address PR review findings ([29a4b3a](https://github.com/tenequm/pond/commit/29a4b3a2a76f8c9642781e04ff04a5ed4946dd96))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0
+
 ## [0.11.2](https://github.com/tenequm/pond/compare/v0.11.1...v0.11.2) - 2026-07-03
 
 ### <!-- 2 -->🐛 Bug Fixes
