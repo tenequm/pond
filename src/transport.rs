@@ -701,9 +701,13 @@ Examples (4 patterns the agent should recognize):
             )
             .await
             {
-                SearchEnvelope::Success(response) => Ok(tool_result(
-                    crate::render::render_search_transcript(&response, &request),
-                )),
+                SearchEnvelope::Success(response) => {
+                    Ok(tool_result(crate::render::render_search_transcript(
+                        &response,
+                        &request,
+                        crate::render::Surface::Mcp,
+                    )))
+                }
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
         }
@@ -745,7 +749,11 @@ Examples (4 patterns the agent should recognize):
             };
             match run_get(&self.state.store, request.clone()).await {
                 GetEnvelope::Success(response) => {
-                    let mut transcript = crate::render::render_get_transcript(&response, &request);
+                    let mut transcript = crate::render::render_get_transcript(
+                        &response,
+                        &request,
+                        crate::render::Surface::Mcp,
+                    );
                     // Spawn-only subagents are stored as their own sessions
                     // (spec.md#datasets); surface them on the parent's first page
                     // so an agent can open each (otherwise they are undiscoverable
@@ -758,7 +766,10 @@ Examples (4 patterns the agent should recognize):
                             self.state.store.child_sessions(&response.session.id).await
                         && !children.is_empty()
                     {
-                        transcript.push_str(&crate::render::render_subagents_footer(&children));
+                        transcript.push_str(&crate::render::render_subagents_footer(
+                            &children,
+                            crate::render::Surface::Mcp,
+                        ));
                     }
                     Ok(tool_result(transcript))
                 }

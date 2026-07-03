@@ -144,7 +144,33 @@ pub trait Adapter: Send + Sync {
     /// short-circuit per-session re-decoding (spec.md#adapter-integrity-event-ordering). Default impl
     /// ignores the oracle.
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a>;
+
+    /// Cheap sync preview: classify every discovered source as fresh vs
+    /// pending against the oracle's watermarks WITHOUT decoding bodies (the
+    /// same gate [`Self::events_with`] applies before its expensive read).
+    /// Powers `pond sync --dry-run` and the `pond status` pending count, so it
+    /// must stay bounded-read cheap. `Ok(None)` (the default) means this
+    /// adapter has no gate cheaper than a full read and callers report the
+    /// pending count as unknown rather than paying for it.
+    fn plan<'a>(&'a self, _oracle: &'a dyn SkipOracle) -> PlanFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 }
+
+/// What the next `pond sync` would do for one adapter, computed from the
+/// freshness gate alone: `pending` sources get read (and possibly turn out
+/// empty); `fresh` ones are skipped outright.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncPlan {
+    pub sources: usize,
+    pub fresh: usize,
+    pub pending: usize,
+}
+
+/// Boxed future for [`Adapter::plan`], mirroring [`DiscoverFuture`].
+pub type PlanFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<SyncPlan>, AdapterError>> + Send + 'a>,
+>;
 
 /// Store-side freshness watermark: the max message timestamp (micros) pond
 /// already holds for a session. Backed by the resident row-meta map (zero S3 -

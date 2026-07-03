@@ -343,8 +343,10 @@ fn parse_and_gate(sql: &str) -> Result<ParsedStatement, SqlError> {
 }
 
 fn read_only_rejection() -> SqlError {
+    // Surface-neutral wording: this message reaches both the pond_sql_query
+    // MCP tool and the `pond sql` CLI, so it names neither.
     SqlError::Query(
-        "pond_sql_query is read-only: only a single SELECT/WITH (or EXPLAIN of one) is \
+        "pond's SQL surface is read-only: only a single SELECT/WITH (or EXPLAIN of one) is \
          allowed (no INSERT/UPDATE/DELETE/CREATE/DROP/COPY/SET)"
             .to_owned(),
     )

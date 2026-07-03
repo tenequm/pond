@@ -6,22 +6,42 @@
 use crate::handlers::default_excludes_subagents;
 use crate::wire::{
     GetRequest, GetResponse, GetResult, MessageView, PartKind, PartSummary, ResponsePart,
-    SearchRequest, SearchResponse, SortBy,
+    SearchModeWire, SearchRequest, SearchResponse, SortBy,
 };
+
+/// Which surface a transcript renders for. The format is identical; only the
+/// follow-up vocabulary differs - the MCP tools are `pond_get` /
+/// `pond_sql_query` with `key=value` args, the CLI verbs are
+/// `pond get --message-id <ID>` / `pond sql`. Without this a human at the
+/// terminal is told to run tool syntax their shell rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Mcp,
+    Cli,
+}
+
+/// `1 message` / `2 messages`: a count with a correctly pluralized noun.
+fn count_noun(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
 
 /// Footer for a `pond_get` session response listing the session's spawn-only
 /// subagents. Each subagent is its own session (spec.md#datasets) addressable
 /// by the printed id, so the caller can open any with `pond_get(session_id)`;
 /// without this they are invisible from the MCP surface.
-pub fn render_subagents_footer(children: &[crate::wire::Session]) -> String {
+pub fn render_subagents_footer(children: &[crate::wire::Session], surface: Surface) -> String {
     use std::fmt::Write;
+    let how = match surface {
+        Surface::Mcp => "pass an id to pond_get(session_id=...)",
+        Surface::Cli => "pass an id to `pond get --session-id <ID>`",
+    };
     let mut out = String::new();
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "subagents ({}) - pass an id to pond_get(session_id=...):",
-        children.len()
-    );
+    let _ = writeln!(out, "subagents ({}) - {how}:", children.len());
     for child in children {
         let _ = writeln!(out, "  {} | {}", child.id, child.source_agent);
     }
@@ -56,12 +76,24 @@ fn push_lines(out: &mut String, body: &str, indent: &str) {
 /// transcript. Soft: a single session's header + one hit may nudge past it.
 const SEARCH_TRANSCRIPT_BUDGET: usize = 10_000;
 
-pub fn render_search_transcript(response: &SearchResponse, request: &SearchRequest) -> String {
+pub fn render_search_transcript(
+    response: &SearchResponse,
+    request: &SearchRequest,
+    surface: Surface,
+) -> String {
     use std::fmt::Write;
-    let subagent_note = if default_excludes_subagents(&request.filters) {
-        " Subagent sessions excluded; reach them via pond_sql_query (parent_session_id)."
-    } else {
-        ""
+    let prefix = match surface {
+        Surface::Mcp => "pond_search",
+        Surface::Cli => "pond search",
+    };
+    let subagent_note = match (default_excludes_subagents(&request.filters), surface) {
+        (false, _) => "",
+        (true, Surface::Mcp) => {
+            " Subagent sessions excluded; reach them via pond_sql_query (parent_session_id)."
+        }
+        (true, Surface::Cli) => {
+            " Subagent sessions excluded; reach them via `pond sql` (parent_session_id)."
+        }
     };
     let recency_note = if matches!(request.sort_by, SortBy::Recency) {
         " Sorted by recency (newest first) - rank is NOT match strength."
@@ -71,33 +103,72 @@ pub fn render_search_transcript(response: &SearchResponse, request: &SearchReque
     if response.sessions.is_empty() {
         // spec.md#search-absence-honesty: name the scope size and the
         // recovery path - a zero-hit response must distinguish "nothing
-        // relevant exists" from "the filters excluded everything".
+        // relevant exists" from "the filters excluded everything" from "the
+        // store simply has nothing stored yet".
         if response.searchable_in_scope == 0 {
-            return format!(
-                "pond_search: 0 searchable messages in scope - the filters exclude \
-                 everything before retrieval. Widen or drop project/date filters.\
-                 {subagent_note}\n"
-            );
+            let scoped = request.filters.project.is_some()
+                || request.filters.session_id.is_some()
+                || request.filters.from_date.is_some()
+                || request.filters.to_date.is_some();
+            if scoped {
+                return format!(
+                    "{prefix}: 0 searchable messages in scope - the filters exclude \
+                     everything before retrieval. Widen or drop project/date filters.\
+                     {subagent_note}\n"
+                );
+            }
+            // No filters were set: the corpus itself is empty, so pointing
+            // at filters would send the user chasing settings they never made.
+            return match surface {
+                Surface::Cli => format!(
+                    "{prefix}: no sessions stored yet - run `pond init` to set up \
+                     adapters, then `pond sync` to import your history.\n"
+                ),
+                Surface::Mcp => format!(
+                    "{prefix}: the store has no searchable messages yet (nothing \
+                     ingested so far). Not an absence signal about the topic.\n"
+                ),
+            };
         }
-        let fts_hint = " For exact strings or identifiers, try pond_sql_query: SELECT \
-                        message_id, session_id, search_text FROM messages WHERE \
-                        contains_tokens(search_text, '...').";
+        let fts_hint = match surface {
+            Surface::Mcp => {
+                " For exact strings or identifiers, try pond_sql_query: SELECT \
+                 message_id, session_id, search_text FROM messages WHERE \
+                 contains_tokens(search_text, '...')."
+            }
+            Surface::Cli => {
+                " For exact strings or identifiers, try: pond sql \"SELECT \
+                 message_id, session_id, search_text FROM messages WHERE \
+                 contains_tokens(search_text, '...')\"."
+            }
+        };
         return format!(
-            "pond_search: no matches for {:?} across {} searchable messages in \
+            "{prefix}: no matches for {:?} across {} in \
              scope.{subagent_note}{fts_hint}\n",
-            request.query, response.searchable_in_scope
+            request.query,
+            count_noun(response.searchable_in_scope, "searchable message"),
         );
     }
     let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
+    // Vector mode ranks by similarity and ALWAYS returns the nearest rows,
+    // even when none truly match (cosine bands for present vs absent content
+    // overlap, so there is deliberately no score cutoff) - so call them
+    // "nearest", not "matching", or a gibberish query looks like confident
+    // relevance. fts requires real token overlap, so "matching" is honest there.
+    let vector_mode = matches!(request.mode, SearchModeWire::Vector);
+    let head_noun = if vector_mode {
+        "nearest message"
+    } else {
+        "matching message"
+    };
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "pond_search: {} matching messages ({} searchable in scope), showing {} hits from {} \
-         sessions.{}{}",
-        response.matched_total,
+        "{prefix}: {} ({} searchable in scope), showing {} from {}.{}{}",
+        count_noun(response.matched_total, head_noun),
         response.searchable_in_scope,
-        shown,
-        response.sessions.len(),
+        count_noun(shown, "hit"),
+        count_noun(response.sessions.len(), "session"),
         subagent_note,
         recency_note,
     );
@@ -106,9 +177,22 @@ pub fn render_search_transcript(response: &SearchResponse, request: &SearchReque
     } else {
         "ordered by best hit"
     };
+    let full_hint = match surface {
+        Surface::Mcp => "pond_get <message_id> for full",
+        Surface::Cli => "`pond get --message-id <ID>` for full",
+    };
+    let mode_note = match (vector_mode, surface) {
+        (false, _) => "",
+        (true, Surface::Cli) => {
+            " Vector mode returns the closest rows by meaning even when none are strong; for exact-word matching use --mode fts."
+        }
+        (true, Surface::Mcp) => {
+            " Vector mode returns the closest rows by meaning even when none are strong; for exact-word matching set mode=\"fts\"."
+        }
+    };
     let _ = writeln!(
         out,
-        "key: session rules group hits by session, {order}; within a session, messages are newest-first. \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. pond_get <message_id> for full; raise limit for more (no pagination)."
+        "key: session rules group hits by session, {order}; within a session, messages are newest-first. \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. {full_hint}; raise limit for more (no pagination).{mode_note}"
     );
     let mut index = 0;
     let n_sessions = response.sessions.len();
@@ -171,18 +255,30 @@ pub fn render_search_transcript(response: &SearchResponse, request: &SearchReque
         // session's latest state, which may revise these older hits.
         let omitted = session.matches.len() - rendered;
         if omitted > 0 {
+            let latest_hint = match surface {
+                Surface::Mcp => "read with session_from=end",
+                Surface::Cli => "read with `pond get --session-id <ID> --session-from end`",
+            };
             let _ = writeln!(
                 out,
                 "... {omitted} more match(es) in this session not shown (char budget); \
-                 read with session_from=end for the session's latest state"
+                 {latest_hint} for the session's latest state"
             );
         }
     }
     out
 }
 
-pub fn render_get_transcript(response: &GetResponse, request: &GetRequest) -> String {
+pub fn render_get_transcript(
+    response: &GetResponse,
+    request: &GetRequest,
+    surface: Surface,
+) -> String {
     use std::fmt::Write;
+    let prefix = match surface {
+        Surface::Mcp => "pond_get",
+        Surface::Cli => "pond get",
+    };
     let session = &response.session;
     let mut out = String::new();
     match &response.result {
@@ -193,22 +289,37 @@ pub fn render_get_transcript(response: &GetResponse, request: &GetRequest) -> St
         } => {
             let _ = writeln!(
                 out,
-                "pond_get: session {}, {} messages.",
+                "{prefix}: session {}, {}.",
                 session.id,
-                messages.len(),
+                count_noun(messages.len(), "message"),
             );
+            let (expand_hint, page_hint) = match surface {
+                Surface::Mcp => (
+                    "pond_get message_id=<id> to expand any tool body",
+                    "Page with session_before_message_id / session_after_message_id.",
+                ),
+                Surface::Cli => (
+                    "`pond get --message-id <ID>` to expand any tool body",
+                    "Page with --session-before-message-id / --session-after-message-id.",
+                ),
+            };
             let _ = writeln!(
                 out,
-                "key: \"--- [n] role | time | message_id ---\" delimits each message; \"->\" tool call, \"<-\" result; pond_get message_id=<id> to expand any tool body. Page with session_before_message_id / session_after_message_id."
+                "key: \"--- [n] role | time | message_id ---\" delimits each message; \"->\" tool call, \"<-\" result; {expand_hint}. {page_hint}"
             );
             // Top marker: earlier messages precede this page (page up).
             if *before_remaining > 0
                 && let Some(first) = messages.first()
             {
+                let page_up = match surface {
+                    Surface::Mcp => format!("pass session_before_message_id={}", first.id),
+                    Surface::Cli => {
+                        format!("pass --session-before-message-id {}", first.id)
+                    }
+                };
                 let _ = writeln!(
                     out,
-                    "... {before_remaining} earlier messages; pass session_before_message_id={} to page up",
-                    first.id,
+                    "... {before_remaining} earlier messages; {page_up} to page up",
                 );
             }
             for (idx, message) in messages.iter().enumerate() {
@@ -232,10 +343,13 @@ pub fn render_get_transcript(response: &GetResponse, request: &GetRequest) -> St
             if *after_remaining > 0
                 && let Some(last) = messages.last()
             {
+                let page_down = match surface {
+                    Surface::Mcp => format!("pass session_after_message_id={}", last.id),
+                    Surface::Cli => format!("pass --session-after-message-id {}", last.id),
+                };
                 let _ = writeln!(
                     out,
-                    "... {after_remaining} later messages; pass session_after_message_id={} to page down",
-                    last.id,
+                    "... {after_remaining} later messages; {page_down} to page down",
                 );
             }
         }
@@ -247,15 +361,19 @@ pub fn render_get_transcript(response: &GetResponse, request: &GetRequest) -> St
         } => {
             let _ = writeln!(
                 out,
-                "pond_get: thread around {} in session {} (context -{}/+{}).",
+                "{prefix}: thread around {} in session {} (context -{}/+{}).",
                 target.id,
                 session.id,
                 request.message_context_before,
                 request.message_context_after,
             );
+            let expand_hint = match surface {
+                Surface::Mcp => "pond_get message_id=<id> to expand any line",
+                Surface::Cli => "`pond get --message-id <ID>` to expand any line",
+            };
             let _ = writeln!(
                 out,
-                "key: \"--- [n] role | time | message_id ---\" delimits each message; \">\" = the one you requested; \"->\" tool call, \"<-\" result. pond_get message_id=<id> to expand any line."
+                "key: \"--- [n] role | time | message_id ---\" delimits each message; \">\" = the one you requested; \"->\" tool call, \"<-\" result. {expand_hint}."
             );
             // Interleave target with siblings, ordered by (timestamp, id) to
             // match storage - codex writes many messages at the same
@@ -526,7 +644,7 @@ mod tests {
             message_context_after: 3,
         };
 
-        let transcript = crate::render::render_get_transcript(&response, &request);
+        let transcript = crate::render::render_get_transcript(&response, &request, Surface::Mcp);
         assert!(transcript.contains("--- [1] > assistant | 1970-01-01 00:00:00Z | m1 ---"));
         assert!(transcript.contains("Let me list files."));
         assert!(transcript.contains("  -> Bash [toolu_x]"));
@@ -566,11 +684,13 @@ mod tests {
             limit: 10,
         };
 
-        let transcript = crate::render::render_search_transcript(&response, &request);
+        let transcript = crate::render::render_search_transcript(&response, &request, Surface::Mcp);
         assert!(transcript.starts_with(
-            "pond_search: 1 matching messages (2 searchable in scope), showing 1 hits from 1 \
-             sessions."
+            "pond_search: 1 nearest message (2 searchable in scope), showing 1 hit from 1 \
+             session."
         ));
+        // Vector mode names the closest-rows caveat and points at fts.
+        assert!(transcript.contains("Vector mode returns the closest rows"));
         assert!(
             transcript.contains("key: session rules group hits by session, ordered by best hit")
         );
@@ -629,7 +749,7 @@ mod tests {
             filters: SearchFilters::default(),
             limit: 10,
         };
-        let transcript = crate::render::render_search_transcript(&response, &request);
+        let transcript = crate::render::render_search_transcript(&response, &request, Surface::Mcp);
 
         // Bounded near the budget (soft: each session's guaranteed top hit
         // can nudge its share, so allow a per-session overshoot margin).

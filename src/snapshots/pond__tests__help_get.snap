@@ -1,6 +1,5 @@
 ---
 source: src/main.rs
-assertion_line: 4798
 expression: sub.render_long_help().to_string()
 ---
 Fetch a session or message.
@@ -51,6 +50,8 @@ Options:
           [default: 3]
 
       --format <FORMAT>
+          Output format: `text` (readable transcript) or `json` (one document)
+          
           [default: text]
           [possible values: text, json]
 

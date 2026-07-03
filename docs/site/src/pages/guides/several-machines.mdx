@@ -3,3 +3,5 @@
 Point each machine's `config.toml` (or `POND_*` env) at the same URL and credentials, and run `pond sync` on each.
 
 Concurrent writers are safe: Lance serializes commits through the object store's conditional writes (optimistic concurrency), so two syncs at once cannot corrupt the dataset.
+
+Within one machine, sync is single-flight: a second `pond sync` against the same store waits for the first (naming the holder), and the scheduled run passes `--no-wait` so ticks skip cleanly instead of queueing. `pond status --hosts` shows which machines feed the store - sessions and latest activity per ingest host.

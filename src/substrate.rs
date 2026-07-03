@@ -3752,8 +3752,9 @@ pub mod index_cache {
 
 /// Stable filesystem-safe key for a store URL: same URL -> same key, so sibling
 /// pond processes share one on-disk cache and distinct stores never collide.
-/// Shared by the rowmap (`sessions.rs`) and the index disk cache.
-pub(crate) fn store_key(location: &Url) -> String {
+/// Shared by the rowmap (`sessions.rs`), the index disk cache, and the CLI's
+/// per-store sync lock / last-sync state files.
+pub fn store_key(location: &Url) -> String {
     blake3::hash(location.as_str().as_bytes()).to_hex()[..16].to_owned()
 }
 

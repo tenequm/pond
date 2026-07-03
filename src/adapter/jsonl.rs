@@ -19,7 +19,8 @@ use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 use tokio::{sync::mpsc, task::JoinError};
 
 use super::{
-    AdapterError, AdapterYield, AdapterYieldStream, DiscoverFuture, SkipOracle, SkipReason,
+    AdapterError, AdapterYield, AdapterYieldStream, DiscoverFuture, PlanFuture, SkipOracle,
+    SkipReason, SyncPlan,
     extract::{LEAF_CAP, bound_value, truncate_to_marker},
 };
 use crate::{
@@ -179,6 +180,39 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
         if let Err(join) = handle.await {
             yield Err(join_error(name, join));
         }
+    })
+}
+
+/// The freshness gate of [`jsonl_tree_events`] run standalone: the same
+/// `collect_heads` peek, classified instead of read. On an empty oracle the
+/// peek is skipped entirely, so a first sync's plan is "everything pending"
+/// at directory-walk cost.
+pub(crate) fn jsonl_tree_plan<'a, D: JsonlTree>(
+    driver: &'a D,
+    oracle: &'a dyn SkipOracle,
+) -> PlanFuture<'a> {
+    let name = driver.name();
+    Box::pin(async move {
+        let heads = {
+            let driver = driver.clone();
+            let oracle_is_empty = oracle.is_empty();
+            tokio::task::spawn_blocking(move || collect_heads(&driver, oracle_is_empty))
+                .await
+                .map_err(|join| join_error(name, join))??
+        };
+        let mut plan = SyncPlan {
+            sources: heads.len(),
+            ..SyncPlan::default()
+        };
+        for head in &heads {
+            if let Some(id) = &head.session_id
+                && crate::adapter::is_session_fresh(oracle, id, head.last_ts)
+            {
+                plan.fresh += 1;
+            }
+        }
+        plan.pending = plan.sources - plan.fresh;
+        Ok(Some(plan))
     })
 }
 

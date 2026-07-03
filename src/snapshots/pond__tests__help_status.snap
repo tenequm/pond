@@ -1,6 +1,5 @@
 ---
 source: src/main.rs
-assertion_line: 4707
 expression: sub.render_long_help().to_string()
 ---
 Show pond health, data, and adapter status.
@@ -12,6 +11,9 @@ Usage: pond status [OPTIONS]
 Options:
       --include-subagents
           Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`) as its own adapter. Default counts only main agents
+
+      --hosts
+          Break the corpus down by ingest host: which machines have fed this store, how many sessions each contributed, and their latest one
 
       --format <FORMAT>
           Output format: `text` (human tables) or `json` (one document)
@@ -43,4 +45,5 @@ Global options:
 
 Examples:
   pond status                       the one-screen overview
+  pond status --hosts               which machines feed this store, and when
   pond status --include-subagents   count each subagent as its own adapter

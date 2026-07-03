@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Manage the automatic sync schedule.
 
-Registers `pond sync -q` with the OS scheduler: launchd on macOS, systemd user timers (or a crontab fence) on Linux. `pond init` offers the same setup interactively.
+Registers `pond sync -q --no-wait` with the OS scheduler: launchd on macOS, systemd user timers (or a crontab fence) on Linux. `pond init` offers the same setup interactively.
 
 Usage: pond schedule [OPTIONS] <COMMAND>
 
@@ -39,7 +39,7 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond schedule start              sync every hour
+  pond schedule start              every 5 minutes (the default)
   pond schedule start --every 15m
   pond schedule status
   pond schedule logs

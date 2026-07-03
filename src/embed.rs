@@ -50,6 +50,18 @@ impl CandleEmbedder {
         let id = model_id();
         let api = hf_hub::api::sync::Api::new().context("init HuggingFace hub client")?;
         let repo = api.model(id.to_owned());
+        // The weights are ~500 MB and the ureq-only hf-hub build renders no
+        // download progress, so a first run looks hung for minutes without
+        // this notice. Cache-hit runs stay silent.
+        if hf_hub::Cache::default()
+            .model(id.to_owned())
+            .get("model.safetensors")
+            .is_none()
+        {
+            let _ = crate::output::line_err(&format!(
+                "downloading embedding model {id} (~500 MB, one-time; cached under ~/.cache/huggingface)..."
+            ));
+        }
         let fetch = |file: &str| {
             repo.get(file)
                 .with_context(|| format!("fetch {file} for {id}"))

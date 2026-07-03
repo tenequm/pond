@@ -1,11 +1,13 @@
-//! `pond schedule`: register `pond sync -q` with the OS scheduler.
+//! `pond schedule`: register `pond sync -q --no-wait` with the OS scheduler.
 //!
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
 //! span sleep). Linux prefers systemd user timers (`Persistent=true` catches
 //! up after downtime) and falls back to a fenced crontab block. The
-//! scheduled job is `pond sync -q` - NOT `--yes`, so an unattended run can
-//! never auto-enable freshly-detected adapters.
+//! scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an unattended
+//! run can never auto-enable freshly-detected adapters, and `--no-wait` so a
+//! tick that lands while another sync holds the per-store lock skips cleanly
+//! (exit 0) instead of queueing behind it.
 //!
 //! Bin-only module: OS-scheduler integration has no library callers.
 
@@ -28,8 +30,7 @@ pub(crate) enum ScheduleEvery {
 }
 
 impl ScheduleEvery {
-    #[cfg(unix)]
-    fn secs(self) -> u32 {
+    pub(crate) fn secs(self) -> u32 {
         match self {
             Self::M5 => 300,
             Self::M15 => 900,
@@ -68,7 +69,7 @@ pub(crate) enum ScheduleCmd {
   pond schedule start --every 1h
   pond schedule start --every 1d")]
     Start {
-        /// How often to run `pond sync -q`.
+        /// How often to run `pond sync -q --no-wait`.
         #[arg(long, value_enum, default_value_t = ScheduleEvery::M5)]
         every: ScheduleEvery,
     },
@@ -107,8 +108,27 @@ pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
     bail!("pond schedule is not supported on Windows yet")
 }
 
+#[cfg(not(unix))]
+pub(crate) fn status_snapshot() -> ScheduleSnapshot {
+    ScheduleSnapshot {
+        line: status_line(),
+        active: false,
+        backend: None,
+        every: None,
+    }
+}
+
+/// One scheduler probe's answer, shared by the `pond status` text line and
+/// the JSON document (which needs the fields structured, not pre-rendered).
+pub(crate) struct ScheduleSnapshot {
+    pub line: String,
+    pub active: bool,
+    pub backend: Option<&'static str>,
+    pub every: Option<ScheduleEvery>,
+}
+
 #[cfg(unix)]
-pub(crate) use unix::{run, start, status_line};
+pub(crate) use unix::{run, start, status_line, status_snapshot};
 
 #[cfg(unix)]
 mod unix {
@@ -150,12 +170,36 @@ mod unix {
     /// command that would set one up. Never errors - status must render even
     /// when the scheduler probe can't run.
     pub(crate) fn status_line() -> String {
+        status_snapshot().line
+    }
+
+    /// One probe (a launchctl/systemctl spawn) serving every `pond status`
+    /// need: the rendered schedule line plus the structured active/backend/
+    /// cadence fields (status combines the cadence with the last-sync record
+    /// to estimate the next run; JSON emits the fields directly).
+    pub(crate) fn status_snapshot() -> super::ScheduleSnapshot {
         match probe() {
-            Ok(state) => render_state(&state),
-            Err(_) => format!(
-                "{}  unknown (scheduler probe failed)",
-                paint("schedule", dim())
-            ),
+            Ok(state) => {
+                let (active, backend, every) = match &state {
+                    Active { backend, every } => (true, Some(*backend), *every),
+                    Inactive => (false, None, None),
+                };
+                super::ScheduleSnapshot {
+                    line: render_state(&state),
+                    active,
+                    backend,
+                    every,
+                }
+            }
+            Err(_) => super::ScheduleSnapshot {
+                line: format!(
+                    "{}  unknown (scheduler probe failed)",
+                    paint("schedule", dim())
+                ),
+                active: false,
+                backend: None,
+                every: None,
+            },
         }
     }
 
@@ -193,17 +237,39 @@ mod unix {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        // The scheduler daemon never sources shell rc files, so a shell-only
+        // XDG_STATE_HOME would put the scheduled sync's flock and last-sync
+        // record in a different state dir than manual syncs - splitting the
+        // single-flight lock. Pin the registration-time resolution into the
+        // job's environment (same precedent as the baked-in log path).
+        let state = crate::syncstate::state_root();
+        // The path is embedded verbatim in plist XML, a systemd quoted
+        // Environment= value, and a crontab line (where % means newline) -
+        // none of which this template escapes. Reject the exotic characters
+        // up front instead of writing a silently broken registration.
+        let state_str = state.display().to_string();
+        if state_str.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
+            // Name the resolved path AND its sources: the bad character may
+            // come from $HOME (the fallback), where "unset XDG_STATE_HOME"
+            // would be a dead-end instruction.
+            bail!(
+                "state dir {state_str:?} contains a character (< > & \" % or a newline) that \
+                 cannot be embedded in a scheduler registration; it resolves from \
+                 XDG_STATE_HOME, falling back to $HOME/.local/state - set XDG_STATE_HOME \
+                 to a simpler absolute path and re-run `pond schedule start`"
+            );
+        }
         match std::env::consts::OS {
-            "macos" => start_launchd(&bin, every, &log),
+            "macos" => start_launchd(&bin, every, &log, &state),
             "linux" => {
                 if systemd_user_available() {
                     // Switching schedulers must not leave the other one
                     // firing: a systemd start strips any cron fence.
                     remove_cron_fence()?;
-                    start_systemd(&bin, every)
+                    start_systemd(&bin, every, &state)
                 } else {
                     stop_systemd()?;
-                    start_cron(&bin, every, &log)
+                    start_cron(&bin, every, &log, &state)
                 }
             }
             other => bail!("pond schedule is not supported on {other} yet"),
@@ -307,17 +373,9 @@ mod unix {
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
     }
 
-    /// `$XDG_STATE_HOME/pond/sync.log`, default `~/.local/state/pond/sync.log`
-    /// (state, not data: logs are reproducible, per the XDG base-dir spec).
+    /// `$XDG_STATE_HOME/pond/sync.log`, default `~/.local/state/pond/sync.log`.
     fn log_path() -> PathBuf {
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".pond-state"));
-        state.join("pond").join("sync.log")
+        crate::syncstate::pond_state_dir().join("sync.log")
     }
 
     /// Numeric uid for the `gui/<uid>` launchd domain. Shelled out to
@@ -342,7 +400,7 @@ mod unix {
             .join(format!("{LAUNCHD_LABEL}.plist")))
     }
 
-    fn plist_body(bin: &Path, every: ScheduleEvery, log: &Path) -> String {
+    fn plist_body(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -356,7 +414,13 @@ mod unix {
 		<string>{bin}</string>
 		<string>sync</string>
 		<string>-q</string>
+		<string>--no-wait</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>XDG_STATE_HOME</key>
+		<string>{state}</string>
+	</dict>
 	<key>StartInterval</key>
 	<integer>{secs}</integer>
 	<key>StandardOutPath</key>
@@ -371,6 +435,7 @@ mod unix {
             bin = bin.display(),
             secs = every.secs(),
             log = log.display(),
+            state = state.display(),
         )
     }
 
@@ -384,9 +449,9 @@ mod unix {
             .unwrap_or(false)
     }
 
-    fn start_launchd(bin: &Path, every: ScheduleEvery, log: &Path) -> Result<()> {
+    fn start_launchd(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> Result<()> {
         let plist = plist_path()?;
-        let body = plist_body(bin, every, log);
+        let body = plist_body(bin, every, log, state);
         let uid = current_uid()?;
         let unchanged = std::fs::read_to_string(&plist)
             .map(|existing| existing == body)
@@ -512,14 +577,16 @@ mod unix {
             .join("systemd/user")
     }
 
-    fn systemd_service_body(bin: &Path) -> String {
+    fn systemd_service_body(bin: &Path, state: &Path) -> String {
         format!(
             "# created and maintained by pond; edits may be replaced\n\
              [Unit]\n\
              Description=pond sync\n\n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart={} sync -q\n",
+             Environment=\"XDG_STATE_HOME={}\"\n\
+             ExecStart={} sync -q --no-wait\n",
+            state.display(),
             bin.display(),
         )
     }
@@ -540,13 +607,13 @@ mod unix {
         )
     }
 
-    fn start_systemd(bin: &Path, every: ScheduleEvery) -> Result<()> {
+    fn start_systemd(bin: &Path, every: ScheduleEvery, state: &Path) -> Result<()> {
         let dir = systemd_unit_dir();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         let service_path = dir.join("pond-sync.service");
         let timer_path = dir.join("pond-sync.timer");
-        let service = systemd_service_body(bin);
+        let service = systemd_service_body(bin, state);
         let timer = systemd_timer_body(every);
         let unchanged = std::fs::read_to_string(&service_path)
             .map(|existing| existing == service)
@@ -639,8 +706,19 @@ mod unix {
     /// The cron line for one cadence. The minute is randomized once at
     /// registration so a fleet of pond installs doesn't synchronize load on
     /// a shared object store at :00.
-    fn cron_entry(bin: &Path, every: ScheduleEvery, log: &Path, minute: u32) -> String {
-        let command = format!("{} sync -q >> {} 2>&1", bin.display(), log.display());
+    fn cron_entry(
+        bin: &Path,
+        every: ScheduleEvery,
+        log: &Path,
+        minute: u32,
+        state: &Path,
+    ) -> String {
+        let command = format!(
+            "XDG_STATE_HOME=\"{}\" {} sync -q --no-wait >> {} 2>&1",
+            state.display(),
+            bin.display(),
+            log.display()
+        );
         let schedule = match every {
             ScheduleEvery::M5 => format!("{}-59/5 * * * *", minute % 5),
             ScheduleEvery::M15 => {
@@ -748,16 +826,22 @@ mod unix {
         Ok(fence_entry_in(&read_crontab()?))
     }
 
-    fn start_cron(bin: &Path, every: ScheduleEvery, log: &Path) -> Result<()> {
+    fn start_cron(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> Result<()> {
         let existing = read_crontab()?;
+        // The command-shape check keeps this a real idempotence test: a fence
+        // entry written by an older pond (`sync -q` without `--no-wait`, or
+        // without the pinned state dir) must re-register, not be kept as
+        // "already scheduled".
         if let Some(entry) = fence_entry_in(&existing)
             && cron_entry_interval(&entry) == Some(every)
             && entry.contains(&bin.display().to_string())
+            && entry.contains("--no-wait")
+            && entry.contains("XDG_STATE_HOME=")
         {
             line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
-        let entry = cron_entry(bin, every, log, fastrand::u32(0..60));
+        let entry = cron_entry(bin, every, log, fastrand::u32(0..60), state);
         let mut body = strip_cron_fence(&existing);
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
@@ -793,6 +877,7 @@ mod unix {
         fn cron_entries_reverse_map_to_their_cadence() {
             let bin = Path::new("/usr/local/bin/pond");
             let log = Path::new("/tmp/sync.log");
+            let state = Path::new("/home/user/.local/state");
             for every in [
                 ScheduleEvery::M5,
                 ScheduleEvery::M15,
@@ -801,7 +886,7 @@ mod unix {
                 ScheduleEvery::D1,
             ] {
                 for minute in [0, 7, 59] {
-                    let entry = cron_entry(bin, every, log, minute);
+                    let entry = cron_entry(bin, every, log, minute, state);
                     assert_eq!(cron_entry_interval(&entry), Some(every), "entry: {entry}");
                 }
             }

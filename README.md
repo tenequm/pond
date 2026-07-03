@@ -127,7 +127,7 @@ pond schedule status
 pond schedule logs
 ```
 
-`pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + searchable messages), and `adapters` (configured adapter count). Pass `--adapters` for per-project tables and per-intent index detail. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+`pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
 ### Remote storage
 
