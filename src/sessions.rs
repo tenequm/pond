@@ -56,6 +56,31 @@ pub struct Store {
     /// attach one via [`Store::with_embedder`]. Lazy, so a store that never
     /// ingests an embeddable row never loads the model.
     embedder: Option<Arc<crate::embed::LazyEmbedder>>,
+    /// Observer for inline embed-at-ingest: `(embedded_so_far, total)` per
+    /// model batch within one flush. Lets the CLI keep its progress line
+    /// moving through the otherwise-opaque commit phase.
+    ingest_embed_progress: Option<IngestEmbedProgress>,
+}
+
+/// One ingest host's slice of a shared store (see
+/// [`Store::ingest_host_activity`]). `hostname: None` groups rows carrying
+/// no host stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostActivity {
+    pub hostname: Option<String>,
+    pub sessions: usize,
+    pub last_message_at: DateTime<Utc>,
+}
+
+/// Callback wrapper for [`Store::with_ingest_embed_progress`]; a newtype so
+/// `Store` keeps its derived `Debug`.
+#[derive(Clone)]
+pub struct IngestEmbedProgress(pub Arc<dyn Fn(usize, usize) + Send + Sync>);
+
+impl std::fmt::Debug for IngestEmbedProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IngestEmbedProgress")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +320,7 @@ impl Store {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
             embedder: None,
+            ingest_embed_progress: None,
         })
     }
 
@@ -305,6 +331,13 @@ impl Store {
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<crate::embed::LazyEmbedder>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// Attach an inline-embed progress observer (see [`IngestEmbedProgress`]).
+    #[must_use]
+    pub fn with_ingest_embed_progress(mut self, progress: IngestEmbedProgress) -> Self {
+        self.ingest_embed_progress = Some(progress);
         self
     }
 
@@ -328,6 +361,7 @@ impl Store {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
             embedder: None,
+            ingest_embed_progress: None,
         })
     }
 
@@ -349,6 +383,7 @@ impl Store {
             .await?,
             rowmap: ArcSwapOption::empty(),
             embedder: None,
+            ingest_embed_progress: None,
         })
     }
 
@@ -982,11 +1017,21 @@ impl Store {
             .iter()
             .map(|&index| rows[index].search_text.unwrap_or_default())
             .collect();
+        let total = targets.len();
+        let mut done = 0usize;
+        if let Some(progress) = &self.ingest_embed_progress {
+            (progress.0)(done, total);
+        }
         let vectors = crate::embed::embed_passages(
             backend.as_ref(),
             &texts,
             crate::embed::DEFAULT_BATCH_SIZE,
-            |_| {},
+            |batch| {
+                done += batch;
+                if let Some(progress) = &self.ingest_embed_progress {
+                    (progress.0)(done, total);
+                }
+            },
         )?;
         for (&index, vector) in targets.iter().zip(vectors) {
             out[index] = Some(vector);
@@ -1830,6 +1875,17 @@ impl Store {
         Ok(())
     }
 
+    /// Open the newest locally cached rowmap chain regardless of the store's
+    /// current version, without installing it. Read-only estimate seam for
+    /// `pond status`: the chain is as-of this host's last sync - exactly the
+    /// baseline "pending since then" wants - and a version-matched load would
+    /// cost a remote manifest read. Never assigned to `self.rowmap`: searches
+    /// must not hydrate from a possibly-stale map.
+    pub fn open_cached_rowmap(&self, cache_dir: &Path) -> Option<Arc<RowMetaSet>> {
+        let chain = discover_chain(cache_dir, &self.store_key())?;
+        RowMetaSet::open(&chain).ok().map(Arc::new)
+    }
+
     /// Install an already-published rowmap chain for the current version if a
     /// sibling built one, without building it (no full scan, no build flock).
     /// For one-shot read commands (`pond search`): a warm sibling makes
@@ -2122,6 +2178,54 @@ impl Store {
             }
         }
         Ok(names.into_iter().collect())
+    }
+
+    /// Per-ingest-host activity: distinct sessions and newest message
+    /// timestamp per `options.pond.ingest.host.hostname` stamp
+    /// (spec.md#model-pond-options). The stamp is written per message at
+    /// ingest, so this scans the `messages` table - acceptable because
+    /// `pond status --hosts` is an explicit opt-in view, never the default
+    /// status path. Rows without the stamp (wire-ingested, or predating it)
+    /// group under the `None` host; a session synced from several hosts
+    /// counts once under each. Answers "is every machine feeding the pond"
+    /// on a shared store.
+    pub async fn ingest_host_activity(&self) -> Result<Vec<HostActivity>> {
+        let scanner = self
+            .handle
+            .scan(
+                Table::Messages,
+                ScanOpts::project_only(&["session_id", "timestamp", "options"]),
+            )
+            .await?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut hosts: BTreeMap<Option<String>, (HashSet<String>, DateTime<Utc>)> = BTreeMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                let session_id =
+                    string(&batch, "session_id", row)?.context("session_id is null")?;
+                let timestamp = datetime(&batch, "timestamp", row)?;
+                let hostname = json_column(&batch, "options", row)?
+                    .and_then(|bytes| json_parse::<serde_json::Value>(&bytes).ok())
+                    .as_ref()
+                    .and_then(|options| options.pointer("/pond/ingest/host/hostname"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let entry = hosts
+                    .entry(hostname)
+                    .or_insert_with(|| (HashSet::new(), timestamp));
+                entry.0.insert(session_id);
+                entry.1 = entry.1.max(timestamp);
+            }
+        }
+        Ok(hosts
+            .into_iter()
+            .map(|(hostname, (sessions, last_message_at))| HostActivity {
+                hostname,
+                sessions: sessions.len(),
+                last_message_at,
+            })
+            .collect())
     }
 
     /// Write a batch of embeddings into `messages`: set `vector` and

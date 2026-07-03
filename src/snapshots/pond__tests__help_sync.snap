@@ -21,6 +21,18 @@ Options:
       --verify
           Reconcile pass: bypass the freshness skip and re-read every source body, re-ingesting through the idempotent merge. The skip compares source mtime to pond's per-session ingest watermark; a session that was partially flushed before the commit-row-last fix kept a frozen watermark that mtime can never re-read past. This is the body-reading tier that heals that historical damage (and audits completeness). It is slower - every file is decoded - so it is opt-in, not the default
 
+      --dry-run
+          Preview the next sync: per-adapter source counts and how many the freshness gate would re-read. Writes nothing to the store
+
+      --no-wait
+          If another pond sync is already running against this store on this host, skip this run (exit 0) instead of waiting for the lock. The scheduled sync passes this so ticks never queue up
+
+      --format <FORMAT>
+          Output format: `text` (stage lines + progress) or `json` (one summary document on stdout; progress stays on stderr)
+          
+          [default: text]
+          [possible values: text, json]
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -46,5 +58,6 @@ Global options:
 Examples:
   pond sync                                  sync every enabled adapter
   pond sync claude-code                      sync one enabled adapter
+  pond sync --dry-run                        preview what the next sync would read
   pond sync codex-cli --path ~/backup        one-off path override, config untouched
   pond sync --verify                         full re-read; heal anything the skip missed

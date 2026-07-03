@@ -316,6 +316,10 @@ impl Adapter for ClaudeCodeAdapter {
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         jsonl_tree_events(self, oracle)
     }
+
+    fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> crate::adapter::PlanFuture<'a> {
+        crate::adapter::jsonl::jsonl_tree_plan(self, oracle)
+    }
 }
 
 impl JsonlTree for ClaudeCodeAdapter {
@@ -1296,6 +1300,39 @@ mod tests {
             std::path::Path::new(FIXTURE_ROOT),
         )
         .await
+    }
+
+    /// `plan` is the events_with freshness gate run standalone: an empty
+    /// oracle marks everything pending (walk cost only), a saturated oracle
+    /// marks every readable-id source fresh, and the counts always partition
+    /// `sources`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_classifies_fresh_vs_pending_without_decoding() -> anyhow::Result<()> {
+        use crate::adapter::{Adapter, SkipOracle};
+
+        let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+        let first_sync = adapter
+            .plan(&crate::adapter::NoopOracle)
+            .await?
+            .expect("jsonl-tree adapters support plan");
+        assert!(first_sync.sources > 0);
+        assert_eq!(first_sync.pending, first_sync.sources);
+        assert_eq!(first_sync.fresh, 0);
+
+        struct MaxWatermarkOracle;
+        impl SkipOracle for MaxWatermarkOracle {
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+                Some(i64::MAX)
+            }
+        }
+        let caught_up = adapter
+            .plan(&MaxWatermarkOracle)
+            .await?
+            .expect("jsonl-tree adapters support plan");
+        assert_eq!(caught_up.sources, first_sync.sources);
+        assert!(caught_up.fresh > 0, "fixture sessions must gate as fresh");
+        assert_eq!(caught_up.fresh + caught_up.pending, caught_up.sources);
+        Ok(())
     }
 
     /// `<root>/<encoded-cwd>/<parent_uuid>.jsonl` plus

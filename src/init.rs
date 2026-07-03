@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use pond::adapter::{self, Candidate};
@@ -58,10 +60,25 @@ impl cliclack::Theme for WizardTheme {
     }
 }
 
+/// Whether the wizard's prompts still own the terminal. While true, the ctrlc
+/// handler stays a no-op so cliclack can surface the interrupt through its own
+/// raw-mode read; once the wizard hands off to the first sync it flips false
+/// and Ctrl-C kills the process again - a long first sync must stay
+/// interruptible.
+static WIZARD_PROMPTS_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// The schedule the user opted into, parked here before the first sync runs
+/// so the Ctrl-C handler can register it on the way out. The first-sync
+/// banner promises "Ctrl-C is safe: the next sync resumes where this one
+/// stopped" - that is only true if the interrupt path still installs the
+/// schedule. `take()` keeps registration single-shot between the handler and
+/// the normal path.
+static PENDING_SCHEDULE: Mutex<Option<ScheduleEvery>> = Mutex::new(None);
+
 /// Unwrap a prompt result. Esc and Ctrl-C surface from cliclack as
-/// `Interrupted` (the no-op ctrlc handler in [`run`] is what keeps SIGINT
-/// from killing the process mid-raw-mode); both cancel the whole wizard -
-/// nothing has been written yet, so there is nothing to roll back.
+/// `Interrupted` (the wizard-scoped ctrlc handler in [`run`] is what keeps
+/// SIGINT from killing the process mid-raw-mode); both cancel the whole
+/// wizard - nothing has been written yet, so there is nothing to roll back.
 fn wiz<T>(result: std::io::Result<T>) -> Result<T> {
     match result {
         Ok(inner) => Ok(inner),
@@ -100,7 +117,17 @@ pub(crate) async fn run(
     // instead of prompting - a partially-flagged non-TTY run must never hang.
     let prompts = interactive && !args.yes;
     if prompts {
-        let _ = ctrlc::set_handler(|| {});
+        WIZARD_PROMPTS_ACTIVE.store(true, Ordering::SeqCst);
+        let _ = ctrlc::set_handler(|| {
+            if !WIZARD_PROMPTS_ACTIVE.load(Ordering::SeqCst) {
+                if let Ok(mut pending) = PENDING_SCHEDULE.lock()
+                    && let Some(every) = pending.take()
+                {
+                    let _ = schedule::start(every);
+                }
+                std::process::exit(130);
+            }
+        });
         cliclack::set_theme(WizardTheme);
     }
 
@@ -225,19 +252,6 @@ pub(crate) async fn run(
     }
     adapter::apply_to_doc(&mut doc, &fresh_accepts, &fresh_declines)?;
 
-    // ---- embeddings (informational - a model swap forces re-embedding,
-    // too heavy a side effect for a wizard default) --------------------------
-    let model = doc
-        .get("embeddings")
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("model"))
-        .and_then(Item::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| pond::embed::DEFAULT_MODEL_ID.to_owned());
-    cliclack::log::info(format!(
-        "embeddings: {model} - override under [embeddings] in config"
-    ))?;
-
     // ---- schedule (opt-in: --yes alone never schedules) --------------------
     let schedule_choice: Option<ScheduleEvery> = match args.schedule {
         Some(every) => Some(every),
@@ -309,28 +323,90 @@ pub(crate) async fn run(
         crate::config::write_config_file(&config_file, &new_text)?;
     }
 
-    // External side effects (MCP registration, OS-scheduler registration) run
-    // only AFTER the write gate: declining "Write config?" exits above, so a
-    // cancelled wizard never mutates another tool's config or the scheduler.
+    // External side effects (MCP registration, the first sync, OS-scheduler
+    // registration) run only AFTER the write gate: declining "Write config?"
+    // exits above, so a cancelled wizard never mutates another tool's config
+    // or the scheduler.
     if !args.skip_mcp {
         mcp_section(prompts, args.yes)?;
     }
-    // Schedule registration also needs the config on disk first - the initial
-    // scheduled `pond sync -q` must see what this wizard just composed.
-    if let Some(every) = schedule_choice {
-        schedule::start(every)?;
-    }
 
-    cliclack::note(
-        "Next steps",
-        "pond sync      import your sessions\npond status    check health\npond --help    explore the rest",
-    )?;
+    // ---- first sync, then the schedule --------------------------------------
+    // The scheduler registers only AFTER the first sync completes: a fresh
+    // systemd timer's OnBootSec elapse is already in the past, so it fires
+    // ~immediately on registration - racing the (long, first) manual sync it
+    // was set up to automate, and the two only slow each other down. Running
+    // the first sync inside init also gives it the full progress UI.
+    let run_first_sync = prompts
+        && !picked.is_empty()
+        && wiz(cliclack::confirm(
+            "Run the first sync now? (recommended - it reads and embeds your full history)",
+        )
+        .initial_value(true)
+        .interact())?;
+    if run_first_sync && schedule_choice.is_some() {
+        cliclack::log::info("the sync schedule will be registered once this first sync completes")?;
+    }
+    let next_steps = if run_first_sync {
+        "pond status    check health\npond --help    explore the rest"
+    } else {
+        "pond sync      import your sessions\npond status    check health\npond --help    explore the rest"
+    };
+    cliclack::note("Next steps", next_steps)?;
     if changed {
         cliclack::outro(format!("Config written to {}", display_path(&config_file)))?;
     } else {
         cliclack::outro("Already set up - nothing to change")?;
     }
-    Ok(())
+
+    // Park the schedule for the Ctrl-C handler BEFORE the sync re-arms it, so
+    // no window exists where an interrupt exits without registering.
+    if let Ok(mut pending) = PENDING_SCHEDULE.lock() {
+        *pending = schedule_choice;
+    }
+    let first_sync = if run_first_sync {
+        WIZARD_PROMPTS_ACTIVE.store(false, Ordering::SeqCst);
+        // Reload from disk so the sync sees exactly what this wizard wrote.
+        let reloaded = Config::load(&config_file)?;
+        crate::run_sync(
+            &reloaded,
+            &config_file,
+            None,
+            crate::SyncInvocation::defaults(),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    // Register the schedule even when the first sync failed: the scheduled
+    // retry is the recovery path, and `pond status` now surfaces the failure.
+    let pending_schedule = PENDING_SCHEDULE
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    if let Some(every) = pending_schedule {
+        match schedule::start(every) {
+            Ok(()) => {
+                if !run_first_sync {
+                    pond::output::line_err(&pond::output::paint(
+                        "note: the first scheduled sync can start within minutes and takes a while on a full history; `pond sync` runs it in the foreground instead",
+                        pond::output::dim(),
+                    ))?;
+                }
+            }
+            // A registration failure must not clobber the first sync's error.
+            Err(error) if first_sync.is_ok() => return Err(error),
+            Err(error) => {
+                let _ = pond::output::line_err(&pond::output::paint(
+                    &format!(
+                        "schedule registration failed: {error:#} - run `pond schedule start` to retry"
+                    ),
+                    pond::output::red(),
+                ));
+            }
+        }
+    }
+    first_sync
 }
 
 fn display_path(path: &Path) -> String {

@@ -279,6 +279,10 @@ impl Adapter for PiCodingAgentAdapter {
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         jsonl_tree_events(self, oracle)
     }
+
+    fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> crate::adapter::PlanFuture<'a> {
+        crate::adapter::jsonl::jsonl_tree_plan(self, oracle)
+    }
 }
 
 impl JsonlTree for PiCodingAgentAdapter {
