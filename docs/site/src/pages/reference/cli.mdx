@@ -23,6 +23,10 @@ pond <command> --help   # full flags for any command
 - `pond sql <query>` - one read-only SQL query over the corpus
 - `pond status` - health, row counts, embedding coverage, schedule state
 
+### `pond status --format json`
+
+One machine-readable document for scripting. Top-level keys: `storage`, `corpus`, `indexes`, `embedding`, `source_agents` (count of distinct source agents in the store), `local` (this host's adapters + pending-sync counts, last sync, next scheduled run), `hosts`, and `schedule` (`{active, backend, every}`).
+
 ## Serve
 - `pond serve --transport http|stdio` - run the API (HTTP default)
 - `pond mcp` - alias for `pond serve --transport stdio`
