@@ -88,7 +88,16 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
             Ok(SyncLockState::Busy(holder))
         }
         Err(std::fs::TryLockError::Error(error)) => {
-            Err(error).with_context(|| format!("failed to probe sync lock {}", path.display()))
+            // A filesystem without flock semantics (some network mounts) can't
+            // single-flight. The lock is best-effort local coordination that
+            // never touches store bytes - cross-writer safety is OCC - so
+            // degrade to running unlocked instead of failing the sync.
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "sync lock unsupported on this filesystem; proceeding without single-flight"
+            );
+            Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
         }
     }
 }

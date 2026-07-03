@@ -488,6 +488,7 @@ enum Command {
         /// Print Lance query plans instead of search results.
         #[arg(long)]
         explain: bool,
+        /// Output format: `text` (readable transcript) or `json` (one document).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -546,6 +547,7 @@ enum Command {
         /// Message scope: conversational siblings after the target (grep -A).
         #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
         message_context_after: usize,
+        /// Output format: `text` (readable transcript) or `json` (one document).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -624,7 +626,7 @@ enum Command {
     /// systemd user timers (or a crontab fence) on Linux. `pond init` offers
     /// the same setup interactively.
     #[command(after_long_help = "Examples:
-  pond schedule start              sync every hour
+  pond schedule start              every 5 minutes (the default)
   pond schedule start --every 15m
   pond schedule status
   pond schedule logs
@@ -846,13 +848,20 @@ enum AdaptersCmd {
         format: OutputFormat,
     },
     /// Probe this machine for adapters and interactively enable the ones you pick.
+    #[command(after_long_help = "Examples:
+  pond adapters discover           probe, then pick what to enable")]
     Discover,
     /// Enable an adapter, discovering its default path if it has no config entry yet.
+    #[command(after_long_help = "Examples:
+  pond adapters enable claude-code
+  pond adapters enable codex-cli")]
     Enable {
         /// Adapter name (claude-code, codex-cli, ...).
         name: String,
     },
     /// Disable an adapter so `pond sync` skips it (kept as `enabled = false`).
+    #[command(after_long_help = "Examples:
+  pond adapters disable opencode   stop syncing it, keep its config entry")]
     Disable {
         /// Adapter name to disable.
         name: String,
@@ -1054,10 +1063,14 @@ async fn main() -> anyhow::Result<()> {
             let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
+                let has_adapters = loaded
+                    .resolve_adapters(None)
+                    .map(|adapters| !adapters.is_empty())
+                    .unwrap_or(false);
                 match format {
                     OutputFormat::Json => output(&status_json_empty(&resolved)?)?,
                     OutputFormat::Text => {
-                        render_empty_status("pond status", &resolved)?;
+                        render_empty_status("pond status", &resolved, has_adapters)?;
                         output(&crate::schedule::status_line())?;
                         if hosts {
                             output_err(&pond::output::paint(
@@ -1142,10 +1155,12 @@ async fn main() -> anyhow::Result<()> {
                         let probes = adapter::probe_unconfigured(&loaded.adapters);
                         if !probes.is_empty() {
                             let names: Vec<&str> = probes.iter().map(|c| c.name.as_str()).collect();
+                            // `pond sync` never enables adapters (spec rule:
+                            // enabling is always explicit), so the hint must
+                            // name the command that actually does.
                             output_err(&pond::output::paint(
                                 &format!(
-                                    "hint     {} unconfigured adapter(s): {} - run `pond sync` to enable",
-                                    probes.len(),
+                                    "hint     detected but not enabled: {} - run `pond adapters discover` to enable",
                                     names.join(", "),
                                 ),
                                 pond::output::dim(),
@@ -1404,7 +1419,8 @@ async fn main() -> anyhow::Result<()> {
                 && let Ok(children) = store.child_sessions(&response.session.id).await
                 && !children.is_empty()
             {
-                subagents_footer = pond::render::render_subagents_footer(&children);
+                subagents_footer =
+                    pond::render::render_subagents_footer(&children, pond::render::Surface::Cli);
             }
             if !render_get_envelope(format, &envelope, &request, &subagents_footer)? {
                 std::process::exit(1);
@@ -3144,20 +3160,49 @@ pub(crate) async fn run_sync(
     storage_path: Option<StorageUrl>,
     invocation: SyncInvocation,
 ) -> anyhow::Result<()> {
+    let json = matches!(invocation.format, OutputFormat::Json);
     if invocation.dry_run {
-        return run_sync_dry_run(loaded, config_file, storage_path, &invocation).await;
+        let outcome = run_sync_dry_run(loaded, config_file, storage_path, &invocation).await;
+        // The one-document-on-stdout contract covers dry-run failures too.
+        if json && let Err(error) = &outcome {
+            emit_sync_json_error(error)?;
+        }
+        return outcome;
     }
     let cmd_started = std::time::Instant::now();
-    let json = matches!(invocation.format, OutputFormat::Json);
-    let storage = resolve_storage_location(storage_path, loaded)?;
-    let store_key = pond::substrate::store_key(storage.resolve(&loaded.creds)?.lance_url());
+    // Pre-stage failures (storage resolve, creds, lock) happen before the
+    // last-sync record exists, but the `--format json` contract - one summary
+    // document on stdout for EVERY outcome - already holds here.
+    let setup = (|| -> anyhow::Result<(StorageUrl, String)> {
+        let storage = resolve_storage_location(storage_path, loaded)?;
+        let store_key = pond::substrate::store_key(storage.resolve(&loaded.creds)?.lance_url());
+        Ok((storage, store_key))
+    })();
+    let (storage, store_key) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            if json {
+                emit_sync_json_error(&error)?;
+            }
+            return Err(error);
+        }
+    };
 
     // Per-host single-flight: a manual sync and the scheduled one against the
     // same store only make each other slower (double inline embedding, OCC
     // commit conflicts, and the rowmap-build flock loser losing its freshness
     // oracle), so the second run waits - or, under --no-wait, skips cleanly.
     // Cross-host writers need no lock; they stay pure OCC on the store.
-    let _lock = match syncstate::try_acquire_sync_lock(&store_key)? {
+    let lock_state = match syncstate::try_acquire_sync_lock(&store_key) {
+        Ok(state) => state,
+        Err(error) => {
+            if json {
+                emit_sync_json_error(&error)?;
+            }
+            return Err(error);
+        }
+    };
+    let _lock = match lock_state {
         syncstate::SyncLockState::Acquired(guard) => guard,
         syncstate::SyncLockState::Busy(holder) => {
             if invocation.no_wait {
@@ -3175,7 +3220,15 @@ pub(crate) async fn run_sync(
                 }
                 return Ok(());
             }
-            wait_for_sync_lock(&store_key, holder).await?
+            match wait_for_sync_lock(&store_key, holder).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    if json {
+                        emit_sync_json_error(&error)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
     };
 
@@ -3266,9 +3319,10 @@ async fn run_sync_stages(
     tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
 
     // Load the model before the import bars own the terminal: a first run
-    // downloads the weights (hf-hub renders its own download bar), which would
-    // otherwise fire mid-import underneath active progress bars. Best-effort:
-    // a caught-up sync embeds nothing, so an offline host must not fail here -
+    // downloads ~500 MB of weights (embed.rs prints a one-time notice - the
+    // ureq-only hf-hub build renders no progress bar), which would otherwise
+    // fire mid-import underneath active progress bars. Best-effort: a
+    // caught-up sync embeds nothing, so an offline host must not fail here -
     // when new rows do need embedding, the flush surfaces the real error.
     let model_started = std::time::Instant::now();
     match embedder.get().await {
@@ -3306,11 +3360,14 @@ async fn run_sync_stages(
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
     let any_new_rows = import_summary.inserted > 0;
     if !json {
+        // "searchable": the delta counts user/assistant conversational rows
+        // only, while the stored total below counts every role - unlabeled,
+        // the 10x gap between them reads as dropped data.
         output(&stage_line(
             import_started.elapsed(),
             "import",
             &format!(
-                "+{} sessions, +{} messages",
+                "+{} sessions, +{} searchable messages",
                 format_thousands(import_summary.sessions_inserted as u64),
                 format_thousands(import_summary.messages_inserted_searchable as u64),
             ),
@@ -3478,6 +3535,16 @@ async fn run_sync_dry_run(
     Ok(())
 }
 
+/// The `--format json` error document for failures that happen before the
+/// staged pipeline (storage resolve, creds, lock, dry-run) - keeping the
+/// one-document-on-stdout contract on every exit path, not just staged ones.
+fn emit_sync_json_error(error: &anyhow::Error) -> anyhow::Result<()> {
+    output(&serde_json::to_string_pretty(&serde_json::json!({
+        "outcome": "error",
+        "error": format!("{error:#}"),
+    }))?)
+}
+
 fn describe_lock_holder(holder: Option<&syncstate::SyncLockHolder>) -> String {
     match holder {
         Some(holder) => format!("pid {}, running for {}", holder.pid, ago(holder.started_at)),
@@ -3580,6 +3647,17 @@ impl FlushHud {
     fn detach(&self) {
         if let Ok(mut slot) = self.inner.lock() {
             *slot = None;
+        }
+    }
+
+    /// One throttle for every off-TTY heartbeat this adapter emits: the
+    /// import-progress and embed-flush paths share the slot's timer, so a
+    /// 30s window never carries two heartbeat lines from drifting timers.
+    fn heartbeat(&self, line: &str) {
+        if let Ok(mut slot) = self.inner.lock()
+            && let Some(slot) = slot.as_mut()
+        {
+            heartbeat_line(slot.stderr_tty, &mut slot.last_heartbeat, line);
         }
     }
 
@@ -4214,14 +4292,14 @@ async fn sync_with_progress(
     let bar_ref = &bar;
     let stderr_tty = io::stderr().is_terminal();
     flush_hud.attach(name, &bar, started, stderr_tty);
-    let mut last_heartbeat = std::time::Instant::now();
     // Repaint the bar; off-TTY (where indicatif draws nothing) also emit the
-    // same line as a plain log heartbeat so the run is never silent.
-    let paint_line =
-        move |bar: &ProgressBar, line: String, last_heartbeat: &mut std::time::Instant| {
-            heartbeat_line(stderr_tty, last_heartbeat, &line);
-            bar.set_message(line);
-        };
+    // same line as a plain log heartbeat so the run is never silent. The
+    // throttle lives in the flush HUD slot so this path and the embed-flush
+    // path share one timer instead of two that drift.
+    let paint_line = |bar: &ProgressBar, line: String| {
+        flush_hud.heartbeat(&line);
+        bar.set_message(line);
+    };
 
     let summary = handlers::ingest_adapter(store, adapter.as_ref(), oracle, |event| match event {
         SyncEvent::Discovered { total } => {
@@ -4331,7 +4409,7 @@ async fn sync_with_progress(
                 Some(bar_ref.eta()),
                 &tail,
             );
-            paint_line(bar_ref, line, &mut last_heartbeat);
+            paint_line(bar_ref, line);
         }
         SyncEvent::SkippedBulk { status, count } => {
             match status {
@@ -4350,7 +4428,7 @@ async fn sync_with_progress(
                 Some(bar_ref.eta()),
                 &tail,
             );
-            paint_line(bar_ref, line, &mut last_heartbeat);
+            paint_line(bar_ref, line);
         }
         SyncEvent::Flushing { pending } => {
             // The flush embeds + writes this staged batch - the slow phase with
@@ -4369,7 +4447,7 @@ async fn sync_with_progress(
                     format_thousands(pending as u64)
                 ),
             );
-            paint_line(bar_ref, line, &mut last_heartbeat);
+            paint_line(bar_ref, line);
         }
     })
     .await?;
@@ -4408,7 +4486,7 @@ fn format_sync_outcome(
         "up to date".to_owned()
     } else {
         format!(
-            "+{} sessions (+{} messages) in {}  {:.0} msgs/s",
+            "+{} sessions (+{} searchable messages) in {}  {:.0} msgs/s",
             format_thousands(new_sessions),
             format_thousands(new_messages),
             elapsed_hms(elapsed),
@@ -4697,10 +4775,15 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
 /// empty-store render so `pond status` opens the same way in either state.
 /// Per-index status word for `pond status --format json`, mirroring the
 /// existence/backlog split the text `index detail` block surfaces.
-fn index_status_label(status: &IndexStatus) -> &'static str {
+/// Mirrors `classify_index_health`'s threshold logic: a tail below the sync
+/// fold threshold is expected between batched folds and stays fully
+/// searchable (the retrievers flat-scan it), so it is `ready` - reporting it
+/// `pending` made JSON say "pending" forever on a healthy store while the
+/// text line said "ready".
+fn index_status_label(status: &IndexStatus, fold_threshold: u64) -> &'static str {
     if !status.exists {
         "not_built"
-    } else if status.unindexed_rows == 0 {
+    } else if (status.unindexed_rows as u64) < fold_threshold.max(1) {
         "ready"
     } else {
         "pending"
@@ -4742,7 +4825,10 @@ fn status_json(
         .map(|status| {
             serde_json::json!({
                 "name": format!("{}.{}", status.table.as_str(), status.intent_name),
-                "status": index_status_label(status),
+                "status": index_status_label(
+                    status,
+                    pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
+                ),
             })
         })
         .collect();
@@ -4797,7 +4883,7 @@ fn status_json(
         },
         "indexes": indexes,
         "embedding": embedding_doc,
-        "adapters": checks.adapter_count,
+        "source_agents": checks.adapter_count,
         "local": {
             "host": local.hostname,
             "adapters": local_adapters,
@@ -4811,7 +4897,11 @@ fn status_json(
             "next_scheduled_run_secs": local.next_run_secs,
         },
         "hosts": hosts_doc,
-        "schedule": local.schedule_line,
+        "schedule": {
+            "active": local.schedule.active,
+            "backend": local.schedule.backend,
+            "every": local.schedule.every.map(|every| every.label()),
+        },
         "initialized": true,
     });
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
@@ -4831,12 +4921,23 @@ fn render_status_storage_line(title: &str, resolved: &ResolvedStorage) -> anyhow
 
 /// Storage configured but never synced (no tables): the storage line plus a
 /// pointer at `pond sync`, instead of erroring on the first table describe.
-fn render_empty_status(title: &str, resolved: &ResolvedStorage) -> anyhow::Result<()> {
+fn render_empty_status(
+    title: &str,
+    resolved: &ResolvedStorage,
+    has_adapters: bool,
+) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     render_status_storage_line(title, resolved)?;
+    // With no adapters enabled, `pond sync` dead-ends ("no adapters
+    // configured") - point the first-run user at the command that works.
+    let fix = if has_adapters {
+        "run `pond sync` to import sessions"
+    } else {
+        "run `pond init` to set up adapters and import sessions"
+    };
     output(&format!(
-        "{}    no data yet - run `pond sync` to import sessions",
-        paint("stored", dim()),
+        "{}    no data yet - {fix}",
+        paint("stored", dim())
     ))?;
     Ok(())
 }
@@ -4932,9 +5033,18 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         format_thousands(checks.totals.sessions),
         messages_label,
     ))?;
+    // "agents", not "adapters": this counts distinct source agents stored in
+    // the corpus (possibly fed from other hosts) - a different population
+    // from the locally configured `pond adapters list` set, and labeling both
+    // "adapters" read as a bug when the numbers differed.
+    let noun = if checks.adapter_count == 1 {
+        "source agent"
+    } else {
+        "source agents"
+    };
     output(&format!(
-        "{}  {} adapter(s)",
-        paint("adapters", dim()),
+        "{}    {} {noun} in this store",
+        paint("agents", dim()),
         checks.adapter_count,
     ))?;
     if checks.embedding.is_none() {
@@ -4961,11 +5071,13 @@ struct LocalStatus {
     /// that never synced) pending counts are unknown, never scanned for.
     pending_known: bool,
     last_sync: Option<syncstate::LastSyncRecord>,
-    /// The probed scheduler line, from the same single probe that supplied
-    /// the cadence behind `next_run_secs`.
-    schedule_line: String,
+    /// The one scheduler probe's answer: rendered line plus the structured
+    /// active/backend/cadence fields (JSON emits those directly).
+    schedule: crate::schedule::ScheduleSnapshot,
     /// Estimated seconds until the next scheduled sync (negative = overdue).
     /// `None` without an active schedule or a last-sync record to anchor on.
+    /// An estimate only: it anchors on the last recorded sync (manual or
+    /// scheduled), while the OS timer ticks on its own clock.
     next_run_secs: Option<i64>,
 }
 
@@ -4977,9 +5089,9 @@ async fn local_status(
     loaded: &Config,
     store: &Store,
     store_key: &str,
-    schedule: (String, Option<crate::schedule::ScheduleEvery>),
+    schedule: crate::schedule::ScheduleSnapshot,
 ) -> LocalStatus {
-    let (schedule_line, active_every) = schedule;
+    let active_every = schedule.every;
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
     // last sync - exactly the baseline "pending since then" wants, and a
@@ -5027,7 +5139,7 @@ async fn local_status(
         adapters,
         pending_known,
         last_sync,
-        schedule_line,
+        schedule,
         next_run_secs,
     }
 }
@@ -5039,6 +5151,15 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
     if let Some(hostname) = &local.hostname {
         output(&format!("{}      {hostname}", paint("host", dim())))?;
     }
+    // Pad the name column to the longest adapter name: a fixed width fused
+    // long names with their counts ("claude-desktop-app11 sources").
+    let name_width = local
+        .adapters
+        .iter()
+        .map(|adapter| adapter.name.len())
+        .max()
+        .unwrap_or(0)
+        + 2;
     for (index, adapter) in local.adapters.iter().enumerate() {
         let label = if index == 0 {
             paint("local", dim()) + "     "
@@ -5066,9 +5187,18 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
                     pond::output::yellow(),
                 ),
             ),
+            (Some(sources), None) if local.pending_known => format!(
+                "{} sources {}",
+                format_thousands(sources as u64),
+                paint("(pending unknown - no cheap freshness preview)", dim()),
+            ),
             (Some(sources), None) => format!("{} sources", format_thousands(sources as u64)),
         };
-        output(&format!("{label}{:<13}{detail}", adapter.name))?;
+        output(&format!(
+            "{label}{:<name_width$}{detail}",
+            adapter.name,
+            name_width = name_width,
+        ))?;
     }
     if !local.adapters.is_empty() && !local.pending_known {
         output_err(&paint(
@@ -5077,12 +5207,19 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
         ))?;
     }
     let last_sync_line = match &local.last_sync {
+        // An active schedule with no record means the scheduled sync has not
+        // completed here yet (or is skipping on the lock) - without saying
+        // so, "never" reads as contradicting the schedule line below it.
+        None if local.schedule.active => paint(
+            "never recorded on this host - the scheduled sync hasn't completed yet (`pond schedule logs`), or run `pond sync` now",
+            dim(),
+        ),
         None => paint("never on this host - run `pond sync`", dim()),
         Some(record) => {
             let ago = ago(record.finished_at);
             match record.outcome {
                 syncstate::SyncOutcome::Ok => format!(
-                    "{ago} ago - {}: +{} sessions, +{} messages in {}",
+                    "{ago} ago - {}: +{} sessions, +{} searchable messages in {}",
                     paint("ok", green()),
                     format_thousands(record.sessions_inserted),
                     format_thousands(record.messages_inserted),
@@ -5103,13 +5240,16 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
         }
     };
     output(&format!("{} {last_sync_line}", paint("last sync", dim())))?;
-    let mut schedule_line = local.schedule_line.clone();
+    let mut schedule_line = local.schedule.line.clone();
+    // "expected within": the anchor is the last recorded sync (manual or
+    // scheduled) while the OS timer ticks on its own clock, so this is an
+    // upper-bound estimate, not the timer's actual next fire time.
     if let Some(next_run_secs) = local.next_run_secs {
         let suffix = if next_run_secs <= 0 {
-            " - next run due now".to_owned()
+            " - next run expected about now".to_owned()
         } else {
             format!(
-                " - next run in ~{}",
+                " - next run expected within {}",
                 brief_duration(Duration::from_secs(next_run_secs as u64)),
             )
         };
@@ -5271,8 +5411,13 @@ fn render_search_envelope(
         }
         OutputFormat::Text => match envelope {
             SearchEnvelope::Success(response) => {
-                // One canonical transcript shared with the MCP tool.
-                let transcript = pond::render::render_search_transcript(response, request);
+                // One canonical transcript shared with the MCP tool, in CLI
+                // vocabulary (`pond get --message-id`, not `pond_get`).
+                let transcript = pond::render::render_search_transcript(
+                    response,
+                    request,
+                    pond::render::Surface::Cli,
+                );
                 output(transcript.trim_end_matches('\n'))?;
                 Ok(true)
             }
@@ -5300,7 +5445,11 @@ fn render_get_envelope(
         }
         OutputFormat::Text => match envelope {
             GetEnvelope::Success(response) => {
-                let transcript = pond::render::render_get_transcript(response, request);
+                let transcript = pond::render::render_get_transcript(
+                    response,
+                    request,
+                    pond::render::Surface::Cli,
+                );
                 let combined = format!("{transcript}{subagents_footer}");
                 output(combined.trim_end_matches('\n'))?;
                 Ok(true)
@@ -5331,6 +5480,17 @@ fn render_error_pretty(error: &ErrorEnvelope) {
         paint(code, bold()),
         error.error.message,
     );
+    // Name the fix, not just the symptom: a bogus id's recovery path is a
+    // fresh search, and nothing else tells the user where ids come from.
+    if matches!(error.error.code, wire::ErrorCode::NotFound) {
+        eprintln!(
+            "{}",
+            paint(
+                "  hint: message and session ids come from `pond search` output",
+                dim(),
+            ),
+        );
+    }
     let details_present = !error.error.details.is_null()
         && !error
             .error

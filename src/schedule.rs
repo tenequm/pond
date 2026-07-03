@@ -109,8 +109,22 @@ pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn status_snapshot() -> (String, Option<ScheduleEvery>) {
-    (status_line(), None)
+pub(crate) fn status_snapshot() -> ScheduleSnapshot {
+    ScheduleSnapshot {
+        line: status_line(),
+        active: false,
+        backend: None,
+        every: None,
+    }
+}
+
+/// One scheduler probe's answer, shared by the `pond status` text line and
+/// the JSON document (which needs the fields structured, not pre-rendered).
+pub(crate) struct ScheduleSnapshot {
+    pub line: String,
+    pub active: bool,
+    pub backend: Option<&'static str>,
+    pub every: Option<ScheduleEvery>,
 }
 
 #[cfg(unix)]
@@ -156,28 +170,36 @@ mod unix {
     /// command that would set one up. Never errors - status must render even
     /// when the scheduler probe can't run.
     pub(crate) fn status_line() -> String {
-        status_snapshot().0
+        status_snapshot().line
     }
 
-    /// One probe (a launchctl/systemctl spawn) serving both `pond status`
-    /// needs: the rendered schedule line and the active cadence (which status
-    /// combines with the last-sync record to estimate the next run).
-    pub(crate) fn status_snapshot() -> (String, Option<super::ScheduleEvery>) {
+    /// One probe (a launchctl/systemctl spawn) serving every `pond status`
+    /// need: the rendered schedule line plus the structured active/backend/
+    /// cadence fields (status combines the cadence with the last-sync record
+    /// to estimate the next run; JSON emits the fields directly).
+    pub(crate) fn status_snapshot() -> super::ScheduleSnapshot {
         match probe() {
             Ok(state) => {
-                let every = match &state {
-                    Active { every, .. } => *every,
-                    Inactive => None,
+                let (active, backend, every) = match &state {
+                    Active { backend, every } => (true, Some(*backend), *every),
+                    Inactive => (false, None, None),
                 };
-                (render_state(&state), every)
+                super::ScheduleSnapshot {
+                    line: render_state(&state),
+                    active,
+                    backend,
+                    every,
+                }
             }
-            Err(_) => (
-                format!(
+            Err(_) => super::ScheduleSnapshot {
+                line: format!(
                     "{}  unknown (scheduler probe failed)",
                     paint("schedule", dim())
                 ),
-                None,
-            ),
+                active: false,
+                backend: None,
+                every: None,
+            },
         }
     }
 
@@ -227,10 +249,14 @@ mod unix {
         // up front instead of writing a silently broken registration.
         let state_str = state.display().to_string();
         if state_str.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
+            // Name the resolved path AND its sources: the bad character may
+            // come from $HOME (the fallback), where "unset XDG_STATE_HOME"
+            // would be a dead-end instruction.
             bail!(
-                "state dir {state_str:?} contains characters that cannot be embedded in a \
-                 scheduler registration; unset or simplify XDG_STATE_HOME and re-run \
-                 `pond schedule start`"
+                "state dir {state_str:?} contains a character (< > & \" % or a newline) that \
+                 cannot be embedded in a scheduler registration; it resolves from \
+                 XDG_STATE_HOME, falling back to $HOME/.local/state - set XDG_STATE_HOME \
+                 to a simpler absolute path and re-run `pond schedule start`"
             );
         }
         match std::env::consts::OS {

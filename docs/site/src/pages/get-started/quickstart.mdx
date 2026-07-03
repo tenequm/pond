@@ -9,7 +9,7 @@ pond init                  # interactive
 pond init -y --every 5m    # non-interactive: enable every discovered adapter, sync every 5m
 ```
 
-`init` walks storage, adapters, MCP registration, and an optional schedule, then writes `config.toml` in one pass. Idempotent - re-run to repair. `-y` takes defaults; `--every` is opt-in (`-y` alone never schedules).
+`init` walks storage, adapters, MCP registration, and an optional schedule, then writes `config.toml` in one pass. An interactive run offers to run the first sync in the foreground with full progress, and registers the schedule once that sync completes. Idempotent - re-run to repair. `-y` takes defaults; `--every` is opt-in (`-y` alone never schedules).
 
 ## 2. Ingest
 

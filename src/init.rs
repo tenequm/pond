@@ -349,14 +349,28 @@ pub(crate) async fn run(
     }
     let next_steps = if run_first_sync {
         "pond status    check health\npond --help    explore the rest"
+    } else if picked.is_empty() {
+        // No adapters enabled: `pond sync` would dead-end, so don't list it.
+        "pond adapters discover    enable an adapter once an agent CLI has history\npond status               check health\npond --help               explore the rest"
     } else {
         "pond sync      import your sessions\npond status    check health\npond --help    explore the rest"
     };
     cliclack::note("Next steps", next_steps)?;
-    if changed {
-        cliclack::outro(format!("Config written to {}", display_path(&config_file)))?;
+    // The outro is the wizard UI's closing element, but the first sync still
+    // runs after it - say so, or "Config written" reads as "done" and the
+    // sync output looks like a second program starting.
+    let outro_tail = if run_first_sync {
+        " - starting the first sync..."
     } else {
-        cliclack::outro("Already set up - nothing to change")?;
+        ""
+    };
+    if changed {
+        cliclack::outro(format!(
+            "Config written to {}{outro_tail}",
+            display_path(&config_file)
+        ))?;
+    } else {
+        cliclack::outro(format!("Already set up - nothing to change{outro_tail}"))?;
     }
 
     // Park the schedule for the Ctrl-C handler BEFORE the sync re-arms it, so
@@ -788,7 +802,14 @@ fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<
         return Ok(requested.clone());
     }
     if rows.is_empty() {
-        cliclack::log::info("adapters: none detected - add [adapters.<adapter>] entries manually")?;
+        // Say what pond was looking for and the command that retries - "add
+        // TOML entries manually" assumes knowledge a first-run user lacks.
+        cliclack::log::info(
+            "adapters: none detected - pond reads local session history from agent CLIs \
+             (Claude Code, Codex, OpenCode, Pi, Claude Cowork) and found none on this machine.\n\
+             Once you have used one, run `pond adapters discover` to enable it; a custom \
+             location can be added as an [adapters.<name>] entry (see `pond config schema`).",
+        )?;
         return Ok(Vec::new());
     }
     if !prompts {
