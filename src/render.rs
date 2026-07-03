@@ -6,7 +6,7 @@
 use crate::handlers::default_excludes_subagents;
 use crate::wire::{
     GetRequest, GetResponse, GetResult, MessageView, PartKind, PartSummary, ResponsePart,
-    SearchRequest, SearchResponse, SortBy,
+    SearchModeWire, SearchRequest, SearchResponse, SortBy,
 };
 
 /// Which surface a transcript renders for. The format is identical; only the
@@ -150,11 +150,22 @@ pub fn render_search_transcript(
         );
     }
     let shown: usize = response.sessions.iter().map(|s| s.matches.len()).sum();
+    // Vector mode ranks by similarity and ALWAYS returns the nearest rows,
+    // even when none truly match (cosine bands for present vs absent content
+    // overlap, so there is deliberately no score cutoff) - so call them
+    // "nearest", not "matching", or a gibberish query looks like confident
+    // relevance. fts requires real token overlap, so "matching" is honest there.
+    let vector_mode = matches!(request.mode, SearchModeWire::Vector);
+    let head_noun = if vector_mode {
+        "nearest message"
+    } else {
+        "matching message"
+    };
     let mut out = String::new();
     let _ = writeln!(
         out,
         "{prefix}: {} ({} searchable in scope), showing {} from {}.{}{}",
-        count_noun(response.matched_total, "matching message"),
+        count_noun(response.matched_total, head_noun),
         response.searchable_in_scope,
         count_noun(shown, "hit"),
         count_noun(response.sessions.len(), "session"),
@@ -170,9 +181,18 @@ pub fn render_search_transcript(
         Surface::Mcp => "pond_get <message_id> for full",
         Surface::Cli => "`pond get --message-id <ID>` for full",
     };
+    let mode_note = match (vector_mode, surface) {
+        (false, _) => "",
+        (true, Surface::Cli) => {
+            " Vector mode returns the closest rows by meaning even when none are strong; for exact-word matching use --mode fts."
+        }
+        (true, Surface::Mcp) => {
+            " Vector mode returns the closest rows by meaning even when none are strong; for exact-word matching set mode=\"fts\"."
+        }
+    };
     let _ = writeln!(
         out,
-        "key: session rules group hits by session, {order}; within a session, messages are newest-first. \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. {full_hint}; raise limit for more (no pagination)."
+        "key: session rules group hits by session, {order}; within a session, messages are newest-first. \"--- [n] score | role | time | message_id | project | agent | session ---\" delimits each hit + matched text. {full_hint}; raise limit for more (no pagination).{mode_note}"
     );
     let mut index = 0;
     let n_sessions = response.sessions.len();
@@ -666,9 +686,11 @@ mod tests {
 
         let transcript = crate::render::render_search_transcript(&response, &request, Surface::Mcp);
         assert!(transcript.starts_with(
-            "pond_search: 1 matching message (2 searchable in scope), showing 1 hit from 1 \
+            "pond_search: 1 nearest message (2 searchable in scope), showing 1 hit from 1 \
              session."
         ));
+        // Vector mode names the closest-rows caveat and points at fts.
+        assert!(transcript.contains("Vector mode returns the closest rows"));
         assert!(
             transcript.contains("key: session rules group hits by session, ordered by best hit")
         );

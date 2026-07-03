@@ -1059,6 +1059,10 @@ async fn main() -> anyhow::Result<()> {
             hosts,
             format,
         } => {
+            // Wrap the whole command so a failure (unreachable store, a
+            // bounded-scan error) still emits the one-document-on-stdout JSON
+            // contract instead of empty stdout + an anyhow dump on stderr.
+            let outcome: anyhow::Result<()> = async {
             let loaded = Config::load(config_path(config))?;
             let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
@@ -1169,6 +1173,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(())
+            }
+            .await;
+            if matches!(format, OutputFormat::Json)
+                && let Err(error) = &outcome
+            {
+                emit_json_error(error)?;
+            }
+            outcome?;
         }
         Command::Sync {
             adapter,
@@ -1525,8 +1538,9 @@ async fn main() -> anyhow::Result<()> {
                 },
                 Err(pond::sql::SqlError::Query(message)) => {
                     output_err(&format!(
-                        "{} {message}",
-                        pond::output::paint("sql error:", pond::output::dim())
+                        "{} {}",
+                        pond::output::paint("sql error:", pond::output::dim()),
+                        sql_error_for_cli(&message),
                     ))?;
                     std::process::exit(2);
                 }
@@ -3165,7 +3179,7 @@ pub(crate) async fn run_sync(
         let outcome = run_sync_dry_run(loaded, config_file, storage_path, &invocation).await;
         // The one-document-on-stdout contract covers dry-run failures too.
         if json && let Err(error) = &outcome {
-            emit_sync_json_error(error)?;
+            emit_json_error(error)?;
         }
         return outcome;
     }
@@ -3182,7 +3196,7 @@ pub(crate) async fn run_sync(
         Ok(setup) => setup,
         Err(error) => {
             if json {
-                emit_sync_json_error(&error)?;
+                emit_json_error(&error)?;
             }
             return Err(error);
         }
@@ -3197,7 +3211,7 @@ pub(crate) async fn run_sync(
         Ok(state) => state,
         Err(error) => {
             if json {
-                emit_sync_json_error(&error)?;
+                emit_json_error(&error)?;
             }
             return Err(error);
         }
@@ -3224,7 +3238,7 @@ pub(crate) async fn run_sync(
                 Ok(guard) => guard,
                 Err(error) => {
                     if json {
-                        emit_sync_json_error(&error)?;
+                        emit_json_error(&error)?;
                     }
                     return Err(error);
                 }
@@ -3535,10 +3549,10 @@ async fn run_sync_dry_run(
     Ok(())
 }
 
-/// The `--format json` error document for failures that happen before the
-/// staged pipeline (storage resolve, creds, lock, dry-run) - keeping the
-/// one-document-on-stdout contract on every exit path, not just staged ones.
-fn emit_sync_json_error(error: &anyhow::Error) -> anyhow::Result<()> {
+/// The `--format json` error document, keeping the one-document-on-stdout
+/// contract on every exit path for `sync` (storage resolve, creds, lock,
+/// dry-run) and `status` (store open / bounded-scan failure).
+fn emit_json_error(error: &anyhow::Error) -> anyhow::Result<()> {
     output(&serde_json::to_string_pretty(&serde_json::json!({
         "outcome": "error",
         "error": format!("{error:#}"),
@@ -5367,7 +5381,11 @@ fn render_indexes_line(health: &IndexHealth) -> String {
             let semantic_part = match &health.semantic {
                 Ready => "semantic ready".to_owned(),
                 Pending(n) => format!("semantic {} pending", format_thousands(*n)),
-                NotBuilt => "semantic below activation threshold".to_owned(),
+                // The ANN index only builds past an activation row-count, but
+                // vector search already works below it via a brute-force scan -
+                // so say "ready", not the alarming "below activation threshold"
+                // that reads as broken (three fresh users misread it that way).
+                NotBuilt => "semantic ready (brute-force; index builds at scale)".to_owned(),
             };
             format!("{text_part} . {semantic_part}")
         }
@@ -5460,6 +5478,19 @@ fn render_get_envelope(
             }
         },
     }
+}
+
+/// Rewrite the SQL module's canonical (MCP-vocabulary) error text for the CLI.
+/// `pond::sql` is shared with the `pond_sql_query` tool and names the MCP
+/// tools/resources; a terminal user runs `pond sql`/`pond search`/`pond get`
+/// and has no `schema://` resource, so translate those tokens at the boundary.
+fn sql_error_for_cli(message: &str) -> String {
+    message
+        .replace("resource schema://pond-sql", "`pond sql --help`")
+        .replace("schema://pond-sql", "`pond sql --help`")
+        .replace("pond_sql_query", "`pond sql`")
+        .replace("pond_search", "`pond search`")
+        .replace("pond_get", "`pond get`")
 }
 
 fn render_error_pretty(error: &ErrorEnvelope) {
