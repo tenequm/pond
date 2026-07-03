@@ -28,7 +28,6 @@ exclude = [
     "AGENTS.md",
     "CLAUDE.md",
     "SKILL.md",
-    ".release-plz.toml",
     "**/.DS_Store",
 ]
 

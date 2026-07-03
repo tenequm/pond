@@ -2,7 +2,7 @@
 # Scan staged changes for secrets before they enter history - the only cheap
 # moment to stop them, since a committed secret lives in git history forever
 # even after deletion. This hook is the sole automated gate; there is no CI
-# backstop. Rules + verified-false-positive allowlist: .gitleaks.toml.
+# backstop. Rules + verified-false-positive allowlist: .github/gitleaks.toml.
 set -euo pipefail
 
 if ! command -v gitleaks >/dev/null 2>&1; then
@@ -11,11 +11,11 @@ if ! command -v gitleaks >/dev/null 2>&1; then
   exit 0
 fi
 
-if ! gitleaks git --staged --no-banner --redact -v; then
+if ! gitleaks git --staged --no-banner --redact -v --config .github/gitleaks.toml; then
   echo >&2
   echo "pre-commit: gitleaks flagged a staged secret (above)." >&2
   echo "  real secret?    unstage it, rotate the credential, then re-stage" >&2
-  echo "  false positive? add a narrow allowlist block to .gitleaks.toml" >&2
+  echo "  false positive? add a narrow allowlist block to .github/gitleaks.toml" >&2
   exit 1
 fi
 

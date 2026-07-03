@@ -4,6 +4,12 @@ projects:
 
 vcs:
   defaultBranch: 'main'
+  # sync: true wires core.hooksPath -> .moon/hooks on every moon run, so the
+  # secret-scan gate configures itself on any fresh clone (no manual setup).
+  hooks:
+    pre-commit:
+      - './.github/hooks/pre-commit'
+  sync: true
 
 # .claude/ and .agents/ hold local Claude Code settings and skill symlinks that
 # point outside the repo; moon's vcs walk follows them, so exclude from hashing.

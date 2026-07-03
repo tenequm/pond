@@ -63,7 +63,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: stable }
       - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
-        with: { command: release-pr }   # keep the release PR current; never publishes
+        with: { command: release-pr, config: .github/release-plz.toml }   # keep the release PR current; never publishes
         env:
           # PAT (not GITHUB_TOKEN) so the opened release PR triggers build-and-test.
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
@@ -120,7 +120,7 @@ jobs:
       
       - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         id: release-plz
-        with: { command: release }
+        with: { command: release, config: .github/release-plz.toml }
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

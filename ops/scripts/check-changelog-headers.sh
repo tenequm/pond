@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Gate the top CHANGELOG.md section's `###` headers to the canonical emoji
-# taxonomy from .release-plz.toml. The release body is this section verbatim
+# taxonomy from .github/release-plz.toml. The release body is this section verbatim
 # (release-plz git_release_body default), and it fans out to the GitHub release
 # + homebrew-tap + pond-nix, so a hand-edit that drops the emoji headers silently
 # de-styles all three. This is the only check that stops that before it ships.

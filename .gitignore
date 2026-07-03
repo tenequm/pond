@@ -59,6 +59,8 @@ skills-lock.json
 
 # moon local cache (rebuilt on demand; never commit)
 /.moon/cache/
+# generated from vcs.hooks in workspace.yml on every moon run
+/.moon/hooks/
 
 # wrangler local state/cache (created by `wrangler deploy`)
 /.wrangler/
