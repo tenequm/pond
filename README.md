@@ -55,7 +55,7 @@ Linux and macOS are supported; Windows is not in v1 scope.
 
 ```sh
 brew install tenequm/tap/pond                       # Homebrew
-nix profile add github:tenequm/pond-nix#pond        # Nix
+nix profile add github:tenequm/pond#pond           # Nix
 cargo install pond-db                               # crates.io (installs the `pond` command)
 ```
 

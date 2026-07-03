@@ -125,34 +125,103 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # Assemble pond's own release first: it is the source of truth the
-      # homebrew/nix mirrors copy their notes from, so it must be complete before
-      # any mirror runs - and a later mirror failure must never starve it.
+      # Assemble pond's own release first: it is the single host of the release
+      # binaries - the homebrew formula, the root flake, and the pond-nix legacy
+      # mirror all fetch from it - so it must be complete before anything else.
       - name: Mirror binaries to pond release
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
 
-      - name: Release binaries to homebrew-tap
+      # One rendered nix derivation feeds both the root flake (canonical,
+      # github:tenequm/pond) and the pond-nix legacy mirror.
+      - name: Render nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
-        # Explicit globs, not dist/*: moon can hydrate dist/ from cache, so
-        # only upload exactly our archives and checksums.
-        # Notes mirror pond's own release body (release-plz changelog) so
-        # downstream tap users see the changelog without a second lookup.
+        env: { V: "${{ steps.ver.outputs.v }}" }
         run: |
-          notes=$(gh release view "v$V" -R tenequm/pond --json body -q .body)
-          gh release create "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap \
-            --title "pond v$V" --notes "$notes" \
-          || gh release upload "pond-v$V" dist/pond-* dist/checksums.txt --repo tenequm/homebrew-tap --clobber
-          gh release edit "pond-v$V" --repo tenequm/homebrew-tap --title "pond v$V" --notes "$notes"
+          set -euo pipefail
+          sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
+          cat > "$RUNNER_TEMP/pond.nix" <<EOF
+          { lib, fetchurl, stdenv, autoPatchelfHook, installShellFiles, zlib }:
+          let
+            inherit (stdenv) hostPlatform;
+            inherit (hostPlatform) system;
+            version = "$V";
+            base = "https://github.com/tenequm/pond/releases/download/v\${version}";
+            shaMap = {
+              x86_64-linux = "$(sha x86_64-unknown-linux-gnu)";
+              aarch64-linux = "$(sha aarch64-unknown-linux-gnu)";
+              aarch64-darwin = "$(sha aarch64-apple-darwin)";
+            };
+            urlMap = {
+              x86_64-linux = "\${base}/pond-x86_64-unknown-linux-gnu.tar.xz";
+              aarch64-linux = "\${base}/pond-aarch64-unknown-linux-gnu.tar.xz";
+              aarch64-darwin = "\${base}/pond-aarch64-apple-darwin.tar.xz";
+            };
+          in
+          stdenv.mkDerivation {
+            pname = "pond";
+            inherit version;
+
+            src = fetchurl {
+              url = urlMap.\${system};
+              sha256 = shaMap.\${system};
+            };
+
+            sourceRoot = ".";
+
+            # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
+            # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
+            nativeBuildInputs = [ installShellFiles ] ++ lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
+
+            # The released Linux build is CPU-only candle + vendored onig + rustls,
+            # so the sole dynamic deps beyond glibc are libgcc_s/libstdc++.
+            buildInputs = lib.optionals hostPlatform.isLinux [ stdenv.cc.cc.lib zlib ];
+
+            # Completions ship pre-generated in the tarball: the binary can't
+            # run here (autoPatchelfHook rewrites the interpreter later, in
+            # fixupPhase).
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 pond \$out/bin/pond
+              installShellCompletion --bash completions/pond.bash --zsh completions/_pond --fish completions/pond.fish
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "Lossless storage and hybrid search for sessions from any AI agent client";
+              homepage = "https://pond.locker/";
+              changelog = "https://github.com/tenequm/pond/releases/tag/v\${version}";
+              license = lib.licenses.asl20;
+              mainProgram = "pond";
+              sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
+              platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
+              maintainers = with lib.maintainers; [ ];
+            };
+          }
+          EOF
+
+      # The tag was cut from this checkout's HEAD, so this lands one commit
+      # after it: tag-pinned flake refs carry the previous release's hashes,
+      # main is always current. [skip ci] keeps the push from triggering CI.
+      - name: Point root flake at the new binaries
+        if: ${{ steps.release-plz.outputs.releases_created }}
+        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/pond.nix" nix/pond.nix
+          git add nix/pond.nix
+          git -c user.name=ci -c user.email=ci@pond commit -m "chore(release): point flake at v$V binaries [skip ci]"
+          git fetch "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond" main
+          git rebase FETCH_HEAD
+          git push "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond" HEAD:main
 
       - name: Publish Homebrew formula
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: |
           set -euo pipefail
-          base="https://github.com/tenequm/homebrew-tap/releases/download/pond-v$V"
+          base="https://github.com/tenequm/pond/releases/download/v$V"
           sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
           tap="$RUNNER_TEMP/tap"
           rm -rf "$tap"
@@ -170,7 +239,7 @@ jobs:
             livecheck do
               url :stable
               strategy :github_releases
-              regex(/^pond[._-]v?(\d+(?:\.\d+)+)\$/i)
+              regex(/^v?(\d+(?:\.\d+)+)\$/i)
             end
 
             on_macos do
@@ -206,83 +275,19 @@ jobs:
           git -C "$tap" add Formula/pond.rb
           git -C "$tap" diff --quiet --staged || git -C "$tap" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
           git -C "$tap" push
-      - name: Publish pond-nix package
+      # Legacy mirror for existing github:tenequm/pond-nix users; the canonical
+      # flake now lives in this repo. Both fetch binaries from pond's release,
+      # so pond-nix no longer gets releases of its own.
+      - name: Update pond-nix legacy mirror
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: |
           set -euo pipefail
-          # pond-nix hosts its own binaries; the flake fetches from this repo's releases.
-          base="https://github.com/tenequm/pond-nix/releases/download/pond-v$V"
-          nix32() { nix-hash --type sha256 --to-base32 "$(sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1)"; }
           nix="$RUNNER_TEMP/pond-nix"
           rm -rf "$nix"
           git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" "$nix"
           mkdir -p "$nix/pkgs/pond"
-          cat > "$nix/pkgs/pond/default.nix" <<EOF
-          { lib, fetchurl, stdenv, autoPatchelfHook, installShellFiles, zlib }:
-          let
-            inherit (stdenv) hostPlatform;
-            inherit (hostPlatform) system;
-            version = "$V";
-            shaMap = {
-              x86_64-linux = "$(nix32 x86_64-unknown-linux-gnu)";
-              aarch64-linux = "$(nix32 aarch64-unknown-linux-gnu)";
-              aarch64-darwin = "$(nix32 aarch64-apple-darwin)";
-            };
-            urlMap = {
-              x86_64-linux = "$base/pond-x86_64-unknown-linux-gnu.tar.xz";
-              aarch64-linux = "$base/pond-aarch64-unknown-linux-gnu.tar.xz";
-              aarch64-darwin = "$base/pond-aarch64-apple-darwin.tar.xz";
-            };
-          in
-          stdenv.mkDerivation {
-            pname = "pond";
-            inherit version;
-
-            src = fetchurl {
-              url = urlMap.\${system};
-              sha256 = shaMap.\${system};
-            };
-
-            sourceRoot = ".";
-
-            # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
-            # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
-            nativeBuildInputs = [ installShellFiles ] ++ lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
-
-            # The released Linux build is CPU-only candle + vendored onig + rustls,
-            # so the sole dynamic deps beyond glibc are libgcc_s/libstdc++.
-            buildInputs = lib.optionals hostPlatform.isLinux [ stdenv.cc.cc.lib zlib ];
-
-            # Completions ship pre-generated in the tarball: the binary can't
-            # run here (autoPatchelfHook rewrites the interpreter later, in
-            # fixupPhase).
-            installPhase = ''
-              runHook preInstall
-              install -Dm755 pond \$out/bin/pond
-              installShellCompletion --bash completions/pond.bash --zsh completions/_pond --fish completions/pond.fish
-              runHook postInstall
-            '';
-
-            meta = {
-              description = "Lossless storage and hybrid search for sessions from any AI agent client";
-              homepage = "https://pond.locker/";
-              changelog = "https://github.com/tenequm/pond-nix/releases/tag/pond-v\${version}";
-              license = lib.licenses.asl20;
-              mainProgram = "pond";
-              sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
-              platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
-              maintainers = with lib.maintainers; [ ];
-            };
-          }
-          EOF
+          cp "$RUNNER_TEMP/pond.nix" "$nix/pkgs/pond/default.nix"
           git -C "$nix" add pkgs/pond/default.nix
           git -C "$nix" diff --quiet --staged || git -C "$nix" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
           git -C "$nix" push
-          # The flake fetches binaries from this release; attach the tarballs +
-          # the changelog notes, and target the default.nix commit we just pushed.
-          notes=$(gh release view "v$V" -R tenequm/pond --json body -q .body)
-          gh release create "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix \
-            --target "$(git -C "$nix" rev-parse HEAD)" --title "pond v$V" --notes "$notes" \
-          || { gh release upload "pond-v$V" dist/pond-*.tar.xz dist/checksums.txt --repo tenequm/pond-nix --clobber; \
-               gh release edit "pond-v$V" --repo tenequm/pond-nix --title "pond v$V" --notes "$notes"; }

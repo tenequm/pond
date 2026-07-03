@@ -28,15 +28,17 @@ exclude = [
     "AGENTS.md",
     "CLAUDE.md",
     "SKILL.md",
+    "flake.nix",
+    "nix/",
     "**/.DS_Store",
 ]
 
-# cargo-binstall: binaries live on the homebrew-tap release under tag
-# `pond-vX.Y.Z` with `pond` at the archive root - so the URL is fully custom;
-# binstall's default `{ repo }` + `v{version}` tag would 404. `{ bin }` resolves
-# to `pond` (the [[bin]] name), not the crate `pond-db`.
+# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z`
+# with `pond` at the archive root - the URL stays custom because binstall's
+# default `{ repo }` derives from the crate name `pond-db`. `{ bin }` resolves
+# to `pond` (the [[bin]] name).
 [package.metadata.binstall]
-pkg-url = "https://github.com/tenequm/homebrew-tap/releases/download/pond-v{ version }/pond-{ target }{ archive-suffix }"
+pkg-url = "https://github.com/tenequm/pond/releases/download/v{ version }/pond-{ target }{ archive-suffix }"
 pkg-fmt = "txz"
 bin-dir = "{ bin }{ binary-ext }"
 

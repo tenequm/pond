@@ -64,3 +64,6 @@ skills-lock.json
 
 # wrangler local state/cache (created by `wrangler deploy`)
 /.wrangler/
+
+# nix build output symlink
+/result
