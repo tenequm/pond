@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.2](https://github.com/tenequm/pond/compare/v0.11.1...v0.11.2) - 2026-07-03
+
+### <!-- 2 -->🐛 Bug Fixes
+- **index:** consolidate FTS delta segments by rebuild, never merge ([3a46cea](https://github.com/tenequm/pond/commit/3a46cea98403dd4983d52b9ed4195ac357f85981))
+- **index:** guard FTS folds against all-null tails; honest pending counts ([a7a82f9](https://github.com/tenequm/pond/commit/a7a82f987ed7ab2ff83541852636ba42d3078ec8))
+- **optimize:** make --rebuild reachable when the fold is broken; document claude.ai import ([7695f3f](https://github.com/tenequm/pond/commit/7695f3f8a27bbeef904cd7c6c6a86d4bad14e041))
+
+### <!-- 3 -->🚀 Performance
+- **sync:** escalating peek window, parallel peek, skip no-op sessions merge ([11d1037](https://github.com/tenequm/pond/commit/11d1037ea9c1753fc101bb09543cc33029908886))
+
+### <!-- 6 -->🧹 Chores
+- **repo:** move gitleaks/release-plz configs + git hooks under .github/, moon-manage hook setup ([2323744](https://github.com/tenequm/pond/commit/23237441d92ec569792d8b252aa966431fca48c4))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.11.1...v0.11.2
+
 ## [0.11.1](https://github.com/tenequm/pond/compare/v0.11.0...v0.11.1) - 2026-07-01
 
 ### <!-- 3 -->🚀 Performance
