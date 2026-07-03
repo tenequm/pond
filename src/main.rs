@@ -4809,6 +4809,7 @@ fn index_status_label(status: &IndexStatus, fold_threshold: u64) -> &'static str
 /// text path's "no data yet" line).
 fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
     let doc = serde_json::json!({
+        "pond_version": VERSION.as_str(),
         "storage": {
             "url": resolved.display(),
             "binding": resolved.binding.describe(),
@@ -4880,6 +4881,7 @@ fn status_json(
             .collect::<Vec<_>>()
     });
     let doc = serde_json::json!({
+        "pond_version": VERSION.as_str(),
         "storage": {
             "url": resolved.display(),
             "binding": resolved.binding.describe(),

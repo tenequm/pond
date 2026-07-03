@@ -25,7 +25,7 @@ pond <command> --help   # full flags for any command
 
 ### `pond status --format json`
 
-One machine-readable document for scripting. Top-level keys: `storage`, `corpus`, `indexes`, `embedding`, `source_agents` (count of distinct source agents in the store), `local` (this host's adapters + pending-sync counts, last sync, next scheduled run), `hosts`, and `schedule` (`{active, backend, every}`).
+One machine-readable document for scripting. Top-level keys: `pond_version` (the producing binary's version, so consumers can pin the format), `storage`, `corpus`, `indexes`, `embedding`, `source_agents` (count of distinct source agents in the store), `local` (this host's adapters + pending-sync counts, last sync, next scheduled run), `hosts`, and `schedule` (`{active, backend, every}`).
 
 ## Serve
 - `pond serve --transport http|stdio` - run the API (HTTP default)
