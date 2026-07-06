@@ -158,13 +158,88 @@ pub trait Adapter: Send + Sync {
 }
 
 /// What the next `pond sync` would do for one adapter, computed from the
-/// freshness gate alone: `pending` sources get read (and possibly turn out
-/// empty); `fresh` ones are skipped outright.
+/// freshness gate alone: `pending` sessions get read; `fresh` ones are skipped
+/// outright - including sessions whose source provably holds nothing ingestible
+/// right now ([`SourceWatermark::Empty`]), because "nothing to sync" IS up to
+/// date. The unit is the SESSION, not the file: a source may hold many (an
+/// export archive) and the gate enumerates and counts what pond stores.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncPlan {
-    pub sources: usize,
+    pub sessions: usize,
     pub fresh: usize,
     pub pending: usize,
+}
+
+impl SyncPlan {
+    /// The one classifier: fold session heads through [`source_in_sync`].
+    /// Callers with an empty oracle must not use this - there is nothing to
+    /// compare against, so a first sync's plan is [`SyncPlan::all_pending`]
+    /// without paying for peeks.
+    pub fn from_heads<'a>(
+        oracle: &dyn SkipOracle,
+        heads: impl IntoIterator<Item = (Option<&'a str>, SourceWatermark)>,
+    ) -> Self {
+        let mut plan = Self::default();
+        for (session_id, watermark) in heads {
+            plan.sessions += 1;
+            if source_in_sync(oracle, session_id, watermark) {
+                plan.fresh += 1;
+            } else {
+                plan.pending += 1;
+            }
+        }
+        plan
+    }
+
+    /// A first-sync plan: no oracle entries means every session will be read.
+    pub fn all_pending(sessions: usize) -> Self {
+        Self {
+            sessions,
+            pending: sessions,
+            ..Self::default()
+        }
+    }
+}
+
+/// Source-side verdict of a freshness peek.
+///
+/// `Empty` MUST be claimed only on PROOF that the source currently holds
+/// nothing ingestible (a zero-byte file; a whole-source inspection finding no
+/// ingestible record). The proof is re-derived from current source content on
+/// every run - never a cached marker - so the moment the source gains real
+/// content the peek stops saying `Empty` and the source re-reads
+/// (spec.md#session-movement-complete). Without `Empty`, a permanently
+/// content-free source can never earn a stored watermark and reports a store
+/// that syncs clean as forever out of date.
+///
+/// `Opaque` is the safe default for anything undeterminable cheaply (an
+/// oversized record, a tail window smaller than the file): the source counts
+/// pending and re-reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceWatermark {
+    /// Latest ingestible-content timestamp (micros) found in the source.
+    At(i64),
+    /// Provably nothing to ingest right now.
+    Empty,
+    /// Could not determine cheaply - re-read to be safe.
+    Opaque,
+}
+
+/// Gate verdict for one source: skip (in sync) or re-read. `Empty` sources are
+/// in sync by definition; a watermark compares via [`is_session_fresh`], which
+/// needs a session id to look up the stored side; anything else re-reads.
+pub fn source_in_sync(
+    oracle: &dyn SkipOracle,
+    session_id: Option<&str>,
+    watermark: SourceWatermark,
+) -> bool {
+    match watermark {
+        SourceWatermark::Empty => true,
+        SourceWatermark::At(ts) => {
+            session_id.is_some_and(|id| is_session_fresh(oracle, id, Some(ts)))
+        }
+        SourceWatermark::Opaque => false,
+    }
 }
 
 /// Boxed future for [`Adapter::plan`], mirroring [`DiscoverFuture`].

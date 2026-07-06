@@ -30,7 +30,7 @@ use super::{
     },
     extracted_text,
     jsonl::{
-        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_mapped,
+        BoundedRow, JsonlTree, TAIL_CAP, jsonl_tree_discover, jsonl_tree_events, peek_last_mapped,
         source_line,
     },
     jsonl_bytes, part_id, part_ordinal, raw_record,
@@ -348,17 +348,30 @@ impl JsonlTree for ClaudeCodeAdapter {
         row.get("sessionId")?.as_str().map(ToOwned::to_owned)
     }
 
-    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+    fn peek_watermark(&self, path: &Path) -> crate::adapter::SourceWatermark {
         // Claude Code appends trailing metadata rows (`last-prompt`,
         // `permission-mode`, `bridge-session`, ...) with no timestamp after the
         // conversation, so the literal last line is usually not a message. Walk
         // back to the latest row that carries a timestamp - the real watermark.
         // Taking only the last line stranded ~2k sessions perpetually un-fresh,
         // re-decoding ~1.2M already-stored rows every sync.
-        peek_last_mapped(path, |line| {
+        if let Some(ts) = peek_last_mapped(path, |line| {
             let row: Value = serde_json::from_str(line).ok()?;
             Some(parse_timestamp(&row).ok()?.timestamp_micros())
-        })
+        }) {
+            return crate::adapter::SourceWatermark::At(ts);
+        }
+        // No timestamped row found. When the scan covered the WHOLE file
+        // (len <= TAIL_CAP) that is a proof of nothing ingestible: session
+        // anchoring runs the same `parse_timestamp` over the same lines
+        // (`session_from_rows`), so this file cannot anchor a session and
+        // ingests nothing - the invariant is locked by
+        // `keyless_file_peeks_empty_and_ingests_nothing`. A larger file's scan
+        // is a window, not a proof, so it stays opaque and re-reads.
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() <= TAIL_CAP => crate::adapter::SourceWatermark::Empty,
+            _ => crate::adapter::SourceWatermark::Opaque,
+        }
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -387,14 +400,10 @@ impl JsonlTree for ClaudeCodeAdapter {
         // child id (its leaf isn't `agent-<hash>.jsonl`) must NOT fall back to
         // its content `sessionId` - that id is the parent's, so it would
         // silently merge into the parent session. Fail visibly and wait for an
-        // adapter update instead - EXCEPT the Workflow runner's `journal.jsonl`,
-        // a known control file that carries no `sessionId`, so it falls through
-        // to `session()` and is dropped as a benign Empty skip rather than
-        // flagged as an unrecognized transcript layout. See spec.md#datasets.
-        if subagents_dir(path).is_some()
-            && subagent_ids(path).is_none()
-            && !is_workflow_control_file(path)
-        {
+        // adapter update instead. The Workflow runner's `journal.jsonl` never
+        // reaches this check - `skip_source` excludes it from the walk - and if
+        // it ever did, a visible skip is the safe answer. See spec.md#datasets.
+        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
             return Some(format!(
                 "{}: subagent transcript layout not recognized by this pond version; \
                  skipped so it is not merged into the parent session - update pond and \
@@ -403,6 +412,10 @@ impl JsonlTree for ClaudeCodeAdapter {
             ));
         }
         None
+    }
+
+    fn skip_source(&self, path: &Path) -> bool {
+        is_workflow_control_file(path)
     }
 }
 
@@ -436,8 +449,11 @@ fn source_record_hash(value: &Value) -> u64 {
 /// The Workflow runner writes `journal.jsonl` (its resume/cache journal of agent
 /// `started`/`result` events) beside the `agent-<hash>.jsonl` transcripts under
 /// `subagents/workflows/<wf-id>/`. It carries no `sessionId` and only duplicates
-/// content already in those transcripts, so it is a control file to ignore (a
-/// benign Empty skip), not an unrecognized transcript layout. See spec.md#datasets.
+/// content already in those transcripts, so it is a control file excluded from
+/// the walk outright (`skip_source`): never a source, never read, never pending.
+/// One accumulates per Workflow run, and none can ever earn a freshness key -
+/// left in the walk they'd grow `pond status`'s pending count without bound.
+/// See spec.md#datasets.
 fn is_workflow_control_file(path: &Path) -> bool {
     subagents_dir(path).is_some()
         && path.file_name().and_then(|n| n.to_str()) == Some("journal.jsonl")
@@ -1304,8 +1320,8 @@ mod tests {
 
     /// `plan` is the events_with freshness gate run standalone: an empty
     /// oracle marks everything pending (walk cost only), a saturated oracle
-    /// marks every readable-id source fresh, and the counts always partition
-    /// `sources`.
+    /// marks every readable-id session fresh, and the counts always partition
+    /// `sessions`.
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_classifies_fresh_vs_pending_without_decoding() -> anyhow::Result<()> {
         use crate::adapter::{Adapter, SkipOracle};
@@ -1315,8 +1331,8 @@ mod tests {
             .plan(&crate::adapter::NoopOracle)
             .await?
             .expect("jsonl-tree adapters support plan");
-        assert!(first_sync.sources > 0);
-        assert_eq!(first_sync.pending, first_sync.sources);
+        assert!(first_sync.sessions > 0);
+        assert_eq!(first_sync.pending, first_sync.sessions);
         assert_eq!(first_sync.fresh, 0);
 
         struct MaxWatermarkOracle;
@@ -1329,9 +1345,119 @@ mod tests {
             .plan(&MaxWatermarkOracle)
             .await?
             .expect("jsonl-tree adapters support plan");
-        assert_eq!(caught_up.sources, first_sync.sources);
+        assert_eq!(caught_up.sessions, first_sync.sessions);
         assert!(caught_up.fresh > 0, "fixture sessions must gate as fresh");
-        assert_eq!(caught_up.fresh + caught_up.pending, caught_up.sources);
+        assert_eq!(caught_up.fresh + caught_up.pending, caught_up.sessions);
+        Ok(())
+    }
+
+    /// Sessions that can never earn a stored watermark - a zero-byte file, a
+    /// metadata-only transcript with no timestamped row - gate `Empty` (proven
+    /// nothing to ingest), and a workflow `journal.jsonl` leaves the walk
+    /// entirely. Otherwise a store that syncs clean reports as forever out of
+    /// date. The Empty proof is locked to real ingest below
+    /// (`keyless_file_peeks_empty_and_ingests_nothing`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_gates_keyless_sessions_empty_and_excludes_journals() -> anyhow::Result<()> {
+        use crate::adapter::{Adapter, SkipOracle};
+
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let session_uuid = "99999999-9999-9999-9999-999999999999";
+        let wf_dir = project_dir
+            .join(session_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_11111111-abc");
+        std::fs::create_dir_all(&wf_dir)?;
+
+        let session_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-1",
+            "sessionId": session_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-06-04T00:00:00.000Z",
+            "message": {"role": "user", "content": "hi"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{session_uuid}.jsonl")),
+            format!("{session_row}\n"),
+        )?;
+        std::fs::write(project_dir.join("empty-session.jsonl"), "")?;
+        let title_row = serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "title only",
+            "sessionId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        });
+        std::fs::write(
+            project_dir.join("title-only.jsonl"),
+            format!("{title_row}\n"),
+        )?;
+        std::fs::write(wf_dir.join("journal.jsonl"), "{\"type\":\"started\"}\n")?;
+
+        struct MaxWatermarkOracle;
+        impl SkipOracle for MaxWatermarkOracle {
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+                Some(i64::MAX)
+            }
+        }
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let plan = adapter
+            .plan(&MaxWatermarkOracle)
+            .await?
+            .expect("jsonl-tree adapters support plan");
+        assert_eq!(
+            plan.sessions, 3,
+            "journal.jsonl must not count as a session"
+        );
+        assert_eq!(
+            plan.fresh, 3,
+            "keyless sessions gate Empty and count as fresh",
+        );
+        assert_eq!(plan.pending, 0, "a clean corpus must read as fully synced");
+        Ok(())
+    }
+
+    /// The `Empty` proof's lock: a file the peek judges `Empty` (no timestamped
+    /// row in a whole-file scan) MUST ingest zero rows through the real ingest
+    /// path - peek and session anchoring share `parse_timestamp`, and this test
+    /// fails the moment ingest learns to anchor such files without the peek
+    /// being updated in the same change (spec.md#session-movement-complete).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyless_file_peeks_empty_and_ingests_nothing() -> anyhow::Result<()> {
+        use crate::adapter::SourceWatermark;
+
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let title_row = serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "title only",
+            "sessionId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        });
+        let path = project_dir.join("title-only.jsonl");
+        std::fs::write(&path, format!("{title_row}\n"))?;
+
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        assert_eq!(
+            adapter.peek_watermark(&path),
+            SourceWatermark::Empty,
+            "a whole-file scan with no timestamped row is a proof of emptiness",
+        );
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            summary.accepted(),
+            0,
+            "an Empty-judged file must ingest nothing - if this fails, ingest \
+             learned to anchor keyless files and peek_watermark must be updated",
+        );
+        assert!(
+            store.session_ids().await?.is_empty(),
+            "no session row may land from an Empty-judged file",
+        );
         Ok(())
     }
 
@@ -1869,7 +1995,7 @@ mod tests {
     /// timestamp - taking only the literal last line returned None and stranded
     /// ~2k sessions perpetually un-fresh, re-decoding ~1.2M stored rows every sync.
     #[test]
-    fn peek_last_ts_walks_back_past_trailing_metadata_rows() {
+    fn peek_watermark_walks_back_past_trailing_metadata_rows() {
         let corpus = TempDir::new().unwrap();
         let project_dir = corpus.path().join("-tmp-pond-test");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -1894,8 +2020,8 @@ mod tests {
             .unwrap()
             .timestamp_micros();
         assert_eq!(
-            adapter.peek_last_ts(&path),
-            Some(expected),
+            adapter.peek_watermark(&path),
+            crate::adapter::SourceWatermark::At(expected),
             "walk back past trailing metadata to the last message's timestamp",
         );
     }
@@ -2189,18 +2315,18 @@ mod tests {
     }
 
     /// The Workflow runner's `journal.jsonl` under `subagents/workflows/<wf>/`
-    /// is a known control file, not an unrecognized transcript - it must NOT be
-    /// flagged unsupported (it falls through to a benign Empty skip).
+    /// is a known control file: `skip_source` excludes it from the walk so it
+    /// is never a session, never read, and never counted pending.
     #[test]
-    fn workflow_journal_is_a_control_file_not_unsupported() {
+    fn workflow_journal_is_excluded_from_the_walk() {
         let adapter = ClaudeCodeAdapter::new("/tmp/pond-test-root");
         let journal = std::path::Path::new(
             "/root/-proj/55555555-5555-5555-5555-555555555555/subagents/workflows/wf_030e6487-da6/journal.jsonl",
         );
         assert!(is_workflow_control_file(journal));
         assert!(
-            adapter.unsupported_reason(journal).is_none(),
-            "journal.jsonl is a known control file, not an unsupported layout",
+            adapter.skip_source(journal),
+            "journal.jsonl is a known control file, excluded from the walk",
         );
     }
 
@@ -2218,6 +2344,11 @@ mod tests {
             "an unrecognized non-agent, non-journal leaf must still fail visibly",
         );
         assert!(!is_workflow_control_file(unknown));
+        assert!(
+            !adapter.skip_source(unknown),
+            "only the exact journal.jsonl leaf may leave the walk - an unknown \
+             leaf stays in so its unsupported skip stays visible",
+        );
 
         let agent = std::path::Path::new("/root/-proj/PARENT/subagents/agent-abc123def456.jsonl");
         assert!(
@@ -2228,10 +2359,10 @@ mod tests {
 
     /// End-to-end: a workflow dir holding both a real `agent-<hash>.jsonl`
     /// transcript and the runner's `journal.jsonl`. The agent transcript
-    /// ingests as a child session; the journal is a benign skip (no
+    /// ingests as a child session; the journal is excluded from the walk (no
     /// `skipped_files` failure) and its rows never merge into the parent.
     #[tokio::test(flavor = "multi_thread")]
-    async fn workflow_journal_skipped_benignly_while_sibling_agent_ingests() -> anyhow::Result<()> {
+    async fn workflow_journal_excluded_while_sibling_agent_ingests() -> anyhow::Result<()> {
         let corpus = TempDir::new()?;
         let project_dir = corpus.path().join("-tmp-pond-test");
         let parent_uuid = "77777777-7777-7777-7777-777777777777";
@@ -2283,7 +2414,7 @@ mod tests {
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert_eq!(
             summary.skipped_files, 0,
-            "journal.jsonl is a control file (benign Empty skip), not an unsupported failure",
+            "journal.jsonl is a control file excluded from the walk, not an unsupported failure",
         );
 
         let child = store
@@ -2354,7 +2485,7 @@ mod tests {
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert_eq!(
             summary.skipped_files, 0,
-            "journal is a benign Empty skip, not an unsupported failure",
+            "journal is excluded from the walk, not an unsupported failure",
         );
         let parent = store
             .get_session(parent_uuid)
