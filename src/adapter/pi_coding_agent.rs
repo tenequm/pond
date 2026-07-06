@@ -307,22 +307,28 @@ impl JsonlTree for PiCodingAgentAdapter {
         }
     }
 
-    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+    fn peek_watermark(&self, path: &Path) -> crate::adapter::SourceWatermark {
         // The `session` header is eventless; every other row is a message
         // carrying its own `timestamp`. The transcript is append-ordered, so the
         // last line is the latest message; a `session`-only or timestamp-less
-        // tail yields None and the file re-reads (safe).
-        let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
-        if row.get("type").and_then(Value::as_str) == Some("session") {
-            return None;
+        // tail is opaque and the file re-reads (safe).
+        let last_ts = || -> Option<i64> {
+            let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
+            if row.get("type").and_then(Value::as_str) == Some("session") {
+                return None;
+            }
+            let text = row.get("timestamp").and_then(Value::as_str)?;
+            Some(
+                DateTime::parse_from_rfc3339(text)
+                    .ok()?
+                    .with_timezone(&Utc)
+                    .timestamp_micros(),
+            )
+        };
+        match last_ts() {
+            Some(ts) => crate::adapter::SourceWatermark::At(ts),
+            None => crate::adapter::SourceWatermark::Opaque,
         }
-        let text = row.get("timestamp").and_then(Value::as_str)?;
-        Some(
-            DateTime::parse_from_rfc3339(text)
-                .ok()?
-                .with_timezone(&Utc)
-                .timestamp_micros(),
-        )
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {

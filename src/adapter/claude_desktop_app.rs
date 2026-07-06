@@ -125,6 +125,46 @@ impl Adapter for ClaudeDesktopAppAdapter {
         })
     }
 
+    fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> super::PlanFuture<'a> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            // The events_with freshness pre-pass run standalone: the same
+            // per-session audit-tail peek, classified instead of read. On an
+            // empty oracle the peeks are skipped - a first sync reads everything.
+            let peek = !oracle.is_empty();
+            let heads = tokio::task::spawn_blocking(move || {
+                let sessions = collect_sessions(&root)?;
+                Ok::<_, AdapterError>(
+                    sessions
+                        .into_iter()
+                        .map(|session| {
+                            let watermark = if peek {
+                                match source_last_ts(&session.audit_path) {
+                                    Some(ts) => super::SourceWatermark::At(ts),
+                                    None => super::SourceWatermark::Opaque,
+                                }
+                            } else {
+                                super::SourceWatermark::Opaque
+                            };
+                            (session.session_id, watermark)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await
+            .map_err(join_error)??;
+            if !peek {
+                return Ok(Some(super::SyncPlan::all_pending(heads.len())));
+            }
+            Ok(Some(super::SyncPlan::from_heads(
+                oracle,
+                heads
+                    .iter()
+                    .map(|(session_id, watermark)| (Some(session_id.as_str()), *watermark)),
+            )))
+        })
+    }
+
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let adapter = self.clone();
         Box::pin(stream! {
@@ -1069,6 +1109,57 @@ mod tests {
                 "local-agent-mode-sessions",
             ],
         )
+    }
+
+    /// `plan` is the events_with freshness pre-pass run standalone and MUST
+    /// agree with it: the sessions plan calls fresh are exactly the sessions
+    /// the gate skips. An empty oracle plans everything pending at walk cost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
+        use tokio_stream::StreamExt;
+
+        let adapter = ClaudeDesktopAppAdapter::new(FIXTURES);
+        let first_sync = adapter
+            .plan(&crate::adapter::NoopOracle)
+            .await?
+            .expect("cowork supports plan");
+        assert_eq!(first_sync.sessions, 4, "the four audit.jsonl sessions");
+        assert_eq!(first_sync.pending, first_sync.sessions);
+        assert_eq!(first_sync.fresh, 0);
+
+        struct MaxWatermarkOracle;
+        impl SkipOracle for MaxWatermarkOracle {
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+                Some(i64::MAX)
+            }
+        }
+        let plan = adapter
+            .plan(&MaxWatermarkOracle)
+            .await?
+            .expect("cowork supports plan");
+        assert_eq!(plan.sessions, first_sync.sessions);
+        assert_eq!(plan.pending, 0, "a saturated oracle gates everything fresh");
+
+        let mut gate_fresh = 0usize;
+        let mut events = 0usize;
+        let mut stream = adapter.events_with(&MaxWatermarkOracle);
+        while let Some(item) = stream.next().await {
+            match item? {
+                AdapterYield::Skipped {
+                    reason: SkipReason::Fresh,
+                    ..
+                } => gate_fresh += 1,
+                AdapterYield::SkippedBatch {
+                    reason: SkipReason::Fresh,
+                    count,
+                } => gate_fresh += count,
+                AdapterYield::Event(_) => events += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(gate_fresh, plan.fresh, "plan and gate must agree");
+        assert_eq!(events, 0, "a fully fresh corpus reads nothing");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

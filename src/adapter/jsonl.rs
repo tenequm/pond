@@ -20,8 +20,9 @@ use tokio::{sync::mpsc, task::JoinError};
 
 use super::{
     AdapterError, AdapterYield, AdapterYieldStream, DiscoverFuture, PlanFuture, SkipOracle,
-    SkipReason, SyncPlan,
+    SkipReason, SourceWatermark, SyncPlan,
     extract::{LEAF_CAP, bound_value, truncate_to_marker},
+    source_in_sync,
 };
 use crate::{
     sessions::IngestEvent,
@@ -62,11 +63,14 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     /// line; `None` disables the skip for that file.
     fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String>;
 
-    /// Latest message timestamp (micros) for the freshness gate - the source-side
-    /// watermark compared against pond's stored max. The driver reads it from the
-    /// file tail (the last message line, or a bounded backward scan); `None`
-    /// disables the skip (the file re-reads).
-    fn peek_last_ts(&self, path: &Path) -> Option<i64>;
+    /// Source-side freshness verdict for a non-empty file: the latest
+    /// ingestible-content timestamp ([`SourceWatermark::At`], compared against
+    /// pond's stored max), a proof there is nothing to ingest
+    /// ([`SourceWatermark::Empty`]), or undeterminable
+    /// ([`SourceWatermark::Opaque`] - the file re-reads). The driver reads the
+    /// file tail (the last message line, or a bounded backward scan). Zero-byte
+    /// files are `Empty` at the seam before this is called.
+    fn peek_watermark(&self, path: &Path) -> SourceWatermark;
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError>;
 
@@ -84,6 +88,16 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     /// Default: no such category.
     fn unsupported_reason(&self, _path: &Path) -> Option<String> {
         None
+    }
+
+    /// A file the adapter knows carries no session data (a runner control file
+    /// whose content duplicates real transcripts). Excluded from the walk
+    /// entirely: never counted as a source, never read, never pending. Only for
+    /// files whose non-session nature is structural and certain - anything the
+    /// adapter merely can't decode must stay IN the walk so it surfaces as a
+    /// visible skip instead of vanishing. Default: no such category.
+    fn skip_source(&self, _path: &Path) -> bool {
+        false
     }
 }
 
@@ -124,7 +138,12 @@ pub(crate) fn jsonl_tree_discover<D: JsonlTree>(driver: &D) -> DiscoverFuture<'_
     Box::pin(async move {
         tokio::task::spawn_blocking(move || {
             collect_jsonl_files(driver.root())
-                .map(|files| files.len())
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter(|path| !driver.skip_source(path))
+                        .count()
+                })
                 .map_err(|io| AdapterError::io(driver.name(), io.path, io.source))
         })
         .await
@@ -156,9 +175,7 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
         let mut survivors = Vec::with_capacity(heads.len());
         let mut fresh_count = 0usize;
         for head in heads {
-            if let Some(id) = &head.session_id
-                && crate::adapter::is_session_fresh(oracle, id, head.last_ts)
-            {
+            if source_in_sync(oracle, head.session_id.as_deref(), head.watermark) {
                 fresh_count += 1;
                 continue;
             }
@@ -200,19 +217,15 @@ pub(crate) fn jsonl_tree_plan<'a, D: JsonlTree>(
                 .await
                 .map_err(|join| join_error(name, join))??
         };
-        let mut plan = SyncPlan {
-            sources: heads.len(),
-            ..SyncPlan::default()
-        };
-        for head in &heads {
-            if let Some(id) = &head.session_id
-                && crate::adapter::is_session_fresh(oracle, id, head.last_ts)
-            {
-                plan.fresh += 1;
-            }
+        if oracle.is_empty() {
+            return Ok(Some(SyncPlan::all_pending(heads.len())));
         }
-        plan.pending = plan.sources - plan.fresh;
-        Ok(Some(plan))
+        Ok(Some(SyncPlan::from_heads(
+            oracle,
+            heads
+                .iter()
+                .map(|head| (head.session_id.as_deref(), head.watermark)),
+        )))
     })
 }
 
@@ -229,7 +242,7 @@ fn join_error(name: &'static str, join: JoinError) -> AdapterError {
 struct FileHead {
     path: PathBuf,
     session_id: Option<String>,
-    last_ts: Option<i64>,
+    watermark: SourceWatermark,
 }
 
 fn collect_heads<D: JsonlTree>(
@@ -237,8 +250,9 @@ fn collect_heads<D: JsonlTree>(
     oracle_is_empty: bool,
 ) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
-    let files = collect_jsonl_files(driver.root())
+    let mut files = collect_jsonl_files(driver.root())
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
+    files.retain(|path| !driver.skip_source(path));
     // The freshness peek (first line -> session id, file tail -> latest
     // timestamp) costs bounded reads + JSON decodes per file. On a first-time
     // ingest (`NoopOracle` or an empty map) there is nothing to compare
@@ -249,7 +263,7 @@ fn collect_heads<D: JsonlTree>(
             .map(|path| FileHead {
                 path,
                 session_id: None,
-                last_ts: None,
+                watermark: SourceWatermark::Opaque,
             })
             .collect());
     }
@@ -287,19 +301,35 @@ fn collect_heads<D: JsonlTree>(
 }
 
 fn peek_head<D: JsonlTree>(driver: &D, path: &Path) -> FileHead {
+    // A zero-byte file provably holds nothing to ingest, in any format - the
+    // one `Empty` verdict the seam owns. Drivers only judge non-empty files.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() == 0) {
+        return FileHead {
+            path: path.to_owned(),
+            session_id: None,
+            watermark: SourceWatermark::Empty,
+        };
+    }
     let first_line = peek_first_line(path).unwrap_or_default();
     let session_id = driver.peek_session_id(path, &first_line);
-    let last_ts = session_id.as_ref().and_then(|_| driver.peek_last_ts(path));
+    let watermark = if session_id.is_some() {
+        driver.peek_watermark(path)
+    } else {
+        // No readable session id: the stored side can't be looked up, so a
+        // watermark would be unusable - re-read (and let a deliberately
+        // id-less file keep surfacing its `unsupported_reason` every sync).
+        SourceWatermark::Opaque
+    };
     FileHead {
         path: path.to_owned(),
         session_id,
-        last_ts,
+        watermark,
     }
 }
 
 /// First non-empty line of `path`, read bounded so a pathological first line
 /// cannot blow up the cheap freshness peek. Any io error yields `None`.
-fn peek_first_line(path: &Path) -> Option<String> {
+pub(crate) fn peek_first_line(path: &Path) -> Option<String> {
     let mut reader = BufReader::new(std::fs::File::open(path).ok()?);
     loop {
         let mut buf = Vec::new();
@@ -832,8 +862,8 @@ mod tests {
         fn peek_session_id(&self, path: &Path, _first_line: &str) -> Option<String> {
             Some(path.file_stem()?.to_str()?.to_owned())
         }
-        fn peek_last_ts(&self, _path: &Path) -> Option<i64> {
-            Some(1)
+        fn peek_watermark(&self, _path: &Path) -> SourceWatermark {
+            SourceWatermark::At(1)
         }
         fn session(&self, _path: &Path, _rows: &[BoundedRow]) -> Result<Session, AdapterError> {
             unreachable!("collect_heads never builds sessions")
@@ -866,7 +896,7 @@ mod tests {
         assert!(
             heads
                 .iter()
-                .all(|head| head.session_id.is_some() && head.last_ts == Some(1)),
+                .all(|head| head.session_id.is_some() && head.watermark == SourceWatermark::At(1)),
             "the peeked fields must survive the parallel fan-out",
         );
     }

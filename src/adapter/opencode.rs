@@ -105,6 +105,46 @@ impl Adapter for OpencodeAdapter {
         })
     }
 
+    fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> super::PlanFuture<'a> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            // The events_with freshness pre-pass run standalone: the same
+            // per-session subtree walk sync's gate pays every run, classified
+            // instead of read. On an empty oracle the walks are skipped - a
+            // first sync reads everything. A message-less session stays Opaque
+            // (never Empty): reading it still ingests its Session row.
+            let peek = !oracle.is_empty();
+            let heads = tokio::task::spawn_blocking(move || {
+                collect_session_files(&root)?
+                    .into_iter()
+                    .map(|file| {
+                        let watermark = if peek {
+                            let walk = walk_session_subtree(&root, &file.path, &file.session_id)?;
+                            match newest_message_ts(&walk) {
+                                Some(ts) => super::SourceWatermark::At(ts),
+                                None => super::SourceWatermark::Opaque,
+                            }
+                        } else {
+                            super::SourceWatermark::Opaque
+                        };
+                        Ok((file.session_id, watermark))
+                    })
+                    .collect::<Result<Vec<_>, AdapterError>>()
+            })
+            .await
+            .map_err(join_error)??;
+            if !peek {
+                return Ok(Some(super::SyncPlan::all_pending(heads.len())));
+            }
+            Ok(Some(super::SyncPlan::from_heads(
+                oracle,
+                heads
+                    .iter()
+                    .map(|(session_id, watermark)| (Some(session_id.as_str()), *watermark)),
+            )))
+        })
+    }
+
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let adapter = self.clone();
         Box::pin(stream! {
@@ -1032,6 +1072,71 @@ mod tests {
             std::path::Path::new(FIXTURES),
         )
         .await
+    }
+
+    /// `plan` is the events_with freshness pre-pass run standalone and MUST
+    /// agree with it: the sessions plan calls fresh are exactly the sessions
+    /// the gate skips. A message-less session stays pending (never Empty) -
+    /// reading it still ingests its Session row, so the gate must keep
+    /// re-reading it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
+        use tokio_stream::StreamExt;
+
+        let temp = TempDir::new()?;
+        let source = temp.path().join("storage");
+        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        let empty_dir = source.join("session").join("proj-empty");
+        std::fs::create_dir_all(&empty_dir)?;
+        std::fs::write(
+            empty_dir.join("ses_zzzzemptysession00000000.json"),
+            "{\"id\":\"ses_zzzzemptysession00000000\",\"projectID\":\"proj-empty\",\
+             \"directory\":\"/tmp/pond-test\",\"time\":{\"created\":1759859990000}}",
+        )?;
+
+        let adapter = OpencodeAdapter::new(&source);
+        let first_sync = adapter
+            .plan(&crate::adapter::NoopOracle)
+            .await?
+            .expect("opencode supports plan");
+        assert!(first_sync.sessions > 1);
+        assert_eq!(first_sync.pending, first_sync.sessions);
+        assert_eq!(first_sync.fresh, 0);
+
+        struct MaxWatermarkOracle;
+        impl crate::adapter::SkipOracle for MaxWatermarkOracle {
+            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+                Some(i64::MAX)
+            }
+        }
+        let plan = adapter
+            .plan(&MaxWatermarkOracle)
+            .await?
+            .expect("opencode supports plan");
+        assert_eq!(plan.sessions, first_sync.sessions);
+        assert_eq!(
+            plan.pending, 1,
+            "the message-less session must stay pending - its Session row only \
+             lands by reading it",
+        );
+
+        let mut gate_fresh = 0usize;
+        let mut stream = adapter.events_with(&MaxWatermarkOracle);
+        while let Some(item) = stream.next().await {
+            match item? {
+                AdapterYield::Skipped {
+                    reason: SkipReason::Fresh,
+                    ..
+                } => gate_fresh += 1,
+                AdapterYield::SkippedBatch {
+                    reason: SkipReason::Fresh,
+                    count,
+                } => gate_fresh += count,
+                _ => {}
+            }
+        }
+        assert_eq!(gate_fresh, plan.fresh, "plan and gate must agree");
+        Ok(())
     }
 
     /// `append_fresh_opencode_turn` writes its message at this `time.created`

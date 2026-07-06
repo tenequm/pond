@@ -3499,19 +3499,19 @@ async fn run_sync_dry_run(
         })?;
         let opened = factory.open(blob)?;
         let plan = opened.plan(oracle).await?;
-        let sources = match &plan {
-            Some(plan) => plan.sources,
+        let sessions = match &plan {
+            Some(plan) => plan.sessions,
             None => opened.discover().await?,
         };
-        rows.push((name, sources, plan));
+        rows.push((name, sessions, plan));
     }
     if json {
         let adapters: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, sources, plan)| {
+            .map(|(name, sessions, plan)| {
                 serde_json::json!({
                     "name": name,
-                    "sources": sources,
+                    "sessions": sessions,
                     "fresh": plan.map(|plan| plan.fresh),
                     "pending": plan.map(|plan| plan.pending),
                 })
@@ -3524,20 +3524,23 @@ async fn run_sync_dry_run(
         return Ok(());
     }
     let label = pond::output::paint("plan", pond::output::dim());
-    for (name, sources, plan) in &rows {
+    for (name, sessions, plan) in &rows {
         let detail = match plan {
             Some(plan) if plan.pending == 0 => {
-                format!("{} sources - up to date", format_thousands(*sources as u64))
+                format!(
+                    "{} sessions - up to date",
+                    format_thousands(*sessions as u64)
+                )
             }
             Some(plan) => format!(
-                "{} sources - {} to sync, {} fresh",
-                format_thousands(*sources as u64),
+                "{} sessions - {} to sync, {} fresh",
+                format_thousands(*sessions as u64),
                 format_thousands(plan.pending as u64),
                 format_thousands(plan.fresh as u64),
             ),
             None => format!(
-                "{} sources (pending unknown - this adapter has no cheap freshness preview)",
-                format_thousands(*sources as u64),
+                "{} sessions (pending unknown - this adapter has no cheap freshness preview)",
+                format_thousands(*sessions as u64),
             ),
         };
         output(&format!("{label}      {name:<12} {detail}"))?;
@@ -4862,7 +4865,7 @@ fn status_json(
         .map(|adapter| {
             serde_json::json!({
                 "name": adapter.name,
-                "sources": adapter.sources,
+                "sessions": adapter.sessions,
                 "fresh": adapter.plan.map(|plan| plan.fresh),
                 "pending": adapter.plan.map(|plan| plan.pending),
             })
@@ -5076,7 +5079,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
 /// locally cached freshness map (see [`local_status`]).
 struct LocalAdapterStatus {
     name: String,
-    sources: Option<usize>,
+    sessions: Option<usize>,
     plan: Option<pond::adapter::SyncPlan>,
 }
 
@@ -5123,7 +5126,7 @@ async fn local_status(
         let Ok(opened) = factory.open(blob) else {
             adapters.push(LocalAdapterStatus {
                 name,
-                sources: None,
+                sessions: None,
                 plan: None,
             });
             continue;
@@ -5133,13 +5136,13 @@ async fn local_status(
         } else {
             None
         };
-        let sources = match &plan {
-            Some(plan) => Some(plan.sources),
+        let sessions = match &plan {
+            Some(plan) => Some(plan.sessions),
             None => opened.discover().await.ok(),
         };
         adapters.push(LocalAdapterStatus {
             name,
-            sources,
+            sessions,
             plan,
         });
     }
@@ -5168,7 +5171,7 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
         output(&format!("{}      {hostname}", paint("host", dim())))?;
     }
     // Pad the name column to the longest adapter name: a fixed width fused
-    // long names with their counts ("claude-desktop-app11 sources").
+    // long names with their counts ("claude-desktop-app11 sessions").
     let name_width = local
         .adapters
         .iter()
@@ -5182,7 +5185,7 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
         } else {
             "          ".to_owned()
         };
-        let detail = match (adapter.sources, &adapter.plan) {
+        let detail = match (adapter.sessions, &adapter.plan) {
             (None, _) => paint(
                 &format!(
                     "source path unreadable - check [adapters.{}] in config",
@@ -5190,25 +5193,25 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
                 ),
                 red(),
             ),
-            (Some(sources), Some(plan)) if plan.pending == 0 => format!(
-                "{} sources - {}",
-                format_thousands(sources as u64),
+            (Some(sessions), Some(plan)) if plan.pending == 0 => format!(
+                "{} sessions - {}",
+                format_thousands(sessions as u64),
                 paint("up to date", green()),
             ),
-            (Some(sources), Some(plan)) => format!(
-                "{} sources - {}",
-                format_thousands(sources as u64),
+            (Some(sessions), Some(plan)) => format!(
+                "{} sessions - {}",
+                format_thousands(sessions as u64),
                 paint(
                     &format!("{} pending sync", format_thousands(plan.pending as u64)),
                     pond::output::yellow(),
                 ),
             ),
-            (Some(sources), None) if local.pending_known => format!(
-                "{} sources {}",
-                format_thousands(sources as u64),
+            (Some(sessions), None) if local.pending_known => format!(
+                "{} sessions {}",
+                format_thousands(sessions as u64),
                 paint("(pending unknown - no cheap freshness preview)", dim()),
             ),
-            (Some(sources), None) => format!("{} sources", format_thousands(sources as u64)),
+            (Some(sessions), None) => format!("{} sessions", format_thousands(sessions as u64)),
         };
         output(&format!(
             "{label}{:<name_width$}{detail}",

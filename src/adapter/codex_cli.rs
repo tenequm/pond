@@ -31,7 +31,10 @@ use super::{
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
     extracted_text,
-    jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_mapped},
+    jsonl::{
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_first_line,
+        peek_last_mapped,
+    },
     jsonl_bytes, part_id, part_ordinal, raw_record,
 };
 
@@ -275,16 +278,14 @@ impl JsonlTree for CodexCliAdapter {
         }
     }
 
-    fn peek_last_ts(&self, path: &Path) -> Option<i64> {
+    fn peek_watermark(&self, path: &Path) -> crate::adapter::SourceWatermark {
         // Codex message ids are physical line numbers, not tail-recoverable on a
         // multi-GB rollout, so freshness keys on the watermark timestamp instead.
-        // Pond stores the envelope `timestamp` only for `response_item` rows
-        // (`event_msg`/`turn_context` get the session-start default), so the
-        // session's max stored timestamp is its last response_item's. Scan a
-        // bounded tail backward for it - never the whole file. The nested
+        // The session's max stored timestamp is its last `response_item`'s. Scan
+        // a bounded tail backward for it - never the whole file. The nested
         // `Option` keeps the walk stopping at the newest response_item even
         // when its timestamp fails to parse, exactly like the pre-seam walk.
-        peek_last_mapped(path, |line| {
+        match peek_last_mapped(path, |line| {
             let row: Value = serde_json::from_str(line).ok()?;
             (row.get("type").and_then(Value::as_str) == Some("response_item")).then(|| {
                 let text = row.get("timestamp").and_then(Value::as_str)?;
@@ -292,7 +293,24 @@ impl JsonlTree for CodexCliAdapter {
                     .ok()
                     .map(|ts| ts.with_timezone(&Utc).timestamp_micros())
             })
-        })?
+        }) {
+            Some(Some(ts)) => crate::adapter::SourceWatermark::At(ts),
+            // The newest response_item exists but its timestamp is unreadable:
+            // re-read, exactly as before.
+            Some(None) => crate::adapter::SourceWatermark::Opaque,
+            // No response_item in the scan (a legacy rollout, or a session with
+            // no completed turn yet). Every message such a rollout stores
+            // carries a timestamp at or after the session-start header (legacy
+            // payload rows and noise carriers default to it; carriers with own
+            // timestamps are later), so the header is a valid source watermark:
+            // the gate skips only when the store already holds this session at
+            // or past session start - i.e. it was ingested. A never-ingested
+            // rollout has no stored watermark and always re-reads.
+            None => match session_start_ts(path) {
+                Some(ts) => crate::adapter::SourceWatermark::At(ts),
+                None => crate::adapter::SourceWatermark::Opaque,
+            },
+        }
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -316,6 +334,32 @@ impl JsonlTree for CodexCliAdapter {
 /// wrapper, so the first row IS the payload.
 fn is_legacy_session_row(row: &Value) -> bool {
     row.get("type").is_none() && row.get("id").is_some()
+}
+
+/// Session-start timestamp (micros) from the rollout's first line, mirroring
+/// `session_from_rows`' anchor: the `session_meta` payload timestamp (envelope
+/// timestamp as fallback) or a legacy bare header's own. `None` for anything
+/// that is not a recognizable session header.
+fn session_start_ts(path: &Path) -> Option<i64> {
+    let line = peek_first_line(path)?;
+    let row: Value = serde_json::from_str(&line).ok()?;
+    let payload = if row.get("type").and_then(Value::as_str) == Some("session_meta") {
+        row.get("payload").unwrap_or(&Value::Null)
+    } else if is_legacy_session_row(&row) {
+        &row
+    } else {
+        return None;
+    };
+    let text = payload
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .or_else(|| row.get("timestamp").and_then(Value::as_str))?;
+    Some(
+        DateTime::parse_from_rfc3339(text)
+            .ok()?
+            .with_timezone(&Utc)
+            .timestamp_micros(),
+    )
 }
 
 fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -906,13 +950,13 @@ mod tests {
         )
     }
 
-    /// `peek_last_ts` is the freshness watermark for multi-GB rollouts where the
-    /// line-numbered message id is not tail-recoverable. It must read the last
-    /// `response_item`'s envelope timestamp - pond's stored max - and ignore the
-    /// trailing `event_msg` noise (whose stored timestamp is the session default),
-    /// scanning only the file tail.
+    /// `peek_watermark` is the freshness watermark for multi-GB rollouts where
+    /// the line-numbered message id is not tail-recoverable. It must read the
+    /// last `response_item`'s envelope timestamp - pond's stored max - and
+    /// ignore the trailing `event_msg` noise (whose stored timestamp is the
+    /// session default), scanning only the file tail.
     #[test]
-    fn peek_last_ts_targets_last_response_item_ignoring_trailing_event_msg() {
+    fn peek_watermark_targets_last_response_item_ignoring_trailing_event_msg() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let lines = [
@@ -930,7 +974,37 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc)
             .timestamp_micros();
-        assert_eq!(adapter.peek_last_ts(&path), Some(expected));
+        assert_eq!(
+            adapter.peek_watermark(&path),
+            crate::adapter::SourceWatermark::At(expected)
+        );
+    }
+
+    /// A rollout with no `response_item` at all (legacy data rows only, or a
+    /// session with no completed turn) keys freshness on the session-start
+    /// header: pond stores all such rows at or after that timestamp, so a
+    /// stored watermark at/past it proves the file was ingested. A
+    /// never-ingested file has no stored watermark and still re-reads.
+    #[test]
+    fn peek_watermark_falls_back_to_session_start_without_response_items() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-legacy.jsonl");
+        let lines = [
+            r#"{"id":"sess-legacy","timestamp":"2025-09-10T12:48:29.371Z","git":{},"instructions":null}"#,
+            r#"{"record_type":"state"}"#,
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let adapter = CodexCliAdapter::new(dir.path());
+        let expected = DateTime::parse_from_rfc3339("2025-09-10T12:48:29.371Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .timestamp_micros();
+        assert_eq!(
+            adapter.peek_watermark(&path),
+            crate::adapter::SourceWatermark::At(expected)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
