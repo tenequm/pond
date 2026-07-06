@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.1](https://github.com/tenequm/pond/compare/v0.12.0...v0.12.1) - 2026-07-06
+
+Sync status now reports genuine work only, and forked subagent transcripts are no longer silently dropped. Verified end to end against the full real corpus (11k+ sessions / 1.8M messages) on both a local store and the S3 backend: ingestion is byte-identical to v0.12.0 except for the recovered data.
+
+### <!-- 1 -->🎉 New Features
+- **status:** pending preview for claude-desktop-app and opencode ([fa41ddf](https://github.com/tenequm/pond/commit/fa41ddf3346b962e4db1ee7b3ee23e46787e5098)) - these adapters now report an accurate per-session pending count instead of "pending unknown".
+
+### <!-- 2 -->🐛 Bug Fixes
+- **sync:** stop reporting provably-synced or empty sessions as pending ([6a05cd1](https://github.com/tenequm/pond/commit/6a05cd17f0869967d149df42f0b4b961b3d3c0ee)) - a source whose stored watermark already covers it (or that a bounded whole-source scan proves holds nothing ingestible) no longer counts as pending, so a clean store reports "up to date" instead of a permanent phantom floor (real corpus: claude-code 43 -> 0 false pending, codex-cli 4 -> 0). Skip signals derive only from stored data; anything the gate cannot cheaply classify still re-reads.
+- **claude-code:** ingest forked subagent transcripts ([06a2d27](https://github.com/tenequm/pond/commit/06a2d2725ede538d5016dcae4a6af178fd636e48)) - a `/fork` subagent transcript (Claude Code >= 2.1.117) opens with a `fork-context-ref` header row that carries no `sessionId`, which the adapter rejected as "line 1 missing sessionId" - silently dropping the entire forked conversation. The id is now taken from the first row that carries one (subagents derive it from the path regardless), recovering the full transcript with lossless native restore. Real corpus: 1 of 7,843 subagent transcripts affected, recovered as 16 messages, every other row byte-identical.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.12.0...v0.12.1
+
 ## [0.12.0](https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0) - 2026-07-03
 
 Onboarding and multi-machine sync: a first run no longer looks like it hangs, the scheduled sync no longer races a manual one, and `pond status` finally reports this host's own relationship to the store. Verified end to end on a fresh install (macOS and Linux) plus cold-context first-run testing.
