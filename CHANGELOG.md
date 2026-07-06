@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.12.1](https://github.com/tenequm/pond/compare/v0.12.0...v0.12.1) - 2026-07-06
+
+### <!-- 1 -->🎉 New Features
+- **status:** pending preview for claude-desktop-app and opencode ([fa41ddf](https://github.com/tenequm/pond/commit/fa41ddf3346b962e4db1ee7b3ee23e46787e5098))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **claude-code:** ingest forked subagent transcripts ([06a2d27](https://github.com/tenequm/pond/commit/06a2d2725ede538d5016dcae4a6af178fd636e48))
+- **sync:** stop reporting provably-synced or empty sessions as pending ([6a05cd1](https://github.com/tenequm/pond/commit/6a05cd17f0869967d149df42f0b4b961b3d3c0ee))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.12.0...v0.12.1
+
 ## [0.12.0](https://github.com/tenequm/pond/compare/v0.11.2...v0.12.0) - 2026-07-03
 
 Onboarding and multi-machine sync: a first run no longer looks like it hangs, the scheduled sync no longer races a manual one, and `pond status` finally reports this host's own relationship to the store. Verified end to end on a fresh install (macOS and Linux) plus cold-context first-run testing.
