@@ -519,20 +519,19 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
         .first()
         .ok_or_else(|| AdapterError::schema(NAME, path_display.clone(), "empty jsonl session"))?;
     let at_first = format!("{path_display}:{}", first.line);
-    let raw_session_id = first
-        .value
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            AdapterError::schema(
-                NAME,
-                at_first.clone(),
-                format!("line {} missing sessionId", first.line),
-            )
-        })?
-        .to_owned();
+    // A forked subagent transcript (Claude Code >= 2.1.117 `/fork`) opens with a
+    // `fork-context-ref` header row that carries no `sessionId` - the id first
+    // appears on the following message row. Scan for it rather than demanding it
+    // on record 0, or the whole transcript is dropped
+    // (spec.md#adapter-integrity-no-silent-drops). A subagent derives its id from
+    // the path regardless, so it tolerates the id being absent entirely; only a
+    // top-level session (below) genuinely requires one.
+    let raw_session_id = rows
+        .iter()
+        .find_map(|row| row.value.get("sessionId").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
     let created_at = created_at.ok_or_else(|| {
-        AdapterError::schema(NAME, at_first, "session has no parseable timestamp")
+        AdapterError::schema(NAME, at_first.clone(), "session has no parseable timestamp")
     })?;
 
     // Subagent detection. Claude Code stores each subagent's transcript under
@@ -572,7 +571,18 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
             });
             (child_id, Some(parent_uuid), agent_label, Some(metadata))
         }
-        None => (raw_session_id, None, "claude-code".to_owned(), None),
+        None => {
+            // A top-level session has no path-derived id, so it genuinely
+            // requires a `sessionId` somewhere in the file.
+            let id = raw_session_id.ok_or_else(|| {
+                AdapterError::schema(
+                    NAME,
+                    at_first,
+                    format!("line {} missing sessionId", first.line),
+                )
+            })?;
+            (id, None, "claude-code".to_owned(), None)
+        }
     };
 
     let project = match project {
@@ -1563,6 +1573,125 @@ mod tests {
         assert_eq!(
             subagent_meta["meta"]["description"],
             serde_json::json!("do a thing")
+        );
+        Ok(())
+    }
+
+    /// A forked subagent transcript (Claude Code >= 2.1.117 `/fork`) opens with
+    /// a `fork-context-ref` header row that carries no `sessionId`; the id first
+    /// appears on the following message row. The whole transcript must still
+    /// ingest - id derived from the path, header preserved as a System message,
+    /// the conversation turns landing as their own messages - not be dropped as
+    /// "line 1 missing sessionId" (that pre-fix drop silently lost every forked
+    /// subagent's conversation). Fails on `main`; passes with the fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_subagent_transcript_ingests_despite_headerless_first_row() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "33333333-3333-3333-3333-333333333333";
+        let agent_hash = "afork0001";
+        std::fs::create_dir_all(project_dir.join(parent_uuid).join("subagents"))?;
+
+        // Parent anchor.
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "timestamp": "2026-06-10T00:00:00.000Z",
+            "version": "2.1.170",
+            "message": {"role": "user", "content": "hi parent"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+
+        // Fork transcript: a `fork-context-ref` header (NO sessionId, NO
+        // timestamp) followed by the inherited-context conversation turns.
+        let header = serde_json::json!({
+            "type": "fork-context-ref",
+            "agentId": agent_hash,
+            "parentSessionId": parent_uuid,
+            "parentLastUuid": "u-parent-1",
+            "contextLength": 74,
+        });
+        let user_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-fork-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "isSidechain": true,
+            "agentId": agent_hash,
+            "timestamp": "2026-06-10T00:01:00.000Z",
+            "version": "2.1.170",
+            "message": {"role": "user", "content": "do the fork task"},
+        });
+        let assistant_row = serde_json::json!({
+            "type": "assistant",
+            "uuid": "a-fork-1",
+            "sessionId": parent_uuid,
+            "cwd": "/tmp/pond-test",
+            "isSidechain": true,
+            "agentId": agent_hash,
+            "timestamp": "2026-06-10T00:01:05.000Z",
+            "version": "2.1.170",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        });
+        std::fs::write(
+            project_dir
+                .join(parent_uuid)
+                .join("subagents")
+                .join(format!("agent-{agent_hash}.jsonl")),
+            format!("{header}\n{user_row}\n{assistant_row}\n"),
+        )?;
+        std::fs::write(
+            project_dir
+                .join(parent_uuid)
+                .join("subagents")
+                .join(format!("agent-{agent_hash}.meta.json")),
+            r#"{"agentType":"fork","description":"do the fork task"}"#,
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            summary.dropped_sessions, 0,
+            "fork transcript must ingest, not drop on the headerless first row"
+        );
+
+        let child_id = format!("{parent_uuid}/agent-{agent_hash}");
+        let child = store
+            .get_session(&child_id)
+            .await?
+            .expect("forked subagent must surface under the path-derived child id");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(parent_uuid),
+            "fork must link back to its parent",
+        );
+        assert_eq!(
+            child.session.source_agent, "claude-code/fork",
+            "agent_type `fork` from .meta.json should suffix the source_agent label",
+        );
+        // The inherited-context conversation must survive - this is the data the
+        // pre-fix drop was losing.
+        assert!(
+            child
+                .messages
+                .iter()
+                .any(|m| matches!(m.message, Message::User { .. })),
+            "the fork's user turn must persist",
+        );
+        assert!(
+            child
+                .messages
+                .iter()
+                .any(|m| matches!(m.message, Message::Assistant { .. })),
+            "the fork's assistant turn must persist",
         );
         Ok(())
     }
