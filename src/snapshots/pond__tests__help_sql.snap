@@ -1,6 +1,5 @@
 ---
 source: src/main.rs
-assertion_line: 4791
 expression: sub.render_long_help().to_string()
 ---
 Run one read-only SQL query over the corpus.
@@ -27,6 +26,11 @@ Options:
 
   -o, --output-file <OUTPUT_FILE>
           Write the export bytes here instead of stdout (required for `--format parquet`; optional for ndjson). Ignored for text
+
+      --timeout <TIMEOUT>
+          Per-query timeout in seconds. Default 30, max 600 - raise it for a genuinely long-running query (e.g. a large remote-store scan)
+          
+          [default: 30]
 
   -h, --help
           Print help (see a summary with '-h')

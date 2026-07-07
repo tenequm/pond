@@ -578,6 +578,10 @@ enum Command {
         /// `--format parquet`; optional for ndjson). Ignored for text.
         #[arg(long, short = 'o')]
         output_file: Option<PathBuf>,
+        /// Per-query timeout in seconds. Default 30, max 600 - raise it for a
+        /// genuinely long-running query (e.g. a large remote-store scan).
+        #[arg(long, default_value_t = pond::sql::DEFAULT_QUERY_TIMEOUT_SECS)]
+        timeout: u64,
     },
     /// Run the HTTP API server (or MCP over stdio with --transport stdio).
     ///
@@ -1468,6 +1472,7 @@ async fn main() -> anyhow::Result<()> {
             format,
             limit,
             output_file,
+            timeout,
         } => {
             if matches!(format, CliSqlFormat::Parquet) && output_file.is_none() {
                 bail!(
@@ -1510,7 +1515,7 @@ async fn main() -> anyhow::Result<()> {
                 messages,
                 parts,
             };
-            match pond::sql::run(&tables, &sql, mode, inline_rows).await {
+            match pond::sql::run(&tables, &sql, mode, inline_rows, Some(timeout)).await {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
                 }
@@ -1567,9 +1572,14 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
     // the check/probe error. Silencing both keeps the storage probe's spinner
     // (and the init wizard) from being corrupted mid-render; `RUST_LOG`
     // (which replaces this whole filter) still opts back in.
+    //
+    // Lance v8 WARNs on every COUNT over a stable-row-id dataset (all pond
+    // tables) that count_pushdown fell back to a scan - a known, unactionable
+    // consequence of the pin, fixed upstream in v9 (lance PR #7360); drop the
+    // directive at the v9 bump.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error"
+            "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error,lance::io::exec::count_pushdown=error"
         ))
     });
     // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)

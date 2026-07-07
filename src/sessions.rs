@@ -440,13 +440,20 @@ impl Store {
         let messages_dataset =
             open_archive_table(Table::Messages, &source.join("messages.lance")).await?;
         let parts_dataset = open_archive_table(Table::Parts, &source.join("parts.lance")).await?;
+        // Validate every table's schema before importing any: a
+        // mixed-compatibility archive must fail whole, not half-restore.
+        let sessions_upgrade = archive_schema_backfill(&sessions_dataset, Table::Sessions)?;
+        let messages_upgrade = archive_schema_backfill(&messages_dataset, Table::Messages)?;
+        let parts_upgrade = archive_schema_backfill(&parts_dataset, Table::Parts)?;
         let (sessions, sessions_inserted) = self
-            .import_clean_table(Table::Sessions, sessions_dataset)
+            .import_clean_table(Table::Sessions, sessions_dataset, sessions_upgrade)
             .await?;
         let (messages, messages_inserted) = self
-            .import_clean_table(Table::Messages, messages_dataset)
+            .import_clean_table(Table::Messages, messages_dataset, messages_upgrade)
             .await?;
-        let (parts, parts_inserted) = self.import_clean_table(Table::Parts, parts_dataset).await?;
+        let (parts, parts_inserted) = self
+            .import_clean_table(Table::Parts, parts_dataset, parts_upgrade)
+            .await?;
         Ok(LanceArchiveImport {
             rows: LanceArchiveCounts {
                 sessions,
@@ -508,12 +515,21 @@ impl Store {
         Ok((rows, source_version))
     }
 
-    async fn import_clean_table(&self, table: Table, dataset: Dataset) -> Result<(usize, usize)> {
+    /// `upgrade` carries the batch-level backfill for a pre-upgrade archive:
+    /// an archive is a snapshot, so restore MUST NOT mutate it in place - the
+    /// missing cells derive at the read boundary through the same recipe the
+    /// store migration uses.
+    async fn import_clean_table(
+        &self,
+        table: Table,
+        dataset: Dataset,
+        upgrade: Option<ColumnBackfill>,
+    ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front: an empty
         // archive table yields zero batches, so merge_insert alone would
         // leave a lazily-created table (sessions or parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
-        self.merge_scanner(table, dataset.scan(), "archive import")
+        self.merge_scanner(table, dataset.scan(), "archive import", upgrade)
             .await
     }
 
@@ -527,6 +543,7 @@ impl Store {
         table: Table,
         mut scanner: lance::dataset::scanner::Scanner,
         context: &'static str,
+        upgrade: Option<ColumnBackfill>,
     ) -> Result<(usize, usize)> {
         scanner.blob_handling(lance::datatypes::BlobHandling::AllBinary);
         let mut stream = scanner
@@ -538,6 +555,10 @@ impl Store {
         while let Some(batch) = stream.next().await {
             let batch = batch
                 .with_context(|| format!("failed to read {} {context} batch", table.as_str()))?;
+            let batch = match &upgrade {
+                Some(spec) => upgraded_batch(&batch, spec)?,
+                None => batch,
+            };
             let row_count = batch.num_rows();
             rows += row_count;
             let stats = self
@@ -4534,7 +4555,10 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
 ];
 
 /// Scalar indexes on `parts`: `(session_id, message_id)` is the hot-path lookup key for
-/// `parts_for_messages` (hydration on every `get` and grouped search).
+/// `parts_for_messages` (hydration on every `get` and grouped search). `tool_name`
+/// serves the #89 analytics filters; BTree, not Bitmap, despite the categorical
+/// shape - prefix LIKE (`tool_name LIKE 'mcp__%'`) errors on bitmap indexes
+/// (same upstream limitation documented for `messages.source_agent`).
 const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
@@ -4545,6 +4569,11 @@ const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         "message_id",
         BuiltinIndexType::BTree,
         "parts_message_id_btree",
+    ),
+    (
+        "tool_name",
+        BuiltinIndexType::BTree,
+        "parts_tool_name_btree",
     ),
 ];
 
@@ -4749,29 +4778,78 @@ fn export_schema(table: Table) -> Arc<Schema> {
     }
 }
 
-fn ensure_schema_matches_archive(dataset: &Dataset, table: Table) -> Result<()> {
+/// Decide how an archive table's schema relates to this build's: identical ->
+/// import verbatim (`None`); missing exactly a derivable set of nullable
+/// columns (the archive predates an additive schema change) -> the recipe to
+/// derive them per batch; anything else -> a hard error naming the version fix.
+fn archive_schema_backfill(dataset: &Dataset, table: Table) -> Result<Option<ColumnBackfill>> {
+    use std::collections::BTreeSet;
     let expected = export_schema(table);
     let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
-    let actual_names: Vec<_> = actual.fields().iter().map(|field| field.name()).collect();
-    let expected_names: Vec<_> = expected.fields().iter().map(|field| field.name()).collect();
-    if actual_names != expected_names {
+    let actual_names: BTreeSet<&str> = actual.fields().iter().map(|f| f.name().as_str()).collect();
+    let expected_names: BTreeSet<&str> = expected
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let extra: Vec<&str> = actual_names.difference(&expected_names).copied().collect();
+    if !extra.is_empty() {
         anyhow::bail!(
-            "{} archive table has columns {actual_names:?} but this pond build expects {expected_names:?}",
+            "{} archive table has columns {actual_names:?} but this pond build expects \
+             {expected_names:?} - the archive was written by a newer pond; upgrade pond \
+             to restore it",
             table.as_str(),
         );
     }
-    Ok(())
+    let missing: Vec<Field> = expected
+        .fields()
+        .iter()
+        .filter(|f| !actual_names.contains(f.name().as_str()))
+        .map(|f| f.as_ref().clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    column_backfill(table.as_str(), &missing)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "{} archive predates a schema change this pond build cannot bridge; \
+                 restore it with the pond version that wrote it",
+                table.as_str(),
+            )
+        })
+}
+
+/// Extend an older-schema `batch` with the cells `spec` derives from it. The
+/// derived columns append after the scanned ones as-is: a scan may
+/// auto-convert JSON columns to their Arrow text form, and aligning batch
+/// columns to the stored schema (by name, with that conversion) is the merge
+/// path's job, not this function's.
+fn upgraded_batch(batch: &RecordBatch, spec: &ColumnBackfill) -> Result<RecordBatch> {
+    let derived = (spec.mapper)(batch)?;
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    for (field, column) in spec.output_schema.fields().iter().zip(derived.columns()) {
+        fields.push(field.as_ref().clone());
+        columns.push(column.clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .context("failed to assemble upgraded batch")
 }
 
 async fn open_archive_table(table: Table, source: &Path) -> Result<Dataset> {
     let source_uri = source
         .to_str()
         .with_context(|| format!("archive path is not UTF-8: {}", source.display()))?;
-    let dataset = Dataset::open(source_uri)
+    Dataset::open(source_uri)
         .await
-        .with_context(|| format!("failed to open {} archive table", table.as_str()))?;
-    ensure_schema_matches_archive(&dataset, table)?;
-    Ok(dataset)
+        .with_context(|| format!("failed to open {} archive table", table.as_str()))
 }
 
 /// The composite primary-key columns each table's schema declares
@@ -4833,6 +4911,111 @@ pub(crate) fn message_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Derives one batch of backfill cells from a batch of stored columns.
+pub(crate) type BackfillMapper = Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>;
+
+/// One table's recipe for the additive-schema backfill: which stored columns
+/// to read and how to derive the missing ones. The substrate open path feeds
+/// this to `Dataset::add_columns`, so an existing store upgrades in place -
+/// never by re-ingest, which cannot recover sessions whose sources are gone
+/// (spec.md#session-durable-copy).
+pub(crate) struct ColumnBackfill {
+    pub read_columns: Vec<String>,
+    pub output_schema: Arc<Schema>,
+    pub mapper: BackfillMapper,
+}
+
+/// Build the recipe deriving `missing` for `table_name`, or fail when any of
+/// the columns cannot be derived from stored data.
+pub(crate) fn column_backfill(table_name: &str, missing: &[Field]) -> Result<ColumnBackfill> {
+    match table_name {
+        PARTS => parts_backfill(missing),
+        other => anyhow::bail!(
+            "table {other} is missing columns {:?} that this pond build cannot derive from \
+             stored data - use the pond version that wrote it",
+            missing.iter().map(|f| f.name()).collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
+    for field in missing {
+        anyhow::ensure!(
+            ["tool_name", "call_id", "is_failure"].contains(&field.name().as_str())
+                && field.is_nullable(),
+            "column {PARTS}.{} cannot be derived from stored data - use the pond version \
+             that wrote it",
+            field.name(),
+        );
+    }
+    let output_schema = Arc::new(Schema::new(missing.to_vec()));
+    let schema = output_schema.clone();
+    let mapper = move |batch: &RecordBatch| -> Result<RecordBatch> {
+        let rows = batch.num_rows();
+        let mut names: Vec<Option<String>> = Vec::with_capacity(rows);
+        let mut call_ids: Vec<Option<String>> = Vec::with_capacity(rows);
+        let mut failures: Vec<Option<bool>> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let type_name = string(batch, "type", row)?.context("part type is null")?;
+            // Only tool parts carry identity; skipping the JSONB decode for
+            // text/reasoning rows keeps the backfill pass cheap.
+            let kind = match type_name.as_str() {
+                "tool_call" | "tool_result" | "tool_approval_request" => {
+                    let body =
+                        json_column(batch, "variant_data", row)?.context("variant_data is null")?;
+                    // An undecodable body degrades to NULL cells (spec.md#model-no-synthesis:
+                    // a cell the stored record cannot justify stays NULL) rather than failing
+                    // the migration, which re-runs on every open and would leave the store
+                    // permanently un-openable over one bad row.
+                    match part_kind_from_json(&type_name, &body, None) {
+                        Ok(kind) => Some(kind),
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = string(batch, "session_id", row)?.as_deref(),
+                                part_id = string(batch, "id", row)?.as_deref(),
+                                error = %format!("{error:#}"),
+                                "stored tool part body failed to decode; its backfilled \
+                                 cells stay NULL",
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let (name, call_id, is_failure) = kind
+                .as_ref()
+                .map(tool_identity)
+                .unwrap_or((None, None, None));
+            names.push(name.map(str::to_owned));
+            call_ids.push(call_id.map(str::to_owned));
+            failures.push(is_failure);
+        }
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|field| -> ArrayRef {
+                match field.name().as_str() {
+                    "tool_name" => Arc::new(StringArray::from(names.clone())),
+                    "call_id" => Arc::new(StringArray::from(call_ids.clone())),
+                    _ => Arc::new(BooleanArray::from(failures.clone())),
+                }
+            })
+            .collect();
+        RecordBatch::try_new(schema.clone(), arrays).context("failed to build backfill batch")
+    };
+    Ok(ColumnBackfill {
+        read_columns: vec![
+            "session_id".to_owned(),
+            "id".to_owned(),
+            "type".to_owned(),
+            "variant_data".to_owned(),
+        ],
+        output_schema,
+        mapper: Box::new(mapper),
+    })
+}
+
 pub(crate) fn part_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         primary_field("session_id", DataType::Utf8, false),
@@ -4843,6 +5026,13 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         // spec.md#model-part-provenance: conversation vs harness-injected; search
         // reads this column to exclude injected scaffolding.
         Field::new("provenance", DataType::Utf8, false),
+        // Materialized copies of the tool-part identity fields (#89): analytics
+        // must run on narrow native columns - a JSON getter over `variant_data`
+        // reads the whole multi-GB column, which times out on object stores.
+        // NULL for non-tool parts and absent source fields (spec.md#model-no-synthesis).
+        Field::new("tool_name", DataType::Utf8, true),
+        Field::new("call_id", DataType::Utf8, true),
+        Field::new("is_failure", DataType::Boolean, true),
         json_field("variant_data", false),
         legacy_blob_field("data", true),
         json_field("options", false),
@@ -5281,6 +5471,16 @@ fn parts_chunk(
         .collect();
     let blob_array = LargeBinaryArray::from_iter(blob_payloads);
 
+    let mut tool_names: Vec<Option<&str>> = Vec::with_capacity(parts.len());
+    let mut call_ids: Vec<Option<&str>> = Vec::with_capacity(parts.len());
+    let mut failures: Vec<Option<bool>> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (name, call_id, is_failure) = tool_identity(&part.kind);
+        tool_names.push(name);
+        call_ids.push(call_id);
+        failures.push(is_failure);
+    }
+
     RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -5317,6 +5517,9 @@ fn parts_chunk(
                     .map(|part| part.provenance.as_str())
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(tool_names)),
+            Arc::new(StringArray::from(call_ids)),
+            Arc::new(BooleanArray::from(failures)),
             Arc::new(LargeBinaryArray::from_iter_values(
                 variant_data.iter().map(Vec::as_slice),
             )),
@@ -5602,6 +5805,12 @@ fn legacy_blob_field(name: &str, nullable: bool) -> Field {
     )
 }
 
+// Deliberately NO `lance-encoding:compression` metadata (#89): lance's
+// miniblock zstd compresses tiny chunks independently and cannot reach the
+// cross-row redundancy where the real ratio lives - measured 0% on real
+// corpora vs 4.8-7.4x full-window, while values > 32 KiB are already
+// compressed per-value by default. Tool analytics avoid the fat column via
+// the materialized tool_name/call_id/is_failure columns instead.
 fn json_field(name: &str, nullable: bool) -> Field {
     lance_arrow::json::json_field(name, nullable)
 }
@@ -5625,6 +5834,39 @@ fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 fn json_parse<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
     serde_json::from_slice(value).context("failed to parse JSON field")
+}
+
+/// The materialized `(tool_name, call_id, is_failure)` cells for one part -
+/// shared by the ingest write path and the schema-migration backfill (which
+/// reconstructs the `PartKind` via [`part_kind_from_json`]) so both derive
+/// identical cells. The approval request's `tool_call_id` surfaces under the
+/// one `call_id` column (the same correlation key the call/result pair
+/// carries); absent source fields stay NULL (spec.md#model-no-synthesis).
+fn tool_identity(kind: &PartKind) -> (Option<&str>, Option<&str>, Option<bool>) {
+    match kind {
+        PartKind::ToolCall { name, call_id, .. } => (
+            name.as_deref().map(String::as_str),
+            call_id.as_deref().map(String::as_str),
+            None,
+        ),
+        PartKind::ToolResult {
+            name,
+            call_id,
+            is_failure,
+            ..
+        } => (
+            name.as_deref().map(String::as_str),
+            call_id.as_deref().map(String::as_str),
+            Some(*is_failure),
+        ),
+        PartKind::ToolApprovalRequest { tool_call_id, .. } => {
+            (None, Some(tool_call_id.as_str()), None)
+        }
+        PartKind::Text { .. }
+        | PartKind::Reasoning { .. }
+        | PartKind::File { .. }
+        | PartKind::ToolApprovalResponse { .. } => (None, None, None),
+    }
 }
 
 fn part_variant_json(kind: &PartKind) -> Result<Vec<u8>> {
@@ -5886,6 +6128,96 @@ mod tests {
             injected.is_none(),
             "a message whose only part is injected has null search_text"
         );
+    }
+
+    #[test]
+    fn parts_chunk_materializes_tool_identity_columns() -> anyhow::Result<()> {
+        let part = |ordinal: i32, kind: PartKind| Part {
+            session_id: "s1".to_owned(),
+            id: format!("p{ordinal}"),
+            message_id: "m1".to_owned(),
+            ordinal,
+            provenance: crate::wire::Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind,
+        };
+        let parts = vec![
+            part(
+                0,
+                PartKind::ToolCall {
+                    call_id: Some(Extracted::from_test_value("c1".to_owned())),
+                    name: Some(Extracted::from_test_value("Bash".to_owned())),
+                    params: serde_json::json!({}),
+                    provider_executed: false,
+                },
+            ),
+            part(
+                1,
+                PartKind::ToolResult {
+                    call_id: Some(Extracted::from_test_value("c1".to_owned())),
+                    name: Some(Extracted::from_test_value("Bash".to_owned())),
+                    is_failure: true,
+                    result: serde_json::json!({}),
+                },
+            ),
+            // Absent source fields stay NULL - never a synthesized sentinel.
+            part(
+                2,
+                PartKind::ToolCall {
+                    call_id: None,
+                    name: None,
+                    params: serde_json::json!({}),
+                    provider_executed: false,
+                },
+            ),
+            part(
+                3,
+                PartKind::ToolApprovalRequest {
+                    approval_id: "a1".to_owned(),
+                    tool_call_id: "c1".to_owned(),
+                },
+            ),
+            part(
+                4,
+                PartKind::Text {
+                    text: Some(Extracted::from_test_value("hi".to_owned())),
+                },
+            ),
+        ];
+        let payloads = vec![vec![1u8]; parts.len()];
+        let batch = parts_chunk(&parts, &payloads, &payloads)?;
+
+        let tool_name = |row| string(&batch, "tool_name", row).unwrap();
+        let call_id = |row| string(&batch, "call_id", row).unwrap();
+        let is_failure = batch
+            .column_by_name("is_failure")
+            .expect("is_failure column present")
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("is_failure is boolean");
+
+        assert_eq!(tool_name(0).as_deref(), Some("Bash"));
+        assert_eq!(call_id(0).as_deref(), Some("c1"));
+        assert!(is_failure.is_null(0), "tool_call has no failure flag");
+
+        assert_eq!(tool_name(1).as_deref(), Some("Bash"));
+        assert_eq!(call_id(1).as_deref(), Some("c1"));
+        assert!(is_failure.value(1), "tool_result failure flag materialized");
+
+        assert_eq!(tool_name(2), None, "absent name stays NULL");
+        assert_eq!(call_id(2), None, "absent call_id stays NULL");
+
+        assert_eq!(tool_name(3), None);
+        assert_eq!(
+            call_id(3).as_deref(),
+            Some("c1"),
+            "approval request surfaces its tool_call_id as call_id",
+        );
+
+        assert_eq!(tool_name(4), None);
+        assert_eq!(call_id(4), None);
+        assert!(is_failure.is_null(4));
+        Ok(())
     }
 
     #[test]

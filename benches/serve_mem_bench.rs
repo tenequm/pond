@@ -662,7 +662,7 @@ async fn run_sql_phase(
             messages: Some(store.dataset(Table::Messages).await?),
             parts: Some(store.dataset(Table::Parts).await?),
         };
-        match sql::run(&tables, q, Mode::Inline, sql::DEFAULT_INLINE_ROWS).await {
+        match sql::run(&tables, q, Mode::Inline, sql::DEFAULT_INLINE_ROWS, None).await {
             Ok(_) => {}
             Err(error) => anyhow::bail!("{name}: sql {q:?} failed: {error:?}"),
         }

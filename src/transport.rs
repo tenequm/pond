@@ -288,11 +288,16 @@ NULL, source_agent text, created_at timestamp(us, UTC), project text, options js
 - parts(session_id text, message_id text, id text, ordinal int, type text \
 {text|reasoning|file|tool_call|tool_result|tool_approval_request|\
 tool_approval_response - exact strings, underscores not hyphens}, provenance \
-text {conversational|injected}, variant_data json, options json). The verbatim \
-part body lives in `variant_data`; its fields follow the part type, e.g. \
-tool_call carries {call_id, name, params}, tool_result carries {call_id, name, \
-is_failure, result}, text/reasoning carry {text}. FilePart binary payloads are \
-not exposed in SQL.
+text {conversational|injected}, tool_name text NULL, call_id text NULL, \
+is_failure boolean NULL, variant_data json, options json). `tool_name` / \
+`call_id` / `is_failure` are narrow native columns materialized from the tool \
+part bodies - ALWAYS prefer them over json_get_* on `variant_data` for tool \
+analytics (name filters, GROUP BY, call->result joins, failure rates); they are \
+NULL on non-tool parts (`is_failure` is non-NULL only on tool_result). The \
+verbatim part body lives in `variant_data`; its fields follow the part type, \
+e.g. tool_call carries {call_id, name, params}, tool_result carries {call_id, \
+name, is_failure, result}, text/reasoning carry {text}. FilePart binary \
+payloads are not exposed in SQL.
 Enum literals matter: a wrong value (e.g. 'tool-call') is valid SQL and silently \
 returns zero rows. Discovery from SQL works too: SELECT table_name, column_name, \
 data_type FROM information_schema.columns.
@@ -302,7 +307,7 @@ messages.session_id AND parts.message_id = messages.message_id. Subagents are \
 sessions whose source_agent matches '%/%' (e.g. 'claude-code/general-purpose').
 
 Indexed (fast) filter columns: messages.session_id / source_agent; \
-parts.session_id / message_id; sessions.session_id. \
+parts.session_id / message_id / tool_name; sessions.session_id. \
 Prefer equality/range predicates on these. Known limitation: prefix LIKE ('x%') and starts_with() FAIL \
 on bitmap-indexed columns (messages.source_agent) with \"LIKE \
 prefix queries are not supported for bitmap indexes\". Workarounds: equality, \
@@ -330,18 +335,16 @@ return NULL on a non-coercible value.
 json_get_string(json_get(variant_data, 'params'), 'command').
 - Also: json_array_contains(col, 'key', value), json_array_length(col, 'key').
 
-Worked example - tool usage and failure rates over the last week:
+Worked example - tool usage and failure rates over the last week, entirely on \
+the narrow native columns (no JSON getters):
 
-  SELECT json_get_string(c.variant_data, 'name') AS tool,
+  SELECT c.tool_name AS tool,
          COUNT(*) AS calls,
-         SUM(CASE WHEN json_get_bool(r.variant_data, 'is_failure') THEN 1 \
-ELSE 0 END) AS failures
+         SUM(CASE WHEN r.is_failure THEN 1 ELSE 0 END) AS failures
   FROM parts c
   JOIN messages m ON m.session_id = c.session_id AND m.message_id = c.message_id
   LEFT JOIN parts r ON r.session_id = c.session_id
-   AND r.type = 'tool_result'
-   AND json_get_string(r.variant_data, 'call_id') = \
-json_get_string(c.variant_data, 'call_id')
+   AND r.type = 'tool_result' AND r.call_id = c.call_id
   WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
   GROUP BY tool ORDER BY calls DESC;
 
@@ -572,9 +575,12 @@ Examples (4 patterns the agent should recognize):
         /// embedding_model, options) | sessions(session_id,
         /// parent_session_id, parent_message_id, source_agent, created_at,
         /// project, options) | parts(session_id, message_id, id, ordinal,
-        /// type, provenance, variant_data, options). parts.type enums use
-        /// underscores: 'tool_call', 'tool_result', 'text', 'reasoning',
-        /// 'file'. JSON columns (variant_data, options) are JSONB: read
+        /// type, provenance, tool_name, call_id, is_failure, variant_data,
+        /// options). parts.type enums use underscores: 'tool_call',
+        /// 'tool_result', 'text', 'reasoning', 'file'. Tool analytics: use the
+        /// narrow native columns (tool_name, call_id, is_failure), not
+        /// json_get_* over variant_data. JSON columns (variant_data, options)
+        /// are JSONB: read
         /// fields with json_extract(col, '$.a.b') or json_get_string(col,
         /// 'key', ...), never CAST them. Text search: WHERE
         /// contains_tokens(search_text, 'words') to filter, FROM
@@ -592,6 +598,11 @@ Examples (4 patterns the agent should recognize):
         /// machine-readable JSON output.
         #[serde(default)]
         format: Option<String>,
+        /// Per-query timeout in seconds (default 30, max 600). Raise it for a
+        /// genuinely long-running query (e.g. a large remote-store scan);
+        /// prefer narrower predicates and the indexed/native columns first.
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
     }
 
     fn parse_session_from(value: Option<String>) -> SessionFrom {
@@ -788,14 +799,16 @@ Examples (4 patterns the agent should recognize):
                            (column discovery also works: SELECT column_name FROM \
                            information_schema.columns WHERE table_name = 'messages'). \
                            Routing: metadata analytics -> SQL on messages/sessions; tool-call \
-                           analytics -> parts WHERE type = 'tool_call' with \
-                           json_get_string(variant_data, 'name'); text search -> WHERE \
+                           analytics -> parts WHERE type = 'tool_call' on the narrow native \
+                           columns (tool_name, call_id, is_failure); text search -> WHERE \
                            contains_tokens(search_text, 'words') to filter or FROM \
                            fts('messages', '{...json...}') for BM25-ranked results, or \
                            pond_search for semantic recall; reading a transcript -> pond_get, \
                            not SQL. The embedding `vector` column is never returned (explicit \
                            projection is rejected; filtering in WHERE is fine). Control row \
                            count with SQL `LIMIT`; inline text output is capped at 100 rows. \
+                           Queries are wall-clock-capped at 30s by default; set \
+                           timeout_seconds (max 600) for a genuinely long-running query. \
                            format defaults to text (a row-capped rendered table); set \
                            format=parquet|ndjson to write the full result to a file returned as \
                            a pond-sql-export:// resource (ndjson for machine-readable JSON). \
@@ -860,7 +873,15 @@ Examples (4 patterns the agent should recognize):
                 }
             };
 
-            match sql::run(&tables, &params.query, mode, inline_rows).await {
+            match sql::run(
+                &tables,
+                &params.query,
+                mode,
+                inline_rows,
+                params.timeout_seconds,
+            )
+            .await
+            {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::Export {
                     bytes,

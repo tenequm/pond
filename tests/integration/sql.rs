@@ -578,6 +578,31 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
         "no raw newline inside a row: {text}"
     );
 
+    // 24. Materialized tool columns (#89): tool analytics run on the narrow
+    // native columns - indexed tool_name filter, call_id join, is_failure
+    // aggregate - with no json_get_* over variant_data anywhere in the plan.
+    let result = call(json!({
+        "sql": "SELECT c.tool_name, COUNT(*) AS calls, \
+                       SUM(CASE WHEN r.is_failure THEN 1 ELSE 0 END) AS failures \
+                FROM parts c \
+                LEFT JOIN parts r ON r.session_id = c.session_id \
+                 AND r.type = 'tool_result' AND r.call_id = c.call_id \
+                WHERE c.type = 'tool_call' AND c.tool_name = 'Bash' \
+                GROUP BY c.tool_name"
+    }))
+    .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "native tool-column analytics should work: {result:?}"
+    );
+    let text = first_text(&result).expect("inline result");
+    let squashed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        squashed.contains("| Bash | 1 | 0 |"),
+        "one call joined to its non-failed result: {text}"
+    );
+
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())
