@@ -2,12 +2,12 @@
 let
   inherit (stdenv) hostPlatform;
   inherit (hostPlatform) system;
-  version = "0.12.2";
+  version = "0.13.0";
   base = "https://github.com/tenequm/pond/releases/download/v${version}";
   shaMap = {
-    x86_64-linux = "8199a367d96335b2568dfc3da27d7a5ef5d604657e04908bad23d45cdb5dbf8c";
-    aarch64-linux = "92d9f7df1037fcd5e0ad8646dce0f9210dc93ea89f7f949e5b9688bb40475209";
-    aarch64-darwin = "b3aca6948e76247f1fa9edce2cfa7185d71147fbe10bb434a6aaf5681c2508c4";
+    x86_64-linux = "a322ec66bf7925cd42f9803fc22da334e9bc00d1750128ea12412f0a9f1c85bf";
+    aarch64-linux = "dab643006a089877ce19ac651f45a2a00665e50ae6edb668d04441518de44627";
+    aarch64-darwin = "71fcebbb0b1e51c0e571525a52781082fe85fea8244e582869a72a94886181d4";
   };
   urlMap = {
     x86_64-linux = "${base}/pond-x86_64-unknown-linux-gnu.tar.xz";
@@ -45,7 +45,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Lossless storage and search for sessions from any AI agent client";
+    description = "Lossless storage and hybrid search for sessions from any AI agent client";
     homepage = "https://pond.locker/";
     changelog = "https://github.com/tenequm/pond/releases/tag/v${version}";
     license = lib.licenses.asl20;
