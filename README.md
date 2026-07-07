@@ -9,7 +9,16 @@
 [![docs](https://img.shields.io/badge/docs-pond.locker-blue?style=flat-square)](https://pond.locker/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
 
-Lossless storage and search for AI agent sessions, across every agentic client.
+> "I know we discussed that before. Why can't I find that damn conversation?"
+
+Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
+
+<p align="center">
+  <img src="docs/site/assets/demo-search.gif" alt="Claude Code answering a three-month-old debugging question from pond in seconds" width="900">
+</p>
+<p align="center"><sub>Live search over 12k+ real sessions - a three-month-old fix, found and verified in seconds (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
+
+Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
 **Quickstart.** Install, run guided setup, and ingest your local sessions:
 
@@ -19,23 +28,19 @@ pond init   # guided setup: storage, adapters, MCP registration, optional schedu
 pond sync   # ingest, embed, update indexes - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients; to add it by hand:
+`pond init` registers pond as an MCP server for detected clients (by hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`). Then ask your agent - real prompts from daily use:
 
-```sh
-claude mcp add -s user pond -- pond mcp   # Claude Code
-codex mcp add pond -- pond mcp            # Codex
+```
+check in pond how we solved this before, then apply the same fix here
+```
+```
+where we left off yesterday - check pond, then continue
+```
+```
+are you sure that won't break X? check in pond how we struggled with exactly this
 ```
 
-Pond keeps every AI conversation you've ever had intact and searchable, and lets you continue any of them in any supported tool - your history, your search, your sessions, independent of the agent vendor that made them. It is one Rust binary that ingests sessions from registered agentic-client adapters into a canonical Session / Message / Part interlingua, stores them in Lance on object storage, and serves search over them via HTTP+JSON and MCP. Two deployments: a personal pond on your laptop, or a multi-tenant backend for hosted agent infrastructure. No extra database, no wrapper around Lance.
-
-Current automatically synced agent clients:
-- Claude Code CLI
-- Claude desktop app (local agent mode)
-- Codex CLI
-- opencode CLI
-- pi-coding-agent CLI
-
-You can also import a Claude.ai data export with the `claude-ai-export` adapter - a manual download, so it is not auto-discovered: `pond sync claude-ai-export --path <path>`.
+Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, and **pi-coding-agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
 
