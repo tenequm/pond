@@ -2,8 +2,15 @@
 
 ## [0.13.0](https://github.com/tenequm/pond/compare/v0.12.2...v0.13.0) - 2026-07-07
 
+Tool analytics stop paying the JSON tax: the common query shapes now run on three narrow derived columns instead of the multi-GB `variant_data` blob, turning remote S3 tool GROUP BYs from hard >30s timeouts into ~9s answers (local: 1,693ms -> 48ms, ~35x). Existing stores upgrade themselves in place on first open - no re-ingest, no manual step - but once migrated they are unreadable by older pond binaries, so upgrade every machine that shares a store together.
+
 ### <!-- 0 -->🛠 Breaking Changes
 - **parts:** [**breaking**] materialize tool columns + in-place schema migration; per-query SQL timeout ([#100](https://github.com/tenequm/pond/pull/100)) ([5490122](https://github.com/tenequm/pond/commit/54901228e3f3389ce9494c5d7bda5f213ee559ab))
+  - **What breaks:** the `parts` table gains three derived nullable columns - `tool_name`, `call_id`, `is_failure` - plus a BTree scalar index on `tool_name`. pond <= 0.12.2 enforces strict schema equality, so a store first opened by 0.13.0 becomes **unreadable by older binaries**, and there is no downgrade path once migrated. `variant_data` stays the verbatim source of truth; the new columns are derived from it at write time.
+  - **What upgrading requires:** nothing manual. The first open by a 0.13.0 binary migrates the store in place: a one-time backfill derives the three columns from stored `variant_data` (seconds on a local store; one `add_columns` commit on a remote/S3 store), announced by a single stderr notice. If multiple machines sync into one shared store, upgrade all of them before the first 0.13.0 open - any host still on <= 0.12.2 loses access the moment the store migrates.
+  - Pre-0.13.0 `.pond` archives keep restoring unchanged: the columns are derived at the read boundary and the archive file is never modified.
+  - Also in this change: a per-query SQL timeout - `timeout_seconds` on `pond_sql_query`, `--timeout` on `pond sql` (default 30s, clamp 1..600); the timeout error names the knob and steers toward the native columns.
+  - Measured on the full real corpus (10,840 sessions / 1.81M messages / ~608K tool-call parts) over S3: tool GROUP BY timeout -> 8.5-9.7s, failure-rate self-join timeout -> 23-24s, indexed `tool_name = 'Bash'` point filter 4.7-8.0s. Ingest and read benchmarks unchanged within noise.
 
 ### <!-- 5 -->📚 Documentation
 - update README for clarity and structure, add new sections on usage and maintenance ([8298db5](https://github.com/tenequm/pond/commit/8298db572481320b47075eac7ef2aafc54bb0884))
