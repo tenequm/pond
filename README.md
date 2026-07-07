@@ -20,7 +20,11 @@ Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool
 
 Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
-**Quickstart.** Install, run guided setup, and ingest your local sessions:
+Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
+
+## Quickstart
+
+Install, run guided setup, and ingest your local sessions:
 
 ```sh
 brew install tenequm/tap/pond
@@ -42,9 +46,9 @@ are you sure that won't break X? check in pond how we struggled with exactly thi
 
 Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, and **pi-coding-agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
-**Isn't this another memory tool?** No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories.
+## Isn't this another memory tool?
 
-Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
+No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories.
 
 ## Background
 
@@ -84,6 +88,8 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 
 ## Usage
 
+### Sync and search
+
 Set up storage, adapters, MCP registration, and an optional sync schedule in one pass (idempotent - re-run it any time to repair or update):
 
 ```sh
@@ -97,13 +103,15 @@ pond sync
 pond search "how did we wire up the OCC retry loop"
 ```
 
-Run a server:
+### Run a server
 
 ```sh
 pond serve                         # HTTP on 127.0.0.1:9797
 pond serve --transport stdio       # MCP over stdio
 pond mcp                           # alias for stdio MCP
 ```
+
+### Fetch and copy
 
 Fetch a single session or message, or move a whole corpus:
 
@@ -113,11 +121,15 @@ pond copy --from local --to snapshot.pond
 pond copy --from snapshot.pond --to local
 ```
 
+### Read-only SQL
+
 Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):
 
 ```sh
 pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DESC"
 ```
+
+### Maintenance
 
 Run maintenance on demand (sync already embeds inline and folds indexes every run):
 
@@ -126,6 +138,8 @@ pond optimize --only embed
 pond optimize --only index
 ```
 
+### Scheduled sync
+
 Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
 
 ```sh
@@ -133,6 +147,8 @@ pond schedule start                # every 5m by default (--every 15m|1h|6h|1d)
 pond schedule status
 pond schedule logs
 ```
+
+### Status and introspection
 
 `pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
