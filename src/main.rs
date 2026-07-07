@@ -1572,9 +1572,14 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
     // the check/probe error. Silencing both keeps the storage probe's spinner
     // (and the init wizard) from being corrupted mid-render; `RUST_LOG`
     // (which replaces this whole filter) still opts back in.
+    //
+    // Lance v8 WARNs on every COUNT over a stable-row-id dataset (all pond
+    // tables) that count_pushdown fell back to a scan - a known, unactionable
+    // consequence of the pin, fixed upstream in v9 (lance PR #7360); drop the
+    // directive at the v9 bump.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error"
+            "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error,lance::io::exec::count_pushdown=error"
         ))
     });
     // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)
