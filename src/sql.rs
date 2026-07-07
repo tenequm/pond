@@ -1040,8 +1040,9 @@ fn enrich(message: &str) -> String {
              project, content [system-role only], search_text [the conversational text], \
              embedding_model, options) | sessions(session_id, parent_session_id, \
              parent_message_id, source_agent, created_at, project, options) | \
-             parts(session_id, message_id, id, ordinal, type, provenance, variant_data, \
-             options). Part bodies (tool params/results, text) live in parts.variant_data - \
+             parts(session_id, message_id, id, ordinal, type, provenance, tool_name, \
+             call_id, is_failure, variant_data, options). Part bodies (tool params/results, \
+             text) live in parts.variant_data - \
              read them with json_extract(variant_data, '$.field'). For text search use \
              contains_tokens(search_text, '...') in WHERE, or the fts('messages', ...) \
              table function in FROM for ranked results; to read a transcript use pond_get. \

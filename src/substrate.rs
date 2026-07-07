@@ -3853,11 +3853,11 @@ async fn open_or_create_via_ns(
                     }
                 }
             }
-            let dataset = builder
+            let mut dataset = builder
                 .load()
                 .await
                 .with_context(|| format!("failed to open table {table_name}"))?;
-            ensure_schema_matches(&dataset, schema.as_ref(), table_name)?;
+            ensure_current_schema(&mut dataset, schema.as_ref(), table_name).await?;
             return Ok(dataset);
         }
         Err(error) => match &error {
@@ -3918,49 +3918,185 @@ fn scanner_with_prefilter(
     }
     Ok(scanner)
 }
-fn ensure_schema_matches(
-    dataset: &Dataset,
+/// How the on-disk schema relates to this build's expected schema.
+enum SchemaFit {
+    Match,
+    /// Expected columns absent on disk, every one nullable: the store
+    /// predates an additive schema change and upgrades in place.
+    MissingNullable(Vec<lance::deps::arrow_schema::Field>),
+    /// On-disk columns this build does not know: written by a newer pond.
+    /// Reads proceed (scans project known columns; extra ones are inert);
+    /// writes against the newer schema fail at the Lance layer, and the fix
+    /// is upgrading pond, not editing the store.
+    UnknownExtra(Vec<String>),
+}
+
+fn classify_schema(
+    actual: &lance::deps::arrow_schema::Schema,
     expected: &lance::deps::arrow_schema::Schema,
     table_name: &str,
-) -> Result<()> {
-    use lance::deps::arrow_schema::DataType;
+) -> Result<SchemaFit> {
     use std::collections::BTreeSet;
-    let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
     let actual_names: BTreeSet<&str> = actual.fields().iter().map(|f| f.name().as_str()).collect();
     let expected_names: BTreeSet<&str> = expected
         .fields()
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    if actual_names != expected_names {
-        anyhow::bail!(
+    let missing: Vec<_> = expected
+        .fields()
+        .iter()
+        .filter(|f| !actual_names.contains(f.name().as_str()))
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let extra: Vec<String> = actual_names
+        .difference(&expected_names)
+        .map(|name| (*name).to_owned())
+        .collect();
+    match (missing.is_empty(), extra.is_empty()) {
+        (true, true) => Ok(SchemaFit::Match),
+        (false, true) if missing.iter().all(|f| f.is_nullable()) => {
+            Ok(SchemaFit::MissingNullable(missing))
+        }
+        (true, false) => Ok(SchemaFit::UnknownExtra(extra)),
+        _ => anyhow::bail!(
             "table {table_name} has columns {actual_names:?} but this pond build expects \
-             {expected_names:?} - the on-disk store predates a schema change; delete the \
-             data directory and re-run `pond ingest`",
-        );
+             {expected_names:?}, and the difference is not an additive nullable-column \
+             change this build can migrate - upgrade pond, or restore the store from a \
+             `pond copy` snapshot taken by the version that wrote it",
+        ),
     }
-    // Catch a vector-dim change (configured `[embeddings].dim` differs from
-    // the on-disk vector column width) early with a friendly message. Lance
-    // would otherwise reject the next write with an opaque schema-mismatch
-    // error inside the `merge_update` path.
-    for actual_field in actual.fields() {
-        let Some(expected_field) = expected.field_with_name(actual_field.name()).ok() else {
-            continue;
-        };
-        if let (DataType::FixedSizeList(_, actual_dim), DataType::FixedSizeList(_, expected_dim)) =
-            (actual_field.data_type(), expected_field.data_type())
-            && actual_dim != expected_dim
-        {
-            tracing::warn!(
-                table = table_name,
-                column = actual_field.name(),
-                actual_dim,
-                expected_dim,
-                "embedding dimension differs from config; open proceeds because model swaps are operator-driven",
-            );
+}
+
+/// Open-time schema reconciliation: a store missing this build's known
+/// nullable columns is backfilled IN PLACE via `Dataset::add_columns` - the
+/// values derive from data already stored, so no re-ingest is ever required
+/// (spec.md#session-durable-copy: a rotated source cannot supply rows again).
+/// Concurrent openers race benignly: `add_columns` commits through OCC, a
+/// losing writer sees a conflict, re-checks out latest, and finds the columns
+/// present.
+async fn ensure_current_schema(
+    dataset: &mut Dataset,
+    expected: &lance::deps::arrow_schema::Schema,
+    table_name: &str,
+) -> Result<()> {
+    use lance::deps::arrow_schema::DataType;
+    const MAX_MIGRATION_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_MIGRATION_ATTEMPTS {
+        let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
+        match classify_schema(&actual, expected, table_name)? {
+            SchemaFit::Match => {
+                // Catch a vector-dim change (configured `[embeddings].dim`
+                // differs from the on-disk vector column width) early with a
+                // friendly message. Lance would otherwise reject the next
+                // write with an opaque schema-mismatch error inside the
+                // `merge_update` path.
+                for actual_field in actual.fields() {
+                    let Some(expected_field) = expected.field_with_name(actual_field.name()).ok()
+                    else {
+                        continue;
+                    };
+                    if let (
+                        DataType::FixedSizeList(_, actual_dim),
+                        DataType::FixedSizeList(_, expected_dim),
+                    ) = (actual_field.data_type(), expected_field.data_type())
+                        && actual_dim != expected_dim
+                    {
+                        tracing::warn!(
+                            table = table_name,
+                            column = actual_field.name(),
+                            actual_dim,
+                            expected_dim,
+                            "embedding dimension differs from config; open proceeds because model swaps are operator-driven",
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            SchemaFit::UnknownExtra(extra) => {
+                tracing::warn!(
+                    table = table_name,
+                    ?extra,
+                    "store carries columns unknown to this pond build (written by a newer \
+                     version); reads proceed, writes need the newer pond",
+                );
+                return Ok(());
+            }
+            SchemaFit::MissingNullable(missing) => {
+                backfill_missing_columns(dataset, table_name, missing).await?;
+            }
         }
     }
-    Ok(())
+    anyhow::bail!(
+        "schema migration for table {table_name} did not converge after \
+         {MAX_MIGRATION_ATTEMPTS} attempts (a concurrent writer kept changing \
+         the schema); re-run once the other pond process finishes",
+    )
+}
+
+/// One in-place additive migration pass: derive the missing columns from
+/// stored data and commit them via `add_columns` (new column files only, no
+/// row rewrites). The recipe - which columns to read and how to derive the
+/// values - is consumer knowledge and lives in `sessions::column_backfill`.
+async fn backfill_missing_columns(
+    dataset: &mut Dataset,
+    table_name: &str,
+    missing: Vec<lance::deps::arrow_schema::Field>,
+) -> Result<()> {
+    use lance::dataset::{BatchUDF, NewColumnTransform};
+    let names: Vec<&str> = missing.iter().map(|f| f.name().as_str()).collect();
+    let spec = sessions::column_backfill(table_name, &missing)?;
+    // A full-column read over a remote store runs minutes; a silent stall
+    // reads as a hang, so this one-time event gets a stderr notice (same
+    // pattern as the embedding-model download notice in embed.rs).
+    let _ = crate::output::line_err(&format!(
+        "migrating {table_name}: backfilling {names:?} from stored data (one-time, in place)...",
+    ));
+    let started = std::time::Instant::now();
+    let mapper = spec.mapper;
+    // Boxed: `add_columns`' concrete future is enormous (it embeds DataFusion
+    // planner types), and inlining it here overflows rustc's auto-trait
+    // solver (E0275) once this future nests inside the open chain.
+    let migration: std::pin::Pin<
+        Box<dyn std::future::Future<Output = lance::Result<()>> + Send + '_>,
+    > = Box::pin(dataset.add_columns(
+        NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(move |batch| {
+                mapper(batch).map_err(|error| lance::Error::io(format!("{error:#}")))
+            }),
+            output_schema: spec.output_schema,
+            result_checkpoint: None,
+        }),
+        Some(spec.read_columns),
+        None,
+    ));
+    let result = migration.await;
+    match result {
+        Ok(()) => {
+            let _ = crate::output::line_err(&format!(
+                "migrated {table_name} in {:.1}s",
+                started.elapsed().as_secs_f64(),
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            let error = anyhow::Error::from(error);
+            if is_commit_conflict(&error) {
+                // Another writer migrated (or wrote) concurrently; re-check
+                // out latest and let the caller re-classify.
+                dataset.checkout_latest().await?;
+                Ok(())
+            } else {
+                Err(error).with_context(|| {
+                    format!(
+                        "schema backfill failed for {table_name}; the one-time migration \
+                         writes new column files, so it needs write access to the store - \
+                         re-run any pond command with write-capable credentials to complete it",
+                    )
+                })
+            }
+        }
+    }
 }
 /// Object-store defaults injected for any non-local pond location. Each key
 /// is only set when neither the user-provided key nor its env-var-form alias

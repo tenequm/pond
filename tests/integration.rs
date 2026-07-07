@@ -28,6 +28,8 @@ mod recovery;
 mod remote_backend;
 #[path = "integration/s3_backend.rs"]
 mod s3_backend;
+#[path = "integration/schema_migration.rs"]
+mod schema_migration;
 #[path = "integration/search.rs"]
 mod search;
 #[path = "integration/session_scoped_pk.rs"]

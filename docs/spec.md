@@ -362,7 +362,7 @@ This section is how the canonical model of Section 4 persists on the substrate o
 
 ### 5.1 Three datasets
 
-The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type - no projections, no promotions - except that `messages` additionally carries a message's derived embedding (5.5).
+The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type plus a small, named set of derived storage columns with no canonical counterpart: `messages` carries the message's derived embedding (5.5), and `parts` carries the materialized tool-identity columns (5.6). Nothing else is projected or promoted.
 
 `sessions` - one row per Session:
 
@@ -398,6 +398,9 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `ordinal` | position within the message's content |
 | `type` | the Part discriminator |
 | `provenance` | conversational vs injected (`model-part-provenance`, 4.8); search reads it to exclude injected scaffolding |
+| `tool_name` | derived tool-identity column (5.6); scalar-indexed - tool analytics run on the narrow columns instead of scanning `variant_data` |
+| `call_id` | derived tool-call correlation id (5.6) |
+| `is_failure` | derived ToolResult flag (5.6); non-null only on `tool_result` rows |
 | `variant_data` | JSON (Lance `pa.json_()`, stored as JSONB); the variant-specific fields |
 | `data` | Lance blob; FilePart payload only |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
@@ -425,6 +428,12 @@ A message's embedding has no canonical-type counterpart - it is produced by pond
 **`session-embed-from-canonical`** {#session-embed-from-canonical} - A message's embedding MUST be derived from its stored `search_text`, never from the source record. Why: `search_text` is durable (`session-durable-copy`) and the source is not - deriving from canonical is what lets pond re-embed under a new or changed model at any later time with no source present, making a model change a re-derivation, not a migration.
 
 Re-embedding rewrites only `vector` and `embedding_model`; no canonical column is touched, and each rewrite lands as a new manifest version, not a row mutation (`lance-append-only`). A model swap is a single conditional `merge_update` keyed on `target.embedding_model != source.embedding_model`: stale rows update, up-to-date rows are left alone, and the vector index is dropped before new vectors arrive (centroids belong to one distance space; the next index stage rebuilds it). A same-dimension swap rewrites `vector` in place; a different-dimension swap adds a new column, backfills from `search_text`, drops the old, and renames - all on `messages`, never a new table. Lance's manifest history retains prior vectors, so a regressed swap rolls back without a re-ingest. Section 8 covers how embeddings are produced and queried.
+
+### 5.6 Derived analytics columns and additive schema migration
+
+`parts` carries three nullable columns materialized at ingest from the tool Part bodies: `tool_name`, `call_id` (also carrying the approval request's `tool_call_id` - the same correlation key), and `is_failure` (non-null only on tool results). NULL means the part is not a tool part or the source did not carry the field (`model-no-synthesis`). They exist because analytics must run on narrow native columns: a JSON getter over `variant_data` reads the whole multi-GB column, which on an object store cannot finish inside the query timeout. `variant_data` remains the verbatim record; the materialized columns are projections of it, never independently writable.
+
+**`session-additive-schema-backfill`** {#session-additive-schema-backfill} - A schema change that adds derived nullable columns MUST upgrade existing data in place, never by re-ingest: on open, a store missing known derivable columns backfills them from data already stored (one `add_columns` commit per table; concurrent openers race benignly under OCC), and a `.pond` archive predating the change restores by deriving the missing cells at the read boundary - an archive is a snapshot and restore never mutates it. Why: re-ingest is not a migration path (`session-durable-copy` - a rotated source cannot supply its rows again), so an additive change that stranded existing stores or archives would violate the durability contract it sits on. The backfill derives only from stored data, preserving `model-no-synthesis`: a cell the stored record cannot justify stays NULL.
 
 ---
 
