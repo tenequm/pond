@@ -3985,34 +3985,11 @@ async fn ensure_current_schema(
     for _ in 0..MAX_MIGRATION_ATTEMPTS {
         let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
         match classify_schema(&actual, expected, table_name)? {
-            SchemaFit::Match => {
-                // Catch a vector-dim change (configured `[embeddings].dim`
-                // differs from the on-disk vector column width) early with a
-                // friendly message. Lance would otherwise reject the next
-                // write with an opaque schema-mismatch error inside the
-                // `merge_update` path.
-                for actual_field in actual.fields() {
-                    let Some(expected_field) = expected.field_with_name(actual_field.name()).ok()
-                    else {
-                        continue;
-                    };
-                    if let (
-                        DataType::FixedSizeList(_, actual_dim),
-                        DataType::FixedSizeList(_, expected_dim),
-                    ) = (actual_field.data_type(), expected_field.data_type())
-                        && actual_dim != expected_dim
-                    {
-                        tracing::warn!(
-                            table = table_name,
-                            column = actual_field.name(),
-                            actual_dim,
-                            expected_dim,
-                            "embedding dimension differs from config; open proceeds because model swaps are operator-driven",
-                        );
-                    }
-                }
-                return Ok(());
+            SchemaFit::MissingNullable(missing) => {
+                backfill_missing_columns(dataset, table_name, missing).await?;
+                continue;
             }
+            SchemaFit::Match => {}
             SchemaFit::UnknownExtra(extra) => {
                 tracing::warn!(
                     table = table_name,
@@ -4020,12 +3997,32 @@ async fn ensure_current_schema(
                     "store carries columns unknown to this pond build (written by a newer \
                      version); reads proceed, writes need the newer pond",
                 );
-                return Ok(());
-            }
-            SchemaFit::MissingNullable(missing) => {
-                backfill_missing_columns(dataset, table_name, missing).await?;
             }
         }
+        // Catch a vector-dim change (configured `[embeddings].dim` differs
+        // from the on-disk vector column width) early with a friendly
+        // message. Lance would otherwise reject the next write with an
+        // opaque schema-mismatch error inside the `merge_update` path.
+        for actual_field in actual.fields() {
+            let Some(expected_field) = expected.field_with_name(actual_field.name()).ok() else {
+                continue;
+            };
+            if let (
+                DataType::FixedSizeList(_, actual_dim),
+                DataType::FixedSizeList(_, expected_dim),
+            ) = (actual_field.data_type(), expected_field.data_type())
+                && actual_dim != expected_dim
+            {
+                tracing::warn!(
+                    table = table_name,
+                    column = actual_field.name(),
+                    actual_dim,
+                    expected_dim,
+                    "embedding dimension differs from config; open proceeds because model swaps are operator-driven",
+                );
+            }
+        }
+        return Ok(());
     }
     anyhow::bail!(
         "schema migration for table {table_name} did not converge after \

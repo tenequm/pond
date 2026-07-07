@@ -4931,7 +4931,8 @@ pub(crate) fn column_backfill(table_name: &str, missing: &[Field]) -> Result<Col
     match table_name {
         PARTS => parts_backfill(missing),
         other => anyhow::bail!(
-            "table {other} is missing columns {:?} that this pond build cannot derive from stored data",
+            "table {other} is missing columns {:?} that this pond build cannot derive from \
+             stored data - use the pond version that wrote it",
             missing.iter().map(|f| f.name()).collect::<Vec<_>>(),
         ),
     }
@@ -4942,7 +4943,8 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
         anyhow::ensure!(
             ["tool_name", "call_id", "is_failure"].contains(&field.name().as_str())
                 && field.is_nullable(),
-            "column {PARTS}.{} cannot be derived from stored data",
+            "column {PARTS}.{} cannot be derived from stored data - use the pond version \
+             that wrote it",
             field.name(),
         );
     }
@@ -4961,7 +4963,23 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
                 "tool_call" | "tool_result" | "tool_approval_request" => {
                     let body =
                         json_column(batch, "variant_data", row)?.context("variant_data is null")?;
-                    Some(part_kind_from_json(&type_name, &body, None)?)
+                    // An undecodable body degrades to NULL cells (spec.md#model-no-synthesis:
+                    // a cell the stored record cannot justify stays NULL) rather than failing
+                    // the migration, which re-runs on every open and would leave the store
+                    // permanently un-openable over one bad row.
+                    match part_kind_from_json(&type_name, &body, None) {
+                        Ok(kind) => Some(kind),
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = string(batch, "session_id", row)?.as_deref(),
+                                part_id = string(batch, "id", row)?.as_deref(),
+                                error = %format!("{error:#}"),
+                                "stored tool part body failed to decode; its backfilled \
+                                 cells stay NULL",
+                            );
+                            None
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -4987,7 +5005,12 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
         RecordBatch::try_new(schema.clone(), arrays).context("failed to build backfill batch")
     };
     Ok(ColumnBackfill {
-        read_columns: vec!["type".to_owned(), "variant_data".to_owned()],
+        read_columns: vec![
+            "session_id".to_owned(),
+            "id".to_owned(),
+            "type".to_owned(),
+            "variant_data".to_owned(),
+        ],
         output_schema,
         mapper: Box::new(mapper),
     })
@@ -5813,13 +5836,12 @@ fn json_parse<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
     serde_json::from_slice(value).context("failed to parse JSON field")
 }
 
-/// The materialized `(tool_name, call_id, is_failure)` cells for one part.
-/// Shared by the ingest write path and the schema-migration backfill (which
+/// The materialized `(tool_name, call_id, is_failure)` cells for one part -
+/// shared by the ingest write path and the schema-migration backfill (which
 /// reconstructs the `PartKind` via [`part_kind_from_json`]) so both derive
-/// identical cells. The approval request's `tool_call_id` is the same
-/// correlation key the call/result pair carries, surfaced under the one
-/// `call_id` column; absent source fields stay NULL
-/// (spec.md#model-no-synthesis).
+/// identical cells. The approval request's `tool_call_id` surfaces under the
+/// one `call_id` column (the same correlation key the call/result pair
+/// carries); absent source fields stay NULL (spec.md#model-no-synthesis).
 fn tool_identity(kind: &PartKind) -> (Option<&str>, Option<&str>, Option<bool>) {
     match kind {
         PartKind::ToolCall { name, call_id, .. } => (

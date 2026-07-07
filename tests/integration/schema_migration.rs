@@ -26,8 +26,12 @@ fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
 
 async fn seed_store(dir: &TempDir) -> anyhow::Result<()> {
     let store = Store::open_local(dir.path()).await?;
+    ingest_session(&store, SESSION_ID, "Bash").await
+}
+
+async fn ingest_session(store: &Store, session_id: &str, tool: &str) -> anyhow::Result<()> {
     let session = Session {
-        id: SESSION_ID.to_owned(),
+        id: session_id.to_owned(),
         parent_session_id: None,
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
@@ -37,12 +41,12 @@ async fn seed_store(dir: &TempDir) -> anyhow::Result<()> {
     };
     let assistant = Message::Assistant {
         id: "m-asst".to_owned(),
-        session_id: SESSION_ID.to_owned(),
+        session_id: session_id.to_owned(),
         timestamp: Utc::now(),
         options: Default::default(),
     };
     let part = |id: &str, ordinal: i32, kind: PartKind| Part {
-        session_id: SESSION_ID.to_owned(),
+        session_id: session_id.to_owned(),
         id: id.to_owned(),
         message_id: "m-asst".to_owned(),
         ordinal,
@@ -65,7 +69,7 @@ async fn seed_store(dir: &TempDir) -> anyhow::Result<()> {
             1,
             PartKind::ToolCall {
                 call_id: s("call-1"),
-                name: s("Bash"),
+                name: s(tool),
                 params: json!({ "command": "false" }),
                 provider_executed: false,
             },
@@ -75,14 +79,14 @@ async fn seed_store(dir: &TempDir) -> anyhow::Result<()> {
             2,
             PartKind::ToolResult {
                 call_id: s("call-1"),
-                name: s("Bash"),
+                name: s(tool),
                 is_failure: true,
                 result: json!("exit 1"),
             },
         )),
     ];
     let envelope = pond_ingest(
-        &store,
+        store,
         IngestRequest {
             protocol_version: PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
@@ -192,6 +196,26 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
         reopened.version().version,
         version_before,
         "a migrated store must not commit again on reopen",
+    );
+
+    // New ingest into the migrated store: `add_columns` appended the tool
+    // columns at the END of the on-disk schema while fresh batches carry them
+    // mid-schema, so this pins that the write path aligns columns by name,
+    // not position.
+    ingest_session(&store, "post-migration-session", "Grep").await?;
+    let text = run_sql(
+        &store,
+        "SELECT tool_name, call_id FROM parts \
+         WHERE session_id = 'post-migration-session' AND type = 'tool_call'",
+    )
+    .await?;
+    assert!(
+        text.contains("Grep"),
+        "post-migration ingest materializes tool_name: {text}",
+    );
+    assert!(
+        text.contains("call-1"),
+        "post-migration ingest materializes call_id: {text}",
     );
     Ok(())
 }
