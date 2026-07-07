@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/tenequm/pond/compare/v0.12.1...v0.12.2) - 2026-07-07
+
+### <!-- 1 -->🎉 New Features
+- **deps:** upgrade lance 7.0.0 -> 8.0.0 ([56e968e](https://github.com/tenequm/pond/commit/56e968ed355581eb7464ad0cd2c19236b81b9e67))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.12.1...v0.12.2
+
 ## [0.12.1](https://github.com/tenequm/pond/compare/v0.12.0...v0.12.1) - 2026-07-06
 
 Sync status now reports genuine work only, and forked subagent transcripts are no longer silently dropped. Verified end to end against the full real corpus (11k+ sessions / 1.8M messages) on both a local store and the S3 backend: ingestion is byte-identical to v0.12.0 except for the recovered data.
