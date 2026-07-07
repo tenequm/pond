@@ -1,5 +1,5 @@
 {
-  description = "pond - lossless session storage and hybrid search for AI agent clients";
+  description = "pond - lossless session storage and search for AI agent clients";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

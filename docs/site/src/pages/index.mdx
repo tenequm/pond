@@ -5,11 +5,43 @@ description: Lossless storage and search for AI agent sessions, across every age
 
 # Why pond? [One searchable archive of every AI session, restorable into any client]
 
-One Rust binary. It ingests sessions from your agentic clients into a canonical Session / Message / Part interlingua, stores them in Lance (local disk or object storage), and serves search over HTTP and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not just the one that made it.
+> "I know we discussed that before. Why can't I find that damn conversation?"
+
+Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
+
+![Claude Code answering a three-month-old debugging question from pond in seconds](/demo-search.gif)
+
+Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
+
+```sh
+brew install tenequm/tap/pond
+pond init   # guided setup: storage, adapters, MCP registration, optional schedule
+pond sync   # ingest, embed, update indexes
+```
+
+Then ask your agent - real prompts from daily use:
+
+```
+check in pond how we solved this before, then apply the same fix here
+```
+```
+where we left off yesterday - check pond, then continue
+```
+```
+are you sure that won't break X? check in pond how we struggled with exactly this
+```
 
 :::tip
 Install, `pond init`, `pond sync`. -> [Quickstart](/get-started/quickstart).
 :::
+
+## Isn't this another memory tool?
+
+No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories.
+
+## How it works
+
+One Rust binary. It ingests sessions from your agentic clients into a canonical Session / Message / Part interlingua, stores them in Lance (local disk or object storage), and serves search over HTTP and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not just the one that made it.
 
 ## The problem
 

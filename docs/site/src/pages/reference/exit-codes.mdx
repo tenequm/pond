@@ -5,10 +5,12 @@ Branch on exit codes, not output text.
 | Code | Meaning | Commands |
 |---|---|---|
 | 0 | success / synced | all |
-| 2 | URL parse error | storage, copy |
+| 1 | generic failure - I/O, config, any unhandled error | all |
+| 2 | URL parse error | storage check, storage use |
+| 2 | disallowed statement (SQL surface is read-only) | sql |
 | 3 | no credentials matched | storage, copy |
 | 4 | auth failed | storage, copy |
 | 5 | store lacks conditional-put (OCC) | storage, copy |
-| 6 | destination missing source rows | copy |
+| 6 | destination missing source rows, or duplicate destination rows | copy |
 
-`copy` exit `6` is recoverable: re-run, the union merge converges.
+`copy` exit `6` is recoverable: re-run, the union merge converges. A malformed URL passed to `copy` fails with the generic exit `1`; only `storage check` / `storage use` exit `2` on it.

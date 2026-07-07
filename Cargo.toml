@@ -8,7 +8,7 @@ edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.95"
 license = "Apache-2.0"
-description = "Lossless storage and hybrid search for sessions from any AI agent client"
+description = "Lossless storage and search for sessions from any AI agent client"
 repository = "https://github.com/tenequm/pond"
 homepage = "https://pond.locker/"
 documentation = "https://pond.locker/"

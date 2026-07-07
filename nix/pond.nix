@@ -45,7 +45,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Lossless storage and hybrid search for sessions from any AI agent client";
+    description = "Lossless storage and search for sessions from any AI agent client";
     homepage = "https://pond.locker/";
     changelog = "https://github.com/tenequm/pond/releases/tag/v${version}";
     license = lib.licenses.asl20;

@@ -3,7 +3,10 @@ import { defineConfig } from 'vocs/config'
 export default defineConfig({
   title: 'pond',
   description:
-    'Lossless storage and hybrid search for AI agent sessions, across every agentic client.',
+    'Lossless storage and search for AI agent sessions, across every agentic client.',
+  iconUrl: '/logo.png',
+  logoUrl: '/logo.png',
+  ogImageUrl: 'https://pond.locker/og-image.png',
   rootDir: '.',
   // 'dynamic' (default) emits zero HTML; full-static prerenders one index.html
   // per route into dist/public/ for plain Cloudflare static-asset hosting.

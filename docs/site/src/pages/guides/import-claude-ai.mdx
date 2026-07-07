@@ -9,4 +9,4 @@ Claude.ai conversations have no local session files, so they arrive via the offi
 pond sync claude-ai-export --path <path-to-export.zip>
 ```
 
-`--path` accepts the `.zip` directly, an extracted directory, or a bare `conversations.json`; it is a one-off override that bypasses config and writes nothing. The import is idempotent - re-running with a newer export adds only what is new.
+`--path` accepts the `.zip` directly, an extracted directory, or a bare `conversations.json`; it is a one-off override that bypasses config and writes nothing to `config.toml`. The import is idempotent - re-running with a newer export adds only what is new.
