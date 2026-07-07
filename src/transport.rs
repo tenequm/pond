@@ -592,6 +592,11 @@ Examples (4 patterns the agent should recognize):
         /// machine-readable JSON output.
         #[serde(default)]
         format: Option<String>,
+        /// Per-query timeout in seconds (default 30, max 600). Raise it for a
+        /// genuinely long-running query (e.g. a large remote-store scan);
+        /// prefer narrower predicates and the indexed/native columns first.
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
     }
 
     fn parse_session_from(value: Option<String>) -> SessionFrom {
@@ -860,7 +865,15 @@ Examples (4 patterns the agent should recognize):
                 }
             };
 
-            match sql::run(&tables, &params.query, mode, inline_rows).await {
+            match sql::run(
+                &tables,
+                &params.query,
+                mode,
+                inline_rows,
+                params.timeout_seconds,
+            )
+            .await
+            {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::Export {
                     bytes,

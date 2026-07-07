@@ -51,7 +51,19 @@ use parquet::arrow::ArrowWriter;
 const MEM_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 /// Wall-clock cap on `collect()`. DataFusion 53 has no built-in query timeout,
 /// so this `tokio::time::timeout` is the only guard against a runaway plan.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Callers may raise it per query up to [`MAX_QUERY_TIMEOUT_SECS`].
+pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+/// Ceiling on the caller-supplied timeout: `collect()` is cancellable only by
+/// this timeout, so an absurd value must not pin the server on a runaway scan.
+pub const MAX_QUERY_TIMEOUT_SECS: u64 = 600;
+
+fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(
+        timeout_secs
+            .unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS)
+            .clamp(1, MAX_QUERY_TIMEOUT_SECS),
+    )
+}
 /// Byte budget for the inline (rendered table) result; rows are dropped to fit.
 const INLINE_BUDGET_BYTES: usize = 80_000;
 /// Hard ceiling on an export artifact: base64'd over `resources/read` it costs
@@ -151,6 +163,7 @@ pub async fn run(
     sql: &str,
     mode: Mode,
     inline_rows: usize,
+    timeout_secs: Option<u64>,
 ) -> Result<Outcome, SqlError> {
     let parsed = parse_and_gate(sql)?;
     if matches!(parsed.kind, StatementKind::Explain) && matches!(mode, Mode::Export(_)) {
@@ -215,16 +228,21 @@ pub async fn run(
     // planned fix is lance v8's FM-Index on variant_data (raw-byte substring
     // search via `contains(variant_data, 'needle')`); until it lands, the
     // message steers agents to predicates the current indexes can serve.
-    let collected = tokio::time::timeout(QUERY_TIMEOUT, df.collect())
+    let timeout = effective_timeout(timeout_secs);
+    let collected = tokio::time::timeout(timeout, df.collect())
         .await
         .map_err(|_| {
             SqlError::Query(format!(
-                "query exceeded the {}s limit; add a narrower WHERE or a LIMIT. If you were \
+                "query exceeded the {}s limit; add a narrower WHERE or a LIMIT, or raise \
+                 the per-query timeout (`timeout_seconds` on pond_sql_query, `--timeout` \
+                 on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
+                 longer. For tool analytics use the narrow native columns (tool_name, \
+                 call_id, is_failure) instead of json_get_* over variant_data. If you were \
                  substring-scanning variant_data (json_extract + LIKE), there is no \
-                 substring index on tool bodies yet: filter parts by type and \
-                 json_get_string(variant_data, 'name') first, or search conversational \
-                 text with contains_tokens(search_text, '...') instead.",
-                QUERY_TIMEOUT.as_secs()
+                 substring index on tool bodies yet: filter parts by type and tool_name \
+                 first, or search conversational text with \
+                 contains_tokens(search_text, '...') instead.",
+                timeout.as_secs()
             ))
         })?
         .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
@@ -1517,5 +1535,19 @@ mod tests {
             .filter(|line| line.contains("line one"))
             .collect();
         assert_eq!(row_lines.len(), 1, "one physical line per row: {out}");
+    }
+
+    #[test]
+    fn effective_timeout_defaults_and_clamps() {
+        assert_eq!(
+            effective_timeout(None),
+            Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS)
+        );
+        assert_eq!(effective_timeout(Some(60)), Duration::from_secs(60));
+        assert_eq!(effective_timeout(Some(0)), Duration::from_secs(1));
+        assert_eq!(
+            effective_timeout(Some(u64::MAX)),
+            Duration::from_secs(MAX_QUERY_TIMEOUT_SECS)
+        );
     }
 }

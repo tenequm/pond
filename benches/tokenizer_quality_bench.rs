@@ -309,7 +309,7 @@ async fn resolve_anchors(store: &Store, queries: &mut [Query]) -> Result<()> {
             let escaped = anchor.replace('\'', "''");
             let sql =
                 format!("SELECT message_id FROM messages WHERE search_text LIKE '%{escaped}%'");
-            match sql::run(&tables, &sql, Mode::Export(sql::Format::Ndjson), 0).await {
+            match sql::run(&tables, &sql, Mode::Export(sql::Format::Ndjson), 0, None).await {
                 Ok(sql::Outcome::Export { bytes, .. }) => {
                     for line in String::from_utf8_lossy(&bytes).lines() {
                         if line.is_empty() {
