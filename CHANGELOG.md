@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/tenequm/pond/compare/v0.12.2...v0.13.0) - 2026-07-07
+
+### <!-- 0 -->🛠 Breaking Changes
+- **parts:** [**breaking**] materialize tool columns + in-place schema migration; per-query SQL timeout ([#100](https://github.com/tenequm/pond/pull/100)) ([5490122](https://github.com/tenequm/pond/commit/54901228e3f3389ce9494c5d7bda5f213ee559ab))
+
+### <!-- 5 -->📚 Documentation
+- update README for clarity and structure, add new sections on usage and maintenance ([8298db5](https://github.com/tenequm/pond/commit/8298db572481320b47075eac7ef2aafc54bb0884))
+- launch fold, memory-tool FAQ, OG/meta, vocs 2.3.3, reference-page fixes ([a3a3e65](https://github.com/tenequm/pond/commit/a3a3e654612ac82caca7066afaecba4f1ca6fb16))
+- **readme:** launch fold - hook quote, live search demo, real prompts ([d53226f](https://github.com/tenequm/pond/commit/d53226fe0bf619e601c009e440175f7ec1fa51f9))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.12.2...v0.13.0
+
 ## [0.12.2](https://github.com/tenequm/pond/compare/v0.12.1...v0.12.2) - 2026-07-07
 
 ### <!-- 1 -->🎉 New Features
