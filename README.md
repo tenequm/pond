@@ -14,9 +14,9 @@
 Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
 
 <p align="center">
-  <img src="docs/site/assets/demo-search.gif" alt="Claude Code answering a three-month-old debugging question from pond in seconds" width="900">
+  <img src="docs/site/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
 </p>
-<p align="center"><sub>Live search over 12k+ real sessions - a three-month-old fix, found and verified in seconds (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
+<p align="center"><sub>A live 12k-session corpus, then a three-month-old fix found and verified against the current code (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
 
 Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
