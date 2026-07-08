@@ -12,7 +12,11 @@ export default {
         `${env.RYBBIT_HOST}/api${url.pathname.slice('/mesh'.length)}${url.search}`,
         request,
       )
-      upstream.headers.set('X-Forwarded-For', request.headers.get('CF-Connecting-IP') ?? '')
+      // X-Real-IP is the header Rybbit's proxy guide prefers; without the
+      // visitor IP, events from a datacenter egress get flagged as bot ASN.
+      const visitorIp = request.headers.get('CF-Connecting-IP') ?? ''
+      upstream.headers.set('X-Real-IP', visitorIp)
+      upstream.headers.set('X-Forwarded-For', visitorIp)
       return fetch(upstream)
     }
     const response = await env.ASSETS.fetch(request)
