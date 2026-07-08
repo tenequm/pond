@@ -132,6 +132,13 @@ lance-namespace-impls = "8.0.0"
 # is mmap'd so the OS page cache holds one physical copy across pond instances.
 # Already in the tree via candle/safetensors.
 memmap2 = "0.9"
+# Filesystem-change notifications for the `pond watch` daemon. `notify` wraps
+# the platform watcher (FSEvents on macOS, inotify on Linux via default
+# features); `notify-debouncer-full` coalesces the burst of writes one appended
+# message produces into a single debounced batch, so watch fires ONE
+# incremental sync per message instead of one per write syscall.
+notify = "8"
+notify-debouncer-full = "0.5"
 # Already in the tree via lance-io; named directly so `pond storage check` can
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).

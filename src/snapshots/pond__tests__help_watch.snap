@@ -1,0 +1,47 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Continuously back up sessions as they're written.
+
+Runs a long-lived daemon that watches the enabled adapters' source directories and, the moment an agent appends a message, runs an incremental no-embed sync - so a message is backed up within seconds instead of waiting for the next `pond schedule` tick. Embeddings stay a manual `pond optimize` step. `start` registers the daemon with the OS keepalive supervisor (launchd on macOS, a systemd user service on Linux).
+
+Usage: pond watch [OPTIONS] <COMMAND>
+
+Commands:
+  run     Run the watcher in the foreground (this is what the keepalive service executes)
+  start   Register the watcher with the OS keepalive supervisor (idempotent)
+  stop    Unregister the watcher
+  status  Show whether the watcher is running
+  logs    Show recent watcher output
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond watch start                 keep sessions backed up as they're written
+  pond watch status
+  pond watch logs
+  pond watch stop
+  pond watch run                   run the daemon in the foreground

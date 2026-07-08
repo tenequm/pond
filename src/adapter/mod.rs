@@ -566,10 +566,33 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
     }
     let cfg: Cfg = serde_json::from_value(config)
         .map_err(|err| AdapterError::config(adapter, format!("bad config blob: {err}")))?;
-    Ok(match std::env::var_os("HOME") {
-        Some(home) => crate::config::expand_home_under(&cfg.path, Path::new(&home)),
-        None => cfg.path,
-    })
+    Ok(expand_adapter_path(cfg.path))
+}
+
+/// Expand a leading `~` in a filesystem-adapter path against `$HOME`. Shared by
+/// [`config_path`] (the factory-open path) and [`source_root`] (the watch path)
+/// so both resolve the same directory from the same config blob.
+fn expand_adapter_path(path: PathBuf) -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => crate::config::expand_home_under(&path, Path::new(&home)),
+        None => path,
+    }
+}
+
+/// The local directory a resolved adapter reads sessions from, if it is a
+/// path-shaped ("filesystem") adapter. `pond watch` places one fs-notify watch
+/// on each of these roots so a freshly-appended message triggers an immediate
+/// incremental sync. The resolution is deliberately the SAME parse + `~`-expand
+/// [`config_path`] applies inside the factory's `open`, so the watched
+/// directory is byte-identical to the one the importer actually reads - no
+/// second source of truth to drift from the adapter config.
+///
+/// `None` for an adapter whose config blob carries no local `path` (an
+/// API-backed source such as a cloud export): there is nothing on disk to
+/// watch, and such sources fall to the periodic scheduled sync instead.
+pub fn source_root(config: &Value) -> Option<PathBuf> {
+    let path = config.get("path")?.as_str()?;
+    Some(expand_adapter_path(PathBuf::from(path)))
 }
 
 pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {

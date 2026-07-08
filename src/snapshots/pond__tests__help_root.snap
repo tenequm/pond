@@ -14,10 +14,11 @@ Commands:
     storage      Probe and switch storage destinations
     creds        Manage URL-scoped credential sets
     schedule     Manage the automatic sync schedule
+    watch        Continuously back up sessions as they're written
     config       Inspect configuration
 
   Data flow
-    sync         Make pond current: import, embed, index
+    sync         Make pond current: import, index; embed with `pond optimize`
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
 
@@ -63,7 +64,7 @@ Options:
 
 Getting started:
   pond init                                  set up storage, adapters, MCP, and scheduling
-  pond sync                                  import new sessions, embed, update indexes
+  pond sync                                  import new sessions, update indexes (embed via optimize)
   pond search "that auth refactor"           find past work
   claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
 

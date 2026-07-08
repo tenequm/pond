@@ -441,6 +441,17 @@ pub struct EmbeddingsConfig {
     /// Output dimension of `model`. Must equal the model's `hidden_size`.
     /// Defaults to 384 (e5-small). Set to 768 for e5-base, 1024 for e5-large.
     pub dim: usize,
+    /// Whether `pond sync` embeds each new message inline at ingest. Off by
+    /// default: sync is a cheap message backup that writes null vectors, so it
+    /// never downloads the ~500 MB model, never touches the GPU, and never
+    /// blocks on embedding - it just captures your conversations. `pond
+    /// optimize` is the manual embed step that backfills those null-vector rows
+    /// later. Until it runs, search still works but degrades to keyword/FTS for
+    /// the un-embedded rows (vector search only scores rows that carry a
+    /// vector). Set `true` to restore embed-at-ingest, so every synced row is
+    /// immediately vector-searchable at the cost of the model download and the
+    /// per-message embedding work on the sync's critical path.
+    pub embed_on_sync: bool,
 }
 
 impl Default for EmbeddingsConfig {
@@ -448,6 +459,7 @@ impl Default for EmbeddingsConfig {
         Self {
             model: crate::embed::DEFAULT_MODEL_ID.to_owned(),
             dim: crate::sessions::DEFAULT_EMBEDDING_DIM,
+            embed_on_sync: false,
         }
     }
 }
@@ -913,6 +925,7 @@ mod tests {
         let bad_model = EmbeddingsConfig {
             model: "   ".to_owned(),
             dim: 768,
+            embed_on_sync: false,
         };
         assert!(bad_model.validate().is_err());
         // Non-multiple-of-8 dims are accepted now: IVF_SQ has no subspace
@@ -920,12 +933,14 @@ mod tests {
         let odd_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
+            embed_on_sync: false,
         };
         assert!(odd_dim.validate().is_ok());
         // Zero is still rejected.
         let zero_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,
+            embed_on_sync: false,
         };
         assert!(zero_dim.validate().is_err());
     }

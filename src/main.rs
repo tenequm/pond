@@ -39,6 +39,7 @@ use pond::{
 mod init;
 mod schedule;
 mod syncstate;
+mod watch;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PondArchiveManifest {
@@ -235,10 +236,11 @@ Commands:
     storage      Probe and switch storage destinations
     creds        Manage URL-scoped credential sets
     schedule     Manage the automatic sync schedule
+    watch        Continuously back up sessions as they're written
     config       Inspect configuration
 
   Data flow
-    sync         Make pond current: import, embed, index
+    sync         Make pond current: import, index; embed with `pond optimize`
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
 
@@ -272,7 +274,7 @@ Options:
     after_long_help = "\
 Getting started:
   pond init                                  set up storage, adapters, MCP, and scheduling
-  pond sync                                  import new sessions, embed, update indexes
+  pond sync                                  import new sessions, update indexes (embed via optimize)
   pond search \"that auth refactor\"           find past work
   claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
 
@@ -346,17 +348,24 @@ enum Command {
     // if the template is ever removed.
     #[command(display_order = 1)]
     Init(init::InitArgs),
-    /// Make pond current: import, embed, update indexes.
+    /// Make pond current: import new messages, fold the search indexes.
     ///
     /// The everyday command: pulls fresh sessions from every enabled
-    /// `[adapters.*]` entry (or one named adapter), embedding each message
-    /// inline as it is written, and folds new rows into the search indexes. It
-    /// only ever syncs adapters you have already enabled - enabling one is an
-    /// explicit step (`pond adapters enable` / `pond adapters discover` / `pond
-    /// init`), never a side effect of sync.
+    /// `[adapters.*]` entry (or one named adapter) and folds the new rows into
+    /// the search indexes. By default it does NOT embed - it writes null
+    /// vectors, so sync stays a cheap message backup (no ~500 MB model
+    /// download, no GPU). Fill those vectors later with `pond optimize`; until
+    /// then search still works but leans on keyword/FTS for the un-embedded
+    /// rows. Pass `--embed` (or set `[embeddings].embed_on_sync = true`) to
+    /// embed inline at ingest instead. It only ever syncs adapters you have
+    /// already enabled - enabling one is an explicit step (`pond adapters
+    /// enable` / `pond adapters discover` / `pond init`), never a side effect
+    /// of sync.
     #[command(after_long_help = "Examples:
-  pond sync                                  sync every enabled adapter
+  pond sync                                  sync every enabled adapter (no embed)
   pond sync claude-code                      sync one enabled adapter
+  pond sync --embed                          also embed this run, inline at ingest
+  pond sync --no-embed                       force skip embed (override config)
   pond sync --dry-run                        preview what the next sync would read
   pond sync codex-cli --path ~/backup        one-off path override, config untouched
   pond sync --verify                         full re-read; heal anything the skip missed")]
@@ -369,6 +378,13 @@ enum Command {
         /// Bypasses `[adapters.<adapter>]` and does not modify config.toml.
         #[arg(long, value_name = "DIR")]
         path: Option<PathBuf>,
+        /// Force embedding on for this run (overrides [embeddings].embed_on_sync).
+        #[arg(long, overrides_with = "no_embed")]
+        embed: bool,
+        /// Skip embedding for this run; write null vectors for `pond optimize` to
+        /// fill later (overrides [embeddings].embed_on_sync).
+        #[arg(long = "no-embed", overrides_with = "embed")]
+        no_embed: bool,
         /// Reconcile pass: bypass the freshness skip and re-read every source
         /// body, re-ingesting through the idempotent merge. The skip compares
         /// source mtime to pond's per-session ingest watermark; a session that
@@ -639,6 +655,25 @@ enum Command {
     Schedule {
         #[command(subcommand)]
         command: schedule::ScheduleCmd,
+    },
+    /// Continuously back up sessions as they're written.
+    ///
+    /// Runs a long-lived daemon that watches the enabled adapters' source
+    /// directories and, the moment an agent appends a message, runs an
+    /// incremental no-embed sync - so a message is backed up within seconds
+    /// instead of waiting for the next `pond schedule` tick. Embeddings stay a
+    /// manual `pond optimize` step. `start` registers the daemon with the OS
+    /// keepalive supervisor (launchd on macOS, a systemd user service on Linux).
+    #[command(after_long_help = "Examples:
+  pond watch start                 keep sessions backed up as they're written
+  pond watch status
+  pond watch logs
+  pond watch stop
+  pond watch run                   run the daemon in the foreground")]
+    #[command(display_order = 6)]
+    Watch {
+        #[command(subcommand)]
+        command: watch::WatchCmd,
     },
     /// Probe and switch storage destinations.
     ///
@@ -1190,6 +1225,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Sync {
             adapter,
             path,
+            embed,
+            no_embed,
             verify,
             dry_run,
             no_wait,
@@ -1197,6 +1234,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
+            // Tri-state: `--embed` => Some(true), `--no-embed` => Some(false),
+            // neither => None (follow `[embeddings].embed_on_sync`). clap's
+            // `overrides_with` guarantees at most one boolean is set.
+            let embed = match (embed, no_embed) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
             run_sync(
                 &loaded,
                 &config_file,
@@ -1204,6 +1249,7 @@ async fn main() -> anyhow::Result<()> {
                 SyncInvocation {
                     adapter,
                     path,
+                    embed,
                     verify,
                     dry_run,
                     no_wait,
@@ -1447,6 +1493,17 @@ async fn main() -> anyhow::Result<()> {
             run_config_command(command, storage_path, config).await?;
         }
         Command::Schedule { command } => schedule::run(command)?,
+        Command::Watch { command } => match command {
+            // `run` is the async daemon body; it needs the loaded config +
+            // storage handle, so it dispatches here rather than through
+            // `watch::run` (which handles the synchronous service commands).
+            watch::WatchCmd::Run => {
+                let config_file = config_path(config);
+                let loaded = Config::load(&config_file)?;
+                watch::run_watch(&loaded, &config_file, storage_path).await?;
+            }
+            other => watch::run(other)?,
+        },
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }
@@ -3143,6 +3200,9 @@ impl OptimizeStages {
 pub(crate) struct SyncInvocation {
     pub adapter: Option<String>,
     pub path: Option<PathBuf>,
+    /// Resolved `--embed` / `--no-embed` override: `Some(true)`/`Some(false)`
+    /// force it for this run, `None` follows `[embeddings].embed_on_sync`.
+    pub embed: Option<bool>,
     pub verify: bool,
     pub dry_run: bool,
     pub no_wait: bool,
@@ -3155,6 +3215,9 @@ impl SyncInvocation {
         Self {
             adapter: None,
             path: None,
+            // Follow config so `pond init`'s first sync honors
+            // `[embeddings].embed_on_sync` (which defaults to no-embed).
+            embed: None,
             verify: false,
             dry_run: false,
             no_wait: false,
@@ -3329,17 +3392,29 @@ async fn run_sync_stages(
 ) -> anyhow::Result<()> {
     let open_started = std::time::Instant::now();
     let (_, store) = open_store(storage_path, loaded, true, false).await?;
-    // sync ingests through `upsert_session_batch`, which embeds inline; it
-    // has no query path, so this is its own resident embedder. The flush HUD
-    // connects that inline embedding back to the live adapter bar.
-    let embedder = Arc::new(LazyEmbedder::candle());
+    // Flag wins over config; unset (`None`) follows `[embeddings].embed_on_sync`
+    // (which defaults to off). Off = the cheap message-backup path: no embedder
+    // attached, so `upsert_session_batch` writes null vectors that `pond
+    // optimize` backfills later.
+    let embed = invocation.embed.unwrap_or(loaded.embeddings.embed_on_sync);
     let flush_hud = Arc::new(FlushHud::default());
-    let store = store
-        .with_embedder(embedder.clone())
-        .with_ingest_embed_progress(pond::sessions::IngestEmbedProgress(Arc::new({
-            let hud = flush_hud.clone();
-            move |done, total| hud.embed_tick(done, total)
-        })));
+    // When embedding is on, sync ingests through `upsert_session_batch`, which
+    // embeds inline; it has no query path, so this is its own resident
+    // embedder. The flush HUD connects that inline embedding back to the live
+    // adapter bar. When off, we skip both the embedder and the ingest-embed
+    // progress observer - with no embedder the observer never ticks, so wiring
+    // it would only paint a misleading zero-progress HUD.
+    let embedder = embed.then(|| Arc::new(LazyEmbedder::candle()));
+    let store = if let Some(embedder) = &embedder {
+        store
+            .with_embedder(embedder.clone())
+            .with_ingest_embed_progress(pond::sessions::IngestEmbedProgress(Arc::new({
+                let hud = flush_hud.clone();
+                move |done, total| hud.embed_tick(done, total)
+            })))
+    } else {
+        store
+    };
     tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
 
     // Load the model before the import bars own the terminal: a first run
@@ -3348,25 +3423,36 @@ async fn run_sync_stages(
     // fire mid-import underneath active progress bars. Best-effort: a
     // caught-up sync embeds nothing, so an offline host must not fail here -
     // when new rows do need embedding, the flush surfaces the real error.
-    let model_started = std::time::Instant::now();
-    match embedder.get().await {
-        Ok(_) => {
-            if !json && model_started.elapsed() > Duration::from_secs(1) {
-                output(&stage_line(
-                    model_started.elapsed(),
-                    "model",
-                    "embedding model ready",
+    // Skipped entirely when embedding is off: no embedder, no download.
+    if let Some(embedder) = &embedder {
+        let model_started = std::time::Instant::now();
+        match embedder.get().await {
+            Ok(_) => {
+                if !json && model_started.elapsed() > Duration::from_secs(1) {
+                    output(&stage_line(
+                        model_started.elapsed(),
+                        "model",
+                        "embedding model ready",
+                    ))?;
+                }
+            }
+            Err(error) => {
+                output_err(&pond::output::paint(
+                    &format!(
+                        "model: embedding model unavailable ({error:#}); continuing - the sync fails only if new sessions need embedding"
+                    ),
+                    pond::output::yellow(),
                 ))?;
             }
         }
-        Err(error) => {
-            output_err(&pond::output::paint(
-                &format!(
-                    "model: embedding model unavailable ({error:#}); continuing - the sync fails only if new sessions need embedding"
-                ),
-                pond::output::yellow(),
-            ))?;
-        }
+    } else if !json {
+        // One quiet line so a no-embed sync explains why rows land un-embedded
+        // and points at the manual fill step. Suppressed under `-q`/json.
+        output(&stage_line(
+            Duration::ZERO,
+            "embed",
+            "skipped (null vectors) - run `pond optimize` to fill embeddings",
+        ))?;
     }
 
     let import_started = std::time::Instant::now();
@@ -3410,26 +3496,32 @@ async fn run_sync_stages(
         if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
             tracing::warn!(%error, "post-import rowmap refresh skipped");
         }
-        // Sync embeds inline at ingest (the `with_embedder` above), so
-        // every new searchable row already carries its vector and a flush
-        // that fails to embed aborts without writing - sync can never
-        // leave a searchable row un-embedded. The finalize *embed worker*
-        // would therefore only full-scan `messages` over S3 to discover
-        // there is nothing to embed (measured 20-81s of pure waste on the
-        // remote store), so sync skips it and keeps only the cheap
-        // LIMIT-1 model-swap guard. A genuine pre-inline / wire-ingest
-        // backlog is healed by `pond optimize` (which keeps the full
-        // embed pass). Cleanup is amortized: a 5-min cron sync shouldn't
-        // pay the per-table version-log walk (~9s on S3) every run, so it
-        // cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL commits instead
-        // (`pond optimize` still cleans every run). The scalar-index fold
-        // is amortized the same way: Lance 7.0.0 rewrites the whole
-        // BTree/bitmap file per fold, so most syncs defer it and let the
-        // unindexed tail accrue (see DEFAULT_SYNC_SCALAR_FOLD_ROWS). The
-        // FTS + vector fold is batched too (DEFAULT_SYNC_INDEX_FOLD_ROWS):
-        // each fold is an S3 round-trip storm, and the deferred tail stays
-        // searchable because the retrievers flat-scan it.
-        guard_embedding_model_unchanged(&store).await?;
+        // Whether sync ever leaves a row un-embedded depends on `embed`.
+        // With embed on (the `with_embedder` above), every new searchable row
+        // is embedded inline at ingest and a flush that fails to embed aborts
+        // without writing, so sync can never leave a searchable row
+        // un-embedded; with embed off (the default), new rows land carrying
+        // null vectors on purpose, and `pond optimize` backfills them later.
+        // Either way the finalize *embed worker* is correctly skipped: with
+        // embed on it would only full-scan `messages` over S3 to discover
+        // there is nothing left to embed (measured 20-81s of pure waste on the
+        // remote store), and with embed off backfilling is explicitly deferred
+        // to `pond optimize` (which keeps the full embed pass) rather than run
+        // on the backup's critical path. The cheap LIMIT-1 model-swap guard
+        // matters only when we actually embed, so it is gated on `embed` too.
+        // Cleanup is amortized: a 5-min cron sync shouldn't pay the per-table
+        // version-log walk (~9s on S3) every run, so it cleans once every
+        // DEFAULT_SYNC_CLEANUP_INTERVAL commits instead (`pond optimize` still
+        // cleans every run). The scalar-index fold is amortized the same way:
+        // Lance 7.0.0 rewrites the whole BTree/bitmap file per fold, so most
+        // syncs defer it and let the unindexed tail accrue (see
+        // DEFAULT_SYNC_SCALAR_FOLD_ROWS). The FTS + vector fold is batched too
+        // (DEFAULT_SYNC_INDEX_FOLD_ROWS): each fold is an S3 round-trip storm,
+        // and the deferred tail stays searchable because the retrievers
+        // flat-scan it.
+        if embed {
+            guard_embedding_model_unchanged(&store).await?;
+        }
         let policy = configured_maintenance_policy(loaded, None)?
             .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL)
             .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS)
@@ -4228,7 +4320,7 @@ fn unzip_archive(source: &Path, dest: &Path) -> anyhow::Result<()> {
 /// 3. `<adapter>` set, no config entry: error pointing at `pond adapters enable`.
 /// 4. No `<adapter>`, `[adapters]` non-empty: sync every enabled entry.
 /// 5. No `<adapter>`, empty `[adapters]`: error pointing at `pond adapters discover`.
-fn resolve_sync_adapters(
+pub(crate) fn resolve_sync_adapters(
     config: &Config,
     name: Option<&str>,
     path: Option<PathBuf>,

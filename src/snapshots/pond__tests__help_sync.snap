@@ -2,9 +2,9 @@
 source: src/main.rs
 expression: sub.render_long_help().to_string()
 ---
-Make pond current: import, embed, update indexes.
+Make pond current: import new messages, fold the search indexes.
 
-The everyday command: pulls fresh sessions from every enabled `[adapters.*]` entry (or one named adapter), embedding each message inline as it is written, and folds new rows into the search indexes. It only ever syncs adapters you have already enabled - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync.
+The everyday command: pulls fresh sessions from every enabled `[adapters.*]` entry (or one named adapter) and folds the new rows into the search indexes. By default it does NOT embed - it writes null vectors, so sync stays a cheap message backup (no ~500 MB model download, no GPU). Fill those vectors later with `pond optimize`; until then search still works but leans on keyword/FTS for the un-embedded rows. Pass `--embed` (or set `[embeddings].embed_on_sync = true`) to embed inline at ingest instead. It only ever syncs adapters you have already enabled - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync.
 
 Usage: pond sync [OPTIONS] [ADAPTER]
 
@@ -17,6 +17,12 @@ Options:
           One-off source-path override (requires <ADAPTER>).
           
           Bypasses `[adapters.<adapter>]` and does not modify config.toml.
+
+      --embed
+          Force embedding on for this run (overrides [embeddings].embed_on_sync)
+
+      --no-embed
+          Skip embedding for this run; write null vectors for `pond optimize` to fill later (overrides [embeddings].embed_on_sync)
 
       --verify
           Reconcile pass: bypass the freshness skip and re-read every source body, re-ingesting through the idempotent merge. The skip compares source mtime to pond's per-session ingest watermark; a session that was partially flushed before the commit-row-last fix kept a frozen watermark that mtime can never re-read past. This is the body-reading tier that heals that historical damage (and audits completeness). It is slower - every file is decoded - so it is opt-in, not the default
@@ -56,8 +62,10 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond sync                                  sync every enabled adapter
+  pond sync                                  sync every enabled adapter (no embed)
   pond sync claude-code                      sync one enabled adapter
+  pond sync --embed                          also embed this run, inline at ingest
+  pond sync --no-embed                       force skip embed (override config)
   pond sync --dry-run                        preview what the next sync would read
   pond sync codex-cli --path ~/backup        one-off path override, config untouched
   pond sync --verify                         full re-read; heal anything the skip missed
