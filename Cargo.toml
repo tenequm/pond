@@ -263,6 +263,10 @@ harness = false
 name = "commands_bench"
 harness = false
 
+[[bench]]
+name = "fmindex_probe"
+harness = false
+
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo
 # only a step-debugger uses. Faster codegen on every rebuild.
 [profile.dev]
