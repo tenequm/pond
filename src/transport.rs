@@ -395,7 +395,9 @@ slow queries without leaving SQL.
 Output modes (the `format` arg):
 - text (default): a row-capped rendered ASCII table with a header showing \
 `{total_rows} in {elapsed_ms} ms; showing {shown}` and, on truncation, a \
-keyset-pagination hint.
+keyset-pagination hint. Long text cells clip at ~1000 chars with a \
+`[+N chars ...]` marker - the full value is one format=ndjson call away, or \
+project a narrower json_extract path.
 - parquet | ndjson: write the FULL result set to a file and return a \
 `pond-sql-export://<id>` resource link; read it via MCP resources/read. On a \
 local/stdio install the response also names the on-disk path so you can open it \
@@ -784,8 +786,10 @@ Examples (4 patterns the agent should recognize):
                            subagent sessions, bulk export (format=parquet|ndjson). Read \
                            resource schema://pond-sql FIRST - exact columns, indexed \
                            predicates, JSON access rules, worked examples; do not guess \
-                           column names or JSON paths. Inline text output is row-capped; \
-                           queries are wall-clock-capped (raise via timeout_seconds).",
+                           column names or JSON paths. Inline text output is row-capped \
+                           and long cells clip with a +N chars marker (full values via \
+                           format=parquet|ndjson); queries are wall-clock-capped (raise \
+                           via timeout_seconds).",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_sql(

@@ -1139,22 +1139,43 @@ fn is_displayable(data_type: &DataType) -> bool {
     )
 }
 
-/// One physical line per row: embedded newlines in cell values (markdown,
-/// multi-line commands) otherwise explode a row across many table lines that
-/// hard-wrap unreadably in narrow clients. The literal two-char `\n` matches
-/// the JSON escaping agents already read, and keeps row boundaries
-/// unambiguous. Inline table mode only - json and export modes keep raw data.
-fn collapse_newlines(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> {
+/// Per-cell character cap for the inline rendered table. Without it a single
+/// fat cell (tool bodies reach 56KB) defeats the row-halving byte budget in
+/// [`render_inline`] - which cannot drop below one row - and the table
+/// renderer amplifies it ~5x by padding every row to the widest cell.
+/// Measured: one 42KB cell rendered a 214KB response. Export modes
+/// (parquet/ndjson) are never clipped.
+const CELL_CLIP_CHARS: usize = 1_000;
+
+/// Bound each cell for the inline table: clip long values to
+/// [`CELL_CLIP_CHARS`] with a marker naming the unclipped path, and collapse
+/// embedded newlines (markdown, multi-line commands) that otherwise explode a
+/// row across many table lines that hard-wrap unreadably in narrow clients.
+/// The literal two-char `\n` matches the JSON escaping agents already read,
+/// and keeps row boundaries unambiguous. Inline table mode only - json and
+/// export modes keep raw data.
+fn bound_cells(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> {
     fn escape<O: OffsetSizeTrait>(array: &GenericStringArray<O>) -> ArrayRef {
         let escaped: GenericStringArray<O> =
             array.iter().map(|value| value.map(escape_cell)).collect();
         Arc::new(escaped)
     }
     fn escape_cell(text: &str) -> std::borrow::Cow<'_, str> {
-        if text.contains(['\n', '\r']) {
-            std::borrow::Cow::Owned(text.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n"))
+        let clipped = match text.char_indices().nth(CELL_CLIP_CHARS) {
+            Some((cut, _)) => {
+                let omitted = text[cut..].chars().count();
+                std::borrow::Cow::Owned(format!(
+                    "{} [+{omitted} chars - full cell via format=ndjson, or project a \
+                     narrower json_extract path]",
+                    &text[..cut]
+                ))
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        };
+        if clipped.contains(['\n', '\r']) {
+            std::borrow::Cow::Owned(clipped.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n"))
         } else {
-            std::borrow::Cow::Borrowed(text)
+            clipped
         }
     }
     batches
@@ -1206,7 +1227,7 @@ fn render_inline(
         ));
     }
     let render = |shown: usize| -> Result<String, ArrowError> {
-        let limited = collapse_newlines(&limit_batches(display, shown))?;
+        let limited = bound_cells(&limit_batches(display, shown))?;
         Ok(pretty_format_batches(&limited)?.to_string())
     };
     let mut shown = total.min(max_rows);
@@ -1517,6 +1538,57 @@ mod tests {
         ] {
             assert!(!jsonb_fulldoc_like_scan(sql), "should allow: {sql}");
         }
+    }
+
+    #[test]
+    fn render_inline_clips_fat_cells() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        let fat = "x".repeat(42_000);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(
+            out.len() < INLINE_BUDGET_BYTES,
+            "one fat cell stays within the inline budget: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("[+41000 chars - full cell via format=ndjson"),
+            "clip marker names the omitted count and the full path: {out}"
+        );
+    }
+
+    #[test]
+    fn cell_clip_respects_multibyte_boundaries_and_collapses_newlines() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        // Multibyte chars around the cut plus embedded newlines in the kept
+        // prefix: the clip must cut on a char boundary and still collapse.
+        let fat = format!("é\ný{}", "λ".repeat(2_000));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(
+            out.contains("é\\ný") && out.contains("[+1003 chars"),
+            "char-boundary clip with newline collapse: {out}"
+        );
+        // Short cells are untouched.
+        let exactly_cap = "a".repeat(CELL_CLIP_CHARS);
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(
+                exactly_cap.as_str(),
+            )]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(!out.contains("chars -"), "cap-sized cell not clipped");
     }
 
     #[test]
