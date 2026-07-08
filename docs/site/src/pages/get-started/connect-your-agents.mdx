@@ -1,19 +1,19 @@
 # Connect your agents
 
-pond is an MCP server. `pond init` registers it for detected clients. To add it by hand:
+pond is an MCP server. `pond init` registers it for detected clients and installs the bundled pond skill into Claude Code's user skills dir. To add the server by hand:
 
 ```sh
 claude mcp add -s user pond -- pond mcp   # Claude Code
 codex mcp add pond -- pond mcp            # Codex
 ```
 
-Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the server command.
+Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the server command. The skill installs by hand too: save `pond skill` output to `~/.claude/skills/pond/SKILL.md`.
 
 ## Tools the agent gets
 
-- `pond_search` - search across all sessions (vector or full-text)
-- `pond_get` - fetch a session or message by id
-- `pond_sql_query` - read-only SQL over the corpus
+- `pond_search` - find relevant messages across all sessions (vector or full-text)
+- `pond_get` - read, analyze, or summarize a session; or one message with its full tool bodies
+- `pond_sql` - the escape hatch: read-only SQL over the corpus
 
 ## Agent setup prompt
 

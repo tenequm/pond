@@ -1934,7 +1934,7 @@ impl Handle {
         &self.storage_options
     }
 
-    /// Object-store URI for a `pond_sql_query` export artifact:
+    /// Object-store URI for a `pond_sql` export artifact:
     /// `<location>/exports/<name>`. A sibling of the `*.lance` table dirs;
     /// the Directory namespace tracks tables in its `__manifest` table rather
     /// than by listing prefixes, so this prefix is never seen as a table
@@ -1960,7 +1960,7 @@ impl Handle {
         }
     }
 
-    /// Write a `pond_sql_query` export artifact, reusing the handle's
+    /// Write a `pond_sql` export artifact, reusing the handle's
     /// storage_options so S3 installs inherit the same credentials.
     pub(crate) async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let uri = self.export_uri(name);
@@ -1976,7 +1976,7 @@ impl Handle {
         Ok(())
     }
 
-    /// Read a `pond_sql_query` export artifact back (for the
+    /// Read a `pond_sql` export artifact back (for the
     /// `pond-sql-export://` MCP resource).
     pub(crate) async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
         let uri = self.export_uri(name);

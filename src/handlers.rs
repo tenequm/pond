@@ -1787,7 +1787,7 @@ mod search_handler {
     /// spec.md#search: subagents are excluded from `pond_search` results -
     /// always, except when the caller scopes to one `session_id` (which may
     /// itself be a subagent session, so the exclusion would fight the filter).
-    /// Subagents are reachable only via `pond_sql_query` (`parent_session_id`).
+    /// Subagents are reachable only via `pond_sql` (`parent_session_id`).
     pub fn default_excludes_subagents(filters: &SearchFilters) -> bool {
         filters.session_id.is_none()
     }

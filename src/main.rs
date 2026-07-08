@@ -98,7 +98,7 @@ impl From<CliSortBy> for wire::SortBy {
 }
 
 /// CLI surface for `pond sql --format`. Maps to `sql::Mode` / `sql::Format`.
-/// Mirrors the MCP `pond_sql_query` `format` arg (text|ndjson|parquet).
+/// Mirrors the MCP `pond_sql` `format` arg (text|ndjson|parquet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSqlFormat {
     Text,
@@ -330,10 +330,10 @@ struct StoreArgs {
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
     ///
-    /// Walks through storage, adapters, MCP registration, and an
-    /// optional sync schedule, then writes config.toml in one pass at the
-    /// end. Re-running repairs or updates an existing setup; flags answer
-    /// sections non-interactively.
+    /// Walks through storage, adapters, MCP registration (with the bundled
+    /// agent skill), and an optional sync schedule, then writes config.toml
+    /// in one pass at the end. Re-running repairs or updates an existing
+    /// setup; flags answer sections non-interactively.
     #[command(after_long_help = "Examples:
   pond init                                   interactive setup (or repair)
   pond init --yes                             accept defaults, no prompts
@@ -555,7 +555,7 @@ enum Command {
     ///
     /// DataFusion / PostgreSQL-compatible SELECT/WITH over the sessions,
     /// messages, and parts tables; writes and side-effecting statements are
-    /// rejected. Same surface as the `pond_sql_query` MCP tool - the MCP
+    /// rejected. Same surface as the `pond_sql` MCP tool - the MCP
     /// resource `schema://pond-sql` documents columns, indexed predicates,
     /// and pagination patterns.
     #[command(after_long_help = "Examples:
@@ -617,7 +617,7 @@ enum Command {
     /// Serve the MCP tools over stdio (for agent clients).
     ///
     /// Equivalent to `pond serve --transport stdio`. Register once per
-    /// client; the tools are pond_search, pond_get, and pond_sql_query, with
+    /// client; the tools are pond_search, pond_get, and pond_sql, with
     /// resources schema://pond, schema://pond-sql, and stats://pond.
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
@@ -5496,14 +5496,14 @@ fn render_get_envelope(
 }
 
 /// Rewrite the SQL module's canonical (MCP-vocabulary) error text for the CLI.
-/// `pond::sql` is shared with the `pond_sql_query` tool and names the MCP
+/// `pond::sql` is shared with the `pond_sql` tool and names the MCP
 /// tools/resources; a terminal user runs `pond sql`/`pond search`/`pond get`
 /// and has no `schema://` resource, so translate those tokens at the boundary.
 fn sql_error_for_cli(message: &str) -> String {
     message
         .replace("resource schema://pond-sql", "`pond sql --help`")
         .replace("schema://pond-sql", "`pond sql --help`")
-        .replace("pond_sql_query", "`pond sql`")
+        .replace("pond_sql", "`pond sql`")
         .replace("pond_search", "`pond search`")
         .replace("pond_get", "`pond get`")
 }

@@ -23,7 +23,7 @@
 //!   - vector_first  : first vector query (the cold E5 model-load spike)
 //!   - vector_steady : N vector-arm queries (default arm; needs the embedder)
 //!   - get_steady    : N `pond_get` hydration calls on prior hits
-//!   - sql_steady    : N `pond_sql_query` calls (the analytic tool)
+//!   - sql_steady    : N `pond_sql` calls (the analytic tool)
 //!   - idle/drained  : resting footprint; drained drops the model (cache stays)
 //!
 //! Run:
@@ -85,7 +85,7 @@ const QUERIES: &[&str] = &[
     "schema evolution add column",
 ];
 
-/// `pond_sql_query` workload: one metadata-only count (manifest, no data read),
+/// `pond_sql` workload: one metadata-only count (manifest, no data read),
 /// two column scans, a token filter (FTS-accelerated), and a group-by. Mirrors
 /// the analytic shapes the MCP tool actually serves.
 const SQL_QUERIES: &[&str] = &[
@@ -1201,7 +1201,7 @@ async fn main() -> Result<()> {
             .map(|s| phases.push(s))?;
     }
 
-    // ---- Phase: sql_steady (the pond_sql_query analytic tool) ----
+    // ---- Phase: sql_steady (the pond_sql analytic tool) ----
     run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
         .await
         .map(|s| phases.push(s))?;

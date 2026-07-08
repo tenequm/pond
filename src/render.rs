@@ -11,7 +11,7 @@ use crate::wire::{
 
 /// Which surface a transcript renders for. The format is identical; only the
 /// follow-up vocabulary differs - the MCP tools are `pond_get` /
-/// `pond_sql_query` with `key=value` args, the CLI verbs are
+/// `pond_sql` with `key=value` args, the CLI verbs are
 /// `pond get --message-id <ID>` / `pond sql`. Without this a human at the
 /// terminal is told to run tool syntax their shell rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub fn render_search_transcript(
     let subagent_note = match (default_excludes_subagents(&request.filters), surface) {
         (false, _) => "",
         (true, Surface::Mcp) => {
-            " Subagent sessions excluded; reach them via pond_sql_query (parent_session_id)."
+            " Subagent sessions excluded; reach them via pond_sql (parent_session_id)."
         }
         (true, Surface::Cli) => {
             " Subagent sessions excluded; reach them via `pond sql` (parent_session_id)."
@@ -132,7 +132,7 @@ pub fn render_search_transcript(
         }
         let fts_hint = match surface {
             Surface::Mcp => {
-                " For exact strings or identifiers, try pond_sql_query: SELECT \
+                " For exact strings or identifiers, try pond_sql: SELECT \
                  message_id, session_id, search_text FROM messages WHERE \
                  contains_tokens(search_text, '...')."
             }

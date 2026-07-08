@@ -1794,7 +1794,7 @@ impl Store {
     }
 
     /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
-    /// DataFusion `LanceTableProvider` in `pond_sql_query`. Goes through the
+    /// DataFusion `LanceTableProvider` in `pond_sql`. Goes through the
     /// handle's freshness gate, so each query sees a current snapshot.
     pub async fn dataset(&self, table: Table) -> Result<Arc<Dataset>> {
         Ok(Arc::new(self.handle.dataset(table).await?))
@@ -2161,12 +2161,12 @@ impl Store {
         Ok(keys)
     }
 
-    /// Write a `pond_sql_query` export artifact.
+    /// Write a `pond_sql` export artifact.
     pub async fn export_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
         self.handle.export_write(name, bytes).await
     }
 
-    /// Read a `pond_sql_query` export artifact back.
+    /// Read a `pond_sql` export artifact back.
     pub async fn export_read(&self, name: &str) -> Result<Vec<u8>> {
         self.handle.export_read(name).await
     }

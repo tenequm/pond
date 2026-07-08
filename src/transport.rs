@@ -4,7 +4,7 @@
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get`, and `POST /v1/ingest`. MCP
 //! exposes `pond_search` / `pond_get` (the kb-parity surface) plus
-//! `pond_sql_query` (read-only SQL); ingest stays HTTP-only and CLI-only.
+//! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
 use std::sync::Arc;
 
@@ -167,7 +167,7 @@ pub mod http {
 }
 
 pub mod mcp {
-    //! The rmcp MCP layer: `pond_search` / `pond_get` / `pond_sql_query` tools
+    //! The rmcp MCP layer: `pond_search` / `pond_get` / `pond_sql` tools
     //! and `schema://pond` / `schema://pond-sql` / `stats://pond` (plus
     //! `pond-sql-export://` export artifacts) resources, transport-agnostic.
     //! Mounted on stdio (via `pond mcp`) and on the `/mcp` HTTP route (via
@@ -215,7 +215,7 @@ sort_by (relevance default | recency), limit (returned sessions; default 10, \
 max 200 - also the want-more knob, there is no pagination), project (path \
 substring), session_id (exact session match - search within one session), \
 from_date / to_date (YYYY-MM-DD). Subagents are excluded; reach them via \
-pond_sql_query (parent_session_id).
+pond_sql (parent_session_id).
 
 pond_search response: a transcript. The first line states totals \
 (`matched_total` is the message count before `limit` and byte-budget \
@@ -250,7 +250,7 @@ bulk export - use `pond copy --to <file>`.";
 
     /// Static documentation served as the `schema://pond-sql` resource: the
     /// table/column schema, dialect, function set, output modes, pagination
-    /// pattern, drilling pattern, and worked examples for `pond_sql_query`.
+    /// pattern, drilling pattern, and worked examples for `pond_sql`.
     /// Loaded on demand so the tool description stays tight.
     ///
     /// TODO(#47): when the lance v8 FM-Index on parts.variant_data lands,
@@ -259,7 +259,7 @@ bulk export - use `pond copy --to <file>`.";
     /// no substring index (yet)" framing) and the timeout message in
     /// src/sql.rs.
     const SQL_SCHEMA_DOC: &str = "\
-pond_sql_query runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
+pond_sql runs ONE read-only SELECT (DataFusion SQL, PostgreSQL-compatible) \
 over three registered tables. Read-only is hard-enforced: anything other than a \
 single SELECT/WITH (or EXPLAIN of one) is rejected (no INSERT/UPDATE/DELETE/\
 CREATE/DROP/COPY/SET).
@@ -564,31 +564,27 @@ Examples (4 patterns the agent should recognize):
         message_context_after: Option<usize>,
     }
 
-    /// `pond_sql_query` MCP tool parameters.
+    /// `pond_sql` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSqlParams {
-        /// One read-only SQL statement (DataFusion / PostgreSQL-compatible).
-        /// SELECT/WITH only (or EXPLAIN of one); writes and side-effecting
-        /// statements are rejected. Exact columns - messages(session_id,
-        /// message_id, timestamp, role, source_agent, project, content
-        /// [system-role only], search_text [the conversational text],
-        /// embedding_model, options) | sessions(session_id,
-        /// parent_session_id, parent_message_id, source_agent, created_at,
-        /// project, options) | parts(session_id, message_id, id, ordinal,
-        /// type, provenance, tool_name, call_id, is_failure, variant_data,
-        /// options). parts.type enums use underscores: 'tool_call',
-        /// 'tool_result', 'text', 'reasoning', 'file'. Tool analytics: use the
-        /// narrow native columns (tool_name, call_id, is_failure), not
-        /// json_get_* over variant_data. JSON columns (variant_data, options)
-        /// are JSONB: read
-        /// fields with json_extract(col, '$.a.b') or json_get_string(col,
-        /// 'key', ...), never CAST them. Text search: WHERE
-        /// contains_tokens(search_text, 'words') to filter, FROM
-        /// fts('messages', '{...}') for BM25-ranked results. Control row count
-        /// with SQL `LIMIT`; inline output is capped at 100 rows (use
-        /// format=parquet|ndjson to get every row). See the `schema://pond-sql`
-        /// resource for joins, JSON/FTS functions, pagination + drilling
-        /// patterns, and worked examples.
+        /// One read-only SQL statement (SELECT/WITH only; writes rejected).
+        /// Exact columns - messages(session_id, message_id, timestamp, role,
+        /// source_agent, project, content [system-role only], search_text
+        /// [the conversational text], embedding_model, options) |
+        /// sessions(session_id, parent_session_id, parent_message_id,
+        /// source_agent, created_at, project, options) | parts(session_id,
+        /// message_id, id, ordinal, type, provenance, tool_name, call_id,
+        /// is_failure, variant_data, options). parts.type enums use
+        /// underscores: 'tool_call', 'tool_result', 'text', 'reasoning',
+        /// 'file'. Tool bodies live in JSONB variant_data - tool_call is
+        /// {call_id, name, params} (a Bash command is
+        /// json_extract(variant_data, '$.params.command')), tool_result is
+        /// {call_id, name, is_failure, result}; never CAST JSON columns. Tool
+        /// analytics: prefer the narrow native columns (tool_name, call_id,
+        /// is_failure). Text search: WHERE contains_tokens(search_text,
+        /// 'words'), or FROM fts('messages', '{...}') for BM25 ranking.
+        /// Joins, indexed columns, JSON functions, pagination, worked
+        /// examples: resource schema://pond-sql.
         #[serde(alias = "sql")]
         query: String,
         /// Output format: "text" (default; rendered ASCII table with metrics
@@ -647,27 +643,17 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
-            description = "Semantic search over stored conversation history. Pick the arm per \
-                           query with `mode`: \"vector\" (default) matches on meaning - use it \
-                           for concepts and paraphrases; \"fts\" matches exact whole words \
-                           (BM25) - use it when you know the literal words. For symbols, \
-                           substrings, identifiers, cross-session analytics, or subagent \
-                           sessions, use pond_sql_query instead (this tool excludes subagents). \
-                           Returns a readable transcript: a leading `key:` line explains the \
-                           format and the first line states totals plus how many searchable \
-                           messages the filters left in scope (the absence signal; searchable text \
-                           is user/assistant conversational text by design - tool calls/results and \
-                           reasoning are excluded as low-signal noise, so a gap there is expected, \
-                           not a failure - reach tool output via pond_sql_query over \
-                           parts.variant_data), then results are \
-                           grouped by session, best session first; within a session, matching \
-                           messages are newest-first. Each hit is a `--- [n] score | role | time \
-                           | message_id | project | agent | session ---` rule followed by the \
-                           matched text. Pass a returned `message_id` to `pond_get` for full \
-                           text. Args: query (semantic - concepts, not project names), mode, \
-                           sort_by (\"relevance\" default | \"recency\"), project / session_id / \
-                           from_date / to_date to scope, limit to widen (no pagination - raise \
-                           limit for more). Scores are relative within one response.",
+            description = "Find relevant messages in past sessions - the entry point for \
+                           recall: \"have we worked on X\", \"what did we decide about Y\", \
+                           \"find the session where...\". mode=\"vector\" (default) matches \
+                           meaning; mode=\"fts\" matches exact whole words (BM25). Scope with \
+                           project / session_id / from_date / to_date; keep the query semantic \
+                           (concepts, not project names). Returns scored hits grouped by \
+                           session, best session first; pass a hit's message_id or session_id \
+                           to pond_get to read it. Searches conversational text only (tool \
+                           calls/results and reasoning are excluded by design - a gap there is \
+                           expected, not a failure) and excludes subagent sessions; reach both \
+                           via pond_sql. Response format details: resource schema://pond.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
@@ -724,22 +710,21 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
-            description = "Retrieve stored conversation content as a readable transcript \
-                           (a leading `key:` line explains the format). Pass exactly one of: \
-                           session_id (the whole session as a conversational transcript - \
-                           user/assistant text plus one-line tool/file refs; never inlines \
-                           tool bodies) OR message_id (that one message with its full parts, \
-                           incl. tool_call/tool_result bodies, marked `>`, plus its \
-                           conversational neighbors). Params are prefixed by scope. session_*: \
-                           session_limit (cap, default 20), session_from (\"start\"|\"end\"; \
-                           \"end\" = most recent, e.g. to recover context after compaction), \
-                           session_after_message_id / session_before_message_id (page down/up - \
-                           pass the id a page marker shows). message_*: message_context_before / \
-                           message_context_after (conversational neighbors each side, like \
-                           grep -B/-A, default 3). A session_id response lists the session's \
-                           subagents in a footer so you can open each. Tool/result lines render \
-                           as `-> name [call_id]` / `<- name [call_id] (ok|failed)`. Not for \
-                           bulk export - use `pond copy --to <file>`.",
+            description = "Read stored conversations - the tool for analyzing, reviewing, or \
+                           summarizing a past session. Pass exactly one of: session_id (the \
+                           whole session as a readable chronological transcript - \
+                           user/assistant text plus one-line tool/file refs) OR message_id \
+                           (that one message expanded with its full tool_call/tool_result \
+                           bodies, plus conversational neighbors). Use it after pond_search, \
+                           or directly when you already have an id. Paging: session_limit \
+                           (default 20), session_from=\"end\" reads the most recent turns \
+                           first (post-compaction recovery), session_after_message_id / \
+                           session_before_message_id to continue; message_context_before / \
+                           message_context_after size the neighbor window (default 3, like \
+                           grep -B/-A). A session response lists its subagent sessions in a \
+                           footer - pass a listed id back as session_id to open one. Not for \
+                           bulk export - use `pond copy --to <file>`. Response format \
+                           details: resource schema://pond.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_get(
@@ -789,36 +774,21 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
-            description = "Run ONE read-only SQL query (DataFusion / PostgreSQL-compatible) \
-                           over the stored corpus as three tables: sessions, messages, parts. \
-                           For filtering, joins, and aggregation (counts, group-by, time \
-                           buckets) - the analytic complement to pond_search's semantic \
-                           recall. SELECT/WITH only (or EXPLAIN of one); writes and side- \
-                           effecting statements are rejected. The exact column lists are in \
-                           the `query` parameter description - use those names, do not guess \
-                           (column discovery also works: SELECT column_name FROM \
-                           information_schema.columns WHERE table_name = 'messages'). \
-                           Routing: metadata analytics -> SQL on messages/sessions; tool-call \
-                           analytics -> parts WHERE type = 'tool_call' on the narrow native \
-                           columns (tool_name, call_id, is_failure); text search -> WHERE \
-                           contains_tokens(search_text, 'words') to filter or FROM \
-                           fts('messages', '{...json...}') for BM25-ranked results, or \
-                           pond_search for semantic recall; reading a transcript -> pond_get, \
-                           not SQL. The embedding `vector` column is never returned (explicit \
-                           projection is rejected; filtering in WHERE is fine). Control row \
-                           count with SQL `LIMIT`; inline text output is capped at 100 rows. \
-                           Queries are wall-clock-capped at 30s by default; set \
-                           timeout_seconds (max 600) for a genuinely long-running query. \
-                           format defaults to text (a row-capped rendered table); set \
-                           format=parquet|ndjson to write the full result to a file returned as \
-                           a pond-sql-export:// resource (ndjson for machine-readable JSON). \
-                           Read resource schema://pond-sql \
-                           for joins, indexed columns, JSON access rules, the function \
-                           quick-reference, pagination + drilling patterns, and worked \
-                           examples.",
+            description = "Advanced escape hatch: run ONE read-only SQL statement \
+                           (SELECT/WITH, DataFusion / PostgreSQL-compatible) over the \
+                           sessions / messages / parts tables. NOT for finding or reading \
+                           conversations - pond_search and pond_get cover almost all recall. \
+                           Reach for SQL only for: aggregation (counts, group-by, joins, time \
+                           buckets), exact strings or identifiers in conversational text \
+                           (contains_tokens / fts), tool-call analytics and tool bodies, \
+                           subagent sessions, bulk export (format=parquet|ndjson). Read \
+                           resource schema://pond-sql FIRST - exact columns, indexed \
+                           predicates, JSON access rules, worked examples; do not guess \
+                           column names or JSON paths. Inline text output is row-capped; \
+                           queries are wall-clock-capped (raise via timeout_seconds).",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
-        async fn pond_sql_query(
+        async fn pond_sql(
             &self,
             Parameters(params): Parameters<McpSqlParams>,
         ) -> Result<CallToolResult, ErrorData> {
@@ -931,33 +901,37 @@ Examples (4 patterns the agent should recognize):
             // rmcp's default `from_build_env` reports the rmcp crate (name +
             // version) - clients display the server's own identity, so set it.
             .with_server_info(Implementation::new("pond", env!("CARGO_PKG_VERSION")))
+            // The one pond-authored text eagerly loaded into every connected
+            // session (clients defer tool descriptions behind tool search),
+            // so it carries ALL the routing; cookbook detail lives in the
+            // schema:// resources. Wording is deliberate: "analyze / review /
+            // summarize a session" must bind to pond_get(session_id), and
+            // pond_sql must never read as the general "analyze" tool.
             .with_instructions(
                 "pond recalls past agent sessions (Claude Code and others) - prior work, \
-                 decisions, and context across sessions, not the live conversation. \
-                 Workflow: pond_search to find relevant messages, then pond_get to read \
-                 full text by message_id or a whole session by session_id; both return \
-                 readable transcripts, not JSON. Scope with filters, not the query: project \
-                 (path substring), session_id, source_agent, from_date / to_date - \
-                 keep query semantic (concepts, not project names). Scores are relative \
-                 within one response; there is no min_score. Subagents are stored as their \
-                 own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
-                 on a parent session lists them in a footer so you can open each. Recover \
-                 context lost to compaction: find this session via pond_search (a distinctive \
-                 recent topic + project + from_date=today), then pond_get(session_id, \
-                 session_from=\"end\") for the recent pre-compaction turns. Deeper \
-                 reference on demand: resource schema://pond (all filters + response format), \
-                 stats://pond (corpus + embedding stats). For structured/analytic queries \
-                 (filtering, joins, counts, group-by) use pond_sql_query: read-only SQL \
-                 (SELECT only) over the sessions/messages/parts tables, with optional \
-                 parquet/ndjson export; see resource schema://pond-sql. Search indexes only \
-                 user/assistant conversational text by design (tool calls/results and \
-                 reasoning are excluded as low-signal noise, not a bug), and a \
-                 zero/weak result is not proof of absence - for exact strings, \
-                 identifiers, or error messages run pond_sql_query with WHERE \
-                 contains_tokens(search_text, 'words') (all words must match; \
-                 index-accelerated), or FROM fts('messages', \
-                 '{\"match\":{\"column\":\"search_text\",\"terms\":\"...\"}}') for \
-                 BM25-ranked results; both cover subagent sessions too.",
+                 decisions, and context across sessions, not the live conversation. Two \
+                 tools cover almost every request: pond_search finds relevant messages, \
+                 pond_get reads them; both return readable transcripts. To analyze, \
+                 review, or summarize a past session: pond_get(session_id) - one call, the \
+                 whole transcript. For \"what did we decide / latest state\" questions, \
+                 early conclusions in a long session are often superseded later - read \
+                 from the end (pond_get session_from=\"end\") or re-sort with pond_search \
+                 sort_by=\"recency\"; relevance rank favors the early, confident, possibly \
+                 overturned phrasing. To recover context lost to compaction: pond_search (a \
+                 distinctive recent topic + project + from_date=today), then \
+                 pond_get(session_id, session_from=\"end\"). pond_sql is the advanced \
+                 escape hatch for what search+get cannot express: corpus-wide aggregation \
+                 (counts, group-by, joins), exact strings or identifiers inside tool \
+                 bodies, subagent sessions, bulk export (parquet/ndjson) - read resource \
+                 schema://pond-sql before writing SQL. Scope with filters (project, \
+                 session_id, from_date / to_date), keep queries semantic (concepts, not \
+                 project names). Search covers only user/assistant conversational text by \
+                 design (tool calls/results and reasoning are excluded as low-signal \
+                 noise, not a bug) - a zero/weak result is not proof of absence: verify \
+                 exact strings with pond_sql WHERE contains_tokens(search_text, '...') \
+                 before concluding something never happened. Deeper reference: resources \
+                 schema://pond (search/get params + response format), schema://pond-sql \
+                 (SQL columns, functions, worked examples), stats://pond (corpus stats).",
             )
         }
 
@@ -991,7 +965,7 @@ Examples (4 patterns the agent should recognize):
                     SQL_SCHEMA_DOC,
                     request.uri,
                 )])),
-                // `pond_sql_query` export artifacts: read the file pond wrote
+                // `pond_sql` export artifacts: read the file pond wrote
                 // (parquet -> base64 blob, ndjson -> text). The filename is
                 // validated to a minted `<uuid>.<ext>` so the URI can't traverse.
                 uri if uri.starts_with("pond-sql-export://") => {
@@ -1100,7 +1074,7 @@ Examples (4 patterns the agent should recognize):
             let chars = match tool.name.as_ref() {
                 "pond_search" => 80_000,
                 "pond_get" => 200_000,
-                "pond_sql_query" => 80_000,
+                "pond_sql" => 80_000,
                 _ => continue,
             };
             let mut meta = serde_json::Map::new();
@@ -1133,7 +1107,7 @@ Examples (4 patterns the agent should recognize):
         CallToolResult::success(vec![Content::text(transcript)])
     }
 
-    /// Build the `pond_sql_query` export result: a text summary plus a
+    /// Build the `pond_sql` export result: a text summary plus a
     /// `resource_link` to the artifact (the spec-canonical way to hand back a
     /// tool-produced file - the bytes ride `resources/read`, not the tool
     /// result, so they don't load into context unless the host fetches them).

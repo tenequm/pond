@@ -124,7 +124,7 @@ async fn fetch_tables(store: &Store) -> Result<Tables> {
 }
 
 /// Run a SQL query through pond's own `sql::run` path - so the bench exercises
-/// the exact DataFusion + Lance pushdown wiring the MCP `pond_sql_query` tool
+/// the exact DataFusion + Lance pushdown wiring the MCP `pond_sql` tool
 /// uses. Returns the row count from the result; the inline rendering cost is
 /// kept tiny by passing `inline_rows = 0`.
 async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {

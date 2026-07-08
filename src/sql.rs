@@ -1,4 +1,4 @@
-//! `pond_sql_query`: read-only DataFusion SQL over the three Lance tables
+//! `pond_sql`: read-only DataFusion SQL over the three Lance tables
 //! (`sessions` / `messages` / `parts`), registered as `LanceTableProvider`s
 //! (behind plan-time views that rename `id` to `message_id` / `session_id`)
 //! on a fresh per-call `SessionContext`. Read-only is enforced in two layers - a
@@ -98,7 +98,7 @@ impl Format {
     }
 }
 
-/// How `pond_sql_query` returns results.
+/// How `pond_sql` returns results.
 #[derive(Debug, Clone, Copy)]
 pub enum Mode {
     /// Render a row-capped table into the tool result.
@@ -174,7 +174,7 @@ pub async fn run(
     }
     if projection_mentions_vector(parsed.projection_query()) {
         return Err(SqlError::Query(
-            "the `vector` column is not selectable from pond_sql_query (it is a \
+            "the `vector` column is not selectable from pond_sql (it is a \
              FixedSizeList<f32> embedding, ~600 bytes per row and not useful in a result). \
              For semantic search use pond_search. Filtering on it is allowed in WHERE \
              (e.g. `vector IS NOT NULL`)."
@@ -234,9 +234,12 @@ pub async fn run(
         .map_err(|_| {
             SqlError::Query(format!(
                 "query exceeded the {}s limit; add a narrower WHERE or a LIMIT, or raise \
-                 the per-query timeout (`timeout_seconds` on pond_sql_query, `--timeout` \
+                 the per-query timeout (`timeout_seconds` on pond_sql, `--timeout` \
                  on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
-                 longer. For tool analytics use the narrow native columns (tool_name, \
+                 longer. On a remote object store, queries over parts cost seconds per \
+                 round-trip - scope by session_id / tool_name, and to reconstruct one \
+                 session use pond_get(session_id), not SQL. For tool analytics use the \
+                 narrow native columns (tool_name, \
                  call_id, is_failure) instead of json_get_* over variant_data. If you were \
                  substring-scanning variant_data (json_extract + LIKE), there is no \
                  substring index on tool bodies yet: filter parts by type and tool_name \
@@ -332,7 +335,7 @@ fn parse_and_gate(sql: &str) -> Result<ParsedStatement, SqlError> {
         .map_err(|error| SqlError::Query(format!("SQL parse error: {error}")))?;
     if statements.len() != 1 {
         return Err(SqlError::Query(
-            "pond_sql_query runs exactly one statement; submit a single SELECT".to_owned(),
+            "pond_sql runs exactly one statement; submit a single SELECT".to_owned(),
         ));
     }
     let Some(front) = statements.front() else {
@@ -361,7 +364,7 @@ fn parse_and_gate(sql: &str) -> Result<ParsedStatement, SqlError> {
 }
 
 fn read_only_rejection() -> SqlError {
-    // Surface-neutral wording: this message reaches both the pond_sql_query
+    // Surface-neutral wording: this message reaches both the pond_sql
     // MCP tool and the `pond sql` CLI, so it names neither.
     SqlError::Query(
         "pond's SQL surface is read-only: only a single SELECT/WITH (or EXPLAIN of one) is \
@@ -1041,9 +1044,11 @@ fn enrich(message: &str) -> String {
              embedding_model, options) | sessions(session_id, parent_session_id, \
              parent_message_id, source_agent, created_at, project, options) | \
              parts(session_id, message_id, id, ordinal, type, provenance, tool_name, \
-             call_id, is_failure, variant_data, options). Part bodies (tool params/results, \
-             text) live in parts.variant_data - \
-             read them with json_extract(variant_data, '$.field'). For text search use \
+             call_id, is_failure, variant_data, options). Part bodies live in \
+             parts.variant_data (JSONB) and nest by part type: tool_call is {call_id, \
+             name, params} - a Bash command is json_extract(variant_data, \
+             '$.params.command') - tool_result is {call_id, name, is_failure, result}, \
+             text/reasoning carry {text}. For text search use \
              contains_tokens(search_text, '...') in WHERE, or the fts('messages', ...) \
              table function in FROM for ranked results; to read a transcript use pond_get. \
              Full doc: resource schema://pond-sql.",
