@@ -339,7 +339,10 @@ pub fn render_get_transcript(
                 "session {} | {} | {}",
                 session.id, session.source_agent, session.project,
             );
-            // Bottom marker: later messages follow this page (page down).
+            // Bottom marker: later messages follow this page (page down). The
+            // supersession note guards the field-tested failure where an agent
+            // reads an early page of a long session and reports a
+            // since-revised conclusion as current.
             if *after_remaining > 0
                 && let Some(last) = messages.last()
             {
@@ -347,9 +350,14 @@ pub fn render_get_transcript(
                     Surface::Mcp => format!("pass session_after_message_id={}", last.id),
                     Surface::Cli => format!("pass --session-after-message-id {}", last.id),
                 };
+                let latest = match surface {
+                    Surface::Mcp => "session_from=\"end\"",
+                    Surface::Cli => "--session-from end",
+                };
                 let _ = writeln!(
                     out,
-                    "... {after_remaining} later messages; {page_down} to page down",
+                    "... {after_remaining} later messages; {page_down} to page down \
+                     (conclusions may have been revised - {latest} reads the latest turns)",
                 );
             }
         }
