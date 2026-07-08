@@ -44,6 +44,10 @@ jobs:
 
       - name: Build
         run: pnpm build
+        env:
+          # The changelog page fetches GitHub releases at build time;
+          # unauthenticated API calls from shared runners rate-limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy
         uses: cloudflare/wrangler-action@v3

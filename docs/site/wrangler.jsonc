@@ -12,5 +12,8 @@
   "routes": [
     { "pattern": "pond.locker", "custom_domain": true },
     { "pattern": "pond.cascade.fyi", "custom_domain": true }
-  ]
+  ],
+  "vars": {
+    "RYBBIT_HOST": "https://analytics.glim.sh"
+  }
 }

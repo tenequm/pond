@@ -47,9 +47,9 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 - `search_text` (the column the FTS index, embeddings, and `pond_search` all use, built in `sessions.rs::search_text`) carries ONLY user- and assistant-role conversational text (plus file metadata). Tool calls, tool results, reasoning, and system/tool-role messages are deliberately excluded. This is a deliberate signal-quality choice, NOT a gap or a bug: that excluded content almost never holds anything findable beyond what the conversational text already says, and indexing it would pollute both results and the caller's context. Never "improve" search by folding tool/reasoning/system content into `search_text`. Tool-body archaeology goes through `parts.variant_data` via `pond_sql_query`.
 - Subagent sessions are excluded from default `pond_search` results for the same reason (low unique signal, high pollution); they remain reachable on purpose via `pond_sql_query` (`parent_session_id`). Don't surface them in the main search.
 
-## Dependencies
+## MCP surfaces are hard-enforced read-only
 
-- Lance crates are pinned to crates.io `7.0.0`. Don't bump without explicit ask.
+- Every pond MCP action is read-only, hard-enforced (durable user constraint) - any new MCP tool that reaches the store must clear the same bar; never expose a write path through MCP. `pond_sql_query` proves it in two layers: (1) a pre-parse gate requiring exactly one `Statement::Query` - this also catches `EXPLAIN ANALYZE` / `DESCRIBE`, which DataFusion's `SQLOptions` alone misses; (2) `sql_with_options` with `allow_ddl` / `allow_dml` / `allow_statements` all false (only a bare `EXPLAIN` of a SELECT flips `allow_statements`). Fresh `SessionContext` per query.
 
 ## Sync change-detection oracle (S3 perf, measured)
 
@@ -58,7 +58,7 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Copy write path: the append fast-path is load-bearing (S3 perf, measured)
 
-- Benchmarked full real corpus (11,185 sessions / ~276k messages) local-source -> S3 scratch, clean cold each (`cargo bench --bench write_bench -- --source-url <store> --dest-url <s3> --only append|merge`): appending absent sessions is **13.8 min / 1 commit per table**; routing the same rows through merge-insert is **75.7 min / 354 commits** - **5.47x slower** and it left **2,685 objects vs 62**. Merge over S3 is **commit-latency-bound** (one commit per chunk = one round-trip), append is bandwidth-bound (spec.md#session-durable-copy / spec.md:573). Absent rows can't collide, so they MUST append - never merge-insert them on a remote store.
+- Benchmarked full real corpus (11,185 sessions / ~276k messages) local-source -> S3 scratch, clean cold each (`cargo bench --bench write_bench -- --source-url <store> --dest-url <s3> --only append|merge`): appending absent sessions is **13.8 min / 1 commit per table**; routing the same rows through merge-insert is **75.7 min / 354 commits** - **5.47x slower** and it left **2,685 objects vs 62**. Merge over S3 is **commit-latency-bound** (one commit per chunk = one round-trip), append is bandwidth-bound (spec.md#session-durable-copy / spec.md:686). Absent rows can't collide, so they MUST append - never merge-insert them on a remote store.
 - Consequence for any write-path unification: a single shared write seam is good (stops bespoke write paths re-appearing), but it MUST expose append-for-absent as a first-class mode, not collapse everything into merge_insert. `write_bench --only append|merge` is the regression guard.
 
 ## Sync cleanup amortization: gate `cleanup_old_versions` off the hot path (S3 perf, measured)
@@ -69,6 +69,11 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ## Object-store request rate: never tune Lance's AIMD limiter
 
 - Lance wraps every cloud store in an AIMD rate limiter (defaults: initial 2000 -> max 5000 req/s). Leave it at the defaults - never set `LANCE_AIMD_*` or equivalent storage options to widen or narrow it. The throttle/503s pond saw on Hetzner were a *symptom of issuing too many requests* (the `versions()` manifest storm, full-column rescans, per-batch merge commits), not the ceiling being too low - and Lance mislabels the resulting transport timeouts as "Throttle error detected", which once seeded a wrong throttle theory. On an object store latency is round-trip-bound, so the fix is always to issue *fewer* requests (append-only writes, bounded/index-resident reads, minimized commit count - the S3 cost law is ~1 s per commit, flat 1..512 rows), never to move the limiter. Our job is to be optimal within its boundaries, not to change them.
+
+## count_rows predicates: guard inequalities with IsNotNull (measured)
+
+- A bare inequality (`Ne`) on a nullable column in `Dataset::count_rows` hits a pathological slow path: `count_rows(Ne("embedding_model", v))` over ~2M rows (~87% null, 1 distinct non-null value) on the real S3 store ran **>25 min (effectively hung)**. Guard it - `And(IsNotNull("col"), Ne("col", val))` dropped the same count to **7.35 s**; a bare `IsNotNull` is also fast. It is the unguarded `Ne`, not the column, that is the trap.
+- Lance keeps no per-column null_count metadata, so every `count_rows(filter)` is a data-page read - count a **narrow co-set column, not a wide one** (`embedding_model IS NOT NULL`, never `vector IS NOT NULL`; they are co-set per spec.md#session-embed-from-canonical).
 
 ## Errors
 

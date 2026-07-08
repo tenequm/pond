@@ -2,11 +2,21 @@
 
 macOS and Linux. Windows is out of v1 scope.
 
-```sh
-brew install tenequm/tap/pond                  # Homebrew
-nix profile add github:tenequm/pond#pond      # Nix
-cargo install pond-db                           # crates.io (installs `pond`)
+:::code-group
+
+```sh [Homebrew]
+brew install tenequm/tap/pond
 ```
+
+```sh [Nix]
+nix profile add github:tenequm/pond#pond
+```
+
+```sh [Cargo]
+cargo install pond-db   # installs the `pond` binary
+```
+
+:::
 
 macOS selects the Metal backend automatically; elsewhere a CPU fallback runs.
 
