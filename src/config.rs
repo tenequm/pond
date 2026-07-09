@@ -199,6 +199,18 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
 # re-enable via `pond adapters enable <adapter>`.
+#
+# An adapter can pool more than one directory into one corpus with `paths`
+# instead of `path` - e.g. two Claude Code homes (a personal install and a
+# second CLAUDE_CONFIG_DIR):
+#
+# [adapters.claude-code]
+# enabled = true
+# paths = [\"~/.claude/projects\", \"~/work/.claude/projects\"]
+#
+# Set at most one of `path` / `paths` per adapter. A root nested inside
+# another configured root is dropped (it would double-scan); `pond watch`
+# places one filesystem watch per resolved root.
 
 # Embeddings. Search defaults to the vector arm (matching on meaning) when the
 # store has any vectors, falling back to FTS otherwise - the model loads lazily
@@ -1452,7 +1464,10 @@ secret_access_key = "share-secret"
             .expect("data url parses");
             let data_resolved = data_url.resolve(&config.creds).expect("data resolves");
             assert_eq!(
-                data_resolved.options.get("access_key_id").map(String::as_str),
+                data_resolved
+                    .options
+                    .get("access_key_id")
+                    .map(String::as_str),
                 Some("data-key"),
             );
 

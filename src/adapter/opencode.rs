@@ -34,7 +34,7 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_path,
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_roots,
     extract::{bound_value, extract_str},
     jsonl::RECORD_CAP,
     part_id, part_ordinal, raw_record, source_options, validate_path_id,
@@ -56,7 +56,11 @@ impl AdapterFactory for OpencodeFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        Ok(Box::new(OpencodeAdapter::new(config_path(NAME, config)?)))
+        let roots = config_roots(NAME, &config)?;
+        if roots.is_empty() {
+            return Err(AdapterError::config(NAME, "missing `path`/`paths`"));
+        }
+        Ok(Box::new(OpencodeAdapter::with_roots(roots)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -81,24 +85,35 @@ impl AdapterFactory for OpencodeFactory {
     }
 }
 
-/// Configured opencode reader, rooted at a `storage/` directory.
+/// Configured opencode reader, rooted at one or more `storage/` directories.
 #[derive(Debug, Clone)]
 pub struct OpencodeAdapter {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
 }
 
 impl OpencodeAdapter {
+    /// Single-root constructor: the common case, and what every existing
+    /// test builds against.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            roots: vec![root.into()],
+        }
+    }
+
+    /// Pools every root into one adapter identity
+    /// (spec.md#adapter-multi-root); what `AdapterFactory::open` uses once
+    /// config resolves to more than one directory.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
     }
 }
 
 impl Adapter for OpencodeAdapter {
     fn discover(&self) -> DiscoverFuture<'_> {
-        let root = self.root.clone();
+        let roots = self.roots.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                collect_session_files(&root).map(|files| files.len())
+                collect_session_files_multi(&roots).map(|files| files.len())
             })
             .await
             .map_err(join_error)?
@@ -106,7 +121,7 @@ impl Adapter for OpencodeAdapter {
     }
 
     fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> super::PlanFuture<'a> {
-        let root = self.root.clone();
+        let roots = self.roots.clone();
         Box::pin(async move {
             // The events_with freshness pre-pass run standalone: the same
             // per-session subtree walk sync's gate pays every run, classified
@@ -115,11 +130,12 @@ impl Adapter for OpencodeAdapter {
             // (never Empty): reading it still ingests its Session row.
             let peek = !oracle.is_empty();
             let heads = tokio::task::spawn_blocking(move || {
-                collect_session_files(&root)?
+                collect_session_files_multi(&roots)?
                     .into_iter()
                     .map(|file| {
                         let watermark = if peek {
-                            let walk = walk_session_subtree(&root, &file.path, &file.session_id)?;
+                            let walk =
+                                walk_session_subtree(&file.root, &file.path, &file.session_id)?;
                             match newest_message_ts(&walk) {
                                 Some(ts) => super::SourceWatermark::At(ts),
                                 None => super::SourceWatermark::Opaque,
@@ -146,11 +162,11 @@ impl Adapter for OpencodeAdapter {
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
-        let adapter = self.clone();
+        let roots = self.roots.clone();
         Box::pin(stream! {
             let files = {
-                let root = adapter.root.clone();
-                tokio::task::spawn_blocking(move || collect_session_files(&root)).await
+                let roots = roots.clone();
+                tokio::task::spawn_blocking(move || collect_session_files_multi(&roots)).await
             };
             let files = match files {
                 Ok(Ok(files)) => files,
@@ -167,7 +183,7 @@ impl Adapter for OpencodeAdapter {
             for mut file in files {
                 if !oracle.is_empty() {
                     let walked = {
-                        let root = adapter.root.clone();
+                        let root = file.root.clone();
                         let session_path = file.path.clone();
                         let session_id = file.session_id.clone();
                         tokio::task::spawn_blocking(move || {
@@ -198,8 +214,7 @@ impl Adapter for OpencodeAdapter {
             }
 
             let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
-            let reader = adapter.clone();
-            let handle = tokio::task::spawn_blocking(move || read_sessions(&reader, survivors, &tx));
+            let handle = tokio::task::spawn_blocking(move || read_sessions(survivors, &tx));
             while let Some(item) = rx.recv().await {
                 yield item;
             }
@@ -220,10 +235,14 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
     )
 }
 
-/// One session file located on disk. `cached_subtree` is populated only when
-/// the freshness pre-walk happened (i.e. the oracle had a watermark for this
-/// session); the read pass reuses the listings instead of re-walking.
+/// One session file located on disk. `root` is the storage root it was found
+/// under - needed downstream to locate its `message/`/`part/` subtree once a
+/// multi-root adapter can no longer assume "the" root. `cached_subtree` is
+/// populated only when the freshness pre-walk happened (i.e. the oracle had
+/// a watermark for this session); the read pass reuses the listings instead
+/// of re-walking.
 struct SessionFile {
+    root: PathBuf,
     session_id: String,
     path: PathBuf,
     cached_subtree: Option<SubtreeWalk>,
@@ -280,11 +299,27 @@ fn collect_session_files(root: &Path) -> Result<Vec<SessionFile>, AdapterError> 
                 path.display().to_string(),
             )?;
             out.push(SessionFile {
+                root: root.to_owned(),
                 session_id,
                 path,
                 cached_subtree: None,
             });
         }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// [`collect_session_files`] over every root, concatenated and re-sorted for
+/// deterministic order independent of root order. A root that doesn't exist
+/// is already tolerated by `collect_session_files` itself (its `session/`
+/// read_dir NotFound arm returns an empty list), so no separate skip logic
+/// is needed here - unlike the JSONL-tree walk, this reader never errors on
+/// a missing directory in the first place.
+fn collect_session_files_multi(roots: &[PathBuf]) -> Result<Vec<SessionFile>, AdapterError> {
+    let mut out = Vec::new();
+    for root in roots {
+        out.extend(collect_session_files(root)?);
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -346,12 +381,11 @@ fn newest_message_ts(walk: &SubtreeWalk) -> Option<i64> {
 }
 
 fn read_sessions(
-    adapter: &OpencodeAdapter,
     sessions: Vec<SessionFile>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) {
     for session in sessions {
-        if !read_one_session(adapter, session, tx) {
+        if !read_one_session(session, tx) {
             return;
         }
     }
@@ -359,7 +393,6 @@ fn read_sessions(
 
 /// Returns `false` when the consumer dropped the receiver and the read should stop.
 fn read_one_session(
-    adapter: &OpencodeAdapter,
     file: SessionFile,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
@@ -402,7 +435,7 @@ fn read_one_session(
     let (message_files, mut part_files_by_message) = match file.cached_subtree {
         Some(walk) => (walk.message_files, walk.part_files_by_message),
         None => {
-            let message_dir = adapter.root.join("message").join(&session_id);
+            let message_dir = file.root.join("message").join(&session_id);
             let files = match list_json_sorted(&message_dir) {
                 Ok(files) => files,
                 Err(error) => {
@@ -443,7 +476,7 @@ fn read_one_session(
         let part_files = if use_cache {
             std::mem::take(&mut part_files_by_message[index])
         } else {
-            let part_dir = adapter.root.join("part").join(message_id);
+            let part_dir = file.root.join("part").join(message_id);
             match list_json_sorted(&part_dir) {
                 Ok(files) => files,
                 Err(error) => {

@@ -57,7 +57,10 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     type State: Default;
 
     fn name(&self) -> &'static str;
-    fn root(&self) -> &Path;
+    /// Every root this driver reads from - almost always one, but an
+    /// adapter configured with `paths = [...]` pools more than one directory
+    /// into a single walk (spec.md#adapter-multi-root).
+    fn roots(&self) -> &[PathBuf];
 
     /// Session id for the freshness gate, from a file's raw first non-empty
     /// line; `None` disables the skip for that file.
@@ -132,12 +135,42 @@ pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath>
     Ok(paths)
 }
 
+/// [`collect_jsonl_files`] over every root, concatenated. Roots are deduped
+/// and never nested (`config_roots` guarantees this), so each file appears
+/// under exactly one root; the final sort makes ingest order deterministic
+/// and independent of root order, matching the single-root walk it replaces.
+///
+/// A root that doesn't exist (yet) is skipped with a warning, not a hard
+/// error - the same tolerance `pond watch` already applies to a root it
+/// can't watch (watch.rs). A single second root missing on a machine that
+/// hasn't written to it yet must not break sync for every OTHER configured
+/// root; the root reappearing (e.g. a work laptop mounting its dir) is
+/// picked up on the next sync with no special handling. A real permissions
+/// or other io error still fails loudly.
+pub(crate) fn collect_jsonl_files_multi(roots: &[PathBuf]) -> Result<Vec<PathBuf>, IoAtPath> {
+    let mut paths = Vec::new();
+    for root in roots {
+        match collect_jsonl_files(root) {
+            Ok(files) => paths.extend(files),
+            Err(io) if io.source.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    root = %root.display(),
+                    "configured source root does not exist yet; skipping (picked up once it appears)",
+                );
+            }
+            Err(io) => return Err(io),
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 pub(crate) fn jsonl_tree_discover<D: JsonlTree>(driver: &D) -> DiscoverFuture<'_> {
     let driver = driver.clone();
     let name = driver.name();
     Box::pin(async move {
         tokio::task::spawn_blocking(move || {
-            collect_jsonl_files(driver.root())
+            collect_jsonl_files_multi(driver.roots())
                 .map(|files| {
                     files
                         .iter()
@@ -250,7 +283,7 @@ fn collect_heads<D: JsonlTree>(
     oracle_is_empty: bool,
 ) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
-    let mut files = collect_jsonl_files(driver.root())
+    let mut files = collect_jsonl_files_multi(driver.roots())
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
     files.retain(|path| !driver.skip_source(path));
     // The freshness peek (first line -> session id, file tail -> latest
@@ -847,7 +880,7 @@ mod tests {
 
     #[derive(Clone)]
     struct PeekTree {
-        root: PathBuf,
+        roots: Vec<PathBuf>,
     }
 
     impl JsonlTree for PeekTree {
@@ -856,8 +889,8 @@ mod tests {
         fn name(&self) -> &'static str {
             "peek-test"
         }
-        fn root(&self) -> &Path {
-            &self.root
+        fn roots(&self) -> &[PathBuf] {
+            &self.roots
         }
         fn peek_session_id(&self, path: &Path, _first_line: &str) -> Option<String> {
             Some(path.file_stem()?.to_str()?.to_owned())
@@ -886,7 +919,7 @@ mod tests {
             write_peek_file(&dir, &format!("s{i:02}.jsonl"), "{\"ts\":1}\n");
         }
         let tree = PeekTree {
-            root: dir.path().to_owned(),
+            roots: vec![dir.path().to_owned()],
         };
         let heads = collect_heads(&tree, false).unwrap();
         let paths: Vec<_> = heads.iter().map(|head| head.path.clone()).collect();

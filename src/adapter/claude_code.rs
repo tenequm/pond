@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
+    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_roots,
     empty_options,
     extract::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
@@ -78,7 +78,11 @@ impl AdapterFactory for ClaudeCodeFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        Ok(Box::new(ClaudeCodeAdapter::new(config_path(NAME, config)?)))
+        let roots = config_roots(NAME, &config)?;
+        if roots.is_empty() {
+            return Err(AdapterError::config(NAME, "missing `path`/`paths`"));
+        }
+        Ok(Box::new(ClaudeCodeAdapter::with_roots(roots)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -295,16 +299,29 @@ fn file_source(data: &FileData) -> Value {
     }
 }
 
-/// Configured claude-code reader. Walks a tree of `*.jsonl` files under
-/// [`Self::root`] and yields canonical events in source order per session.
+/// Configured claude-code reader. Walks a tree of `*.jsonl` files under each
+/// of [`Self::roots`] and yields canonical events in source order per
+/// session; more than one root is what `paths = [...]` in config pools into
+/// one adapter identity (spec.md#adapter-multi-root).
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
 }
 
 impl ClaudeCodeAdapter {
+    /// Single-root constructor: the common case, and what every existing
+    /// test builds against.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            roots: vec![root.into()],
+        }
+    }
+
+    /// Pools every root into one adapter identity
+    /// (spec.md#adapter-multi-root); what `AdapterFactory::open` uses once
+    /// config resolves to more than one directory.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
     }
 }
 
@@ -329,8 +346,8 @@ impl JsonlTree for ClaudeCodeAdapter {
         NAME
     }
 
-    fn root(&self) -> &Path {
-        &self.root
+    fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
     fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String> {
@@ -2624,6 +2641,77 @@ mod tests {
             parent.messages.len(),
             1,
             "journal row must NOT merge even when it carries the parent sessionId",
+        );
+        Ok(())
+    }
+
+    /// Multi-root pooling (spec.md#adapter-multi-root): two independent
+    /// claude-code homes (e.g. a personal `~/.claude/projects` and a work
+    /// `CLAUDE_CONFIG_DIR` tree) configured as one adapter via
+    /// `with_roots` must ingest sessions from BOTH into one corpus, counts
+    /// add up across roots, and re-syncing is idempotent (no duplicate rows
+    /// from the union - spec.md#adapter-integrity-dedup backstop).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_root_pools_sessions_from_every_configured_root() -> anyhow::Result<()> {
+        let root_a = TempDir::new()?;
+        let root_b = TempDir::new()?;
+        let session_a = "aaaaaaaa-0000-0000-0000-000000000001";
+        let session_b = "bbbbbbbb-0000-0000-0000-000000000002";
+        for (root, session_id, text) in [
+            (&root_a, session_a, "hello from root a"),
+            (&root_b, session_b, "hello from root b"),
+        ] {
+            let project_dir = root.path().join("-tmp-pond-test");
+            std::fs::create_dir_all(&project_dir)?;
+            let row = serde_json::json!({
+                "type": "user",
+                "uuid": format!("u-{session_id}"),
+                "sessionId": session_id,
+                "cwd": "/tmp/pond-test",
+                "timestamp": "2026-06-04T00:00:00.000Z",
+                "message": {"role": "user", "content": text},
+            });
+            std::fs::write(
+                project_dir.join(format!("{session_id}.jsonl")),
+                format!("{row}\n"),
+            )?;
+        }
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter =
+            ClaudeCodeAdapter::with_roots(vec![root_a.path().to_owned(), root_b.path().to_owned()]);
+        let first = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            first.sessions_inserted, 2,
+            "both roots' sessions must be ingested by one sync"
+        );
+        assert!(
+            store.get_session(session_a).await?.is_some(),
+            "root a's session must be present"
+        );
+        assert!(
+            store.get_session(session_b).await?.is_some(),
+            "root b's session must be present"
+        );
+
+        // Idempotency: re-syncing the same roots must not duplicate rows -
+        // NoopOracle re-reads everything (no watermark), so this exercises
+        // merge_insert's no-op match, not the freshness skip.
+        let second = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert_eq!(
+            second.sessions_inserted, 0,
+            "a re-sync must insert nothing new"
+        );
+        assert_eq!(
+            second.sessions_matched, 2,
+            "a re-sync must match (no-op) both already-stored sessions"
+        );
+        let session_ids = store.session_ids().await?;
+        assert_eq!(
+            session_ids.len(),
+            2,
+            "the store must hold exactly the union of both roots' sessions, no dupes"
         );
         Ok(())
     }

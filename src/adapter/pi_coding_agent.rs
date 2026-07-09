@@ -25,7 +25,7 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
+    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_roots,
     empty_options,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text,
@@ -47,9 +47,11 @@ impl AdapterFactory for PiCodingAgentFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        Ok(Box::new(PiCodingAgentAdapter::new(config_path(
-            NAME, config,
-        )?)))
+        let roots = config_roots(NAME, &config)?;
+        if roots.is_empty() {
+            return Err(AdapterError::config(NAME, "missing `path`/`paths`"));
+        }
+        Ok(Box::new(PiCodingAgentAdapter::with_roots(roots)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -262,12 +264,23 @@ fn pi_content_item(part: &Part) -> Value {
 /// and yields canonical events in source order per session.
 #[derive(Debug, Clone)]
 pub struct PiCodingAgentAdapter {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
 }
 
 impl PiCodingAgentAdapter {
+    /// Single-root constructor: the common case, and what every existing
+    /// test builds against.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            roots: vec![root.into()],
+        }
+    }
+
+    /// Pools every root into one adapter identity
+    /// (spec.md#adapter-multi-root); what `AdapterFactory::open` uses once
+    /// config resolves to more than one directory.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
     }
 }
 
@@ -294,8 +307,8 @@ impl JsonlTree for PiCodingAgentAdapter {
         NAME
     }
 
-    fn root(&self) -> &Path {
-        &self.root
+    fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
     fn peek_session_id(&self, _path: &Path, first_line: &str) -> Option<String> {

@@ -556,22 +556,102 @@ pub(crate) fn jsonl_bytes(
     Ok(bytes)
 }
 
-/// Shared `AdapterFactory::open` plumbing: parse the config blob's `path` and
-/// expand a leading `~` against `$HOME` once, not per path adapter.
+/// Config blob shape shared by every path-based adapter: the legacy
+/// singular `path`, or the plural `paths` for pooling more than one root
+/// into one adapter identity (spec.md#adapter-multi-root).
+#[derive(serde::Deserialize)]
+struct RootsCfg {
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+}
+
+/// Shared `AdapterFactory::open` plumbing for a single-root adapter: parse
+/// the config blob and expand a leading `~` against `$HOME`. Errors if the
+/// blob resolves to anything other than exactly one root (multi-root config
+/// on a single-root-only adapter is a config error, not a silent "use the
+/// first one").
 pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBuf, AdapterError> {
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    struct Cfg {
-        path: PathBuf,
+    let mut roots = config_roots(adapter, &config)?;
+    if roots.len() > 1 {
+        return Err(AdapterError::config(
+            adapter,
+            "this adapter accepts a single `path`, not `paths`",
+        ));
     }
-    let cfg: Cfg = serde_json::from_value(config)
+    roots
+        .pop()
+        .ok_or_else(|| AdapterError::config(adapter, "missing `path`"))
+}
+
+/// Every local root a filesystem adapter reads from, `~`-expanded. Accepts
+/// the legacy singular `path` and the plural `paths`, normalizing both to
+/// one `Vec<PathBuf>` shape so downstream code sees only one shape. Errors
+/// if both `path` and `paths` are set (ambiguous intent - never silently
+/// merged); returns an empty vec if neither is present (the existing
+/// API-backed-adapter case, and a hard config error for a factory that
+/// requires a root, via [`config_path`]).
+///
+/// De-dups and drops any root nested inside another (a parent+child pair
+/// would double-watch and double-scan the child).
+pub(crate) fn config_roots(
+    adapter: &'static str,
+    config: &Value,
+) -> Result<Vec<PathBuf>, AdapterError> {
+    let cfg: RootsCfg = serde_json::from_value(config.clone())
         .map_err(|err| AdapterError::config(adapter, format!("bad config blob: {err}")))?;
-    Ok(expand_adapter_path(cfg.path))
+    let raw = match (cfg.path, cfg.paths.is_empty()) {
+        (Some(_), false) => {
+            return Err(AdapterError::config(
+                adapter,
+                "set one of `path` or `paths`, not both",
+            ));
+        }
+        (Some(path), true) => vec![path],
+        (None, false) => cfg.paths,
+        (None, true) => Vec::new(),
+    };
+    Ok(dedup_roots(
+        raw.into_iter().map(expand_adapter_path).collect(),
+    ))
+}
+
+/// Drop exact duplicates and any root nested inside another surviving root.
+/// A newly-considered root that is itself inside (or equal to) an already-kept
+/// root is redundant and dropped; a newly-considered root that is the PARENT
+/// of an already-kept root supersedes it, so the (now-redundant) child is
+/// dropped instead and the parent kept. Order-preserving otherwise, so config
+/// order stays the operator-visible order.
+fn dedup_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if kept
+            .iter()
+            .any(|existing| root == *existing || root.starts_with(existing))
+        {
+            tracing::debug!(
+                root = %root.display(),
+                "duplicate or nested source root dropped",
+            );
+            continue;
+        }
+        let before = kept.len();
+        kept.retain(|existing| !existing.starts_with(&root));
+        if kept.len() != before {
+            tracing::debug!(
+                root = %root.display(),
+                "source root supersedes previously configured nested root(s)",
+            );
+        }
+        kept.push(root);
+    }
+    kept
 }
 
 /// Expand a leading `~` in a filesystem-adapter path against `$HOME`. Shared by
-/// [`config_path`] (the factory-open path) and [`source_root`] (the watch path)
-/// so both resolve the same directory from the same config blob.
+/// [`config_roots`] (the factory-open path) and [`source_roots`] (the watch
+/// path) so both resolve the same directories from the same config blob.
 fn expand_adapter_path(path: PathBuf) -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => crate::config::expand_home_under(&path, Path::new(&home)),
@@ -579,20 +659,20 @@ fn expand_adapter_path(path: PathBuf) -> PathBuf {
     }
 }
 
-/// The local directory a resolved adapter reads sessions from, if it is a
+/// Every local directory a resolved adapter reads sessions from, if it is a
 /// path-shaped ("filesystem") adapter. `pond watch` places one fs-notify watch
 /// on each of these roots so a freshly-appended message triggers an immediate
 /// incremental sync. The resolution is deliberately the SAME parse + `~`-expand
-/// [`config_path`] applies inside the factory's `open`, so the watched
-/// directory is byte-identical to the one the importer actually reads - no
+/// [`config_roots`] applies inside the factory's `open`, so the watched
+/// directories are byte-identical to the ones the importer actually reads - no
 /// second source of truth to drift from the adapter config.
 ///
-/// `None` for an adapter whose config blob carries no local `path` (an
-/// API-backed source such as a cloud export): there is nothing on disk to
-/// watch, and such sources fall to the periodic scheduled sync instead.
-pub fn source_root(config: &Value) -> Option<PathBuf> {
-    let path = config.get("path")?.as_str()?;
-    Some(expand_adapter_path(PathBuf::from(path)))
+/// Empty for an adapter whose config blob carries no local `path`/`paths` (an
+/// API-backed source such as a cloud export), OR whose blob is malformed
+/// (`open` will raise that error loudly on the next sync; watch just has
+/// nothing to watch for it meanwhile).
+pub fn source_roots(config: &Value) -> Vec<PathBuf> {
+    config_roots("watch", config).unwrap_or_default()
 }
 
 pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {
@@ -779,6 +859,95 @@ pub(crate) fn by_timestamp_then_id(
 #[inline]
 pub(crate) fn empty_options() -> ProviderOptions {
     ProviderOptions::new()
+}
+
+#[cfg(test)]
+mod config_roots_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::config_roots;
+
+    // `config_roots` reads `$HOME` via `expand_adapter_path`; these tests use
+    // paths that don't start with `~` so expansion is a no-op and no env
+    // mutation is needed (env vars are process-global and tests run
+    // concurrently).
+
+    #[test]
+    fn path_only_yields_one_root() {
+        let cfg = json!({ "path": "/tmp/a" });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from("/tmp/a")],
+        );
+    }
+
+    #[test]
+    fn paths_only_yields_every_root_in_order() {
+        let cfg = json!({ "paths": ["/tmp/a", "/tmp/b"] });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+        );
+    }
+
+    #[test]
+    fn both_path_and_paths_is_an_error() {
+        let cfg = json!({ "path": "/tmp/a", "paths": ["/tmp/b"] });
+        let err = config_roots("t", &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("one of `path` or `paths`"),
+            "error should name the ambiguity: {err}"
+        );
+    }
+
+    #[test]
+    fn neither_key_yields_empty() {
+        let cfg = json!({});
+        assert_eq!(config_roots("t", &cfg).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn tilde_expands_against_home() {
+        let home = std::env::var_os("HOME").expect("HOME must be set for this test");
+        let cfg = json!({ "path": "~/projects" });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from(home).join("projects")],
+        );
+    }
+
+    #[test]
+    fn duplicate_paths_are_deduped() {
+        let cfg = json!({ "paths": ["/tmp/a", "/tmp/b", "/tmp/a"] });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+        );
+    }
+
+    #[test]
+    fn root_nested_inside_an_earlier_root_is_dropped() {
+        let cfg = json!({ "paths": ["/tmp/a", "/tmp/a/child"] });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from("/tmp/a")],
+            "the child is already covered by the parent",
+        );
+    }
+
+    #[test]
+    fn root_that_is_a_parent_of_an_earlier_root_supersedes_it() {
+        let cfg = json!({ "paths": ["/tmp/a/child", "/tmp/a"] });
+        assert_eq!(
+            config_roots("t", &cfg).unwrap(),
+            vec![PathBuf::from("/tmp/a")],
+            "the later, broader root should replace the already-kept child",
+        );
+    }
 }
 
 #[cfg(test)]

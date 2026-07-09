@@ -98,23 +98,26 @@ pub(crate) fn run(command: WatchCmd) -> Result<()> {
 
 // ----- the daemon body (cross-platform) --------------------------------------
 
-/// Resolve the directories to watch: each enabled filesystem adapter's source
-/// root, taken from the SAME resolution `pond sync` uses
-/// ([`crate::resolve_sync_adapters`] -> [`pond::adapter::source_root`]) so the
-/// watched directory can never drift from the one the importer reads.
+/// Resolve the directories to watch: every enabled filesystem adapter's
+/// source roots (plural - an adapter may pool more than one directory, e.g.
+/// two Claude Code homes), taken from the SAME resolution `pond sync` uses
+/// ([`crate::resolve_sync_adapters`] -> [`pond::adapter::source_roots`]) so
+/// the watched directories can never drift from the ones the importer reads.
 /// API-backed adapters contribute no root (nothing on disk to watch) and rely
 /// on the periodic scheduled sync.
 fn resolve_watch_roots(loaded: &Config) -> Result<Vec<(String, PathBuf)>> {
     let adapters = crate::resolve_sync_adapters(loaded, None, None)?;
     let mut roots = Vec::new();
     for (name, blob) in adapters {
-        match pond::adapter::source_root(&blob) {
-            Some(root) => roots.push((name, root)),
-            None => tracing::debug!(
+        let adapter_roots = pond::adapter::source_roots(&blob);
+        if adapter_roots.is_empty() {
+            tracing::debug!(
                 adapter = %name,
                 "watch: adapter has no local source root; left to the scheduled sync"
-            ),
+            );
+            continue;
         }
+        roots.extend(adapter_roots.into_iter().map(|root| (name.clone(), root)));
     }
     Ok(roots)
 }
@@ -243,7 +246,10 @@ async fn sync_tick(loaded: &Config, config_file: &Path, storage_path: Option<Sto
         format: OutputFormat::Text,
     };
     if let Err(error) = crate::run_sync(loaded, config_file, storage_path, invocation).await {
-        tracing::warn!(error = format!("{error:#}"), "watch: sync tick failed; continuing");
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "watch: sync tick failed; continuing"
+        );
     }
 }
 

@@ -593,6 +593,10 @@ A write MUST NOT overwrite a row already present under its primary key - matched
 
 An adapter SHOULD detect duplicate primary keys in its own output using the source format's own mechanism; the write path drops duplicates as a floor regardless. Catching them in the adapter keeps the count visible in the ingest summary, while the write-path floor keeps storage correct when an adapter misses one. A duplicate is two records that agree on primary key and content; two records sharing a source-supplied id but differing in content are not duplicates - dropping one is invisible data loss (`adapter-integrity-no-silent-drops`). An adapter that dedups on a source id alone MUST confirm content-identity before dropping, or distinguish the records by deriving a content-keyed primary key; a collision it cannot resolve surfaces as a visible drop, never a silent one.
 
+#### `adapter-multi-root`
+
+A path-shaped adapter MAY be configured with more than one source root (`paths = [...]` in `config.toml`, alongside the legacy singular `path`), pooled into one adapter identity and one corpus - not a per-root identity or provenance label. Every configured root is walked as if it were one merged tree, in root-then-path sorted order; a root nested inside another configured root is dropped rather than double-scanned. Session ids are globally unique regardless of which root produced them, so `adapter-integrity-additive-sync`'s idempotent primary-key merge already makes a newly-added, removed, or overlapping root safe by construction - no per-root watermark or bookkeeping is needed. A root that does not exist (yet) on a given machine is skipped with a warning, not a hard sync failure, so one root only some machines have does not break sync on the others; `pond watch` places one filesystem watch per resolved root.
+
 ### 6.7 The registry
 
 Adapters are listed in one registry; adding an adapter is a new file plus one line in that list - there is no central enum or dispatch to edit, and no code generation. Why: a low, fixed cost per adapter is what keeps the adapter list open-ended.
