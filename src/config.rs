@@ -291,6 +291,23 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [creds.default]
 # access_key_id     = \"...\"
 # secret_access_key = \"...\"
+
+# `pond share <session-id>` publishing destination - a public bucket, distinct
+# from `[storage]`. Give it its own `[creds.share]` set scoped to `bucket` so
+# publishing credentials stay separate from the private data-store credentials.
+# No POND_* env mirror for this section (file-only, unlike [storage]/[creds]).
+#
+# [share]
+# provider        = \"bucket\"
+# bucket          = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
+# public_base_url = \"https://shares.example.com\"
+# viewer          = \"html\"
+# max_inline_image_bytes = \"2 MiB\"
+#
+# [creds.share]
+# scope             = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
+# access_key_id     = \"...\"
+# secret_access_key = \"...\"
 ";
 
 /// Top-level `config.toml` shape.
@@ -316,9 +333,15 @@ pub struct Config {
     /// `None` = the platform-local data dir.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// `[share]`: `pond share`'s publishing destination. Distinct from
+    /// `[storage]` - shares go to a public bucket, not the private data store.
+    #[serde(default)]
+    pub share: ShareConfig,
     /// `[creds.<name>]`: URL-scoped credential sets. Every storage URL
     /// resolves its own set by longest-prefix `scope` match
     /// (spec.md#creds-scope-match); the resolver lives in `pond::substrate`.
+    /// `[share].bucket` resolves against this same map (typically a distinct
+    /// `[creds.share]` entry, scoped to the share bucket).
     #[serde(default)]
     pub creds: BTreeMap<String, CredsSet>,
 }
@@ -380,6 +403,55 @@ pub fn creds_set_name_error(name: &str) -> String {
     format!(
         "creds set name {name:?} must match [a-z][a-z0-9]{{0,15}} (lowercase alphanumeric, no separators)"
     )
+}
+
+/// `[share]`: `pond share`'s publishing destination. All fields optional -
+/// `pond share` bails with a clear message if `bucket`/`public_base_url` are
+/// unset when it actually needs them (mirrors `[storage]`, which is likewise
+/// unvalidated at load time). File-only: unlike `[storage]`/`[creds.*]`, this
+/// section has no `POND_*` env mirror (`env_mirror` only recognizes
+/// `storage_path` and `creds_*` - see spec.md#storage-env-mirror).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShareConfig {
+    /// Publishing backend. Only `bucket` is implemented; the type exists so
+    /// an unimplemented value fails at config-load with serde's own
+    /// "unknown variant" error instead of a runtime `bail!`.
+    pub provider: Option<ShareProvider>,
+    /// Public bucket URL (same grammar as `[storage].path`), resolved against
+    /// `[creds.<name>]` exactly like any other storage address.
+    pub bucket: Option<String>,
+    /// Public origin that serves `bucket`'s contents, e.g.
+    /// `https://shares.example.com`. Combined with the generated share id to
+    /// form the printed URL: `{public_base_url}/{id}.{ext}`.
+    pub public_base_url: Option<String>,
+    /// Artifact format. Only `html` is implemented in v1.
+    #[serde(default)]
+    pub viewer: ShareViewer,
+    /// Per-image cap for inline `data:` URIs in the HTML renderer; images
+    /// over this size fall back to a placeholder instead of ballooning the
+    /// artifact. Accepts the same forms as `[runtime]`'s byte-size fields
+    /// (`"2 MiB"` or a bare integer). `None` = a 2 MiB built-in default.
+    #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
+    pub max_inline_image_bytes: Option<usize>,
+}
+
+/// `[share].provider` values. Single-variant today; `GitHubPagesPublisher` /
+/// `SelfHostedPublisher` / `HostedPublisher` land as new variants later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareProvider {
+    #[default]
+    Bucket,
+}
+
+/// `[share].viewer` values. Single-variant today; `JsonRenderer` (hosted
+/// viewer) lands as a new variant later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareViewer {
+    #[default]
+    Html,
 }
 
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
@@ -1328,6 +1400,136 @@ region        = "file-region"
             assert_eq!(work.region.as_deref(), Some("file-region"));
             assert_eq!(work.scope.as_deref(), Some("s3://file-bucket/"));
             assert_eq!(config.creds["ci"].access_key_id.as_deref(), Some("ci-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_parses_with_distinct_creds_scope() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+path = "s3+https://acct.example.com/pond-data"
+
+[creds.default]
+access_key_id     = "data-key"
+secret_access_key = "data-secret"
+
+[share]
+provider        = "bucket"
+bucket          = "s3+https://acct.example.com/pond-shares"
+public_base_url = "https://shares.example.com"
+viewer          = "html"
+max_inline_image_bytes = "2 MiB"
+
+[creds.share]
+scope             = "s3+https://acct.example.com/pond-shares"
+access_key_id     = "share-key"
+secret_access_key = "share-secret"
+"#,
+            )?;
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(config.share.provider, Some(ShareProvider::Bucket));
+            assert_eq!(
+                config.share.bucket.as_deref(),
+                Some("s3+https://acct.example.com/pond-shares"),
+            );
+            assert_eq!(
+                config.share.public_base_url.as_deref(),
+                Some("https://shares.example.com"),
+            );
+            assert_eq!(config.share.viewer, ShareViewer::Html);
+            assert_eq!(config.share.max_inline_image_bytes, Some(2 * 1024 * 1024));
+
+            // The data URL resolves to [creds.default]; the share URL resolves
+            // to the separate, more-specifically-scoped [creds.share] - same
+            // resolver, same map, two independent scope matches.
+            let data_url = crate::substrate::StorageUrl::parse(
+                config.storage.path.as_deref().expect("storage path"),
+            )
+            .expect("data url parses");
+            let data_resolved = data_url.resolve(&config.creds).expect("data resolves");
+            assert_eq!(
+                data_resolved.options.get("access_key_id").map(String::as_str),
+                Some("data-key"),
+            );
+
+            let share_url =
+                crate::substrate::StorageUrl::parse(config.share.bucket.as_deref().unwrap())
+                    .expect("share url parses");
+            let share_resolved = share_url.resolve(&config.creds).expect("share resolves");
+            assert_eq!(
+                share_resolved
+                    .options
+                    .get("access_key_id")
+                    .map(String::as_str),
+                Some("share-key"),
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_rejects_unknown_fields_and_bad_viewer() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", "[share]\nbuckett = \"typo\"\n")?;
+            let err = Config::load("config.toml")
+                .expect_err("typo'd field must error")
+                .to_string();
+            assert!(err.contains("buckett"), "got: {err}");
+
+            jail.create_file("config.toml", "[share]\nviewer = \"json\"\n")?;
+            let err = Config::load("config.toml")
+                .expect_err("unimplemented viewer must error")
+                .to_string();
+            assert!(err.contains("json"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_has_no_env_mirror() {
+        // [share] is file-only in v1 (env_mirror only recognizes storage_path
+        // and creds_* - see the doc comment on ShareConfig). A POND_SHARE_*
+        // var must be silently ignored, not error and not override the file.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[share]\nbucket = \"s3://from-file/shares\"\n",
+            )?;
+            jail.set_env("POND_SHARE_BUCKET", "s3://from-env/shares");
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(
+                config.share.bucket.as_deref(),
+                Some("s3://from-file/shares"),
+                "POND_SHARE_BUCKET must not reach [share] - no env mirror in v1",
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_creds_still_get_the_existing_creds_env_mirror() {
+        // [creds.share] is just another entry in the existing creds map, so
+        // it rides the pre-existing POND_CREDS_<NAME>_<FIELD> mirror for free
+        // even though [share] itself has none.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[creds.share]
+scope         = "s3://shares/"
+access_key_id = "from-file"
+"#,
+            )?;
+            jail.set_env("POND_CREDS_SHARE_ACCESS_KEY_ID", "from-env");
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(
+                config.creds["share"].access_key_id.as_deref(),
+                Some("from-env"),
+            );
             Ok(())
         });
     }

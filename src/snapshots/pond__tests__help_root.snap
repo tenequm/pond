@@ -21,6 +21,7 @@ Commands:
     sync         Make pond current: import, index; embed with `pond optimize`
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
+    share        Publish one session's transcript to a public link
 
   Query
     search       Search stored messages

@@ -121,6 +121,18 @@ pond copy --from local --to snapshot.pond
 pond copy --from snapshot.pond --to local
 ```
 
+### Share a session
+
+Publish one session's full transcript as a self-contained HTML page to a public link. No redaction is applied - it requires `--yes` or an interactive confirm that says so plainly:
+
+```sh
+pond share <session-id>                             # confirm interactively, publish to [share].bucket
+pond share <session-id> --yes --open                # skip the prompt, open the URL in a browser
+pond share <session-id> --to s3://bucket/shares     # publish to an ad-hoc destination
+```
+
+Needs a `[share]` bucket configured (see `pond config schema`) or an ad-hoc `--to <url>`; publishing credentials resolve the same way as any other storage address, so a separate `[creds.share]` set keeps them apart from your data-store credentials.
+
 ### Read-only SQL
 
 Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):

@@ -16,6 +16,7 @@ pond <command> --help   # full flags for any command
 - `pond sync [<adapter>]` - import, embed inline, fold indexes; `--dry-run` preview, `--no-wait` skip if locked, `--verify` reconcile, `--format json`
 - `pond optimize` - embed the backlog, fold the indexes; `--only` / `--skip <stage>`
 - `pond copy --from <x> --to <y>` - move data between stores, `.pond` archives, JSONL; `--verify-only`
+- `pond share <session-id>` - publish one session's transcript to a public link (no redaction, `--yes` or interactive confirm required); `--to <url>` for an ad-hoc destination, `--open` to launch it
 
 ## Query
 - `pond search <query>` - search (`--mode vector|fts`, `--sort-by relevance|recency`); `--explain` for the query plan

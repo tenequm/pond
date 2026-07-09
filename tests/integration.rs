@@ -34,6 +34,8 @@ mod schema_migration;
 mod search;
 #[path = "integration/session_scoped_pk.rs"]
 mod session_scoped_pk;
+#[path = "integration/share_publish.rs"]
+mod share_publish;
 #[path = "integration/sql.rs"]
 mod sql;
 #[path = "integration/store_concurrency.rs"]

@@ -122,6 +122,22 @@ impl From<CliSessionFrom> for SessionFrom {
         }
     }
 }
+
+/// CLI surface for `pond share --viewer`. Maps 1:1 to `config::ShareViewer` -
+/// single-variant today (only `HtmlRenderer` is implemented); `json` becomes
+/// valid the day a `JsonRenderer` lands.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliShareViewer {
+    Html,
+}
+
+impl From<CliShareViewer> for pond::config::ShareViewer {
+    fn from(value: CliShareViewer) -> Self {
+        match value {
+            CliShareViewer::Html => pond::config::ShareViewer::Html,
+        }
+    }
+}
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tracing_indicatif::IndicatifLayer;
@@ -243,6 +259,7 @@ Commands:
     sync         Make pond current: import, index; embed with `pond optimize`
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
+    share        Publish one session's transcript to a public link
 
   Query
     search       Search stored messages
@@ -742,6 +759,36 @@ enum Command {
         /// nothing, rebuild no indexes. Read-only; store-to-store only.
         #[arg(long)]
         verify_only: bool,
+    },
+    /// Publish one session's transcript to a public link.
+    ///
+    /// Renders the session as a self-contained HTML page and writes it to the
+    /// `[share]` bucket (or `--to` for an ad-hoc destination), then prints the
+    /// public URL. No redaction is applied - anything in the transcript,
+    /// including secrets, becomes public. Requires `--yes` or an interactive
+    /// confirm.
+    #[command(after_long_help = "Examples:
+  pond share 01HXY...                            confirm interactively, publish to [share].bucket
+  pond share 01HXY... --yes                      skip the confirm prompt
+  pond share 01HXY... --to s3://bucket/shares    publish to an ad-hoc bucket
+  pond share 01HXY... --yes --open               publish and open the URL in a browser")]
+    #[command(display_order = 18)]
+    Share {
+        /// The session to publish.
+        session_id: String,
+        /// Ad-hoc publish destination, overriding `[share].bucket`. Same URL
+        /// grammar and `[creds.*]` resolution as any other storage address.
+        #[arg(long, value_name = "URL")]
+        to: Option<String>,
+        /// Overrides `[share].viewer` for this run.
+        #[arg(long, value_enum)]
+        viewer: Option<CliShareViewer>,
+        /// Skip the interactive confirm prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Open the published URL in the default browser after publishing.
+        #[arg(long)]
+        open: bool,
     },
     /// Inspect configuration.
     ///
@@ -1523,6 +1570,28 @@ async fn main() -> anyhow::Result<()> {
             verify_only,
         } => {
             run_copy(from, to, verify_only, storage_path, config).await?;
+        }
+        Command::Share {
+            session_id,
+            to,
+            viewer,
+            yes,
+            open,
+        } => {
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+            pond::share::run(
+                &store,
+                &loaded,
+                pond::share::ShareArgs {
+                    session_id,
+                    to,
+                    viewer: viewer.map(Into::into),
+                    yes,
+                    open,
+                },
+            )
+            .await?;
         }
         Command::Sql {
             sql,

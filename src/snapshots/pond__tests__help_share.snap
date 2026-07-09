@@ -1,0 +1,56 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Publish one session's transcript to a public link.
+
+Renders the session as a self-contained HTML page and writes it to the `[share]` bucket (or `--to` for an ad-hoc destination), then prints the public URL. No redaction is applied - anything in the transcript, including secrets, becomes public. Requires `--yes` or an interactive confirm.
+
+Usage: pond share [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>
+          The session to publish
+
+Options:
+      --to <URL>
+          Ad-hoc publish destination, overriding `[share].bucket`. Same URL grammar and `[creds.*]` resolution as any other storage address
+
+      --viewer <VIEWER>
+          Overrides `[share].viewer` for this run
+          
+          [possible values: html]
+
+      --yes
+          Skip the interactive confirm prompt
+
+      --open
+          Open the published URL in the default browser after publishing
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond share 01HXY...                            confirm interactively, publish to [share].bucket
+  pond share 01HXY... --yes                      skip the confirm prompt
+  pond share 01HXY... --to s3://bucket/shares    publish to an ad-hoc bucket
+  pond share 01HXY... --yes --open               publish and open the URL in a browser

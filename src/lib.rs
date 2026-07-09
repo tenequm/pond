@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod render;
 pub mod rowmap;
 pub mod sessions;
+pub mod share;
 pub mod sql;
 pub mod substrate;
 pub mod transport;
