@@ -34,10 +34,11 @@ exclude = [
     "**/.DS_Store",
 ]
 
-# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z`
-# with `pond` at the archive root - the URL stays custom because binstall's
-# default `{ repo }` derives from the crate name `pond-db`. `{ bin }` resolves
-# to `pond` (the [[bin]] name).
+# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z` with
+# `pond` at the archive root. The URL stays custom because binstall's default
+# filename template is `{ name }-{ target }`, and `{ name }` is the crate name
+# (`pond-db`) - our assets are named `pond-{ target }`, so the defaults miss.
+# `{ bin }` resolves to `pond` (the [[bin]] name).
 [package.metadata.binstall]
 pkg-url = "https://github.com/tenequm/pond/releases/download/v{ version }/pond-{ target }{ archive-suffix }"
 pkg-fmt = "txz"
