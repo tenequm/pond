@@ -26,6 +26,12 @@ tasks:
     command: 'bash ops/scripts/check-changelog-headers.sh'
     toolchains: 'system'
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
+  # Cheap packaging gate: `cargo package --list` must contain every file the
+  # code embeds via include_str!/include_bytes! (a full verify build is skipped
+  # at publish time - publish_no_verify in .github/release-plz.toml).
+  check-package:
+    command: 'bash ops/scripts/check-package-contents.sh'
+    inputs: ['@group(sources)', 'SKILL.md', 'ops/scripts/check-package-contents.sh']
 
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
   # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via

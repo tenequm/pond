@@ -2,8 +2,8 @@
 publish = true
 # Skip the `cargo publish` verify build: build-and-test already compiled this
 # exact code on the self-hosted runner (with protoc + kache), and a cold lance
-# build on ubuntu-latest risks the publish timeout. Packaging is verified
-# locally via `cargo publish --dry-run` before release.
+# build on ubuntu-latest risks the publish timeout. Packaging contents are
+# gated in CI by pond:check-package (cargo package --list vs include_str!).
 publish_no_verify = true
 # Release whenever main has an unpublished version bump (the release-plz
 # default). The release PR still drives version/changelog; this just also covers

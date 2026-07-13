@@ -18,6 +18,8 @@ categories = ["command-line-utilities", "database", "artificial-intelligence"]
 # Publish only what `cargo install` compiles. The repo's bulk is dev-only:
 # tests/fixtures (~10 MiB) lives under tests/.
 # benches/ stays - the [[bench]] targets declare paths cargo resolves on build.
+# SKILL.md must ship: `pond skill` embeds it via include_str! (excluding it
+# broke `cargo install` for v0.10.0-v0.13.0; check-package guards this in CI).
 exclude = [
     "tests/",
     "docs/",
@@ -27,7 +29,6 @@ exclude = [
     "moon.yml",
     "AGENTS.md",
     "CLAUDE.md",
-    "SKILL.md",
     "flake.nix",
     "nix/",
     "**/.DS_Store",
