@@ -42,7 +42,7 @@ jobs:
       - uses: ./.github/actions/bootstrap
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant).
-      - run: moon run pond:check-changelog pond:format pond:lint pond:test
+      - run: moon run pond:check-changelog pond:check-package pond:format pond:lint pond:test
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
