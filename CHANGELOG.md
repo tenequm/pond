@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.1](https://github.com/tenequm/pond/compare/v0.13.0...v0.13.1) - 2026-07-13
+
+### <!-- 2 -->🐛 Bug Fixes
+- ship SKILL.md in the published crate so cargo install compiles ([#105](https://github.com/tenequm/pond/pull/105)) ([4c2213e](https://github.com/tenequm/pond/commit/4c2213e0ab7489c740d56084059cd9acc5ae1bfd))
+
+### <!-- 5 -->📚 Documentation
+- **site:** lead the demo with the pond status scene ([ba67eca](https://github.com/tenequm/pond/commit/ba67ecabd34f488141fca18cfd694ed6c76d78e8))
+
+### <!-- 6 -->🧹 Chores
+- **bench:** add fmindex_probe substring-index comparison harness ([a9c38cf](https://github.com/tenequm/pond/commit/a9c38cf3cdb140b2f33bac2dbd6aa3f2c2db945f))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.13.0...v0.13.1
+
 ## [0.13.0](https://github.com/tenequm/pond/compare/v0.12.2...v0.13.0) - 2026-07-07
 
 Tool analytics stop paying the JSON tax: the common query shapes now run on three narrow derived columns instead of the multi-GB `variant_data` blob, turning remote S3 tool GROUP BYs from hard >30s timeouts into ~9s answers (local: 1,693ms -> 48ms, ~35x). Existing stores upgrade themselves in place on first open - no re-ingest, no manual step - but once migrated they are unreadable by older pond binaries, so upgrade every machine that shares a store together.
