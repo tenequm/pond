@@ -2,8 +2,10 @@
 
 ## [0.13.1](https://github.com/tenequm/pond/compare/v0.13.0...v0.13.1) - 2026-07-13
 
+Fixes `cargo install pond-db`, broken for every release since v0.10.0: `pond skill` embeds SKILL.md via `include_str!`, but the file was excluded from the published crate, so the .crate on crates.io could not compile. Installs via brew, nix, and cargo-binstall were unaffected (they ship prebuilt binaries). CI now gates packaging so this class of breakage cannot recur.
+
 ### <!-- 2 -->🐛 Bug Fixes
-- ship SKILL.md in the published crate so cargo install compiles ([#105](https://github.com/tenequm/pond/pull/105)) ([4c2213e](https://github.com/tenequm/pond/commit/4c2213e0ab7489c740d56084059cd9acc5ae1bfd))
+- ship SKILL.md in the published crate so cargo install compiles ([#105](https://github.com/tenequm/pond/pull/105)) ([4c2213e](https://github.com/tenequm/pond/commit/4c2213e0ab7489c740d56084059cd9acc5ae1bfd)) - drops SKILL.md from `Cargo.toml`'s exclude list and adds a `check-package` CI gate: `cargo package --list` must contain every `include_str!`/`include_bytes!` target, since publishing skips the verify build (`publish_no_verify`)
 
 ### <!-- 5 -->📚 Documentation
 - **site:** lead the demo with the pond status scene ([ba67eca](https://github.com/tenequm/pond/commit/ba67ecabd34f488141fca18cfd694ed6c76d78e8))
