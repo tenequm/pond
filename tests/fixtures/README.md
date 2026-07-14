@@ -6,7 +6,8 @@ serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
 
 Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
-claude_code nested workflow-subagent sample added 2026-06-04).
+claude_code nested workflow-subagent sample added 2026-06-04; opencode
+`opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15).
 
 ## Why
 
@@ -193,26 +194,100 @@ sample tree.
 
 ### opencode
 
-- Source path: `~/.local/share/opencode/storage/{session,message,part}/...`
-- Layout: fan-out tree, one file per object.
-  - `session/<projectID>/<sessionID>.json` - session metadata
-    (`id`, `version`, `projectID`, `directory`, `title`, `time`)
-  - `message/<sessionID>/<messageID>.json` - one file per message (user
-    messages are tiny stubs; assistant messages carry `system` prompt array,
-    `modelID`, `providerID`, `mode`, `path`, `cost`, `tokens` including
-    cache read/write)
-  - `part/<messageID>/<partID>.json` - one file per part. Types: `text`,
-    `reasoning`, `tool` (state-union with status `pending` / `running` /
-    `completed` / `error`), `step-start`, `step-finish`, `file` (with `mime`,
-    `filename`, `url`, optional `source.text` span), `patch`. Tool calls
-    use `callID` (e.g. Anthropic `toolu_*`).
-  - ULID-style IDs (`ses_*`, `msg_*`, `prt_*`).
-- Samples: 4 sessions, 57 message files, 172 part files. Single projectID
-  because only one existed on the source machine; session-internal
+opencode has TWO on-disk formats and this fixture carries BOTH, because the
+adapter must read both. opencode stopped writing the JSON fan-out tree in
+v1.2.0 (2026-02-14); current releases write a SQLite database instead, and a
+one-time startup migration (removed 2026-06-02) copied the old tree into it.
+Users who jumped past that migration keep tree-only sessions that never reach
+the DB, so completeness requires reading the DB PLUS the stale tree.
+
+- Source-of-truth layout under the opencode data dir
+  (`~/.local/share/opencode/`):
+  - `opencode.db` - the primary store since v1.2.0. SQLite, normally WAL
+    (checkpointed to a plain rollback-journal `.db` here so the fixture is a
+    single file). Channel variants live at `opencode-<channel>.db`. Schema
+    (`packages/core/src/session/sql.ts`):
+    - `session`: typed columns, no JSON blob (`id`, `project_id`,
+      `workspace_id`, `parent_id`, `slug`, `directory`, `path`, `title`,
+      `version`, cost/token counters, `agent`, `model` JSON, `time_created`,
+      `time_updated`, `time_compacting`, `time_archived`).
+    - `message`: `id`, `session_id`, `time_created`, `time_updated`, `data`
+      = the old per-message JSON minus `id`/`sessionID`.
+    - `part`: `id`, `message_id`, `session_id`, `time_created`,
+      `time_updated`, `data` = the old part JSON minus
+      `id`/`sessionID`/`messageID`.
+    opencode rehydrates JSON as `{...data, id, sessionID(, messageID)}`; parts
+    order `ORDER BY message_id, id`. Sibling `project` / `project_directory`
+    tables map `project_id` to a `directory` path. The `event` table is
+    opencode's internal pub/sub log (a redundant copy of session/part events);
+    the adapter ignores it, but it is kept here as realistic DB content.
+  - `storage/{session,message,part}/...` - the STALE legacy fan-out tree, one
+    file per object, left behind by the migration and never updated by current
+    opencode. `session/<projectID>/<sessionID>.json` (session metadata),
+    `message/<sessionID>/<messageID>.json` (user stubs; assistant messages
+    carry `system` prompt array, `modelID`, `providerID`, `mode`, `path`,
+    `cost`, `tokens`), `part/<messageID>/<partID>.json` (types `text`,
+    `reasoning`, `tool` state-union, `step-start`, `step-finish`, `file`,
+    `patch`; tool calls use `callID` like Anthropic `toolu_*`).
+  - ULID-style IDs throughout (`ses_*`, `msg_*`, `prt_*`).
+
+- `opencode.db` sample (the DB-era source of truth): GENERATED, not captured
+  from a real user. Produced by driving the real pinned opencode CLI
+  (`opencode 1.17.15`, `/opt/homebrew/bin/opencode`) non-interactively in
+  sandboxed XDG dirs rooted at a NEUTRAL base path (`/tmp/oc-fixture`) so no
+  username leaks into the recorded `directory` columns; project cwd was a
+  throwaway git repo at `/tmp/oc-fixture/project` (macOS resolves this to
+  `/private/tmp/oc-fixture/project`), plus a second repo at `.../project2` for
+  a distinct `directory`/`project_id`. A copy of the host `auth.json` was
+  placed in the sandbox data dir purely to authenticate, then deleted before
+  the DB was finalized (`account`/`credential`/`workspace` tables are empty -
+  opencode stores auth in `auth.json`, never in the DB). Model:
+  `openrouter/anthropic/claude-haiku-4.5` (cheap), all runs with `--auto` to
+  auto-approve tool permissions. Staged prompts (`opencode run`) drive one
+  session each to reach the part types and session shapes below.
+  - Census: 10 sessions (1 child with `parent_id` set, 1 doctored-archived),
+    across 2 project directories; 27 messages; 69 parts. DB is ~496 KB,
+    single file, no `-wal`/`-shm` sidecars.
+  - Part-type coverage: `text`, `reasoning` (via `--variant high --thinking`),
+    `file` (a user `-f` attachment), `patch` (an edit-tool run), `tool` in
+    both `completed` and `error` states (read of an existing vs missing file;
+    an `edit`; and a `task` tool call), plus `step-start`/`step-finish`
+    (which also carry the git `snapshot` hash as a field - opencode 1.17.15
+    embeds snapshots on step parts rather than emitting a distinct `snapshot`
+    part). The child session is created by a `task`-tool prompt: the child
+    `session` row carries `parent_id` and `agent = general`, and the parent
+    carries a `tool` part named `task`.
+
+- Doctored rows (no current CLI can produce these states, so they are set by a
+  documented `UPDATE`; both replicate real-world DB quirks):
+  - Migration-stamp row: message `msg_f6041991e001BOYvwdP1iI0H0A` (the
+    assistant reply in the plain-text session
+    `ses_09fbe676bffe9nYsSBi5xhBlaD`) has its `time_created` column pushed ~4
+    months forward - to `1794394339614` (2026-11-11) - while its truthful
+    `data.time.created` stays `1784026339614` (2026-07-14). This replicates
+    the Feb-2026 migration quirk where the `time_created` COLUMN is the
+    migration time, not the message time; the adapter must trust
+    `data.time.created`, not the column.
+  - Archived session: `ses_09fbd06d2ffewwkvIM1tMfh8o8` has `time_archived` set
+    (`1784030031861`, ~1h after its `time_updated`). opencode 1.17.15 has no
+    CLI archive command, so the column is set directly.
+
+- Legacy `storage/` tree sample (the stranded-JSON source of truth): 4
+  sessions, 57 message files, 172 part files, retained from the 2026-05-13
+  capture and NOT regenerated (it is exactly the format current opencode no
+  longer writes, so it is the fixture for the tree-only ingest path). Single
+  projectID because only one existed on the source machine; session-internal
   placeholders distinguish `myproject-a` / `myproject-b` / `myproject-c`. The
-  `ses_64247d48` session was added to cover the `reasoning` part type (7
-  reasoning parts) plus an assistant-message `error` field; it also exercises
-  the `tool` `error` state.
+  `ses_64247d48` session covers the `reasoning` part type (7 reasoning parts)
+  plus an assistant-message `error` field and the `tool` `error` state. These
+  session IDs do not overlap the `opencode.db` IDs, so both sources ingest
+  fully; construct an overlapping-ID case in-test if the dedup path needs it.
+
+- Secret hygiene: the generated DB was dumped (`sqlite3 .dump`) and swept -
+  `trufflehog` and `gitleaks` report zero findings, no `/Users/...` path or
+  username survives (a stray `project` row that opencode auto-registered for
+  the real worktree cwd was deleted), and every `message.data` / `part.data`
+  blob passes `json_valid`.
 
 ### pi (pi-coding-agent CLI)
 
@@ -319,7 +394,28 @@ Update as gaps are closed.
   an API playground export with no on-disk format, so a refresh requires a
   new export.
 
+- **opencode `subtask` / `agent` / `compaction` / `retry` / `snapshot` part
+  types absent from `opencode.db`.** opencode 1.17.15's non-interactive
+  `opencode run` cannot reach them: the `task` tool records a child session
+  (via `parent_id` + a `tool` part named `task`) rather than a `subtask`
+  part; inline `@agent` mentions are not parsed as `agent` parts by the run
+  CLI; `--command compact` / a `/compact` message error out or are treated as
+  plain text (real compaction needs a context-overflow, which is expensive to
+  force with a cheap model); `retry` needs a mid-run provider failure; and
+  1.17.15 embeds the git snapshot as a field on `step-start`/`step-finish`
+  parts instead of emitting a distinct `snapshot` part. These types all flow
+  through the adapter as generic `raw_record` carriers (no type-specific
+  logic), so the untested surface is only carrier injection for these five
+  discriminators. Close by capturing from a real long-running install, an
+  interactive/TUI session, or a newer opencode that surfaces a compact CLI
+  command. The child-session lineage path itself (`parent_id`,
+  `source_agent`) IS covered by the `task`-tool child session.
+
 Closed gaps (kept here briefly for history):
+
+- **opencode DB-era (SQLite) storage** - closed by generating
+  `opencode.db` (opencode 1.17.15) alongside the retained stale `storage/`
+  tree; see the opencode per-platform note for coverage and doctored rows.
 
 - **opencode `reasoning` parts** - closed by adding `ses_64247d48` (7
   reasoning parts).
