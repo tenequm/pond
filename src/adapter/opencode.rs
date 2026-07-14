@@ -62,6 +62,10 @@ const NAME: &str = "opencode";
 /// `blocking_send` when the consumer lags.
 const CHANNEL_CAP: usize = 256;
 
+/// Read-side SQLite busy timeout - opencode writes the DB live (WAL), so short
+/// read bursts must not stall on a checkpoint.
+const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
+
 /// Send one yield through the blocking read channel, returning `false` from the
 /// caller (stop reading this source) when the consumer dropped the receiver.
 /// Shared by both readers (the DB and the legacy tree path).
@@ -87,7 +91,7 @@ impl AdapterFactory for OpencodeFactory {
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
-        // The configured root is the opencode DATA DIR now (it holds both the
+        // The configured root is the opencode DATA DIR (it holds both the
         // `opencode*.db` files and the legacy `storage/` tree). Only offer it
         // when it actually has one of those, so an empty `~/.local/share/opencode`
         // does not masquerade as a source.
@@ -122,8 +126,8 @@ pub struct OpencodeAdapter {
 impl OpencodeAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        // Legacy configs pointed `path` at `<data-dir>/storage`; the root is the
-        // data dir now, so a configured basename of `storage` resolves to its
+        // Legacy configs pointed `path` at `<data-dir>/storage`; the root is
+        // the data dir, so a configured basename of `storage` resolves to its
         // parent and existing configs keep working.
         let root = if root.file_name().and_then(|name| name.to_str()) == Some("storage") {
             root.parent()
@@ -136,9 +140,9 @@ impl OpencodeAdapter {
 }
 
 /// The legacy split-file tree lives at `<data-dir>/storage/`; a root that IS
-/// itself a bare tree (`session/` directly under it, e.g. a foreign-restore
-/// target) has no `storage/` subdir, so fall back to the root. Resolved once per
-/// enumeration and carried through to the read pass.
+/// itself a bare tree (`session/` directly under it) has no `storage/` subdir,
+/// so fall back to the root. Resolved once per enumeration and carried through
+/// to the read pass.
 fn tree_base(root: &Path) -> PathBuf {
     let nested = root.join("storage");
     if nested.join("session").is_dir() {
@@ -430,7 +434,7 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
 /// DB once (cached by path); tree sessions route through the legacy read path.
 /// Keeps its OWN connection cache: the enumerate/peek pass's handles are dropped
 /// before this runs, so no rusqlite handle is dragged across the await between
-/// them (the design honored by keeping the caches separate).
+/// them.
 fn read_survivors(
     tree_base: &Path,
     survivors: Vec<SessionSource>,
@@ -458,6 +462,16 @@ fn read_db_survivor(
     light: DbLight,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
+    // DB session ids become restore filenames; a hostile id fails here at
+    // ingest, typed and attributed, like the tree path's four gates.
+    if let Err(error) = validate_path_id(
+        NAME,
+        "session id",
+        &light.session_id,
+        record_location(&light.db_path, &light.session_id, &light.session_id),
+    ) {
+        return tx.blocking_send(Err(error)).is_ok();
+    }
     let conn = match connection(conns, &light.db_path) {
         Ok(conn) => conn,
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
@@ -781,15 +795,13 @@ fn db_paths(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
     list_files_sorted(root, "db", |name| name.starts_with("opencode"))
 }
 
-/// Open a DB read-only with a bounded busy timeout - opencode writes it live
-/// (WAL), so short read bursts must not stall on a checkpoint.
 fn open_db(path: &Path) -> Result<Connection, AdapterError> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|error| db_error(path, "open", &error))?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))
+    conn.busy_timeout(DB_BUSY_TIMEOUT)
         .map_err(|error| db_error(path, "set busy_timeout", &error))?;
     Ok(conn)
 }
@@ -984,29 +996,41 @@ fn session_info_from_row(row: &rusqlite::Row) -> rusqlite::Result<Value> {
 /// Freshness watermark for a DB session (micros): the newest message by id order,
 /// its `data.time.created` raised by any of its tool parts' `state.time.end` (via
 /// [`watermark_micros`]). NEVER the `time_created` COLUMN - migration-stamped rows
-/// carry a future column value that would re-read forever (spec.md, decision 9).
+/// carry a future column value that would re-read forever.
 /// `None` (empty or unreadable newest message) -> safe re-read.
 ///
-/// The `ORDER BY id DESC LIMIT 1` probe scans the full id index by design: the
-/// only streamable alternative order is `time_created` (the poisoned migration
-/// column), so this MUST NOT be "optimized" onto it.
+/// The probe is two statements on purpose: the newest id comes from a covering
+/// scan of the `(session_id, time_created, id)` index (ids only - the sort
+/// discards every row but one, so materializing `data` per row would read the
+/// session's whole `data` column just to keep one blob), then that single
+/// row's `data` is fetched by primary key. The only streamable alternative
+/// order is `time_created` (the poisoned migration column), so this MUST NOT
+/// be "optimized" onto it.
 fn db_session_watermark(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
 ) -> Result<Option<i64>, AdapterError> {
     let mut newest_stmt = conn
-        .prepare_cached(
-            "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-        )
-        .map_err(|error| db_error(db_path, "prepare newest message", &error))?;
-    let latest = newest_stmt
-        .query_row([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .prepare_cached("SELECT id FROM message WHERE session_id = ?1 ORDER BY id DESC LIMIT 1")
+        .map_err(|error| db_error(db_path, "prepare newest message id", &error))?;
+    let newest = newest_stmt
+        .query_row([session_id], |row| row.get::<_, String>(0))
         .optional()
-        .map_err(|error| db_error(db_path, "query newest message", &error))?;
-    let Some((message_id, data)) = latest else {
+        .map_err(|error| db_error(db_path, "query newest message id", &error))?;
+    let Some(message_id) = newest else {
+        return Ok(None);
+    };
+    let mut data_stmt = conn
+        .prepare_cached("SELECT data FROM message WHERE id = ?1")
+        .map_err(|error| db_error(db_path, "prepare newest message data", &error))?;
+    let data = data_stmt
+        .query_row([&message_id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|error| db_error(db_path, "query newest message data", &error))?;
+    // A row vanishing between the two statements (live writer) is a safe
+    // re-read, same as an unparseable one.
+    let Some(data) = data else {
         return Ok(None);
     };
     let Ok(message) = serde_json::from_str::<Value>(&data) else {
@@ -1174,7 +1198,9 @@ fn reconstruct_record(
     session_id: &str,
     record_id: &str,
 ) -> Result<Value, AdapterError> {
-    let mut value = parse_bounded(data, || record_location(db_path, session_id, record_id))?;
+    let mut value = parse_bounded(data.as_bytes(), || {
+        record_location(db_path, session_id, record_id)
+    })?;
     if let Value::Object(map) = &mut value {
         for (key, injected) in inject {
             map.insert(key.to_owned(), injected);
@@ -1192,33 +1218,42 @@ fn record_location(db_path: &Path, session_id: &str, record_id: &str) -> String 
 
 /// Enforce the record cap on `text`, parse it as JSON, and bound every string
 /// leaf at the seam cap (spec.md#adapter-bounded-values) before it leaves this
-/// module. Shared by [`read_json`] (file bytes read to text) and
-/// [`reconstruct_record`] (a DB `data` blob). `location` names the fault site and
-/// is invoked only when building an error.
-fn parse_bounded(text: &str, location: impl FnOnce() -> String) -> Result<Value, AdapterError> {
-    if text.len() > RECORD_CAP {
+/// module. Shared by [`read_json`] (file bytes) and [`reconstruct_record`] (a
+/// DB `data` blob). `location` names the fault site and is invoked only when
+/// building an error.
+fn parse_bounded(bytes: &[u8], location: impl FnOnce() -> String) -> Result<Value, AdapterError> {
+    if bytes.len() > RECORD_CAP {
         return Err(AdapterError::schema(
             NAME,
             location(),
             format!(
                 "record data exceeds adapter record cap: {} bytes > {RECORD_CAP}",
-                text.len()
+                bytes.len()
             ),
         ));
     }
-    let mut value: Value = serde_json::from_str(text)
+    let mut value: Value = serde_json::from_slice(bytes)
         .map_err(|error| AdapterError::parse(NAME, location(), 1, error))?;
     bound_value(&mut value);
     Ok(value)
 }
 
 /// Read one JSON file, bounding every string leaf at the seam cap
-/// (spec.md#adapter-bounded-values) before it leaves this module. Reads the file
-/// then delegates the cap/parse/bound pipeline to [`parse_bounded`].
+/// (spec.md#adapter-bounded-values) before it leaves this module. The size gate
+/// runs on metadata BEFORE the read so the record cap stays a memory bound,
+/// never a post-hoc validation of bytes already resident.
 fn read_json(path: &Path) -> Result<Value, AdapterError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|source| AdapterError::io(NAME, path.display().to_string(), source))?;
-    parse_bounded(&text, || path.display().to_string())
+    let io = |source| AdapterError::io(NAME, path.display().to_string(), source);
+    let len = std::fs::metadata(path).map_err(io)?.len();
+    if len > RECORD_CAP as u64 {
+        return Err(AdapterError::schema(
+            NAME,
+            path.display().to_string(),
+            format!("record data exceeds adapter record cap: {len} bytes > {RECORD_CAP}"),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(io)?;
+    parse_bounded(&bytes, || path.display().to_string())
 }
 
 /// List `*.json` files in `dir`, sorted by filename (= creation order, ids are
@@ -1445,9 +1480,8 @@ fn tool_part(
     let result_ts = millis_at(value, &["state", "time", "end"]).unwrap_or(message_ts);
 
     // Take input/output by moving them out of a single owned `state` clone
-    // rather than cloning each field separately - on the real corpus a fused
-    // tool part fans into three records (call + tool message + result), each
-    // of which used to clone its own slice of `state`.
+    // rather than cloning each field separately - a fused tool part fans into
+    // three records (call + tool message + result) that all draw on `state`.
     let mut owned_state = state.cloned().unwrap_or(Value::Null);
     let (input, result) = match owned_state.as_object_mut() {
         Some(map) => {
@@ -1743,7 +1777,7 @@ mod tests {
     use super::*;
     use crate::{
         adapter::{SyncPlan, extract::LEAF_CAP, test_support::MaxWatermarkOracle},
-        handlers::ingest_adapter,
+        handlers::{SyncEvent, SyncStatus, ingest_adapter},
         sessions::Store,
         wire::PartKind,
     };
@@ -1770,7 +1804,7 @@ mod tests {
     const FRESH_MESSAGE_ID: &str = "msg_zzzzfresh0001";
     const FRESH_PART_ID: &str = "prt_zzzzfresh0001";
 
-    // DB-fixture facts (Agent A's generated corpus).
+    // Facts about the committed DB fixture.
     const DB_SESSION_COUNT: usize = 10;
     const CHILD_SESSION_ID: &str = "ses_09fbc7fc1ffeUaBz77QiNdJbXa";
     const CHILD_PARENT_ID: &str = "ses_09fbc87f2ffeyYCZq51oN2HfGa";
@@ -1898,8 +1932,7 @@ mod tests {
     }
 
     /// A legacy-tree-era session serializes native into the import envelope with
-    /// the tree `raw_record`s embedded (replaces the old tree-value-equal test;
-    /// native no longer writes the split tree).
+    /// the tree `raw_record`s embedded.
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_emits_import_shape_from_tree() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -2713,6 +2746,65 @@ mod tests {
         assert!(
             store.get_session(tree_only).await?.is_some(),
             "the tree-only session still ingests",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hostile_db_session_id_is_rejected_at_ingest() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = db_data_dir(temp.path())?;
+        let conn = Connection::open(data.join("opencode.db"))?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        conn.execute(
+            "UPDATE session SET id = '../evil' WHERE id = ?1",
+            [CHILD_SESSION_ID],
+        )?;
+        drop(conn);
+
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let skip_reasons = std::sync::Mutex::new(Vec::new());
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |event| {
+                if let SyncEvent::SessionDone(outcome) = &event
+                    && let SyncStatus::Skipped { reason } = &outcome.status
+                {
+                    skip_reasons.lock().unwrap().push(reason.clone());
+                }
+            },
+        )
+        .await?;
+
+        let skip_reasons = skip_reasons.into_inner().unwrap();
+        assert!(
+            skip_reasons
+                .iter()
+                .any(|reason| reason.contains("traversal")),
+            "the hostile id must surface as a typed skip, got {skip_reasons:?}",
+        );
+        assert_eq!(summary.skipped_files, 1, "got {summary:?}");
+        assert!(store.get_session("../evil").await?.is_none());
+        let (sessions, ..) = store.row_counts().await?;
+        assert_eq!(
+            sessions,
+            DB_SESSION_COUNT - 1,
+            "every well-formed session still ingests",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_json_file_is_rejected_by_the_record_cap() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("big.json");
+        std::fs::write(&path, vec![b' '; RECORD_CAP + 1])?;
+        let error = read_json(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("record cap"),
+            "the pre-read size gate must reject the file, got: {error}",
         );
         Ok(())
     }
