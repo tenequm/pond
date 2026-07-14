@@ -143,6 +143,11 @@ object_store = { version = "0.13", default-features = false }
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+# opencode's storage moved from a JSON file tree to a Drizzle-managed SQLite DB
+# (`opencode*.db`, WAL) in v1.2.0; the opencode adapter opens it read-only. First
+# SQLite dependency in the tree; `bundled` statically links libsqlite3 so the
+# binary stays self-contained.
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # `~` + `$VAR` expansion for user-supplied paths in config values.
@@ -201,6 +206,8 @@ lance = { version = "8.0.0", features = ["protoc"] }
 lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
+# Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
+rusqlite = { version = "0.40", features = ["bundled"] }
 insta = "1.47.2"
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
@@ -212,12 +219,9 @@ s3s = "0.14"
 s3s-fs = "0.14"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
-# macOS-only dev-dep so `benches/serve_mem_bench.rs` can sample
-# `phys_footprint` via `libc::proc_pid_rusage(RUSAGE_INFO_V4)` - the same
-# ledger Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read.
-# RSS on macOS is wrong in both directions (overcounts shared dyld pages,
-# undercounts compressed pages); phys_footprint is the load-bearing metric.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Bench memory sampling: `getrusage` peak-RSS in commands_bench (any unix),
+# plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.

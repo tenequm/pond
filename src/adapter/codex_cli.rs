@@ -29,7 +29,10 @@ use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
     empty_options,
-    extract::{Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str},
+    extract::{
+        Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
+        json_or_string,
+    },
     extracted_text,
     jsonl::{
         BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_first_line,
@@ -735,9 +738,7 @@ fn tool_call_events(
     let call_id = extract_str(payload, "call_id");
     let name = extract_str(payload, "name");
     let params = match payload.get("arguments") {
-        Some(Value::String(text)) => {
-            serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.clone()))
-        }
+        Some(Value::String(text)) => json_or_string(text),
         Some(other) => other.clone(),
         None => Value::Null,
     };

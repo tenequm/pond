@@ -1127,12 +1127,7 @@ mod tests {
         assert_eq!(first_sync.pending, first_sync.sessions);
         assert_eq!(first_sync.fresh, 0);
 
-        struct MaxWatermarkOracle;
-        impl SkipOracle for MaxWatermarkOracle {
-            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
-                Some(i64::MAX)
-            }
-        }
+        use crate::adapter::test_support::MaxWatermarkOracle;
         let plan = adapter
             .plan(&MaxWatermarkOracle)
             .await?

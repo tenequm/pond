@@ -330,6 +330,12 @@ pub enum SkipReason {
     /// another session under a borrowed id. The payload is the user-facing
     /// reason naming the file and the fix.
     Unsupported(String),
+    /// Session present in more than one source form; this copy is superseded by
+    /// an authoritative copy the same run ingests (e.g. opencode's legacy tree
+    /// copy of a DB-resident session). Content identity is not verified -
+    /// supersession is by session id (the source's documented migration
+    /// contract). Visible and counted, never folded into `Empty`.
+    Superseded,
 }
 
 pub type AdapterYieldStream<'a> =
@@ -768,8 +774,16 @@ pub(crate) mod test_support {
     use serde_json::Value;
     use tempfile::TempDir;
 
-    use super::{Adapter, AdapterFactory, Env, NoopOracle, RestoreFidelity};
+    use super::{Adapter, AdapterFactory, Env, NoopOracle, RestoreFidelity, SkipOracle};
     use crate::{handlers::ingest_adapter, sessions::Store};
+
+    /// Oracle that makes every session gate as fresh.
+    pub(crate) struct MaxWatermarkOracle;
+    impl SkipOracle for MaxWatermarkOracle {
+        fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
+            Some(i64::MAX)
+        }
+    }
 
     /// Shared probe_default contract: when the adapter's expected install
     /// subpath exists under an injected `HOME`, `probe_default` returns it;

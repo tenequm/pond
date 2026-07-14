@@ -4,8 +4,9 @@ description: >
   the persistent /ci-cache PVC; warm runs only pay the version checks and
   PATH/env exports. Root-required tools (zig, macOS SDK, rcodesign, gh) live
   in the pond-runner image instead; user-space static binaries are pinned
-  HERE so pond controls their versions without an image rebuild. rustup
-  installs the rust-toolchain.toml pin on first cargo use.
+  HERE so pond controls their versions without an image rebuild. Every tool is
+  installed explicitly and completely before any task runs - nothing is left to
+  be materialized lazily by a later step.
 runs:
   using: composite
   steps:
@@ -14,8 +15,9 @@ runs:
         set -euo pipefail
         MOON_VERSION=2.3.5
         PROTOC_VERSION=35.1
-        KACHE_VERSION=0.8.0
-        mkdir -p /ci-cache/bin
+        KACHE_VERSION=0.9.0
+
+        mkdir -p /ci-cache/bin /ci-cache/tmp
         echo "/ci-cache/bin" >> "$GITHUB_PATH"
         echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
         {
@@ -24,19 +26,68 @@ runs:
           echo "CARGO_TARGET_DIR=/ci-cache/target"
         } >> "$GITHUB_ENV"
         export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
-        if [ ! -x /ci-cache/cargo/bin/rustup ]; then
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
-        fi
+        export PATH="/ci-cache/bin:/ci-cache/cargo/bin:$PATH"
+
+        # /ci-cache is one RWO PVC shared by every runner pod on the node, so two
+        # concurrent jobs bootstrap into the SAME paths. Serialize: without this,
+        # two pods can write one binary, or one can read another's half-install.
+        exec 9>/ci-cache/.bootstrap.lock
+        flock 9
+
+        # Fetch into a staging dir on the same filesystem, then rename into place.
+        # rename(2) is atomic, so a cancelled or crashed run can never leave a
+        # truncated binary behind for the next job to execute.
+        install_tool() {
+          name=$1 url=$2 want=$3
+          tmp=$(mktemp -d /ci-cache/tmp/"$name".XXXXXX)
+          case $url in
+            *.tar.xz) curl -fsSL "$url" | tar -xJ -C "$tmp" --strip-components=1 "$want" ;;
+            *.tar.gz) curl -fsSL "$url" | tar -xz -C "$tmp" "$want" ;;
+          esac
+          mv -f "$tmp/$(basename "$want")" /ci-cache/bin/"$name"
+          rm -rf "$tmp"
+        }
+
         if [ "$(/ci-cache/bin/moon --version 2>/dev/null)" != "moon $MOON_VERSION" ]; then
-          curl -fsSL "https://github.com/moonrepo/moon/releases/download/v$MOON_VERSION/moon_cli-x86_64-unknown-linux-gnu.tar.xz" \
-            | tar -xJ -C /ci-cache/bin --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+          install_tool moon \
+            "https://github.com/moonrepo/moon/releases/download/v$MOON_VERSION/moon_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            moon_cli-x86_64-unknown-linux-gnu/moon
         fi
-        if [ "$(/ci-cache/bin/protoc --version 2>/dev/null)" != "libprotoc $PROTOC_VERSION" ]; then
-          curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
-          unzip -oq /tmp/protoc.zip -d /ci-cache/protoc 'bin/protoc' 'include/*'
-          ln -sf /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
-        fi
+
         if [ "$(/ci-cache/bin/kache --version 2>/dev/null)" != "kache $KACHE_VERSION" ]; then
-          curl -fsSL "https://github.com/kunobi-ninja/kache/releases/download/v$KACHE_VERSION/kache-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz -C /ci-cache/bin kache
+          install_tool kache \
+            "https://github.com/kunobi-ninja/kache/releases/download/v$KACHE_VERSION/kache-x86_64-unknown-linux-musl.tar.gz" \
+            kache
         fi
+
+        if [ "$(/ci-cache/bin/protoc --version 2>/dev/null)" != "libprotoc $PROTOC_VERSION" ]; then
+          tmp=$(mktemp -d /ci-cache/tmp/protoc.XXXXXX)
+          curl -fsSL -o "$tmp/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+          unzip -oq "$tmp/protoc.zip" -d "$tmp/protoc" 'bin/protoc' 'include/*'
+          rm -rf /ci-cache/protoc.prev
+          if [ -e /ci-cache/protoc ]; then mv /ci-cache/protoc /ci-cache/protoc.prev; fi
+          mv "$tmp/protoc" /ci-cache/protoc
+          ln -sfn /ci-cache/protoc/bin/protoc /ci-cache/bin/protoc
+          rm -rf "$tmp" /ci-cache/protoc.prev
+        fi
+
+        if [ ! -x /ci-cache/cargo/bin/rustup ]; then
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --no-modify-path
+        fi
+
+        # Materialize the rust-toolchain.toml pin (toolchain + components + targets)
+        # HERE, under the lock, as one serial install. It used to happen implicitly
+        # on "first cargo use" - which under moon's parallel task fan-out meant N
+        # rustup installs racing on one shared download dir, and they clobbered each
+        # other ("could not rename 'downloaded' file ... .partial"). A warm cache hid
+        # it; any cold /ci-cache (new PVC, moved nodepool) failed the build.
+        rustup toolchain install --no-self-update
+
+        # Fail loudly here rather than N steps later with a cryptic cargo error.
+        rustup show active-toolchain
+        cargo --version
+        moon --version
+        protoc --version
+        kache --version
