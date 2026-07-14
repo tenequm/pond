@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.13.0"
+version = "0.13.2"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.95"
@@ -18,6 +18,8 @@ categories = ["command-line-utilities", "database", "artificial-intelligence"]
 # Publish only what `cargo install` compiles. The repo's bulk is dev-only:
 # tests/fixtures (~10 MiB) lives under tests/.
 # benches/ stays - the [[bench]] targets declare paths cargo resolves on build.
+# SKILL.md must ship: `pond skill` embeds it via include_str! (excluding it
+# broke `cargo install` for v0.10.0-v0.13.0; check-package guards this in CI).
 exclude = [
     "tests/",
     "docs/",
@@ -27,17 +29,16 @@ exclude = [
     "moon.yml",
     "AGENTS.md",
     "CLAUDE.md",
-    # SKILL.md is NOT excluded: `include_str!` in main.rs/init.rs compiles it
-    # into the binary, so the published package must carry it.
     "flake.nix",
     "nix/",
     "**/.DS_Store",
 ]
 
-# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z`
-# with `pond` at the archive root - the URL stays custom because binstall's
-# default `{ repo }` derives from the crate name `pond-db`. `{ bin }` resolves
-# to `pond` (the [[bin]] name).
+# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z` with
+# `pond` at the archive root. The URL stays custom because binstall's default
+# filename template is `{ name }-{ target }`, and `{ name }` is the crate name
+# (`pond-db`) - our assets are named `pond-{ target }`, so the defaults miss.
+# `{ bin }` resolves to `pond` (the [[bin]] name).
 [package.metadata.binstall]
 pkg-url = "https://github.com/tenequm/pond/releases/download/v{ version }/pond-{ target }{ archive-suffix }"
 pkg-fmt = "txz"
@@ -142,6 +143,11 @@ object_store = { version = "0.13", default-features = false }
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+# opencode's storage moved from a JSON file tree to a Drizzle-managed SQLite DB
+# (`opencode*.db`, WAL) in v1.2.0; the opencode adapter opens it read-only. First
+# SQLite dependency in the tree; `bundled` statically links libsqlite3 so the
+# binary stays self-contained.
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # `~` + `$VAR` expansion for user-supplied paths in config values.
@@ -200,6 +206,8 @@ lance = { version = "8.0.0", features = ["protoc"] }
 lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
+# Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
+rusqlite = { version = "0.40", features = ["bundled"] }
 insta = "1.47.2"
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
@@ -211,12 +219,9 @@ s3s = "0.14"
 s3s-fs = "0.14"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
-# macOS-only dev-dep so `benches/serve_mem_bench.rs` can sample
-# `phys_footprint` via `libc::proc_pid_rusage(RUSAGE_INFO_V4)` - the same
-# ledger Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read.
-# RSS on macOS is wrong in both directions (overcounts shared dyld pages,
-# undercounts compressed pages); phys_footprint is the load-bearing metric.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Bench memory sampling: `getrusage` peak-RSS in commands_bench (any unix),
+# plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
@@ -262,6 +267,10 @@ harness = false
 
 [[bench]]
 name = "commands_bench"
+harness = false
+
+[[bench]]
+name = "fmindex_probe"
 harness = false
 
 # Keeps file/line info for panic backtraces; drops the per-variable debuginfo

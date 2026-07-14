@@ -135,6 +135,13 @@ mod ingest_handler {
         /// rows, or an unextractable header). Benign: counted in
         /// `skipped_empty`, never an error or a drop.
         Empty,
+        /// Session present in more than one source form; this copy is
+        /// superseded by an authoritative copy the same run ingests (e.g.
+        /// opencode's legacy tree copy of a DB-resident session). Content
+        /// identity is not verified - supersession is by session id (the
+        /// source's documented migration contract). Counted in
+        /// `skipped_superseded`, never folded into `Empty`.
+        Superseded,
     }
 
     #[derive(Debug, Default)]
@@ -255,6 +262,10 @@ mod ingest_handler {
                             summary.skipped_empty += 1;
                             SyncStatus::Empty
                         }
+                        SkipReason::Superseded => {
+                            summary.skipped_superseded += 1;
+                            SyncStatus::Superseded
+                        }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += 1;
                             SyncStatus::Skipped { reason }
@@ -276,6 +287,10 @@ mod ingest_handler {
                         SkipReason::Empty => {
                             summary.skipped_empty += count;
                             SyncStatus::Empty
+                        }
+                        SkipReason::Superseded => {
+                            summary.skipped_superseded += count;
+                            SyncStatus::Superseded
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += count;
@@ -451,6 +466,7 @@ mod ingest_handler {
             dropped_sessions = summary.dropped_sessions as u64,
             skipped_files = summary.skipped_files as u64,
             skipped_fresh = summary.skipped_fresh as u64,
+            skipped_superseded = summary.skipped_superseded as u64,
             truncated_values = summary.truncated_values as u64,
             "ingest_adapter complete"
         );

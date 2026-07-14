@@ -1334,7 +1334,7 @@ mod tests {
     /// `sessions`.
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_classifies_fresh_vs_pending_without_decoding() -> anyhow::Result<()> {
-        use crate::adapter::{Adapter, SkipOracle};
+        use crate::adapter::{Adapter, test_support::MaxWatermarkOracle};
 
         let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
         let first_sync = adapter
@@ -1345,12 +1345,6 @@ mod tests {
         assert_eq!(first_sync.pending, first_sync.sessions);
         assert_eq!(first_sync.fresh, 0);
 
-        struct MaxWatermarkOracle;
-        impl SkipOracle for MaxWatermarkOracle {
-            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
-                Some(i64::MAX)
-            }
-        }
         let caught_up = adapter
             .plan(&MaxWatermarkOracle)
             .await?
@@ -1369,7 +1363,7 @@ mod tests {
     /// (`keyless_file_peeks_empty_and_ingests_nothing`).
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_gates_keyless_sessions_empty_and_excludes_journals() -> anyhow::Result<()> {
-        use crate::adapter::{Adapter, SkipOracle};
+        use crate::adapter::{Adapter, test_support::MaxWatermarkOracle};
 
         let corpus = TempDir::new()?;
         let project_dir = corpus.path().join("-tmp-pond-test");
@@ -1405,12 +1399,6 @@ mod tests {
         )?;
         std::fs::write(wf_dir.join("journal.jsonl"), "{\"type\":\"started\"}\n")?;
 
-        struct MaxWatermarkOracle;
-        impl SkipOracle for MaxWatermarkOracle {
-            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
-                Some(i64::MAX)
-            }
-        }
         let adapter = ClaudeCodeAdapter::new(corpus.path());
         let plan = adapter
             .plan(&MaxWatermarkOracle)

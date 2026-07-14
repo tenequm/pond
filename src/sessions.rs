@@ -3492,6 +3492,10 @@ pub struct IngestSummary {
     /// (spec.md#adapter-integrity-event-ordering): file `mtime` was at or before the wall-clock time
     /// pond last wrote that session's row, so re-decode was bypassed.
     pub skipped_fresh: usize,
+    /// Legacy/source copies dropped because an authoritative copy of the same
+    /// session was ingested from another source form this run (currently:
+    /// opencode tree copies superseded by the DB). Counted, never silent.
+    pub skipped_superseded: usize,
     /// Storage-layer failures whose retries were exhausted (commit
     /// conflicts, transient IO that didn't recover). Hard zero on healthy
     /// runs.
@@ -3585,6 +3589,7 @@ impl IngestSummary {
         self.skipped_files += other.skipped_files;
         self.skipped_empty += other.skipped_empty;
         self.skipped_fresh += other.skipped_fresh;
+        self.skipped_superseded += other.skipped_superseded;
         self.storage_errors += other.storage_errors;
         self.truncated_values += other.truncated_values;
         for (key, value) in &other.drop_reasons {

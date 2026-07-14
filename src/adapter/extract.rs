@@ -154,6 +154,15 @@ pub fn extract_raw_record(row: &Value) -> Value {
     bounded
 }
 
+/// Parse `text` as JSON, or preserve it losslessly as a JSON string when it
+/// is not valid JSON. The lossless parse-or-preserve idiom for source columns
+/// that usually hold serialized JSON but may hold plain text (e.g. a tool
+/// call's `arguments`): the raw text survives either way, so no data is
+/// invented or dropped.
+pub(crate) fn json_or_string(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+}
+
 //
 // Round-tripping `Extracted<T>` through serde is required because
 // `PartKind::Text { text: Option<Extracted<String>> }` (and friends) are

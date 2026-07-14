@@ -20,6 +20,7 @@ use pond::{
 use tempfile::TempDir;
 
 mod claude_code;
+mod opencode;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_restore_codex_to_claude_reparses() -> anyhow::Result<()> {
