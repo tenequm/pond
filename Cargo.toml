@@ -206,6 +206,8 @@ lance = { version = "8.0.0", features = ["protoc"] }
 lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
+# Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
+rusqlite = { version = "0.40", features = ["bundled"] }
 insta = "1.47.2"
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
