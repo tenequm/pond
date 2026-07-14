@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.13.2](https://github.com/tenequm/pond/compare/v0.13.1...v0.13.2) - 2026-07-14
+
+### <!-- 2 -->🐛 Bug Fixes
+- **opencode:** read opencode sqlite storage ([#108](https://github.com/tenequm/pond/pull/108)) ([73273d7](https://github.com/tenequm/pond/commit/73273d7506643b7255d50702a6ec634b7db23615))
+
+### <!-- 6 -->🧹 Chores
+- ignore .playwright-cli local state ([1b22537](https://github.com/tenequm/pond/commit/1b225370c3fbe5c10cc3da4485447119ffae42b3))
+- correct the binstall pkg-url comment ([5498a14](https://github.com/tenequm/pond/commit/5498a144e8adba628c5d503b04fec642dd869317))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.13.1...v0.13.2
+
 ## [0.13.1](https://github.com/tenequm/pond/compare/v0.13.0...v0.13.1) - 2026-07-13
 
 Fixes `cargo install pond-db`, broken for every release since v0.10.0: `pond skill` embeds SKILL.md via `include_str!`, but the file was excluded from the published crate, so the .crate on crates.io could not compile. Installs via brew, nix, and cargo-binstall were unaffected (they ship prebuilt binaries). CI now gates packaging so this class of breakage cannot recur.
