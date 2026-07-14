@@ -22,9 +22,15 @@
 //! assistant message. Canonical keeps the two apart (a `tool_result` on an
 //! assistant message is a category error, spec.md#model-part-provenance), so the
 //! adapter splits it: a `ToolCall` Part stays on the assistant message and a
-//! synthetic `Tool` message carries the `ToolResult`. Native restore replays
-//! each real part's stored `raw_record` at its original path and skips the
-//! synthetic records, so the split is value-complete-lossless.
+//! synthetic `Tool` message carries the `ToolResult`.
+//!
+//! Restore (native AND foreign) emits one `<session_id>.json` per session in the
+//! `opencode import` shape - `{ info, messages: [ { info, parts } ] }` (see
+//! `packages/opencode/src/cli/cmd/import.ts`). Native replays each real record's
+//! stored `raw_record` (session/message/part) into that envelope and skips the
+//! synthetic split records (the `Tool` carrier message + `ToolResult` part),
+//! re-fusing into the single source `tool` part, so the split is
+//! value-complete-lossless.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
@@ -1467,11 +1473,16 @@ fn is_synthetic(options: &ProviderOptions) -> bool {
 fn serialize_native(
     session: &crate::sessions::SessionWithMessages,
 ) -> Result<Vec<RestoredFile>, AdapterError> {
-    // Native replays each stored `raw_record` at its original split path; the
-    // synthetic `Tool` message and `ToolResult` (which carry no `raw_record`)
-    // are skipped, re-fusing into the single source `tool` part. Replay echoes
-    // a frozen snapshot - safe only while canonical is append-only
-    // (spec.md#adapter-integrity-additive-sync).
+    // Native replays each stored `raw_record` into the `opencode import`
+    // envelope: the session `info`, then each real message's `raw_record` as an
+    // `info` with its real parts' `raw_record`s nested under it. The synthetic
+    // `Tool` message and `ToolResult` (which carry no `raw_record`) are skipped,
+    // re-fusing into the single source `tool` part. Replay echoes a frozen
+    // snapshot - safe only while canonical is append-only
+    // (spec.md#adapter-integrity-additive-sync). One file per session; a child
+    // session is its own `SessionWithMessages`, so the caller iterating every
+    // session id emits parent and child files independently
+    // (spec.md#adapter-lineage-complete-restore).
     //
     // spec.md#adapter-native-restore-lossless: when the session lacks a stored
     // `raw_record` (older ingest, foreign-sourced session), native is
@@ -1480,78 +1491,53 @@ fn serialize_native(
     let Some(session_raw) = raw_record(&session.session.options) else {
         return serialize_foreign(session);
     };
-    let project_id = session_raw
-        .get("projectID")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            AdapterError::schema(
-                NAME,
-                session.session.id.clone(),
-                "stored session raw_record missing projectID",
-            )
-        })?;
 
-    let mut files = vec![RestoredFile::new(
-        PathBuf::from("session")
-            .join(project_id)
-            .join(format!("{}.json", session.session.id)),
-        encode(&session_raw, &session.session.id)?,
-        RestoreFidelity::Native,
-    )];
-
+    let mut messages = Vec::with_capacity(session.messages.len());
     for message in &session.messages {
-        if !is_synthetic(message.message.options())
-            && let Some(raw) = raw_record(message.message.options())
-        {
-            files.push(RestoredFile::new(
-                PathBuf::from("message")
-                    .join(&session.session.id)
-                    .join(format!("{}.json", message.message.id())),
-                encode(&raw, message.message.id())?,
-                RestoreFidelity::Native,
-            ));
+        if is_synthetic(message.message.options()) {
+            continue;
         }
+        let Some(info) = raw_record(message.message.options()) else {
+            continue;
+        };
+        let mut parts = Vec::with_capacity(message.parts.len());
         for part in &message.parts {
-            // A part that carries a `raw_record` maps 1:1 to a source file at
-            // `part/<message_id>/<part_id>.json`; synthetic split parts do not.
+            // A real part carries its source `raw_record`; the synthetic split
+            // `ToolResult` does not, so it is skipped here.
             if let Some(raw) = raw_record(&part.options) {
-                files.push(RestoredFile::new(
-                    PathBuf::from("part")
-                        .join(&part.message_id)
-                        .join(format!("{}.json", part.id)),
-                    encode(&raw, &part.id)?,
-                    RestoreFidelity::Native,
-                ));
+                parts.push(raw);
             }
         }
+        messages.push(json!({ "info": info, "parts": parts }));
     }
-    Ok(files)
+
+    let body = json!({ "info": session_raw, "messages": messages });
+    Ok(vec![RestoredFile::new(
+        PathBuf::from(format!("{}.json", session.session.id)),
+        encode(&body, &session.session.id)?,
+        RestoreFidelity::Native,
+    )])
 }
 
 fn serialize_foreign(
     session: &crate::sessions::SessionWithMessages,
 ) -> Result<Vec<RestoredFile>, AdapterError> {
-    // Foreign restore: a best-effort, idiomatic opencode tree. A non-opencode
-    // session has no `projectID` hash, so derive a stable directory key from
+    // Foreign restore: a best-effort, idiomatic `opencode import` envelope. A
+    // non-opencode session has no `projectID` hash, so derive a stable key from
     // the project path; tool results (canonical `Tool` messages) and System
-    // carriers have no idiomatic home in opencode's part model and are dropped
-    // (spec.md#adapter-native-restore-lossless, foreign clause).
-    let project_id = encode_project(&session.session.project);
+    // carriers have no idiomatic home in opencode's message model and are
+    // dropped (spec.md#adapter-native-restore-lossless, foreign clause). The
+    // minimal `info` shapes omit fields canonical does not carry (a user
+    // message's `agent`/`model`) - the same loss foreign restore accepts.
     let created = session.session.created_at.timestamp_millis();
-    let session_record = json!({
+    let info = json!({
         "id": session.session.id,
-        "projectID": project_id,
+        "projectID": encode_project(&session.session.project),
         "directory": &*session.session.project,
         "time": { "created": created, "updated": created },
     });
-    let mut files = vec![RestoredFile::new(
-        PathBuf::from("session")
-            .join(&project_id)
-            .join(format!("{}.json", session.session.id)),
-        encode(&session_record, &session.session.id)?,
-        RestoreFidelity::Foreign,
-    )];
 
+    let mut messages = Vec::with_capacity(session.messages.len());
     for message in &session.messages {
         let role = match message.message {
             Message::User { .. } => "user",
@@ -1560,33 +1546,27 @@ fn serialize_foreign(
             Message::Tool { .. } | Message::System { .. } => continue,
         };
         let created = message.message.timestamp().timestamp_millis();
-        let record = json!({
+        let msg_info = json!({
             "id": message.message.id(),
             "sessionID": session.session.id,
             "role": role,
             "time": { "created": created },
         });
-        files.push(RestoredFile::new(
-            PathBuf::from("message")
-                .join(&session.session.id)
-                .join(format!("{}.json", message.message.id())),
-            encode(&record, message.message.id())?,
-            RestoreFidelity::Foreign,
-        ));
+        let mut parts = Vec::with_capacity(message.parts.len());
         for part in &message.parts {
-            let Some(record) = foreign_part(&session.session.id, part) else {
-                continue;
-            };
-            files.push(RestoredFile::new(
-                PathBuf::from("part")
-                    .join(message.message.id())
-                    .join(format!("{}.json", part.id)),
-                encode(&record, &part.id)?,
-                RestoreFidelity::Foreign,
-            ));
+            if let Some(record) = foreign_part(&session.session.id, part) {
+                parts.push(record);
+            }
         }
+        messages.push(json!({ "info": msg_info, "parts": parts }));
     }
-    Ok(files)
+
+    let body = json!({ "info": info, "messages": messages });
+    Ok(vec![RestoredFile::new(
+        PathBuf::from(format!("{}.json", session.session.id)),
+        encode(&body, &session.session.id)?,
+        RestoreFidelity::Foreign,
+    )])
 }
 
 fn foreign_part(session_id: &str, part: &Part) -> Option<Value> {
@@ -1743,17 +1723,228 @@ mod tests {
         Ok(())
     }
 
+    /// The `opencode import` envelope a native serialize must produce for one
+    /// session, rebuilt from the session's own stored `raw_record`s (synthetic
+    /// split records skipped). Serialize just copies those raw_records into the
+    /// envelope, so an emitted body must value-equal this.
+    fn expected_import_body(session: &crate::sessions::SessionWithMessages) -> Value {
+        let mut messages = Vec::new();
+        for message in &session.messages {
+            if is_synthetic(message.message.options()) {
+                continue;
+            }
+            let Some(info) = raw_record(message.message.options()) else {
+                continue;
+            };
+            let parts: Vec<Value> = message
+                .parts
+                .iter()
+                .filter_map(|part| raw_record(&part.options))
+                .collect();
+            messages.push(json!({ "info": info, "parts": parts }));
+        }
+        json!({
+            "info": raw_record(&session.session.options).expect("native session has raw_record"),
+            "messages": messages,
+        })
+    }
+
+    /// Serialize `session` native and return the single emitted file's parsed
+    /// JSON body, asserting the import-shape envelope (`<id>.json`, one file).
+    fn serialize_native_body(session: &crate::sessions::SessionWithMessages) -> Value {
+        let files = serialize_native(session).expect("native serialize");
+        assert_eq!(files.len(), 1, "one file per session");
+        let file = &files[0];
+        assert_eq!(file.actual_fidelity, RestoreFidelity::Native);
+        assert_eq!(
+            file.relative_path,
+            PathBuf::from(format!("{}.json", session.session.id)),
+            "native emits <session_id>.json at the root",
+        );
+        let body: Value = serde_json::from_slice(&file.bytes).expect("emitted body is JSON");
+        assert!(body.get("info").is_some(), "envelope carries session info");
+        assert!(
+            body.get("messages").and_then(Value::as_array).is_some(),
+            "envelope carries a messages array",
+        );
+        body
+    }
+
+    /// A legacy-tree-era session serializes native into the import envelope with
+    /// the tree `raw_record`s embedded (replaces the old tree-value-equal test;
+    /// native no longer writes the split tree).
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_restore_is_value_equal_to_tree_corpus() -> anyhow::Result<()> {
-        // Native restore round-trips the legacy tree exactly; copy the tree into a
-        // db-free temp root so restore is exercised against tree-sourced sessions
-        // (the DB-native conformance is a separate test).
+    async fn native_restore_emits_import_shape_from_tree() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
         copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        let store = Store::open_local(temp.path().join("store")).await?;
         let adapter = OpencodeAdapter::new(&source);
-        crate::adapter::test_support::assert_native_restore(&OpencodeFactory, &adapter, &source)
-            .await
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        let session_ids = store.session_ids().await?;
+        assert!(!session_ids.is_empty(), "tree fixture ingests sessions");
+        for session_id in session_ids {
+            let session = store
+                .get_session(&session_id)
+                .await?
+                .expect("session round-trips");
+            let body = serialize_native_body(&session);
+            assert_eq!(
+                body,
+                expected_import_body(&session),
+                "tree session {session_id} embeds its raw_records into the envelope",
+            );
+            // No synthetic split record leaks into the envelope: every emitted
+            // message id is a real (non-synthetic) canonical message.
+            let real_ids: std::collections::HashSet<&str> = session
+                .messages
+                .iter()
+                .filter(|m| !is_synthetic(m.message.options()))
+                .map(|m| m.message.id())
+                .collect();
+            for message in body["messages"].as_array().unwrap() {
+                let id = message["info"]["id"].as_str().expect("message info id");
+                assert!(
+                    real_ids.contains(id),
+                    "emitted message {id} must be a real canonical message",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Native restore against the DB fixture: for every emitted file, the
+    /// envelope `info`/messages/parts value-equal the rows reconstructed straight
+    /// from the DB (`reconstruct_session_info` / `reconstruct_record`), synthetic
+    /// split records are absent, and every session - parent AND child - gets its
+    /// own file (spec.md#adapter-lineage-complete-restore).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_restore_conformance_against_db_fixture() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = db_data_dir(temp.path())?;
+        let store = Store::open_local(temp.path().join("store")).await?;
+        ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+
+        // Independently reconstruct the expected records from the raw DB rows.
+        let db = std::path::Path::new(DB_FIXTURE);
+        let conn = open_db(db)?;
+        let expected_session: HashMap<String, Value> = fetch_session_rows(&conn, db)?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    crate::adapter::extract::extract_raw_record(&reconstruct_session_info(&row)),
+                )
+            })
+            .collect();
+        let reconstruct_expected = |data: &str, inject: &[(&str, Value)]| -> Value {
+            reconstruct_record(data, "", inject).unwrap()
+        };
+
+        let mut file_count = 0usize;
+        let mut saw_child = false;
+        let mut saw_parent = false;
+        for session_id in store.session_ids().await? {
+            let session = store
+                .get_session(&session_id)
+                .await?
+                .expect("session round-trips");
+            let body = serialize_native_body(&session);
+            file_count += 1;
+            if session_id == CHILD_SESSION_ID {
+                saw_child = true;
+            }
+            if session_id == CHILD_PARENT_ID {
+                saw_parent = true;
+            }
+
+            // Session info matches the row-reconstructed SessionInfo.
+            assert_eq!(
+                &body["info"],
+                expected_session
+                    .get(&session_id)
+                    .unwrap_or_else(|| panic!("session {session_id} in DB")),
+                "session info equals the row-reconstructed SessionInfo",
+            );
+
+            // Message + part bodies match the rows' reconstructed JSON.
+            let mut expected_msg_ids: Vec<String> = Vec::new();
+            let mut stmt =
+                conn.prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY id")?;
+            let msg_rows: Vec<(String, String)> = stmt
+                .query_map([&session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (message_id, data) in &msg_rows {
+                expected_msg_ids.push(message_id.clone());
+                let expected_info = reconstruct_expected(
+                    data,
+                    &[("id", json!(message_id)), ("sessionID", json!(session_id))],
+                );
+                let entry = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["info"]["id"].as_str() == Some(message_id.as_str()))
+                    .unwrap_or_else(|| panic!("message {message_id} emitted"));
+                assert_eq!(&entry["info"], &expected_info, "message info matches row");
+
+                let mut pstmt =
+                    conn.prepare("SELECT id, data FROM part WHERE message_id = ?1 ORDER BY id")?;
+                let expected_parts: Vec<Value> = pstmt
+                    .query_map([message_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .map(|r| {
+                        let (part_id, data) = r.unwrap();
+                        reconstruct_expected(
+                            &data,
+                            &[
+                                ("id", json!(part_id)),
+                                ("sessionID", json!(session_id)),
+                                ("messageID", json!(message_id)),
+                            ],
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    entry["parts"].as_array().unwrap(),
+                    &expected_parts,
+                    "parts for message {message_id} match the rows in id order",
+                );
+            }
+
+            // Synthetic split records are absent: the envelope's message ids are
+            // exactly the DB message rows (no `<part>/result` carriers).
+            let emitted_ids: Vec<&str> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["info"]["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                emitted_ids.len(),
+                expected_msg_ids.len(),
+                "no synthetic message carriers leak into the envelope",
+            );
+        }
+
+        assert_eq!(file_count, DB_SESSION_COUNT, "one file per DB session");
+        assert!(
+            saw_child,
+            "child session {CHILD_SESSION_ID} gets its own file"
+        );
+        assert!(
+            saw_parent,
+            "parent session {CHILD_PARENT_ID} gets its own file",
+        );
+        Ok(())
     }
 
     /// `plan` is the events_with freshness pre-pass run standalone and MUST
@@ -2591,8 +2782,13 @@ mod tests {
         Ok(())
     }
 
+    /// Foreign restore of a non-opencode (pi) session emits one `<id>.json` in
+    /// the `opencode import` envelope: `{info, messages:[{info, parts}]}` built
+    /// from canonical fields, with a re-fused `tool` part (`state.status =
+    /// completed`, `input`). Per spec 6.8 there is no re-parse path for import
+    /// JSON, so structural + value assertions suffice (golden-file reviewed).
     #[tokio::test(flavor = "multi_thread")]
-    async fn foreign_serialization_reparses_as_opencode() -> anyhow::Result<()> {
+    async fn foreign_serialization_emits_import_shape() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
         let origin = crate::adapter::PiCodingAgentAdapter::new(concat!(
@@ -2600,33 +2796,72 @@ mod tests {
             "/tests/fixtures/adapter/pi-coding-agent/sessions"
         ));
         ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
-        let session_id = origin_store
-            .session_ids()
-            .await?
-            .into_iter()
-            .next()
-            .expect("pi fixture has sessions");
-        let session = origin_store
-            .get_session(&session_id)
-            .await?
-            .expect("fixture session is readable");
 
-        let restored_root = temp.path().join("opencode-storage");
-        crate::adapter::write_restored_files(
-            &restored_root,
-            OpencodeFactory.serialize(&session, RestoreFidelity::Foreign)?,
-        )?;
-        let restored_store = Store::open_local(temp.path().join("restored-store")).await?;
-        let summary = ingest_adapter(
-            &restored_store,
-            &OpencodeAdapter::new(&restored_root),
-            &crate::adapter::NoopOracle,
-            |_| {},
-        )
-        .await?;
+        let mut saw_tool = false;
+        for session_id in origin_store.session_ids().await? {
+            let session = origin_store
+                .get_session(&session_id)
+                .await?
+                .expect("fixture session is readable");
 
-        assert!(summary.accepted() > 0);
-        assert_eq!(summary.dropped_events, 0);
+            let mut files = OpencodeFactory.serialize(&session, RestoreFidelity::Foreign)?;
+            assert_eq!(files.len(), 1, "foreign emits one file per session");
+            let file = files.remove(0);
+            assert_eq!(file.actual_fidelity, RestoreFidelity::Foreign);
+            assert_eq!(
+                file.relative_path,
+                PathBuf::from(format!("{session_id}.json")),
+                "foreign emits <session_id>.json at the root",
+            );
+            let body: Value = serde_json::from_slice(&file.bytes)?;
+            // Defense-in-depth: the writer accepts the emitted path.
+            crate::adapter::write_restored_files(
+                &temp.path().join("opencode-restore"),
+                vec![file],
+            )?;
+            assert_eq!(
+                body["info"]["id"].as_str(),
+                Some(session_id.as_str()),
+                "envelope info carries the session id",
+            );
+            assert!(
+                body["info"]["directory"].is_string(),
+                "foreign session info carries a directory",
+            );
+            let messages = body["messages"]
+                .as_array()
+                .expect("envelope carries a messages array");
+
+            for message in messages {
+                let role = message["info"]["role"].as_str().expect("message info role");
+                assert!(
+                    role == "user" || role == "assistant",
+                    "only user/assistant carriers survive foreign restore, got {role}",
+                );
+                assert_eq!(
+                    message["info"]["sessionID"].as_str(),
+                    Some(session_id.as_str()),
+                );
+                for part in message["parts"].as_array().expect("parts array") {
+                    if part["type"].as_str() == Some("tool") {
+                        saw_tool = true;
+                        assert_eq!(
+                            part["state"]["status"].as_str(),
+                            Some("completed"),
+                            "a re-fused tool part is completed",
+                        );
+                        assert!(
+                            part["state"].get("input").is_some(),
+                            "a re-fused tool part carries its input",
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_tool,
+            "the pi fixture's tool call re-fuses into a `tool` part",
+        );
         Ok(())
     }
 
