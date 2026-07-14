@@ -32,7 +32,8 @@
 //! re-fusing into the single source `tool` part, so the split is
 //! value-complete-lossless.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_stream::stream;
@@ -48,8 +49,9 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_path,
-    extract::{bound_value, extract_str},
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
+    config_path,
+    extract::{bound_value, extract_str, json_or_string},
     jsonl::RECORD_CAP,
     part_id, part_ordinal, raw_record, source_options, validate_path_id,
 };
@@ -59,6 +61,17 @@ const NAME: &str = "opencode";
 /// Event-channel bound; doubles as backpressure - the blocking reader parks on
 /// `blocking_send` when the consumer lags.
 const CHANNEL_CAP: usize = 256;
+
+/// Send one yield through the blocking read channel, returning `false` from the
+/// caller (stop reading this source) when the consumer dropped the receiver.
+/// Shared by both readers (the DB and the legacy tree path).
+macro_rules! emit {
+    ($tx:expr, $item:expr) => {
+        if $tx.blocking_send($item).is_err() {
+            return false;
+        }
+    };
+}
 
 /// Stateless factory: opens [`OpencodeAdapter`] instances and probes for the
 /// canonical install location under `~/.local/share/opencode/storage`.
@@ -120,15 +133,12 @@ impl OpencodeAdapter {
         };
         Self { root }
     }
-
-    /// The legacy split-file tree lives at `<data-dir>/storage/`; a root that IS
-    /// itself a bare tree (`session/` directly under it, e.g. a foreign-restore
-    /// target) has no `storage/` subdir, so fall back to the root.
-    fn tree_base(&self) -> PathBuf {
-        tree_base(&self.root)
-    }
 }
 
+/// The legacy split-file tree lives at `<data-dir>/storage/`; a root that IS
+/// itself a bare tree (`session/` directly under it, e.g. a foreign-restore
+/// target) has no `storage/` subdir, so fall back to the root. Resolved once per
+/// enumeration and carried through to the read pass.
 fn tree_base(root: &Path) -> PathBuf {
     let nested = root.join("storage");
     if nested.join("session").is_dir() {
@@ -143,11 +153,11 @@ impl Adapter for OpencodeAdapter {
         let root = self.root.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let sources = enumerate_sources(&root)?;
-                // Count the deduped tree copies too: the progress bar shrinks its
-                // length by the `SkippedBatch` count (an Empty bulk skip), so the
-                // discover total must include what that skip will subtract.
-                Ok(sources.db.len() + sources.tree.len() + sources.duplicates)
+                // The TRUE deduped count: every DB session id plus each legacy-tree
+                // session whose id no DB carries. Superseded tree copies are NOT
+                // counted - the progress bar never ticks them (the bulk Superseded
+                // skip leaves its length untouched).
+                Ok(enumerate_and_peek(&root, false).entries.len())
             })
             .await
             .map_err(join_error)?
@@ -161,19 +171,25 @@ impl Adapter for OpencodeAdapter {
             // per-session peek sync's gate pays every run, classified instead of
             // read. On an empty oracle the peeks are skipped - a first sync reads
             // everything. A message-less session stays Opaque (never Empty):
-            // reading it still ingests its Session row.
+            // reading it still ingests its Session row. Degrades like the gate: a
+            // source that failed to enumerate already warned and is counted as
+            // whatever survived, never propagated.
             let peek = !oracle.is_empty();
-            let heads = tokio::task::spawn_blocking(move || peek_heads(&root, peek))
+            let peeked = tokio::task::spawn_blocking(move || enumerate_and_peek(&root, peek))
                 .await
-                .map_err(join_error)??;
+                .map_err(join_error)?;
             if !peek {
-                return Ok(Some(super::SyncPlan::all_pending(heads.len())));
+                return Ok(Some(super::SyncPlan::all_pending(peeked.entries.len())));
             }
             Ok(Some(super::SyncPlan::from_heads(
                 oracle,
-                heads
-                    .iter()
-                    .map(|(session_id, watermark)| (Some(session_id.as_str()), *watermark)),
+                peeked.entries.iter().map(|entry| {
+                    let watermark = match entry.source_ts {
+                        Some(ts) => super::SourceWatermark::At(ts),
+                        None => super::SourceWatermark::Opaque,
+                    };
+                    (Some(entry.source.session_id()), watermark)
+                }),
             )))
         })
     }
@@ -189,28 +205,38 @@ impl Adapter for OpencodeAdapter {
             // consult the borrowed oracle without dragging a rusqlite handle
             // across an await point.
             let peeked = tokio::task::spawn_blocking(move || enumerate_and_peek(&root, peek)).await;
-            let Peeked { entries, duplicates } = match peeked {
-                Ok(Ok(peeked)) => peeked,
-                Ok(Err(error)) => { yield Err(error); return; }
+            let Peeked { tree_base, entries, duplicates, errors } = match peeked {
+                Ok(peeked) => peeked,
                 Err(join) => { yield Err(join_error(join)); return; }
             };
 
-            // Legacy-tree copies of DB sessions never reach the read pass; surface
-            // the count so the dedup skip is visible, not silent
-            // (spec.md#adapter-integrity-dedup).
+            // Per-source enumeration failures surface as visible errors and the
+            // run continues with the survivors (spec.md#adapter-integrity-no-silent-drops).
+            // A failed DB's session ids are unknown this run, so its tree copies
+            // (if any) ingest undeduped - additive and safe, self-correcting once
+            // the DB opens again next run.
+            for error in errors {
+                yield Err(error);
+            }
+
+            // spec.md#adapter-integrity-dedup: a legacy-tree copy that shares a DB
+            // session's id is a pre-1.2 migration artifact, superseded wholesale by
+            // the DB copy. Content identity is deliberately NOT verified (locked
+            // plan decision): the drop stays visible as a counted Superseded skip -
+            // the spec's sanctioned terminal state for an unresolved collision -
+            // never folded into Empty.
             if duplicates > 0 {
                 yield Ok(AdapterYield::SkippedBatch {
-                    reason: SkipReason::Empty,
+                    reason: SkipReason::Superseded,
                     count: duplicates,
                 });
             }
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
-                let session_id = entry.source.session_id().to_owned();
-                if crate::adapter::is_session_fresh(oracle, &session_id, entry.source_ts) {
+                if crate::adapter::is_session_fresh(oracle, entry.source.session_id(), entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
-                        session_id: Some(session_id),
+                        session_id: Some(entry.source.session_id().to_owned()),
                         project: None,
                         reason: SkipReason::Fresh,
                     });
@@ -220,7 +246,6 @@ impl Adapter for OpencodeAdapter {
             }
 
             let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
-            let tree_base = adapter.tree_base();
             let handle =
                 tokio::task::spawn_blocking(move || read_survivors(&tree_base, survivors, &tx));
             while let Some(item) = rx.recv().await {
@@ -240,19 +265,28 @@ struct HeadEntry {
     source_ts: Option<i64>,
 }
 
-/// Where a session's records come from: a SQLite DB or the legacy split tree.
+/// Where a session's records come from: a SQLite DB (identified by id, its full
+/// row fetched at read time) or the legacy split tree.
 enum SessionSource {
-    Db(Box<DbSessionHead>),
+    Db(DbLight),
     Tree(SessionFile),
 }
 
 impl SessionSource {
     fn session_id(&self) -> &str {
         match self {
-            SessionSource::Db(head) => &head.session.id,
+            SessionSource::Db(light) => &light.session_id,
             SessionSource::Tree(file) => &file.session_id,
         }
     }
+}
+
+/// A DB session located by the light enumeration SELECT: just the DB it lives in
+/// and its id. The full `session` row is fetched by primary key at read time so
+/// the freshness gate never materializes a row it may skip.
+struct DbLight {
+    db_path: PathBuf,
+    session_id: String,
 }
 
 /// A session read from a DB: the canonical `Session` (built from the row
@@ -262,70 +296,119 @@ struct DbSessionHead {
     session: Session,
 }
 
-struct Sources {
-    db: Vec<DbSessionHead>,
-    tree: Vec<SessionFile>,
-    /// Tree sessions whose id is already covered by a DB (DB wins).
-    duplicates: usize,
-}
-
+/// The enumerated (and optionally peeked) session set, plus the once-resolved
+/// tree base carried through to the read pass and any per-source enumeration
+/// failures collected for the gate to surface.
 struct Peeked {
+    tree_base: PathBuf,
     entries: Vec<HeadEntry>,
+    /// Tree sessions whose id a DB already carries (DB wins); counted, not read.
     duplicates: usize,
+    errors: Vec<AdapterError>,
 }
 
-/// Enumerate both sources and dedup by session id: every DB session, plus the
-/// legacy-tree sessions whose id no DB already carries (`adapter-integrity-dedup`).
-fn enumerate_sources(root: &Path) -> Result<Sources, AdapterError> {
-    let db = collect_db_heads(root)?;
-    let seen: HashSet<&str> = db.iter().map(|head| head.session.id.as_str()).collect();
+/// Enumerate both sources into light entries, dedup by session id (every DB
+/// session id, plus the legacy-tree sessions no DB carries,
+/// `adapter-integrity-dedup`), and - when `peek` - compute each session's
+/// freshness watermark. A single connection per DB is opened for the id SELECT
+/// and reused for every one of that DB's session peeks (no double open). Tree
+/// walks cache their listings on the `SessionFile` so the read pass does not
+/// re-list.
+///
+/// Error resilience (spec.md#adapter-integrity-no-silent-drops), two levels:
+/// - a per-session watermark peek that fails degrades to `source_ts = None`
+///   (never fresh, so a safe re-read), not propagated;
+/// - a per-source failure (a DB that won't open, its id SELECT fails, or an
+///   unlistable tree) is `warn!`-logged naming the source and collected into
+///   `errors`, and enumeration continues with the remaining sources.
+fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
     let tree_base = tree_base(root);
-    let mut tree = Vec::new();
-    let mut duplicates = 0;
-    for file in collect_session_files(&tree_base)? {
-        if seen.contains(file.session_id.as_str()) {
-            duplicates += 1;
-        } else {
-            tree.push(file);
+    let mut errors = Vec::new();
+    let mut conns: HashMap<PathBuf, Connection> = HashMap::new();
+
+    // DB side: light `(db_path, session_id)` per session, resilient per source.
+    let mut db_entries: Vec<DbLight> = Vec::new();
+    let mut db_ids: HashSet<String> = HashSet::new();
+    let paths = match db_paths(root) {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(path = %root.display(), %error, "opencode: listing DB files failed");
+            errors.push(error);
+            Vec::new()
+        }
+    };
+    for db_path in paths {
+        match db_session_ids(&mut conns, &db_path) {
+            Ok(ids) => {
+                for id in ids {
+                    db_ids.insert(id.clone());
+                    db_entries.push(DbLight {
+                        db_path: db_path.clone(),
+                        session_id: id,
+                    });
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    %error,
+                    "opencode: enumerating DB sessions failed"
+                );
+                errors.push(error);
+            }
         }
     }
-    Ok(Sources {
-        db,
-        tree,
-        duplicates,
-    })
-}
 
-/// Enumerate and, when `peek`, compute each session's freshness watermark. DB
-/// watermarks reuse one connection per DB; tree walks cache their listings on
-/// the `SessionFile` so the read pass does not re-list.
-fn enumerate_and_peek(root: &Path, peek: bool) -> Result<Peeked, AdapterError> {
-    let Sources {
-        db,
-        tree,
-        duplicates,
-    } = enumerate_sources(root)?;
-    let tree_base = tree_base(root);
-    let mut conns: HashMap<PathBuf, Connection> = HashMap::new();
-    let mut entries = Vec::with_capacity(db.len() + tree.len());
-    for head in db {
+    // Tree side: list session files and dedup against the DB ids.
+    let mut tree_entries: Vec<SessionFile> = Vec::new();
+    let mut duplicates = 0usize;
+    match collect_session_files(&tree_base) {
+        Ok(files) => {
+            for file in files {
+                if db_ids.contains(&file.session_id) {
+                    duplicates += 1;
+                } else {
+                    tree_entries.push(file);
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %tree_base.display(),
+                %error,
+                "opencode: listing tree sessions failed"
+            );
+            errors.push(error);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(db_entries.len() + tree_entries.len());
+    for light in db_entries {
         let source_ts = if peek {
-            let conn = connection(&mut conns, &head.db_path)?;
-            db_session_watermark(conn, &head.db_path, &head.session.id)?
+            match connection(&mut conns, &light.db_path) {
+                Ok(conn) => {
+                    db_session_watermark(conn, &light.db_path, &light.session_id).unwrap_or(None)
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
         entries.push(HeadEntry {
-            source: SessionSource::Db(Box::new(head)),
+            source: SessionSource::Db(light),
             source_ts,
         });
     }
-    for mut file in tree {
+    for mut file in tree_entries {
         let source_ts = if peek {
-            let walk = walk_session_subtree(&tree_base, &file.session_id)?;
-            let ts = newest_message_ts(&walk);
-            file.cached_subtree = Some(walk);
-            ts
+            match walk_session_subtree(&tree_base, &file.session_id) {
+                Ok(walk) => {
+                    let ts = newest_message_ts(&walk);
+                    file.cached_subtree = Some(walk);
+                    ts
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -334,33 +417,20 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Result<Peeked, AdapterError> {
             source_ts,
         });
     }
-    Ok(Peeked {
+
+    Peeked {
+        tree_base,
         entries,
         duplicates,
-    })
-}
-
-/// The `plan()` heads: every session id with its `SourceWatermark`. When `!peek`
-/// every watermark is `Opaque` (plan short-circuits to all-pending before use).
-fn peek_heads(
-    root: &Path,
-    peek: bool,
-) -> Result<Vec<(String, super::SourceWatermark)>, AdapterError> {
-    let Peeked { entries, .. } = enumerate_and_peek(root, peek)?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| {
-            let watermark = match entry.source_ts {
-                Some(ts) => super::SourceWatermark::At(ts),
-                None => super::SourceWatermark::Opaque,
-            };
-            (entry.source.session_id().to_owned(), watermark)
-        })
-        .collect())
+        errors,
+    }
 }
 
 /// Read every survivor session's body, streaming events through `tx`. Opens each
 /// DB once (cached by path); tree sessions route through the legacy read path.
+/// Keeps its OWN connection cache: the enumerate/peek pass's handles are dropped
+/// before this runs, so no rusqlite handle is dragged across the await between
+/// them (the design honored by keeping the caches separate).
 fn read_survivors(
     tree_base: &Path,
     survivors: Vec<SessionSource>,
@@ -369,15 +439,40 @@ fn read_survivors(
     let mut conns: HashMap<PathBuf, Connection> = HashMap::new();
     for source in survivors {
         let keep = match source {
-            SessionSource::Db(head) => match connection(&mut conns, &head.db_path) {
-                Ok(conn) => read_db_session(conn, *head, tx),
-                Err(error) => tx.blocking_send(Err(error)).is_ok(),
-            },
+            SessionSource::Db(light) => read_db_survivor(&mut conns, light, tx),
             SessionSource::Tree(file) => read_one_session(tree_base, file, tx),
         };
         if !keep {
             return;
         }
+    }
+}
+
+/// Fetch one DB survivor's full `session` row by primary key (the peek carried
+/// only the id), build its head, and stream its body. A row that vanished between
+/// enumeration and read (opencode deleted the session; our separate statements
+/// share no snapshot) yields a typed error for that session and continues
+/// (spec.md#adapter-integrity-no-silent-drops).
+fn read_db_survivor(
+    conns: &mut HashMap<PathBuf, Connection>,
+    light: DbLight,
+    tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
+) -> bool {
+    let conn = match connection(conns, &light.db_path) {
+        Ok(conn) => conn,
+        Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+    };
+    match fetch_db_session_head(conn, &light.db_path, &light.session_id) {
+        Ok(Some(head)) => read_db_session(conn, head, tx),
+        Ok(None) => {
+            let error = AdapterError::schema(
+                NAME,
+                record_location(&light.db_path, &light.session_id, &light.session_id),
+                "session row vanished between enumeration and read",
+            );
+            tx.blocking_send(Err(error)).is_ok()
+        }
+        Err(error) => tx.blocking_send(Err(error)).is_ok(),
     }
 }
 
@@ -489,23 +584,40 @@ fn walk_session_subtree(tree_base: &Path, session_id: &str) -> Result<SubtreeWal
     })
 }
 
-/// Watermark for the freshness gate: the session's max stored message timestamp.
-/// That is the last message's `time.created` or any of its tool parts'
-/// `state.time.end` (a tool result completing after the message was created);
-/// earlier messages' events all precede the last message, so its subtree
-/// suffices. `None` on an empty session or unreadable last message -> safe
-/// re-read. Reads only the last message and its parts (a handful of small files).
+/// Watermark for the freshness gate: the session's max stored message timestamp,
+/// read from the last message's subtree (its `time.created` raised by any of its
+/// tool parts' `state.time.end`, via [`watermark_micros`]). Earlier messages'
+/// events all precede the last message, so its subtree suffices. `None` on an
+/// empty session or unreadable last message -> safe re-read. Reads only the last
+/// message and its parts (a handful of small files).
 fn newest_message_ts(walk: &SubtreeWalk) -> Option<i64> {
-    let message_path = walk.message_files.last()?;
-    let message = read_json(message_path).ok()?;
-    let mut newest = millis_at(&message, &["time", "created"])?;
-    if let Some(parts) = walk.part_files_by_message.last() {
-        for part_path in parts {
-            if let Ok(part) = read_json(part_path)
-                && let Some(end) = millis_at(&part, &["state", "time", "end"])
-            {
-                newest = newest.max(end);
-            }
+    let message = read_json(walk.message_files.last()?).ok()?;
+    let parts = walk
+        .part_files_by_message
+        .last()
+        .into_iter()
+        .flatten()
+        .filter_map(|part_path| read_json(part_path).ok());
+    watermark_micros(&message, parts)
+}
+
+/// The freshness-watermark kernel (micros): the message's `data.time.created`,
+/// raised by each part's `state.time.end`; `.timestamp_micros()`. `None` (the
+/// message carries no `time.created`) = safe re-read.
+///
+/// KNOWN RESIDUAL: the peek reads only the newest message's subtree, while pond's
+/// stored watermark is a global max over ALL messages, including the synthetic
+/// tool carrier messages stamped at their `state.time.end`. So an earlier
+/// message's tool end outrunning a later message's `time.created` (clock skew,
+/// out-of-order end) can over-skip. Accepted: ULID message ordering plus
+/// opencode's turn protocol make it unreachable in practice, and `pond sync
+/// --verify` is the full-re-read backstop (the same posture as the equal-micros
+/// residual documented on `SkipOracle` in adapter/mod.rs).
+fn watermark_micros(message: &Value, parts: impl IntoIterator<Item = Value>) -> Option<i64> {
+    let mut newest = millis_at(message, &["time", "created"])?;
+    for part in parts {
+        if let Some(end) = millis_at(&part, &["state", "time", "end"]) {
+            newest = newest.max(end);
         }
     }
     Some(newest.timestamp_micros())
@@ -517,25 +629,17 @@ fn read_one_session(
     file: SessionFile,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
-    macro_rules! emit {
-        ($item:expr) => {
-            if tx.blocking_send($item).is_err() {
-                return false;
-            }
-        };
-    }
-
     let session_value = match read_json(&file.path) {
         Ok(value) => value,
         Err(error) => {
-            emit!(Err(error));
+            emit!(tx, Err(error));
             return true;
         }
     };
     let session = match session_from_value(&session_value, &file.path) {
         Ok(session) => session,
         Err(error) => {
-            emit!(Err(error));
+            emit!(tx, Err(error));
             return true;
         }
     };
@@ -546,11 +650,11 @@ fn read_one_session(
         &session_id,
         file.path.display().to_string(),
     ) {
-        emit!(Err(error));
+        emit!(tx, Err(error));
         return true;
     }
     let session_created_at = session.created_at;
-    emit!(Ok(AdapterYield::Event(IngestEvent::Session(session))));
+    emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
     // Reuse the freshness pre-walk's listings when present; otherwise list now.
     let (message_files, mut part_files_by_message) = match file.cached_subtree {
@@ -560,7 +664,7 @@ fn read_one_session(
             let files = match list_json_sorted(&message_dir) {
                 Ok(files) => files,
                 Err(error) => {
-                    emit!(Err(error));
+                    emit!(tx, Err(error));
                     return true;
                 }
             };
@@ -573,16 +677,19 @@ fn read_one_session(
         let message_value = match read_json(message_path) {
             Ok(value) => value,
             Err(error) => {
-                emit!(Err(error));
+                emit!(tx, Err(error));
                 continue;
             }
         };
         let Some(message_id) = message_value.get("id").and_then(Value::as_str) else {
-            emit!(Err(AdapterError::schema(
-                NAME,
-                message_path.display().to_string(),
-                "message file missing `id`",
-            )));
+            emit!(
+                tx,
+                Err(AdapterError::schema(
+                    NAME,
+                    message_path.display().to_string(),
+                    "message file missing `id`",
+                ))
+            );
             continue;
         };
         if let Err(error) = validate_path_id(
@@ -591,7 +698,7 @@ fn read_one_session(
             message_id,
             message_path.display().to_string(),
         ) {
-            emit!(Err(error));
+            emit!(tx, Err(error));
             continue;
         }
         let part_files = if use_cache {
@@ -601,7 +708,7 @@ fn read_one_session(
             match list_json_sorted(&part_dir) {
                 Ok(files) => files,
                 Err(error) => {
-                    emit!(Err(error));
+                    emit!(tx, Err(error));
                     continue;
                 }
             }
@@ -610,56 +717,68 @@ fn read_one_session(
         for part_path in part_files {
             match read_json(&part_path) {
                 Ok(value) => parts.push(value),
-                Err(error) => emit!(Err(error)),
+                Err(error) => emit!(tx, Err(error)),
             }
         }
         match build_message_events(&session_id, &message_value, &parts, session_created_at) {
             Ok(events) => {
                 for event in events {
-                    emit!(Ok(AdapterYield::Event(event)));
+                    emit!(tx, Ok(AdapterYield::Event(event)));
                 }
             }
-            Err(error) => emit!(Err(error)),
+            Err(error) => emit!(tx, Err(error)),
         }
     }
     true
 }
 
-/// All columns of the `session` table, in the order [`session_row_from_row`]
-/// reads them.
+/// The `session` table's columns as a SELECT list. Read by name in
+/// [`session_info_from_row`], so this order is NOT load-bearing - it only fixes
+/// the projected column set.
 const SESSION_COLUMNS: &str = "id, project_id, workspace_id, parent_id, slug, directory, path, \
      title, version, share_url, summary_additions, summary_deletions, summary_files, \
      summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, \
      tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, \
      time_updated, time_compacting, time_archived";
 
-/// Every `opencode*.db` directly under `root` (WAL `-wal`/`-shm` sidecars are
-/// excluded by the `.db` extension filter). A missing root is "no DB", not an
-/// error - the adapter may be pointed at a bare legacy tree.
-fn db_paths(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
-    let entries = match std::fs::read_dir(root) {
+/// List the `*.<extension>` files directly in `dir` whose file name passes
+/// `name_filter`, sorted by path (= creation order, ids are time-sortable). A
+/// missing dir is an empty list, not an error - a source dir may not exist yet.
+fn list_files_sorted(
+    dir: &Path,
+    extension: &str,
+    name_filter: impl Fn(&str) -> bool,
+) -> Result<Vec<PathBuf>, AdapterError> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(AdapterError::io(NAME, root.display().to_string(), error)),
+        Err(error) => return Err(AdapterError::io(NAME, dir.display().to_string(), error)),
     };
     let mut out = Vec::new();
     for entry in entries {
         let entry =
-            entry.map_err(|error| AdapterError::io(NAME, root.display().to_string(), error))?;
+            entry.map_err(|error| AdapterError::io(NAME, dir.display().to_string(), error))?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
             continue;
         }
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("opencode"))
+            .is_some_and(&name_filter)
         {
             out.push(path);
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// Every `opencode*.db` directly under `root` (WAL `-wal`/`-shm` sidecars are
+/// excluded by the `.db` extension filter). A missing root is "no DB", not an
+/// error - the adapter may be pointed at a bare legacy tree.
+fn db_paths(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
+    list_files_sorted(root, "db", |name| name.starts_with("opencode"))
 }
 
 /// Open a DB read-only with a bounded busy timeout - opencode writes it live
@@ -675,11 +794,15 @@ fn open_db(path: &Path) -> Result<Connection, AdapterError> {
     Ok(conn)
 }
 
+/// A DB-interaction failure (open, prepare, query, row read) classified as
+/// [`AdapterError::io`] - matching the claude_desktop_app precedent: these are
+/// all substrate faults, not source-shape faults (genuine shape errors route
+/// through [`reconstruct_record`]'s parse errors instead).
 fn db_error(path: &Path, op: &str, error: &rusqlite::Error) -> AdapterError {
-    AdapterError::schema(
+    AdapterError::io(
         NAME,
         path.display().to_string(),
-        format!("sqlite {op} failed: {error}"),
+        std::io::Error::other(format!("sqlite {op} failed: {error}")),
     )
 }
 
@@ -689,121 +812,63 @@ fn connection<'a>(
     path: &Path,
 ) -> Result<&'a Connection, AdapterError> {
     match conns.entry(path.to_path_buf()) {
-        Entry::Occupied(slot) => Ok(slot.into_mut()),
-        Entry::Vacant(slot) => Ok(slot.insert(open_db(path)?)),
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => Ok(entry.insert(open_db(path)?)),
     }
 }
 
-/// Session heads across every DB under `root`, each already mapped to a canonical
-/// [`Session`]. Ordered by (DB path, then session id) for deterministic ingest.
-fn collect_db_heads(root: &Path) -> Result<Vec<DbSessionHead>, AdapterError> {
-    let mut heads = Vec::new();
-    for db_path in db_paths(root)? {
-        let conn = open_db(&db_path)?;
-        for row in fetch_session_rows(&conn, &db_path)? {
-            heads.push(db_session_head(&db_path, row)?);
-        }
-    }
-    Ok(heads)
-}
-
-fn fetch_session_rows(conn: &Connection, db_path: &Path) -> Result<Vec<SessionRow>, AdapterError> {
+/// Every session id in one DB, ordered by id for deterministic ingest. Uses the
+/// shared connection cache so enumeration and the per-session peeks share a
+/// single open per DB.
+fn db_session_ids(
+    conns: &mut HashMap<PathBuf, Connection>,
+    db_path: &Path,
+) -> Result<Vec<String>, AdapterError> {
+    let conn = connection(conns, db_path)?;
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM session ORDER BY id"
-        ))
-        .map_err(|error| db_error(db_path, "prepare session", &error))?;
+        .prepare_cached("SELECT id FROM session ORDER BY id")
+        .map_err(|error| db_error(db_path, "prepare session ids", &error))?;
     let rows = stmt
-        .query_map([], session_row_from_row)
-        .map_err(|error| db_error(db_path, "query session", &error))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|error| db_error(db_path, "read session row", &error))?);
-    }
-    Ok(out)
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| db_error(db_path, "query session ids", &error))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| db_error(db_path, "read session id", &error))
 }
 
-/// Owned projection of one `session` row. JSON-mode columns (model, metadata,
-/// permission, revert, summary_diffs) stay as their raw text and are parsed
-/// lazily in [`reconstruct_session_info`].
-struct SessionRow {
-    id: String,
-    project_id: String,
-    workspace_id: Option<String>,
-    parent_id: Option<String>,
-    slug: String,
-    directory: String,
-    path: Option<String>,
-    title: String,
-    version: String,
-    share_url: Option<String>,
-    summary_additions: Option<i64>,
-    summary_deletions: Option<i64>,
-    summary_files: Option<i64>,
-    summary_diffs: Option<String>,
-    metadata: Option<String>,
-    cost: f64,
-    tokens_input: i64,
-    tokens_output: i64,
-    tokens_reasoning: i64,
-    tokens_cache_read: i64,
-    tokens_cache_write: i64,
-    revert: Option<String>,
-    permission: Option<String>,
-    agent: Option<String>,
-    model: Option<String>,
-    time_created: i64,
-    time_updated: i64,
-    time_compacting: Option<i64>,
-    time_archived: Option<i64>,
+/// Fetch one `session` row by primary key and map it to a [`DbSessionHead`].
+/// `Ok(None)` when no row matches (the session vanished between enumeration and
+/// read - our separate statements share no snapshot).
+fn fetch_db_session_head(
+    conn: &Connection,
+    db_path: &Path,
+    session_id: &str,
+) -> Result<Option<DbSessionHead>, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {SESSION_COLUMNS} FROM session WHERE id = ?1"
+        ))
+        .map_err(|error| db_error(db_path, "prepare session by id", &error))?;
+    let info = stmt
+        .query_row([session_id], session_info_from_row)
+        .optional()
+        .map_err(|error| db_error(db_path, "query session by id", &error))?;
+    info.map(|info| db_session_head(db_path, &info)).transpose()
 }
 
-fn session_row_from_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
-    Ok(SessionRow {
-        id: row.get(0)?,
-        project_id: row.get(1)?,
-        workspace_id: row.get(2)?,
-        parent_id: row.get(3)?,
-        slug: row.get(4)?,
-        directory: row.get(5)?,
-        path: row.get(6)?,
-        title: row.get(7)?,
-        version: row.get(8)?,
-        share_url: row.get(9)?,
-        summary_additions: row.get(10)?,
-        summary_deletions: row.get(11)?,
-        summary_files: row.get(12)?,
-        summary_diffs: row.get(13)?,
-        metadata: row.get(14)?,
-        cost: row.get(15)?,
-        tokens_input: row.get(16)?,
-        tokens_output: row.get(17)?,
-        tokens_reasoning: row.get(18)?,
-        tokens_cache_read: row.get(19)?,
-        tokens_cache_write: row.get(20)?,
-        revert: row.get(21)?,
-        permission: row.get(22)?,
-        agent: row.get(23)?,
-        model: row.get(24)?,
-        time_created: row.get(25)?,
-        time_updated: row.get(26)?,
-        time_compacting: row.get(27)?,
-        time_archived: row.get(28)?,
-    })
-}
-
-/// Map one `session` row to a canonical [`Session`]. The `raw_record` is the
-/// `fromRow`-shaped `SessionInfo` reconstruction (the object `opencode import`
-/// accepts); reusing [`session_from_value`] threads `directory` through the
-/// sealed `Extracted` path and derives `created_at` from the row `time_created`.
-fn db_session_head(db_path: &Path, row: SessionRow) -> Result<DbSessionHead, AdapterError> {
-    let info = reconstruct_session_info(&row);
-    let mut session = session_from_value(&info, db_path)?;
-    // spec.md#model-no-synthesis: a subagent session (`parent_id` set) is labeled
-    // `opencode/<agent>` so children leave default search, matching claude-code;
-    // a null agent column degrades to the bare `opencode/subagent` label.
-    if row.parent_id.is_some() {
-        session.source_agent = match row.agent.as_deref() {
+/// Map one reconstructed `SessionInfo` to a canonical [`Session`]. Reusing
+/// [`session_from_value`] threads `directory` through the sealed `Extracted` path
+/// and derives `created_at` from the row `time.created`.
+fn db_session_head(db_path: &Path, info: &Value) -> Result<DbSessionHead, AdapterError> {
+    let mut session = session_from_value(info, db_path)?;
+    // spec.md#model-no-synthesis: a subagent session (`parentID` set) is labeled
+    // `opencode/<agent>` so children leave default search, matching claude-code; a
+    // null agent column degrades to the bare `opencode/subagent` label. Tree-era
+    // child sessions carry no agent column and keep the plain `opencode` the tree
+    // path assigns: `source_agent` is immutable after first write
+    // (spec.md#adapter-integrity-additive-sync), so relabeling would fork history
+    // against already-stored rows.
+    if info.get("parentID").and_then(Value::as_str).is_some() {
+        session.source_agent = match info.get("agent").and_then(Value::as_str) {
             Some(agent) => format!("{NAME}/{agent}"),
             None => format!("{NAME}/subagent"),
         };
@@ -814,108 +879,131 @@ fn db_session_head(db_path: &Path, row: SessionRow) -> Result<DbSessionHead, Ada
     })
 }
 
-/// Rebuild the `fromRow` `SessionInfo` JSON from a row: camelCase keys, nested
-/// `time`/`tokens`/`summary`, null columns omitted (spec.md#model-lossless-projection -
-/// every non-null column is recoverable).
-fn reconstruct_session_info(row: &SessionRow) -> Value {
+/// Rebuild the `fromRow` `SessionInfo` JSON from a `session` row by NAME
+/// (`&str` implements `RowIndex`): camelCase keys, nested `time`/`tokens`/`summary`,
+/// null columns omitted (spec.md#model-lossless-projection - every non-null column
+/// is recoverable). JSON-mode columns (model, metadata, permission, revert,
+/// summary diffs) go through [`json_or_string`]. This is the shape
+/// [`session_from_value`] and the DB conformance test both consume.
+fn session_info_from_row(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     let mut info = serde_json::Map::new();
-    info.insert("id".to_owned(), json!(row.id));
-    info.insert("slug".to_owned(), json!(row.slug));
-    info.insert("projectID".to_owned(), json!(row.project_id));
-    if let Some(value) = &row.workspace_id {
+    info.insert("id".to_owned(), json!(row.get::<_, String>("id")?));
+    info.insert("slug".to_owned(), json!(row.get::<_, String>("slug")?));
+    info.insert(
+        "projectID".to_owned(),
+        json!(row.get::<_, String>("project_id")?),
+    );
+    if let Some(value) = row.get::<_, Option<String>>("workspace_id")? {
         info.insert("workspaceID".to_owned(), json!(value));
     }
-    info.insert("directory".to_owned(), json!(row.directory));
-    if let Some(value) = &row.path {
+    info.insert(
+        "directory".to_owned(),
+        json!(row.get::<_, String>("directory")?),
+    );
+    if let Some(value) = row.get::<_, Option<String>>("path")? {
         info.insert("path".to_owned(), json!(value));
     }
-    if let Some(value) = &row.parent_id {
+    if let Some(value) = row.get::<_, Option<String>>("parent_id")? {
         info.insert("parentID".to_owned(), json!(value));
     }
-    info.insert("title".to_owned(), json!(row.title));
-    if let Some(value) = &row.agent {
+    info.insert("title".to_owned(), json!(row.get::<_, String>("title")?));
+    if let Some(value) = row.get::<_, Option<String>>("agent")? {
         info.insert("agent".to_owned(), json!(value));
     }
-    if let Some(value) = &row.model {
-        info.insert("model".to_owned(), parse_json_column(value));
+    if let Some(value) = row.get::<_, Option<String>>("model")? {
+        info.insert("model".to_owned(), json_or_string(&value));
     }
-    info.insert("version".to_owned(), json!(row.version));
-    if row.summary_additions.is_some()
-        || row.summary_deletions.is_some()
-        || row.summary_files.is_some()
-    {
+    info.insert(
+        "version".to_owned(),
+        json!(row.get::<_, String>("version")?),
+    );
+    let summary_additions = row.get::<_, Option<i64>>("summary_additions")?;
+    let summary_deletions = row.get::<_, Option<i64>>("summary_deletions")?;
+    let summary_files = row.get::<_, Option<i64>>("summary_files")?;
+    let summary_diffs = row.get::<_, Option<String>>("summary_diffs")?;
+    if summary_additions.is_some() || summary_deletions.is_some() || summary_files.is_some() {
         let mut summary = serde_json::Map::new();
         summary.insert(
             "additions".to_owned(),
-            json!(row.summary_additions.unwrap_or(0)),
+            json!(summary_additions.unwrap_or(0)),
         );
         summary.insert(
             "deletions".to_owned(),
-            json!(row.summary_deletions.unwrap_or(0)),
+            json!(summary_deletions.unwrap_or(0)),
         );
-        summary.insert("files".to_owned(), json!(row.summary_files.unwrap_or(0)));
-        if let Some(value) = &row.summary_diffs {
-            summary.insert("diffs".to_owned(), parse_json_column(value));
+        summary.insert("files".to_owned(), json!(summary_files.unwrap_or(0)));
+        if let Some(value) = &summary_diffs {
+            summary.insert("diffs".to_owned(), json_or_string(value));
         }
         info.insert("summary".to_owned(), Value::Object(summary));
     }
-    info.insert("cost".to_owned(), json!(row.cost));
+    info.insert("cost".to_owned(), json!(row.get::<_, f64>("cost")?));
     info.insert(
         "tokens".to_owned(),
         json!({
-            "input": row.tokens_input,
-            "output": row.tokens_output,
-            "reasoning": row.tokens_reasoning,
-            "cache": { "read": row.tokens_cache_read, "write": row.tokens_cache_write },
+            "input": row.get::<_, i64>("tokens_input")?,
+            "output": row.get::<_, i64>("tokens_output")?,
+            "reasoning": row.get::<_, i64>("tokens_reasoning")?,
+            "cache": {
+                "read": row.get::<_, i64>("tokens_cache_read")?,
+                "write": row.get::<_, i64>("tokens_cache_write")?,
+            },
         }),
     );
-    if let Some(value) = &row.share_url {
+    if let Some(value) = row.get::<_, Option<String>>("share_url")? {
         info.insert("share".to_owned(), json!({ "url": value }));
     }
-    if let Some(value) = &row.metadata {
-        info.insert("metadata".to_owned(), parse_json_column(value));
+    if let Some(value) = row.get::<_, Option<String>>("metadata")? {
+        info.insert("metadata".to_owned(), json_or_string(&value));
     }
-    if let Some(value) = &row.revert {
-        info.insert("revert".to_owned(), parse_json_column(value));
+    if let Some(value) = row.get::<_, Option<String>>("revert")? {
+        info.insert("revert".to_owned(), json_or_string(&value));
     }
-    if let Some(value) = &row.permission {
-        info.insert("permission".to_owned(), parse_json_column(value));
+    if let Some(value) = row.get::<_, Option<String>>("permission")? {
+        info.insert("permission".to_owned(), json_or_string(&value));
     }
     let mut time = serde_json::Map::new();
-    time.insert("created".to_owned(), json!(row.time_created));
-    time.insert("updated".to_owned(), json!(row.time_updated));
-    if let Some(value) = row.time_compacting {
+    time.insert(
+        "created".to_owned(),
+        json!(row.get::<_, i64>("time_created")?),
+    );
+    time.insert(
+        "updated".to_owned(),
+        json!(row.get::<_, i64>("time_updated")?),
+    );
+    if let Some(value) = row.get::<_, Option<i64>>("time_compacting")? {
         time.insert("compacting".to_owned(), json!(value));
     }
-    if let Some(value) = row.time_archived {
+    if let Some(value) = row.get::<_, Option<i64>>("time_archived")? {
         time.insert("archived".to_owned(), json!(value));
     }
     info.insert("time".to_owned(), Value::Object(time));
-    Value::Object(info)
-}
-
-/// A Drizzle `mode: "json"` column stores JSON text; recover the value, falling
-/// back to the raw string if it is somehow not valid JSON (lossless either way).
-fn parse_json_column(text: &str) -> Value {
-    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+    Ok(Value::Object(info))
 }
 
 /// Freshness watermark for a DB session (micros): the newest message by id order,
-/// its `data.time.created` raised by any of its tool parts' `state.time.end`.
-/// NEVER the `time_created` COLUMN - migration-stamped rows carry a future column
-/// value that would re-read forever (spec.md, decision 9). `None` (empty or
-/// unreadable newest message) -> safe re-read.
+/// its `data.time.created` raised by any of its tool parts' `state.time.end` (via
+/// [`watermark_micros`]). NEVER the `time_created` COLUMN - migration-stamped rows
+/// carry a future column value that would re-read forever (spec.md, decision 9).
+/// `None` (empty or unreadable newest message) -> safe re-read.
+///
+/// The `ORDER BY id DESC LIMIT 1` probe scans the full id index by design: the
+/// only streamable alternative order is `time_created` (the poisoned migration
+/// column), so this MUST NOT be "optimized" onto it.
 fn db_session_watermark(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
 ) -> Result<Option<i64>, AdapterError> {
-    let latest = conn
-        .query_row(
+    let mut newest_stmt = conn
+        .prepare_cached(
             "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-            [session_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
+        .map_err(|error| db_error(db_path, "prepare newest message", &error))?;
+    let latest = newest_stmt
+        .query_row([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()
         .map_err(|error| db_error(db_path, "query newest message", &error))?;
     let Some((message_id, data)) = latest else {
@@ -924,31 +1012,26 @@ fn db_session_watermark(
     let Ok(message) = serde_json::from_str::<Value>(&data) else {
         return Ok(None);
     };
-    let Some(created) = millis_at(&message, &["time", "created"]) else {
-        return Ok(None);
-    };
-    let mut newest = created;
     let mut stmt = conn
-        .prepare("SELECT data FROM part WHERE message_id = ?1 ORDER BY id")
+        .prepare_cached("SELECT data FROM part WHERE message_id = ?1 ORDER BY id")
         .map_err(|error| db_error(db_path, "prepare newest parts", &error))?;
     let rows = stmt
         .query_map([&message_id], |row| row.get::<_, String>(0))
         .map_err(|error| db_error(db_path, "query newest parts", &error))?;
-    for row in rows {
-        let data = row.map_err(|error| db_error(db_path, "read newest part row", &error))?;
-        if let Ok(part) = serde_json::from_str::<Value>(&data)
-            && let Some(end) = millis_at(&part, &["state", "time", "end"])
-        {
-            newest = newest.max(end);
-        }
-    }
-    Ok(Some(newest.timestamp_micros()))
+    let datas = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| db_error(db_path, "read newest part row", &error))?;
+    let parts = datas
+        .iter()
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok());
+    Ok(watermark_micros(&message, parts))
 }
 
-/// Owned projection of one `message`/`part` row.
+/// Owned projection of one `message`/`part` row: its id (for ordering and id
+/// injection) and its `data` blob. The row `time_created` column is deliberately
+/// not projected (see the `default_ts` note in [`read_db_session`]).
 struct RecordRow {
     id: String,
-    time_created: i64,
     data: String,
 }
 
@@ -960,22 +1043,18 @@ fn fetch_records(
     kind: &str,
 ) -> Result<Vec<RecordRow>, AdapterError> {
     let mut stmt = conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .map_err(|error| db_error(db_path, &format!("prepare {kind}"), &error))?;
     let rows = stmt
         .query_map([param], |row| {
             Ok(RecordRow {
                 id: row.get(0)?,
-                time_created: row.get(1)?,
-                data: row.get(2)?,
+                data: row.get(1)?,
             })
         })
         .map_err(|error| db_error(db_path, &format!("query {kind}"), &error))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|error| db_error(db_path, &format!("read {kind} row"), &error))?);
-    }
-    Ok(out)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| db_error(db_path, &format!("read {kind} row"), &error))
 }
 
 /// Read one DB session's body in short bursts (messages, then per-message parts -
@@ -987,62 +1066,71 @@ fn read_db_session(
     head: DbSessionHead,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
-    macro_rules! emit {
-        ($item:expr) => {
-            if tx.blocking_send($item).is_err() {
-                return false;
-            }
-        };
-    }
-
     let db_path = head.db_path.clone();
     let session_id = head.session.id.clone();
     let session_anchor = head.session.created_at;
-    emit!(Ok(AdapterYield::Event(IngestEvent::Session(head.session))));
+    emit!(
+        tx,
+        Ok(AdapterYield::Event(IngestEvent::Session(head.session)))
+    );
 
-    let messages = match fetch_records(
+    // No `ORDER BY id` in SQL: no index ends in bare `id`, so an SQL sort forces a
+    // transient temp b-tree over the full rows (~2x memory), and chunked keyset
+    // pagination would be O(N^2) re-sorts. The accepted bound is O(one session)
+    // resident, sorted in Rust below (BINARY collation == Rust byte order,
+    // verified no `COLLATE` on `id`).
+    let mut messages = match fetch_records(
         conn,
         &db_path,
-        "SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY id",
+        "SELECT id, data FROM message WHERE session_id = ?1",
         &session_id,
         "message",
     ) {
         Ok(rows) => rows,
         Err(error) => {
-            emit!(Err(error));
+            emit!(tx, Err(error));
             return true;
         }
     };
+    messages.sort_unstable_by(|a, b| a.id.cmp(&b.id));
 
     for message in messages {
         let message_id = message.id;
-        // Message timestamp chain (spec, engineering defaults): the row
-        // `time_created` is the fallback, the session anchor the last resort;
-        // `build_message_events` prefers the `data.time.created` in the value.
-        let default_ts =
-            DateTime::from_timestamp_millis(message.time_created).unwrap_or(session_anchor);
+        // spec.md#model-no-synthesis: `build_message_events` prefers the message's
+        // own `data.time.created`; when it is absent the session anchor is the
+        // spec-blessed fallback. The row `time_created` COLUMN is deliberately NOT
+        // used: it is migration-stamped, and a future column value would become the
+        // stored watermark and freshness-skip every later real message. Trade-off:
+        // a non-migrated message genuinely lacking `data.time.created` takes the
+        // coarser session anchor even though its column was accurate - accepted
+        // because ordering still survives via the id tiebreaker.
+        let default_ts = session_anchor;
         let message_value = match reconstruct_record(
             &message.data,
-            &record_location(&db_path, &session_id, &message_id),
-            &[("id", json!(message_id)), ("sessionID", json!(session_id))],
+            [("id", json!(message_id)), ("sessionID", json!(session_id))],
+            &db_path,
+            &session_id,
+            &message_id,
         ) {
             Ok(value) => value,
             Err(error) => {
-                emit!(Err(error));
+                emit!(tx, Err(error));
                 continue;
             }
         };
 
+        // The part query KEEPS its `ORDER BY id`: it streams via the
+        // (message_id, id) index (verified via EXPLAIN QUERY PLAN), no temp b-tree.
         let part_rows = match fetch_records(
             conn,
             &db_path,
-            "SELECT id, time_created, data FROM part WHERE message_id = ?1 ORDER BY id",
+            "SELECT id, data FROM part WHERE message_id = ?1 ORDER BY id",
             &message_id,
             "part",
         ) {
             Ok(rows) => rows,
             Err(error) => {
-                emit!(Err(error));
+                emit!(tx, Err(error));
                 continue;
             }
         };
@@ -1050,56 +1138,48 @@ fn read_db_session(
         for part in part_rows {
             match reconstruct_record(
                 &part.data,
-                &record_location(&db_path, &session_id, &part.id),
-                &[
+                [
                     ("id", json!(part.id)),
                     ("sessionID", json!(session_id)),
                     ("messageID", json!(message_id)),
                 ],
+                &db_path,
+                &session_id,
+                &part.id,
             ) {
                 Ok(value) => parts.push(value),
-                Err(error) => emit!(Err(error)),
+                Err(error) => emit!(tx, Err(error)),
             }
         }
         match build_message_events(&session_id, &message_value, &parts, default_ts) {
             Ok(events) => {
                 for event in events {
-                    emit!(Ok(AdapterYield::Event(event)));
+                    emit!(tx, Ok(AdapterYield::Event(event)));
                 }
             }
-            Err(error) => emit!(Err(error)),
+            Err(error) => emit!(tx, Err(error)),
         }
     }
     true
 }
 
-/// Reconstruct a `message`/`part` value as `{...data, <injected>}`, enforcing the
-/// record cap on the raw `data` text and bounding string leaves at the seam cap
-/// before it leaves this module (spec.md#adapter-bounded-values). A malformed
-/// `data` JSON drops only that record, like a malformed part file in the tree.
+/// Reconstruct a `message`/`part` value as `{...data, <injected>}`, delegating the
+/// cap check, parse, and leaf bounding to [`parse_bounded`] before injecting the
+/// row's ids. A malformed `data` JSON drops only that record, like a malformed
+/// part file in the tree. `location` is formatted lazily (only on the error path).
 fn reconstruct_record(
     data: &str,
-    location: &str,
-    inject: &[(&str, Value)],
+    inject: impl IntoIterator<Item = (&'static str, Value)>,
+    db_path: &Path,
+    session_id: &str,
+    record_id: &str,
 ) -> Result<Value, AdapterError> {
-    if data.len() > RECORD_CAP {
-        return Err(AdapterError::schema(
-            NAME,
-            location.to_owned(),
-            format!(
-                "record data exceeds adapter record cap: {} bytes > {RECORD_CAP}",
-                data.len()
-            ),
-        ));
-    }
-    let mut value: Value = serde_json::from_str(data)
-        .map_err(|error| AdapterError::parse(NAME, location.to_owned(), 1, error))?;
+    let mut value = parse_bounded(data, || record_location(db_path, session_id, record_id))?;
     if let Value::Object(map) = &mut value {
         for (key, injected) in inject {
-            map.insert((*key).to_owned(), injected.clone());
+            map.insert(key.to_owned(), injected);
         }
     }
-    bound_value(&mut value);
     Ok(value)
 }
 
@@ -1110,50 +1190,42 @@ fn record_location(db_path: &Path, session_id: &str, record_id: &str) -> String 
     )
 }
 
-/// Read one JSON file, bounding every string leaf at the seam cap
-/// (spec.md#adapter-bounded-values) before it leaves this module. One open +
-/// one metadata syscall on the handle - avoids the duplicate `std::fs::metadata`
-/// + `std::fs::read` pair on the ~1k-file real corpus.
-fn read_json(path: &Path) -> Result<Value, AdapterError> {
-    use std::io::Read;
-    let io = |source| AdapterError::io(NAME, path.display().to_string(), source);
-    let mut file = std::fs::File::open(path).map_err(io)?;
-    let len = file.metadata().map_err(io)?.len();
-    if len > RECORD_CAP as u64 {
+/// Enforce the record cap on `text`, parse it as JSON, and bound every string
+/// leaf at the seam cap (spec.md#adapter-bounded-values) before it leaves this
+/// module. Shared by [`read_json`] (file bytes read to text) and
+/// [`reconstruct_record`] (a DB `data` blob). `location` names the fault site and
+/// is invoked only when building an error.
+fn parse_bounded(text: &str, location: impl FnOnce() -> String) -> Result<Value, AdapterError> {
+    if text.len() > RECORD_CAP {
         return Err(AdapterError::schema(
             NAME,
-            path.display().to_string(),
-            format!("json file exceeds adapter record cap: {len} bytes > {RECORD_CAP}"),
+            location(),
+            format!(
+                "record data exceeds adapter record cap: {} bytes > {RECORD_CAP}",
+                text.len()
+            ),
         ));
     }
-    let mut bytes = Vec::with_capacity(len as usize);
-    file.read_to_end(&mut bytes).map_err(io)?;
-    let mut value: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| AdapterError::parse(NAME, path.display().to_string(), 1, error))?;
+    let mut value: Value = serde_json::from_str(text)
+        .map_err(|error| AdapterError::parse(NAME, location(), 1, error))?;
     bound_value(&mut value);
     Ok(value)
+}
+
+/// Read one JSON file, bounding every string leaf at the seam cap
+/// (spec.md#adapter-bounded-values) before it leaves this module. Reads the file
+/// then delegates the cap/parse/bound pipeline to [`parse_bounded`].
+fn read_json(path: &Path) -> Result<Value, AdapterError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|source| AdapterError::io(NAME, path.display().to_string(), source))?;
+    parse_bounded(&text, || path.display().to_string())
 }
 
 /// List `*.json` files in `dir`, sorted by filename (= creation order, ids are
 /// time-sortable). A missing dir is an empty list - a message can legitimately
 /// carry no parts.
 fn list_json_sorted(dir: &Path) -> Result<Vec<PathBuf>, AdapterError> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(AdapterError::io(NAME, dir.display().to_string(), error)),
-    };
-    let mut out = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| AdapterError::io(NAME, dir.display().to_string(), error))?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    Ok(out)
+    list_files_sorted(dir, "json", |_| true)
 }
 
 fn session_from_value(value: &Value, path: &Path) -> Result<Session, AdapterError> {
@@ -1492,13 +1564,21 @@ fn serialize_native(
         return serialize_foreign(session);
     };
 
-    let mut messages = Vec::with_capacity(session.messages.len());
-    for message in &session.messages {
+    // Deterministic order: timestamp, then id (peers use the shared comparator).
+    let mut ordered = session.messages.clone();
+    ordered.sort_by(by_timestamp_then_id);
+
+    let mut messages = Vec::with_capacity(ordered.len());
+    for message in &ordered {
         if is_synthetic(message.message.options()) {
             continue;
         }
+        // A non-synthetic message with no stored `raw_record` cannot be replayed
+        // natively; downgrade the whole session to foreign (the same fallback the
+        // session-level `raw_record` check above applies) rather than silently
+        // dropping the message from the envelope.
         let Some(info) = raw_record(message.message.options()) else {
-            continue;
+            return serialize_foreign(session);
         };
         let mut parts = Vec::with_capacity(message.parts.len());
         for part in &message.parts {
@@ -1511,12 +1591,12 @@ fn serialize_native(
         messages.push(json!({ "info": info, "parts": parts }));
     }
 
-    let body = json!({ "info": session_raw, "messages": messages });
-    Ok(vec![RestoredFile::new(
-        PathBuf::from(format!("{}.json", session.session.id)),
-        encode(&body, &session.session.id)?,
+    import_file(
+        &session.session.id,
+        session_raw,
+        messages,
         RestoreFidelity::Native,
-    )])
+    )
 }
 
 fn serialize_foreign(
@@ -1537,8 +1617,12 @@ fn serialize_foreign(
         "time": { "created": created, "updated": created },
     });
 
-    let mut messages = Vec::with_capacity(session.messages.len());
-    for message in &session.messages {
+    // Deterministic order: timestamp, then id (peers use the shared comparator).
+    let mut ordered = session.messages.clone();
+    ordered.sort_by(by_timestamp_then_id);
+
+    let mut messages = Vec::with_capacity(ordered.len());
+    for message in &ordered {
         let role = match message.message {
             Message::User { .. } => "user",
             Message::Assistant { .. } => "assistant",
@@ -1561,11 +1645,27 @@ fn serialize_foreign(
         messages.push(json!({ "info": msg_info, "parts": parts }));
     }
 
+    import_file(
+        &session.session.id,
+        info,
+        messages,
+        RestoreFidelity::Foreign,
+    )
+}
+
+/// Assemble the `opencode import` envelope (`{ info, messages }`) both serializers
+/// produce and write it as the single `<session_id>.json` restore file.
+fn import_file(
+    session_id: &str,
+    info: Value,
+    messages: Vec<Value>,
+    fidelity: RestoreFidelity,
+) -> Result<Vec<RestoredFile>, AdapterError> {
     let body = json!({ "info": info, "messages": messages });
     Ok(vec![RestoredFile::new(
-        PathBuf::from(format!("{}.json", session.session.id)),
-        encode(&body, &session.session.id)?,
-        RestoreFidelity::Foreign,
+        PathBuf::from(format!("{session_id}.json")),
+        encode(&body, session_id)?,
+        fidelity,
     )])
 }
 
@@ -1642,7 +1742,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        adapter::extract::LEAF_CAP, handlers::ingest_adapter, sessions::Store, wire::PartKind,
+        adapter::{SyncPlan, extract::LEAF_CAP, test_support::MaxWatermarkOracle},
+        handlers::ingest_adapter,
+        sessions::Store,
+        wire::PartKind,
     };
     use tempfile::TempDir;
 
@@ -1723,30 +1826,54 @@ mod tests {
         Ok(())
     }
 
-    /// The `opencode import` envelope a native serialize must produce for one
-    /// session, rebuilt from the session's own stored `raw_record`s (synthetic
-    /// split records skipped). Serialize just copies those raw_records into the
-    /// envelope, so an emitted body must value-equal this.
-    fn expected_import_body(session: &crate::sessions::SessionWithMessages) -> Value {
-        let mut messages = Vec::new();
-        for message in &session.messages {
-            if is_synthetic(message.message.options()) {
-                continue;
+    /// The `opencode import` envelope a native serialize must produce for one tree
+    /// session, derived INDEPENDENTLY from the fixture tree files (session json +
+    /// message/ + part/ files) - not from any production serializer internal.
+    /// Mirrors the DB conformance test's derive-from-raw approach: message order
+    /// matches the serializer's `by_timestamp_then_id` (time.created, then id),
+    /// parts stay in id/filename order, and every leaf is bounded via
+    /// `extract_raw_record` (identity on the small fixture, faithful in general).
+    fn expected_envelope_from_tree(tree_base: &std::path::Path, session_id: &str) -> Value {
+        let read = |path: &std::path::Path| -> Value {
+            let raw: Value =
+                serde_json::from_slice(&std::fs::read(path).expect("read fixture file"))
+                    .expect("fixture file is JSON");
+            crate::adapter::extract::extract_raw_record(&raw)
+        };
+
+        // Locate session/<project>/<id>.json.
+        let mut session_json = None;
+        for project in std::fs::read_dir(tree_base.join("session")).expect("session dir") {
+            let candidate = project
+                .expect("session project entry")
+                .path()
+                .join(format!("{session_id}.json"));
+            if candidate.exists() {
+                session_json = Some(read(&candidate));
+                break;
             }
-            let Some(info) = raw_record(message.message.options()) else {
-                continue;
-            };
-            let parts: Vec<Value> = message
-                .parts
-                .iter()
-                .filter_map(|part| raw_record(&part.options))
-                .collect();
-            messages.push(json!({ "info": info, "parts": parts }));
         }
-        json!({
-            "info": raw_record(&session.session.options).expect("native session has raw_record"),
-            "messages": messages,
-        })
+        let session_json = session_json.expect("session file in fixture tree");
+
+        let mut message_files =
+            list_json_sorted(&tree_base.join("message").join(session_id)).expect("message dir");
+        message_files.sort_by(|a, b| {
+            let (ma, mb) = (read(a), read(b));
+            ma["time"]["created"]
+                .as_i64()
+                .cmp(&mb["time"]["created"].as_i64())
+                .then_with(|| ma["id"].as_str().cmp(&mb["id"].as_str()))
+        });
+        let mut messages = Vec::new();
+        for message_path in &message_files {
+            let msg = read(message_path);
+            let message_id = msg["id"].as_str().expect("message id").to_owned();
+            let part_files =
+                list_json_sorted(&tree_base.join("part").join(&message_id)).expect("part dir");
+            let parts: Vec<Value> = part_files.iter().map(|p| read(p)).collect();
+            messages.push(json!({ "info": msg, "parts": parts }));
+        }
+        json!({ "info": session_json, "messages": messages })
     }
 
     /// Serialize `session` native and return the single emitted file's parsed
@@ -1792,7 +1919,7 @@ mod tests {
             let body = serialize_native_body(&session);
             assert_eq!(
                 body,
-                expected_import_body(&session),
+                expected_envelope_from_tree(&source, &session_id),
                 "tree session {session_id} embeds its raw_records into the envelope",
             );
             // No synthetic split record leaks into the envelope: every emitted
@@ -1816,7 +1943,7 @@ mod tests {
 
     /// Native restore against the DB fixture: for every emitted file, the
     /// envelope `info`/messages/parts value-equal the rows reconstructed straight
-    /// from the DB (`reconstruct_session_info` / `reconstruct_record`), synthetic
+    /// from the DB (`session_info_from_row` / `reconstruct_record`), synthetic
     /// split records are absent, and every session - parent AND child - gets its
     /// own file (spec.md#adapter-lineage-complete-restore).
     #[tokio::test(flavor = "multi_thread")]
@@ -1835,17 +1962,17 @@ mod tests {
         // Independently reconstruct the expected records from the raw DB rows.
         let db = std::path::Path::new(DB_FIXTURE);
         let conn = open_db(db)?;
-        let expected_session: HashMap<String, Value> = fetch_session_rows(&conn, db)?
-            .into_iter()
+        let expected_session: HashMap<String, Value> = conn
+            .prepare(&format!("SELECT {SESSION_COLUMNS} FROM session"))?
+            .query_map([], session_info_from_row)?
             .map(|row| {
-                (
-                    row.id.clone(),
-                    crate::adapter::extract::extract_raw_record(&reconstruct_session_info(&row)),
-                )
+                let info = row.expect("session row reconstructs");
+                let id = info["id"].as_str().expect("session id").to_owned();
+                (id, crate::adapter::extract::extract_raw_record(&info))
             })
             .collect();
-        let reconstruct_expected = |data: &str, inject: &[(&str, Value)]| -> Value {
-            reconstruct_record(data, "", inject).unwrap()
+        let reconstruct_expected = |data: &str, inject: Vec<(&'static str, Value)>| -> Value {
+            reconstruct_record(data, inject, std::path::Path::new(""), "", "").unwrap()
         };
 
         let mut file_count = 0usize;
@@ -1885,7 +2012,7 @@ mod tests {
                 expected_msg_ids.push(message_id.clone());
                 let expected_info = reconstruct_expected(
                     data,
-                    &[("id", json!(message_id)), ("sessionID", json!(session_id))],
+                    vec![("id", json!(message_id)), ("sessionID", json!(session_id))],
                 );
                 let entry = body["messages"]
                     .as_array()
@@ -1905,7 +2032,7 @@ mod tests {
                         let (part_id, data) = r.unwrap();
                         reconstruct_expected(
                             &data,
-                            &[
+                            vec![
                                 ("id", json!(part_id)),
                                 ("sessionID", json!(session_id)),
                                 ("messageID", json!(message_id)),
@@ -1947,50 +2074,33 @@ mod tests {
         Ok(())
     }
 
-    /// `plan` is the events_with freshness pre-pass run standalone and MUST
-    /// agree with it: the sessions plan calls fresh are exactly the sessions
-    /// the gate skips. A message-less session stays pending (never Empty) -
-    /// reading it still ingests its Session row, so the gate must keep
-    /// re-reading it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
+    /// Shared assertion for `plan_matches_the_events_gate*`: a first sync (empty
+    /// oracle) is all-pending, then a max-watermark oracle is re-planned and its
+    /// fresh count is asserted to equal the `events_with` gate's fresh count.
+    /// Returns `(first_sync, max_plan)` so each caller adds its scenario-specific
+    /// count assertions (all-fresh DB vs. one message-less pending in the tree).
+    async fn plan_gate_agreement(
+        adapter: &OpencodeAdapter,
+    ) -> anyhow::Result<(SyncPlan, SyncPlan)> {
         use tokio_stream::StreamExt;
 
-        let temp = TempDir::new()?;
-        let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
-        let empty_dir = source.join("session").join("proj-empty");
-        std::fs::create_dir_all(&empty_dir)?;
-        std::fs::write(
-            empty_dir.join("ses_zzzzemptysession00000000.json"),
-            "{\"id\":\"ses_zzzzemptysession00000000\",\"projectID\":\"proj-empty\",\
-             \"directory\":\"/tmp/pond-test\",\"time\":{\"created\":1759859990000}}",
-        )?;
-
-        let adapter = OpencodeAdapter::new(&source);
         let first_sync = adapter
             .plan(&crate::adapter::NoopOracle)
             .await?
             .expect("opencode supports plan");
-        assert!(first_sync.sessions > 1);
-        assert_eq!(first_sync.pending, first_sync.sessions);
+        assert_eq!(
+            first_sync.pending, first_sync.sessions,
+            "a first sync reads every session"
+        );
         assert_eq!(first_sync.fresh, 0);
 
-        struct MaxWatermarkOracle;
-        impl crate::adapter::SkipOracle for MaxWatermarkOracle {
-            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
-                Some(i64::MAX)
-            }
-        }
-        let plan = adapter
+        let max_plan = adapter
             .plan(&MaxWatermarkOracle)
             .await?
             .expect("opencode supports plan");
-        assert_eq!(plan.sessions, first_sync.sessions);
         assert_eq!(
-            plan.pending, 1,
-            "the message-less session must stay pending - its Session row only \
-             lands by reading it",
+            max_plan.sessions, first_sync.sessions,
+            "session count is stable across oracles",
         );
 
         let mut gate_fresh = 0usize;
@@ -2008,7 +2118,36 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(gate_fresh, plan.fresh, "plan and gate must agree");
+        assert_eq!(gate_fresh, max_plan.fresh, "plan and gate must agree");
+        Ok((first_sync, max_plan))
+    }
+
+    /// `plan` is the events_with freshness pre-pass run standalone and MUST
+    /// agree with it: the sessions plan calls fresh are exactly the sessions
+    /// the gate skips. A message-less session stays pending (never Empty) -
+    /// reading it still ingests its Session row, so the gate must keep
+    /// re-reading it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("storage");
+        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        let empty_dir = source.join("session").join("proj-empty");
+        std::fs::create_dir_all(&empty_dir)?;
+        std::fs::write(
+            empty_dir.join("ses_zzzzemptysession00000000.json"),
+            "{\"id\":\"ses_zzzzemptysession00000000\",\"projectID\":\"proj-empty\",\
+             \"directory\":\"/tmp/pond-test\",\"time\":{\"created\":1759859990000}}",
+        )?;
+
+        let adapter = OpencodeAdapter::new(&source);
+        let (first_sync, max_plan) = plan_gate_agreement(&adapter).await?;
+        assert!(first_sync.sessions > 1);
+        assert_eq!(
+            max_plan.pending, 1,
+            "the message-less session must stay pending - its Session row only \
+             lands by reading it",
+        );
         Ok(())
     }
 
@@ -2552,8 +2691,12 @@ mod tests {
         )
         .await?;
         assert!(
-            summary.skipped_empty >= 1,
-            "the deduped tree copy must be counted, got {summary:?}",
+            summary.skipped_superseded >= 1,
+            "the deduped tree copy must be counted as superseded, got {summary:?}",
+        );
+        assert_eq!(
+            summary.skipped_empty, 0,
+            "the dedup must not fold into skipped_empty, got {summary:?}",
         );
 
         let overlapped = store
@@ -2597,49 +2740,16 @@ mod tests {
     /// fresh, and the gate skips exactly those.
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_matches_the_events_gate_db_source() -> anyhow::Result<()> {
-        use tokio_stream::StreamExt;
-
         let temp = TempDir::new()?;
         let data = db_data_dir(temp.path())?;
         let adapter = OpencodeAdapter::new(&data);
 
-        let first = adapter
-            .plan(&crate::adapter::NoopOracle)
-            .await?
-            .expect("opencode supports plan");
+        let (first, max_plan) = plan_gate_agreement(&adapter).await?;
         assert_eq!(first.sessions, DB_SESSION_COUNT);
-        assert_eq!(first.pending, DB_SESSION_COUNT);
-        assert_eq!(first.fresh, 0);
-
-        struct MaxWatermarkOracle;
-        impl crate::adapter::SkipOracle for MaxWatermarkOracle {
-            fn session_max_ts(&self, _session_id: &str) -> Option<i64> {
-                Some(i64::MAX)
-            }
-        }
-        let plan = adapter
-            .plan(&MaxWatermarkOracle)
-            .await?
-            .expect("opencode supports plan");
-        assert_eq!(plan.sessions, DB_SESSION_COUNT);
-        assert_eq!(plan.fresh, DB_SESSION_COUNT, "every DB session is fresh");
-
-        let mut gate_fresh = 0usize;
-        let mut stream = adapter.events_with(&MaxWatermarkOracle);
-        while let Some(item) = stream.next().await {
-            match item? {
-                AdapterYield::Skipped {
-                    reason: SkipReason::Fresh,
-                    ..
-                } => gate_fresh += 1,
-                AdapterYield::SkippedBatch {
-                    reason: SkipReason::Fresh,
-                    count,
-                } => gate_fresh += count,
-                _ => {}
-            }
-        }
-        assert_eq!(gate_fresh, plan.fresh, "plan and gate must agree");
+        assert_eq!(
+            max_plan.fresh, DB_SESSION_COUNT,
+            "every DB session is fresh under a max watermark",
+        );
         Ok(())
     }
 

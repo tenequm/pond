@@ -4388,6 +4388,14 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Superseded => {
+                    // Superseded copies are already excluded from discover()'s
+                    // total, so the bar never counted them: leave both `len`
+                    // and `pos` untouched (no shrink like Empty, no tick below).
+                    status_label = "superseded";
+                    dropped_count = 0;
+                    optional_reason = None;
+                }
             }
             messages += outcome.messages as u64;
             // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
@@ -4396,7 +4404,7 @@ async fn sync_with_progress(
             // full per-session detail at `-v` verbosity.
             if !matches!(
                 outcome.status,
-                SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty
+                SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty | SyncStatus::Superseded
             ) {
                 let _ = mp.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
             }
@@ -4423,8 +4431,10 @@ async fn sync_with_progress(
                     "session done"
                 ),
             }
-            if !matches!(outcome.status, SyncStatus::Empty) {
+            if !matches!(outcome.status, SyncStatus::Empty | SyncStatus::Superseded) {
                 // Empty already shrunk `len`; ticking `pos` would over-count.
+                // Superseded was never in `len` (excluded from discover's
+                // total), so ticking `pos` would over-count it too.
                 bar_ref.inc(1);
             }
             let tail = format_bar_message(messages, drops, errors, started.elapsed());
@@ -4444,6 +4454,9 @@ async fn sync_with_progress(
                     let len = bar_ref.length().unwrap_or(0);
                     bar_ref.set_length(len.saturating_sub(count as u64));
                 }
+                // Superseded copies are excluded from discover()'s total, so
+                // they were never in `len`: neither shrink it nor tick `pos`.
+                SyncStatus::Superseded => {}
                 _ => bar_ref.inc(count as u64),
             }
             let tail = format_bar_message(messages, drops, errors, started.elapsed());
@@ -4545,6 +4558,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Rejected { .. } => ("rej ", red()),
         SyncStatus::Fresh => ("fresh", green()),
         SyncStatus::Empty => ("empty", dim()),
+        SyncStatus::Superseded => ("superseded", dim()),
     };
     let tag = paint(raw_tag, tag_style);
     if matches!(outcome.status, SyncStatus::Fresh) {

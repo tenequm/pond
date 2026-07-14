@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
             let started = Instant::now();
             let mut sync_partial = 0u64;
             let mut sync_partial_drops = 0u64;
+            let mut sync_superseded = 0u64;
             let summary = ingest_adapter(&store, &adapter, oracle, |event| {
                 if let SyncEvent::SessionDone(outcome) = event {
                     match &outcome.status {
@@ -173,6 +174,7 @@ async fn main() -> Result<()> {
                             sync_partial += 1;
                             sync_partial_drops += *dropped_events as u64;
                         }
+                        SyncStatus::Superseded => sync_superseded += 1,
                         SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty => {}
                     }
                 }
@@ -195,6 +197,7 @@ async fn main() -> Result<()> {
                 sync_errors,
                 sync_partial,
                 sync_partial_drops,
+                sync_superseded,
                 capture: capture.snapshot(),
             });
 
@@ -463,6 +466,7 @@ struct Report<'a> {
     sync_errors: u64,
     sync_partial: u64,
     sync_partial_drops: u64,
+    sync_superseded: u64,
     capture: PerfSnapshot,
 }
 
@@ -489,8 +493,8 @@ fn report(r: Report<'_>) {
         r.dropped_events, r.dropped_sessions, r.skipped_files
     );
     println!(
-        "session outcomes  skipped(file)={}  rejected(session)={}  partial(session)={} (drops={})",
-        r.sync_skips, r.sync_errors, r.sync_partial, r.sync_partial_drops
+        "session outcomes  skipped(file)={}  superseded={}  rejected(session)={}  partial(session)={} (drops={})",
+        r.sync_skips, r.sync_superseded, r.sync_errors, r.sync_partial, r.sync_partial_drops
     );
     if let Some(s) = r.capture.summary {
         let t = s.total_ms.max(1);
