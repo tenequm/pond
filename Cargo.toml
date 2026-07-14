@@ -217,12 +217,9 @@ s3s = "0.14"
 s3s-fs = "0.14"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
-# macOS-only dev-dep so `benches/serve_mem_bench.rs` can sample
-# `phys_footprint` via `libc::proc_pid_rusage(RUSAGE_INFO_V4)` - the same
-# ledger Activity Monitor / `footprint(1)` / `top` / WebKit / psutil read.
-# RSS on macOS is wrong in both directions (overcounts shared dyld pages,
-# undercounts compressed pages); phys_footprint is the load-bearing metric.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Bench memory sampling: `getrusage` peak-RSS in commands_bench (any unix),
+# plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.

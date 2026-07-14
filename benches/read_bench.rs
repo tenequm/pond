@@ -1,4 +1,8 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+// This crate instantiates the lib's deep async ingest futures (e.g.
+// `append_unindexed`); their layout computation exceeds rustc's default
+// query-depth limit of 128.
+#![recursion_limit = "256"]
 
 //! Read-path latency as a function of the unindexed tail - the number that
 //! settles the FTS/vector fold-batching threshold (`DEFAULT_SYNC_INDEX_FOLD_ROWS`).
