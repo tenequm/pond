@@ -67,3 +67,6 @@ skills-lock.json
 
 # nix build output symlink
 /result
+
+# playwright-cli local session state
+/.playwright-cli/
