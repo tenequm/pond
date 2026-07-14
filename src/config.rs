@@ -930,26 +930,34 @@ mod tests {
         assert!(zero_dim.validate().is_err());
     }
 
+    // Every `Config::load` reads the process-global POND_* env mirror, so any
+    // test that calls it must hold the Jail lock - otherwise `env_mirror_layers_
+    // over_file`'s POND_CREDS_* vars leak in mid-load from a parallel thread and
+    // the load fails validation (two scope-less creds sets). Jail is the lock.
     #[test]
     fn config_load_missing_file_falls_back_to_builtin() {
-        let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
-        assert_eq!(config.embeddings, EmbeddingsConfig::default());
+        figment::Jail::expect_with(|_jail| {
+            let config = Config::load("/nonexistent/pond-config-xyz.toml").unwrap();
+            assert_eq!(config.embeddings, EmbeddingsConfig::default());
+            Ok(())
+        });
     }
 
     #[test]
     fn default_config_toml_loads_to_the_builtin_defaults() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, DEFAULT_CONFIG_TOML).unwrap();
-        // The shipped template is all comments, so it must load and validate as
-        // the built-in defaults - a malformed template fails right here.
-        let config = Config::load(&path).unwrap();
-        assert_eq!(config.embeddings, EmbeddingsConfig::default());
-        assert_eq!(config.embeddings.model, crate::embed::DEFAULT_MODEL_ID);
-        assert_eq!(
-            config.embeddings.dim,
-            crate::sessions::DEFAULT_EMBEDDING_DIM
-        );
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", DEFAULT_CONFIG_TOML)?;
+            // The shipped template is all comments, so it must load and validate as
+            // the built-in defaults - a malformed template fails right here.
+            let config = Config::load("config.toml").unwrap();
+            assert_eq!(config.embeddings, EmbeddingsConfig::default());
+            assert_eq!(config.embeddings.model, crate::embed::DEFAULT_MODEL_ID);
+            assert_eq!(
+                config.embeddings.dim,
+                crate::sessions::DEFAULT_EMBEDDING_DIM
+            );
+            Ok(())
+        });
     }
 
     #[test]
@@ -1049,8 +1057,10 @@ mod tests {
 
     #[test]
     fn resolve_adapters_returns_one_or_all_or_errors() {
-        let temp = TempDir::new().unwrap();
-        let body = "\
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "\
 [adapters.claude-code]
 enabled = true
 path = \"/srv/claude\"
@@ -1061,44 +1071,45 @@ path = \"/srv/codex\"
 
 [adapters.opencode]
 enabled = false
-";
-        let path = temp.path().join("config.toml");
-        std::fs::write(&path, body).expect("write config");
-        let config = Config::load(&path).unwrap();
+",
+            )?;
+            let config = Config::load("config.toml").unwrap();
 
-        // None -> only enabled entries
-        let all = config.resolve_adapters(None).unwrap();
-        assert_eq!(all.len(), 2);
-        let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"claude-code"));
-        assert!(names.contains(&"codex-cli"));
-        // The `enabled` discriminator never reaches the adapter blob.
-        for (_, blob) in &all {
-            assert!(blob.get("enabled").is_none(), "enabled should be stripped");
-        }
+            // None -> only enabled entries
+            let all = config.resolve_adapters(None).unwrap();
+            assert_eq!(all.len(), 2);
+            let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(names.contains(&"claude-code"));
+            assert!(names.contains(&"codex-cli"));
+            // The `enabled` discriminator never reaches the adapter blob.
+            for (_, blob) in &all {
+                assert!(blob.get("enabled").is_none(), "enabled should be stripped");
+            }
 
-        // Some(name) -> one entry, opaque JSON blob
-        let one = config.resolve_adapters(Some("codex-cli")).unwrap();
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].0, "codex-cli");
-        assert_eq!(
-            one[0].1.get("path").and_then(Value::as_str),
-            Some("/srv/codex"),
-        );
+            // Some(name) -> one entry, opaque JSON blob
+            let one = config.resolve_adapters(Some("codex-cli")).unwrap();
+            assert_eq!(one.len(), 1);
+            assert_eq!(one[0].0, "codex-cli");
+            assert_eq!(
+                one[0].1.get("path").and_then(Value::as_str),
+                Some("/srv/codex"),
+            );
 
-        // Disabled positional -> errors with the recovery hint baked in.
-        let disabled = config.resolve_adapters(Some("opencode"));
-        let err = disabled
-            .expect_err("disabled adapter must error")
-            .to_string();
-        assert!(err.contains("enabled = false"), "got: {err}");
-        assert!(err.contains("pond sync opencode"), "got: {err}");
+            // Disabled positional -> errors with the recovery hint baked in.
+            let disabled = config.resolve_adapters(Some("opencode"));
+            let err = disabled
+                .expect_err("disabled adapter must error")
+                .to_string();
+            assert!(err.contains("enabled = false"), "got: {err}");
+            assert!(err.contains("pond sync opencode"), "got: {err}");
 
-        // Unknown -> error
-        assert!(config.resolve_adapters(Some("nope")).is_err());
+            // Unknown -> error
+            assert!(config.resolve_adapters(Some("nope")).is_err());
 
-        // disabled_adapter_names lists exactly the off ones.
-        assert_eq!(config.disabled_adapter_names(), vec!["opencode"]);
+            // disabled_adapter_names lists exactly the off ones.
+            assert_eq!(config.disabled_adapter_names(), vec!["opencode"]);
+            Ok(())
+        });
     }
 
     #[test]
