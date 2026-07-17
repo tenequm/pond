@@ -4,8 +4,9 @@ Working session output: everything discovered while mapping how pond integrates 
 
 ## 0. Task state
 
-- Done: full read of pond `docs/spec.md`; all relevant OpenClaw docs + the four memory extension sources + the memory-slot registration API in core; LanceDB repos and blogs; the option map below was presented and accepted as the decision frame.
-- Not done yet (first next steps): O2 adapter schema investigation (actual SQLite table/column names for OpenClaw transcript events and session rows - read `src/config/sessions.ts`, `src/config/sessions/session-accessor.ts`, or inspect a live `openclaw-agent.sqlite`); decision on branch mapping; then pick which options to build.
+- Done: full read of pond `docs/spec.md`; all relevant OpenClaw docs + the four memory extension sources + the memory-slot registration API in core; LanceDB repos and blogs; the option map below presented and accepted; O2 schema dig completed against source (section 5); GitHub community landscape researched (section 8).
+- User decisions taken 2026-07-17: skill-level integration (former O0) is OUT - proper integration only. The `memory_search` corpus-supplement seam (O4) is NOT the target layer - pond targets the durable layer beneath it (upstream is consolidating in-gateway recall as first-party, section 8). The adapter is built against latest OpenClaw main (storage schema is young and moving, section 8).
+- Open decisions: tree-to-linear mapping variant (A1/A2/A3), project/source_agent scoping, first read surface (O1 vs O3), sync-vs-live freshness (sections 5 and 10).
 - User intent: see all options first, don't be limited by current pond spec (extending it is allowed where it makes the integration better).
 
 ## 1. Ground facts: OpenClaw session storage (adapter-critical)
@@ -19,7 +20,7 @@ Repo: `~/pjv/openclaw/openclaw` (TypeScript Gateway; one long-lived Gateway proc
 - Session identity: `sessionKey` = routing bucket (`agent:<agentId>:main`, `agent:<id>:<channel>:group:<id>`, `cron:<jobId>`, `hook:<uuid>`); `sessionId` = current transcript identity under that key; new sessionId on `/new`, daily reset (default 4am), idle reset. `cwd` in the header + agentId are the raw material for pond `project`.
 - SessionEntry fields (session row): `sessionId`, `sessionStartedAt`, `lastInteractionAt`, `updatedAt`, `archivedAt`, `pinnedAt`, `chatType` (direct|group|room), `provider`/`subject`/`room`/`space`/`displayName`, toggles (thinking/verbose/reasoning/elevated/sendPolicy), model overrides, token counters, `compactionCount`, `memoryFlushAt`.
 - Transcript hygiene (provenance gold for the adapter): stored user turns use the clean transcript body - runtime-enriched prompt wrappers are NOT persisted (post-2026.1.22; legacy sessions may carry wrappers, display projection applied at read). Inter-session routed prompts persist `message.provenance.kind = "inter_session"` plus a same-turn `[Inter-session message ...]` marker -> maps directly to pond `Part.provenance` (`injected`). Provider-specific sanitization is in-memory before replay, not stored; a narrow on-disk repair pass exists (`src/agents/session-file-repair.ts`).
-- Code pointers: `src/config/sessions.ts` (SessionEntry type + paths), `src/config/sessions/session-accessor.ts` (writer path), `src/auto-reply/reply/session.ts` (`initSessionState()`), `src/agents/transcript-policy.ts` + `src/agents/embedded-agent-runner/replay-history.ts` (hygiene), SessionManager for transcript read/write.
+- Code pointers: `src/state/openclaw-agent-schema.sql` (THE DDL - see section 5), `src/config/sessions/session-accessor.sqlite-transcript-store.ts` (writer path), `src/auto-reply/reply/session.ts` (`initSessionState()`), `src/agents/transcript-policy.ts` + `src/agents/embedded-agent-runner/replay-history.ts` (hygiene), `src/sessions/input-provenance.ts` (provenance kinds + inter-session envelope).
 - Docs: `docs/reference/session-management-compaction.md` (THE schema doc), `docs/reference/transcript-hygiene.md`, `docs/concepts/session.md`.
 
 ## 2. Ground facts: OpenClaw integration seams
@@ -39,7 +40,7 @@ Plugin mechanics: `definePluginEntry({id, kind?, configSchema, register(api)})`;
 - Workspace markdown memory: `MEMORY.md` (curated, bootstrap-injected) + `memory/YYYY-MM-DD.md` (daily notes), indexed by the memory slot plugin; tools `memory_search`/`memory_get`. Pre-compaction "memory flush" silent turn writes durable notes before compaction (gateway-side, `src/auto-reply/reply/memory-flush.ts`). Dreaming = memory-core's scheduled promotion pipeline into MEMORY.md.
 - Backends: builtin SQLite (FTS5 + sqlite-vec hybrid, 400/80-token chunks, index inside `openclaw-agent.sqlite`); QMD sidecar (external local binary with own index, managed subprocess - the closest architectural analog to pond as external binary; `memory.backend: "qmd"`, per-agent home, transcript export opt-in via `memory.qmd.sessions.enabled`); Honcho (external service plugin); memory-lancedb (official external plugin, npm `@openclaw/memory-lancedb`).
 - `sessions_search` (core tool): SQLite FTS indexed in the same transaction as persist; user+assistant text only; active branch only; tool results/reasoning/images excluded - SAME signal philosophy as pond `search_text`, but lexical-only. `sessions_history` returns normalized transcripts (strips thinking tags, tool-call XML, `<relevant-memories>` scaffolding; redacts credential-like text). Session-transcript semantic indexing exists only as experimental `memorySearch.experimental.sessionMemory` + `sources: ["memory","sessions"]` (async, stale, SQLite) - this is what O4 replaces.
-- active-memory (bundled plugin): blocking recall sub-agent BEFORE the main reply for eligible interactive chats; calls only tools in `config.toolsAllow` (concrete registered tool names; defaults `["memory_search","memory_get"]`, or `["memory_recall"]` when slot = memory-lancedb); injects `<active_memory_plugin>` untrusted-context block. Pond tools can be its backend if registered as plugin tools (MCP-projected tools' eligibility in toolsAllow is UNVERIFIED - check before relying on O1 for this).
+- active-memory (bundled plugin): blocking recall sub-agent BEFORE the main reply for eligible interactive chats; calls only tools in `config.toolsAllow` (concrete registered tool names; defaults `["memory_search","memory_get"]`, or `["memory_recall"]` when slot = memory-lancedb); injects `<active_memory_plugin>` untrusted-context block. Verified 2026-07-17: the recall sub-agent run bundles MCP servers (`cleanupBundleMcpOnRunEnd: true` in `extensions/active-memory/recall-run.ts`) and `toolsAllow` accepts arbitrary concrete tool names (wildcards/groups rejected; graceful typed error when none resolve) - MCP-projected pond tools are LIKELY eligible; verify the exact projected tool naming at implementation time. Note: PR #100140 (section 8) reworks active-memory targeting around `rememberAcrossConversations` and restricts the protected transcript-recall path to the built-in provider.
 - memory-lancedb internals (full read of `extensions/memory-lancedb/index.ts`, ~2100 lines - the template for O3): `kind: "memory"`; tools memory_recall/memory_store/memory_forget; `before_prompt_build` auto-recall (embeds latest user text, overfetch 10 -> cap 3 injected, 15s timeout, cooldown on embed failure); `agent_end` auto-capture (trigger regexes, `sanitizeForMemoryCapture` strips envelope metadata - big investment in filtering harness sludge, a problem pond's provenance-typed ingest largely avoids); `session_end` cursor cleanup; single LanceDB `memories` table with per-agent `agentId` owner column enforced in every predicate; embeddings via provider adapters (`openclaw/plugin-sdk/memory-core-host-engine-embeddings`) or direct OpenAI-compatible; `~/.openclaw/memory/lancedb` default, `storageOptions` for S3; CLI namespace `ltm`.
 - Onboarding imports Claude Code / Codex / Hermes MARKDOWN memory into `memory/imports/` (memory-only; never sessions). Doc: `docs/concepts/memory.md`.
 
@@ -59,14 +60,50 @@ Plugin mechanics: `definePluginEntry({id, kind?, configSchema, register(api)})`;
 | O9 | restore/interchange: adapter serialize face restores any pond session INTO openclaw (and openclaw sessions into Claude Code etc.); unique pond capability, no competitor has it | pond | adapter serialize face | none | S after O2 |
 | O10 | fleet archive: every OpenClaw VM (AgentBox) runs `pond sync` to one shared S3 store; ingest-host stamp gives per-VM attribution, `pond status --hosts` fleet view | deploy | O2/O6 + schedule | none | S |
 
-Composition spine: O2 -> O1/O0 (instant recall) -> O3+O4 (native feel + auto-recall) -> O9 (differentiator); O6 upgrades freshness; O8 endgame; O7 skip. Positioning: fact-memory plugins (memory-lancedb/-pro) remember conclusions; pond remembers everything that happened; they stack (LanceDB's own blog argues the plugin layer is the right boundary).
+Composition spine (as originally presented): O2 -> O1/O0 (instant recall) -> O3+O4 (native feel + auto-recall) -> O9 (differentiator); O6 upgrades freshness; O8 endgame; O7 skip.
 
-## 5. O2 adapter design notes (accumulated decisions/questions)
+Decisions taken 2026-07-17 that amend the map: O0 is OUT (user wants proper integration only). O4 is NOT the spearhead - upstream is consolidating in-gateway session recall as first-party (PR #100140, section 8), so competing inside `memory_search` corpora is the wrong layer; pond positions as the durable cross-harness tier BENEATH it (permanence past the disk budget, cross-harness corpus, off-gateway indexing, restore/interchange). O4 stays available as a later optional surface. O2 is unconditionally first and tracks latest OpenClaw main. Positioning: fact-memory plugins (memory-lancedb/-pro) remember conclusions; upstream remembers recent private context in-gateway; pond remembers everything, forever, across harnesses - they stack.
 
-- Source: per-agent SQLite (active) + `sessions/` zstd archives + legacy JSONL/sessions.json. Adapter seam is transport-agnostic; a SQLite reader is legitimate (needs rusqlite; zstd for archives).
-- Mapping sketch: agentId (+ `cwd` from session header) -> `project`; `source_agent: "openclaw"` (subagents/cron/hook variants as `openclaw/<kind>` to inherit pond's default subagent exclusion); session header `parentSession` + fork machinery -> `parent_session_id`/`parent_message_id`; `compaction`/`branch_summary`/`custom` entries -> placement rule 3 carriers or options; `custom_message` -> injected-provenance Parts; `provenance.kind = "inter_session"` -> `injected`.
-- Open: tree-to-linear strategy (one pond session per branch vs active-branch-only with branch_summary preservation - lean: ingest ALL branches, each branch tail as its own session with fork lineage, but verify volume); entry-id determinism for `lance-deterministic-pk`; timestamps per entry; whether sessionKey or sessionId becomes pond SessionID (lean: sessionId; sessionKey into options).
-- First task: reverse-engineer exact SQLite DDL (tables/columns) from `src/config/sessions.ts` + accessor, or `sqlite3 ~/.openclaw/agents/main/agent/openclaw-agent.sqlite .schema` on a live install.
+## 5. O2 adapter: schema dig results (verified in source 2026-07-17)
+
+Source of truth: `src/state/openclaw-agent-schema.sql` (per-agent `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite`). Writer: `src/config/sessions/session-accessor.sqlite-transcript-store.ts`. Entry types: `@mariozechner/pi-coding-agent/dist/core/session-manager.d.ts` (session version 3); message types: `@mariozechner/pi-ai/dist/types.d.ts`. Adapter needs rusqlite + zstd.
+
+Tables the adapter reads:
+
+- `sessions` - `session_id` PK, `session_key`, `session_scope` (conversation|shared-main|group|channel), `parent_session_key`, `spawned_by`, `chat_type`, `channel`, `account_id`, `model_provider`/`model`, `agent_harness_id`, `status`, ms-epoch timestamps. Lineage is relational - no JSON parsing needed.
+- `transcript_events` - `(session_id, seq)` PK, `event_json`, `created_at`. `seq` is the per-session total append order.
+- `transcript_event_identities` - `(session_id, event_id)` -> `seq`, `event_type`, `parent_id`, `message_idempotency_key`. The tree structure is ALREADY extracted into SQL.
+- `session_transcript_active_events` - the active branch materialized: `(session_id, active_position) -> event_seq, message_position`.
+- Session/routing metadata for options: `session_entries` (SessionEntry JSON per routing key), `conversations`, `session_conversations`, `session_routes`.
+- Out of scope candidates (decide explicitly, `model-lossless-projection` documented-contract clause): `session_transcript_fts` (their index, derived data), `trajectory_runtime_events` (separate runtime stream per run_id).
+
+Entry JSON (pi `FileEntry`): header `{type:"session", version, id, timestamp(ISO), cwd, parentSession?}` + entries `{type, id, parentId, timestamp}` in 9 types: `message`, `thinking_level_change`, `model_change`, `compaction` (summary, firstKeptEntryId, tokensBefore), `branch_summary` (fromId, summary), `custom` (extension state, NOT in LLM context), `custom_message` (extension-injected, IS in LLM context), `label`, `session_info`. Archives are the SAME JSONL entry lines (`<id>.jsonl.<reason>.<timestamp>[.zst]`, reasons reset/deleted, zstd level 3; `archive-compression.ts`) - one entry parser serves live SQLite rows and archive files.
+
+Message mapping (pi-ai -> canonical), near-1:1:
+
+| OpenClaw | pond |
+|---|---|
+| `TextContent{text,textSignature}` | TextPart (+options) |
+| `ThinkingContent{thinking,thinkingSignature,redacted}` | ReasoningPart (+options) |
+| `ToolCall{id,name,arguments,thoughtSignature}` | ToolCallPart |
+| `ToolResultMessage{toolCallId,toolName,isError,content,details}` | ToolMessage + ToolResultPart (`is_failure`) |
+| `ImageContent{data,mimeType}` | FilePart (blob) |
+| `usage`/`stopReason`/`api`/`provider`/`model`/`errorMessage`/`responseId` | `options.openclaw.*` (spec 4.6) |
+
+Provenance is a gift: user messages carry `provenance.kind in {external_user, inter_session, internal_system}` plus `originSessionId`/`sourceSessionKey`/`sourceChannel`/`sourceTool` (`src/sessions/input-provenance.ts`), and the `[Inter-session message]` prefix is a documented, strippable envelope -> maps to pond conversational/injected with a byte-exact split (placement rule 1). `custom_message` -> injected Parts. `custom`/`label`/`session_info`/`thinking_level_change`/`model_change` -> rule-3 carriers or options.
+
+Deterministic PKs, zero synthesis: entry `id` is source-supplied -> MessageID; PartID = entry id + ordinal; SessionID = `session_id`; sessionKey into options. Subagents already have their own `session_id` (sessionKey `agent:<agentId>:subagent:<uuid>`, `spawned_by` -> parent key) -> pond child sessions via `parent_session_id`.
+
+Open decision A - tree-to-linear mapping:
+
+- A1: active branch only. Simplest; discards abandoned branches - against pond's preservation-over-convenience posture. Listed for completeness only.
+- A2: one pond session per branch (active branch = `<sessionId>`; each abandoned branch tail = child session with fork cut-point via `parent_session_id`/`parent_message_id`). Matches pond's lineage-copies-history model, but duplicates shared prefixes and mints session ids the source never had.
+- A3: one pond session per OpenClaw session, flattened in `seq` order, `parentId` preserved in each message's options. No duplication, fully lossless (native restore rebuilds the exact tree from options), search sees every branch once. The transcript IS an append-only log with tree pointers; A3 stores it as exactly that.
+
+Open decision B - scoping conventions (design once, the Hermes provider reuses them):
+
+- `project`: agentId vs header `cwd` vs composite. Agents often share a cwd; agentId is the true shared-state scope, but pond project filters are path-shaped today.
+- `source_agent`: `"openclaw"` for main sessions; cron/hook/subagent sessions as `openclaw/<kind>` (inherits pond's default subagent search exclusion) or top-level.
 
 ## 6. Hermes phase (deferred; minimal carry-forward)
 
@@ -81,7 +118,20 @@ Composition spine: O2 -> O1/O0 (instant recall) -> O3+O4 (native feel + auto-rec
 - [Positioning blog](https://www.lancedb.com/blog/openclaw-lancedb-memory-layer): LanceDB's stance is that the community plugin layer is the right abstraction boundary (no native plugin needed) - supports pond integrating as plugin/adapter rather than upstream core.
 - Partitioned-namespace design (`~/pjv/lance-format/lance-context/docs/design/partitioned-namespace.md`, lance-context #90): one shared schema, physical partitions by tenant/agent/source via the namespace `__manifest`; guidance "start with one dataset + metadata filters; partition only for physical needs (isolation, lifecycle, per-scope index, deletion)". Matches pond's current single-namespace + project-column filtering; the reference design if per-agent physical isolation or hosted multi-tenant (spec 9.5) activates. Relevant for O10.
 
-## 8. Curated re-read list (the load-bearing sources only)
+## 8. GitHub community landscape (researched 2026-07-17)
+
+Where upstream and the community are heading on session memory. All threads in `openclaw/openclaw`.
+
+- Cross-session continuity is the top demand in the memory space: #51386 "graduate sessionMemory from experimental" (top community rating, open since March), #99611 "remember across private conversations", RFC #48874 (multi-session architecture), #90916 (topic-session families), plus a steady stream of session-memory-hook trigger gaps (#15828, #11960, #51572, #50991, PR #61675). Canonical complaint: "twin brothers who don't share memory".
+- Upstream's answer is landing NOW and walls out third-party providers: PR #100140 (maintainer-driven, near-merge as of 2026-07-17) adds per-agent `memorySearch.rememberAcrossConversations` - memory-core transcript index + active-memory bounded pre-reply recall, private conversations only, fail-closed. The protected transcript-recall authorization is EXCLUSIVE to the built-in provider (builtin/QMD backends); memory-lancedb and others get a doctor "unsupported provider" diagnostic. Consequence: in-gateway, same-agent, private-scope recall is upstream turf - do not compete there.
+- Their transcript indexing structurally struggles (pond's openings): full delete-and-re-embed of every chunk per sync (#40919; third fix attempt PR #103201), transcript search blocking the Gateway event loop (#105735), gateway-dispatched sessions missing from memory_search (#53550), duplicate indexing hook-vs-transcript (#54524). A #51386 comment argues graduation is blocked on a missing "source/retrieval policy contract" (labeled sources, ranking precedence, memory-vs-sessions semantics) - effectively a requirements spec for a proper session corpus.
+- History loss is P0-grade pain; the upstream fix is partial: #45003 (P0, impact:data-loss - daily reset archived all history at once) was closed by steipete 2026-07-11: reset archives now default to zstd cold storage with transparent fallback readers and a doctor manifest-driven restore. But retention stays bounded by the per-agent disk budget - old history still eventually dies. This anxiety is pond's marketing surface.
+- Storage layer is young and moving: PR #78595 (May 2026) moved sessions/transcripts from JSON/JSONL to per-agent SQLite; steipete closes storage-implicated issues optimistically as the rework lands. Hence the user decision: the adapter tracks latest main (watch `schema_meta.schema_version` in the agent DB).
+- Privacy is the axis every maintainer move is judged on (fail-closed scoping everywhere: #99225, #70761, #103087). Any pond surface exposing cross-conversation content needs its own explicit scoping story to be viable upstream and trustworthy to users.
+- Adjacent ecosystem circling the durability/history space: [agent-sessions](https://github.com/jazzyalex/agent-sessions) - read-only multi-harness local history viewer (OpenClaw, Claude Code, Codex, Hermes; proof of cross-harness demand); KeepMyClaw - paid encrypted R2 snapshot backups (marketing in threads). Neither is a canonical searchable archive - pond's lane (permanence beyond the disk budget, cross-harness corpus, off-gateway indexing, restore/interchange) is uncontested.
+- memory-lancedb is now first-party-adjacent (Featured plugin with brand icon PR #109337; active partitioning/scoping #108782, configurable auto-recall #109283). The fact-memory side is crowded; stay off it.
+
+## 9. Curated re-read list (the load-bearing sources only)
 
 pond: `docs/spec.md` (esp. sections 4, 6, 7.6-7.8, 9.1, 9.4, 9.5).
 
@@ -91,9 +141,11 @@ OpenClaw source: `extensions/memory-lancedb/` (O3 template), `extensions/memory-
 
 Known-wasteful (skip on re-read): `cli/onboard.md`, all `start/*`, `cli/plugins.md`, `cli/transcripts.md` (meeting-audio, not sessions), `cli/worker.md`, `concepts/usage-tracking.md`, `concepts/session-state.md`, `concepts/context.md`, `concepts/architecture.md`, `concepts/dreaming.md`, `cli/memory.md`, `concepts/experimental-features.md`, `plugins/building-extensions.md` (redirect stub), [newsletter blog](https://www.lancedb.com/blog/newsletter-september-2025), [seed2 blog](https://www.lancedb.com/blog/openclaw-lancedb-seed2), [openclaw-lancedb-demo repo](https://github.com/lancedb/openclaw-lancedb-demo) (toy; covered by the positioning blog).
 
-## 9. Immediate next steps for the design phase
+## 10. Immediate next steps for the design phase
 
-1. O2 schema dig: exact SQLite DDL for transcript events + session rows; sample a live db; settle tree-to-linear mapping, deterministic PKs, provenance table (entry type -> Part provenance/placement rule).
-2. Decide the build order across O2/O1/O3/O4 (spine above is the working recommendation) and what pond-side API additions O3/O4 need (search response `format` for injection? project/agent scoping convention?).
-3. Verify: are MCP-projected tools eligible in active-memory `toolsAllow`? (determines whether O1 alone can back active-memory or O3 is required for it).
-4. Keep the Hermes-thin-frontend constraint in every pond-side surface decision (section 6).
+1. Decide the tree-to-linear variant (A1/A2/A3) and scoping conventions (`project`, `source_agent`) - section 5 open decisions A and B.
+2. Decide the first read surface after O2: O1 (MCP attach) vs O3 (plugin) vs both; and O3's transport (CLI spawn per query vs HTTP to a running `pond serve`).
+3. Decide freshness: scheduled `pond sync` first, or O6 live push as part of the core design.
+4. Positioning is settled (sections 4 and 8): pond = the durable cross-harness tier beneath OpenClaw's in-gateway recall; do not compete with `rememberAcrossConversations` or the fact-memory plugins. Design every surface with an explicit fail-closed scoping story (privacy is the upstream axis).
+5. Keep the Hermes-thin-frontend constraint in every pond-side surface decision (section 6).
+6. At implementation time: verify MCP-projected tool naming for active-memory `toolsAllow` (section 3); track OpenClaw main for schema drift (`schema_meta.schema_version`).
