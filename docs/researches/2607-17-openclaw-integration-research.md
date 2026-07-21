@@ -6,7 +6,8 @@ Working session output: everything discovered while mapping how pond integrates 
 
 - Done: full read of pond `docs/spec.md`; all relevant OpenClaw docs + the four memory extension sources + the memory-slot registration API in core; LanceDB repos and blogs; the option map below presented and accepted; O2 schema dig completed against source (section 5); GitHub community landscape researched (section 8).
 - User decisions taken 2026-07-17: skill-level integration (former O0) is OUT - proper integration only. The `memory_search` corpus-supplement seam (O4) is NOT the target layer - pond targets the durable layer beneath it (upstream is consolidating in-gateway recall as first-party, section 8). The adapter is built against latest OpenClaw main (storage schema is young and moving, section 8).
-- Open decisions: tree-to-linear mapping variant (A1/A2/A3), project/source_agent scoping, first read surface (O1 vs O3), sync-vs-live freshness (sections 5 and 10).
+- User decisions taken 2026-07-21: deletion policy = skip-deleted by default + erase reconciliation, never via MCP (section 5); capture-first build order; noise filtering is adapter-level config; schema-drift posture = best-effort with warnings; runtime = daemonless v1, daemon consolidation bundled with the O6 decision (section 4); no multi-tenancy in v1 but per-agent scoping is mandatory (section 4); O8 confirmed as endgame, certainly not the first integration.
+- Open decisions: tree-to-linear mapping variant (A1/A2/A3), project/source_agent scoping (leading candidate identified, needs a focused deeper dig at plan finalization - section 5), first read surface (O1 vs O3) + O3 transport, sync-vs-live freshness (sections 5 and 10).
 - User intent: see all options first, don't be limited by current pond spec (extending it is allowed where it makes the integration better).
 
 ## 1. Ground facts: OpenClaw session storage (adapter-critical)
@@ -33,7 +34,15 @@ Five seams, all verified in source:
 4. **Context-engine slot** - `plugins.slots.contextEngine`; interface: `info` (`ownsCompaction`, `hostRequirements`), `ingest`, `assemble` (returns messages + `estimatedTokens` + optional `systemPromptAddition`, `promptAuthority`), `compact`, optional `bootstrap`/`maintain`/`ingestBatch`/`afterTurn`/`prepareSubagentSpawn`/`onSubagentEnded`/`dispose`. Failure isolation: broken engine is quarantined, falls back to `legacy`. Example: Lossless Claw (`@martian-engineering/lossless-claw`). Doc: `docs/concepts/context-engine.md`.
 5. **External MCP servers** - `mcp.servers.*` registry (`openclaw mcp add/set/configure/tools/login`), projected into eligible runtimes. ACP bridge mode does NOT accept per-session MCP injection. Doc: `docs/cli/mcp.md`.
 
-Plugin mechanics: `definePluginEntry({id, kind?, configSchema, register(api)})`; manifest `openclaw.plugin.json` must declare `contracts.tools`; `api.registerTool(factoryOrDescriptor, {name})` - factory receives ctx with `agentId` and can return null to hide the tool per agent; `api.registerCli` for a CLI namespace; `api.registerService({id, start, stop})`; tool names MUST NOT collide with core tool names (conflicts are silently skipped - relevant to O5). Local dev: `openclaw plugins install -l <dir>` / `plugins.load.paths`. Docs: `docs/plugins/architecture.md`, `docs/plugins/building-plugins.md`.
+Plugin mechanics: `definePluginEntry({id, kind?, configSchema, register(api)})`; manifest `openclaw.plugin.json` must declare `contracts.tools`; `api.registerTool(factoryOrDescriptor, {name})` - factory receives ctx with `agentId` and can return null to hide the tool per agent; `api.registerCli` for a CLI namespace; `api.registerService({id, start, stop})`; tool names MUST NOT collide with core tool names (conflicts are silently skipped - relevant to O5). Local dev: `openclaw plugins install -l <dir>` / `plugins.load.paths`. Docs: `docs/plugins/architecture.md`, `docs/plugins/building-plugins.md`. "Extension" = "plugin" (docs use both words); `extensions/` in-repo is just the bundled plugins, same API as external ones.
+
+Core-integration verdict (settled 2026-07-21, pressure-tested): the plugin system IS OpenClaw's sanctioned deep-integration surface - their own memory system ships as bundled plugins using the same `definePluginEntry` API, and plugins reach prompt assembly, agent lifecycle, tools, CLI, and services. Only three things a plugin cannot do, each closed on purpose:
+
+1. Replace transcript persistence - no session-store seam exists in the SQLite accessor/write path; proposing one into the post-#78595 climate (storage rework in flight, providers being walled out of trusted paths) is months of friction for zero user value. Pond reads the SQLite they already write instead.
+2. The trusted private-recall authorization - built-in-provider-only per PR #100140, gate-kept deliberately on privacy grounds. Not winnable now.
+3. Owning context assembly - which HAS a sanctioned slot (`plugins.slots.contextEngine`, the Lossless Claw pattern). That is O8, the endgame, deferred on pond's missing live-write + read-latency SLAs, not on principle.
+
+Risks of reading their SQLite from outside (verified in writer path): one long-lived Gateway process owns the DB - open read-only and WAL-aware, never take write locks; secrets are redacted BEFORE storage (good: pond can't launder secrets); `schema_meta.schema_version` makes drift detectable but the schema will drift (hence tracking main); ACP-owned and plugin-owned sessions carry flags to respect; doctor migrations can rewrite storage underneath a sync.
 
 ## 3. Ground facts: OpenClaw memory system (what pond does/doesn't compete with)
 
@@ -63,6 +72,8 @@ Plugin mechanics: `definePluginEntry({id, kind?, configSchema, register(api)})`;
 Composition spine (as originally presented): O2 -> O1/O0 (instant recall) -> O3+O4 (native feel + auto-recall) -> O9 (differentiator); O6 upgrades freshness; O8 endgame; O7 skip.
 
 Decisions taken 2026-07-17 that amend the map: O0 is OUT (user wants proper integration only). O4 is NOT the spearhead - upstream is consolidating in-gateway session recall as first-party (PR #100140, section 8), so competing inside `memory_search` corpora is the wrong layer; pond positions as the durable cross-harness tier BENEATH it (permanence past the disk budget, cross-harness corpus, off-gateway indexing, restore/interchange). O4 stays available as a later optional surface. O2 is unconditionally first and tracks latest OpenClaw main. Positioning: fact-memory plugins (memory-lancedb/-pro) remember conclusions; upstream remembers recent private context in-gateway; pond remembers everything, forever, across harnesses - they stack.
+
+Decisions taken 2026-07-21 that amend the map: O8 is confirmed as the endgame and certainly not the first integration. Runtime shape is daemonless in v1: `pond schedule` registers periodic `pond sync` (one-shot, reads OpenClaw SQLite read-only, writes Lance, exits) and OpenClaw's `mcp.servers` spawns `pond mcp` over stdio per client session (model loads once per session, no port, no service management) - two crash-isolated jobs sharing one Lance store under OCC. One resident `pond serve` doing both becomes right exactly when O6 (live push) arrives - an ingest endpoint must listen constantly, and folding the sync loop into serve is then natural (a deliberate spec extension: "no daemon beyond `pond serve`" stays true, serve just becomes that daemon). Multi-tenancy: none in v1 - one operator = one namespace (hosted multi-tenant stays spec 9.5, seams preserved); but per-agent SCOPING is mandatory and cheap - agent identity lands in filterable columns and every read surface filters on it by default, matching upstream's fail-closed privacy posture. It is a filtering convention, not tenancy machinery.
 
 ## 5. O2 adapter: schema dig results (verified in source 2026-07-17)
 
@@ -100,10 +111,20 @@ Open decision A - tree-to-linear mapping:
 - A2: one pond session per branch (active branch = `<sessionId>`; each abandoned branch tail = child session with fork cut-point via `parent_session_id`/`parent_message_id`). Matches pond's lineage-copies-history model, but duplicates shared prefixes and mints session ids the source never had.
 - A3: one pond session per OpenClaw session, flattened in `seq` order, `parentId` preserved in each message's options. No duplication, fully lossless (native restore rebuilds the exact tree from options), search sees every branch once. The transcript IS an append-only log with tree pointers; A3 stores it as exactly that.
 
-Open decision B - scoping conventions (design once, the Hermes provider reuses them):
+Caveat for A3 (verified in writer path): `seq` is NOT stable - `replaceSqliteTranscriptEventsInTransaction` can delete and rewrite a session's events with new seq numbers (repairs/migrations). Entry `id` is the stable identity; ordering must derive from timestamp + tree position, never seq alone. Related: since pond's additive-sync never overwrites matched rows, a source-side history rewrite produces silent divergence between pond's copy and theirs - whether the adapter detects and reports that is an implementation-plan item.
 
-- `project`: agentId vs header `cwd` vs composite. Agents often share a cwd; agentId is the true shared-state scope, but pond project filters are path-shaped today.
+Open decision B - scoping conventions (design once, the Hermes provider reuses them). Leading candidate identified 2026-07-21, NOT settled - needs a focused deeper dig at plan finalization:
+
+- `project`: leading candidate is conversation identity in session_key-shaped composite form (`agent:main:telegram:group:123`, `cron:<jobId>`, `hook:<uuid>`). Rationale: pond `project` is "the shared-state scope", and OpenClaw sessions share state per chat, not per directory; substring filtering gives both scopes (agent prefix -> all that agent's chats; full string -> one chat stitched across daily-reset segments); the key exists for every session type (satisfies `model-project-non-empty`) and never mutates (unlike `primary_conversation_id`, ON DELETE SET NULL); header `cwd` goes to options. Known consequences to weigh in the dig: project semantics become source-defined (directory for Claude Code, chat for OpenClaw - a convention to document), cardinality rises from a handful of repos to hundreds of chats, and conversation-scoped recall may eventually want a first-class filter (options + `pond sql` cover it until proven needed). Alternatives still on the table: agentId-only, cwd, other composites.
 - `source_agent`: `"openclaw"` for main sessions; cron/hook/subagent sessions as `openclaw/<kind>` (inherits pond's default subagent search exclusion) or top-level.
+
+Settled design inputs (2026-07-21):
+
+- Deletion policy - skip-deleted by default, erase reconciliation, never via MCP. A `[adapters.openclaw]` flag defaults to skipping `.deleted.` archives at ingest (deliberate non-ingest is legal as a documented contract, spec 6.9). Skipping only covers sessions deleted before pond saw them, so sync also reconciles: an already-ingested session later carrying the `.deleted.` marker triggers (per config) the existing `pond erase`, whose denylist prevents a later sync from resurrecting it. Wiring into OpenClaw: a plugin CLI command shelling to pond's CLI, or the plugin's service reacting to a delete event (whether a plugin-visible delete hook exists is an implementation-time verification; sync-time reconciliation achieves the result without one). Hard boundary: pond's MCP surface is read-only permanently - erase is NEVER an MCP tool.
+- Capture-first build order - the pruning clock runs while we design; every day without the adapter, installs lose history past the retention window permanently. Raw ingest correctness ships early; search/scoping polish follows.
+- Noise (heartbeats, cron runs, NO_REPLY turns) - adapter-level config, pond's subagent-exclusion philosophy applied to a new source; design the `source_agent`/status skips for signal, not just attribution.
+- Redaction - inherited from source: secrets are stripped before storage, so pond archives what OpenClaw kept, and native restore round-trips redaction placeholders. Accepted as good news only.
+- Schema drift - best-effort with warnings (user call). Unknown entry/message types still land losslessly via the rule-3 catch-all, so best-effort never means data loss - just possibly less-typed data. Watch `schema_meta.schema_version`.
 
 ## 6. Hermes phase (deferred; minimal carry-forward)
 
@@ -143,9 +164,10 @@ Known-wasteful (skip on re-read): `cli/onboard.md`, all `start/*`, `cli/plugins.
 
 ## 10. Immediate next steps for the design phase
 
-1. Decide the tree-to-linear variant (A1/A2/A3) and scoping conventions (`project`, `source_agent`) - section 5 open decisions A and B.
-2. Decide the first read surface after O2: O1 (MCP attach) vs O3 (plugin) vs both; and O3's transport (CLI spawn per query vs HTTP to a running `pond serve`).
-3. Decide freshness: scheduled `pond sync` first, or O6 live push as part of the core design.
-4. Positioning is settled (sections 4 and 8): pond = the durable cross-harness tier beneath OpenClaw's in-gateway recall; do not compete with `rememberAcrossConversations` or the fact-memory plugins. Design every surface with an explicit fail-closed scoping story (privacy is the upstream axis).
-5. Keep the Hermes-thin-frontend constraint in every pond-side surface decision (section 6).
-6. At implementation time: verify MCP-projected tool naming for active-memory `toolsAllow` (section 3); track OpenClaw main for schema drift (`schema_meta.schema_version`).
+1. Decide the tree-to-linear variant (A1/A2/A3) - section 5 open decision A; ordering must not rely on unstable `seq` (leaning A3).
+2. Dig deeper into decision B scoping conventions at plan finalization - the session_key-as-project candidate and its consequences (section 5); user explicitly wants a focused pass before settling.
+3. Decide the first read surface after O2: O1 (MCP attach) vs O3 (plugin) vs both; and O3's transport (CLI spawn per query vs HTTP to a running `pond serve`).
+4. Decide freshness: scheduled `pond sync` first, or O6 live push as part of the core design (the daemon-consolidation call rides on this, section 4).
+5. Positioning is settled (sections 4 and 8): pond = the durable cross-harness tier beneath OpenClaw's in-gateway recall; do not compete with `rememberAcrossConversations` or the fact-memory plugins. Design every surface with an explicit fail-closed scoping story (privacy is the upstream axis).
+6. Keep the Hermes-thin-frontend constraint in every pond-side surface decision (section 6).
+7. At implementation time: verify MCP-projected tool naming for active-memory `toolsAllow` (section 3); verify whether a plugin-visible session-delete event exists for erase wiring (section 5); settle seq/ordering derivation and source-rewrite divergence detection (section 5, deferred to the implementation plan per user); track OpenClaw main for schema drift (`schema_meta.schema_version`).
