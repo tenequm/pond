@@ -243,7 +243,12 @@ jobs:
             end
 
             on_macos do
+              depends_on arch: :arm64
               on_arm do
+                url "$base/pond-aarch64-apple-darwin.tar.xz"
+                sha256 "$(sha aarch64-apple-darwin)"
+              end
+              on_intel do
                 url "$base/pond-aarch64-apple-darwin.tar.xz"
                 sha256 "$(sha aarch64-apple-darwin)"
               end
