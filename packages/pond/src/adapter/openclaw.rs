@@ -41,7 +41,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use async_stream::stream;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -549,14 +550,16 @@ fn read_db_session(
         agent_id,
         session_id,
         session_key,
-        Some(&row),
-        header.as_ref(),
-        entry.as_ref(),
-        generation.as_deref(),
-        leaf.as_deref(),
-        schema_version,
-        &lineage,
-        resolved_parent,
+        SessionInputs {
+            row: Some(&row),
+            header: header.as_ref(),
+            entry: entry.as_ref(),
+            generation: generation.as_deref(),
+            leaf_event_id: leaf.as_deref(),
+            schema_version,
+            lineage: &lineage,
+            resolved_parent_id: resolved_parent,
+        },
     );
     let anchor = session.created_at;
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
@@ -603,14 +606,16 @@ fn read_file_session(
         agent_id,
         session_id,
         session_key,
-        None,
-        header.as_ref(),
-        None,
-        None,
-        None,
-        None,
-        &lineage,
-        None,
+        SessionInputs {
+            row: None,
+            header: header.as_ref(),
+            entry: None,
+            generation: None,
+            leaf_event_id: None,
+            schema_version: None,
+            lineage: &lineage,
+            resolved_parent_id: None,
+        },
     );
     let anchor = session.created_at;
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
@@ -823,20 +828,33 @@ fn entry_ts_micros(value: &Value) -> Option<i64> {
 
 // -- Session construction ---------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+struct SessionInputs<'a> {
+    row: Option<&'a Value>,
+    header: Option<&'a Value>,
+    entry: Option<&'a Value>,
+    generation: Option<&'a str>,
+    leaf_event_id: Option<&'a str>,
+    schema_version: Option<i64>,
+    lineage: &'a Lineage,
+    resolved_parent_id: Option<String>,
+}
+
 fn build_session(
     agent_id: &str,
     session_id: &str,
     session_key: &str,
-    row: Option<&Value>,
-    header: Option<&Value>,
-    entry: Option<&Value>,
-    generation: Option<&str>,
-    leaf_event_id: Option<&str>,
-    schema_version: Option<i64>,
-    lineage: &Lineage,
-    resolved_parent_id: Option<String>,
+    inputs: SessionInputs<'_>,
 ) -> Session {
+    let SessionInputs {
+        row,
+        header,
+        entry,
+        generation,
+        leaf_event_id,
+        schema_version,
+        lineage,
+        resolved_parent_id,
+    } = inputs;
     // spec.md#model-project-non-empty: project = session_key verbatim (decision
     // 2), routed through the seam so it cannot be synthesized. The literal is
     // always a string field, so the fallback is dead - it only keeps the value
@@ -1671,6 +1689,14 @@ fn read_entry_lines(path: &Path, compressed: bool) -> Result<Vec<String>, Adapte
         .collect())
 }
 
+/// Peeked archive watermarks by path, validated by (len, mtime). Archives are
+/// write-once, but the in-serve sync loop re-peeks every cycle and a zstd body
+/// only yields its inner timestamp via a full decode - so decode once per
+/// process and serve repeats from here.
+type PeekValidator = (u64, Option<SystemTime>);
+type ArchivePeekCache = Mutex<HashMap<PathBuf, (PeekValidator, Option<i64>)>>;
+static ARCHIVE_PEEK_CACHE: LazyLock<ArchivePeekCache> = LazyLock::new(Mutex::default);
+
 fn peek_file_watermark(path: &Path, compressed: bool) -> Option<i64> {
     let pick = |line: &str| {
         serde_json::from_str::<Value>(line)
@@ -1681,11 +1707,27 @@ fn peek_file_watermark(path: &Path, compressed: bool) -> Option<i64> {
     // transcript reuses the bounded jsonl tail-peek (walk newest-first to the
     // first timestamped entry) instead of reading the whole file.
     if compressed {
-        read_entry_lines(path, true)
+        let validator: Option<PeekValidator> = std::fs::metadata(path)
+            .ok()
+            .map(|meta| (meta.len(), meta.modified().ok()));
+        if let Some(validator) = &validator
+            && let Ok(cache) = ARCHIVE_PEEK_CACHE.lock()
+            && let Some((cached_validator, watermark)) = cache.get(path)
+            && cached_validator == validator
+        {
+            return *watermark;
+        }
+        let watermark = read_entry_lines(path, true)
             .ok()?
             .iter()
             .rev()
-            .find_map(|line| pick(line))
+            .find_map(|line| pick(line));
+        if let Some(validator) = validator
+            && let Ok(mut cache) = ARCHIVE_PEEK_CACHE.lock()
+        {
+            cache.insert(path.to_owned(), (validator, watermark));
+        }
+        watermark
     } else {
         peek_last_mapped(path, pick)
     }
@@ -2040,6 +2082,41 @@ mod tests {
             assert_eq!(session_kind(key), kind, "kind for {key}");
             assert_eq!(session_kind(key).source_agent(), agent, "agent for {key}");
         }
+    }
+
+    #[test]
+    fn compressed_peek_caches_by_len_and_mtime() -> anyhow::Result<()> {
+        let entry =
+            |id: &str, ts: &str| format!(r#"{{"type":"message","id":"{id}","timestamp":"{ts}"}}"#);
+        let archive = |lines: &[String]| zstd::encode_all(lines.join("\n").as_bytes(), 0);
+        let temp = TempDir::new()?;
+        let path = temp.path().join("s1.jsonl.reset.2026-07-21T12-00-00Z.zst");
+
+        std::fs::write(&path, archive(&[entry("e1", "2026-07-21T11:59:00.000Z")])?)?;
+        let first = peek_file_watermark(&path, true);
+        assert!(first.is_some());
+
+        // Same (len, mtime) -> served from the cache, no re-decode: a seeded
+        // sentinel under the current validator comes back verbatim.
+        let meta = std::fs::metadata(&path)?;
+        ARCHIVE_PEEK_CACHE
+            .lock()
+            .unwrap()
+            .insert(path.clone(), ((meta.len(), meta.modified().ok()), Some(42)));
+        assert_eq!(peek_file_watermark(&path, true), Some(42));
+
+        // A different byte length invalidates the entry and re-decodes.
+        let rewritten = archive(&[
+            entry("e1", "2026-07-21T11:59:00.000Z"),
+            entry("e2", "2026-07-21T12:30:00.000Z"),
+        ])?;
+        assert_ne!(rewritten.len() as u64, meta.len());
+        std::fs::write(&path, rewritten)?;
+        assert_eq!(
+            peek_file_watermark(&path, true),
+            parse_ts("2026-07-21T12:30:00.000Z").map(|dt| dt.timestamp_micros())
+        );
+        Ok(())
     }
 
     #[test]

@@ -4,15 +4,13 @@
 import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { parsePluginConfig } from "./src/config.js";
 import { PondController } from "./src/service.js";
-import { createPondToolFactories } from "./src/tools.js";
-
-const TOOL_NAMES = ["pond_search", "pond_get_session", "pond_get_message", "pond_sql"] as const;
+import { POND_TOOL_NAMES, createPondToolFactories } from "./src/tools.js";
 
 function register(api: OpenClawPluginApi): void {
   // Tool-discovery loads only for ownership metadata; register inert stubs so
   // the runtime is not eagerly constructed (mirrors clickclack's pattern).
   if (api.registrationMode === "tool-discovery") {
-    for (const name of TOOL_NAMES) {
+    for (const name of Object.values(POND_TOOL_NAMES)) {
       api.registerTool(() => null, { name });
     }
     return;
@@ -32,10 +30,10 @@ function register(api: OpenClawPluginApi): void {
     logger,
     callPond: (name, args) => controller.callTool(name, args),
   });
-  api.registerTool(factories.search, { name: "pond_search" });
-  api.registerTool(factories.getSession, { name: "pond_get_session" });
-  api.registerTool(factories.getMessage, { name: "pond_get_message" });
-  api.registerTool(factories.sql, { name: "pond_sql" });
+  api.registerTool(factories.search, { name: POND_TOOL_NAMES.search });
+  api.registerTool(factories.getSession, { name: POND_TOOL_NAMES.getSession });
+  api.registerTool(factories.getMessage, { name: POND_TOOL_NAMES.getMessage });
+  api.registerTool(factories.sql, { name: POND_TOOL_NAMES.sql });
 
   api.registerService({
     id: "pond",

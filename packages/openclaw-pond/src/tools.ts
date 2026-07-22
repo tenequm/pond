@@ -27,7 +27,17 @@ import {
   type GetMessageParams,
   type SearchParams,
   type SqlParams,
+  type ToolOutput,
 } from "./schemas.js";
+
+// Single source for the projected tool names: the registered name, the relayed
+// pond tool name, and index.ts's discovery stubs must never desync.
+export const POND_TOOL_NAMES = {
+  search: "pond_search",
+  getSession: "pond_get_session",
+  getMessage: "pond_get_message",
+  sql: "pond_sql",
+} as const;
 
 // Vendored structural copy of upstream AgentToolResult (openclaw
 // packages/agent-core/src/types.ts): the `openclaw/plugin-sdk/tool-results`
@@ -73,21 +83,19 @@ function resolveSourceAgent(
   return sources[0];
 }
 
-type OutputStatus = { status: "ok"; text: string } | { status: "forbidden" | "error"; error: string };
-
-function result(details: OutputStatus, text: string): AgentToolResult<OutputStatus> {
+function result(details: ToolOutput, text: string): AgentToolResult<ToolOutput> {
   return { content: [{ type: "text", text }], details };
 }
 
-function okResult(text: string): AgentToolResult<OutputStatus> {
+function okResult(text: string): AgentToolResult<ToolOutput> {
   return result({ status: "ok", text }, text);
 }
 
-function forbiddenResult(error: string): AgentToolResult<OutputStatus> {
+function forbiddenResult(error: string): AgentToolResult<ToolOutput> {
   return result({ status: "forbidden", error }, error);
 }
 
-function errorResult(error: string): AgentToolResult<OutputStatus> {
+function errorResult(error: string): AgentToolResult<ToolOutput> {
   return result({ status: "error", error }, error);
 }
 
@@ -118,7 +126,7 @@ async function relay(
   deps: PondToolDeps,
   name: string,
   args: Record<string, unknown>,
-): Promise<AgentToolResult<OutputStatus>> {
+): Promise<AgentToolResult<ToolOutput>> {
   const response = await deps.callPond(name, args);
   if (!response.ok) {
     return errorResult(response.error);
@@ -157,7 +165,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
       return null;
     }
     return {
-      name: "pond_search",
+      name: POND_TOOL_NAMES.search,
       label: "Pond Search",
       description: SEARCH_DESCRIPTION,
       parameters: SearchParamsSchema,
@@ -186,7 +194,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
         if (args.session_id) pondArgs.session_id = args.session_id;
         if (args.from_date) pondArgs.from_date = args.from_date;
         if (args.to_date) pondArgs.to_date = args.to_date;
-        return relay(deps, "pond_search", pondArgs);
+        return relay(deps, POND_TOOL_NAMES.search, pondArgs);
       },
     };
   };
@@ -200,7 +208,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
       return null;
     }
     return {
-      name: "pond_get_session",
+      name: POND_TOOL_NAMES.getSession,
       label: "Pond Get Session",
       description: GET_SESSION_DESCRIPTION,
       parameters: GetSessionParamsSchema,
@@ -228,7 +236,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
             pondArgs[key] = value;
           }
         }
-        return relay(deps, "pond_get_session", pondArgs);
+        return relay(deps, POND_TOOL_NAMES.getSession, pondArgs);
       },
     };
   };
@@ -238,7 +246,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
       return null;
     }
     return {
-      name: "pond_get_message",
+      name: POND_TOOL_NAMES.getMessage,
       label: "Pond Get Message",
       description: GET_MESSAGE_DESCRIPTION,
       parameters: GetMessageParamsSchema,
@@ -260,7 +268,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
         const pondArgs: Record<string, unknown> = { id };
         if (typeof args.context_before === "number") pondArgs.context_before = args.context_before;
         if (typeof args.context_after === "number") pondArgs.context_after = args.context_after;
-        return relay(deps, "pond_get_message", pondArgs);
+        return relay(deps, POND_TOOL_NAMES.getMessage, pondArgs);
       },
     };
   };
@@ -270,7 +278,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
       return null;
     }
     return {
-      name: "pond_sql",
+      name: POND_TOOL_NAMES.sql,
       label: "Pond SQL",
       description: SQL_DESCRIPTION,
       parameters: SqlParamsSchema,
@@ -299,7 +307,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
         const pondArgs: Record<string, unknown> = { query };
         if (args.format) pondArgs.format = args.format;
         if (typeof args.timeout_seconds === "number") pondArgs.timeout_seconds = args.timeout_seconds;
-        return relay(deps, "pond_sql", pondArgs);
+        return relay(deps, POND_TOOL_NAMES.sql, pondArgs);
       },
     };
   };

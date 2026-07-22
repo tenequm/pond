@@ -20,7 +20,7 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { GroupSessionsPolicy } from "./config.js";
 import {
-  createAgentToAgentPolicy,
+  isAgentToAgentEnabled,
   resolveEffectiveSessionToolsVisibility,
   type SessionToolsVisibility,
 } from "./visibility.js";
@@ -82,7 +82,7 @@ export type ResolveScopeInput = {
 // in pond's single project substring - callers fall back to the own-agent
 // clamp, matching core's per-target matchesAllow gate fail-closed.
 export function a2aGrantsAllAgents(cfg: OpenClawConfig): boolean {
-  if (createAgentToAgentPolicy(cfg).enabled !== true) {
+  if (!isAgentToAgentEnabled(cfg)) {
     return false;
   }
   const allow = cfg.tools?.agentToAgent?.allow;
