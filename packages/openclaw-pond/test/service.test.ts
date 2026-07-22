@@ -19,7 +19,7 @@ function collectingLogger(): { logger: PondLogger; errors: string[] } {
 
 // A transport that completes the MCP initialize handshake and then swallows
 // every request, modeling a child that spawned but hung.
-function hangingTransport(opts: { completeHandshake: boolean }): Transport {
+function hangingTransport(opts: { completeHandshake: boolean; onClose?: () => void }): Transport {
   const transport: Transport & { onmessage?: (message: JSONRPCMessage) => void } = {
     async start() {},
     async send(message: JSONRPCMessage) {
@@ -39,7 +39,9 @@ function hangingTransport(opts: { completeHandshake: boolean }): Transport {
         } as JSONRPCMessage);
       });
     },
-    async close() {},
+    async close() {
+      opts.onClose?.();
+    },
   };
   return transport;
 }
@@ -77,11 +79,17 @@ describe("PondController.stop", () => {
 describe("dial deadlines", () => {
   it("fails the initialize handshake within the deadline against a silent child", async () => {
     const client = new PondMcpClient();
+    let closed = false;
     const startedAt = Date.now();
     await expect(
-      client.connect(hangingTransport({ completeHandshake: false }), { timeoutMs: 100 }),
+      client.connect(hangingTransport({ completeHandshake: false, onClose: () => (closed = true) }), {
+        timeoutMs: 100,
+      }),
     ).rejects.toThrow(/timeout|timed out/i);
     expect(Date.now() - startedAt).toBeLessThan(5_000);
+    // The failed dial must tear the transport down, or a spawned-but-hung
+    // child would survive every restart attempt.
+    expect(closed).toBe(true);
   });
 
   it("fails the tool-list probe within the deadline when the child hangs post-handshake", async () => {

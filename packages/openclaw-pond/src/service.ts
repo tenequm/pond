@@ -171,6 +171,9 @@ export class PondController {
       } else {
         this.logger.error(`pond connection to ${this.config.url ?? "(no url)"} failed: ${message}`);
       }
+      // Covers the probe-timeout case: the client connected but the child is
+      // unresponsive - tear it down before the backoff spawns a replacement.
+      await this.client.close().catch(() => {});
       this.scheduleRestart();
     }
   }

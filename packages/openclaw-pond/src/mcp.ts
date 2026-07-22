@@ -44,7 +44,15 @@ export class PondMcpClient {
     }
     // The initialize handshake is where a hung child actually stalls; the SDK
     // default is 60s, so callers pass a deadline suited to a local sidecar.
-    await client.connect(transport, opts?.timeoutMs ? { timeout: opts.timeoutMs } : undefined);
+    try {
+      await client.connect(transport, opts?.timeoutMs ? { timeout: opts.timeoutMs } : undefined);
+    } catch (error) {
+      // A failed handshake may leave a spawned-but-hung child behind; closing
+      // the client runs the transport teardown ladder so it cannot accumulate
+      // across restart attempts.
+      await client.close().catch(() => {});
+      throw error;
+    }
     this.client = client;
   }
 
