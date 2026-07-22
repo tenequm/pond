@@ -195,8 +195,10 @@ struct CachedBackend {
 /// Lazy holder for an [`Embedder`] with idle eviction. The model isn't
 /// loaded until the first hybrid/vector call asks for it - idle `pond mcp`
 /// / `pond serve` processes pay nothing while no vector queries land. After
-/// `idle_threshold` of inactivity the cached backend is dropped on the
-/// next `get` call; under macOS `phys_footprint` the drop reclaims
+/// `idle_threshold` of inactivity the cached backend is dropped - by the
+/// background reaper ([`Self::spawn_idle_reaper`]) in the long-lived
+/// serve/mcp processes, else on the next `get` call; under macOS
+/// `phys_footprint` the drop reclaims
 /// ~365-585 MiB cleanly (the post-drop floor is ~107 MiB regardless of
 /// backend). Reload cost is one synchronous model-load (300-500 ms),
 /// absorbed inside the human-paced gap between MCP queries.
@@ -257,6 +259,38 @@ impl LazyEmbedder {
             })),
             idle_threshold: Duration::MAX,
         }
+    }
+
+    /// Background idle eviction: without it the model dropped only on the
+    /// NEXT `get()` past the threshold, so a process whose last query was a
+    /// vector burst kept ~500 MiB resident indefinitely (measured ~894 MiB
+    /// RSS settling). A tick makes "zero cost when idle" literally true.
+    /// In-flight embeds are unaffected: they hold their own `Arc` clone, so
+    /// reaping drops only the cache's reference; `last_use` refreshes on
+    /// every `get()`.
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            // Floor keeps a tiny test threshold from busy-looping; cap keeps
+            // worst-case reap latency at threshold + 30s.
+            let tick = this
+                .idle_threshold
+                .min(Duration::from_secs(30))
+                .max(Duration::from_millis(10));
+            loop {
+                tokio::time::sleep(tick).await;
+                let mut state = this.state.lock().await;
+                if let Some(cached) = &*state
+                    && Instant::now().duration_since(cached.last_use) > this.idle_threshold
+                {
+                    tracing::info!(
+                        idle_secs = this.idle_threshold.as_secs(),
+                        "evicting idle embedder",
+                    );
+                    *state = None;
+                }
+            }
+        });
     }
 
     /// Load (on first call or after eviction) or return the cached handle.
@@ -676,6 +710,28 @@ mod tests {
             loads.load(AtomicOrdering::SeqCst),
             2,
             "get after the idle threshold triggers a reload",
+        );
+    }
+
+    /// Same real-clock caveat as above: the reaper keys on
+    /// `std::time::Instant`, immune to `tokio::time::pause`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_reaper_evicts_without_an_intervening_get() {
+        let loader: EmbedLoader = Arc::new(|| Ok(Arc::new(CountingEmbedder) as Arc<dyn Embedder>));
+        let embedder = Arc::new(
+            LazyEmbedder::with_loader(loader).with_idle_threshold(Duration::from_millis(20)),
+        );
+        embedder.spawn_idle_reaper();
+        embedder.get().await.unwrap();
+        assert!(embedder.state.lock().await.is_some());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while embedder.state.lock().await.is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            embedder.state.lock().await.is_none(),
+            "reaper dropped the idle backend with no get() call",
         );
     }
 
