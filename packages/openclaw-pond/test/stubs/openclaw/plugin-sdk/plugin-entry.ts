@@ -3,11 +3,11 @@
 // supplies richer types and the live registrar at runtime; this double lets the
 // entry file typecheck and (if imported) run in tests without OpenClaw present.
 import type { TSchema } from "typebox";
+import type { AgentToolResult } from "../../../../src/tools.js";
 import type { OpenClawConfig } from "./config-contracts.js";
-import type { AgentToolResult } from "./tool-results.js";
 
 // AgentToolResult deliberately does NOT re-export from here: the real
-// plugin-entry never exported it (it lives in plugin-sdk/tool-results).
+// plugin-entry never exported it (the plugin vendors it in src/tools.ts).
 export type AnyAgentTool = {
   name: string;
   label: string;

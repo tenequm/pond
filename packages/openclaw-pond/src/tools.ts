@@ -6,7 +6,6 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { redactToolPayloadText } from "openclaw/plugin-sdk/logging-core";
 import type { AnyAgentTool, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
-import type { AgentToolResult } from "openclaw/plugin-sdk/tool-results";
 import type { PondPluginConfig } from "./config.js";
 import type { PondCallResult } from "./mcp.js";
 import {
@@ -29,6 +28,18 @@ import {
   type SearchParams,
   type SqlParams,
 } from "./schemas.js";
+
+// Vendored structural copy of upstream AgentToolResult (openclaw
+// packages/agent-core/src/types.ts): the `openclaw/plugin-sdk/tool-results`
+// subpath was demoted to bundled-only (compat registry
+// `plugin-sdk-tool-results-public-demotion`, removeAfter 2026-07-30) with no
+// public successor.
+export type AgentToolResult<T> = {
+  content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
+  details: T;
+  progress?: { text: string; visibility: "channel"; privacy: "public"; id?: string };
+  terminate?: boolean;
+};
 
 export type PondCaller = (name: string, args: Record<string, unknown>) => Promise<PondCallResult>;
 

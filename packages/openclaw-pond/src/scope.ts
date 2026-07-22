@@ -18,12 +18,12 @@
 // inexpressible in one substring, so it falls back to the own-agent clamp
 // (fail-closed to the expressible subset; own sessions are always permitted).
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { GroupSessionsPolicy } from "./config.js";
 import {
   createAgentToAgentPolicy,
   resolveEffectiveSessionToolsVisibility,
   type SessionToolsVisibility,
-} from "openclaw/plugin-sdk/session-visibility";
-import type { GroupSessionsPolicy } from "./config.js";
+} from "./visibility.js";
 
 export type ScopeContext = {
   sessionKey?: string;

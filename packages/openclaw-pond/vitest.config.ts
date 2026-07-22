@@ -14,8 +14,6 @@ export default defineConfig({
   resolve: {
     alias: {
       "openclaw/plugin-sdk/plugin-entry": stub("plugin-entry"),
-      "openclaw/plugin-sdk/tool-results": stub("tool-results"),
-      "openclaw/plugin-sdk/session-visibility": stub("session-visibility"),
       "openclaw/plugin-sdk/logging-core": stub("logging-core"),
       "openclaw/plugin-sdk/config-contracts": stub("config-contracts"),
     },

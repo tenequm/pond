@@ -72,7 +72,9 @@ vocabulary for them.
 Scoping here is **policy against a confused or prompt-injected agent, not a
 security boundary against the operator** (who can read the pond store directly).
 
-The plugin reuses OpenClaw's session-visibility SDK, so pond tools only reach
+The plugin resolves `tools.sessions.visibility` and `tools.agentToAgent` with a
+vendored copy of OpenClaw's session-visibility policy (`src/visibility.ts`;
+upstream demoted that SDK subpath to bundled-only), so pond tools only reach
 sessions the agent could already read via `sessions_history`. What agents see by
 default and what each widening step exposes:
 
@@ -118,11 +120,12 @@ Notes and deliberate limits:
 
 The `openclaw` package is an **optional peer dependency** - the Gateway supplies
 it at runtime. This checkout does not install the OpenClaw monorepo, so
-`typecheck` and `test` resolve the handful of SDK subpaths the plugin uses
-(`plugin-entry`, `tool-results`, `session-visibility`, `logging-core`,
-`config-contracts`) to
-faithful local doubles under `test/stubs/` via tsconfig `paths` and a Vitest
-alias. Everything runs with a plain `npm install`:
+`typecheck` and `test` resolve the SDK subpaths the plugin uses
+(`plugin-entry`, `config-contracts`, `logging-core`) to faithful local doubles
+under `test/stubs/` via tsconfig `paths` and a Vitest alias. The two surfaces
+upstream demoted to bundled-only (`tool-results`, `session-visibility`) are
+vendored into `src/` instead (see `src/tools.ts` and `src/visibility.ts`).
+Everything runs with a plain `npm install`:
 
 ```bash
 npm install

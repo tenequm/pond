@@ -18,8 +18,6 @@
     "baseUrl": ".",
     "paths": {
       "openclaw/plugin-sdk/plugin-entry": ["./test/stubs/openclaw/plugin-sdk/plugin-entry.ts"],
-      "openclaw/plugin-sdk/tool-results": ["./test/stubs/openclaw/plugin-sdk/tool-results.ts"],
-      "openclaw/plugin-sdk/session-visibility": ["./test/stubs/openclaw/plugin-sdk/session-visibility.ts"],
       "openclaw/plugin-sdk/logging-core": ["./test/stubs/openclaw/plugin-sdk/logging-core.ts"],
       "openclaw/plugin-sdk/config-contracts": ["./test/stubs/openclaw/plugin-sdk/config-contracts.ts"]
     }

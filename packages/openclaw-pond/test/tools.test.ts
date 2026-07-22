@@ -1,12 +1,11 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
-import type { AgentToolResult } from "openclaw/plugin-sdk/tool-results";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PondPluginConfig } from "../src/config.js";
 import { parsePluginConfig } from "../src/config.js";
 import { RESPONSE_MAX_BYTES } from "../src/schemas.js";
 import { relayPondCall } from "../src/service.js";
-import { createPondToolFactories } from "../src/tools.js";
+import { createPondToolFactories, type AgentToolResult } from "../src/tools.js";
 import { createFakePond, type FakePond, type FakePondOptions } from "./fake-pond.js";
 
 const config = parsePluginConfig(undefined);
