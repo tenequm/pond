@@ -1,19 +1,21 @@
-//! Canonical text-transcript rendering for `pond_search` / `pond_get`
+//! Canonical text-transcript rendering for `pond_search` / `pond_get_session` /
+//! `pond_get_message`
 //! responses, shared by the MCP transport and the `pond` CLI so both surfaces
 //! emit one identical readable format (spec.md#protocol). The structured
 //! HTTP/JSON path renders nothing here; this is the plain-text view.
 
 use crate::handlers::default_excludes_subagents;
 use crate::wire::{
-    GetRequest, GetResponse, GetResult, MessageView, PartKind, PartSummary, ResponsePart,
-    SearchModeWire, SearchRequest, SearchResponse, SortBy,
+    GetResponse, GetResult, MessageView, PartKind, PartSummary, ResponsePart, SearchModeWire,
+    SearchRequest, SearchResponse, SortBy,
 };
 
 /// Which surface a transcript renders for. The format is identical; only the
-/// follow-up vocabulary differs - the MCP tools are `pond_get` /
-/// `pond_sql_query` with `key=value` args, the CLI verbs are
-/// `pond get --message-id <ID>` / `pond sql`. Without this a human at the
-/// terminal is told to run tool syntax their shell rejects.
+/// follow-up vocabulary differs - the MCP tools are `pond_get_session` /
+/// `pond_get_message` / `pond_sql` with `key=value` args, the CLI verbs are
+/// `pond get-session <ID>` / `pond get-message <ID>` / `pond sql`. Without
+/// this a human at the terminal is told to run tool syntax their shell
+/// rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Mcp,
@@ -29,15 +31,15 @@ fn count_noun(count: usize, noun: &str) -> String {
     }
 }
 
-/// Footer for a `pond_get` session response listing the session's spawn-only
+/// Footer for a `pond_get_session` response listing the session's spawn-only
 /// subagents. Each subagent is its own session (spec.md#datasets) addressable
-/// by the printed id, so the caller can open any with `pond_get(session_id)`;
+/// by the printed id, so the caller can open any with `pond_get_session`;
 /// without this they are invisible from the MCP surface.
 pub fn render_subagents_footer(children: &[crate::wire::Session], surface: Surface) -> String {
     use std::fmt::Write;
     let how = match surface {
-        Surface::Mcp => "pass an id to pond_get(session_id=...)",
-        Surface::Cli => "pass an id to `pond get --session-id <ID>`",
+        Surface::Mcp => "pass an id to pond_get_session(id=...)",
+        Surface::Cli => "pass an id to `pond get-session <ID>`",
     };
     let mut out = String::new();
     let _ = writeln!(out);
@@ -89,7 +91,7 @@ pub fn render_search_transcript(
     let subagent_note = match (default_excludes_subagents(&request.filters), surface) {
         (false, _) => "",
         (true, Surface::Mcp) => {
-            " Subagent sessions excluded; reach them via pond_sql_query (parent_session_id)."
+            " Subagent sessions excluded; reach them via pond_sql (parent_session_id)."
         }
         (true, Surface::Cli) => {
             " Subagent sessions excluded; reach them via `pond sql` (parent_session_id)."
@@ -132,7 +134,7 @@ pub fn render_search_transcript(
         }
         let fts_hint = match surface {
             Surface::Mcp => {
-                " For exact strings or identifiers, try pond_sql_query: SELECT \
+                " For exact strings or identifiers, try pond_sql: SELECT \
                  message_id, session_id, search_text FROM messages WHERE \
                  contains_tokens(search_text, '...')."
             }
@@ -178,8 +180,8 @@ pub fn render_search_transcript(
         "ordered by best hit"
     };
     let full_hint = match surface {
-        Surface::Mcp => "pond_get <message_id> for full",
-        Surface::Cli => "`pond get --message-id <ID>` for full",
+        Surface::Mcp => "pond_get_message <message_id> for full, pond_get_session for the session",
+        Surface::Cli => "`pond get-message <ID>` for full, `pond get-session <ID>` for the session",
     };
     let mode_note = match (vector_mode, surface) {
         (false, _) => "",
@@ -256,8 +258,8 @@ pub fn render_search_transcript(
         let omitted = session.matches.len() - rendered;
         if omitted > 0 {
             let latest_hint = match surface {
-                Surface::Mcp => "read with session_from=end",
-                Surface::Cli => "read with `pond get --session-id <ID> --session-from end`",
+                Surface::Mcp => "read with pond_get_session from=end",
+                Surface::Cli => "read with `pond get-session <ID> --from end`",
             };
             let _ = writeln!(
                 out,
@@ -269,16 +271,8 @@ pub fn render_search_transcript(
     out
 }
 
-pub fn render_get_transcript(
-    response: &GetResponse,
-    request: &GetRequest,
-    surface: Surface,
-) -> String {
+pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String {
     use std::fmt::Write;
-    let prefix = match surface {
-        Surface::Mcp => "pond_get",
-        Surface::Cli => "pond get",
-    };
     let session = &response.session;
     let mut out = String::new();
     match &response.result {
@@ -286,21 +280,54 @@ pub fn render_get_transcript(
             messages,
             before_remaining,
             after_remaining,
+            resolved_from_message_id,
         } => {
-            let _ = writeln!(
-                out,
-                "{prefix}: session {}, {}.",
-                session.id,
-                count_noun(messages.len(), "message"),
-            );
+            let prefix = match surface {
+                Surface::Mcp => "pond_get_session",
+                Surface::Cli => "pond get-session",
+            };
+            // A partial page must announce the session total up front: a
+            // header saying only the page's count reads as the whole session
+            // (field-tested miss - the rest of a long session went unread).
+            let total = *before_remaining + messages.len() + *after_remaining;
+            if total > messages.len() {
+                let start = *before_remaining + 1;
+                let end = *before_remaining + messages.len();
+                let _ = writeln!(
+                    out,
+                    "{prefix}: session {}, messages {start}-{end} of {total} \
+                     (pages are bounded by limit and a size budget).",
+                    session.id,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{prefix}: session {}, {}.",
+                    session.id,
+                    count_noun(messages.len(), "message"),
+                );
+            }
+            // The id was a message id; say so before the transcript so the
+            // caller knows the page is anchored, not the session start.
+            if let Some(message_id) = resolved_from_message_id {
+                let expand = match surface {
+                    Surface::Mcp => format!("pond_get_message id={message_id}"),
+                    Surface::Cli => format!("`pond get-message {message_id}`"),
+                };
+                let _ = writeln!(
+                    out,
+                    "note: {message_id} is a message id - resolved to its session; this page \
+                     starts at that message ({expand} for its full part bodies)."
+                );
+            }
             let (expand_hint, page_hint) = match surface {
                 Surface::Mcp => (
-                    "pond_get message_id=<id> to expand any tool body",
-                    "Page with session_before_message_id / session_after_message_id.",
+                    "pond_get_message id=<id> to expand any tool body",
+                    "Page with before_message_id / after_message_id.",
                 ),
                 Surface::Cli => (
-                    "`pond get --message-id <ID>` to expand any tool body",
-                    "Page with --session-before-message-id / --session-after-message-id.",
+                    "`pond get-message <ID>` to expand any tool body",
+                    "Page with --before-message-id / --after-message-id.",
                 ),
             };
             let _ = writeln!(
@@ -312,9 +339,9 @@ pub fn render_get_transcript(
                 && let Some(first) = messages.first()
             {
                 let page_up = match surface {
-                    Surface::Mcp => format!("pass session_before_message_id={}", first.id),
+                    Surface::Mcp => format!("pass before_message_id={}", first.id),
                     Surface::Cli => {
-                        format!("pass --session-before-message-id {}", first.id)
+                        format!("pass --before-message-id {}", first.id)
                     }
                 };
                 let _ = writeln!(
@@ -339,17 +366,25 @@ pub fn render_get_transcript(
                 "session {} | {} | {}",
                 session.id, session.source_agent, session.project,
             );
-            // Bottom marker: later messages follow this page (page down).
+            // Bottom marker: later messages follow this page (page down). The
+            // supersession note guards the field-tested failure where an agent
+            // reads an early page of a long session and reports a
+            // since-revised conclusion as current.
             if *after_remaining > 0
                 && let Some(last) = messages.last()
             {
                 let page_down = match surface {
-                    Surface::Mcp => format!("pass session_after_message_id={}", last.id),
-                    Surface::Cli => format!("pass --session-after-message-id {}", last.id),
+                    Surface::Mcp => format!("pass after_message_id={}", last.id),
+                    Surface::Cli => format!("pass --after-message-id {}", last.id),
+                };
+                let latest = match surface {
+                    Surface::Mcp => "from=\"end\"",
+                    Surface::Cli => "--from end",
                 };
                 let _ = writeln!(
                     out,
-                    "... {after_remaining} later messages; {page_down} to page down",
+                    "... {after_remaining} later messages; {page_down} to page down \
+                     (conclusions may have been revised - {latest} reads the latest turns)",
                 );
             }
         }
@@ -358,18 +393,21 @@ pub fn render_get_transcript(
             target_parts,
             target_parts_remaining,
             siblings,
+            context_before,
+            context_after,
         } => {
+            let prefix = match surface {
+                Surface::Mcp => "pond_get_message",
+                Surface::Cli => "pond get-message",
+            };
             let _ = writeln!(
                 out,
                 "{prefix}: thread around {} in session {} (context -{}/+{}).",
-                target.id,
-                session.id,
-                request.message_context_before,
-                request.message_context_after,
+                target.id, session.id, context_before, context_after,
             );
             let expand_hint = match surface {
-                Surface::Mcp => "pond_get message_id=<id> to expand any line",
-                Surface::Cli => "`pond get --message-id <ID>` to expand any line",
+                Surface::Mcp => "pond_get_message id=<id> to expand any line",
+                Surface::Cli => "`pond get-message <ID>` to expand any line",
             };
             let _ = writeln!(
                 out,
@@ -592,7 +630,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::wire::{Role, SearchFilters, SearchModeWire, SearchResult, SessionFrom};
+    use crate::wire::{Role, SearchFilters, SearchModeWire, SearchResult};
 
     #[test]
     fn get_transcript_marks_target_and_renders_tool_parts() {
@@ -629,27 +667,62 @@ mod tests {
                 target_parts: vec![tool_call, tool_result],
                 target_parts_remaining: 0,
                 siblings: Vec::new(),
+                context_before: 3,
+                context_after: 3,
             },
         };
-        let request = GetRequest {
-            protocol_version: crate::PROTOCOL_VERSION,
-            namespace: None,
-            session_id: None,
-            message_id: Some("m1".to_owned()),
-            session_limit: 20,
-            session_from: SessionFrom::default(),
-            session_after_message_id: None,
-            session_before_message_id: None,
-            message_context_before: 3,
-            message_context_after: 3,
-        };
 
-        let transcript = crate::render::render_get_transcript(&response, &request, Surface::Mcp);
+        let transcript = crate::render::render_get_transcript(&response, Surface::Mcp);
         assert!(transcript.contains("--- [1] > assistant | 1970-01-01 00:00:00Z | m1 ---"));
         assert!(transcript.contains("Let me list files."));
         assert!(transcript.contains("  -> Bash [toolu_x]"));
         assert!(transcript.contains("  <- Bash [toolu_x] (ok)"));
         assert!(transcript.contains("session s1 | claude-code | /p"));
+    }
+
+    #[test]
+    fn session_header_states_span_and_total_on_partial_pages() {
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let message = |id: &str| MessageView {
+            id: id.to_owned(),
+            role: crate::wire::Role::User,
+            timestamp: ts,
+            text: Some("hi".to_owned()),
+            content: None,
+            parts_summary: Vec::new(),
+        };
+        let session = crate::wire::GetSession {
+            id: "s1".to_owned(),
+            source_agent: "claude-code".to_owned(),
+            project: "/p".to_owned(),
+            created_at: ts,
+        };
+        let partial = GetResponse {
+            session: session.clone(),
+            result: GetResult::Session {
+                messages: vec![message("m1"), message("m2")],
+                before_remaining: 100,
+                after_remaining: 32,
+                resolved_from_message_id: None,
+            },
+        };
+        let transcript = crate::render::render_get_transcript(&partial, Surface::Mcp);
+        assert!(transcript.starts_with(
+            "pond_get_session: session s1, messages 101-102 of 134 \
+             (pages are bounded by limit and a size budget)."
+        ));
+
+        let full = GetResponse {
+            session,
+            result: GetResult::Session {
+                messages: vec![message("m1"), message("m2")],
+                before_remaining: 0,
+                after_remaining: 0,
+                resolved_from_message_id: None,
+            },
+        };
+        let transcript = crate::render::render_get_transcript(&full, Surface::Cli);
+        assert!(transcript.starts_with("pond get-session: session s1, 2 messages."));
     }
 
     #[test]
@@ -769,6 +842,6 @@ mod tests {
         // The fat session was cut short -> supersession footer pointing at
         // the session's latest state.
         assert!(transcript.contains("more match(es) in this session not shown (char budget)"));
-        assert!(transcript.contains("session_from=end"));
+        assert!(transcript.contains("pond_get_session from=end"));
     }
 }

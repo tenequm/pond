@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! `pond_sql_query` over the stdio-MCP transport (spec.md#protocol): an
+//! `pond_sql` over the stdio-MCP transport (spec.md#protocol): an
 //! in-process rmcp client drives read-only SQL against a synthetic corpus.
 //! Asserts inline aggregation, the hard read-only gate (DROP/INSERT rejected as
 //! tool errors), `vector`-column omission, the `fts()` UDTF, and the
@@ -193,7 +193,7 @@ fn resource_link_uri(result: &CallToolResult) -> Option<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
+async fn pond_sql_over_mcp() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let state = synthetic_state(&temp).await?;
 
@@ -208,7 +208,7 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     let call = async |args: serde_json::Value| {
         client
             .call_tool(
-                CallToolRequestParams::new("pond_sql_query")
+                CallToolRequestParams::new("pond_sql")
                     .with_arguments(args.as_object().unwrap().clone()),
             )
             .await
@@ -218,11 +218,11 @@ async fn pond_sql_query_over_mcp() -> anyhow::Result<()> {
     let tools = client.list_all_tools().await?;
     let cap = tools
         .iter()
-        .find(|tool| tool.name == "pond_sql_query")
+        .find(|tool| tool.name == "pond_sql")
         .and_then(|tool| tool.meta.as_ref())
         .and_then(|meta| meta.0.get("anthropic/maxResultSizeChars"))
         .and_then(serde_json::Value::as_i64);
-    assert_eq!(cap, Some(80_000), "pond_sql_query carries a size cap");
+    assert_eq!(cap, Some(80_000), "pond_sql carries a size cap");
 
     // 1. Inline aggregation: GROUP BY over the role column.
     let result = call(json!({

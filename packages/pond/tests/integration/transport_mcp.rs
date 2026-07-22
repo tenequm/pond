@@ -1,9 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! stdio-MCP transport (spec.md#protocol): the `pond_search` / `pond_get`
-//! tools are driven by an in-process rmcp client over a `duplex` pipe. Asserts
-//! the `tools/list` size-cap annotations, the round-trip response shape, and
-//! the JSON-RPC error mapping for unknown sessions.
+//! stdio-MCP transport (spec.md#protocol): the `pond_search` /
+//! `pond_get_session` / `pond_get_message` tools are driven by an in-process
+//! rmcp client over a `duplex` pipe. Asserts the `tools/list` size-cap
+//! annotations, the round-trip response shape, and the JSON-RPC error mapping
+//! for unknown sessions.
 
 use chrono::Utc;
 use pond::{
@@ -202,7 +203,8 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
             .and_then(serde_json::Value::as_i64)
     };
     assert_eq!(meta_chars("pond_search"), Some(80_000));
-    assert_eq!(meta_chars("pond_get"), Some(200_000));
+    assert_eq!(meta_chars("pond_get_session"), Some(200_000));
+    assert_eq!(meta_chars("pond_get_message"), Some(200_000));
 
     // pond_search runs over the MCP transport and returns a success envelope.
     let result = client
@@ -230,17 +232,13 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "session_id": SESSION_ID })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            CallToolRequestParams::new("pond_get_session")
+                .with_arguments(json!({ "id": SESSION_ID }).as_object().unwrap().clone()),
         )
         .await?;
     let conversational = tool_text(&result);
     assert!(
-        conversational.starts_with(&format!("pond_get: session {SESSION_ID},")),
+        conversational.starts_with(&format!("pond_get_session: session {SESSION_ID},")),
         "get transcript header names the session: {conversational}"
     );
     assert!(
@@ -265,12 +263,8 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     // from search indexing, not from an explicit by-id message read.)
     let result = client
         .call_tool(
-            CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "message_id": MESSAGE_ID })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            CallToolRequestParams::new("pond_get_message")
+                .with_arguments(json!({ "id": MESSAGE_ID }).as_object().unwrap().clone()),
         )
         .await?;
     let message = tool_text(&result);
@@ -282,8 +276,8 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     // A wire error (unknown session) surfaces as a JSON-RPC tool error.
     let missing = client
         .call_tool(
-            CallToolRequestParams::new("pond_get").with_arguments(
-                json!({ "session_id": "no-such-session" })
+            CallToolRequestParams::new("pond_get_session").with_arguments(
+                json!({ "id": "no-such-session" })
                     .as_object()
                     .unwrap()
                     .clone(),

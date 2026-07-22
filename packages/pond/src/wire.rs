@@ -320,42 +320,56 @@ pub enum GetEnvelope {
     Error(ErrorEnvelope),
 }
 
+/// Whole-session read (spec.md#protocol). `id` names either kind: a session
+/// id reads that session; a message id resolves up to its parent session with
+/// the page anchored at that message
+/// (`GetResult::Session.resolved_from_message_id` records the resolution) -
+/// intent comes from the endpoint, so upcasting is always safe. The alias
+/// accepts this endpoint's own typed name; the other type's name is not an
+/// alias - cross-type forgiveness lives in the value, not the param name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GetRequest {
+pub struct GetSessionRequest {
     pub protocol_version: u16,
     #[serde(default)]
     pub namespace: Option<String>,
-    // Mutually exclusive scopes. The prefixed params self-document which scope
-    // they belong to (agents read names, not descriptions).
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub message_id: Option<String>,
-    /// Session scope: max messages per page.
+    #[serde(alias = "session_id")]
+    pub id: String,
+    /// Max messages per page.
     #[serde(default = "default_get_limit")]
-    pub session_limit: usize,
-    /// Session scope: which end to read the first page from - `start` (oldest,
-    /// default) or `end` (most recent, e.g. post-compaction recovery). Pages
-    /// stay chronological. Ignored once an anchor below is set.
+    pub limit: usize,
+    /// Which end to read the first page from - `start` (oldest, default) or
+    /// `end` (most recent, e.g. post-compaction recovery). Pages stay
+    /// chronological. Ignored once an anchor below is set.
     #[serde(default)]
-    pub session_from: SessionFrom,
-    /// Session scope: page forward - messages strictly after this id.
+    pub from: SessionFrom,
+    /// Page forward - messages strictly after this id.
     #[serde(default)]
-    pub session_after_message_id: Option<String>,
-    /// Session scope: page backward - messages strictly before this id.
+    pub after_message_id: Option<String>,
+    /// Page backward - messages strictly before this id.
     #[serde(default)]
-    pub session_before_message_id: Option<String>,
-    /// Message scope: conversational sibling messages before the target
-    /// (mirrors `grep -B`).
-    #[serde(default = "default_context")]
-    pub message_context_before: usize,
-    /// Message scope: conversational sibling messages after the target
-    /// (mirrors `grep -A`).
-    #[serde(default = "default_context")]
-    pub message_context_after: usize,
+    pub before_message_id: Option<String>,
 }
 
-/// Which end of a session `pond_get` reads its first page from
+/// Single-message read (spec.md#protocol): the target with its full part
+/// bodies plus conversational neighbors. `id` must be a message id; a session
+/// id cannot resolve to one message (which one?), so the handler rejects it
+/// with a hint naming the session read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetMessageRequest {
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(alias = "message_id")]
+    pub id: String,
+    /// Conversational sibling messages before the target (mirrors `grep -B`).
+    #[serde(default = "default_context")]
+    pub context_before: usize,
+    /// Conversational sibling messages after the target (mirrors `grep -A`).
+    #[serde(default = "default_context")]
+    pub context_after: usize,
+}
+
+/// Which end of a session `pond_get_session` reads its first page from
 /// (spec.md#protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -380,7 +394,7 @@ pub struct GetResponse {
 
 /// Trimmed session header (spec.md#protocol): adapter-redundant `options`,
 /// parent pointers (served by `restore_lineage`), and per-message session id
-/// dropped to keep `pond_get` responses lean for agent context windows.
+/// dropped to keep get responses lean for agent context windows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetSession {
     pub id: String,
@@ -400,7 +414,7 @@ impl GetSession {
     }
 }
 
-/// Per-message view in a `pond_get` response (spec.md#protocol). Always
+/// Per-message view in a get response (spec.md#protocol). Always
 /// conversational: `text`/`content` plus one-line part summaries. Full part
 /// bodies ride `GetResult::Message.target_parts`, reached by `message_id`
 /// scope - a session view never inlines them.
@@ -498,7 +512,7 @@ pub const SUMMARY_PART_TYPES: &[&str] = &[
     "tool_approval_response",
 ];
 
-/// A `Part` as it rides a `pond_get` response (spec.md#protocol): the canonical
+/// A `Part` as it rides a get response (spec.md#protocol): the canonical
 /// part minus `session_id` / `message_id`, which the enclosing session and
 /// message already identify. Built from a canonical [`Part`] in the handler.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,7 +538,7 @@ impl ResponsePart {
     }
 }
 
-/// Mode-specific `pond_get` payload, tagged by `scope` and flattened into
+/// Mode-specific get payload, tagged by `scope` and flattened into
 /// `GetResponse` alongside the shared session header.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
@@ -532,19 +546,28 @@ pub enum GetResult {
     Session {
         messages: Vec<MessageView>,
         /// Conversational messages before the emitted page (the top marker's
-        /// `session_before_message_id` cursor exists when this is > 0).
+        /// `before_message_id` cursor exists when this is > 0).
         before_remaining: usize,
         /// Conversational messages after the emitted page (the bottom marker's
-        /// `session_after_message_id` cursor exists when this is > 0).
+        /// `after_message_id` cursor exists when this is > 0).
         after_remaining: usize,
+        /// Set when the request's `session_id` was actually a message id that
+        /// the server resolved up to this session; the page is anchored at
+        /// that message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_from_message_id: Option<String>,
     },
     Message {
         target: MessageView,
         target_parts: Vec<ResponsePart>,
         target_parts_remaining: usize,
-        /// `message_context_before` + `message_context_after` conversational
-        /// messages around the target (target excluded).
+        /// `context_before` + `context_after` conversational messages around
+        /// the target (target excluded).
         siblings: Vec<MessageView>,
+        /// Request echo so the rendered header can state the window size.
+        context_before: usize,
+        /// Request echo so the rendered header can state the window size.
+        context_after: usize,
     },
 }
 

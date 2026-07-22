@@ -1,0 +1,71 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Read a whole session as a transcript.
+
+Returns the session as a conversational transcript (user/assistant text + one-line tool/file refs); expand any tool body with `pond get-message`. A message id also works: it resolves to its parent session with the page anchored at that message.
+
+Usage: pond get-session [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Session id (a message id resolves to its parent session)
+
+Options:
+      --namespace <NAMESPACE>
+          Tenant namespace. The personal pond has exactly one; leave at the default
+          
+          [default: local]
+
+      --limit <LIMIT>
+          Max messages per page
+          
+          [default: 20]
+
+      --from <FROM>
+          Which end to read the first page from.
+          
+          start = oldest first (default); end = most recent, e.g. to recover context after compaction.
+          
+          [default: start]
+          [possible values: start, end]
+
+      --after-message-id <ID>
+          Page forward - messages after this id (from a prior page's bottom marker)
+
+      --before-message-id <ID>
+          Page backward - messages before this id (from a prior page's top marker)
+
+      --format <FORMAT>
+          Output format: `text` (readable transcript) or `json` (one document)
+          
+          [default: text]
+          [possible values: text, json]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond get-session 58a96901-4a4f-40be-a3c1-62419ec8c580
+  pond get-session <ID> --from end               most recent messages
+  pond get-session <ID> --after-message-id <ID>  page down

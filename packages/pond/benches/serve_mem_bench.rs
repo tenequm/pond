@@ -6,8 +6,8 @@
 //! Read-path bench for `pond mcp` / `pond serve`. Opens an existing
 //! `~/.local/share/pond/` corpus and measures *pond's own* steady-state read
 //! path: the resident meta cache we build, the two retrieval arms (vector
-//! default, fts), and `pond_get` hydration - with the cache loaded, the way the
-//! server actually serves.
+//! default, fts), and `pond_get_message` hydration - with the cache loaded, the
+//! way the server actually serves.
 //!
 //! It reports total memory at every phase and breaks it into parts - store
 //! open, resident meta cache, Lance caches, candle E5 model - so you can see
@@ -22,8 +22,8 @@
 //!   - fts_steady    : N fts-arm queries (no embedder) - pond's core read path
 //!   - vector_first  : first vector query (the cold E5 model-load spike)
 //!   - vector_steady : N vector-arm queries (default arm; needs the embedder)
-//!   - get_steady    : N `pond_get` hydration calls on prior hits
-//!   - sql_steady    : N `pond_sql_query` calls (the analytic tool)
+//!   - get_steady    : N `pond_get_message` hydration calls on prior hits
+//!   - sql_steady    : N `pond_sql` calls (the analytic tool)
 //!   - idle/drained  : resting footprint; drained drops the model (cache stays)
 //!
 //! Run:
@@ -49,13 +49,13 @@ use pond::{
     PROTOCOL_VERSION,
     config::{Config, SearchConfig},
     embed::LazyEmbedder,
-    handlers::{pond_get, pond_search},
+    handlers::{pond_get_message, pond_search},
     sessions::Store,
     sql::{self, Mode, Tables},
     substrate::{Predicate, ResolvedStorage, RuntimeCaps, StorageUrl, Table},
     wire::{
-        GetEnvelope, GetRequest, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest,
-        SearchResponse,
+        GetEnvelope, GetMessageRequest, SearchEnvelope, SearchFilters, SearchModeWire,
+        SearchRequest, SearchResponse,
     },
 };
 
@@ -85,7 +85,7 @@ const QUERIES: &[&str] = &[
     "schema evolution add column",
 ];
 
-/// `pond_sql_query` workload: one metadata-only count (manifest, no data read),
+/// `pond_sql` workload: one metadata-only count (manifest, no data read),
 /// two column scans, a token filter (FTS-accelerated), and a group-by. Mirrors
 /// the analytic shapes the MCP tool actually serves.
 const SQL_QUERIES: &[&str] = &[
@@ -435,18 +435,13 @@ fn search_request(query: &str, mode: SearchModeWire, limit: usize) -> SearchRequ
     }
 }
 
-fn get_request(message_id: String) -> GetRequest {
-    GetRequest {
+fn get_request(message_id: String) -> GetMessageRequest {
+    GetMessageRequest {
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
-        session_id: None,
-        message_id: Some(message_id),
-        session_limit: 20,
-        session_from: pond::wire::SessionFrom::Start,
-        session_after_message_id: None,
-        session_before_message_id: None,
-        message_context_before: 3,
-        message_context_after: 3,
+        id: message_id,
+        context_before: 3,
+        context_after: 3,
     }
 }
 
@@ -613,7 +608,7 @@ async fn run_get_phase(
     for id in message_ids {
         let request = get_request(id.clone());
         let t = Instant::now();
-        let envelope = pond_get(store, request).await;
+        let envelope = pond_get_message(store, request).await;
         elapsed_ms.push(t.elapsed().as_millis());
         match envelope {
             GetEnvelope::Success(_) => {}
@@ -986,7 +981,7 @@ async fn main() -> Result<()> {
         let warm_hits = store.fts_search(QUERIES[0], 1, &empty).await?;
         let get_id = warm_hits.first().map(|hit| hit.key.message_id.clone());
         if let Some(id) = &get_id {
-            let _ = pond_get(&store, get_request(id.clone())).await;
+            let _ = pond_get_message(&store, get_request(id.clone())).await;
         }
         let _ = pond_search(
             &store,
@@ -1001,7 +996,7 @@ async fn main() -> Result<()> {
             "scope_count",
             "fts_search",
             "vector_search",
-            "pond_get",
+            "pond_get_message",
             "pond_search",
         ];
         let mut iops: [Vec<u128>; 5] = Default::default();
@@ -1044,7 +1039,7 @@ async fn main() -> Result<()> {
             );
             if let Some(id) = &get_id {
                 meas!(3, {
-                    let _ = pond_get(&store, get_request(id.clone())).await;
+                    let _ = pond_get_message(&store, get_request(id.clone())).await;
                 });
             }
             // Full request: scope + arm + hydration. Hydration GETs are the
@@ -1190,7 +1185,7 @@ async fn main() -> Result<()> {
     .await
     .map(|s| phases.push(s))?;
 
-    // ---- Phase: get_steady (pond_get hydration on prior hits) ----
+    // ---- Phase: get_steady (pond_get_message hydration on prior hits) ----
     let ids: Vec<String> = {
         let guard = hit_sink.lock().unwrap();
         guard.iter().take(args.queries).cloned().collect()
@@ -1201,7 +1196,7 @@ async fn main() -> Result<()> {
             .map(|s| phases.push(s))?;
     }
 
-    // ---- Phase: sql_steady (the pond_sql_query analytic tool) ----
+    // ---- Phase: sql_steady (the pond_sql analytic tool) ----
     run_sql_phase("sql_steady", &store, &sampler, SQL_QUERIES)
         .await
         .map(|s| phases.push(s))?;

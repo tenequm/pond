@@ -12,14 +12,15 @@ use pond::{
     config::SearchConfig,
     embed::{EmbedWorker, Embedder, LazyEmbedder},
     handlers::ingest_adapter,
-    handlers::pond_get,
+    handlers::pond_get_message,
+    handlers::pond_get_session,
     handlers::pond_search,
     sessions::{IngestEvent, Store, embedding_dim},
     substrate::MaintenancePolicy,
     wire::{
-        GetEnvelope, GetRequest, GetResult, Message, Part, PartKind, ProjectFilter, Provenance,
-        ProviderOptions, SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest, Session,
-        SortBy,
+        GetEnvelope, GetMessageRequest, GetResult, GetSessionRequest, Message, Part, PartKind,
+        ProjectFilter, Provenance, ProviderOptions, SearchEnvelope, SearchFilters, SearchModeWire,
+        SearchRequest, Session, SortBy,
     },
 };
 use std::sync::Arc;
@@ -93,18 +94,15 @@ fn search_request(query: &str) -> SearchRequest {
     }
 }
 
-fn get_request(session_id: &str) -> GetRequest {
-    GetRequest {
+fn get_request(session_id: &str) -> GetSessionRequest {
+    GetSessionRequest {
         protocol_version: pond::PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
-        session_id: Some(session_id.to_owned()),
-        message_id: None,
-        session_limit: 1000,
-        session_from: Default::default(),
-        session_after_message_id: None,
-        session_before_message_id: None,
-        message_context_before: 3,
-        message_context_after: 3,
+        id: session_id.to_owned(),
+        limit: 1000,
+        from: Default::default(),
+        after_message_id: None,
+        before_message_id: None,
     }
 }
 
@@ -140,7 +138,9 @@ fn hits_of(envelope: SearchEnvelope) -> Vec<HitView> {
 /// hits without hard-coding fixture content.
 async fn corpus_phrase(store: &Store) -> anyhow::Result<String> {
     for session_id in store.session_ids().await? {
-        let GetEnvelope::Success(response) = pond_get(store, get_request(&session_id)).await else {
+        let GetEnvelope::Success(response) =
+            pond_get_session(store, get_request(&session_id)).await
+        else {
             continue;
         };
         let GetResult::Session { messages, .. } = response.result else {
@@ -423,7 +423,8 @@ async fn search_returns_one_session_row_with_top_matches_per_session() -> anyhow
 }
 
 /// spec.md#model-part-provenance: a harness `<task-notification>` message must be
-/// absent from search results yet still returned in full by `pond_get`.
+/// absent from search results yet still returned in full by `pond_get_session` /
+/// `pond_get_message`.
 #[tokio::test(flavor = "multi_thread")]
 async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -> anyhow::Result<()>
 {
@@ -477,9 +478,10 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
         "an injected task-notification must never surface as a search hit"
     );
 
-    let GetEnvelope::Success(default_response) = pond_get(&store, get_request(session_uuid)).await
+    let GetEnvelope::Success(default_response) =
+        pond_get_session(&store, get_request(session_uuid)).await
     else {
-        panic!("pond_get must succeed");
+        panic!("pond_get_session must succeed");
     };
     let GetResult::Session {
         messages: default_messages,
@@ -496,11 +498,15 @@ async fn injected_task_notification_is_excluded_from_search_but_kept_for_get() -
     // The injected message is filtered from search and the conversational
     // session view, but the data is preserved and reachable by id via message
     // scope (the "give me this exact message" path).
-    let mut by_id = get_request(session_uuid);
-    by_id.session_id = None;
-    by_id.message_id = Some("u-notify".to_owned());
-    let GetEnvelope::Success(restore_response) = pond_get(&store, by_id).await else {
-        panic!("message-scope pond_get must succeed");
+    let by_id = GetMessageRequest {
+        protocol_version: pond::PROTOCOL_VERSION,
+        namespace: Some("local".to_owned()),
+        id: "u-notify".to_owned(),
+        context_before: 3,
+        context_after: 3,
+    };
+    let GetEnvelope::Success(restore_response) = pond_get_message(&store, by_id).await else {
+        panic!("message-scope pond_get_message must succeed");
     };
     let GetResult::Message { target, .. } = restore_response.result else {
         panic!("message-scope get returns a message result");
@@ -524,7 +530,8 @@ async fn message_context_siblings_are_conversational() -> anyhow::Result<()> {
     // least three conversational messages, target its middle one.
     let mut target_id = None;
     for session_id in store.session_ids().await? {
-        let GetEnvelope::Success(response) = pond_get(&store, get_request(&session_id)).await
+        let GetEnvelope::Success(response) =
+            pond_get_session(&store, get_request(&session_id)).await
         else {
             continue;
         };
@@ -543,19 +550,14 @@ async fn message_context_siblings_are_conversational() -> anyhow::Result<()> {
     let target_id =
         target_id.expect("fixtures contain a session with >= 3 conversational messages");
 
-    let request = GetRequest {
+    let request = GetMessageRequest {
         protocol_version: pond::PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
-        session_id: None,
-        message_id: Some(target_id),
-        session_limit: 20,
-        session_from: Default::default(),
-        session_after_message_id: None,
-        session_before_message_id: None,
-        message_context_before: 5,
-        message_context_after: 5,
+        id: target_id,
+        context_before: 5,
+        context_after: 5,
     };
-    let GetEnvelope::Success(response) = pond_get(&store, request).await else {
+    let GetEnvelope::Success(response) = pond_get_message(&store, request).await else {
         panic!("message-scope get must succeed");
     };
     let GetResult::Message { siblings, .. } = response.result else {

@@ -1,3 +1,7 @@
+---
+description: Share one pond store across several machines by pointing each config.toml at the same bucket. Lance optimistic concurrency makes concurrent syncs safe; pond status --hosts shows per-machine activity.
+---
+
 # Several machines, one bucket
 
 Point each machine's `config.toml` (or `POND_*` env) at the same URL and credentials, and run `pond sync` on each.

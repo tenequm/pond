@@ -1,33 +1,54 @@
 ---
 name: pond
-description: Recall past AI agent sessions (Claude Code, Codex, opencode, and more) - lossless storage with semantic and full-text search, served over MCP.
+description: Recall and analyze past AI agent sessions (Claude Code, Codex, opencode, and more). Find prior work and decisions, read/review/summarize a past session transcript, or run SQL analytics over session history. Use whenever the user references past sessions, prior work, "check pond", or asks what was done or decided before.
 ---
 
 # pond
 
 pond is your memory across every AI coding session you have run - stored
-losslessly, searchable. If a task needs context you lack, pond likely has it:
-recall first, then answer. Before you say "I don't know" or re-derive something
-that sounds prior, search pond.
+losslessly, searchable over MCP. If a task needs context you lack, pond likely
+has it: recall first, then answer. Before you say "I don't know" or re-derive
+something that sounds prior, search pond.
 
 ## Which tool
 
-- Past work, by meaning ("what did we decide", "last week", "that other repo")
-  -> `pond_search` (`mode=vector` default; `mode=fts` for exact words/symbols).
-- A known session or message -> `pond_get` (transcript, or one message in context).
-- Counts, filters, trends across sessions -> `pond_sql_query` (read-only SQL over
-  `sessions` / `messages` / `parts`).
+- Find past work by meaning ("what did we decide", "have we hit this before")
+  -> `pond_search` (`mode=vector` default; `mode=fts` for exact whole words).
+- Read, analyze, review, or summarize a session -> `pond_get_session(id)` -
+  one call, full readable transcript (a message id also works: it resolves to
+  its parent session, page anchored at that message).
+- Expand one message with its full tool bodies -> `pond_get_message(id)`.
+- Corpus-wide aggregation, exact strings inside tool bodies, subagent
+  sessions, bulk export -> `pond_sql` (read-only SQL). Read resource
+  `schema://pond-sql` first - do not guess columns or JSON paths.
 
-Params and response shapes live in each tool's MCP description and the
-`schema://pond`, `schema://pond-sql`, `stats://pond` resources - read them at
-call time, don't guess.
+## Rules that prevent wrong conclusions
+
+- Long sessions supersede their own early conclusions. For "what did we
+  decide / latest state", read the end (`pond_get_session(id, from="end")`)
+  or `pond_search` with `sort_by=recency` - relevance rank favors the early,
+  confident, possibly overturned phrasing.
+- Search covers only user/assistant conversational text - tool output is
+  excluded by design. A weak search result is NOT proof of absence: verify
+  exact strings with `pond_sql` `contains_tokens(search_text, '...')` before
+  concluding something never happened.
+- Tool bodies in SQL: tool_call is `{call_id, name, params}` (a Bash command
+  is `json_extract(variant_data, '$.params.command')`); tool_result is
+  `{call_id, name, is_failure, result}`.
+- Token accounting: one source line = one row, so sibling rows of one
+  provider turn repeat its usage snapshot - never SUM usage per row (~2-3x
+  inflation). Scope by `session_id`, group by `options.anthropic.id`, take
+  MAX per usage field, then sum; the worked query is in `schema://pond-sql`.
+- On a remote store, SQL over `parts` or the JSONB `options` column costs
+  seconds per round-trip: scope by `session_id` / `tool_name`, and raise
+  `timeout_seconds` when a broad scan is genuinely needed.
 
 ## Setup
 
 `brew install tenequm/tap/pond` (or `cargo binstall pond-db`, or `nix profile
-add github:tenequm/pond#pond`), then `pond init`, then `claude mcp add -s
-user pond -- pond mcp`. Keep current with `pond sync`; `pond --help` for the rest.
-Claude.ai chats are not synced automatically - request a data export
+add github:tenequm/pond#pond`), then `pond init` - it registers the MCP server
+and installs this skill. Keep current with `pond sync`; `pond --help` for the
+rest. Claude.ai chats are not synced automatically - request a data export
 (claude.ai Settings -> Privacy -> Export data, arrives as an emailed `.zip`),
 then `pond sync claude-ai-export --path <export.zip>`.
 Docs: https://pond.locker/

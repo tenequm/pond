@@ -23,7 +23,8 @@ Commands:
 
   Query
     search       Search stored messages
-    get          Fetch a session or message
+    get-session  Read a whole session as a transcript
+    get-message  Expand one message with its full part bodies
     sql          Run one read-only SQL query
     status       Show pond health, data, and adapters
 

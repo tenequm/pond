@@ -11,8 +11,9 @@ use tempfile::TempDir;
 
 /// The adapter ingests the whole fixture corpus without dropping anything, and
 /// every session it produced carries retrievable conversational content.
-/// Asserts adapter output at the Store layer - `pond_get`/`pond_search` render
-/// behavior is covered by their own tests, not re-litigated here.
+/// Asserts adapter output at the Store layer - `pond_get_session`/
+/// `pond_get_message`/`pond_search` render behavior is covered by their own
+/// tests, not re-litigated here.
 #[tokio::test]
 async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
