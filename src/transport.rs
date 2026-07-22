@@ -261,8 +261,10 @@ one-line tool refs (`-> name [call_id]` tool call, `<- name [call_id] \
 (ok|failed)` result); full part bodies stay one pond_get_message away. limit \
 defaults to 20; from=start|end picks which end the first page reads from (end \
 = recent tail - the session's final state, e.g. post-compaction recovery). \
-Bounded by a size budget: page with after_message_id (forward) or \
-before_message_id (backward) using the id a page marker shows. The first page \
+A partial page's header states the span and session total (`messages 1-130 \
+of 234`); pages are bounded by limit and a size budget - page with \
+after_message_id (forward) or before_message_id (backward) using the id a \
+page marker shows. The first page \
 also lists the session's subagents (each stored as its own session) in a \
 footer; pass a listed id back to open it. Not for bulk export - use `pond \
 copy --to <file>`.
@@ -653,9 +655,14 @@ Examples (4 patterns the agent should recognize):
         /// 'file'. Tool bodies live in JSONB variant_data - tool_call is
         /// {call_id, name, params} (a Bash command is
         /// json_extract(variant_data, '$.params.command')), tool_result is
-        /// {call_id, name, is_failure, result}; never CAST JSON columns. Tool
-        /// analytics: prefer the narrow native columns (tool_name, call_id,
-        /// is_failure). Text search: WHERE contains_tokens(search_text,
+        /// {call_id, name, is_failure, result}; never CAST JSON columns. No
+        /// substring index covers tool bodies: an unscoped LIKE over
+        /// variant_data full-scans and times out on a remote store -
+        /// scope-then-scan instead (collect session_ids WHERE
+        /// contains_tokens(search_text, '...'), then match variant_data
+        /// fields only within them; worked example in schema://pond-sql).
+        /// Tool analytics: prefer the narrow native columns (tool_name,
+        /// call_id, is_failure). Text search: WHERE contains_tokens(search_text,
         /// 'words'), or FROM fts('messages', '{...}') for BM25 ranking.
         /// Joins, indexed columns, JSON functions, pagination, worked
         /// examples: resource schema://pond-sql.

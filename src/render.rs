@@ -286,12 +286,27 @@ pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String
                 Surface::Mcp => "pond_get_session",
                 Surface::Cli => "pond get-session",
             };
-            let _ = writeln!(
-                out,
-                "{prefix}: session {}, {}.",
-                session.id,
-                count_noun(messages.len(), "message"),
-            );
+            // A partial page must announce the session total up front: a
+            // header saying only the page's count reads as the whole session
+            // (field-tested miss - the rest of a long session went unread).
+            let total = *before_remaining + messages.len() + *after_remaining;
+            if total > messages.len() {
+                let start = *before_remaining + 1;
+                let end = *before_remaining + messages.len();
+                let _ = writeln!(
+                    out,
+                    "{prefix}: session {}, messages {start}-{end} of {total} \
+                     (pages are bounded by limit and a size budget).",
+                    session.id,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{prefix}: session {}, {}.",
+                    session.id,
+                    count_noun(messages.len(), "message"),
+                );
+            }
             // The id was a message id; say so before the transcript so the
             // caller knows the page is anchored, not the session start.
             if let Some(message_id) = resolved_from_message_id {
@@ -663,6 +678,51 @@ mod tests {
         assert!(transcript.contains("  -> Bash [toolu_x]"));
         assert!(transcript.contains("  <- Bash [toolu_x] (ok)"));
         assert!(transcript.contains("session s1 | claude-code | /p"));
+    }
+
+    #[test]
+    fn session_header_states_span_and_total_on_partial_pages() {
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let message = |id: &str| MessageView {
+            id: id.to_owned(),
+            role: crate::wire::Role::User,
+            timestamp: ts,
+            text: Some("hi".to_owned()),
+            content: None,
+            parts_summary: Vec::new(),
+        };
+        let session = crate::wire::GetSession {
+            id: "s1".to_owned(),
+            source_agent: "claude-code".to_owned(),
+            project: "/p".to_owned(),
+            created_at: ts,
+        };
+        let partial = GetResponse {
+            session: session.clone(),
+            result: GetResult::Session {
+                messages: vec![message("m1"), message("m2")],
+                before_remaining: 100,
+                after_remaining: 32,
+                resolved_from_message_id: None,
+            },
+        };
+        let transcript = crate::render::render_get_transcript(&partial, Surface::Mcp);
+        assert!(transcript.starts_with(
+            "pond_get_session: session s1, messages 101-102 of 134 \
+             (pages are bounded by limit and a size budget)."
+        ));
+
+        let full = GetResponse {
+            session,
+            result: GetResult::Session {
+                messages: vec![message("m1"), message("m2")],
+                before_remaining: 0,
+                after_remaining: 0,
+                resolved_from_message_id: None,
+            },
+        };
+        let transcript = crate::render::render_get_transcript(&full, Surface::Cli);
+        assert!(transcript.starts_with("pond get-session: session s1, 2 messages."));
     }
 
     #[test]
