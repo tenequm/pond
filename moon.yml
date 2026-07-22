@@ -3,40 +3,30 @@ language: rust
 env:
   CARGO_TERM_COLOR: always
 
+# Repo-level project: tasks that operate on the whole tree from the repo root
+# (changelog gate, the multi-target dist build that writes dist/ + target/ at
+# root). The crate itself is the `pond` project under packages/pond.
 fileGroups:
   sources:
-    - 'src/**/*'
-    - 'Cargo.{toml,lock}'
+    - 'packages/pond/src/**/*'
+    - 'packages/pond/Cargo.toml'
+    - 'Cargo.lock'
     - 'rust-toolchain.toml'
   tests:
-    - 'tests/**/*'
-    - 'benches/**/*'
+    - 'packages/pond/tests/**/*'
+    - 'packages/pond/benches/**/*'
 
 tasks:
-  format:
-    command: 'cargo fmt --check'
-    inputs: ['@group(sources)', '@group(tests)']
-  lint:
-    command: 'cargo clippy --locked -- -D warnings'
-    inputs: ['@group(sources)', '@group(tests)']
-  test:
-    command: 'cargo test --locked'
-    inputs: ['@group(sources)', '@group(tests)']
   check-changelog:
     command: 'bash ops/scripts/check-changelog-headers.sh'
     toolchains: 'system'
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
-  # Cheap packaging gate: `cargo package --list` must contain every file the
-  # code embeds via include_str!/include_bytes! (a full verify build is skipped
-  # at publish time - publish_no_verify in .github/release-plz.toml).
-  check-package:
-    command: 'bash ops/scripts/check-package-contents.sh'
-    inputs: ['@group(sources)', 'SKILL.md', 'ops/scripts/check-package-contents.sh']
 
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
   # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
   # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
-  # persistent CARGO_TARGET_DIR.
+  # persistent CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the
+  # workspace target dir and dist/ lands at the root where publish-release reads it.
   build-dist:
     script: |
       set -euo pipefail

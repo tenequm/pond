@@ -603,7 +603,7 @@ Each adapter has a round-trip codec test: parse a committed fixture to canonical
 
 ### 6.9 Adapter set
 
-The adapter set is intentionally not listed here. The registry in `src/adapter/mod.rs` is the source of truth for which formats a build supports, and Section 6 is the contract every registered adapter must satisfy. Per-adapter extraction detail - how an adapter resolves `project`, what its `source_agent` brand is, its on-disk layout, and which source records it deliberately does not ingest - lives in that adapter's own code, which is its documentation.
+The adapter set is intentionally not listed here. The registry in `packages/pond/src/adapter/mod.rs` is the source of truth for which formats a build supports, and Section 6 is the contract every registered adapter must satisfy. Per-adapter extraction detail - how an adapter resolves `project`, what its `source_agent` brand is, its on-disk layout, and which source records it deliberately does not ingest - lives in that adapter's own code, which is its documentation.
 
 ---
 

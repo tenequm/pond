@@ -27,7 +27,7 @@ tmp/
 /.claude
 .agents/
 skills-lock.json
-/benches/corpus/
+/packages/pond/benches/corpus/
 
 # AGENTS.md is the canonical, tracked instructions file; CLAUDE.md is a local
 # symlink to it for Claude Code (which reads CLAUDE.md). Keep the symlink local.

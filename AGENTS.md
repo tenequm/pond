@@ -22,8 +22,8 @@
 
 > **PLACEMENT RULE - read before writing any test.** A test lives next to the code it exercises. If it tests one module's behavior - even when it goes through a `Store` or handler call - it is a UNIT test and belongs in `#[cfg(test)] mod tests` at the bottom of that `src/...` file. `tests/integration/` is ONLY for genuine cross-module integration: multiple subsystems wired end to end (e.g. ingest -> search -> get over a fixture corpus). A `Store`-level, single-module, or pure-helper test in `tests/integration/` is in the WRONG place - move it to `src/`. When in doubt, default to a unit test in `src/`.
 
-- Layout: unit tests live in `#[cfg(test)] mod tests` next to the code they test (`src/...`). All integration tests are bundled into one binary at `tests/integration.rs`, with each suite as a module under `tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
-- Adapter-specific integration tests go in `tests/integration/adapter/<adapter>.rs` (mirroring `src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `tests/integration/adapter/mod.rs`, the seam analog of `src/adapter/mod.rs`.
+- Layout (all crate paths are under `packages/pond/`): unit tests live in `#[cfg(test)] mod tests` next to the code they test (`packages/pond/src/...`). All integration tests are bundled into one binary at `packages/pond/tests/integration.rs`, with each suite as a module under `packages/pond/tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
+- Adapter-specific integration tests go in `packages/pond/tests/integration/adapter/<adapter>.rs` (mirroring `packages/pond/src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `packages/pond/tests/integration/adapter/mod.rs`, the seam analog of `packages/pond/src/adapter/mod.rs`.
 - Run everything: `cargo test`.
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
@@ -77,12 +77,12 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Errors
 
-- `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
+- `anyhow::Result` internally. Typed `pond::Error` (thiserror, `packages/pond/src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`packages/pond/src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
 - When a command fails or detects a recoverable bad state, its output names the fix - the exact recovery command or concrete next step, not just the symptom (e.g. an incomplete index points the user at `pond optimize --only index`).
 
 ## Repo layout
 
-- One flat crate. `src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
+- `packages/` monorepo. The Rust crate is `packages/pond/` (a virtual-workspace member; the workspace `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` stay at the repo root, so `cargo build|test|clippy|fmt` still run from root). `packages/pond/src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`); `SKILL.md` sits at the crate root (embedded via `include_str!`). The OpenClaw plugin is `packages/openclaw-pond/` (npm package `openclaw-pond`). Repo-level dirs (`docs/`, `ops/`, `nix/`, `.github/`, `.moon/`) stay at root. Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `packages/pond/tests/` is for cross-module integration only.
 
 ## Documentation
 
@@ -110,7 +110,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## Adapter seam (load-bearing)
 
 - The adapter seam enforces correctness via types - synthesized values (sentinel strings, fallback defaults like `"unknown"`, `"function"`, `""`) MUST NOT compile, and the seam is transport-agnostic via `Source`/`Extracted<T>` so file, HTTP, and stream adapters share one set of primitives.
-- Keep `src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`src/adapter/<adapter>.rs`) next to the factory/reader they describe.
+- Keep `packages/pond/src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`packages/pond/src/adapter/<adapter>.rs`) next to the factory/reader they describe.
 - Unit tests live in `#[cfg(test)] mod tests` at the bottom of the source file they test; `tests/` is reserved for genuine cross-module integration suites only.
 
 ## Seam boundaries
@@ -121,7 +121,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## CLI output stack
 
 - User-facing CLI output uses `clap` (parsing) + `indicatif` (progress + spinners) + `dialoguer` (interactive prompts) + `comfy-table` (width-adaptive tables) + `anstyle` (color, gated through `pond::output::paint` which honors `NO_COLOR` and non-TTY stdout). Don't reach for `crossterm`, `terminal_size`, `owo-colors`, `colored`, or `tabled`; pond standardizes on the stack above.
-- New tabular surfaces should go through `pond::output` and the `new_table()` helper in `src/main.rs` so every command renders the same: borderless, dynamic-width, dim-bold headers.
+- New tabular surfaces should go through `pond::output` and the `new_table()` helper in `packages/pond/src/main.rs` so every command renders the same: borderless, dynamic-width, dim-bold headers.
 
 ## Test storage backends
 
