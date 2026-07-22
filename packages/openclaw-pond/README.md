@@ -146,9 +146,12 @@ Linux host, corpus of 221 sessions / 3,105 messages):
 - Idle: ~102 MiB RSS at ~0.3% CPU - the embedding model is not loaded until
   the first vector query. fts search, gets, and SQL stay at ~100 MiB.
 - Vector burst: ~894 MiB RSS at 3-4 cores while embedding queries run; the
-  sync embed pass holds a flat ~650 MiB. Since then pond gained a background
-  idle reaper that returns the process to the idle floor ~60 s after the last
-  vector query.
+  sync embed pass holds a flat ~650 MiB. pond drops the cached model ~60 s
+  after the last vector use (a background reaper; eviction verified in the
+  live process - the model mmap is released without any further query). How
+  much RSS the OS then reclaims is platform-dependent: clean on macOS;
+  partial on Linux, where the allocator retains a few hundred MiB of freed
+  heap across reload cycles (bounded - observed oscillating, not growing).
 - Disk: the store for that corpus is 11 MiB; the embedding model cache is a
   466 MiB one-time download.
 - Lifecycle: kill the pond child and the plugin respawns it in ~1 s; kill the
