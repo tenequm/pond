@@ -31,10 +31,13 @@ The child runs at low scheduling priority (`nice -n 19`), so background sync
 never competes with interactive work.
 
 If pond is missing, the service fails with a message naming the exact fix:
-install pond, then run `pond init` once (which also enables the `openclaw`
-adapter). An uninitialized store does not block startup - `pond serve` runs
-and its sync log names the `pond init` fix. The plugin never writes pond
-config.
+install pond. Nothing else is required: on a completely unconfigured pond the
+managed child runs with `--bootstrap openclaw`, which enables the `openclaw`
+adapter (equivalent to a minimal `pond init`) so the first sync ingests your
+OpenClaw history. The plugin never touches an existing pond config - a pond
+with any `[adapters.*]` entry (even a disabled one) is left byte-identical,
+and `pond init` remains the path to a cross-harness corpus (Claude Code,
+Codex, and friends alongside OpenClaw).
 
 ## Configuration
 

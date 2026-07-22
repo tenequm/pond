@@ -2,7 +2,9 @@
 // `pond serve --transport stdio --with-sync`, speak MCP over its stdio, and
 // restart with backoff on unexpected exit. In url mode it instead dials an
 // external `pond serve` over streamable HTTP. Either way it exposes one
-// callTool seam the tools use. The plugin NEVER writes pond config.
+// callTool seam the tools use. The plugin never touches an existing pond
+// config; on a completely unconfigured pond, `--bootstrap openclaw` enables
+// that one adapter (equivalent to a minimal `pond init`).
 import { accessSync, constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { PondPluginConfig } from "./config.js";
@@ -69,8 +71,9 @@ export async function relayPondCall(
 }
 
 const INSTALL_HINT =
-  "install pond (https://github.com/tenequm/pond, `brew install tenequm/tap/pond` or `cargo install pond`), " +
-  "then run `pond init` once to create the store and enable the openclaw adapter.";
+  "install pond (https://github.com/tenequm/pond, `brew install tenequm/tap/pond` or `cargo install pond`). " +
+  "Nothing else is needed - the plugin bootstraps the openclaw adapter itself; `pond init` is only " +
+  "for a cross-harness corpus.";
 
 function isExecutable(path: string): boolean {
   try {
@@ -156,17 +159,15 @@ export class PondController {
         timeoutMs: DIAL_TIMEOUT_MS,
       });
       // Probe the handshake so a dead transport fails here, not on first tool
-      // call. An uninitialized store is NOT caught by this: `pond serve` starts
-      // and lists tools regardless; its own sync WARN names the `pond init` fix.
+      // call. A source-less pond is NOT a dial failure: `pond serve` starts and
+      // lists tools regardless; bootstrap/sync WARN logs name the fix.
       await this.client.listToolNames({ timeoutMs: DIAL_TIMEOUT_MS });
       this.attempt = 0;
       this.logger.info(`pond connected (${this.config.mode} mode).`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (this.config.mode === "managed") {
-        this.logger.error(
-          `pond failed to start: ${message}. If the store is not initialized, run \`pond init\`. Otherwise ${INSTALL_HINT}`,
-        );
+        this.logger.error(`pond failed to start: ${message}. To fix: ${INSTALL_HINT}`);
       } else {
         this.logger.error(`pond connection to ${this.config.url ?? "(no url)"} failed: ${message}`);
       }
@@ -193,6 +194,11 @@ export class PondController {
         "--with-sync",
         "--sync-every",
         String(this.config.syncIntervalMinutes),
+        // Init-equivalent, first-run only: when pond has NO adapters
+        // configured, enable the openclaw adapter so the first sync ingests
+        // something. Never touches an existing pond config.
+        "--bootstrap",
+        "openclaw",
       ],
       env: pondChildEnv(),
     });

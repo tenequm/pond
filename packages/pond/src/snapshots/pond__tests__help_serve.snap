@@ -1,5 +1,5 @@
 ---
-source: src/main.rs
+source: packages/pond/src/main.rs
 expression: sub.render_long_help().to_string()
 ---
 Run the HTTP API server (or MCP over stdio with --transport stdio).
@@ -34,6 +34,9 @@ Options:
           Minutes between in-process syncs (requires --with-sync)
           
           [default: 5]
+
+      --bootstrap <ADAPTER>
+          On startup, when NO adapters are configured yet, discover and enable this one (an init-equivalent step for supervised deploys). Never touches an existing [adapters.*] config; if discovery finds nothing, serve still starts and logs the `pond init` fix
 
   -h, --help
           Print help (see a summary with '-h')

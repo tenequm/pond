@@ -631,6 +631,12 @@ enum Command {
         /// Minutes between in-process syncs (requires --with-sync).
         #[arg(long, default_value_t = 5, requires = "with_sync")]
         sync_every: u64,
+        /// On startup, when NO adapters are configured yet, discover and
+        /// enable this one (an init-equivalent step for supervised deploys).
+        /// Never touches an existing [adapters.*] config; if discovery finds
+        /// nothing, serve still starts and logs the `pond init` fix.
+        #[arg(long, value_name = "ADAPTER")]
+        bootstrap: Option<String>,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -1319,13 +1325,23 @@ async fn main() -> anyhow::Result<()> {
             port,
             with_sync,
             sync_every,
+            bootstrap,
         } => {
             cap_serve_io_buffer();
             let config_file = config_path(config);
-            let config = Config::load(&config_file)?;
+            let mut config = Config::load(&config_file)?;
+            // `--bootstrap` completes before the sync loop spawns, so sync
+            // itself still only ever sees already-enabled adapters (the
+            // spec's sync-never-enables rule is preserved).
+            if let Some(name) = &bootstrap
+                && bootstrap_adapter(&config_file, &config, name)
+            {
+                config = Config::load(&config_file)?;
+            }
             // One resident embedder shared by the query arm (AppState) and the
             // inline embed-at-ingest path (the store), so the model loads once.
             let embedder = Arc::new(LazyEmbedder::candle());
+            embedder.spawn_idle_reaper();
             let store = Arc::new(
                 open_store(storage_path.clone(), &config, true, true)
                     .await?
@@ -1371,6 +1387,7 @@ async fn main() -> anyhow::Result<()> {
             // and the one instance is shared by the query arm and the store's
             // inline embed-at-ingest path.
             let embedder = Arc::new(LazyEmbedder::candle());
+            embedder.spawn_idle_reaper();
             let store = Arc::new(
                 open_store(storage_path, &config, true, true)
                     .await?
@@ -2812,22 +2829,18 @@ fn adapters_discover(config_file: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn adapters_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
-    use pond::output::{dim, paint};
+/// Quiet core of `pond adapters enable`, shared with `pond serve --bootstrap`:
+/// flip an existing entry in place (keeping its path/options), else discover
+/// the default path and persist `enabled = true`. Returns whether discovery
+/// ran; callers own the output surface (CLI stdout vs serve tracing).
+fn enable_adapter(config_file: &Path, name: &str) -> anyhow::Result<bool> {
     let known = adapter::known_names();
     if !known.contains(&name) {
         bail!("unknown adapter {name:?}; known: {}", known.join(", "));
     }
-    // Already configured: flip enabled = true in place, keeping its path/options.
     if adapter::set_adapter_enabled(config_file, name, true)? {
-        output(&format!(
-            "{} [adapters.{}] enabled = true",
-            paint("adapters:", dim()),
-            name,
-        ))?;
-        return Ok(());
+        return Ok(false);
     }
-    // Not configured: discover its default path, then persist enabled = true.
     let candidate = adapter::discover(Some(name))
         .into_iter()
         .find(|c| c.name == name)
@@ -2837,12 +2850,50 @@ fn adapters_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
             )
         })?;
     adapter::persist_accept(config_file, &[candidate])?;
+    Ok(true)
+}
+
+fn adapters_enable(config_file: &Path, name: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint};
+    let discovered = enable_adapter(config_file, name)?;
     output(&format!(
-        "{} [adapters.{}] enabled = true (discovered)",
+        "{} [adapters.{}] enabled = true{}",
         paint("adapters:", dim()),
         name,
+        if discovered { " (discovered)" } else { "" },
     ))?;
     Ok(())
+}
+
+/// `pond serve --bootstrap <adapter>`: an init-equivalent step at serve
+/// startup. Acts only on a completely unconfigured pond (no [adapters.*]
+/// entries at all - a disabled entry counts as configured); never touches
+/// existing adapter config. Failures downgrade to WARN naming `pond init`,
+/// because an empty store serving degraded search is the correct state for a
+/// plugin-only install with no source yet. Output is tracing-only (stdout may
+/// be the stdio transport's). Returns true when config must be reloaded.
+fn bootstrap_adapter(config_file: &Path, config: &Config, name: &str) -> bool {
+    if !config.adapters.is_empty() {
+        tracing::info!(
+            adapter = name,
+            "bootstrap skipped: adapters already configured"
+        );
+        return false;
+    }
+    match enable_adapter(config_file, name) {
+        Ok(discovered) => {
+            tracing::info!(adapter = name, discovered, "bootstrap: adapter enabled");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                adapter = name,
+                "bootstrap: no adapter enabled; run `pond init` (or `pond adapters enable`) to configure sources",
+            );
+            false
+        }
+    }
 }
 
 fn adapters_disable(config_file: &Path, name: &str) -> anyhow::Result<()> {
@@ -5892,6 +5943,50 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn serve_bootstrap_acts_only_on_a_fully_unconfigured_pond() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let config_file = temp.path().join("config.toml");
+
+        // Configured pond (even a disabled entry counts): bootstrap never
+        // touches it, byte for byte.
+        std::fs::write(
+            &config_file,
+            "[adapters.claude-code]\nenabled = false\npath = \"/tmp/x\"\n",
+        )?;
+        let before = std::fs::read_to_string(&config_file)?;
+        let config = Config::load(&config_file)?;
+        assert!(!bootstrap_adapter(&config_file, &config, "openclaw"));
+        assert_eq!(std::fs::read_to_string(&config_file)?, before);
+
+        // Unconfigured pond + an unknown adapter: WARN branch, nothing written,
+        // no error escapes (serve must still start).
+        std::fs::write(&config_file, "")?;
+        let config = Config::load(&config_file)?;
+        assert!(!bootstrap_adapter(
+            &config_file,
+            &config,
+            "not-a-real-adapter"
+        ));
+        assert_eq!(std::fs::read_to_string(&config_file)?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn enable_adapter_flips_an_existing_entry_without_discovery() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let config_file = temp.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[adapters.openclaw]\nenabled = false\npath = \"/tmp/state\"\n",
+        )?;
+        assert!(!enable_adapter(&config_file, "openclaw")?);
+        let config = Config::load(&config_file)?;
+        let resolved = config.resolve_adapters(Some("openclaw"))?;
+        assert_eq!(resolved[0].0, "openclaw");
+        Ok(())
+    }
 
     #[test]
     fn json_summary_carries_reconciliation_when_present() {
