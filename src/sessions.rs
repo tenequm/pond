@@ -2975,6 +2975,19 @@ impl Store {
             .await
     }
 
+    /// Rows added or rewritten in `messages` since the IVF_SQ vector index
+    /// was last folded; a missing index reports the whole table. Manifest-only,
+    /// and an upper bound on the embed backlog (a row folds only after it
+    /// embeds, so no unembedded row is ever folded): zero proves nothing is
+    /// unembedded, but non-zero can be all-embedded rows the index has not
+    /// absorbed yet - confirm with [`embed_backlog_count`](Self::embed_backlog_count)
+    /// before acting on it.
+    pub async fn unindexed_vector_backlog(&self) -> Result<usize> {
+        self.handle
+            .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
+            .await
+    }
+
     /// Embedding coverage: how many `messages` rows carry a vector and how
     /// many are still eligible. Drives the `pond status` embeddings line and
     /// the `pond optimize` progress bar's known total.
@@ -8051,6 +8064,22 @@ mod tests {
         assert_eq!(store.embed_backlog_count().await?, 6);
 
         store.write_embeddings(&embedded(&keys[4..])).await?;
+        assert_eq!(store.embed_backlog_count().await?, 0);
+        Ok(())
+    }
+
+    // The post-copy shape: every row embedded, none folded into IVF_SQ yet
+    // (here: no index at all, which reports the whole table). The lag must
+    // over-state - never under-state - so the embed gate can trust lag == 0
+    // as "nothing unembedded" and must confirm lag > 0 with the exact count.
+    #[tokio::test]
+    async fn unindexed_vector_backlog_over_states_when_embedded_rows_are_unfolded()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 10).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+
+        assert_eq!(store.unindexed_vector_backlog().await?, 10);
         assert_eq!(store.embed_backlog_count().await?, 0);
         Ok(())
     }
