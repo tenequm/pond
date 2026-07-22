@@ -126,15 +126,15 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       # Assemble pond's own release first: it is the single host of the release
-      # binaries - the homebrew formula, the root flake, and the pond-nix legacy
+      # binaries - the homebrew formula, the repo flake (ops/nix), and the pond-nix legacy
       # mirror all fetch from it - so it must be complete before anything else.
       - name: Mirror binaries to pond release
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
 
-      # One rendered nix derivation feeds both the root flake (canonical,
-      # github:tenequm/pond) and the pond-nix legacy mirror.
+      # One rendered nix derivation feeds both the repo flake (canonical,
+      # github:tenequm/pond?dir=ops/nix) and the pond-nix legacy mirror.
       - name: Render nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { V: "${{ steps.ver.outputs.v }}" }
@@ -204,13 +204,13 @@ jobs:
       # The tag was cut from this checkout's HEAD, so this lands one commit
       # after it: tag-pinned flake refs carry the previous release's hashes,
       # main is always current. [skip ci] keeps the push from triggering CI.
-      - name: Point root flake at the new binaries
+      - name: Point the repo flake at the new binaries
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
         run: |
           set -euo pipefail
-          cp "$RUNNER_TEMP/pond.nix" nix/pond.nix
-          git add nix/pond.nix
+          cp "$RUNNER_TEMP/pond.nix" ops/nix/pond.nix
+          git add ops/nix/pond.nix
           git -c user.name=ci -c user.email=ci@pond commit -m "chore(release): point flake at v$V binaries [skip ci]"
           git fetch "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond" main
           git rebase FETCH_HEAD

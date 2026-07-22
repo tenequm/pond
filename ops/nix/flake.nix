@@ -16,10 +16,10 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
-      overlays.default = final: _prev: { pond = final.callPackage ./nix/pond.nix { }; };
+      overlays.default = final: _prev: { pond = final.callPackage ./pond.nix { }; };
 
       packages = forAllSystems (pkgs: rec {
-        pond = pkgs.callPackage ./nix/pond.nix { };
+        pond = pkgs.callPackage ./pond.nix { };
         default = pond;
       });
 
