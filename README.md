@@ -44,7 +44,7 @@ where we left off yesterday - check pond, then continue
 are you sure that won't break X? check in pond how we struggled with exactly this
 ```
 
-Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, and **pi-coding-agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
+Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, **pi-coding-agent**, and **OpenClaw**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
 ## Isn't this another memory tool?
 

@@ -33,8 +33,10 @@ mod codex_cli;
 mod discovery;
 pub mod extract;
 mod jsonl;
+mod openclaw;
 mod opencode;
 mod pi_coding_agent;
+mod sqlite;
 
 pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
@@ -47,6 +49,9 @@ pub use discovery::{
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
+};
+pub use openclaw::{
+    EraseTarget, OpenClawAdapter, OpenClawFactory, PreserveNote, ReconciliationReport,
 };
 pub use opencode::{OpencodeAdapter, OpencodeFactory};
 pub use pi_coding_agent::{PiCodingAgentAdapter, PiCodingAgentFactory};
@@ -509,6 +514,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &ClaudeAiExportFactory,
         &CodexCliFactory,
         &OpencodeFactory,
+        &OpenClawFactory,
         &PiCodingAgentFactory,
     ]
 }

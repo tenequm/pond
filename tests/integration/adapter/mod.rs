@@ -20,6 +20,7 @@ use pond::{
 use tempfile::TempDir;
 
 mod claude_code;
+mod openclaw;
 mod opencode;
 
 #[tokio::test(flavor = "multi_thread")]

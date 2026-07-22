@@ -32,13 +32,12 @@
 //! re-fusing into the single source `tool` part, so the split is
 //! value-complete-lossless.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_stream::stream;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -53,29 +52,12 @@ use super::{
     config_path,
     extract::{bound_value, extract_str, json_or_string},
     jsonl::RECORD_CAP,
-    part_id, part_ordinal, raw_record, source_options, validate_path_id,
+    part_id, part_ordinal, raw_record, source_options,
+    sqlite::{self, CHANNEL_CAP, emit},
+    validate_path_id,
 };
 
 const NAME: &str = "opencode";
-
-/// Event-channel bound; doubles as backpressure - the blocking reader parks on
-/// `blocking_send` when the consumer lags.
-const CHANNEL_CAP: usize = 256;
-
-/// Read-side SQLite busy timeout - opencode writes the DB live (WAL), so short
-/// read bursts must not stall on a checkpoint.
-const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
-
-/// Send one yield through the blocking read channel, returning `false` from the
-/// caller (stop reading this source) when the consumer dropped the receiver.
-/// Shared by both readers (the DB and the legacy tree path).
-macro_rules! emit {
-    ($tx:expr, $item:expr) => {
-        if $tx.blocking_send($item).is_err() {
-            return false;
-        }
-    };
-}
 
 /// Stateless factory: opens [`OpencodeAdapter`] instances and probes for the
 /// canonical install location under `~/.local/share/opencode/storage`.
@@ -490,14 +472,9 @@ fn read_db_survivor(
     }
 }
 
-/// A blocking-task panic is a pond bug, not bad source data, so it fails the
-/// whole run rather than skipping a session.
+/// `NAME`-bound view of the shared [`sqlite`] plumbing (one impl, two adapters).
 fn join_error(join: tokio::task::JoinError) -> AdapterError {
-    AdapterError::io(
-        NAME,
-        "blocking read task",
-        std::io::Error::other(join.to_string()),
-    )
+    sqlite::join_error(NAME, join)
 }
 
 /// One session file located on disk. `cached_subtree` is populated only when
@@ -795,27 +772,17 @@ fn db_paths(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
     list_files_sorted(root, "db", |name| name.starts_with("opencode"))
 }
 
+/// Test-only direct open (the non-test path opens through [`connection`]).
+#[cfg(test)]
 fn open_db(path: &Path) -> Result<Connection, AdapterError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|error| db_error(path, "open", &error))?;
-    conn.busy_timeout(DB_BUSY_TIMEOUT)
-        .map_err(|error| db_error(path, "set busy_timeout", &error))?;
-    Ok(conn)
+    sqlite::open_db(NAME, path)
 }
 
-/// A DB-interaction failure (open, prepare, query, row read) classified as
-/// [`AdapterError::io`] - matching the claude_desktop_app precedent: these are
-/// all substrate faults, not source-shape faults (genuine shape errors route
-/// through [`reconstruct_record`]'s parse errors instead).
+/// DB-interaction failures route through [`sqlite::db_error`] as
+/// [`AdapterError::io`]; genuine shape errors route through
+/// [`reconstruct_record`]'s parse errors instead.
 fn db_error(path: &Path, op: &str, error: &rusqlite::Error) -> AdapterError {
-    AdapterError::io(
-        NAME,
-        path.display().to_string(),
-        std::io::Error::other(format!("sqlite {op} failed: {error}")),
-    )
+    sqlite::db_error(NAME, path, op, error)
 }
 
 /// Get-or-open a cached connection for `path`.
@@ -823,10 +790,7 @@ fn connection<'a>(
     conns: &'a mut HashMap<PathBuf, Connection>,
     path: &Path,
 ) -> Result<&'a Connection, AdapterError> {
-    match conns.entry(path.to_path_buf()) {
-        Entry::Occupied(entry) => Ok(entry.into_mut()),
-        Entry::Vacant(entry) => Ok(entry.insert(open_db(path)?)),
-    }
+    sqlite::connection(NAME, conns, path)
 }
 
 /// Every session id in one DB, ordered by id for deterministic ingest. Uses the
