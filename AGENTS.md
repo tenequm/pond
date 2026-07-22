@@ -44,12 +44,12 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Search scope is intentional - do not "fix" it
 
-- `search_text` (the column the FTS index, embeddings, and `pond_search` all use, built in `sessions.rs::search_text`) carries ONLY user- and assistant-role conversational text (plus file metadata). Tool calls, tool results, reasoning, and system/tool-role messages are deliberately excluded. This is a deliberate signal-quality choice, NOT a gap or a bug: that excluded content almost never holds anything findable beyond what the conversational text already says, and indexing it would pollute both results and the caller's context. Never "improve" search by folding tool/reasoning/system content into `search_text`. Tool-body archaeology goes through `parts.variant_data` via `pond_sql_query`.
-- Subagent sessions are excluded from default `pond_search` results for the same reason (low unique signal, high pollution); they remain reachable on purpose via `pond_sql_query` (`parent_session_id`). Don't surface them in the main search.
+- `search_text` (the column the FTS index, embeddings, and `pond_search` all use, built in `sessions.rs::search_text`) carries ONLY user- and assistant-role conversational text (plus file metadata). Tool calls, tool results, reasoning, and system/tool-role messages are deliberately excluded. This is a deliberate signal-quality choice, NOT a gap or a bug: that excluded content almost never holds anything findable beyond what the conversational text already says, and indexing it would pollute both results and the caller's context. Never "improve" search by folding tool/reasoning/system content into `search_text`. Tool-body archaeology goes through `parts.variant_data` via `pond_sql`.
+- Subagent sessions are excluded from default `pond_search` results for the same reason (low unique signal, high pollution); they remain reachable on purpose via `pond_sql` (`parent_session_id`). Don't surface them in the main search.
 
 ## MCP surfaces are hard-enforced read-only
 
-- Every pond MCP action is read-only, hard-enforced (durable user constraint) - any new MCP tool that reaches the store must clear the same bar; never expose a write path through MCP. `pond_sql_query` proves it in two layers: (1) a pre-parse gate requiring exactly one `Statement::Query` - this also catches `EXPLAIN ANALYZE` / `DESCRIBE`, which DataFusion's `SQLOptions` alone misses; (2) `sql_with_options` with `allow_ddl` / `allow_dml` / `allow_statements` all false (only a bare `EXPLAIN` of a SELECT flips `allow_statements`). Fresh `SessionContext` per query.
+- Every pond MCP action is read-only, hard-enforced (durable user constraint) - any new MCP tool that reaches the store must clear the same bar; never expose a write path through MCP. `pond_sql` proves it in two layers: (1) a pre-parse gate requiring exactly one `Statement::Query` - this also catches `EXPLAIN ANALYZE` / `DESCRIBE`, which DataFusion's `SQLOptions` alone misses; (2) `sql_with_options` with `allow_ddl` / `allow_dml` / `allow_statements` all false (only a bare `EXPLAIN` of a SELECT flips `allow_statements`). Fresh `SessionContext` per query.
 
 ## Sync change-detection oracle (S3 perf, measured)
 
@@ -83,6 +83,12 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ## Repo layout
 
 - One flat crate. `src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
+- Root `SKILL.md` is compiled into the binary via `include_str!` (`pond skill` prints it; `pond init` installs it to `~/.claude/skills/pond/`), so it MUST stay out of Cargo.toml's `exclude` list - excluding it breaks the crates.io publish build.
+
+## MCP tool routing is deliberate
+
+- Clients (Claude Code, Codex) defer MCP tool descriptions behind tool search; the always-loaded pond-authored surfaces are the server `instructions` (transport.rs `get_info`), the tool NAMES, and the installed skill. The instructions therefore carry all routing: "analyze / review / summarize a session" binds to `pond_get_session`, and `pond_sql` self-describes as the escape hatch (never as the "analytic" tool - that word routes "analyze this session" to SQL). Keep cookbook detail in the `schema://` resources and recovery guidance in error messages (sql.rs `enrich`, the timeout text) - those are the surfaces agents reliably see. Don't fatten tool descriptions back up.
+- The get surface is split by intent: `pond_get_session` reads a whole session, `pond_get_message` expands one message. Each takes one `id`; get_session resolves a message id up to its parent session (page anchored at that message), get_message rejects a session id with a hint - the forgiving direction is the well-defined one. Keep it asymmetric; never guess which message a session id "means".
 
 ## Documentation
 

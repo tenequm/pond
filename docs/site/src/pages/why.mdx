@@ -73,7 +73,7 @@ pond's premise: a session should outlive the tool that made it. Three rules foll
 ## Two audiences, one source
 
 - **Humans:** one binary, one searchable archive across every client; ask any agent about your past work. Backend switches and rollbacks are one command; the local copy stays as a backup.
-- **Agents:** pond is an MCP server - `pond_search` / `pond_get` / `pond_sql_query` over the user's full cross-client history, no per-client integration. Every command is exit-code-gated for CI.
+- **Agents:** pond is an MCP server - `pond_search` / `pond_get_session` / `pond_get_message` / `pond_sql` over the user's full cross-client history, no per-client integration. Every command is exit-code-gated for CI.
 
 ## Next
 

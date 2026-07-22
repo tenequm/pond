@@ -10,7 +10,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
-use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
@@ -29,8 +29,8 @@ use pond::{
     },
     transport::{self, AppState},
     wire::{
-        self, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter, SearchEnvelope, SearchFilters,
-        SearchModeWire, SearchRequest, SessionFrom,
+        self, ErrorEnvelope, GetEnvelope, GetMessageRequest, GetSessionRequest, ProjectFilter,
+        SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest, SessionFrom,
     },
 };
 
@@ -98,7 +98,7 @@ impl From<CliSortBy> for wire::SortBy {
 }
 
 /// CLI surface for `pond sql --format`. Maps to `sql::Mode` / `sql::Format`.
-/// Mirrors the MCP `pond_sql_query` `format` arg (text|ndjson|parquet).
+/// Mirrors the MCP `pond_sql` `format` arg (text|ndjson|parquet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSqlFormat {
     Text,
@@ -106,7 +106,7 @@ enum CliSqlFormat {
     Parquet,
 }
 
-/// CLI surface for `pond get --from`. Maps 1:1 to wire `SessionFrom`.
+/// CLI surface for `pond get-session --from`. Maps 1:1 to wire `SessionFrom`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliSessionFrom {
     Start,
@@ -244,7 +244,8 @@ Commands:
 
   Query
     search       Search stored messages
-    get          Fetch a session or message
+    get-session  Read a whole session as a transcript
+    get-message  Expand one message with its full part bodies
     sql          Run one read-only SQL query
     status       Show pond health, data, and adapters
 
@@ -330,10 +331,10 @@ struct StoreArgs {
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
     ///
-    /// Walks through storage, adapters, MCP registration, and an
-    /// optional sync schedule, then writes config.toml in one pass at the
-    /// end. Re-running repairs or updates an existing setup; flags answer
-    /// sections non-interactively.
+    /// Walks through storage, adapters, MCP registration (with the bundled
+    /// agent skill), and an optional sync schedule, then writes config.toml
+    /// in one pass at the end. Re-running repairs or updates an existing
+    /// setup; flags answer sections non-interactively.
     #[command(after_long_help = "Examples:
   pond init                                   interactive setup (or repair)
   pond init --yes                             accept defaults, no prompts
@@ -417,7 +418,7 @@ enum Command {
   pond status                       the one-screen overview
   pond status --hosts               which machines feed this store, and when
   pond status --include-subagents   count each subagent as its own adapter")]
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Status {
         /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
         /// as its own adapter. Default counts only main agents.
@@ -492,61 +493,69 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Fetch a session or message.
+    /// Read a whole session as a transcript.
     ///
-    /// `--session-id` returns the whole session as a conversational transcript
-    /// (user/assistant text + one-line tool/file refs). `--message-id` returns
-    /// that one message with its full parts (tool bodies included) plus
-    /// conversational neighbors. Params are prefixed by scope.
+    /// Returns the session as a conversational transcript (user/assistant
+    /// text + one-line tool/file refs); expand any tool body with `pond
+    /// get-message`. A message id also works: it resolves to its parent
+    /// session with the page anchored at that message.
     #[command(after_long_help = "Examples:
-  pond get --session-id 58a96901-4a4f-40be-a3c1-62419ec8c580
-  pond get --session-id <ID> --session-from end                 most recent messages
-  pond get --session-id <ID> --session-after-message-id <ID>    page down
-  pond get --message-id <ID> --message-context-before 3 --message-context-after 3")]
-    #[command(group(ArgGroup::new("get_selector")
-        .required(true)
-        .args(["session_id", "message_id"])))]
+  pond get-session 58a96901-4a4f-40be-a3c1-62419ec8c580
+  pond get-session <ID> --from end               most recent messages
+  pond get-session <ID> --after-message-id <ID>  page down")]
     #[command(display_order = 11)]
-    Get {
-        /// Fetch an entire session by id. Mutually exclusive with `--message-id`.
-        #[arg(long, value_name = "ID")]
-        session_id: Option<String>,
-        /// Fetch a single message by id (with its full parts). Mutually
-        /// exclusive with `--session-id`.
-        #[arg(long, value_name = "ID")]
-        message_id: Option<String>,
+    GetSession {
+        /// Session id (a message id resolves to its parent session).
+        #[arg(value_name = "ID")]
+        id: String,
         /// Tenant namespace. The personal pond has exactly one; leave at the
         /// default.
         #[arg(long, default_value = "local")]
         namespace: String,
-        /// Session scope: max messages per page.
-        #[arg(long, default_value_t = 20, conflicts_with = "message_id")]
-        session_limit: usize,
-        /// Session scope: which end to read the first page from.
+        /// Max messages per page.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Which end to read the first page from.
         ///
         /// start = oldest first (default); end = most recent, e.g. to recover
         /// context after compaction.
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = CliSessionFrom::Start,
-            conflicts_with = "message_id"
-        )]
-        session_from: CliSessionFrom,
-        /// Session scope: page forward - messages after this id (from a prior
-        /// page's bottom marker).
-        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
-        session_after_message_id: Option<String>,
-        /// Session scope: page backward - messages before this id (from a prior
-        /// page's top marker).
-        #[arg(long, value_name = "ID", conflicts_with = "message_id")]
-        session_before_message_id: Option<String>,
-        /// Message scope: conversational siblings before the target (grep -B).
-        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
-        message_context_before: usize,
-        /// Message scope: conversational siblings after the target (grep -A).
-        #[arg(long, default_value_t = 3, conflicts_with = "session_id")]
-        message_context_after: usize,
+        #[arg(long, value_enum, default_value_t = CliSessionFrom::Start)]
+        from: CliSessionFrom,
+        /// Page forward - messages after this id (from a prior page's bottom
+        /// marker).
+        #[arg(long, value_name = "ID")]
+        after_message_id: Option<String>,
+        /// Page backward - messages before this id (from a prior page's top
+        /// marker).
+        #[arg(long, value_name = "ID")]
+        before_message_id: Option<String>,
+        /// Output format: `text` (readable transcript) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Expand one message with its full part bodies.
+    ///
+    /// Returns the message with its full parts (tool_call / tool_result /
+    /// reasoning bodies included) plus conversational neighbors. For the whole
+    /// session use `pond get-session`.
+    #[command(after_long_help = "Examples:
+  pond get-message <ID>
+  pond get-message <ID> --context-before 5 --context-after 5")]
+    #[command(display_order = 12)]
+    GetMessage {
+        /// Message id.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Tenant namespace. The personal pond has exactly one; leave at the
+        /// default.
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        /// Conversational siblings before the target (grep -B).
+        #[arg(long, default_value_t = 3)]
+        context_before: usize,
+        /// Conversational siblings after the target (grep -A).
+        #[arg(long, default_value_t = 3)]
+        context_after: usize,
         /// Output format: `text` (readable transcript) or `json` (one document).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -555,14 +564,14 @@ enum Command {
     ///
     /// DataFusion / PostgreSQL-compatible SELECT/WITH over the sessions,
     /// messages, and parts tables; writes and side-effecting statements are
-    /// rejected. Same surface as the `pond_sql_query` MCP tool - the MCP
+    /// rejected. Same surface as the `pond_sql` MCP tool - the MCP
     /// resource `schema://pond-sql` documents columns, indexed predicates,
     /// and pagination patterns.
     #[command(after_long_help = "Examples:
   pond sql \"SELECT count(*) FROM sessions\"
   pond sql \"SELECT session_id, ts, role FROM messages WHERE contains_tokens(search_text, 'occ retry') LIMIT 20\"
   pond sql \"SELECT * FROM messages\" --format parquet -o messages.parquet")]
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
@@ -592,7 +601,7 @@ enum Command {
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
         #[arg(long, value_enum, default_value_t = ServeTransport::Http)]
@@ -617,12 +626,13 @@ enum Command {
     /// Serve the MCP tools over stdio (for agent clients).
     ///
     /// Equivalent to `pond serve --transport stdio`. Register once per
-    /// client; the tools are pond_search, pond_get, and pond_sql_query, with
-    /// resources schema://pond, schema://pond-sql, and stats://pond.
+    /// client; the tools are pond_search, pond_get_session, pond_get_message,
+    /// and pond_sql, with resources schema://pond, schema://pond-sql, and
+    /// stats://pond.
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Mcp {},
     /// Manage the automatic sync schedule.
     ///
@@ -730,7 +740,7 @@ enum Command {
   fish:  pond completions fish > ~/.config/fish/completions/pond.fish
 
 Homebrew and nix packages ship these pre-installed.")]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
@@ -739,7 +749,7 @@ Homebrew and nix packages ship these pre-installed.")]
     ///
     /// The same file an agent loads as a skill, emitted to stdout so it stays in
     /// lockstep with the binary (no separate copy to drift).
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Skill,
     /// Keep the lake queryable: embed the backlog, then fold the search indexes.
     ///
@@ -924,10 +934,10 @@ fn parse_project_filter(input: &str) -> Result<ProjectFilter, String> {
     }
 }
 
-/// Output mode for `pond search` and `pond get`. Text is the human default;
-/// Json emits the wire envelope verbatim (including error envelopes), so
-/// scripts can `--format json | jq ...` against the same surface as the HTTP
-/// transport.
+/// Output mode for `pond search` and `pond get-session` / `pond get-message`.
+/// Text is the human default; Json emits the wire envelope verbatim (including
+/// error envelopes), so scripts can `--format json | jq ...` against the same
+/// surface as the HTTP transport.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     Text,
@@ -1398,48 +1408,62 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Get {
-            session_id,
-            message_id,
+        Command::GetSession {
+            id,
             namespace,
-            session_limit,
-            session_from,
-            session_after_message_id,
-            session_before_message_id,
-            message_context_before,
-            message_context_after,
+            limit,
+            from,
+            after_message_id,
+            before_message_id,
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, false).await?;
-            let request = GetRequest {
+            let first_page = after_message_id.is_none() && before_message_id.is_none();
+            let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
-                session_id,
-                message_id,
-                session_limit,
-                session_from: SessionFrom::from(session_from),
-                session_after_message_id,
-                session_before_message_id,
-                message_context_before,
-                message_context_after,
+                id,
+                limit,
+                from: SessionFrom::from(from),
+                after_message_id,
+                before_message_id,
             };
-            let envelope = handlers::pond_get(&store, request.clone()).await;
+            let envelope = handlers::pond_get_session(&store, request).await;
             // Spawn-only subagents are their own sessions (spec.md#datasets);
             // surface them on a session's first page so the CLI matches the MCP
             // transcript. Best-effort: a lookup failure just omits the footer.
             let mut subagents_footer = String::new();
             if let GetEnvelope::Success(response) = &envelope
-                && request.message_id.is_none()
-                && request.session_after_message_id.is_none()
-                && request.session_before_message_id.is_none()
+                && first_page
                 && let Ok(children) = store.child_sessions(&response.session.id).await
                 && !children.is_empty()
             {
                 subagents_footer =
                     pond::render::render_subagents_footer(&children, pond::render::Surface::Cli);
             }
-            if !render_get_envelope(format, &envelope, &request, &subagents_footer)? {
+            if !render_get_envelope(format, &envelope, &subagents_footer)? {
+                std::process::exit(1);
+            }
+        }
+        Command::GetMessage {
+            id,
+            namespace,
+            context_before,
+            context_after,
+            format,
+        } => {
+            let loaded = Config::load(config_path(config))?;
+            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+            let request = GetMessageRequest {
+                protocol_version: PROTOCOL_VERSION,
+                namespace: Some(namespace),
+                id,
+                context_before,
+                context_after,
+            };
+            let envelope = handlers::pond_get_message(&store, request).await;
+            if !render_get_envelope(format, &envelope, "")? {
                 std::process::exit(1);
             }
         }
@@ -5459,7 +5483,7 @@ fn render_search_envelope(
         OutputFormat::Text => match envelope {
             SearchEnvelope::Success(response) => {
                 // One canonical transcript shared with the MCP tool, in CLI
-                // vocabulary (`pond get --message-id`, not `pond_get`).
+                // vocabulary (`pond get-message`, not `pond_get_message`).
                 let transcript = pond::render::render_search_transcript(
                     response,
                     request,
@@ -5479,7 +5503,6 @@ fn render_search_envelope(
 fn render_get_envelope(
     format: OutputFormat,
     envelope: &GetEnvelope,
-    request: &GetRequest,
     subagents_footer: &str,
 ) -> anyhow::Result<bool> {
     match format {
@@ -5492,11 +5515,8 @@ fn render_get_envelope(
         }
         OutputFormat::Text => match envelope {
             GetEnvelope::Success(response) => {
-                let transcript = pond::render::render_get_transcript(
-                    response,
-                    request,
-                    pond::render::Surface::Cli,
-                );
+                let transcript =
+                    pond::render::render_get_transcript(response, pond::render::Surface::Cli);
                 let combined = format!("{transcript}{subagents_footer}");
                 output(combined.trim_end_matches('\n'))?;
                 Ok(true)
@@ -5510,16 +5530,18 @@ fn render_get_envelope(
 }
 
 /// Rewrite the SQL module's canonical (MCP-vocabulary) error text for the CLI.
-/// `pond::sql` is shared with the `pond_sql_query` tool and names the MCP
-/// tools/resources; a terminal user runs `pond sql`/`pond search`/`pond get`
-/// and has no `schema://` resource, so translate those tokens at the boundary.
+/// `pond::sql` is shared with the `pond_sql` tool and names the MCP
+/// tools/resources; a terminal user runs `pond sql`/`pond search`/`pond
+/// get-session` and has no `schema://` resource, so translate those tokens at
+/// the boundary.
 fn sql_error_for_cli(message: &str) -> String {
     message
         .replace("resource schema://pond-sql", "`pond sql --help`")
         .replace("schema://pond-sql", "`pond sql --help`")
-        .replace("pond_sql_query", "`pond sql`")
+        .replace("pond_sql", "`pond sql`")
         .replace("pond_search", "`pond search`")
-        .replace("pond_get", "`pond get`")
+        .replace("pond_get_session", "`pond get-session`")
+        .replace("pond_get_message", "`pond get-message`")
 }
 
 fn render_error_pretty(error: &ErrorEnvelope) {

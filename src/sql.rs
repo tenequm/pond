@@ -1,4 +1,4 @@
-//! `pond_sql_query`: read-only DataFusion SQL over the three Lance tables
+//! `pond_sql`: read-only DataFusion SQL over the three Lance tables
 //! (`sessions` / `messages` / `parts`), registered as `LanceTableProvider`s
 //! (behind plan-time views that rename `id` to `message_id` / `session_id`)
 //! on a fresh per-call `SessionContext`. Read-only is enforced in two layers - a
@@ -98,7 +98,7 @@ impl Format {
     }
 }
 
-/// How `pond_sql_query` returns results.
+/// How `pond_sql` returns results.
 #[derive(Debug, Clone, Copy)]
 pub enum Mode {
     /// Render a row-capped table into the tool result.
@@ -174,7 +174,7 @@ pub async fn run(
     }
     if projection_mentions_vector(parsed.projection_query()) {
         return Err(SqlError::Query(
-            "the `vector` column is not selectable from pond_sql_query (it is a \
+            "the `vector` column is not selectable from pond_sql (it is a \
              FixedSizeList<f32> embedding, ~600 bytes per row and not useful in a result). \
              For semantic search use pond_search. Filtering on it is allowed in WHERE \
              (e.g. `vector IS NOT NULL`)."
@@ -197,8 +197,8 @@ pub async fn run(
              so over parts it will not finish within the time limit. There is no substring \
              index on tool bodies yet (TODO #47: lance v8 FM-Index). Instead match a single \
              field with json_extract(variant_data, '$.field') LIKE '...', scope to one session \
-             with session_id = '<id>' and read it with pond_get, or search conversational text \
-             with contains_tokens(search_text, '...')."
+             with session_id = '<id>' and read it with pond_get_session, or search \
+             conversational text with contains_tokens(search_text, '...')."
                 .to_owned(),
         ));
     }
@@ -234,14 +234,19 @@ pub async fn run(
         .map_err(|_| {
             SqlError::Query(format!(
                 "query exceeded the {}s limit; add a narrower WHERE or a LIMIT, or raise \
-                 the per-query timeout (`timeout_seconds` on pond_sql_query, `--timeout` \
+                 the per-query timeout (`timeout_seconds` on pond_sql, `--timeout` \
                  on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
-                 longer. For tool analytics use the narrow native columns (tool_name, \
+                 longer. On a remote object store, queries over parts cost seconds per \
+                 round-trip - scope by session_id / tool_name, and to reconstruct one \
+                 session use pond_get_session, not SQL. For tool analytics use the \
+                 narrow native columns (tool_name, \
                  call_id, is_failure) instead of json_get_* over variant_data. If you were \
                  substring-scanning variant_data (json_extract + LIKE), there is no \
-                 substring index on tool bodies yet: filter parts by type and tool_name \
-                 first, or search conversational text with \
-                 contains_tokens(search_text, '...') instead.",
+                 substring index on tool bodies yet: scope-then-scan - first collect \
+                 candidate session_ids from the indexed conversational text (WITH hits AS \
+                 (SELECT DISTINCT session_id FROM messages WHERE \
+                 contains_tokens(search_text, '...')), then run the field LIKE only \
+                 against parts JOINed to those session_ids; unscoped body scans time out.",
                 timeout.as_secs()
             ))
         })?
@@ -332,7 +337,7 @@ fn parse_and_gate(sql: &str) -> Result<ParsedStatement, SqlError> {
         .map_err(|error| SqlError::Query(format!("SQL parse error: {error}")))?;
     if statements.len() != 1 {
         return Err(SqlError::Query(
-            "pond_sql_query runs exactly one statement; submit a single SELECT".to_owned(),
+            "pond_sql runs exactly one statement; submit a single SELECT".to_owned(),
         ));
     }
     let Some(front) = statements.front() else {
@@ -361,7 +366,7 @@ fn parse_and_gate(sql: &str) -> Result<ParsedStatement, SqlError> {
 }
 
 fn read_only_rejection() -> SqlError {
-    // Surface-neutral wording: this message reaches both the pond_sql_query
+    // Surface-neutral wording: this message reaches both the pond_sql
     // MCP tool and the `pond sql` CLI, so it names neither.
     SqlError::Query(
         "pond's SQL surface is read-only: only a single SELECT/WITH (or EXPLAIN of one) is \
@@ -1041,12 +1046,14 @@ fn enrich(message: &str) -> String {
              embedding_model, options) | sessions(session_id, parent_session_id, \
              parent_message_id, source_agent, created_at, project, options) | \
              parts(session_id, message_id, id, ordinal, type, provenance, tool_name, \
-             call_id, is_failure, variant_data, options). Part bodies (tool params/results, \
-             text) live in parts.variant_data - \
-             read them with json_extract(variant_data, '$.field'). For text search use \
+             call_id, is_failure, variant_data, options). Part bodies live in \
+             parts.variant_data (JSONB) and nest by part type: tool_call is {call_id, \
+             name, params} - a Bash command is json_extract(variant_data, \
+             '$.params.command') - tool_result is {call_id, name, is_failure, result}, \
+             text/reasoning carry {text}. For text search use \
              contains_tokens(search_text, '...') in WHERE, or the fts('messages', ...) \
-             table function in FROM for ranked results; to read a transcript use pond_get. \
-             Full doc: resource schema://pond-sql.",
+             table function in FROM for ranked results; to read a transcript use \
+             pond_get_session. Full doc: resource schema://pond-sql.",
         ),
         (
             "Encountered non UTF-8 data",
@@ -1134,22 +1141,44 @@ fn is_displayable(data_type: &DataType) -> bool {
     )
 }
 
-/// One physical line per row: embedded newlines in cell values (markdown,
-/// multi-line commands) otherwise explode a row across many table lines that
-/// hard-wrap unreadably in narrow clients. The literal two-char `\n` matches
-/// the JSON escaping agents already read, and keeps row boundaries
-/// unambiguous. Inline table mode only - json and export modes keep raw data.
-fn collapse_newlines(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> {
+/// Per-cell character cap for the inline rendered table. Without it a single
+/// fat cell (tool bodies reach 56KB) defeats the row-halving byte budget in
+/// [`render_inline`] - which cannot drop below one row - and the table
+/// renderer amplifies it ~5x by padding every row to the widest cell.
+/// Measured: one 42KB cell rendered a 214KB response. Export modes
+/// (parquet/ndjson) are never clipped.
+const CELL_CLIP_CHARS: usize = 1_000;
+
+/// Bound each cell for the inline table: clip long values to
+/// [`CELL_CLIP_CHARS`] with a marker naming the unclipped path, and collapse
+/// embedded newlines (markdown, multi-line commands) that otherwise explode a
+/// row across many table lines that hard-wrap unreadably in narrow clients.
+/// The literal two-char `\n` matches the JSON escaping agents already read,
+/// and keeps row boundaries unambiguous. Inline table mode only - json and
+/// export modes keep raw data.
+fn bound_cells(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> {
     fn escape<O: OffsetSizeTrait>(array: &GenericStringArray<O>) -> ArrayRef {
         let escaped: GenericStringArray<O> =
             array.iter().map(|value| value.map(escape_cell)).collect();
         Arc::new(escaped)
     }
     fn escape_cell(text: &str) -> std::borrow::Cow<'_, str> {
-        if text.contains(['\n', '\r']) {
-            std::borrow::Cow::Owned(text.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n"))
+        let clipped = match text.char_indices().nth(CELL_CLIP_CHARS) {
+            Some((cut, _)) => {
+                let omitted = text[cut..].chars().count();
+                std::borrow::Cow::Owned(format!(
+                    "{} [+{omitted} chars - pond_get_message (CLI: pond get-message) on \
+                     this row's message_id renders the full part; or format=ndjson, or a \
+                     narrower json_extract path]",
+                    &text[..cut]
+                ))
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        };
+        if clipped.contains(['\n', '\r']) {
+            std::borrow::Cow::Owned(clipped.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n"))
         } else {
-            std::borrow::Cow::Borrowed(text)
+            clipped
         }
     }
     batches
@@ -1201,7 +1230,7 @@ fn render_inline(
         ));
     }
     let render = |shown: usize| -> Result<String, ArrowError> {
-        let limited = collapse_newlines(&limit_batches(display, shown))?;
+        let limited = bound_cells(&limit_batches(display, shown))?;
         Ok(pretty_format_batches(&limited)?.to_string())
     };
     let mut shown = total.min(max_rows);
@@ -1512,6 +1541,59 @@ mod tests {
         ] {
             assert!(!jsonb_fulldoc_like_scan(sql), "should allow: {sql}");
         }
+    }
+
+    #[test]
+    fn render_inline_clips_fat_cells() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        let fat = "x".repeat(42_000);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(
+            out.len() < INLINE_BUDGET_BYTES,
+            "one fat cell stays within the inline budget: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains(
+                "[+41000 chars - pond_get_message (CLI: pond get-message) on this row's message_id"
+            ),
+            "clip marker names the omitted count and the full path: {out}"
+        );
+    }
+
+    #[test]
+    fn cell_clip_respects_multibyte_boundaries_and_collapses_newlines() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        // Multibyte chars around the cut plus embedded newlines in the kept
+        // prefix: the clip must cut on a char boundary and still collapse.
+        let fat = format!("é\ný{}", "λ".repeat(2_000));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(
+            out.contains("é\\ný") && out.contains("[+1003 chars"),
+            "char-boundary clip with newline collapse: {out}"
+        );
+        // Short cells are untouched.
+        let exactly_cap = "a".repeat(CELL_CLIP_CHARS);
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(
+                exactly_cap.as_str(),
+            )]))],
+        )
+        .expect("single-column batch");
+        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        assert!(!out.contains("chars -"), "cap-sized cell not clipped");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! `pond init`: the idempotent setup-and-repair wizard.
 //!
-//! One pass over four sections - storage, adapters, MCP registration, sync
-//! schedule - then a single `config.toml` write at the end. Every section is
+//! One pass over four sections - storage, adapters, MCP registration (which
+//! also installs the bundled agent skill), sync schedule - then a single
+//! `config.toml` write at the end. Every section is
 //! answerable by a flag for non-interactive use; re-running against an
 //! existing setup proposes only what would change. Bin-only module: the
 //! wizard is a CLI surface, not library behavior.
@@ -29,7 +30,7 @@ pub(crate) struct InitArgs {
     /// Register `pond sync` on a schedule. Opt-in: `--yes` alone never schedules.
     #[arg(long = "every", value_enum, value_name = "EVERY")]
     schedule: Option<ScheduleEvery>,
-    /// Skip MCP registration.
+    /// Skip MCP registration and the skill install.
     #[arg(long)]
     skip_mcp: bool,
     /// Accept defaults for everything not covered by a flag (non-interactive).
@@ -833,10 +834,10 @@ fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<
     wiz(picker.interact())
 }
 
-/// Detect agent CLIs and offer MCP registration. claude has an idempotent
-/// CLI surface (`mcp get` / `mcp add`), so pond drives it directly; codex
-/// gets the exact command to run instead - pond never edits another tool's
-/// config files behind the user's back.
+/// Detect agent CLIs and offer MCP registration plus the bundled skill.
+/// claude has an idempotent CLI surface (`mcp get` / `mcp add`), so pond
+/// drives it directly; codex gets the exact command to run instead - pond
+/// never edits another tool's config files behind the user's back.
 fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
     let claude = crate::find_on_path("claude");
     let codex = crate::find_on_path("codex");
@@ -854,15 +855,18 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
+        // One consent covers registration and the skill; a fresh install
+        // that says yes here is not asked again for the skill write.
+        let mut skill_consented = false;
         if registered {
             cliclack::log::success("mcp: pond is already registered in Claude Code")?;
         } else {
             let add = if prompts {
-                wiz(
-                    cliclack::confirm("Register pond as an MCP server in Claude Code?")
-                        .initial_value(true)
-                        .interact(),
-                )?
+                wiz(cliclack::confirm(
+                    "Register pond in Claude Code (MCP server + the pond skill)?",
+                )
+                .initial_value(true)
+                .interact())?
             } else {
                 auto
             };
@@ -880,11 +884,15 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
                         String::from_utf8_lossy(&output.stderr).trim(),
                     ))?;
                 }
+                skill_consented = true;
             } else {
                 cliclack::log::info(
                     "mcp: skipped - register later with `claude mcp add -s user pond -- pond mcp`",
                 )?;
             }
+        }
+        if registered || skill_consented {
+            skill_section(prompts, auto, skill_consented)?;
         }
     }
     if codex.is_some() {
@@ -893,6 +901,70 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
             "register pond manually:\n  codex mcp add pond -- pond mcp",
         )?;
     }
+    Ok(())
+}
+
+/// The skill pond installs for Claude Code, embedded so the installed copy
+/// always matches the running binary (the same bytes `pond skill` prints).
+const SKILL_MD: &str = include_str!("../SKILL.md");
+
+const SKILL_DISPLAY_PATH: &str = "~/.claude/skills/pond/SKILL.md";
+
+/// Sync the bundled skill into Claude Code's user skills dir.
+fn skill_section(prompts: bool, auto: bool, consented: bool) -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        cliclack::log::info(format!(
+            "skill: HOME not set - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
+        ))?;
+        return Ok(());
+    };
+    let path = home
+        .join(".claude")
+        .join("skills")
+        .join("pond")
+        .join("SKILL.md");
+    skill_sync(&path, prompts, auto, consented)
+}
+
+/// Three states: current (no-op), absent (install), differs (an older pond's
+/// copy or a user edit - overwriting is asked about explicitly in prompt
+/// mode, even when the combined registration consent already said yes).
+fn skill_sync(path: &Path, prompts: bool, auto: bool, consented: bool) -> Result<()> {
+    let existing = std::fs::read_to_string(path).ok();
+    let (question, done) = match existing.as_deref() {
+        Some(current) if current == SKILL_MD => {
+            cliclack::log::success(format!("skill: up to date ({SKILL_DISPLAY_PATH})"))?;
+            return Ok(());
+        }
+        Some(_) => (
+            format!("Update the pond skill? ({SKILL_DISPLAY_PATH} differs from this pond version)"),
+            "skill: updated",
+        ),
+        None => (
+            format!("Install the pond skill for Claude Code? ({SKILL_DISPLAY_PATH})"),
+            "skill: installed",
+        ),
+    };
+    let write = if prompts && (existing.is_some() || !consented) {
+        wiz(cliclack::confirm(question).initial_value(true).interact())?
+    } else if prompts {
+        true
+    } else {
+        auto || consented
+    };
+    if !write {
+        cliclack::log::info(format!(
+            "skill: skipped - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
+        ))?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(path, SKILL_MD)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    cliclack::log::success(format!("{done} ({SKILL_DISPLAY_PATH})"))?;
     Ok(())
 }
 
@@ -1075,6 +1147,38 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn skill_sync_installs_updates_and_respects_declines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skills").join("pond").join("SKILL.md");
+
+        // Absent + non-interactive without consent: nothing written.
+        skill_sync(&path, false, false, false).unwrap();
+        assert!(!path.exists());
+
+        // Absent + --yes: installed with the bundled bytes.
+        skill_sync(&path, false, true, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+
+        // Current: idempotent no-op.
+        skill_sync(&path, false, true, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+
+        // Differs (user edit) + non-interactive without consent: preserved.
+        std::fs::write(&path, "user edit").unwrap();
+        skill_sync(&path, false, false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edit");
+
+        // Differs + --yes: refreshed to the bundled version.
+        skill_sync(&path, false, true, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+
+        // Absent + combined-registration consent: installed without --yes.
+        std::fs::remove_file(&path).unwrap();
+        skill_sync(&path, false, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+    }
 
     #[test]
     fn legacy_rewrite_moves_keys_and_prefills_the_url() {

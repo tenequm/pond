@@ -9,7 +9,7 @@ pond <command> --help   # full flags for any command
 ```
 
 ## Setup
-- `pond init` - guided setup-and-repair: storage, adapters, MCP, schedule
+- `pond init` - guided setup-and-repair: storage, adapters, MCP + agent skill, schedule
 - `pond adapters list|discover|enable|disable` - manage which adapters sync ingests
 - `pond storage check|use` - probe a destination; switch the active store
 - `pond creds add|list|delete` - manage URL-scoped credential sets
@@ -23,7 +23,8 @@ pond <command> --help   # full flags for any command
 
 ## Query
 - `pond search <query>` - search (`--mode vector|fts`, `--sort-by relevance|recency`); `--explain` for the query plan
-- `pond get <--session-id|--message-id>` - fetch a session or message
+- `pond get-session <ID>` - fetch a session
+- `pond get-message <ID>` - fetch a message
 - `pond sql <query>` - one read-only SQL query over the corpus
 - `pond status` - health, row counts, embedding coverage, schedule state; `--hosts` fleet view, `--include-subagents` count subagents separately
 

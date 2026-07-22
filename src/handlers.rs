@@ -773,8 +773,8 @@ mod get_handler {
     use crate::{
         sessions::{GetLookup, MessageViewParams, RetrievedMessage, SessionViewParams, Store},
         wire::{
-            GetEnvelope, GetRequest, GetResponse, GetResult, GetSession, MessageView, PartSummary,
-            ResponsePart, validate_protocol,
+            GetEnvelope, GetMessageRequest, GetResponse, GetResult, GetSession, GetSessionRequest,
+            MessageView, PartSummary, ResponsePart, validate_protocol,
         },
     };
 
@@ -807,29 +807,27 @@ mod get_handler {
     /// `target_parts_remaining` (message) then signal pagination.
     const BUDGET_BYTES: usize = 200_000;
 
-    pub async fn pond_get(store: &Store, request: GetRequest) -> GetEnvelope {
+    pub async fn pond_get_session(store: &Store, request: GetSessionRequest) -> GetEnvelope {
         if let Err(error) = validate_protocol(request.protocol_version) {
             return GetEnvelope::Error(error);
         }
         if let Err(envelope) = super::resolve_namespace(request.namespace.as_deref()) {
             return GetEnvelope::Error(envelope);
         }
+        match session_result(store, &request).await {
+            Ok(response) => GetEnvelope::Success(response),
+            Err(error) => GetEnvelope::Error(error),
+        }
+    }
 
-        let response = match (&request.session_id, &request.message_id) {
-            (Some(session_id), None) => session_result(store, session_id, &request).await,
-            (None, Some(message_id)) => message_result(store, message_id, &request).await,
-            (Some(_), Some(_)) => Err(map_error(crate::Error::validation_field(
-                "session_id and message_id are mutually exclusive",
-                "message_id",
-                request.message_id.clone().map(serde_json::Value::String),
-                Some("omit when session_id is present".to_owned()),
-            ))),
-            (None, None) => Err(map_error(crate::Error::validation(
-                "one of session_id or message_id is required",
-            ))),
-        };
-
-        match response {
+    pub async fn pond_get_message(store: &Store, request: GetMessageRequest) -> GetEnvelope {
+        if let Err(error) = validate_protocol(request.protocol_version) {
+            return GetEnvelope::Error(error);
+        }
+        if let Err(envelope) = super::resolve_namespace(request.namespace.as_deref()) {
+            return GetEnvelope::Error(envelope);
+        }
+        match message_result(store, &request).await {
             Ok(response) => GetEnvelope::Success(response),
             Err(error) => GetEnvelope::Error(error),
         }
@@ -848,70 +846,106 @@ mod get_handler {
 
     async fn session_result(
         store: &Store,
-        session_id: &str,
-        request: &GetRequest,
+        request: &GetSessionRequest,
     ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
-        if request.session_after_message_id.is_some() && request.session_before_message_id.is_some()
-        {
+        if request.after_message_id.is_some() && request.before_message_id.is_some() {
             return Err(map_error(crate::Error::validation_field(
-                "session_after_message_id and session_before_message_id are mutually exclusive",
-                "session_before_message_id",
+                "after_message_id and before_message_id are mutually exclusive",
+                "before_message_id",
                 request
-                    .session_before_message_id
+                    .before_message_id
                     .clone()
                     .map(serde_json::Value::String),
                 Some("set only one pagination anchor".to_owned()),
             )));
         }
         let params = SessionViewParams {
-            after_message_id: request.session_after_message_id.as_deref(),
-            before_message_id: request.session_before_message_id.as_deref(),
-            limit: request.session_limit,
+            at_message_id: None,
+            after_message_id: request.after_message_id.as_deref(),
+            before_message_id: request.before_message_id.as_deref(),
+            limit: request.limit,
             budget_bytes: BUDGET_BYTES,
-            session_from: request.session_from,
+            session_from: request.from,
         };
-        let view = match store
-            .session_view(session_id, params)
+        let (session_id, resolved_from) = match store
+            .session_view(&request.id, params.clone())
             .await
             .map_err(map_storage)?
         {
             GetLookup::NotFound => {
-                return Err(map_error(crate::Error::not_found(
-                    "session",
-                    serde_json::json!(session_id),
-                    format!("session not found: {session_id}"),
-                )));
+                // The id may be a message id: resolve it up to its parent
+                // session (intent is unambiguous - the caller asked for a
+                // session) and anchor the page at that message.
+                match store
+                    .session_id_for_message(&request.id)
+                    .await
+                    .map_err(map_storage)?
+                {
+                    Some(session_id) => (session_id, Some(request.id.clone())),
+                    None => {
+                        return Err(map_error(crate::Error::not_found(
+                            "session",
+                            serde_json::json!(request.id),
+                            format!(
+                                "session not found: {} (not a message id either)",
+                                request.id
+                            ),
+                        )));
+                    }
+                }
             }
             GetLookup::UnknownAnchor => {
-                let (field, value) = match &request.session_after_message_id {
-                    Some(value) => ("session_after_message_id", Some(value.as_str())),
-                    None => (
-                        "session_before_message_id",
-                        request.session_before_message_id.as_deref(),
-                    ),
+                let (field, value) = match &request.after_message_id {
+                    Some(value) => ("after_message_id", Some(value.as_str())),
+                    None => ("before_message_id", request.before_message_id.as_deref()),
                 };
                 return Err(unknown_anchor(field, value));
             }
-            GetLookup::Found(view) => view,
+            GetLookup::Found(view) => {
+                return Ok(session_response(view, None));
+            }
         };
-        Ok(GetResponse {
+        let anchored = SessionViewParams {
+            at_message_id: resolved_from.as_deref(),
+            ..params
+        };
+        match store
+            .session_view(&session_id, anchored)
+            .await
+            .map_err(map_storage)?
+        {
+            GetLookup::Found(view) => Ok(session_response(view, resolved_from)),
+            // The parent session of a stored message always exists; anchor
+            // misses degrade inside session_view, never to UnknownAnchor.
+            GetLookup::NotFound | GetLookup::UnknownAnchor => Err(map_error(
+                crate::Error::internal("resolved parent session lookup failed"),
+            )),
+        }
+    }
+
+    fn session_response(
+        view: crate::sessions::SessionPage,
+        resolved_from_message_id: Option<String>,
+    ) -> GetResponse {
+        GetResponse {
             session: GetSession::from_session(&view.session),
             result: GetResult::Session {
                 messages: view.messages.into_iter().map(to_message_view).collect(),
                 before_remaining: view.before_remaining,
                 after_remaining: view.after_remaining,
+                resolved_from_message_id,
             },
-        })
+        }
     }
 
     async fn message_result(
         store: &Store,
-        message_id: &str,
-        request: &GetRequest,
+        request: &GetMessageRequest,
     ) -> Result<GetResponse, crate::wire::ErrorEnvelope> {
+        let message_id = &request.id;
         let params = MessageViewParams {
-            context_before: request.message_context_before,
-            context_after: request.message_context_after,
+            context_before: request.context_before,
+            context_after: request.context_after,
             budget_bytes: BUDGET_BYTES,
         };
         let view = match store
@@ -920,6 +954,25 @@ mod get_handler {
             .map_err(map_storage)?
         {
             GetLookup::NotFound => {
+                // A session id cannot resolve to one message (which one?), so
+                // teach at the failure point instead of resolving.
+                if store
+                    .find_session(message_id)
+                    .await
+                    .map_err(map_storage)?
+                    .is_some()
+                {
+                    return Err(map_error(crate::Error::validation_field(
+                        format!(
+                            "{message_id} is a session id, not a message id - read it with \
+                             pond_get_session (CLI: pond get-session), or pass a message id \
+                             from its transcript"
+                        ),
+                        "id",
+                        Some(serde_json::Value::String(message_id.clone())),
+                        Some("a message id from a search hit or transcript".to_owned()),
+                    )));
+                }
                 return Err(map_error(crate::Error::not_found(
                     "message",
                     serde_json::json!(message_id),
@@ -955,12 +1008,14 @@ mod get_handler {
                     .collect(),
                 target_parts_remaining: view.target_parts_remaining,
                 siblings: view.siblings.into_iter().map(to_message_view).collect(),
+                context_before: request.context_before,
+                context_after: request.context_after,
             },
         })
     }
 }
 
-pub use get_handler::pond_get;
+pub use get_handler::{pond_get_message, pond_get_session};
 
 mod search_handler {
     //! The `pond_search` handler: single-arm retrieval at message granularity -
@@ -1017,7 +1072,7 @@ mod search_handler {
     const LIMIT_CAP: usize = 200;
     /// Centered query-windowed body returned on every hit (spec.md#search).
     /// Calibrated for the agent-context budget: ~600 code points fits a typical
-    /// match site without crowding the 10k-token `pond_get` page.
+    /// match site without crowding the 10k-token `pond_get_session` page.
     const HIT_SNIPPET_CHARS: usize = 600;
 
     /// Recency tiebreaker for `vector` + `relevance` ordering (spec.md#search):
@@ -1395,7 +1450,7 @@ mod search_handler {
     /// Build a hit's `text` payload (spec.md#search): the message body when
     /// it fits within the snippet window, otherwise a query-windowed slice
     /// centered on the first informative term. Bounded for the agent-context
-    /// budget; callers fetch the full body via `pond_get`.
+    /// budget; callers fetch the full body via `pond_get_message`.
     pub fn hit_payload(text: &str, query: &str) -> String {
         let chars_len = text.chars().count();
         if chars_len <= HIT_SNIPPET_CHARS {
@@ -1447,7 +1502,7 @@ mod search_handler {
         let start = end.saturating_sub(HIT_SNIPPET_CHARS);
         // Truncation markers carry the omitted-char counts so the reader knows
         // this is a windowed slice and roughly how much it's missing. The fetch
-        // verb is left to the transcript's key line (surface-specific: `pond_get`
+        // verb is left to the transcript's key line (surface-specific: `pond_get_message`
         // for MCP, `pond get --message-id` for the CLI); naming it here would be
         // redundant and wrong on one surface.
         let mut snippet = String::new();
@@ -1803,7 +1858,7 @@ mod search_handler {
     /// spec.md#search: subagents are excluded from `pond_search` results -
     /// always, except when the caller scopes to one `session_id` (which may
     /// itself be a subagent session, so the exclusion would fight the filter).
-    /// Subagents are reachable only via `pond_sql_query` (`parent_session_id`).
+    /// Subagents are reachable only via `pond_sql` (`parent_session_id`).
     pub fn default_excludes_subagents(filters: &SearchFilters) -> bool {
         filters.session_id.is_none()
     }
@@ -2108,8 +2163,8 @@ mod get_tests {
 
     use crate::sessions::Store;
     use crate::wire::{
-        GetEnvelope, GetRequest, GetResult, IngestEnvelope, IngestRequest, Message, Part, PartKind,
-        Provenance, ProviderOptions, Session, SessionFrom,
+        GetEnvelope, GetResult, GetSessionRequest, IngestEnvelope, IngestRequest, Message, Part,
+        PartKind, Provenance, ProviderOptions, Session, SessionFrom,
     };
     use chrono::{TimeZone, Utc};
     use tempfile::TempDir;
@@ -2157,10 +2212,10 @@ mod get_tests {
         }
     }
 
-    /// `pond_get` session scope paginates over the response byte budget: a
-    /// session whose `search_text` exceeds the budget reports `after_remaining
-    /// > 0`, and re-requesting with `session_after_message_id` set to the last
-    /// returned id surfaces the rest, disjoint from the first page.
+    /// `pond_get_session` paginates over the response byte budget: a session
+    /// whose `search_text` exceeds the budget reports `after_remaining > 0`,
+    /// and re-requesting with `after_message_id` set to the last returned id
+    /// surfaces the rest, disjoint from the first page.
     #[tokio::test(flavor = "multi_thread")]
     async fn pond_get_paginates_session_via_after_message_id() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -2193,20 +2248,18 @@ mod get_tests {
         }
         ingest(&store, events).await;
 
-        let page_request = |after: Option<String>| GetRequest {
+        let page_request = |after: Option<String>| GetSessionRequest {
             protocol_version: crate::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
-            session_id: Some(session_id.to_owned()),
-            message_id: None,
-            session_limit: 1000,
-            session_from: SessionFrom::Start,
-            session_after_message_id: after,
-            session_before_message_id: None,
-            message_context_before: 3,
-            message_context_after: 3,
+            id: session_id.to_owned(),
+            limit: 1000,
+            from: SessionFrom::Start,
+            after_message_id: after,
+            before_message_id: None,
         };
 
-        let GetEnvelope::Success(first) = super::pond_get(&store, page_request(None)).await else {
+        let GetEnvelope::Success(first) = super::pond_get_session(&store, page_request(None)).await
+        else {
             panic!("first page must succeed");
         };
         let GetResult::Session {
@@ -2220,7 +2273,8 @@ mod get_tests {
         assert!(after_remaining > 0, "long corpus must trip the page budget");
         let after = first_messages.last().expect("non-empty page").id.clone();
 
-        let GetEnvelope::Success(second) = super::pond_get(&store, page_request(Some(after))).await
+        let GetEnvelope::Success(second) =
+            super::pond_get_session(&store, page_request(Some(after))).await
         else {
             panic!("continuation page must succeed");
         };
@@ -2241,15 +2295,15 @@ mod get_tests {
             second_messages
                 .iter()
                 .all(|m| !first_ids.contains(m.id.as_str())),
-            "session_after_message_id pages must be disjoint"
+            "after_message_id pages must be disjoint"
         );
         Ok(())
     }
 
-    /// `pond_get(session_from = "end")` returns the newest `session_limit`
-    /// messages chronologically (the compaction-recovery path) with the older
-    /// messages reported as `before_remaining`; `start` returns the oldest with
-    /// the newer ones as `after_remaining`. The two are disjoint ends.
+    /// `pond_get_session(from = "end")` returns the newest `limit` messages
+    /// chronologically (the compaction-recovery path) with the older messages
+    /// reported as `before_remaining`; `start` returns the oldest with the
+    /// newer ones as `after_remaining`. The two are disjoint ends.
     #[tokio::test(flavor = "multi_thread")]
     async fn pond_get_session_from_end_returns_the_recent_tail() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -2277,17 +2331,14 @@ mod get_tests {
         }
         ingest(&store, events).await;
 
-        let request = |from: SessionFrom| GetRequest {
+        let request = |from: SessionFrom| GetSessionRequest {
             protocol_version: crate::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
-            session_id: Some(session_id.to_owned()),
-            message_id: None,
-            session_limit: 2,
-            session_from: from,
-            session_after_message_id: None,
-            session_before_message_id: None,
-            message_context_before: 3,
-            message_context_after: 3,
+            id: session_id.to_owned(),
+            limit: 2,
+            from,
+            after_message_id: None,
+            before_message_id: None,
         };
         let page = |envelope: GetEnvelope| -> (Vec<String>, usize, usize) {
             let GetEnvelope::Success(response) = envelope else {
@@ -2297,6 +2348,7 @@ mod get_tests {
                 messages,
                 before_remaining,
                 after_remaining,
+                ..
             } = response.result
             else {
                 panic!("session-scope result expected");
@@ -2309,7 +2361,7 @@ mod get_tests {
         };
 
         let (end_ids, end_before, _) =
-            page(super::pond_get(&store, request(SessionFrom::End)).await);
+            page(super::pond_get_session(&store, request(SessionFrom::End)).await);
         assert_eq!(
             end_ids,
             ["tail-msg-3", "tail-msg-4"],
@@ -2318,13 +2370,94 @@ mod get_tests {
         assert_eq!(end_before, 3, "three older messages precede the tail");
 
         let (start_ids, _, start_after) =
-            page(super::pond_get(&store, request(SessionFrom::Start)).await);
+            page(super::pond_get_session(&store, request(SessionFrom::Start)).await);
         assert_eq!(
             start_ids,
             ["tail-msg-0", "tail-msg-1"],
             "start returns the oldest two"
         );
         assert_eq!(start_after, 3, "three newer messages follow the head");
+        Ok(())
+    }
+
+    /// The id-misuse paths: `pond_get_session` given a message id resolves up
+    /// to the parent session with the page anchored at that message and the
+    /// resolution recorded; `pond_get_message` given a session id rejects with
+    /// a hint naming `pond_get_session` (a session cannot pick one message).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_session_resolves_message_id_and_get_message_rejects_session_id()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session_id = "resolve-session";
+
+        let mut events = vec![super::IngestEvent::Session(session(
+            session_id,
+            "pond-resolve",
+        ))];
+        for index in 0..4u32 {
+            let message_id = format!("resolve-msg-{index}");
+            events.push(super::IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: session_id.to_owned(),
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, index + 1, 0).unwrap(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(super::IngestEvent::Part(text_part(
+                session_id,
+                &message_id,
+                &format!("resolve-part-{index}"),
+                &format!("message {index}"),
+            )));
+        }
+        ingest(&store, events).await;
+
+        let by_message = GetSessionRequest {
+            protocol_version: crate::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            id: "resolve-msg-2".to_owned(),
+            limit: 20,
+            from: SessionFrom::Start,
+            after_message_id: None,
+            before_message_id: None,
+        };
+        let GetEnvelope::Success(response) = super::pond_get_session(&store, by_message).await
+        else {
+            panic!("message id must resolve to its parent session");
+        };
+        assert_eq!(response.session.id, session_id);
+        let GetResult::Session {
+            messages,
+            before_remaining,
+            resolved_from_message_id,
+            ..
+        } = response.result
+        else {
+            panic!("session-scope result expected");
+        };
+        assert_eq!(resolved_from_message_id.as_deref(), Some("resolve-msg-2"));
+        assert_eq!(
+            messages.first().map(|m| m.id.as_str()),
+            Some("resolve-msg-2"),
+            "the page is anchored at the resolved message (inclusive)"
+        );
+        assert_eq!(before_remaining, 2, "the two earlier messages page up");
+
+        let by_session = crate::wire::GetMessageRequest {
+            protocol_version: crate::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            id: session_id.to_owned(),
+            context_before: 3,
+            context_after: 3,
+        };
+        let GetEnvelope::Error(error) = super::pond_get_message(&store, by_session).await else {
+            panic!("a session id must not resolve to one message");
+        };
+        assert!(
+            error.error.message.contains("pond_get_session"),
+            "the rejection teaches the session read: {}",
+            error.error.message
+        );
         Ok(())
     }
 }

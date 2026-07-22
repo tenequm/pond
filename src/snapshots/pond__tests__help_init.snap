@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Set up pond (idempotent: safe to re-run).
 
-Walks through storage, adapters, MCP registration, and an optional sync schedule, then writes config.toml in one pass at the end. Re-running repairs or updates an existing setup; flags answer sections non-interactively.
+Walks through storage, adapters, MCP registration (with the bundled agent skill), and an optional sync schedule, then writes config.toml in one pass at the end. Re-running repairs or updates an existing setup; flags answer sections non-interactively.
 
 Usage: pond init [OPTIONS]
 
@@ -18,7 +18,7 @@ Options:
           [possible values: 5m, 15m, 1h, 6h, 1d]
 
       --skip-mcp
-          Skip MCP registration
+          Skip MCP registration and the skill install
 
   -y, --yes
           Accept defaults for everything not covered by a flag (non-interactive)

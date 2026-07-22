@@ -61,7 +61,7 @@ anyhow = "1.0.102"
 # Lock-free read of the loaded `RowKeyMap` on the hot search path; replaced
 # atomically when `ensure_rowmap` rebuilds. Already in the tree via lance.
 arc-swap = "1"
-# ndjson export writer for `pond_sql_query` (already in the tree via the arrow
+# ndjson export writer for `pond_sql` (already in the tree via the arrow
 # stack; named directly here for the `LineDelimitedWriter`).
 arrow-json = "58.3"
 # Already in the tree via the arrow stack; named directly for
@@ -113,7 +113,7 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
 lance = { version = "8.0.0", features = ["protoc"] }
 lance-arrow = "8.0.0"
-# `pond_sql_query` registers lance's JSON / contains_tokens UDFs on the SQL
+# `pond_sql` registers lance's JSON / contains_tokens UDFs on the SQL
 # SessionContext via `lance_datafusion::udf::register_functions`. Already in
 # the tree transitively; named here to reach that one function.
 lance-datafusion = "8.0.0"
@@ -138,7 +138,7 @@ memmap2 = "0.9"
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
 object_store = { version = "0.13", default-features = false }
-# Parquet export writer for `pond_sql_query`. The only genuinely new compiled
+# Parquet export writer for `pond_sql`. The only genuinely new compiled
 # crate the SQL tool adds (lance reads/writes its own format, not parquet).
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }

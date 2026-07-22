@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
-//! `POST /v1/search` and `POST /v1/get`
+//! `POST /v1/search`, `POST /v1/get-session`, and `POST /v1/get-message`
 //! are thin adapters over the shared wire handlers. The router is driven via
 //! `tower::ServiceExt::oneshot` - no socket bind, no HTTP client dependency.
 
@@ -128,11 +128,11 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
         "search should succeed over the fixture corpus",
     );
 
-    // POST /v1/get round-trips a full session by id.
+    // POST /v1/get-session round-trips a full session by id.
     let (status, _headers, body) = post(
         &app,
-        "/v1/get",
-        &json!({ "protocol_version": PROTOCOL_VERSION, "session_id": session_id }),
+        "/v1/get-session",
+        &json!({ "protocol_version": PROTOCOL_VERSION, "id": session_id }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -150,7 +150,13 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> {
-    let (_temp, _store, app) = router().await?;
+    let (_temp, store, app) = router().await?;
+    let session_id = store
+        .session_ids()
+        .await?
+        .into_iter()
+        .find(|id| !id.contains('/'))
+        .expect("the fixture corpus has at least one session");
 
     // version_unsupported -> 400.
     let (status, headers, body) = post(
@@ -166,11 +172,17 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     };
     assert_eq!(error.error.code, ErrorCode::VersionUnsupported);
 
-    // validation_failed -> 400 (get with neither session_id nor message_id).
+    // validation_failed -> 400 (after_message_id and before_message_id are
+    // mutually exclusive pagination anchors).
     let (status, _headers, body) = post(
         &app,
-        "/v1/get",
-        &json!({ "protocol_version": PROTOCOL_VERSION }),
+        "/v1/get-session",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": session_id,
+            "after_message_id": "does-not-exist",
+            "before_message_id": "also-does-not-exist",
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -182,8 +194,8 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     // not_found -> 404.
     let (status, _headers, body) = post(
         &app,
-        "/v1/get",
-        &json!({ "protocol_version": PROTOCOL_VERSION, "session_id": "does-not-exist" }),
+        "/v1/get-session",
+        &json!({ "protocol_version": PROTOCOL_VERSION, "id": "does-not-exist" }),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Serve the MCP tools over stdio (for agent clients).
 
-Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get, and pond_sql_query, with resources schema://pond, schema://pond-sql, and stats://pond.
+Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get_session, pond_get_message, and pond_sql, with resources schema://pond, schema://pond-sql, and stats://pond.
 
 Usage: pond mcp [OPTIONS]
 
