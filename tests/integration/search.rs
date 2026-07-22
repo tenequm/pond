@@ -644,3 +644,141 @@ async fn fts_search_covers_the_unindexed_tail() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// spec.md#search subagent exclusion covers BOTH shapes: claude-code composite
+/// ids (`<parent>/agent-x`, caught pre-hydration by `retain_non_subagents`) and
+/// openclaw plain-id subagents whose subagent-ness lives only in a `/`-subpath
+/// `source_agent` (caught at the hydrated-meta stage). A root `source_agent`
+/// keeps the exclusion; naming the subpath opts in.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_agent_subpath_exclusion_covers_plain_id_openclaw_subagents() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
+
+    let marker = "narwhalescope";
+    // An openclaw main session, its plain-id subagent (subagent-ness only in
+    // source_agent), and a claude-code composite-id subagent (subagent-ness in
+    // the id). Each carries the distinctive marker in one user message.
+    let sessions = [
+        ("01OPENCLAWMAIN000000000000", "openclaw"),
+        ("01OPENCLAWSUBAGENT00000000", "openclaw/subagent"),
+        ("01CCPARENT0000/agent-child", "claude-code/general-purpose"),
+    ];
+    let mut events = Vec::new();
+    for (idx, (sid, agent)) in sessions.iter().enumerate() {
+        let mid = format!("m-{idx}");
+        events.push(IngestEvent::Session(Session {
+            id: (*sid).to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: (*agent).to_owned(),
+            created_at: Utc::now(),
+            project: pond::adapter::extract_str(&serde_json::json!({"x": "/tmp/oc"}), "x").unwrap(),
+            options: ProviderOptions::new(),
+        }));
+        events.push(IngestEvent::Message(Message::User {
+            id: mid.clone(),
+            session_id: (*sid).to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        }));
+        events.push(IngestEvent::Part(Part {
+            session_id: (*sid).to_owned(),
+            id: format!("{mid}:0000"),
+            message_id: mid.clone(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::Text {
+                text: pond::adapter::extract_str(
+                    &serde_json::json!({"x": format!("the {marker} surfaced today")}),
+                    "x",
+                ),
+            },
+        }));
+    }
+    pond::handlers::ingest_events(&store, events).await?;
+
+    let fts = |filters: SearchFilters| SearchRequest {
+        mode: SearchModeWire::Fts,
+        filters,
+        ..search_request(marker)
+    };
+    let success = |envelope: SearchEnvelope| match envelope {
+        SearchEnvelope::Success(response) => response,
+        SearchEnvelope::Error(error) => panic!("search failed: {error:?}"),
+    };
+    let session_ids = |envelope: SearchEnvelope| -> Vec<String> {
+        hits_of(envelope)
+            .into_iter()
+            .map(|h| h.session_id)
+            .collect()
+    };
+
+    // Default: both subagent shapes excluded; only the openclaw main survives.
+    // matched_total drops the meta-excluded subagent too (mirror of the id-based
+    // retain's drop-before-count), so it is not inflated.
+    let default = success(
+        pond_search(
+            &store,
+            &embedder,
+            fts(SearchFilters::default()),
+            &search_config(),
+        )
+        .await,
+    );
+    assert_eq!(
+        default
+            .sessions
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["01OPENCLAWMAIN000000000000".to_owned()],
+        "default excludes both subagent shapes",
+    );
+    assert_eq!(
+        default.matched_total, 1,
+        "meta-excluded subagent must not inflate matched_total",
+    );
+
+    // Explicit subpath filter returns the plain-id openclaw subagent.
+    let got = session_ids(
+        pond_search(
+            &store,
+            &embedder,
+            fts(SearchFilters {
+                source_agent: Some("openclaw/subagent".to_owned()),
+                ..SearchFilters::default()
+            }),
+            &search_config(),
+        )
+        .await,
+    );
+    assert_eq!(
+        got,
+        vec!["01OPENCLAWSUBAGENT00000000".to_owned()],
+        "subpath filter reaches the subagent it names",
+    );
+
+    // Root value keeps the exclusion: the SQL subpath arm matches the subagent
+    // row, but the meta-stage check drops it - only the main session returns.
+    let got = session_ids(
+        pond_search(
+            &store,
+            &embedder,
+            fts(SearchFilters {
+                source_agent: Some("openclaw".to_owned()),
+                ..SearchFilters::default()
+            }),
+            &search_config(),
+        )
+        .await,
+    );
+    assert_eq!(
+        got,
+        vec!["01OPENCLAWMAIN000000000000".to_owned()],
+        "root value stays main-sessions-only",
+    );
+
+    Ok(())
+}

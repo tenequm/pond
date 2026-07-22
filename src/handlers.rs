@@ -1180,7 +1180,7 @@ mod search_handler {
         // top-`limit` sessions' candidates, not the full arm pool (~150). No
         // per-session cap: the surviving candidates are already bounded by the
         // arm pool, and the byte budget bounds the rendered output.
-        let (selected, total_sessions, matched_total) =
+        let (mut selected, mut total_sessions, mut matched_total) =
             select_top_hits(candidates, plan.min_score, plan.limit);
         if selected.is_empty() {
             return Ok(empty_response(searchable_in_scope));
@@ -1192,7 +1192,7 @@ mod search_handler {
         // exactly those rows by id - no `IN x IN` cross-product scan and none of
         // its scalar-index page reads. Otherwise fall back to the keyed IN-scan.
         let rowids: Option<Vec<u64>> = selected.iter().map(|candidate| candidate.rowid).collect();
-        let metas = match &rowids {
+        let mut metas = match &rowids {
             Some(rowids) => store
                 .message_metas_by_rowids(rowids)
                 .await
@@ -1212,6 +1212,49 @@ mod search_handler {
             }
         };
         stage!("metas_hydrated");
+
+        // Authoritative subagent exclusion (spec.md#search). `retain_non_subagents`
+        // above is the cheap pre-hydration drop, but it keys on a `/` in the
+        // composite session_id (claude-code-shaped subagent ids) and so misses
+        // harnesses whose subagent sessions carry a plain id and encode
+        // subagent-ness only in a `/`-subpath `source_agent` (openclaw). The
+        // hydrated meta already carries `source_agent` for display, so enforce
+        // the rule here at zero extra requests. Mirror the id-based retain's
+        // drop-before-count by subtracting the removed hits and their now-empty
+        // session roots from the pool-derived counters. Rows outside this
+        // top-`limit` hydration window keep `source_agent` unmaterialized, so a
+        // subagent match beyond the window can still sit in `matched_total` (the
+        // un-hydrated pool tail) - the accepted cost of not re-adding the
+        // `source_agent` materialization the S3 request-law removed.
+        if plan.exclude_subagents {
+            let excluded: std::collections::HashSet<String> = metas
+                .iter()
+                .filter(|meta| meta.source_agent.contains('/'))
+                .map(|meta| meta.session_id.clone())
+                .collect();
+            if !excluded.is_empty() {
+                matched_total = matched_total.saturating_sub(
+                    selected
+                        .iter()
+                        .filter(|candidate| excluded.contains(&candidate.session_id))
+                        .count(),
+                );
+                total_sessions = total_sessions.saturating_sub(
+                    selected
+                        .iter()
+                        .map(|candidate| session_root(&candidate.session_id))
+                        .filter(|root| excluded.contains(*root))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                );
+                selected.retain(|candidate| !excluded.contains(&candidate.session_id));
+                metas.retain(|meta| !meta.source_agent.contains('/'));
+                if selected.is_empty() {
+                    return Ok(empty_response(searchable_in_scope));
+                }
+            }
+        }
+
         let meta_index = metas
             .iter()
             .map(|meta| ((meta.session_id.as_str(), meta.message_id.as_str()), meta))
@@ -1376,10 +1419,17 @@ mod search_handler {
         }
     }
 
-    /// Drop subagent hits in memory when `exclude` is set: a subagent session id
-    /// carries a `/` (the same marker `session_root` splits on). Replaces the
-    /// `NOT source_agent LIKE` SQL prefilter, which forced a `source_agent`
-    /// materialization that cost scattered GETs on a remote store.
+    /// Early, pre-hydration half of the subagent exclusion: drop hits whose
+    /// composite session id carries a `/` (claude-code-shaped `<parent>/agent-x`
+    /// ids, the same marker `session_root` splits on). This is the cheap path -
+    /// it needs only the retriever's keys, no `messages` read. It is NOT
+    /// authoritative on its own: a harness whose subagent sessions have plain
+    /// ids and mark subagent-ness only via a `/`-subpath `source_agent`
+    /// (openclaw) slips through here and is caught by the authoritative
+    /// `source_agent`-subpath check at the hydrated-meta stage in `pond_search`.
+    /// The two together replace the old `NOT source_agent LIKE` SQL prefilter,
+    /// which forced a `source_agent` materialization that cost scattered GETs on
+    /// a remote store.
     fn retain_non_subagents(hits: &mut Vec<SearchHit>, exclude: bool) {
         if exclude {
             hits.retain(|hit| !hit.key.session_id.contains('/'));
@@ -1758,6 +1808,23 @@ mod search_handler {
         })
     }
 
+    /// Escape regex metacharacters so a `source_agent` brand is matched as a
+    /// literal inside the anchored `regexp_like` subpath predicate (the `^` and
+    /// `(/|$)` anchors stay live; the value between them is inert).
+    fn regex_escape_literal(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if matches!(
+                ch,
+                '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\'
+            ) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     /// User-scope clauses (project/session/date) shared by the arm and
     /// `searchable_in_scope`. The subagent exclusion is not here, nor a SQL
     /// clause anywhere - it is applied in-memory (see `retain_non_subagents`).
@@ -1776,6 +1843,18 @@ mod search_handler {
 
         if let Some(session_id) = &filters.session_id {
             clauses.push(Predicate::Eq("session_id", session_id.clone().into()));
+        }
+        if let Some(source_agent) = &filters.source_agent {
+            // Exact-or-subpath as an anchored regex: matches `<value>` and its
+            // `<value>/...` subpaths, never a sibling brand like `openclaw-x`. A
+            // LIKE-prefix would be rejected by the bitmap index on `source_agent`
+            // (Lance: "LIKE prefix queries are not supported for bitmap
+            // indexes"); `regexp_like` is a scan-side predicate the bitmap index
+            // does not intercept, so it evaluates correctly.
+            clauses.push(Predicate::Regex(
+                "source_agent",
+                format!("^{}(/|$)", regex_escape_literal(source_agent)),
+            ));
         }
         if let Some(from_date) = &filters.from_date {
             clauses.push(Predicate::Gte(
@@ -1801,11 +1880,21 @@ mod search_handler {
     }
 
     /// spec.md#search: subagents are excluded from `pond_search` results -
-    /// always, except when the caller scopes to one `session_id` (which may
-    /// itself be a subagent session, so the exclusion would fight the filter).
-    /// Subagents are reachable only via `pond_sql_query` (`parent_session_id`).
+    /// always, except when the caller scopes to a subagent deliberately. That
+    /// means a `session_id` (which may itself be a subagent session) or a
+    /// `source_agent` value naming a subpath (`"openclaw/subagent"`,
+    /// `"claude-code/general-purpose"`) - there the exclusion would fight the
+    /// explicit filter. A root `source_agent` (`"openclaw"`, `"claude-code"`)
+    /// keeps the default exclusion: its exact-or-subpath match still reaches
+    /// only the harness's main sessions, matching core `sessions_search` UX.
+    /// Subagents are otherwise reachable via `pond_sql_query`
+    /// (`parent_session_id`).
     pub fn default_excludes_subagents(filters: &SearchFilters) -> bool {
         filters.session_id.is_none()
+            && !filters
+                .source_agent
+                .as_deref()
+                .is_some_and(|agent| agent.contains('/'))
     }
 
     /// Parse a `YYYY-MM-DD` filter date into a timestamp literal. `end_of_day`
@@ -1989,6 +2078,7 @@ mod tests {
         let filters = SearchFilters {
             project: Some(ProjectFilter::Contains("/Users/me/pond".to_owned())),
             session_id: Some("01HXY".to_owned()),
+            source_agent: None,
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
             min_score: 0.0,
@@ -2037,6 +2127,63 @@ mod tests {
             sql.contains(r"ESCAPE '\'"),
             "predicate must declare the escape char: {sql}"
         );
+    }
+
+    #[test]
+    fn source_agent_filter_is_exact_or_subpath_never_a_sibling_prefix() {
+        let filters = SearchFilters {
+            source_agent: Some("openclaw".to_owned()),
+            ..SearchFilters::default()
+        };
+        let sql = build_scope_filter(&filters).unwrap().to_lance();
+        // Anchored regex: matches `openclaw` exactly and `openclaw/<subpath>`,
+        // never a sibling like `openclaw-x`. A LIKE prefix is rejected by the
+        // source_agent bitmap index, so this is the correct index-safe form.
+        assert_eq!(
+            sql, "regexp_like(source_agent, '^openclaw(/|$)')",
+            "anchored exact-or-subpath: {sql}"
+        );
+        // Never a LIKE form (prefix errors on the bitmap; contains leaks).
+        assert!(!sql.contains("LIKE"), "no LIKE form: {sql}");
+
+        // A subpath value targets exactly that kind and its own children.
+        let sub = SearchFilters {
+            source_agent: Some("openclaw/subagent".to_owned()),
+            ..SearchFilters::default()
+        };
+        let sql = build_scope_filter(&sub).unwrap().to_lance();
+        assert_eq!(
+            sql, "regexp_like(source_agent, '^openclaw/subagent(/|$)')",
+            "{sql}"
+        );
+
+        // A brand carrying a regex metacharacter is escaped so it stays literal.
+        let meta = SearchFilters {
+            source_agent: Some("a.b".to_owned()),
+            ..SearchFilters::default()
+        };
+        let sql = build_scope_filter(&meta).unwrap().to_lance();
+        assert_eq!(sql, "regexp_like(source_agent, '^a\\.b(/|$)')", "{sql}");
+    }
+
+    #[test]
+    fn source_agent_subpath_disables_exclusion_but_root_value_keeps_it() {
+        // No scope -> subagents excluded by default.
+        assert!(default_excludes_subagents(&SearchFilters::default()));
+        // Naming a subpath explicitly is deliberate subagent scoping -> return
+        // those rows.
+        assert!(!default_excludes_subagents(&SearchFilters {
+            source_agent: Some("openclaw/subagent".to_owned()),
+            ..SearchFilters::default()
+        }));
+        // A root value keeps the exclusion: its exact-or-subpath match still
+        // reaches only the harness's main sessions (the OpenClaw plugin passes
+        // "openclaw" on every call; it must not flood callers with subagent/
+        // cron/hook/probe noise).
+        assert!(default_excludes_subagents(&SearchFilters {
+            source_agent: Some("openclaw".to_owned()),
+            ..SearchFilters::default()
+        }));
     }
 
     #[test]

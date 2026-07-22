@@ -616,6 +616,12 @@ pub struct SearchFilters {
     pub project: Option<ProjectFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Filter to one source harness with exact-or-subpath semantics: the value
+    /// itself plus its `/`-subpaths (`openclaw` covers `openclaw/subagent`, not
+    /// `openclaw-x`). A source_agent filter also disables the default subagent
+    /// exclusion (spec.md#search) - the caller is scoping deliberately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

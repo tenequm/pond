@@ -27,6 +27,14 @@ Options:
           [env: POND_PORT]
           [default: 9797]
 
+      --with-sync
+          Also run periodic sync in-process, reusing this server's store and embedding model (no separate `pond sync` child cold-loading a second ~500 MB model). Sync output goes to stderr/tracing; stdout stays reserved for the transport
+
+      --sync-every <SYNC_EVERY>
+          Minutes between in-process syncs (requires --with-sync)
+          
+          [default: 5]
+
   -h, --help
           Print help (see a summary with '-h')
 

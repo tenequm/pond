@@ -613,6 +613,15 @@ enum Command {
             default_value_t = 9797
         )]
         port: u16,
+        /// Also run periodic sync in-process, reusing this server's store and
+        /// embedding model (no separate `pond sync` child cold-loading a second
+        /// ~500 MB model). Sync output goes to stderr/tracing; stdout stays
+        /// reserved for the transport.
+        #[arg(long)]
+        with_sync: bool,
+        /// Minutes between in-process syncs (requires --with-sync).
+        #[arg(long, default_value_t = 5, requires = "with_sync")]
+        sync_every: u64,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -1298,14 +1307,17 @@ async fn main() -> anyhow::Result<()> {
             transport,
             host,
             port,
+            with_sync,
+            sync_every,
         } => {
             cap_serve_io_buffer();
-            let config = Config::load(config_path(config))?;
+            let config_file = config_path(config);
+            let config = Config::load(&config_file)?;
             // One resident embedder shared by the query arm (AppState) and the
             // inline embed-at-ingest path (the store), so the model loads once.
             let embedder = Arc::new(LazyEmbedder::candle());
             let store = Arc::new(
-                open_store(storage_path, &config, true, true)
+                open_store(storage_path.clone(), &config, true, true)
                     .await?
                     .1
                     .with_embedder(embedder.clone()),
@@ -1316,6 +1328,19 @@ async fn main() -> anyhow::Result<()> {
                 search: config.search.clone(),
             };
             spawn_prewarm(state.store.clone());
+            // `--with-sync`: fold the periodic sync into this process, reusing
+            // the store + embedder above (no separate child cold-loading a
+            // second ~500 MB model). The loop logs to tracing only; stdout is
+            // the transport's.
+            if with_sync {
+                spawn_in_serve_sync(
+                    state.store.clone(),
+                    config.clone(),
+                    config_file,
+                    storage_path,
+                    Duration::from_secs(sync_every.max(1) * 60),
+                );
+            }
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
@@ -1376,6 +1401,7 @@ async fn main() -> anyhow::Result<()> {
                 filters: SearchFilters {
                     project,
                     session_id,
+                    source_agent: None,
                     from_date,
                     to_date,
                     min_score,
@@ -3173,6 +3199,28 @@ struct SyncReport {
     indexes_folded: bool,
     stored_sessions: Option<u64>,
     stored_messages: Option<u64>,
+    /// openclaw deletion-reconciliation outcome (decision 7), when the
+    /// openclaw adapter was in scope. Detection-only until `pond erase` exists.
+    reconciliation: Option<adapter::ReconciliationReport>,
+}
+
+/// Where a sync run's progress + summary go. The CLI verb owns the terminal
+/// (progress HUD to stderr, human/JSON summary to stdout); the in-serve loop
+/// keeps stdout clear for the transport and routes everything to tracing, with
+/// no progress bars.
+#[derive(Clone, Copy)]
+enum SyncSink {
+    Cli { json: bool },
+    Serve,
+}
+
+impl SyncSink {
+    fn is_serve(self) -> bool {
+        matches!(self, SyncSink::Serve)
+    }
+    fn json(self) -> bool {
+        matches!(self, SyncSink::Cli { json: true })
+    }
 }
 
 /// The whole `pond sync` verb: per-host lock, model preload, import, index
@@ -3286,17 +3334,22 @@ pub(crate) async fn run_sync(
     // outcome - the ok and lock-skip paths emit theirs, so the error path must
     // too or a scripted consumer sees empty stdout.
     if json && let Err(error) = &outcome {
-        output(&serde_json::to_string_pretty(&serde_json::json!({
+        let mut summary = serde_json::json!({
             "outcome": "error",
             "error": format!("{error:#}"),
             "sessions_inserted": report.sessions_inserted,
             "messages_inserted": report.messages_inserted,
             "duration_secs": duration.as_secs_f64(),
-        }))?)?;
+        });
+        // Reconciliation runs after import, so a mid-pipeline failure may still
+        // have detected deletions; surface them when present (same store as the
+        // ok path).
+        add_reconciliation(&mut summary, &report)?;
+        output(&serde_json::to_string_pretty(&summary)?)?;
     }
     outcome?;
     if json {
-        output(&serde_json::to_string_pretty(&serde_json::json!({
+        let mut summary = serde_json::json!({
             "outcome": "ok",
             "sessions_inserted": report.sessions_inserted,
             "messages_inserted": report.messages_inserted,
@@ -3306,7 +3359,9 @@ pub(crate) async fn run_sync(
                 "messages": report.stored_messages,
             },
             "duration_secs": duration.as_secs_f64(),
-        }))?)?;
+        });
+        add_reconciliation(&mut summary, &report)?;
+        output(&serde_json::to_string_pretty(&summary)?)?;
     } else {
         output(&format!(
             "{} sync complete in {}",
@@ -3315,6 +3370,100 @@ pub(crate) async fn run_sync(
         ))?;
     }
     Ok(())
+}
+
+/// Spawn `pond serve --with-sync`'s in-process sync loop: reuse the server's
+/// store + embedder, sync every `interval`, sleep, repeat. Errors are caught
+/// and logged so a failing sync never takes the serving half down; output is
+/// tracing-only because stdout is the transport's.
+fn spawn_in_serve_sync(
+    store: Arc<Store>,
+    config: Config,
+    config_file: PathBuf,
+    storage_path: Option<StorageUrl>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) =
+                in_serve_sync_once(&store, &config, &config_file, storage_path.clone()).await
+            {
+                tracing::warn!(%error, "in-serve sync cycle failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// One in-serve sync cycle. Takes the same per-host lock as the CLI verb with
+/// `no_wait` semantics - if another sync (a scheduled `pond sync` or a manual
+/// one) holds it, this cycle skips cleanly. Writes the last-sync breadcrumb so
+/// `pond status` reflects in-serve syncs too.
+async fn in_serve_sync_once(
+    store: &Store,
+    config: &Config,
+    config_file: &Path,
+    storage_path: Option<StorageUrl>,
+) -> anyhow::Result<()> {
+    let storage = resolve_storage_location(storage_path, config)?;
+    let store_key = pond::substrate::store_key(storage.resolve(&config.creds)?.lance_url());
+    let _guard = match syncstate::try_acquire_sync_lock(&store_key)? {
+        syncstate::SyncLockState::Acquired(guard) => guard,
+        syncstate::SyncLockState::Busy(holder) => {
+            tracing::info!(
+                holder = ?holder.as_ref().map(|holder| holder.pid),
+                "in-serve sync skipped: another sync holds the store lock",
+            );
+            return Ok(());
+        }
+    };
+    let invocation = SyncInvocation {
+        adapter: None,
+        path: None,
+        verify: false,
+        dry_run: false,
+        no_wait: true,
+        format: OutputFormat::Text,
+    };
+    let flush_hud = Arc::new(FlushHud::default());
+    let mut report = SyncReport::default();
+    let started = std::time::Instant::now();
+    let outcome = run_sync_pipeline(
+        store,
+        config,
+        config_file,
+        &invocation,
+        SyncSink::Serve,
+        &mut report,
+        &flush_hud,
+    )
+    .await;
+    let duration = started.elapsed();
+    syncstate::write_last_sync(
+        &store_key,
+        &syncstate::LastSyncRecord {
+            finished_at: Utc::now(),
+            duration_secs: duration.as_secs_f64(),
+            sessions_inserted: report.sessions_inserted,
+            messages_inserted: report.messages_inserted,
+            outcome: if outcome.is_ok() {
+                syncstate::SyncOutcome::Ok
+            } else {
+                syncstate::SyncOutcome::Error
+            },
+            error: outcome.as_ref().err().map(|error| format!("{error:#}")),
+        },
+    );
+    if outcome.is_ok() {
+        tracing::info!(
+            target: "pond::sync",
+            sessions = report.sessions_inserted,
+            messages = report.messages_inserted,
+            secs = duration.as_secs_f64(),
+            "in-serve sync complete",
+        );
+    }
+    outcome
 }
 
 /// Everything after the lock, so any failure - unreachable store, model load,
@@ -3369,34 +3518,73 @@ async fn run_sync_stages(
         }
     }
 
+    run_sync_pipeline(
+        &store,
+        loaded,
+        config_file,
+        invocation,
+        SyncSink::Cli { json },
+        report,
+        &flush_hud,
+    )
+    .await
+}
+
+/// The store-agnostic sync core, shared by the `pond sync` verb (which opens
+/// its own store + embedder) and `pond serve --with-sync` (which passes the
+/// server's already-open store so no second ~500 MB model cold-loads). Runs
+/// import -> openclaw deletion reconciliation -> gated optimize -> summary,
+/// routing progress + summary per `sink` (stdout HUD for the CLI, tracing for
+/// the in-serve loop). Every failure lands in the caller's last-sync record.
+#[allow(clippy::too_many_arguments)]
+async fn run_sync_pipeline(
+    store: &Store,
+    loaded: &Config,
+    config_file: &Path,
+    invocation: &SyncInvocation,
+    sink: SyncSink,
+    report: &mut SyncReport,
+    flush_hud: &Arc<FlushHud>,
+) -> anyhow::Result<()> {
     let import_started = std::time::Instant::now();
     let import_summary = run_import_stage(
-        &store,
+        store,
         loaded,
         config_file,
         invocation.adapter.clone(),
         invocation.path.clone(),
         invocation.verify,
-        &flush_hud,
+        flush_hud,
+        sink,
     )
     .await?;
     report.sessions_inserted = import_summary.sessions_inserted as u64;
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
     let any_new_rows = import_summary.inserted > 0;
-    if !json {
-        // "searchable": the delta counts user/assistant conversational rows
-        // only, while the stored total below counts every role - unlabeled,
-        // the 10x gap between them reads as dropped data.
-        output(&stage_line(
-            import_started.elapsed(),
-            "import",
-            &format!(
-                "+{} sessions, +{} searchable messages",
-                format_thousands(import_summary.sessions_inserted as u64),
-                format_thousands(import_summary.messages_inserted_searchable as u64),
-            ),
-        ))?;
+    // "searchable": the delta counts user/assistant conversational rows only,
+    // while the stored total below counts every role - unlabeled, the 10x gap
+    // between them reads as dropped data.
+    emit_sync_stage(
+        sink,
+        import_started.elapsed(),
+        "import",
+        &format!(
+            "+{} sessions, +{} searchable messages",
+            format_thousands(import_summary.sessions_inserted as u64),
+            format_thousands(import_summary.messages_inserted_searchable as u64),
+        ),
+    )?;
+
+    // Deletion reconciliation (decision 7): only when openclaw is in scope, so
+    // a non-openclaw sync pays nothing. Detection-only - it names the erase
+    // set and preserves for the summary; the byte-purge waits on `pond erase`.
+    if let Some(config) = openclaw_in_scope(loaded, invocation)? {
+        let adapter = adapter::OpenClawAdapter::from_config(config)?;
+        let recon = adapter.reconcile_deletions(store).await?;
+        emit_reconciliation(sink, &recon)?;
+        report.reconciliation = Some(recon);
     }
+
     // Optimize stages gated on `any_new_rows`: cleanup_old_versions
     // walks the version log on every call (real work even when "caught
     // up"), so an idempotent no-op sync should not pay it. Catch up an
@@ -3429,32 +3617,128 @@ async fn run_sync_stages(
         // FTS + vector fold is batched too (DEFAULT_SYNC_INDEX_FOLD_ROWS):
         // each fold is an S3 round-trip storm, and the deferred tail stays
         // searchable because the retrievers flat-scan it.
-        guard_embedding_model_unchanged(&store).await?;
+        guard_embedding_model_unchanged(store).await?;
         let policy = configured_maintenance_policy(loaded, None)?
             .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL)
             .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS)
             .with_index_fold_row_threshold(pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS);
         let indexes_started = std::time::Instant::now();
-        run_update_indexes_stage(&store, &policy).await?;
+        run_update_indexes_stage(store, &policy).await?;
         report.indexes_folded = true;
-        if !json {
-            output(&stage_line(
-                indexes_started.elapsed(),
-                "indexes",
-                "fold complete",
-            ))?;
-        }
+        emit_sync_stage(sink, indexes_started.elapsed(), "indexes", "fold complete")?;
     }
     let summary_started = std::time::Instant::now();
-    if json {
+    // The in-serve loop logs its own one-line per-cycle summary from the
+    // report; only the CLI verb renders the terminal/JSON summary here.
+    if sink.json() {
         let (sessions, messages, _) = store.row_counts().await?;
         report.stored_sessions = Some(sessions as u64);
         report.stored_messages = Some(messages as u64);
-    } else {
-        render_sync_summary(&store).await?;
+    } else if !sink.is_serve() {
+        render_sync_summary(store).await?;
     }
     tracing::debug!(target: "pond::perf", stage = "render_summary", elapsed_ms = summary_started.elapsed().as_millis() as u64, "sync stage");
     Ok(())
+}
+
+/// Emit a `label: detail` stage line: to stdout as a HUD row for the CLI verb,
+/// to tracing for the in-serve loop (stdout is the transport's there). The
+/// `--format json` verb records stages in the report, not as loose lines.
+fn emit_sync_stage(
+    sink: SyncSink,
+    elapsed: Duration,
+    label: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    match sink {
+        SyncSink::Cli { json: true } => Ok(()),
+        SyncSink::Cli { json: false } => output(&stage_line(elapsed, label, detail)),
+        SyncSink::Serve => {
+            tracing::info!(target: "pond::sync", label, detail, "sync stage");
+            Ok(())
+        }
+    }
+}
+
+/// Attach the openclaw reconciliation report to a `--format json` summary
+/// document under `"reconciliation"`, mirroring the report's own structure
+/// (`erase` / `preserved`). Skipped when no report was produced (non-openclaw
+/// sync) so unrelated summaries stay compact.
+fn add_reconciliation(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
+    if let Some(recon) = &report.reconciliation
+        && let Value::Object(map) = summary
+    {
+        map.insert("reconciliation".to_owned(), serde_json::to_value(recon)?);
+    }
+    Ok(())
+}
+
+/// Surface the openclaw reconciliation report (decision 7) as summary-terse
+/// lines: detected explicit deletions (erase pending) and preserved lookalikes,
+/// each naming the fact per pond's output convention. JSON callers read the
+/// structured report from the summary document's `reconciliation` key
+/// (`add_reconciliation`), on both the ok and error paths.
+fn emit_reconciliation(
+    sink: SyncSink,
+    recon: &adapter::ReconciliationReport,
+) -> anyhow::Result<()> {
+    if sink.json() {
+        return Ok(());
+    }
+    for line in reconciliation_lines(recon) {
+        if sink.is_serve() {
+            tracing::info!(target: "pond::sync", "{line}");
+        } else {
+            output(&line)?;
+        }
+    }
+    Ok(())
+}
+
+/// The human lines for a reconciliation report. Empty when nothing to say.
+fn reconciliation_lines(recon: &adapter::ReconciliationReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !recon.erase.is_empty() {
+        let keys: Vec<&str> = recon.erase.iter().map(|t| t.session_key.as_str()).collect();
+        lines.push(format!(
+            "openclaw: {} explicitly deleted session(s) detected (erase pending; pond erase is not yet implemented): {}",
+            recon.erase.len(),
+            keys.join(", "),
+        ));
+    }
+    if !recon.preserved.is_empty() {
+        lines.push(format!(
+            "openclaw: {} deleted-archive(s) preserved (eviction lookalike / ambiguous - not erased)",
+            recon.preserved.len(),
+        ));
+    }
+    lines
+}
+
+/// The openclaw adapter's resolved config blob when it is in this sync's scope,
+/// else `None` so a non-openclaw sync skips reconciliation entirely. Reuses the
+/// same resolver the import stage ran, so scope (`--adapter`/`--path`, enabled
+/// set) stays identical.
+fn openclaw_in_scope(
+    loaded: &Config,
+    invocation: &SyncInvocation,
+) -> anyhow::Result<Option<Value>> {
+    if invocation
+        .adapter
+        .as_deref()
+        .is_some_and(|name| name != "openclaw")
+    {
+        return Ok(None);
+    }
+    let adapters = resolve_sync_adapters(
+        loaded,
+        invocation.adapter.as_deref(),
+        invocation.path.clone(),
+    )?;
+    Ok(adapters
+        .into_iter()
+        .find(|(name, _)| name == "openclaw")
+        .map(|(_, blob)| blob))
 }
 
 /// `pond sync --dry-run`: the freshness gate run standalone. Prints what the
@@ -3495,7 +3779,7 @@ async fn run_sync_dry_run(
     } else {
         // The same freshness map a real sync would use, so the preview
         // matches what sync would actually skip.
-        ensure_rowmap_with_spinner(&store).await;
+        ensure_rowmap_with_spinner(&store, false).await;
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
@@ -3614,9 +3898,13 @@ async fn wait_for_sync_lock(
 /// `ensure_rowmap` with a live spinner. On a fresh host against a populated
 /// remote store this is a one-time full scan of the messages table - the
 /// silent minutes-long "hang" of a first sync before it had a face.
-async fn ensure_rowmap_with_spinner(store: &Store) {
+async fn ensure_rowmap_with_spinner(store: &Store, quiet: bool) {
     let started = std::time::Instant::now();
-    let spinner = ProgressBar::new_spinner();
+    let spinner = if quiet {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new_spinner()
+    };
     spinner.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} checking what this store already holds (one-time scan on a new host)... [{elapsed_precise}]",
@@ -3753,6 +4041,7 @@ fn brief_duration(duration: Duration) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_import_stage(
     store: &Store,
     loaded: &Config,
@@ -3761,7 +4050,11 @@ async fn run_import_stage(
     path: Option<PathBuf>,
     verify: bool,
     flush_hud: &Arc<FlushHud>,
+    sink: SyncSink,
 ) -> anyhow::Result<IngestSummary> {
+    // The in-serve loop keeps stdout for the transport and paints no bars:
+    // hide every progress surface and suppress the off-TTY heartbeat lines.
+    let quiet = sink.is_serve();
     let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), path)?;
     if adapters.is_empty() {
         let disabled = loaded.disabled_adapter_names();
@@ -3800,7 +4093,7 @@ async fn run_import_stage(
         // sequential scan, a warm sync delta-extends it - never the per-manifest
         // version-resolution storm that throttled remote syncs to a stall. A
         // missing/stale map yields no key, so the session simply re-reads (safe).
-        ensure_rowmap_with_spinner(store).await;
+        ensure_rowmap_with_spinner(store, quiet).await;
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
@@ -3819,12 +4112,14 @@ async fn run_import_stage(
     // in scrollback. `stderr_with_hz(8)` lowers the redraw rate so reflows have
     // time to settle. Scroll-back lines go through `mp.println` so they land
     // above the live block.
-    let mp = indicatif::MultiProgress::with_draw_target(
-        indicatif::ProgressDrawTarget::stderr_with_hz(8),
-    );
+    let mp = indicatif::MultiProgress::with_draw_target(if quiet {
+        indicatif::ProgressDrawTarget::hidden()
+    } else {
+        indicatif::ProgressDrawTarget::stderr_with_hz(8)
+    });
     let mut total = IngestSummary::default();
     for (name, blob) in adapters {
-        let summary = sync_with_progress(store, &mp, &name, blob, oracle, flush_hud).await?;
+        let summary = sync_with_progress(store, &mp, &name, blob, oracle, flush_hud, quiet).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -4277,6 +4572,7 @@ const SYNC_HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 /// Run one adapter's ingest pass into `store` with a live progress bar and
 /// one greppable log line per finished (or skipped) session.
+#[allow(clippy::too_many_arguments)]
 async fn sync_with_progress(
     store: &Store,
     mp: &indicatif::MultiProgress,
@@ -4284,6 +4580,7 @@ async fn sync_with_progress(
     config: Value,
     oracle: &dyn pond::adapter::SkipOracle,
     flush_hud: &FlushHud,
+    quiet: bool,
 ) -> anyhow::Result<IngestSummary> {
     let factory = adapter::by_name(name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -4317,7 +4614,9 @@ async fn sync_with_progress(
     let mut drops: u64 = 0;
     let started = std::time::Instant::now();
     let bar_ref = &bar;
-    let stderr_tty = io::stderr().is_terminal();
+    // Quiet (in-serve) runs treat stderr as a TTY so the off-TTY heartbeat
+    // lines stay silent too; the serve loop logs one summary line per cycle.
+    let stderr_tty = quiet || io::stderr().is_terminal();
     flush_hud.attach(name, &bar, started, stderr_tty);
     // Repaint the bar; off-TTY (where indicatif draws nothing) also emit the
     // same line as a plain log heartbeat so the run is never silent. The
@@ -5571,6 +5870,32 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn json_summary_carries_reconciliation_when_present() {
+        let report = SyncReport {
+            reconciliation: Some(adapter::ReconciliationReport {
+                erase: vec![adapter::EraseTarget {
+                    agent_id: "bot".to_owned(),
+                    session_id: "s1".to_owned(),
+                    session_key: "agent:bot:main".to_owned(),
+                }],
+                preserved: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut summary = serde_json::json!({ "outcome": "ok" });
+        add_reconciliation(&mut summary, &report).unwrap();
+        let recon = &summary["reconciliation"];
+        assert_eq!(recon["erase"][0]["session_key"], "agent:bot:main");
+        assert_eq!(recon["erase"][0]["session_id"], "s1");
+        assert!(recon["preserved"].as_array().unwrap().is_empty());
+
+        // A non-openclaw sync (no report) leaves the summary compact.
+        let mut plain = serde_json::json!({ "outcome": "ok" });
+        add_reconciliation(&mut plain, &SyncReport::default()).unwrap();
+        assert!(plain.get("reconciliation").is_none());
+    }
 
     #[test]
     fn brief_duration_picks_the_readable_unit() {

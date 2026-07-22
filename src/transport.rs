@@ -214,8 +214,12 @@ pond_search params: query (semantic - concepts, not project names), mode \
 sort_by (relevance default | recency), limit (returned sessions; default 10, \
 max 200 - also the want-more knob, there is no pagination), project (path \
 substring), session_id (exact session match - search within one session), \
-from_date / to_date (YYYY-MM-DD). Subagents are excluded; reach them via \
-pond_sql_query (parent_session_id).
+source_agent (one source harness, exact-or-subpath: \"openclaw\" also covers \
+\"openclaw/subagent\", not \"openclaw-x\"), from_date / to_date (YYYY-MM-DD). \
+Subagents are excluded by default: a root source_agent like \"openclaw\" returns \
+main sessions only, while naming a subpath (e.g. \"claude-code/general-purpose\") \
+reaches those subagent sessions and is the opt-in that disables the default \
+exclusion. Subagents are also reachable via pond_sql_query (parent_session_id).
 
 pond_search response: a transcript. The first line states totals \
 (`matched_total` is the message count before `limit` and byte-budget \
@@ -515,6 +519,14 @@ Examples (4 patterns the agent should recognize):
         /// possibly long, session.
         #[serde(default)]
         session_id: Option<String>,
+        /// Filter to one source harness. A root value ("openclaw",
+        /// "claude-code") returns that harness's main sessions (subagents stay
+        /// excluded, like the default). Name a subpath
+        /// ("claude-code/general-purpose", "openclaw/subagent") to search those
+        /// subagent sessions directly - a subpath value is the deliberate opt-in
+        /// that disables the default subagent exclusion.
+        #[serde(default)]
+        source_agent: Option<String>,
         /// Only messages on or after this date (YYYY-MM-DD).
         #[serde(default)]
         from_date: Option<String>,
@@ -695,6 +707,7 @@ Examples (4 patterns the agent should recognize):
                 filters: SearchFilters {
                     project: params.project.map(ProjectFilter::Contains),
                     session_id: params.session_id,
+                    source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
                     // min_score is intentionally not on the MCP surface; scores
@@ -939,9 +952,13 @@ Examples (4 patterns the agent should recognize):
                  readable transcripts, not JSON. Scope with filters, not the query: project \
                  (path substring), session_id, source_agent, from_date / to_date - \
                  keep query semantic (concepts, not project names). Scores are relative \
-                 within one response; there is no min_score. Subagents are stored as their \
-                 own sessions (source_agent like \"claude-code/general-purpose\"); pond_get \
-                 on a parent session lists them in a footer so you can open each. Recover \
+                 within one response; there is no min_score. source_agent is exact-or-\
+                 subpath: a root value (\"openclaw\", \"claude-code\") returns that \
+                 harness's main sessions, while naming a subpath reaches subagent \
+                 sessions. Subagents are stored as their own sessions (source_agent like \
+                 \"claude-code/general-purpose\") and excluded from default results; \
+                 name that subpath to search them, or pond_get on a parent session lists \
+                 them in a footer so you can open each. Recover \
                  context lost to compaction: find this session via pond_search (a distinctive \
                  recent topic + project + from_date=today), then pond_get(session_id, \
                  session_from=\"end\") for the recent pre-compaction turns. Deeper \
@@ -1271,6 +1288,24 @@ Examples (4 patterns the agent should recognize):
                     "MCP errors use JSON-RPC ids for correlation"
                 );
             }
+        }
+
+        #[test]
+        fn search_params_deserialize_source_agent_and_map_to_filters() {
+            let params: McpSearchParams = serde_json::from_value(serde_json::json!({
+                "query": "vector store",
+                "source_agent": "openclaw/subagent",
+            }))
+            .expect("params deserialize");
+            assert_eq!(params.source_agent.as_deref(), Some("openclaw/subagent"));
+
+            // Mirror the pond_search mapping: the param flows verbatim into the
+            // wire filter that the handler translates to a scope predicate.
+            let filters = crate::wire::SearchFilters {
+                source_agent: params.source_agent,
+                ..Default::default()
+            };
+            assert_eq!(filters.source_agent.as_deref(), Some("openclaw/subagent"));
         }
 
         #[test]
