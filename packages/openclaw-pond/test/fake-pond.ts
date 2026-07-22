@@ -3,10 +3,18 @@
 // text (golden-response assertions), matching pond's real text-only tool output.
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { PondMcpClient } from "../src/mcp.js";
 
-export type FakeResponse = string | { text: string; isError: true };
+// `rpcError` mirrors pond's envelope-error channel (Err(to_error_data) ->
+// JSON-RPC error -> client throws McpError): not_found, validation_failed, the
+// get_message wrong-id hint. Plain string / isError mirror CallToolResult text.
+export type FakeResponse = string | { text: string; isError: true } | { rpcError: string };
 
 export type FakePondOptions = {
   responses?: Partial<Record<string, (args: Record<string, unknown>) => FakeResponse>>;
@@ -45,6 +53,9 @@ export async function createFakePond(options: FakePondOptions = {}): Promise<Fak
     const response: FakeResponse = responder ? responder(args) : `ok:${name}`;
     if (typeof response === "string") {
       return { content: [{ type: "text", text: response }] };
+    }
+    if ("rpcError" in response) {
+      throw new McpError(ErrorCode.InvalidParams, response.rpcError);
     }
     return { content: [{ type: "text", text: response.text }], isError: true };
   });

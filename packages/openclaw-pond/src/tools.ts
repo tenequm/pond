@@ -11,7 +11,7 @@ import type { PondPluginConfig } from "./config.js";
 import type { PondCallResult } from "./mcp.js";
 import {
   combineProject,
-  isLeafSubagentContext,
+  isSubagentContext,
   resolveScopeFromContext,
   type ScopeContext,
 } from "./scope.js";
@@ -142,7 +142,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
   const sourceAgent = resolveSourceAgent(deps.config.sources, deps.logger?.warn);
 
   const search = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
-    if (isLeafSubagentContext(scopeContext(ctx))) {
+    if (isSubagentContext(scopeContext(ctx))) {
       return null;
     }
     return {
@@ -185,7 +185,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
   // MCP output is text, so per-target scope is not re-verified server-side -
   // this is deliberate (policy, not a security boundary against the operator).
   const getSession = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
-    if (isLeafSubagentContext(scopeContext(ctx))) {
+    if (isSubagentContext(scopeContext(ctx))) {
       return null;
     }
     return {
@@ -223,7 +223,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
   };
 
   const getMessage = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
-    if (isLeafSubagentContext(scopeContext(ctx))) {
+    if (isSubagentContext(scopeContext(ctx))) {
       return null;
     }
     return {
@@ -255,7 +255,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
   };
 
   const sql = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
-    if (isLeafSubagentContext(scopeContext(ctx))) {
+    if (isSubagentContext(scopeContext(ctx))) {
       return null;
     }
     return {

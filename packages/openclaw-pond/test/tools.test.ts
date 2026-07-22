@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { PondPluginConfig } from "../src/config.js";
 import { parsePluginConfig } from "../src/config.js";
 import { RESPONSE_MAX_BYTES } from "../src/schemas.js";
+import { relayPondCall } from "../src/service.js";
 import { createPondToolFactories } from "../src/tools.js";
 import { createFakePond, type FakePond, type FakePondOptions } from "./fake-pond.js";
 
@@ -26,7 +27,9 @@ async function harness(options: HarnessOptions = {}) {
   const factories = createPondToolFactories({
     config: options.config ?? config,
     ...(options.logger ? { logger: options.logger } : {}),
-    callPond: (name, args) => fake!.client.callTool(name, args),
+    // Same seam production uses (PondController.callTool -> relayPondCall), so
+    // the thrown-McpError -> {ok:false} mapping is exercised, not bypassed.
+    callPond: (name, args) => relayPondCall(fake!.client, name, args),
   });
   return { factories, calls: fake.calls };
 }
@@ -136,6 +139,18 @@ describe("pond_get_session", () => {
 });
 
 describe("pond_get_message", () => {
+  it("relays a pond envelope error (wrong-id hint) as readable error text", async () => {
+    const hint = "abc123 is a session id, not a message id - read it with pond_get_session";
+    const { factories } = await harness({
+      responses: { pond_get_message: () => ({ rpcError: hint }) },
+    });
+    const out = await factories.getMessage(mainCtx())!.execute("id", { id: "abc123" });
+    const d = details(out);
+    expect(d.status).toBe("error");
+    expect(d.error).toContain("pond call failed");
+    expect(d.error).toContain("read it with pond_get_session");
+  });
+
   it("forwards a message expansion (golden request/response)", async () => {
     const { factories, calls } = await harness({ responses: { pond_get_message: () => "MESSAGE" } });
     const out = await factories.getMessage(mainCtx())!.execute("id", { id: "m1", context_before: 5 });
@@ -168,18 +183,20 @@ describe("pond_sql", () => {
   });
 });
 
-describe("subagent leaf denial", () => {
-  it("hides every pond tool from a sandboxed leaf subagent", async () => {
+describe("subagent denial", () => {
+  it("hides every pond tool from any subagent context, sandboxed or not", async () => {
     const { factories } = await harness();
-    const leaf: OpenClawPluginToolContext = {
-      sessionKey: "agent:main:subagent:abc",
-      agentId: "main",
-      sandboxed: true,
-      config: {},
-    };
-    expect(factories.search(leaf)).toBeNull();
-    expect(factories.getSession(leaf)).toBeNull();
-    expect(factories.getMessage(leaf)).toBeNull();
-    expect(factories.sql(leaf)).toBeNull();
+    for (const sandboxed of [true, false]) {
+      const subagent: OpenClawPluginToolContext = {
+        sessionKey: "agent:main:subagent:abc",
+        agentId: "main",
+        sandboxed,
+        config: {},
+      };
+      expect(factories.search(subagent)).toBeNull();
+      expect(factories.getSession(subagent)).toBeNull();
+      expect(factories.getMessage(subagent)).toBeNull();
+      expect(factories.sql(subagent)).toBeNull();
+    }
   });
 });

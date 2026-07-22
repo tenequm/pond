@@ -2,6 +2,7 @@
 // Models only the registration surface the pond plugin touches. The real SDK
 // supplies richer types and the live registrar at runtime; this double lets the
 // entry file typecheck and (if imported) run in tests without OpenClaw present.
+import type { TSchema } from "typebox";
 import type { OpenClawConfig } from "./config-contracts.js";
 import type { AgentToolResult } from "./tool-results.js";
 
@@ -11,8 +12,8 @@ export type AnyAgentTool = {
   name: string;
   label: string;
   description: string;
-  parameters: unknown;
-  outputSchema?: unknown;
+  parameters: TSchema;
+  outputSchema?: TSchema;
   execute: (
     toolCallId: string,
     args: unknown,
@@ -52,9 +53,23 @@ export type OpenClawPluginService = {
   stop?: (ctx: OpenClawPluginServiceContext) => void | Promise<void>;
 };
 
+export type PluginLogger = {
+  debug?: (message: string) => void;
+  info: (message: string) => void;
+  warn: (message: string) => void;
+  error: (message: string) => void;
+};
+
 export type OpenClawPluginApi = {
-  registrationMode: "runtime" | "tool-discovery" | (string & {});
+  registrationMode:
+    | "full"
+    | "discovery"
+    | "tool-discovery"
+    | "setup-only"
+    | "setup-runtime"
+    | "cli-metadata";
   pluginConfig?: Record<string, unknown>;
+  logger: PluginLogger;
   registerTool: (
     factory: OpenClawPluginToolFactory | AnyAgentTool,
     options?: { name?: string; optional?: boolean },

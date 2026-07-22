@@ -7,9 +7,9 @@
   "files": [
     "index.ts",
     "src",
-    "dist",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

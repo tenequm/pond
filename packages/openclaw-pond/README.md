@@ -79,23 +79,34 @@ default and what each widening step exposes:
 | `self` | only the current session |
 | `tree` (default) | the caller's own agent (its sessions + spawned children) |
 | `agent` | the caller's own agent |
-| `all` + `tools.agentToAgent.enabled` | every agent's sessions (cross-harness if `sources: ["*"]`) |
+| `all` + `tools.agentToAgent.enabled` (unrestricted `allow`) | every agent's sessions (cross-harness if `sources: ["*"]`) |
 
 Notes and deliberate limits:
 
 - pond's MCP `project` filter is a single substring, so a set of keys cannot be
   expressed in one call. `tree` and `agent` therefore both clamp to the caller's
   own-agent key prefix `agent:<agentId>:` - bounded to one agent (the primary
-  leak risk), coarser than a strict tree. `self` pins the exact session key.
+  leak risk), coarser than a strict tree (broader for same-agent siblings,
+  narrower for spawned children living under another agent id - those stay
+  unreachable). `self` pins the exact session key.
+- `all` drops the clamp only when `tools.agentToAgent` is enabled with an
+  **unrestricted** `allow` list (empty or `"*"`). Core grants cross-agent reads
+  per target via its allow-list matcher; a restricted list cannot be expressed
+  in one substring, so the plugin keeps the own-agent clamp (fail-closed to the
+  expressible subset).
 - Group/channel-context callers clamp down to `tree` unless
-  `groupSessions: "inherit"` (the private-vs-shared asymmetry).
+  `groupSessions: "inherit"` (the private-vs-shared asymmetry). This is a
+  pond-specific conservatism - core has no group-context visibility downgrade.
 - `pond_sql` runs arbitrary read-only SELECT over the whole corpus; a
   single substring filter cannot clamp arbitrary SQL, so it is gated on the
   operator's broad opt-in (`tools.sessions.visibility: "all"`) and returns a
   typed `forbidden` naming the knob otherwise. Use `pond_search` /
   `pond_get_session` for scoped reads.
-- Sandboxed leaf subagents get the pond tools hidden entirely (the tool factory
-  returns `null`), mirroring core denying `sessions_search` to leaves.
+- Subagent contexts get the pond tools hidden entirely (the tool factory
+  returns `null`), sandboxed or not. Core denies `sessions_search` to leaf-role
+  subagents by spawn depth, a signal the plugin tool context does not carry -
+  hiding from all subagents is the conservative superset that never
+  over-exposes. A subagent needing history gets it passed in by its parent.
 - `sources: ["*"]` opts into foreign-harness content, which has **no OpenClaw
   redaction pass**. Snippets are still passed through `redactToolPayloadText`.
 - The plugin fails **closed** (typed `forbidden`) whenever scope cannot be

@@ -10,9 +10,13 @@
 // ProjectFilter::Contains), so a set of keys cannot be expressed in one call.
 // Consequently `tree` and `agent` both clamp to the requester's own-agent key
 // prefix `agent:<agentId>:` - bounded to a single agent (the primary leak risk),
-// coarser than a strict tree. `self` pins the exact session key; `all` drops the
-// clamp only when agent-to-agent access is enabled (else it clamps to the own
-// agent, mirroring the SDK row checker denying cross-agent reads without a2a).
+// coarser than a strict tree. `self` pins the exact session key. `all` drops the
+// clamp only when agent-to-agent access grants every agent: core's rule is
+// `enabled && matchesAllow(requester) && matchesAllow(target)` per target, and
+// dropping the clamp exposes every target at once - sound only when the allow
+// list is unrestricted (empty or "*"). Any restricted allow list is
+// inexpressible in one substring, so it falls back to the own-agent clamp
+// (fail-closed to the expressible subset; own sessions are always permitted).
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   createAgentToAgentPolicy,
@@ -44,12 +48,13 @@ export function isSubagentSessionKey(sessionKey: string | undefined): boolean {
   return typeof sessionKey === "string" && sessionKey.includes(":subagent:");
 }
 
-// The tool context carries no explicit subagent role (leaf vs orchestrator lives
-// in stored session metadata, not the per-call ctx). Sandboxed subagents are the
-// constrained leaves whose visibility core clamps and to which it denies
-// sessions_search; mirror that posture by hiding pond tools from them.
-export function isLeafSubagentContext(ctx: ScopeContext): boolean {
-  return isSubagentSessionKey(ctx.sessionKey) && ctx.sandboxed === true;
+// Core denies sessions_search to leaf-ROLE subagents (spawn depth), but the
+// tool context carries no role/depth signal, so the exact condition cannot be
+// replicated. Hide pond tools from ALL subagent contexts instead - a
+// conservative superset of "leaves denied" that never over-exposes. Subagents
+// needing historical context get it passed in by the agent that spawned them.
+export function isSubagentContext(ctx: ScopeContext): boolean {
+  return isSubagentSessionKey(ctx.sessionKey);
 }
 
 export function isGroupContext(ctx: ScopeContext): boolean {
@@ -65,10 +70,27 @@ function clampToTree(visibility: SessionToolsVisibility): SessionToolsVisibility
 
 export type ResolveScopeInput = {
   visibility: SessionToolsVisibility;
-  a2aEnabled: boolean;
+  /** True only when a2a is enabled AND its allow list grants every agent. */
+  a2aGrantsAll: boolean;
   ctx: ScopeContext;
   groupSessions: GroupSessionsPolicy;
 };
+
+// Dropping the pond clamp exposes every agent's sessions in one call, so it
+// requires the a2a policy to grant every target: enabled with an unrestricted
+// allow list (empty or containing "*"). A restricted list cannot be expressed
+// in pond's single project substring - callers fall back to the own-agent
+// clamp, matching core's per-target matchesAllow gate fail-closed.
+export function a2aGrantsAllAgents(cfg: OpenClawConfig): boolean {
+  if (createAgentToAgentPolicy(cfg).enabled !== true) {
+    return false;
+  }
+  const allow = cfg.tools?.agentToAgent?.allow;
+  const patterns = Array.isArray(allow)
+    ? allow.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return patterns.length === 0 || patterns.includes("*");
+}
 
 // Pure translation from a resolved visibility to a pond project clamp. Fails
 // closed when identity needed for the clamp is missing.
@@ -104,7 +126,7 @@ export function resolvePondScope(input: ResolveScopeInput): ScopeResolution {
     case "agent":
       return ownAgentClamp();
     case "all":
-      return input.a2aEnabled ? { ok: true } : ownAgentClamp();
+      return input.a2aGrantsAll ? { ok: true } : ownAgentClamp();
   }
 }
 
@@ -130,12 +152,11 @@ export function resolveScopeFromContext(params: {
   groupSessions: GroupSessionsPolicy;
 }): { visibility: SessionToolsVisibility; scope: ScopeResolution } {
   const visibility = resolveEffectiveVisibility(params);
-  const a2a = createAgentToAgentPolicy(params.cfg);
   // resolvePondScope applies no group clamp of its own here: `visibility` is
   // already group-clamped, so passing "clamp" would be a harmless no-op.
   const scope = resolvePondScope({
     visibility,
-    a2aEnabled: a2a.enabled,
+    a2aGrantsAll: a2aGrantsAllAgents(params.cfg),
     ctx: params.ctx,
     groupSessions: "inherit",
   });

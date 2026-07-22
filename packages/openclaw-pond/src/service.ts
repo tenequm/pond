@@ -22,6 +22,48 @@ export type PondLogger = {
 const RESTART_BASE_DELAY_MS = 500;
 const RESTART_MAX_DELAY_MS = 30_000;
 
+// The MCP SDK's stdio transport passes the child a fixed safelist (HOME, PATH,
+// USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
+// relocated via XDG vars would open as a different, empty store. Build the
+// child env explicitly: the SDK's safelist plus pond's own knobs.
+const CHILD_ENV_VARS = [
+  "HOME",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "TERM",
+  "USER",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "RUST_LOG",
+];
+
+export function pondChildEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && (CHILD_ENV_VARS.includes(key) || key.startsWith("POND_"))) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+// The one production mapping from a thrown MCP call (JSON-RPC error envelopes:
+// not_found, validation_failed, the get_message wrong-id hint) to the typed
+// {ok:false} the tools relay. Exported so tests exercise this exact seam.
+export async function relayPondCall(
+  client: PondMcpClient,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<PondCallResult> {
+  try {
+    return await client.callTool(name, args);
+  } catch (error) {
+    return { ok: false, error: `pond call failed: ${String(error instanceof Error ? error.message : error)}` };
+  }
+}
+
 const INSTALL_HINT =
   "install pond (https://github.com/tenequm/pond, `brew install tenequm/tap/pond` or `cargo install pond`), " +
   "then run `pond init` once to create the store and enable the openclaw adapter.";
@@ -89,11 +131,7 @@ export class PondController {
         error: "pond is not connected; the pond service is starting or unavailable. Check the gateway logs.",
       };
     }
-    try {
-      return await this.client.callTool(name, args);
-    } catch (error) {
-      return { ok: false, error: `pond call failed: ${String(error instanceof Error ? error.message : error)}` };
-    }
+    return relayPondCall(this.client, name, args);
   }
 
   private async dial(): Promise<void> {
@@ -133,6 +171,7 @@ export class PondController {
         "--sync-every",
         String(this.config.syncIntervalMinutes),
       ],
+      env: pondChildEnv(),
     });
   }
 

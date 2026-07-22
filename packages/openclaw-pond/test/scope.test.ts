@@ -1,9 +1,10 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
 import {
+  a2aGrantsAllAgents,
   agentIdFromSessionKey,
   isGroupContext,
-  isLeafSubagentContext,
+  isSubagentContext,
   resolvePondScope,
   resolveScopeFromContext,
   type ScopeContext,
@@ -39,10 +40,11 @@ describe("helpers", () => {
     expect(agentIdFromSessionKey(undefined)).toBeUndefined();
   });
 
-  it("hides tools from sandboxed leaf subagents only", () => {
-    expect(isLeafSubagentContext({ sessionKey: "agent:a1:subagent:x", sandboxed: true })).toBe(true);
-    expect(isLeafSubagentContext({ sessionKey: "agent:a1:subagent:x", sandboxed: false })).toBe(false);
-    expect(isLeafSubagentContext({ sessionKey: KEY, sandboxed: true })).toBe(false);
+  it("hides tools from every subagent context, sandboxed or not", () => {
+    expect(isSubagentContext({ sessionKey: "agent:a1:subagent:x", sandboxed: true })).toBe(true);
+    expect(isSubagentContext({ sessionKey: "agent:a1:subagent:x", sandboxed: false })).toBe(true);
+    expect(isSubagentContext({ sessionKey: "agent:a1:subagent:x" })).toBe(true);
+    expect(isSubagentContext({ sessionKey: KEY, sandboxed: true })).toBe(false);
   });
 
   it("detects group/channel context", () => {
@@ -54,14 +56,14 @@ describe("helpers", () => {
 
 describe("resolvePondScope translation matrix", () => {
   it("self pins the exact session key", () => {
-    const r = resolvePondScope({ visibility: "self", a2aEnabled: false, ctx: baseCtx, groupSessions: "clamp" });
+    const r = resolvePondScope({ visibility: "self", a2aGrantsAll: false, ctx: baseCtx, groupSessions: "clamp" });
     expect(r).toEqual({ ok: true, project: KEY });
   });
 
   it("self fails closed without a session key", () => {
     const r = resolvePondScope({
       visibility: "self",
-      a2aEnabled: false,
+      a2aGrantsAll: false,
       ctx: { agentId: "a1" },
       groupSessions: "clamp",
     });
@@ -70,7 +72,7 @@ describe("resolvePondScope translation matrix", () => {
 
   it("tree and agent both clamp to the own-agent prefix", () => {
     for (const visibility of ["tree", "agent"] as const) {
-      const r = resolvePondScope({ visibility, a2aEnabled: false, ctx: baseCtx, groupSessions: "clamp" });
+      const r = resolvePondScope({ visibility, a2aGrantsAll: false, ctx: baseCtx, groupSessions: "clamp" });
       expect(r).toEqual({ ok: true, project: "agent:a1:" });
     }
   });
@@ -78,7 +80,7 @@ describe("resolvePondScope translation matrix", () => {
   it("derives the agent prefix from the session key when agentId is absent", () => {
     const r = resolvePondScope({
       visibility: "tree",
-      a2aEnabled: false,
+      a2aGrantsAll: false,
       ctx: { sessionKey: "agent:x9:main" },
       groupSessions: "clamp",
     });
@@ -86,26 +88,26 @@ describe("resolvePondScope translation matrix", () => {
   });
 
   it("all without agent-to-agent clamps to the own agent", () => {
-    const r = resolvePondScope({ visibility: "all", a2aEnabled: false, ctx: baseCtx, groupSessions: "clamp" });
+    const r = resolvePondScope({ visibility: "all", a2aGrantsAll: false, ctx: baseCtx, groupSessions: "clamp" });
     expect(r).toEqual({ ok: true, project: "agent:a1:" });
   });
 
   it("all with agent-to-agent drops the project clamp", () => {
-    const r = resolvePondScope({ visibility: "all", a2aEnabled: true, ctx: baseCtx, groupSessions: "clamp" });
+    const r = resolvePondScope({ visibility: "all", a2aGrantsAll: true, ctx: baseCtx, groupSessions: "clamp" });
     expect(r).toEqual({ ok: true });
   });
 
   it("fails closed when identity is missing for a scope that needs it", () => {
-    const r = resolvePondScope({ visibility: "tree", a2aEnabled: false, ctx: {}, groupSessions: "clamp" });
+    const r = resolvePondScope({ visibility: "tree", a2aGrantsAll: false, ctx: {}, groupSessions: "clamp" });
     expect(r.ok).toBe(false);
   });
 
   it("group context clamps agent/all down to tree unless inherit", () => {
     const groupCtx: ScopeContext = { sessionKey: "agent:a1:telegram:group:1", agentId: "a1", messageChannel: "telegram" };
     // all + a2a would normally drop the clamp; group clamp forces tree -> own agent.
-    const clamped = resolvePondScope({ visibility: "all", a2aEnabled: true, ctx: groupCtx, groupSessions: "clamp" });
+    const clamped = resolvePondScope({ visibility: "all", a2aGrantsAll: true, ctx: groupCtx, groupSessions: "clamp" });
     expect(clamped).toEqual({ ok: true, project: "agent:a1:" });
-    const inherited = resolvePondScope({ visibility: "all", a2aEnabled: true, ctx: groupCtx, groupSessions: "inherit" });
+    const inherited = resolvePondScope({ visibility: "all", a2aGrantsAll: true, ctx: groupCtx, groupSessions: "inherit" });
     expect(inherited).toEqual({ ok: true });
   });
 });
@@ -128,6 +130,39 @@ describe("resolveScopeFromContext (SDK-backed)", () => {
     expect(denied.scope).toEqual({ ok: true, project: "agent:a1:" });
     const allowed = resolveScopeFromContext({ cfg: cfg({ visibility: "all", a2aEnabled: true }), ctx: baseCtx, groupSessions: "clamp" });
     expect(allowed.scope).toEqual({ ok: true });
+  });
+
+  it("a restricted a2a allow list keeps the own-agent clamp (inexpressible in one substring)", () => {
+    // Core grants cross-agent reads per target via matchesAllow; a restricted
+    // list cannot be expressed in pond's single substring, so unclamping would
+    // over-expose. Both a non-listed and a listed requester stay clamped.
+    for (const allow of [["other"], ["a1", "other"]]) {
+      const out = resolveScopeFromContext({
+        cfg: cfg({ visibility: "all", a2aEnabled: true, a2aAllow: allow }),
+        ctx: baseCtx,
+        groupSessions: "clamp",
+      });
+      expect(out.scope).toEqual({ ok: true, project: "agent:a1:" });
+    }
+  });
+
+  it("an unrestricted a2a allow list (empty or *) drops the clamp", () => {
+    for (const allow of [[], ["*"]]) {
+      const out = resolveScopeFromContext({
+        cfg: cfg({ visibility: "all", a2aEnabled: true, a2aAllow: allow }),
+        ctx: baseCtx,
+        groupSessions: "clamp",
+      });
+      expect(out.scope).toEqual({ ok: true });
+    }
+  });
+
+  it("a2aGrantsAllAgents requires enabled and an unrestricted list", () => {
+    expect(a2aGrantsAllAgents(cfg({ a2aEnabled: true }))).toBe(true);
+    expect(a2aGrantsAllAgents(cfg({ a2aEnabled: true, a2aAllow: ["*"] }))).toBe(true);
+    expect(a2aGrantsAllAgents(cfg({ a2aEnabled: true, a2aAllow: ["other"] }))).toBe(false);
+    expect(a2aGrantsAllAgents(cfg({ a2aEnabled: false }))).toBe(false);
+    expect(a2aGrantsAllAgents({})).toBe(false);
   });
 
   it("sandbox clamp drops non-tree visibility to tree", () => {

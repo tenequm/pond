@@ -19,10 +19,11 @@ function register(api: OpenClawPluginApi): void {
   }
 
   const config = parsePluginConfig(api.pluginConfig);
+  // api.logger routes into OpenClaw's structured plugins logger.
   const logger = {
-    info: (message: string) => console.info(`[pond] ${message}`),
-    warn: (message: string) => console.warn(`[pond] ${message}`),
-    error: (message: string) => console.error(`[pond] ${message}`),
+    info: (message: string) => api.logger.info(`[pond] ${message}`),
+    warn: (message: string) => api.logger.warn(`[pond] ${message}`),
+    error: (message: string) => api.logger.error(`[pond] ${message}`),
   };
   const controller = new PondController(config, logger);
 
