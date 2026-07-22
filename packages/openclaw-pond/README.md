@@ -174,12 +174,15 @@ npm run typecheck   # tsc against the SDK stubs (canonical local gate)
 npm test            # vitest: golden MCP fixtures, scope matrix, GBNF conformance
 ```
 
-`npm run build` (`tsconfig.build.json`) compiles against the **real** `openclaw`
-peer and therefore only succeeds where the host is installed (a publish
-environment); the OpenClaw extension entry is the TypeScript source `./index.ts`,
-so a source-checkout install needs no prior build. Real host-compatibility is
-proven with the `npm-pack:` install flow from OpenClaw's plugin docs, not the
-local stub typecheck.
+`npm run build` (`tsconfig.build.json`) emits `dist/` - typechecked against
+the same local doubles, while the emitted JavaScript keeps its bare
+`openclaw/plugin-sdk/*` import specifiers for the Gateway to supply at
+runtime. Packaged installs need it: OpenClaw's installer requires compiled
+output (`./dist/index.js`) next to a TypeScript entry - the TS-source
+fallback covers only `plugins.load.paths` checkouts - so `npm pack` builds
+`dist/` automatically via `prepack`. Real host-compatibility is proven by
+installing the packed tarball into a live OpenClaw, not by the local stub
+typecheck.
 
 ## Tests
 

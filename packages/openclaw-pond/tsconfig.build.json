@@ -1,7 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "paths": {},
     "noEmit": false
   },
   "include": ["index.ts", "src/**/*.ts"]
