@@ -34,20 +34,28 @@ export class PondMcpClient {
     return this.client !== null;
   }
 
-  async connect(transport: Transport, opts?: { onClose?: () => void }): Promise<void> {
+  async connect(
+    transport: Transport,
+    opts?: { onClose?: () => void; timeoutMs?: number },
+  ): Promise<void> {
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     if (opts?.onClose) {
       client.onclose = opts.onClose;
     }
-    await client.connect(transport);
+    // The initialize handshake is where a hung child actually stalls; the SDK
+    // default is 60s, so callers pass a deadline suited to a local sidecar.
+    await client.connect(transport, opts?.timeoutMs ? { timeout: opts.timeoutMs } : undefined);
     this.client = client;
   }
 
-  async listToolNames(): Promise<string[]> {
+  async listToolNames(opts?: { timeoutMs?: number }): Promise<string[]> {
     if (!this.client) {
       throw new Error("pond MCP client is not connected");
     }
-    const result = await this.client.listTools();
+    const result = await this.client.listTools(
+      undefined,
+      opts?.timeoutMs ? { timeout: opts.timeoutMs } : undefined,
+    );
     return result.tools.map((tool) => tool.name);
   }
 

@@ -27,6 +27,8 @@ In the default **managed** mode the plugin locates the `pond` binary
 (config `pond.binaryPath`, else `PATH`) and supervises
 `pond serve --transport stdio --with-sync`, speaking MCP over the child's stdio -
 no port, no token, no auth surface. It restarts the child with backoff on exit.
+The child runs at low scheduling priority (`nice -n 19`), so background sync
+never competes with interactive work.
 
 If pond is missing, the service fails with a message naming the exact fix:
 install pond, then run `pond init` once (which also enables the `openclaw`

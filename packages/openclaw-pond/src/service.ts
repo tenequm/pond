@@ -21,6 +21,10 @@ export type PondLogger = {
 
 const RESTART_BASE_DELAY_MS = 500;
 const RESTART_MAX_DELAY_MS = 30_000;
+// Local-sidecar deadline for the initialize handshake and the tool-list probe
+// (OpenClaw's house pattern probes local children with a 10s deadline); the
+// SDK default of 60s would let a hung child stall gateway startup.
+const DIAL_TIMEOUT_MS = 10_000;
 
 // The MCP SDK's stdio transport passes the child a fixed safelist (HOME, PATH,
 // USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
@@ -115,6 +119,12 @@ export class PondController {
     await this.dial();
   }
 
+  // Idempotent: both the service stop and the runtime-lifecycle cleanup route
+  // here, and core may fire both on shutdown. Child teardown is the SDK stdio
+  // transport's close() ladder - stdin end, 2s wait, SIGTERM, 2s wait, SIGKILL.
+  // Signalling the direct child suffices: `pond serve` is a single Rust process
+  // that spawns no descendants (and `nice` execs in place, same pid), so a
+  // core-style process-tree kill would enumerate exactly this one pid.
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.restartTimer) {
@@ -141,11 +151,14 @@ export class PondController {
     try {
       const transport =
         this.config.mode === "url" ? this.dialHttp() : this.dialStdio();
-      await this.client.connect(transport, { onClose: () => this.handleDisconnect() });
+      await this.client.connect(transport, {
+        onClose: () => this.handleDisconnect(),
+        timeoutMs: DIAL_TIMEOUT_MS,
+      });
       // Probe the handshake so a dead transport fails here, not on first tool
       // call. An uninitialized store is NOT caught by this: `pond serve` starts
       // and lists tools regardless; its own sync WARN names the `pond init` fix.
-      await this.client.listToolNames();
+      await this.client.listToolNames({ timeoutMs: DIAL_TIMEOUT_MS });
       this.attempt = 0;
       this.logger.info(`pond connected (${this.config.mode} mode).`);
     } catch (error) {
@@ -162,10 +175,18 @@ export class PondController {
   }
 
   private dialStdio() {
-    const command = resolvePondBinary(this.config.binaryPath);
+    // Resolve first so a missing install still fails with the named fix, then
+    // wrap in `nice -n 19` (posix): background sync must never compete with
+    // interactive work. `nice` execs pond in place - the child pid IS pond, so
+    // the stop() ladder signals the right process. Skipped on Windows.
+    const pondBin = resolvePondBinary(this.config.binaryPath);
+    const posix = process.platform !== "win32";
+    const command = posix ? "nice" : pondBin;
+    const prefix = posix ? ["-n", "19", pondBin] : [];
     return createStdioTransport({
       command,
       args: [
+        ...prefix,
         "serve",
         "--transport",
         "stdio",
