@@ -1,0 +1,171 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { AgentToolResult, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import { afterEach, describe, expect, it } from "vitest";
+import type { PondPluginConfig } from "../src/config.js";
+import { parsePluginConfig } from "../src/config.js";
+import { RESPONSE_MAX_BYTES } from "../src/schemas.js";
+import { createPondToolFactories } from "../src/tools.js";
+import { createFakePond, type FakePond, type FakePondOptions } from "./fake-pond.js";
+
+const config = parsePluginConfig(undefined);
+
+let fake: FakePond | undefined;
+afterEach(async () => {
+  await fake?.close();
+  fake = undefined;
+});
+
+type HarnessOptions = FakePondOptions & {
+  config?: PondPluginConfig;
+  logger?: { warn: (message: string) => void };
+};
+
+async function harness(options: HarnessOptions = {}) {
+  fake = await createFakePond(options.responses ? { responses: options.responses } : {});
+  const factories = createPondToolFactories({
+    config: options.config ?? config,
+    ...(options.logger ? { logger: options.logger } : {}),
+    callPond: (name, args) => fake!.client.callTool(name, args),
+  });
+  return { factories, calls: fake.calls };
+}
+
+function mainCtx(cfg: OpenClawConfig = {}): OpenClawPluginToolContext {
+  return { sessionKey: "agent:main:main", agentId: "main", config: cfg };
+}
+
+function details(result: AgentToolResult): { status: string; text?: string; error?: string } {
+  return result.details as { status: string; text?: string; error?: string };
+}
+
+describe("pond_search", () => {
+  it("clamps the project to the caller's scope and caps the limit (golden request)", async () => {
+    const { factories, calls } = await harness({ responses: { pond_search: () => "SEARCH RESULT" } });
+    const tool = factories.search(mainCtx());
+    expect(tool).not.toBeNull();
+    const out = await tool!.execute("id", { query: "hello world", limit: 100 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      name: "pond_search",
+      args: { query: "hello world", project: "agent:main:", limit: 25, source_agent: "openclaw" },
+    });
+    expect(details(out)).toEqual({ status: "ok", text: "SEARCH RESULT" });
+  });
+
+  it("forwards the default source_agent filter (openclaw)", async () => {
+    const { factories, calls } = await harness();
+    await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(calls[0]!.args.source_agent).toBe("openclaw");
+  });
+
+  it("omits source_agent when sources is [\"*\"] (cross-harness corpus)", async () => {
+    const { factories, calls } = await harness({ config: parsePluginConfig({ sources: ["*"] }) });
+    await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(calls[0]!.args).not.toHaveProperty("source_agent");
+  });
+
+  it("forwards the first source and warns once when several are configured", async () => {
+    const warnings: string[] = [];
+    const { factories, calls } = await harness({
+      config: parsePluginConfig({ sources: ["openclaw", "claude-code"] }),
+      logger: { warn: (message) => warnings.push(message) },
+    });
+    await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(calls[0]!.args.source_agent).toBe("openclaw");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("single source");
+  });
+
+  it("lets a caller narrow within scope but never widen it", async () => {
+    const { factories, calls } = await harness();
+    // Narrowing to a full key that contains the scope prefix is honored.
+    await factories.search(mainCtx())!.execute("id", { query: "q", project: "agent:main:telegram:group:1" });
+    expect(calls[0]!.args.project).toBe("agent:main:telegram:group:1");
+    // An out-of-scope narrowing is clamped back to the scope prefix.
+    await factories.search(mainCtx())!.execute("id", { query: "q", project: "agent:other:main" });
+    expect(calls[1]!.args.project).toBe("agent:main:");
+  });
+
+  it("fails closed (forbidden) when the tool context has no identity", async () => {
+    const { factories, calls } = await harness();
+    const out = await factories.search({ config: {} })!.execute("id", { query: "q" });
+    expect(details(out).status).toBe("forbidden");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("redacts secret-shaped text and relays pond output", async () => {
+    const { factories } = await harness({
+      responses: { pond_search: () => "token sk-ABCDEFGHIJKLMNOP0123 done" },
+    });
+    const out = await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(details(out).text).toContain("[redacted]");
+    expect(details(out).text).not.toContain("sk-ABCDEFGHIJKLMNOP0123");
+  });
+
+  it("byte-caps oversized responses", async () => {
+    const big = "x".repeat(RESPONSE_MAX_BYTES + 5000);
+    const { factories } = await harness({ responses: { pond_search: () => big } });
+    const out = await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(details(out).text!.length).toBeLessThan(big.length);
+    expect(details(out).text).toContain("truncated");
+  });
+
+  it("surfaces a pond tool error as a typed error result", async () => {
+    const { factories } = await harness({
+      responses: { pond_search: () => ({ text: "store unavailable", isError: true }) },
+    });
+    const out = await factories.search(mainCtx())!.execute("id", { query: "q" });
+    expect(details(out)).toEqual({ status: "error", error: "store unavailable" });
+  });
+});
+
+describe("pond_get", () => {
+  it("forwards a session read (golden request/response)", async () => {
+    const { factories, calls } = await harness({ responses: { pond_get: () => "TRANSCRIPT" } });
+    const out = await factories.get(mainCtx())!.execute("id", { session_id: "s1", session_from: "end" });
+    expect(calls[0]).toMatchObject({ name: "pond_get", args: { session_id: "s1", session_from: "end" } });
+    expect(details(out)).toEqual({ status: "ok", text: "TRANSCRIPT" });
+  });
+
+  it("rejects passing neither or both of session_id/message_id", async () => {
+    const { factories, calls } = await harness();
+    expect(details(await factories.get(mainCtx())!.execute("id", {})).status).toBe("error");
+    expect(
+      details(await factories.get(mainCtx())!.execute("id", { session_id: "s", message_id: "m" })).status,
+    ).toBe("error");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("pond_sql_query", () => {
+  it("is forbidden below visibility=all and names the knob", async () => {
+    const { factories, calls } = await harness();
+    const out = await factories.sql(mainCtx())!.execute("id", { query: "SELECT 1" });
+    expect(details(out).status).toBe("forbidden");
+    expect(details(out).error).toContain("tools.sessions.visibility=all");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("forwards when the operator set visibility=all", async () => {
+    const { factories, calls } = await harness({ responses: { pond_sql_query: () => "ROWS" } });
+    const cfg: OpenClawConfig = { tools: { sessions: { visibility: "all" }, agentToAgent: { enabled: true } } };
+    const out = await factories.sql(mainCtx(cfg))!.execute("id", { query: "SELECT 1", format: "ndjson" });
+    expect(calls[0]).toMatchObject({ name: "pond_sql_query", args: { query: "SELECT 1", format: "ndjson" } });
+    expect(details(out)).toEqual({ status: "ok", text: "ROWS" });
+  });
+});
+
+describe("subagent leaf denial", () => {
+  it("hides every pond tool from a sandboxed leaf subagent", async () => {
+    const { factories } = await harness();
+    const leaf: OpenClawPluginToolContext = {
+      sessionKey: "agent:main:subagent:abc",
+      agentId: "main",
+      sandboxed: true,
+      config: {},
+    };
+    expect(factories.search(leaf)).toBeNull();
+    expect(factories.get(leaf)).toBeNull();
+    expect(factories.sql(leaf)).toBeNull();
+  });
+});

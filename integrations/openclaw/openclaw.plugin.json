@@ -1,0 +1,51 @@
+{
+  "id": "pond",
+  "name": "Pond",
+  "description": "Durable, lossless recall over past agent sessions. Read-only pond_search / pond_get / pond_sql_query tools backed by a local pond store.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["pond_search", "pond_get", "pond_sql_query"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pond": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["managed", "url"]
+          },
+          "syncIntervalMinutes": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 1440
+          },
+          "binaryPath": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "sources": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "maxItems": 50
+      },
+      "groupSessions": {
+        "type": "string",
+        "enum": ["clamp", "inherit"]
+      }
+    }
+  }
+}

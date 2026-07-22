@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "openclaw/plugin-sdk/plugin-entry": ["./test/stubs/openclaw/plugin-sdk/plugin-entry.ts"],
+      "openclaw/plugin-sdk/session-visibility": ["./test/stubs/openclaw/plugin-sdk/session-visibility.ts"],
+      "openclaw/plugin-sdk/logging-core": ["./test/stubs/openclaw/plugin-sdk/logging-core.ts"],
+      "openclaw/plugin-sdk/config-contracts": ["./test/stubs/openclaw/plugin-sdk/config-contracts.ts"]
+    }
+  },
+  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts"]
+}
