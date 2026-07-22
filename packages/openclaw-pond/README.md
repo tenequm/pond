@@ -28,9 +28,11 @@ In the default **managed** mode the plugin locates the `pond` binary
 `pond serve --transport stdio --with-sync`, speaking MCP over the child's stdio -
 no port, no token, no auth surface. It restarts the child with backoff on exit.
 
-If pond is missing or the store is not initialized, the service fails with a
-message naming the exact fix: install pond, then run `pond init` once (which also
-enables the `openclaw` adapter). The plugin never writes pond config.
+If pond is missing, the service fails with a message naming the exact fix:
+install pond, then run `pond init` once (which also enables the `openclaw`
+adapter). An uninitialized store does not block startup - `pond serve` runs
+and its sync log names the `pond init` fix. The plugin never writes pond
+config.
 
 ## Configuration
 

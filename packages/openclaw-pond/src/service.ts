@@ -142,7 +142,9 @@ export class PondController {
       const transport =
         this.config.mode === "url" ? this.dialHttp() : this.dialStdio();
       await this.client.connect(transport, { onClose: () => this.handleDisconnect() });
-      // Probe the handshake so an uninitialized store surfaces the fix now.
+      // Probe the handshake so a dead transport fails here, not on first tool
+      // call. An uninitialized store is NOT caught by this: `pond serve` starts
+      // and lists tools regardless; its own sync WARN names the `pond init` fix.
       await this.client.listToolNames();
       this.attempt = 0;
       this.logger.info(`pond connected (${this.config.mode} mode).`);

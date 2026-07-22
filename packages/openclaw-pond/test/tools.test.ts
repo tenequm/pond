@@ -102,7 +102,7 @@ describe("pond_search", () => {
       responses: { pond_search: () => "token sk-ABCDEFGHIJKLMNOP0123 done" },
     });
     const out = await factories.search(mainCtx())!.execute("id", { query: "q" });
-    expect(details(out).text).toContain("[redacted]");
+    expect(details(out).text).toContain("sk-ABC…0123");
     expect(details(out).text).not.toContain("sk-ABCDEFGHIJKLMNOP0123");
   });
 
