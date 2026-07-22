@@ -54,7 +54,11 @@ export default defineConfig({
     pattern: 'https://github.com/tenequm/pond/edit/main/docs/site/src/pages/:path',
     text: 'Suggest changes to this page',
   },
-  socials: [{ icon: 'github', link: 'https://github.com/tenequm/pond' }],
+  socials: [
+    { icon: 'github', link: 'https://github.com/tenequm/pond' },
+    { icon: 'telegram', link: 'https://t.me/tenequm' },
+    { icon: 'x', link: 'https://x.com/opwizardx' },
+  ],
   topNav: [
     { text: 'Quickstart', link: '/get-started/quickstart' },
     { text: 'Reference', link: '/reference/cli' },
