@@ -1,7 +1,8 @@
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
-  GetParamsSchema,
+  GetMessageParamsSchema,
+  GetSessionParamsSchema,
   SearchParamsSchema,
   SqlParamsSchema,
   ToolOutputSchema,
@@ -11,8 +12,9 @@ import { findGbnfViolations } from "./gbnf.js";
 describe("tool parameter schemas are GBNF-safe", () => {
   const cases = [
     ["pond_search", SearchParamsSchema],
-    ["pond_get", GetParamsSchema],
-    ["pond_sql_query", SqlParamsSchema],
+    ["pond_get_session", GetSessionParamsSchema],
+    ["pond_get_message", GetMessageParamsSchema],
+    ["pond_sql", SqlParamsSchema],
   ] as const;
 
   for (const [name, schema] of cases) {

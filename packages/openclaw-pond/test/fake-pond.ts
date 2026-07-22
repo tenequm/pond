@@ -20,7 +20,7 @@ export type FakePond = {
   close: () => Promise<void>;
 };
 
-const TOOL_NAMES = ["pond_search", "pond_get", "pond_sql_query"];
+const TOOL_NAMES = ["pond_search", "pond_get_session", "pond_get_message", "pond_sql"];
 
 export async function createFakePond(options: FakePondOptions = {}): Promise<FakePond> {
   const calls: RecordedCall[] = [];

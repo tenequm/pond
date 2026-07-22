@@ -1,4 +1,4 @@
-// TypeBox parameter and output schemas for the three projected pond tools.
+// TypeBox parameter and output schemas for the four projected pond tools.
 //
 // Contract mirrors OpenClaw core's sessions_search (src/agents/tools/
 // sessions-search-tool.ts): additionalProperties:false, named bound constants,
@@ -31,18 +31,25 @@ export const SearchParamsSchema = Type.Object(
   additional,
 );
 
-// session_id and message_id are mutually exclusive, validated at runtime rather
-// than via a top-level oneOf that GBNF cannot express.
-export const GetParamsSchema = Type.Object(
+// Mirrors pond's split get surface: intent lives in the tool name, each takes
+// one required `id` (get_session also accepts a message id server-side - it
+// resolves up to the parent session).
+export const GetSessionParamsSchema = Type.Object(
   {
-    session_id: Type.Optional(Type.String({ maxLength: 512 })),
-    message_id: Type.Optional(Type.String({ maxLength: 512 })),
-    session_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
-    session_from: Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("end")])),
-    session_after_message_id: Type.Optional(Type.String({ maxLength: 512 })),
-    session_before_message_id: Type.Optional(Type.String({ maxLength: 512 })),
-    message_context_before: Type.Optional(Type.Integer({ minimum: 0, maximum: 25 })),
-    message_context_after: Type.Optional(Type.Integer({ minimum: 0, maximum: 25 })),
+    id: Type.String({ maxLength: 512 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+    from: Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("end")])),
+    after_message_id: Type.Optional(Type.String({ maxLength: 512 })),
+    before_message_id: Type.Optional(Type.String({ maxLength: 512 })),
+  },
+  additional,
+);
+
+export const GetMessageParamsSchema = Type.Object(
+  {
+    id: Type.String({ maxLength: 512 }),
+    context_before: Type.Optional(Type.Integer({ minimum: 0, maximum: 25 })),
+    context_after: Type.Optional(Type.Integer({ minimum: 0, maximum: 25 })),
   },
   additional,
 );
@@ -72,5 +79,6 @@ export const ToolOutputSchema = Type.Union([
 ]);
 
 export type SearchParams = Static<typeof SearchParamsSchema>;
-export type GetParams = Static<typeof GetParamsSchema>;
+export type GetSessionParams = Static<typeof GetSessionParamsSchema>;
+export type GetMessageParams = Static<typeof GetMessageParamsSchema>;
 export type SqlParams = Static<typeof SqlParamsSchema>;

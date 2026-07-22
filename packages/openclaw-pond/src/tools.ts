@@ -1,15 +1,12 @@
-// The three projected pond tools. Each forwards to pond over MCP, after
+// The four projected pond tools. Each forwards to pond over MCP, after
 // resolving the caller's scope and clamping filters. pond renders its own
 // agent-facing transcript text (its MCP surface is text, not structured hits),
 // so the plugin relays that text redacted and byte-bounded, with a typed
 // forbidden/error union - mirroring core sessions_search's contract shape.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { redactToolPayloadText } from "openclaw/plugin-sdk/logging-core";
-import type {
-  AgentToolResult,
-  AnyAgentTool,
-  OpenClawPluginToolContext,
-} from "openclaw/plugin-sdk/plugin-entry";
+import type { AnyAgentTool, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { AgentToolResult } from "openclaw/plugin-sdk/tool-results";
 import type { PondPluginConfig } from "./config.js";
 import type { PondCallResult } from "./mcp.js";
 import {
@@ -23,10 +20,12 @@ import {
   SEARCH_DEFAULT_LIMIT,
   SEARCH_MAX_LIMIT,
   SearchParamsSchema,
-  GetParamsSchema,
+  GetSessionParamsSchema,
+  GetMessageParamsSchema,
   SqlParamsSchema,
   ToolOutputSchema,
-  type GetParams,
+  type GetSessionParams,
+  type GetMessageParams,
   type SearchParams,
   type SqlParams,
 } from "./schemas.js";
@@ -65,19 +64,19 @@ function resolveSourceAgent(
 
 type OutputStatus = { status: "ok"; text: string } | { status: "forbidden" | "error"; error: string };
 
-function result(details: OutputStatus, text: string): AgentToolResult {
+function result(details: OutputStatus, text: string): AgentToolResult<OutputStatus> {
   return { content: [{ type: "text", text }], details };
 }
 
-function okResult(text: string): AgentToolResult {
+function okResult(text: string): AgentToolResult<OutputStatus> {
   return result({ status: "ok", text }, text);
 }
 
-function forbiddenResult(error: string): AgentToolResult {
+function forbiddenResult(error: string): AgentToolResult<OutputStatus> {
   return result({ status: "forbidden", error }, error);
 }
 
-function errorResult(error: string): AgentToolResult {
+function errorResult(error: string): AgentToolResult<OutputStatus> {
   return result({ status: "error", error }, error);
 }
 
@@ -104,7 +103,11 @@ function scopeContext(ctx: OpenClawPluginToolContext): ScopeContext {
   };
 }
 
-async function relay(deps: PondToolDeps, name: string, args: Record<string, unknown>): Promise<AgentToolResult> {
+async function relay(
+  deps: PondToolDeps,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<AgentToolResult<OutputStatus>> {
   const response = await deps.callPond(name, args);
   if (!response.ok) {
     return errorResult(response.error);
@@ -113,20 +116,27 @@ async function relay(deps: PondToolDeps, name: string, args: Record<string, unkn
 }
 
 const SEARCH_DESCRIPTION =
-  "Semantic search over your durable pond corpus of past agent sessions (Claude Code, OpenClaw, and " +
-  "others). Returns pond's rendered transcript: results grouped by session, best first. Pick `mode`: " +
-  "\"vector\" (default, meaning) or \"fts\" (exact words, BM25). Pass a returned message_id to pond_get. " +
-  "Results are scoped to the sessions you may already read.";
+  "Find relevant messages in your durable pond corpus of past agent sessions (Claude Code, OpenClaw, " +
+  "and others). Returns pond's rendered transcript: results grouped by session, best first. Pick `mode`: " +
+  "\"vector\" (default, meaning) or \"fts\" (exact words, BM25). Pass a hit's session_id to " +
+  "pond_get_session or its message_id to pond_get_message. Results are scoped to the sessions you may " +
+  "already read.";
 
-const GET_DESCRIPTION =
-  "Read stored conversation content from pond as a readable transcript. Pass exactly one of session_id " +
-  "(the whole session) or message_id (that message with full tool_call/tool_result bodies plus neighbors). " +
-  "Use the ids returned by pond_search.";
+const GET_SESSION_DESCRIPTION =
+  "Read a whole past session from pond as a chronological transcript - the tool for analyzing, " +
+  "reviewing, or summarizing a session. Pass an id from pond_search (a message_id also works: it " +
+  "resolves to its parent session anchored at that message). from=\"end\" reads the most recent turns; " +
+  "after_message_id / before_message_id page on from a page marker.";
+
+const GET_MESSAGE_DESCRIPTION =
+  "Expand one pond message with its full part bodies (tool_call / tool_result / reasoning) plus " +
+  "conversational neighbors; context_before / context_after size the window (like grep -B/-A). Pass a " +
+  "message_id from pond_search; for the whole session use pond_get_session.";
 
 const SQL_DESCRIPTION =
-  "Run ONE read-only SQL SELECT over pond's corpus as three tables (sessions, messages, parts) for " +
-  "analytics: filtering, joins, counts, group-by. Cross-session analytics tool; available when your " +
-  "session visibility is `all`. Use pond_search/pond_get for scoped reads.";
+  "Advanced escape hatch: run ONE read-only SQL SELECT over pond's corpus as three tables (sessions, " +
+  "messages, parts) for analytics: filtering, joins, counts, group-by. Cross-session analytics tool; " +
+  "available when your session visibility is `all`. Use pond_search / pond_get_session for scoped reads.";
 
 export function createPondToolFactories(deps: PondToolDeps) {
   const sourceAgent = resolveSourceAgent(deps.config.sources, deps.logger?.warn);
@@ -170,27 +180,26 @@ export function createPondToolFactories(deps: PondToolDeps) {
     };
   };
 
-  const get = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
+  // Gets are targeted follow-ups to a scoped search; enforce the same
+  // ctx/leaf/fail-closed gate. The get tools have no project filter and their
+  // MCP output is text, so per-target scope is not re-verified server-side -
+  // this is deliberate (policy, not a security boundary against the operator).
+  const getSession = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
     if (isLeafSubagentContext(scopeContext(ctx))) {
       return null;
     }
     return {
-      name: "pond_get",
-      label: "Pond Get",
-      description: GET_DESCRIPTION,
-      parameters: GetParamsSchema,
+      name: "pond_get_session",
+      label: "Pond Get Session",
+      description: GET_SESSION_DESCRIPTION,
+      parameters: GetSessionParamsSchema,
       outputSchema: ToolOutputSchema,
       execute: async (_id, rawArgs) => {
-        const args = rawArgs as GetParams;
-        const hasSession = typeof args.session_id === "string" && args.session_id.length > 0;
-        const hasMessage = typeof args.message_id === "string" && args.message_id.length > 0;
-        if (hasSession === hasMessage) {
-          return errorResult("pass exactly one of session_id or message_id");
+        const args = rawArgs as GetSessionParams;
+        const id = typeof args.id === "string" ? args.id.trim() : "";
+        if (!id) {
+          return errorResult("id must not be empty");
         }
-        // Get is a targeted follow-up to a scoped search; enforce the same
-        // ctx/leaf/fail-closed gate. pond_get has no project filter and its MCP
-        // output is text, so per-target scope is not re-verified server-side -
-        // this is deliberate (policy, not a security boundary against the operator).
         const { scope } = resolveScopeFromContext({
           cfg: resolveConfig(ctx),
           ctx: scopeContext(ctx),
@@ -199,23 +208,48 @@ export function createPondToolFactories(deps: PondToolDeps) {
         if (!scope.ok) {
           return forbiddenResult(scope.error);
         }
-        const pondArgs: Record<string, unknown> = {};
-        for (const key of [
-          "session_id",
-          "message_id",
-          "session_from",
-          "session_after_message_id",
-          "session_before_message_id",
-        ] as const) {
+        const pondArgs: Record<string, unknown> = { id };
+        if (args.from) pondArgs.from = args.from;
+        if (typeof args.limit === "number") pondArgs.limit = args.limit;
+        for (const key of ["after_message_id", "before_message_id"] as const) {
           const value = args[key];
           if (typeof value === "string" && value.length > 0) {
             pondArgs[key] = value;
           }
         }
-        if (typeof args.session_limit === "number") pondArgs.session_limit = args.session_limit;
-        if (typeof args.message_context_before === "number") pondArgs.message_context_before = args.message_context_before;
-        if (typeof args.message_context_after === "number") pondArgs.message_context_after = args.message_context_after;
-        return relay(deps, "pond_get", pondArgs);
+        return relay(deps, "pond_get_session", pondArgs);
+      },
+    };
+  };
+
+  const getMessage = (ctx: OpenClawPluginToolContext): AnyAgentTool | null => {
+    if (isLeafSubagentContext(scopeContext(ctx))) {
+      return null;
+    }
+    return {
+      name: "pond_get_message",
+      label: "Pond Get Message",
+      description: GET_MESSAGE_DESCRIPTION,
+      parameters: GetMessageParamsSchema,
+      outputSchema: ToolOutputSchema,
+      execute: async (_id, rawArgs) => {
+        const args = rawArgs as GetMessageParams;
+        const id = typeof args.id === "string" ? args.id.trim() : "";
+        if (!id) {
+          return errorResult("id must not be empty");
+        }
+        const { scope } = resolveScopeFromContext({
+          cfg: resolveConfig(ctx),
+          ctx: scopeContext(ctx),
+          groupSessions: deps.config.groupSessions,
+        });
+        if (!scope.ok) {
+          return forbiddenResult(scope.error);
+        }
+        const pondArgs: Record<string, unknown> = { id };
+        if (typeof args.context_before === "number") pondArgs.context_before = args.context_before;
+        if (typeof args.context_after === "number") pondArgs.context_after = args.context_after;
+        return relay(deps, "pond_get_message", pondArgs);
       },
     };
   };
@@ -225,7 +259,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
       return null;
     }
     return {
-      name: "pond_sql_query",
+      name: "pond_sql",
       label: "Pond SQL",
       description: SQL_DESCRIPTION,
       parameters: SqlParamsSchema,
@@ -236,7 +270,7 @@ export function createPondToolFactories(deps: PondToolDeps) {
         if (!query) {
           return errorResult("query must not be empty");
         }
-        // pond_sql_query runs arbitrary read-only SELECT over the whole corpus;
+        // pond_sql runs arbitrary read-only SELECT over the whole corpus;
         // a single substring project filter cannot clamp arbitrary SQL, so gate
         // the analytic tool on the operator's broad opt-in (visibility=all)
         // instead of silently returning unscoped rows to a narrower caller.
@@ -247,17 +281,17 @@ export function createPondToolFactories(deps: PondToolDeps) {
         });
         if (visibility !== "all") {
           return forbiddenResult(
-            `pond_sql_query is cross-session analytics and requires tools.sessions.visibility=all; ` +
-              `current effective scope is "${visibility}". Use pond_search / pond_get for scoped reads.`,
+            `pond_sql is cross-session analytics and requires tools.sessions.visibility=all; ` +
+              `current effective scope is "${visibility}". Use pond_search / pond_get_session for scoped reads.`,
           );
         }
         const pondArgs: Record<string, unknown> = { query };
         if (args.format) pondArgs.format = args.format;
         if (typeof args.timeout_seconds === "number") pondArgs.timeout_seconds = args.timeout_seconds;
-        return relay(deps, "pond_sql_query", pondArgs);
+        return relay(deps, "pond_sql", pondArgs);
       },
     };
   };
 
-  return { search, get, sql };
+  return { search, getSession, getMessage, sql };
 }

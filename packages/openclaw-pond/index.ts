@@ -6,7 +6,7 @@ import { parsePluginConfig } from "./src/config.js";
 import { PondController } from "./src/service.js";
 import { createPondToolFactories } from "./src/tools.js";
 
-const TOOL_NAMES = ["pond_search", "pond_get", "pond_sql_query"] as const;
+const TOOL_NAMES = ["pond_search", "pond_get_session", "pond_get_message", "pond_sql"] as const;
 
 function register(api: OpenClawPluginApi): void {
   // Tool-discovery loads only for ownership metadata; register inert stubs so
@@ -32,8 +32,9 @@ function register(api: OpenClawPluginApi): void {
     callPond: (name, args) => controller.callTool(name, args),
   });
   api.registerTool(factories.search, { name: "pond_search" });
-  api.registerTool(factories.get, { name: "pond_get" });
-  api.registerTool(factories.sql, { name: "pond_sql_query" });
+  api.registerTool(factories.getSession, { name: "pond_get_session" });
+  api.registerTool(factories.getMessage, { name: "pond_get_message" });
+  api.registerTool(factories.sql, { name: "pond_sql" });
 
   api.registerService({
     id: "pond",

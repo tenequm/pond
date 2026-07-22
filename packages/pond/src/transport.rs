@@ -2,7 +2,8 @@
 //! handlers. Both transports dispatch to the same handler functions - no
 //! per-transport behavior divergence.
 //!
-//! HTTP exposes `POST /v1/search`, `POST /v1/get`, and `POST /v1/ingest`. MCP
+//! HTTP exposes `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`,
+//! and `POST /v1/ingest`. MCP
 //! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
 //! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
@@ -22,8 +23,9 @@ pub struct AppState {
 }
 
 pub mod http {
-    //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get`, and the `/mcp`
-    //! route carrying rmcp's streamable-HTTP MCP transport.
+    //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get-session`,
+    //! `POST /v1/get-message`, and the `/mcp` route carrying rmcp's
+    //! streamable-HTTP MCP transport.
 
     use std::net::{IpAddr, SocketAddr};
 
@@ -740,7 +742,8 @@ Examples (4 patterns the agent should recognize):
                            recall: \"have we worked on X\", \"what did we decide about Y\", \
                            \"find the session where...\". mode=\"vector\" (default) matches \
                            meaning; mode=\"fts\" matches exact whole words (BM25). Scope with \
-                           project / session_id / from_date / to_date; keep the query semantic \
+                           project / session_id / source_agent / from_date / to_date; keep the \
+                           query semantic \
                            (concepts, not project names). Returns scored hits grouped by \
                            session, best session first; pass a hit's session_id to \
                            pond_get_session or its message_id to pond_get_message to read \

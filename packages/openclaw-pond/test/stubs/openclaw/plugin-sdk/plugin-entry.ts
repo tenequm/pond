@@ -3,15 +3,13 @@
 // supplies richer types and the live registrar at runtime; this double lets the
 // entry file typecheck and (if imported) run in tests without OpenClaw present.
 import type { OpenClawConfig } from "./config-contracts.js";
+import type { AgentToolResult } from "./tool-results.js";
 
-export type AgentToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  details?: unknown;
-};
-
+// AgentToolResult deliberately does NOT re-export from here: the real
+// plugin-entry never exported it (it lives in plugin-sdk/tool-results).
 export type AnyAgentTool = {
   name: string;
-  label?: string;
+  label: string;
   description: string;
   parameters: unknown;
   outputSchema?: unknown;
@@ -20,7 +18,7 @@ export type AnyAgentTool = {
     args: unknown,
     signal?: AbortSignal,
     onUpdate?: unknown,
-  ) => AgentToolResult | Promise<AgentToolResult>;
+  ) => Promise<AgentToolResult<unknown>>;
 };
 
 export type OpenClawPluginToolContext = {

@@ -7,14 +7,15 @@ plugin is the complete installation.
 pond is the durable, lossless tier beneath OpenClaw's own memory: permanence
 past OpenClaw's disk budget, a cross-harness corpus, off-gateway indexing, and
 restore. This plugin is deliberately **tools only** - no memory slot, no
-auto-recall, no `before_prompt_build` hook, no CLI namespace. It adds three
+auto-recall, no `before_prompt_build` hook, no CLI namespace. It adds four
 tools:
 
 - `pond_search` - semantic / full-text search over past sessions.
-- `pond_get` - read a session or a single message as a transcript.
-- `pond_sql_query` - read-only SQL analytics over the corpus.
+- `pond_get_session` - read a whole session as a transcript.
+- `pond_get_message` - expand one message with its full tool bodies.
+- `pond_sql` - read-only SQL analytics over the corpus.
 
-All three are read-only. pond's MCP surface never exposes a write path.
+All four are read-only. pond's MCP surface never exposes a write path.
 
 ## Install
 
@@ -73,7 +74,7 @@ The plugin reuses OpenClaw's session-visibility SDK, so pond tools only reach
 sessions the agent could already read via `sessions_history`. What agents see by
 default and what each widening step exposes:
 
-| `tools.sessions.visibility` | pond_search / pond_get reach |
+| `tools.sessions.visibility` | pond_search / pond_get_session / pond_get_message reach |
 | --- | --- |
 | `self` | only the current session |
 | `tree` (default) | the caller's own agent (its sessions + spawned children) |
@@ -88,11 +89,11 @@ Notes and deliberate limits:
   leak risk), coarser than a strict tree. `self` pins the exact session key.
 - Group/channel-context callers clamp down to `tree` unless
   `groupSessions: "inherit"` (the private-vs-shared asymmetry).
-- `pond_sql_query` runs arbitrary read-only SELECT over the whole corpus; a
+- `pond_sql` runs arbitrary read-only SELECT over the whole corpus; a
   single substring filter cannot clamp arbitrary SQL, so it is gated on the
   operator's broad opt-in (`tools.sessions.visibility: "all"`) and returns a
-  typed `forbidden` naming the knob otherwise. Use `pond_search` / `pond_get`
-  for scoped reads.
+  typed `forbidden` naming the knob otherwise. Use `pond_search` /
+  `pond_get_session` for scoped reads.
 - Sandboxed leaf subagents get the pond tools hidden entirely (the tool factory
   returns `null`), mirroring core denying `sessions_search` to leaves.
 - `sources: ["*"]` opts into foreign-harness content, which has **no OpenClaw
@@ -105,7 +106,8 @@ Notes and deliberate limits:
 The `openclaw` package is an **optional peer dependency** - the Gateway supplies
 it at runtime. This checkout does not install the OpenClaw monorepo, so
 `typecheck` and `test` resolve the handful of SDK subpaths the plugin uses
-(`plugin-entry`, `session-visibility`, `logging-core`, `config-contracts`) to
+(`plugin-entry`, `tool-results`, `session-visibility`, `logging-core`,
+`config-contracts`) to
 faithful local doubles under `test/stubs/` via tsconfig `paths` and a Vitest
 alias. Everything runs with a plain `npm install`:
 
@@ -124,7 +126,7 @@ local stub typecheck.
 
 ## Tests
 
-- `test/tools.test.ts` - golden request/response fixtures for all three tools
+- `test/tools.test.ts` - golden request/response fixtures for all four tools
   against an in-memory fake pond MCP endpoint (`test/fake-pond.ts`): asserts the
   clamped `project`, limit capping, redaction, byte budget, typed error relay,
   fail-closed, and leaf-subagent hiding.

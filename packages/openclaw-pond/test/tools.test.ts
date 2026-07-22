@@ -1,5 +1,6 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { AgentToolResult, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { AgentToolResult } from "openclaw/plugin-sdk/tool-results";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PondPluginConfig } from "../src/config.js";
 import { parsePluginConfig } from "../src/config.js";
@@ -34,7 +35,7 @@ function mainCtx(cfg: OpenClawConfig = {}): OpenClawPluginToolContext {
   return { sessionKey: "agent:main:main", agentId: "main", config: cfg };
 }
 
-function details(result: AgentToolResult): { status: string; text?: string; error?: string } {
+function details(result: AgentToolResult<unknown>): { status: string; text?: string; error?: string } {
   return result.details as { status: string; text?: string; error?: string };
 }
 
@@ -119,25 +120,37 @@ describe("pond_search", () => {
   });
 });
 
-describe("pond_get", () => {
+describe("pond_get_session", () => {
   it("forwards a session read (golden request/response)", async () => {
-    const { factories, calls } = await harness({ responses: { pond_get: () => "TRANSCRIPT" } });
-    const out = await factories.get(mainCtx())!.execute("id", { session_id: "s1", session_from: "end" });
-    expect(calls[0]).toMatchObject({ name: "pond_get", args: { session_id: "s1", session_from: "end" } });
+    const { factories, calls } = await harness({ responses: { pond_get_session: () => "TRANSCRIPT" } });
+    const out = await factories.getSession(mainCtx())!.execute("id", { id: "s1", from: "end" });
+    expect(calls[0]).toMatchObject({ name: "pond_get_session", args: { id: "s1", from: "end" } });
     expect(details(out)).toEqual({ status: "ok", text: "TRANSCRIPT" });
   });
 
-  it("rejects passing neither or both of session_id/message_id", async () => {
+  it("rejects an empty id before relaying", async () => {
     const { factories, calls } = await harness();
-    expect(details(await factories.get(mainCtx())!.execute("id", {})).status).toBe("error");
-    expect(
-      details(await factories.get(mainCtx())!.execute("id", { session_id: "s", message_id: "m" })).status,
-    ).toBe("error");
+    expect(details(await factories.getSession(mainCtx())!.execute("id", { id: "  " })).status).toBe("error");
     expect(calls).toHaveLength(0);
   });
 });
 
-describe("pond_sql_query", () => {
+describe("pond_get_message", () => {
+  it("forwards a message expansion (golden request/response)", async () => {
+    const { factories, calls } = await harness({ responses: { pond_get_message: () => "MESSAGE" } });
+    const out = await factories.getMessage(mainCtx())!.execute("id", { id: "m1", context_before: 5 });
+    expect(calls[0]).toMatchObject({ name: "pond_get_message", args: { id: "m1", context_before: 5 } });
+    expect(details(out)).toEqual({ status: "ok", text: "MESSAGE" });
+  });
+
+  it("rejects an empty id before relaying", async () => {
+    const { factories, calls } = await harness();
+    expect(details(await factories.getMessage(mainCtx())!.execute("id", { id: "" })).status).toBe("error");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("pond_sql", () => {
   it("is forbidden below visibility=all and names the knob", async () => {
     const { factories, calls } = await harness();
     const out = await factories.sql(mainCtx())!.execute("id", { query: "SELECT 1" });
@@ -147,10 +160,10 @@ describe("pond_sql_query", () => {
   });
 
   it("forwards when the operator set visibility=all", async () => {
-    const { factories, calls } = await harness({ responses: { pond_sql_query: () => "ROWS" } });
+    const { factories, calls } = await harness({ responses: { pond_sql: () => "ROWS" } });
     const cfg: OpenClawConfig = { tools: { sessions: { visibility: "all" }, agentToAgent: { enabled: true } } };
     const out = await factories.sql(mainCtx(cfg))!.execute("id", { query: "SELECT 1", format: "ndjson" });
-    expect(calls[0]).toMatchObject({ name: "pond_sql_query", args: { query: "SELECT 1", format: "ndjson" } });
+    expect(calls[0]).toMatchObject({ name: "pond_sql", args: { query: "SELECT 1", format: "ndjson" } });
     expect(details(out)).toEqual({ status: "ok", text: "ROWS" });
   });
 });
@@ -165,7 +178,8 @@ describe("subagent leaf denial", () => {
       config: {},
     };
     expect(factories.search(leaf)).toBeNull();
-    expect(factories.get(leaf)).toBeNull();
+    expect(factories.getSession(leaf)).toBeNull();
+    expect(factories.getMessage(leaf)).toBeNull();
     expect(factories.sql(leaf)).toBeNull();
   });
 });

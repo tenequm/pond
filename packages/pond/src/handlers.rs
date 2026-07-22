@@ -1553,7 +1553,7 @@ mod search_handler {
         // Truncation markers carry the omitted-char counts so the reader knows
         // this is a windowed slice and roughly how much it's missing. The fetch
         // verb is left to the transcript's key line (surface-specific: `pond_get_message`
-        // for MCP, `pond get --message-id` for the CLI); naming it here would be
+        // for MCP, `pond get-message` for the CLI); naming it here would be
         // redundant and wrong on one surface.
         let mut snippet = String::new();
         if start > 0 {

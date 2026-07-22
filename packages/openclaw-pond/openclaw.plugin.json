@@ -1,12 +1,12 @@
 {
   "id": "pond",
   "name": "Pond",
-  "description": "Durable, lossless recall over past agent sessions. Read-only pond_search / pond_get / pond_sql_query tools backed by a local pond store.",
+  "description": "Durable, lossless recall over past agent sessions. Read-only pond_search / pond_get_session / pond_get_message / pond_sql tools backed by a local pond store.",
   "activation": {
     "onStartup": true
   },
   "contracts": {
-    "tools": ["pond_search", "pond_get", "pond_sql_query"]
+    "tools": ["pond_search", "pond_get_session", "pond_get_message", "pond_sql"]
   },
   "configSchema": {
     "type": "object",
