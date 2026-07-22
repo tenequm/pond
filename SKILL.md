@@ -14,9 +14,10 @@ something that sounds prior, search pond.
 
 - Find past work by meaning ("what did we decide", "have we hit this before")
   -> `pond_search` (`mode=vector` default; `mode=fts` for exact whole words).
-- Read, analyze, review, or summarize a session -> `pond_get(session_id)` -
-  one call, full readable transcript. `pond_get(message_id)` expands one
-  message with its full tool bodies.
+- Read, analyze, review, or summarize a session -> `pond_get_session(id)` -
+  one call, full readable transcript (a message id also works: it resolves to
+  its parent session, page anchored at that message).
+- Expand one message with its full tool bodies -> `pond_get_message(id)`.
 - Corpus-wide aggregation, exact strings inside tool bodies, subagent
   sessions, bulk export -> `pond_sql` (read-only SQL). Read resource
   `schema://pond-sql` first - do not guess columns or JSON paths.
@@ -24,9 +25,9 @@ something that sounds prior, search pond.
 ## Rules that prevent wrong conclusions
 
 - Long sessions supersede their own early conclusions. For "what did we
-  decide / latest state", read the end (`pond_get(session_id,
-  session_from="end")`) or `pond_search` with `sort_by=recency` - relevance
-  rank favors the early, confident, possibly overturned phrasing.
+  decide / latest state", read the end (`pond_get_session(id, from="end")`)
+  or `pond_search` with `sort_by=recency` - relevance rank favors the early,
+  confident, possibly overturned phrasing.
 - Search covers only user/assistant conversational text - tool output is
   excluded by design. A weak search result is NOT proof of absence: verify
   exact strings with `pond_sql` `contains_tokens(search_text, '...')` before
@@ -34,9 +35,13 @@ something that sounds prior, search pond.
 - Tool bodies in SQL: tool_call is `{call_id, name, params}` (a Bash command
   is `json_extract(variant_data, '$.params.command')`); tool_result is
   `{call_id, name, is_failure, result}`.
-- On a remote store, SQL over `parts` costs seconds per round-trip: scope by
-  `session_id` / `tool_name`, and raise `timeout_seconds` when a broad scan
-  is genuinely needed.
+- Token accounting: one source line = one row, so sibling rows of one
+  provider turn repeat its usage snapshot - never SUM usage per row (~2-3x
+  inflation). Scope by `session_id`, group by `options.anthropic.id`, take
+  MAX per usage field, then sum; the worked query is in `schema://pond-sql`.
+- On a remote store, SQL over `parts` or the JSONB `options` column costs
+  seconds per round-trip: scope by `session_id` / `tool_name`, and raise
+  `timeout_seconds` when a broad scan is genuinely needed.
 
 ## Setup
 

@@ -87,7 +87,8 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## MCP tool routing is deliberate
 
-- Clients (Claude Code, Codex) defer MCP tool descriptions behind tool search; the always-loaded pond-authored surfaces are the server `instructions` (transport.rs `get_info`), the tool NAMES, and the installed skill. The instructions therefore carry all routing: "analyze / review / summarize a session" binds to `pond_get(session_id)`, and `pond_sql` self-describes as the escape hatch (never as the "analytic" tool - that word routes "analyze this session" to SQL). Keep cookbook detail in the `schema://` resources and recovery guidance in error messages (sql.rs `enrich`, the timeout text) - those are the surfaces agents reliably see. Don't fatten tool descriptions back up.
+- Clients (Claude Code, Codex) defer MCP tool descriptions behind tool search; the always-loaded pond-authored surfaces are the server `instructions` (transport.rs `get_info`), the tool NAMES, and the installed skill. The instructions therefore carry all routing: "analyze / review / summarize a session" binds to `pond_get_session`, and `pond_sql` self-describes as the escape hatch (never as the "analytic" tool - that word routes "analyze this session" to SQL). Keep cookbook detail in the `schema://` resources and recovery guidance in error messages (sql.rs `enrich`, the timeout text) - those are the surfaces agents reliably see. Don't fatten tool descriptions back up.
+- The get surface is split by intent: `pond_get_session` reads a whole session, `pond_get_message` expands one message. Each takes one `id`; get_session resolves a message id up to its parent session (page anchored at that message), get_message rejects a session id with a hint - the forgiving direction is the well-defined one. Keep it asymmetric; never guess which message a session id "means".
 
 ## Documentation
 

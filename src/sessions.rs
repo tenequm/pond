@@ -1477,7 +1477,7 @@ impl Store {
             .collect())
     }
 
-    /// Whole-session view for `pond_get` session scope (spec.md#protocol).
+    /// Whole-session view for `pond_get_session` (spec.md#protocol).
     /// Always the conversational view (`search_text IS NOT NULL`) with one-line
     /// part summaries - full part bodies are reached by `message_id` scope, not
     /// here. The page is the window selected by the anchors (`after_message_id`
@@ -1510,9 +1510,20 @@ impl Store {
         let size = |row: &ScanRow| row.text.as_deref().map_or(0, str::len);
         let total = rows.len();
         // Append-only stream: a real anchor never vanishes, so an unknown
-        // anchor is a stale/mistyped client cursor, not "start over".
-        let (win_start, win_end) = match (params.after_message_id, params.before_message_id) {
-            (Some(after), _) => {
+        // anchor is a stale/mistyped client cursor, not "start over". The
+        // inclusive `at` anchor is the resolution path's: the resolved message
+        // is known to exist, but a non-conversational one has no row here, so
+        // it degrades to the first page rather than erroring.
+        let at_pos = params
+            .at_message_id
+            .and_then(|at| rows.iter().position(|row| row.id == at));
+        let (win_start, win_end) = match (at_pos, params.after_message_id, params.before_message_id)
+        {
+            (Some(pos), _, _) => {
+                let n = page_by(&rows[pos..], params.limit, params.budget_bytes, size);
+                (pos, pos + n)
+            }
+            (None, Some(after), _) if params.at_message_id.is_none() => {
                 let pos = match rows.iter().position(|row| row.id == after) {
                     Some(idx) => idx + 1,
                     None => return Ok(GetLookup::UnknownAnchor),
@@ -1520,7 +1531,7 @@ impl Store {
                 let n = page_by(&rows[pos..], params.limit, params.budget_bytes, size);
                 (pos, pos + n)
             }
-            (None, Some(before)) => {
+            (None, None, Some(before)) if params.at_message_id.is_none() => {
                 let pos = match rows.iter().position(|row| row.id == before) {
                     Some(idx) => idx,
                     None => return Ok(GetLookup::UnknownAnchor),
@@ -1528,7 +1539,7 @@ impl Store {
                 let n = page_tail(&rows[..pos], params.limit, params.budget_bytes, size);
                 (pos - n, pos)
             }
-            (None, None) => match params.session_from {
+            _ => match params.session_from {
                 SessionFrom::Start => (0, page_by(&rows, params.limit, params.budget_bytes, size)),
                 SessionFrom::End => {
                     let n = page_tail(&rows, params.limit, params.budget_bytes, size);
@@ -1564,7 +1575,7 @@ impl Store {
         }))
     }
 
-    /// Message-scope retrieval for `pond_get` message scope (spec.md#protocol):
+    /// Message-scope retrieval for `pond_get_message` (spec.md#protocol):
     /// the target with its full parts (budget-bounded) plus `context_before`
     /// conversational siblings before and `context_after` after it. `NotFound`
     /// when no stored message carries `message_id`. Sibling parts are carried
@@ -3242,7 +3253,7 @@ impl Store {
         self.handle.initialized().await
     }
 
-    async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
+    pub(crate) async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
         let batch = self
             .handle
             .scan_batch(
@@ -4394,13 +4405,16 @@ pub struct SessionWithMessages {
 
 #[derive(Debug, Clone)]
 pub struct SessionViewParams<'a> {
+    /// Inclusive anchor: the page starts at this id. Set only by the handler's
+    /// message-to-session resolution; takes precedence over the other anchors.
+    pub at_message_id: Option<&'a str>,
     /// Page forward: messages strictly after this id.
     pub after_message_id: Option<&'a str>,
     /// Page backward: messages strictly before this id.
     pub before_message_id: Option<&'a str>,
     pub limit: usize,
     pub budget_bytes: usize,
-    /// First-page end when neither anchor is set.
+    /// First-page end when no anchor is set.
     pub session_from: SessionFrom,
 }
 
@@ -4413,7 +4427,7 @@ pub struct MessageViewParams {
     pub budget_bytes: usize,
 }
 
-/// Outcome of a `pond_get` lookup. Separates a missing target (the handler
+/// Outcome of a get lookup. Separates a missing target (the handler
 /// maps it to `not_found`) from a stale/unknown pagination anchor (mapped to
 /// `validation_failed`): the message stream is append-only, so an anchor that
 /// was ever valid never disappears - an unknown one is always a client error,
@@ -4425,7 +4439,7 @@ pub enum GetLookup<T> {
     Found(T),
 }
 
-/// Canonical retrieval result for `pond_get` session mode: the stored session
+/// Canonical retrieval result for `pond_get_session`: the stored session
 /// plus the page of messages (each with its `Part`s) and a remaining count.
 /// Protocol-shaping into `GetResult`/`MessageView` happens in the handler.
 #[derive(Debug, Clone, PartialEq)]
@@ -4436,7 +4450,7 @@ pub struct SessionPage {
     pub after_remaining: usize,
 }
 
-/// Canonical retrieval result for `pond_get` message mode. `target.parts` is
+/// Canonical retrieval result for `pond_get_message`. `target.parts` is
 /// empty - the target's parts ride `target_parts` (paginated); `siblings` carry
 /// their parts so the handler can summarize them.
 #[derive(Debug, Clone, PartialEq)]

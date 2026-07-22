@@ -116,7 +116,8 @@ pond mcp                           # alias for stdio MCP
 Fetch a single session or message, or move a whole corpus:
 
 ```sh
-pond get --session-id <id>
+pond get-session <id>
+pond get-message <id>
 pond copy --from local --to snapshot.pond
 pond copy --from snapshot.pond --to local
 ```
@@ -193,7 +194,7 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Index lifecycle decoupled from writes.** Writes commit data (embeddings included, computed inline at ingest) without folding the search indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
 - **Single-arm retrieval.** Each query runs one retriever - `vector` (cosine, with a gentle recency tiebreaker) or `fts` (BM25) - chosen per query; no server-side fusion. The vector arm falls back to full-text when the store has no embeddings, and `--sort-by recency` returns newest-first. Results group to one summary per session, keyed on `session_root`.
 - **Language-neutral full-text.** Word-level `simple` tokenizer with English stemming (ascii-folding on); tokens the stemmer does not recognize pass through unchanged and stay exact-matchable, so pond indexes sessions in any language alike.
-- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
+- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get_session`, `pond_get_message`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
 - **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.
 

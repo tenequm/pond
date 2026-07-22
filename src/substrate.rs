@@ -1717,7 +1717,7 @@ struct DatasetSet {
     sessions: OnceCell<Mutex<CachedDataset>>,
     messages: Mutex<CachedDataset>,
     /// `parts.lance` opens lazily on the first read or write that needs it:
-    /// any `pond_get` (every mode reads parts to build summaries), grouped
+    /// any get read (every mode reads parts to build summaries), grouped
     /// search hydrating user-hit summaries, or ingest with Part events. A
     /// process that does none of those skips the file, saving its metadata
     /// pages and file handle at cold-open. The OnceCell makes init

@@ -2,7 +2,7 @@
 
 What your agent gets when pond is registered as an MCP server ([Connect your agents](/get-started/connect-your-agents)). The wire schemas ship with the server; this page is the human-facing summary.
 
-Two tools cover almost every request: `pond_search` finds, `pond_get` reads. `pond_sql` is the advanced escape hatch for what those two cannot express.
+Three tools cover almost every request: `pond_search` finds, `pond_get_session` reads a session, `pond_get_message` expands one message. `pond_sql` is the advanced escape hatch for what those cannot express.
 
 ## pond_search
 
@@ -22,14 +22,15 @@ Every response reports how many searchable messages the filters left in scope, s
 
 Search indexes only conversational text (user and assistant turns). Tool calls, tool results, and reasoning are deliberately not indexed - reach them with `pond_sql`.
 
-## pond_get
+## pond_get_session
 
-Read stored conversations - the tool for analyzing, reviewing, or summarizing a past session, as a readable transcript. Pass exactly one of:
+Read a whole session as a readable transcript - the tool for analyzing, reviewing, or summarizing a past session: user/assistant text plus one-line tool and file references. Takes one `id`; a message id also works and resolves to its parent session with the page anchored at that message. Page with `limit` (default 20 messages), `from: "start" | "end"` (`end` reads the most recent page first - the session's final state, e.g. recovering context after compaction), and `after_message_id` / `before_message_id` to page onward.
 
-- `session_id` - the whole session: user/assistant text plus one-line tool and file references. Page with `session_limit` (default 20 messages), `session_from: "start" | "end"` (`end` reads the most recent page first - e.g. recovering context after compaction), and `session_after_message_id` / `session_before_message_id` to page onward.
-- `message_id` - one message with its full parts, including tool call and result bodies, plus conversational neighbors (`message_context_before` / `message_context_after`, default 3 each side - like `grep -B/-A`).
+The first page lists the session's subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
 
-A session response lists its subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
+## pond_get_message
+
+Expand one message: its full parts, including tool call and result bodies, plus conversational neighbors (`context_before` / `context_after`, default 3 each side - like `grep -B/-A`). Takes one `id` (a message id; a session id is rejected with a hint naming `pond_get_session`).
 
 ## pond_sql
 

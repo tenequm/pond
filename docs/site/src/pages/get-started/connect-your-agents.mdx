@@ -12,7 +12,8 @@ Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the 
 ## Tools the agent gets
 
 - `pond_search` - find relevant messages across all sessions (vector or full-text)
-- `pond_get` - read, analyze, or summarize a session; or one message with its full tool bodies
+- `pond_get_session` - read, analyze, or summarize a whole session
+- `pond_get_message` - expand one message with its full tool bodies
 - `pond_sql` - the escape hatch: read-only SQL over the corpus
 
 ## Agent setup prompt
@@ -22,5 +23,5 @@ Paste into your agent:
 ```text
 Set up pond as my session memory. Install it (brew install tenequm/tap/pond),
 run `pond init -y`, then `pond sync`. Register pond as an MCP server for this
-client, then use pond_search / pond_get to answer questions about my past work.
+client, then use pond_search / pond_get_session / pond_get_message to answer questions about my past work.
 ```

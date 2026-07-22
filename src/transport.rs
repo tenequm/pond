@@ -3,7 +3,7 @@
 //! per-transport behavior divergence.
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get`, and `POST /v1/ingest`. MCP
-//! exposes `pond_search` / `pond_get` (the kb-parity surface) plus
+//! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
 //! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
 use std::sync::Arc;
@@ -42,10 +42,10 @@ pub mod http {
 
     use super::AppState;
     use crate::{
-        handlers::{pond_get, pond_ingest, pond_search},
+        handlers::{pond_get_message, pond_get_session, pond_ingest, pond_search},
         wire::{
-            ErrorCode, GetEnvelope, GetRequest, IngestEnvelope, IngestRequest, SearchEnvelope,
-            SearchRequest, default_namespace, new_request_id,
+            ErrorCode, GetEnvelope, GetMessageRequest, GetSessionRequest, IngestEnvelope,
+            IngestRequest, SearchEnvelope, SearchRequest, default_namespace, new_request_id,
         },
     };
 
@@ -67,7 +67,8 @@ pub mod http {
         );
         Router::new()
             .route("/v1/search", post(search))
-            .route("/v1/get", post(get))
+            .route("/v1/get-session", post(get_session))
+            .route("/v1/get-message", post(get_message))
             .route("/v1/ingest", post(ingest))
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
@@ -118,9 +119,25 @@ pub mod http {
         with_request_id((status, Json(envelope)).into_response())
     }
 
-    async fn get(State(state): State<AppState>, Json(mut request): Json<GetRequest>) -> Response {
+    async fn get_session(
+        State(state): State<AppState>,
+        Json(mut request): Json<GetSessionRequest>,
+    ) -> Response {
         request.namespace.get_or_insert_with(default_namespace);
-        let envelope = pond_get(&state.store, request).await;
+        let envelope = pond_get_session(&state.store, request).await;
+        let status = match &envelope {
+            GetEnvelope::Success(_) => StatusCode::OK,
+            GetEnvelope::Error(error) => status_for(&error.error.code),
+        };
+        with_request_id((status, Json(envelope)).into_response())
+    }
+
+    async fn get_message(
+        State(state): State<AppState>,
+        Json(mut request): Json<GetMessageRequest>,
+    ) -> Response {
+        request.namespace.get_or_insert_with(default_namespace);
+        let envelope = pond_get_message(&state.store, request).await;
         let status = match &envelope {
             GetEnvelope::Success(_) => StatusCode::OK,
             GetEnvelope::Error(error) => status_for(&error.error.code),
@@ -167,7 +184,8 @@ pub mod http {
 }
 
 pub mod mcp {
-    //! The rmcp MCP layer: `pond_search` / `pond_get` / `pond_sql` tools
+    //! The rmcp MCP layer: `pond_search` / `pond_get_session` /
+    //! `pond_get_message` / `pond_sql` tools
     //! and `schema://pond` / `schema://pond-sql` / `stats://pond` (plus
     //! `pond-sql-export://` export artifacts) resources, transport-agnostic.
     //! Mounted on stdio (via `pond mcp`) and on the `/mcp` HTTP route (via
@@ -195,14 +213,16 @@ pub mod mcp {
     use super::AppState;
     use crate::{
         PROTOCOL_VERSION,
-        handlers::pond_get as run_get,
-        handlers::pond_search as run_search,
+        handlers::{
+            pond_get_message as run_get_message, pond_get_session as run_get_session,
+            pond_search as run_search,
+        },
         sql,
         substrate::Table,
         wire::{
-            ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetRequest, ProjectFilter,
-            SearchEnvelope, SearchFilters, SearchModeWire, SearchRequest, SessionFrom, SortBy,
-            default_namespace,
+            ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetMessageRequest,
+            GetSessionRequest, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire,
+            SearchRequest, SessionFrom, SortBy, default_namespace,
         },
     };
 
@@ -233,20 +253,25 @@ for cross-lingual retrieval, so a vector query in language A can match indexed \
 text in language B. fts is word-tokenized (the `simple` tokenizer with English \
 stemming) and matches surface words only, so it stays within one language.
 
-pond_get: message_id (the target message, marked `>`, plus message_context_before \
-/ message_context_after conversational siblings each side, both default 3, like \
-grep -B/-A) OR session_id (the whole session, conversational view). Output is a \
-transcript - each message is a `--- [n] role | time | message_id ---` rule, \
-then its text/content as real lines, then parts (`-> name [call_id]` tool \
-call, `<- name [call_id] (ok|failed)` result). Session mode renders text plus \
-one-line tool refs; fetch a message by message_id to expand full part bodies \
-(reasoning included). session_limit defaults to 20; session_from=start|end picks \
-which end the first page reads from (end = recent tail, e.g. post-compaction \
-recovery). Bounded by a size budget: page with session_after_message_id (forward) \
-or session_before_message_id (backward) using the id a page marker shows. A \
-whole-session response also lists the session's subagents (each stored as its own \
-session) in a footer; pass a listed id back as session_id to open it. Not for \
-bulk export - use `pond copy --to <file>`.";
+pond_get_session: id (a session id; a message id also works and resolves to \
+its parent session with the page anchored at that message - the response notes \
+the resolution). Output is a transcript - each message is a `--- [n] role | \
+time | message_id ---` rule, then its text/content as real lines, then \
+one-line tool refs (`-> name [call_id]` tool call, `<- name [call_id] \
+(ok|failed)` result); full part bodies stay one pond_get_message away. limit \
+defaults to 20; from=start|end picks which end the first page reads from (end \
+= recent tail - the session's final state, e.g. post-compaction recovery). \
+Bounded by a size budget: page with after_message_id (forward) or \
+before_message_id (backward) using the id a page marker shows. The first page \
+also lists the session's subagents (each stored as its own session) in a \
+footer; pass a listed id back to open it. Not for bulk export - use `pond \
+copy --to <file>`.
+
+pond_get_message: id (a message id - the target renders marked `>` with its \
+full part bodies, reasoning included, plus context_before / context_after \
+conversational siblings each side, both default 3, like grep -B/-A). A \
+session id is rejected with a hint naming pond_get_session - it cannot pick \
+one message.";
 
     /// Static documentation served as the `schema://pond-sql` resource: the
     /// table/column schema, dialect, function set, output modes, pagination
@@ -273,7 +298,8 @@ messages/sessions.
 filter, FROM fts('messages', ...) to rank (both below), or pond_search for \
 meaning-based recall. Never LIKE over parts - tool bodies are JSON with no \
 substring index (yet), and the conversational text is messages.search_text.
-- read a transcript (a session, a message with context) -> pond_get, not SQL.
+- read a transcript -> pond_get_session (a session) / pond_get_message (a \
+message with context), not SQL.
 
 Tables and columns:
 - messages(session_id text, message_id text, timestamp timestamp(us, UTC), role \
@@ -347,6 +373,49 @@ the narrow native columns (no JSON getters):
    AND r.type = 'tool_result' AND r.call_id = c.call_id
   WHERE c.type = 'tool_call' AND m.timestamp >= now() - INTERVAL '7 days'
   GROUP BY tool ORDER BY calls DESC;
+
+Worked example - counting tokens correctly (Claude Code sessions): pond is \
+lossless - one source JSONL line = one row - so a multi-block assistant turn \
+stores N rows sharing one provider message id \
+(options.anthropic.id), EACH carrying that line's usage snapshot. Summing \
+usage per row double-counts (~2-3x inflation). Usage is cumulative within a \
+turn, so collapse to one value per provider message id with MAX (the final \
+snapshot; DISTINCT over the usage tuple still double-counts when snapshots \
+differ mid-turn), then aggregate. Always scope by session_id: usage lives \
+inside the wide options column, which no index can serve (GROUP BY / MAX \
+over JSON paths reads every candidate row's whole document), so an unscoped \
+sweep is a full-column scan - minutes-to-timeout on a remote store. Even \
+scoped, a remote store reads that session's options pages: raise \
+timeout_seconds. For corpus-wide accounting, loop over session_ids or \
+accept the full scan with timeout_seconds near the 600s cap.
+
+  WITH turns AS (
+    SELECT json_get_string(options, 'anthropic', 'id') AS turn_id,
+           MAX(json_get_int(options, 'anthropic', 'usage', 'input_tokens')) AS in_tok,
+           MAX(json_get_int(options, 'anthropic', 'usage', 'output_tokens')) AS out_tok,
+           MAX(json_get_int(options, 'anthropic', 'usage', 'cache_read_input_tokens')) AS cache_read
+    FROM messages
+    WHERE session_id = '<session-id>' AND role = 'assistant'
+      AND json_get_string(options, 'anthropic', 'id') IS NOT NULL
+    GROUP BY turn_id
+  )
+  SELECT COUNT(*) AS turns, SUM(in_tok) AS input_tokens,
+         SUM(out_tok) AS output_tokens, SUM(cache_read) AS cache_read_tokens
+  FROM turns;
+
+Worked example - scope-then-scan, the pattern for substring-hunting tool \
+bodies without a substring index: first collect candidate session_ids from \
+the indexed conversational text, then run the field LIKE only inside them \
+(the session_id btree makes the body scan tractable; unscoped it times out):
+
+  WITH hits AS (
+    SELECT DISTINCT session_id FROM messages
+    WHERE contains_tokens(search_text, 'cargo bench')
+  )
+  SELECT DISTINCT json_extract(p.variant_data, '$.params.command') AS cmd
+  FROM parts p JOIN hits h ON h.session_id = p.session_id
+  WHERE p.type = 'tool_call' AND p.tool_name = 'Bash'
+    AND json_extract(p.variant_data, '$.params.command') LIKE '%cargo bench%';
 
 Full-text search in SQL is a pair - filter form and ranked form:
 - Filtering (WHERE): contains_tokens(search_text, 'word1 word2') - true when the \
@@ -427,7 +496,8 @@ the btree on `timestamp`/`message_id` directly. For known-bounded full results, 
 pagination entirely: format=parquet writes everything in one call. OFFSET works \
 but scans-and-discards prior rows and shifts pages under writes - prefer keyset.
 
-Drilling from aggregates to content (instead of N round-trips of pond_get):
+Drilling from aggregates to content (instead of N round-trips of \
+pond_get_message):
 JOIN to messages/parts directly. Example - top 10 longest sessions with first \
 user message:
 
@@ -451,8 +521,8 @@ user message:
    );
 
 One call, agent picks exactly which columns to hydrate. When you want the \
-pond_get-style rendered transcript (tool-call lines, subagent footer), call \
-pond_get with the session_id - that's its job.
+rendered transcript (tool-call lines, subagent footer), call pond_get_session \
+with the session_id - that's its job.
 
 Examples (4 patterns the agent should recognize):
 
@@ -525,45 +595,47 @@ Examples (4 patterns the agent should recognize):
         to_date: Option<String>,
     }
 
-    /// `pond_get` MCP tool parameters. Exactly one of `session_id` /
-    /// `message_id` is required; the prefix on each param tells you which scope
-    /// it applies to.
+    /// `pond_get_session` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
-    struct McpGetParams {
-        /// Retrieve this whole session as a conversational transcript
-        /// (user/assistant text + one-line tool/file refs). Use the `session_*`
-        /// params with it.
+    struct McpGetSessionParams {
+        /// The session to read - a session_id from pond_search or a subagent
+        /// footer. A message_id also works: it resolves to its parent session
+        /// with the page anchored at that message.
+        #[serde(alias = "session_id")]
+        id: String,
+        /// Max messages per page. Default 20, max 1000.
         #[serde(default)]
-        session_id: Option<String>,
-        /// Max messages per session page. Default 20, max 1000.
+        limit: Option<usize>,
+        /// Which end to read the first page from: "start" (oldest, default) or
+        /// "end" (most recent - the session's final state, e.g. to recover
+        /// context after compaction). Pages stay chronological.
         #[serde(default)]
-        session_limit: Option<usize>,
-        /// Which end to read the first session page from: "start" (oldest,
-        /// default) or "end" (most recent, e.g. to recover context after
-        /// compaction). Pages stay chronological.
-        #[serde(default)]
-        session_from: Option<String>,
+        from: Option<String>,
         /// Page forward: a message id from a prior page's bottom marker;
         /// returns messages after it.
         #[serde(default)]
-        session_after_message_id: Option<String>,
+        after_message_id: Option<String>,
         /// Page backward: a message id from a prior page's top marker; returns
         /// messages before it.
         #[serde(default)]
-        session_before_message_id: Option<String>,
-        /// Retrieve this single message with its full parts (incl. tool_call /
-        /// tool_result bodies). Use the `message_*` params with it. Mutually
-        /// exclusive with session_id.
-        #[serde(default)]
-        message_id: Option<String>,
+        before_message_id: Option<String>,
+    }
+
+    /// `pond_get_message` MCP tool parameters.
+    #[derive(Debug, Deserialize, schemars::JsonSchema)]
+    struct McpGetMessageParams {
+        /// The message to expand - a message_id from pond_search or a
+        /// transcript line.
+        #[serde(alias = "message_id")]
+        id: String,
         /// Conversational sibling messages to include before the target
         /// (mirrors grep -B). Default 3.
         #[serde(default)]
-        message_context_before: Option<usize>,
+        context_before: Option<usize>,
         /// Conversational sibling messages to include after the target
         /// (mirrors grep -A). Default 3.
         #[serde(default)]
-        message_context_after: Option<usize>,
+        context_after: Option<usize>,
     }
 
     /// `pond_sql` MCP tool parameters.
@@ -651,8 +723,9 @@ Examples (4 patterns the agent should recognize):
                            meaning; mode=\"fts\" matches exact whole words (BM25). Scope with \
                            project / session_id / from_date / to_date; keep the query semantic \
                            (concepts, not project names). Returns scored hits grouped by \
-                           session, best session first; pass a hit's message_id or session_id \
-                           to pond_get to read it. Searches conversational text only (tool \
+                           session, best session first; pass a hit's session_id to \
+                           pond_get_session or its message_id to pond_get_message to read \
+                           it. Searches conversational text only (tool \
                            calls/results and reasoning are excluded by design - a gap there is \
                            expected, not a failure) and excludes subagent sessions; reach both \
                            via pond_sql. Response format details: resource schema://pond.",
@@ -712,44 +785,39 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
-            description = "Read stored conversations - the tool for analyzing, reviewing, or \
-                           summarizing a past session. Pass exactly one of: session_id (the \
-                           whole session as a readable chronological transcript - \
-                           user/assistant text plus one-line tool/file refs) OR message_id \
-                           (that one message expanded with its full tool_call/tool_result \
-                           bodies, plus conversational neighbors). Use it after pond_search, \
-                           or directly when you already have an id. Paging: session_limit \
-                           (default 20), session_from=\"end\" reads the most recent turns \
-                           first (post-compaction recovery), session_after_message_id / \
-                           session_before_message_id to continue; message_context_before / \
-                           message_context_after size the neighbor window (default 3, like \
-                           grep -B/-A). A session response lists its subagent sessions in a \
-                           footer - pass a listed id back as session_id to open one. Not for \
-                           bulk export - use `pond copy --to <file>`. Response format \
-                           details: resource schema://pond.",
+            description = "Read a whole past session as a chronological transcript - the tool \
+                           for analyzing, reviewing, or summarizing a session (user/assistant \
+                           text plus one-line tool/file refs; tool bodies stay one \
+                           pond_get_message away). Pass the id from pond_search or a subagent \
+                           footer; a message_id also works - it resolves to its parent \
+                           session with the page anchored at that message. Paging: limit \
+                           (default 20), from=\"end\" reads the most recent turns first (the \
+                           session's final state; late conclusions supersede early ones), \
+                           after_message_id / before_message_id continue from a page marker. \
+                           The first page lists subagent sessions in a footer - pass a listed \
+                           id back to open one. Not for bulk export - use `pond copy --to \
+                           <file>`. Response format details: resource schema://pond.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
-        async fn pond_get(
+        async fn pond_get_session(
             &self,
-            Parameters(params): Parameters<McpGetParams>,
+            Parameters(params): Parameters<McpGetSessionParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let request = GetRequest {
+            let first_page =
+                params.after_message_id.is_none() && params.before_message_id.is_none();
+            let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
-                session_id: params.session_id,
-                message_id: params.message_id,
-                session_limit: params.session_limit.unwrap_or(20),
-                session_from: parse_session_from(params.session_from),
-                session_after_message_id: params.session_after_message_id,
-                session_before_message_id: params.session_before_message_id,
-                message_context_before: params.message_context_before.unwrap_or(3),
-                message_context_after: params.message_context_after.unwrap_or(3),
+                id: params.id,
+                limit: params.limit.unwrap_or(20),
+                from: parse_session_from(params.from),
+                after_message_id: params.after_message_id,
+                before_message_id: params.before_message_id,
             };
-            match run_get(&self.state.store, request.clone()).await {
+            match run_get_session(&self.state.store, request).await {
                 GetEnvelope::Success(response) => {
                     let mut transcript = crate::render::render_get_transcript(
                         &response,
-                        &request,
                         crate::render::Surface::Mcp,
                     );
                     // Spawn-only subagents are stored as their own sessions
@@ -757,9 +825,7 @@ Examples (4 patterns the agent should recognize):
                     // so an agent can open each (otherwise they are undiscoverable
                     // from the MCP surface). Best-effort: a lookup failure just
                     // omits the footer rather than failing the get.
-                    if request.message_id.is_none()
-                        && request.session_after_message_id.is_none()
-                        && request.session_before_message_id.is_none()
+                    if first_page
                         && let Ok(children) =
                             self.state.store.child_sessions(&response.session.id).await
                         && !children.is_empty()
@@ -776,10 +842,39 @@ Examples (4 patterns the agent should recognize):
         }
 
         #[tool(
+            description = "Expand one message with its full part bodies (tool_call / \
+                           tool_result / reasoning / file), plus conversational neighbors \
+                           for context. Pass a message_id from pond_search or a transcript \
+                           line; context_before / context_after size the neighbor window \
+                           (default 3, like grep -B/-A). For the whole session use \
+                           pond_get_session. Response format details: resource schema://pond.",
+            annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+        )]
+        async fn pond_get_message(
+            &self,
+            Parameters(params): Parameters<McpGetMessageParams>,
+        ) -> Result<CallToolResult, ErrorData> {
+            let request = GetMessageRequest {
+                protocol_version: PROTOCOL_VERSION,
+                namespace: Some(default_namespace()),
+                id: params.id,
+                context_before: params.context_before.unwrap_or(3),
+                context_after: params.context_after.unwrap_or(3),
+            };
+            match run_get_message(&self.state.store, request).await {
+                GetEnvelope::Success(response) => Ok(tool_result(
+                    crate::render::render_get_transcript(&response, crate::render::Surface::Mcp),
+                )),
+                GetEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
+            }
+        }
+
+        #[tool(
             description = "Advanced escape hatch: run ONE read-only SQL statement \
                            (SELECT/WITH, DataFusion / PostgreSQL-compatible) over the \
                            sessions / messages / parts tables. NOT for finding or reading \
-                           conversations - pond_search and pond_get cover almost all recall. \
+                           conversations - pond_search and pond_get_session / \
+                           pond_get_message cover almost all recall. \
                            Reach for SQL only for: aggregation (counts, group-by, joins, time \
                            buckets), exact strings or identifiers in conversational text \
                            (contains_tokens / fts), tool-call analytics and tool bodies, \
@@ -909,24 +1004,26 @@ Examples (4 patterns the agent should recognize):
             // session (clients defer tool descriptions behind tool search),
             // so it carries ALL the routing; cookbook detail lives in the
             // schema:// resources. Wording is deliberate: "analyze / review /
-            // summarize a session" must bind to pond_get(session_id), and
+            // summarize a session" must bind to pond_get_session, and
             // pond_sql must never read as the general "analyze" tool.
             .with_instructions(
                 "pond recalls past agent sessions (Claude Code and others) - prior work, \
-                 decisions, and context across sessions, not the live conversation. Two \
+                 decisions, and context across sessions, not the live conversation. Three \
                  tools cover almost every request: pond_search finds relevant messages, \
-                 pond_get reads them; both return readable transcripts. To analyze, \
-                 review, or summarize a past session: pond_get(session_id) - one call, the \
-                 whole transcript. For \"what did we decide / latest state\" questions, \
-                 early conclusions in a long session are often superseded later - read \
-                 from the end (pond_get session_from=\"end\") or re-sort with pond_search \
+                 pond_get_session reads a whole session, pond_get_message expands one \
+                 message with its full tool bodies; all return readable transcripts. To \
+                 analyze, review, or summarize a past session: pond_get_session(id) - one \
+                 call, the whole transcript (any id works: a message id resolves to its \
+                 session). For \"what did we decide / latest state\" questions, early \
+                 conclusions in a long session are often superseded later - read from the \
+                 end (pond_get_session from=\"end\") or re-sort with pond_search \
                  sort_by=\"recency\"; relevance rank favors the early, confident, possibly \
                  overturned phrasing. To recover context lost to compaction: pond_search (a \
                  distinctive recent topic + project + from_date=today), then \
-                 pond_get(session_id, session_from=\"end\"). pond_sql is the advanced \
-                 escape hatch for what search+get cannot express: corpus-wide aggregation \
-                 (counts, group-by, joins), exact strings or identifiers inside tool \
-                 bodies, subagent sessions, bulk export (parquet/ndjson) - read resource \
+                 pond_get_session(id, from=\"end\"). pond_sql is the advanced escape hatch \
+                 for what search+get cannot express: corpus-wide aggregation (counts, \
+                 group-by, joins), exact strings or identifiers inside tool bodies, \
+                 subagent sessions, bulk export (parquet/ndjson) - read resource \
                  schema://pond-sql before writing SQL. Scope with filters (project, \
                  session_id, from_date / to_date), keep queries semantic (concepts, not \
                  project names). Search covers only user/assistant conversational text by \
@@ -1077,7 +1174,7 @@ Examples (4 patterns the agent should recognize):
         for tool in &mut result.tools {
             let chars = match tool.name.as_ref() {
                 "pond_search" => 80_000,
-                "pond_get" => 200_000,
+                "pond_get_session" | "pond_get_message" => 200_000,
                 "pond_sql" => 80_000,
                 _ => continue,
             };
@@ -1257,7 +1354,8 @@ Examples (4 patterns the agent should recognize):
             let mut result = ListToolsResult {
                 tools: vec![
                     Tool::new("pond_search", "Search", Arc::clone(&schema)),
-                    Tool::new("pond_get", "Get", Arc::clone(&schema)),
+                    Tool::new("pond_get_session", "Get session", Arc::clone(&schema)),
+                    Tool::new("pond_get_message", "Get message", Arc::clone(&schema)),
                 ],
                 next_cursor: None,
                 meta: None,
@@ -1273,7 +1371,8 @@ Examples (4 patterns the agent should recognize):
                     .and_then(serde_json::Value::as_i64)
             };
             assert_eq!(value("pond_search"), Some(80_000));
-            assert_eq!(value("pond_get"), Some(200_000));
+            assert_eq!(value("pond_get_session"), Some(200_000));
+            assert_eq!(value("pond_get_message"), Some(200_000));
         }
     }
 }

@@ -197,8 +197,8 @@ pub async fn run(
              so over parts it will not finish within the time limit. There is no substring \
              index on tool bodies yet (TODO #47: lance v8 FM-Index). Instead match a single \
              field with json_extract(variant_data, '$.field') LIKE '...', scope to one session \
-             with session_id = '<id>' and read it with pond_get, or search conversational text \
-             with contains_tokens(search_text, '...')."
+             with session_id = '<id>' and read it with pond_get_session, or search \
+             conversational text with contains_tokens(search_text, '...')."
                 .to_owned(),
         ));
     }
@@ -238,13 +238,15 @@ pub async fn run(
                  on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
                  longer. On a remote object store, queries over parts cost seconds per \
                  round-trip - scope by session_id / tool_name, and to reconstruct one \
-                 session use pond_get(session_id), not SQL. For tool analytics use the \
+                 session use pond_get_session, not SQL. For tool analytics use the \
                  narrow native columns (tool_name, \
                  call_id, is_failure) instead of json_get_* over variant_data. If you were \
                  substring-scanning variant_data (json_extract + LIKE), there is no \
-                 substring index on tool bodies yet: filter parts by type and tool_name \
-                 first, or search conversational text with \
-                 contains_tokens(search_text, '...') instead.",
+                 substring index on tool bodies yet: scope-then-scan - first collect \
+                 candidate session_ids from the indexed conversational text (WITH hits AS \
+                 (SELECT DISTINCT session_id FROM messages WHERE \
+                 contains_tokens(search_text, '...')), then run the field LIKE only \
+                 against parts JOINed to those session_ids; unscoped body scans time out.",
                 timeout.as_secs()
             ))
         })?
@@ -1050,8 +1052,8 @@ fn enrich(message: &str) -> String {
              '$.params.command') - tool_result is {call_id, name, is_failure, result}, \
              text/reasoning carry {text}. For text search use \
              contains_tokens(search_text, '...') in WHERE, or the fts('messages', ...) \
-             table function in FROM for ranked results; to read a transcript use pond_get. \
-             Full doc: resource schema://pond-sql.",
+             table function in FROM for ranked results; to read a transcript use \
+             pond_get_session. Full doc: resource schema://pond-sql.",
         ),
         (
             "Encountered non UTF-8 data",
@@ -1165,7 +1167,8 @@ fn bound_cells(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> 
             Some((cut, _)) => {
                 let omitted = text[cut..].chars().count();
                 std::borrow::Cow::Owned(format!(
-                    "{} [+{omitted} chars - full cell via format=ndjson, or project a \
+                    "{} [+{omitted} chars - pond_get_message (CLI: pond get-message) on \
+                     this row's message_id renders the full part; or format=ndjson, or a \
                      narrower json_extract path]",
                     &text[..cut]
                 ))
@@ -1556,7 +1559,9 @@ mod tests {
             out.len()
         );
         assert!(
-            out.contains("[+41000 chars - full cell via format=ndjson"),
+            out.contains(
+                "[+41000 chars - pond_get_message (CLI: pond get-message) on this row's message_id"
+            ),
             "clip marker names the omitted count and the full path: {out}"
         );
     }
