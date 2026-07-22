@@ -1,5 +1,7 @@
 # openclaw-pond
 
+**Read-only. Local. Zero data egress.**
+
 Projects [pond](https://github.com/tenequm/pond)'s read-only recall tools into
 OpenClaw agents and (optionally) manages a local pond process, so installing the
 plugin is the complete installation.
@@ -10,12 +12,20 @@ restore. This plugin is deliberately **tools only** - no memory slot, no
 auto-recall, no `before_prompt_build` hook, no CLI namespace. It adds four
 tools:
 
-- `pond_search` - semantic / full-text search over past sessions.
+- `pond_search` - search over a readable local archive of past sessions:
+  exact words and BM25 full-text, with semantic (vector) search as the
+  accelerator on top.
 - `pond_get_session` - read a whole session as a transcript.
 - `pond_get_message` - expand one message with its full tool bodies.
 - `pond_sql` - read-only SQL analytics over the corpus.
 
 All four are read-only. pond's MCP surface never exposes a write path.
+
+The tools are search-then-fetch by design: a search returns a few relevant
+hits, and the agent expands only what it needs with the get tools. Every
+response is size-bounded (32 KB cap, then truncated with a note), so recall
+never floods the agent's context - no memory slot means nothing is injected
+into prompts the agent didn't ask for.
 
 ## Install
 
@@ -76,6 +86,13 @@ vocabulary for them.
 
 Scoping here is **policy against a confused or prompt-injected agent, not a
 security boundary against the operator** (who can read the pond store directly).
+This is OpenClaw's own trust model, in its own words: "Anyone who can operate
+an agent can make it do anything that agent can do. Session ownership,
+visibility, and presence are usability features, not security boundaries"
+(SECURITY.md), and "If people must not access each other's sessions, tools,
+credentials, or files, give them separate agents or separate gateway/host
+trust boundaries" (docs/concepts/multi-user.md). The plugin applies the same
+stance to historical sessions.
 
 The plugin resolves `tools.sessions.visibility` and `tools.agentToAgent` with a
 vendored copy of OpenClaw's session-visibility policy (`src/visibility.ts`;
@@ -121,6 +138,25 @@ Notes and deliberate limits:
 - The plugin fails **closed** (typed `forbidden`) whenever scope cannot be
   resolved (missing session identity in the tool context).
 
+## Real behavior proof
+
+Measured end to end on 2026-07-22 against openclaw@2026.7.2-beta.3 (16-core
+Linux host, corpus of 221 sessions / 3,105 messages):
+
+- Idle: ~102 MiB RSS at ~0.3% CPU - the embedding model is not loaded until
+  the first vector query. fts search, gets, and SQL stay at ~100 MiB.
+- Vector burst: ~894 MiB RSS at 3-4 cores while embedding queries run; the
+  sync embed pass holds a flat ~650 MiB. Since then pond gained a background
+  idle reaper that returns the process to the idle floor ~60 s after the last
+  vector query.
+- Disk: the store for that corpus is 11 MiB; the embedding model cache is a
+  466 MiB one-time download.
+- Lifecycle: kill the pond child and the plugin respawns it in ~1 s; kill the
+  gateway and zero orphaned processes remain (verified twice).
+- Concurrency: 10 simultaneous tool calls multiplex cleanly over the one MCP
+  connection; relay latencies measured 8-91 ms (a pre-index brute-force
+  vector search was the outlier at 1.4 s).
+
 ## Development
 
 The `openclaw` package is an **optional peer dependency** - the Gateway supplies
@@ -157,3 +193,6 @@ local stub typecheck.
 - `test/schema.test.ts` - GBNF conformance: the tool parameter schemas carry no
   grammar-breaking features (no `oneOf`, `format`, `patternProperties`, etc.;
   unions emit `anyOf`), with a negative control proving the checker bites.
+- `test/service.test.ts` - lifecycle: `stop()` idempotency (including after a
+  failed dial with a pending backoff restart) and the 10 s dial deadlines
+  against a hung child.

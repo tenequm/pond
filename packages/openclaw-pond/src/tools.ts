@@ -127,8 +127,8 @@ async function relay(
 }
 
 const SEARCH_DESCRIPTION =
-  "Find relevant messages in your durable pond corpus of past agent sessions (Claude Code, OpenClaw, " +
-  "and others). Returns pond's rendered transcript: results grouped by session, best first. Pick `mode`: " +
+  "Find relevant messages in your durable pond corpus of past agent sessions. " +
+  "Returns pond's rendered transcript: results grouped by session, best first. Pick `mode`: " +
   "\"vector\" (default, meaning) or \"fts\" (exact words, BM25). Pass a hit's session_id to " +
   "pond_get_session or its message_id to pond_get_message. Results are scoped to the sessions you may " +
   "already read.";
