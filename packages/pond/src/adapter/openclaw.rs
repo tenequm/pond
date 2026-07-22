@@ -41,6 +41,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use async_stream::stream;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -57,12 +58,9 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    extract::{
-        Extracted, bound_value, extract_compact_repr, extract_raw_record, extract_str,
-        json_or_string,
-    },
+    extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text,
-    jsonl::{RECORD_CAP, peek_last_mapped},
+    jsonl::{parse_bounded, peek_last_mapped},
     jsonl_bytes, part_id, part_ordinal, raw_record,
     sqlite::{self, CHANNEL_CAP, emit},
 };
@@ -513,21 +511,17 @@ fn read_db_session(
         }
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
     };
-    let entry = query_one_string(
+    let entry = query_one_opt::<String>(
         conn,
         "SELECT entry_json FROM session_entries WHERE session_key = ?1",
-        session_key,
-        "session_entries",
+        [session_key],
     )
-    .unwrap_or(None)
     .map(|text| json_or_string(&text));
-    let generation = query_one_string(
+    let generation = query_one_opt::<String>(
         conn,
         "SELECT generation FROM session_transcript_generations WHERE session_id = ?1",
-        session_id,
-        "generations",
-    )
-    .unwrap_or(None);
+        [session_id],
+    );
     let leaf: Option<String> = query_one_opt(
         conn,
         "SELECT leaf_event_id FROM session_transcript_index_state WHERE session_id = ?1",
@@ -589,7 +583,7 @@ fn read_file_session(
     };
     let mut entries: Vec<Value> = Vec::with_capacity(lines.len());
     for (line_no, line) in lines.iter().enumerate() {
-        match parse_bounded(line.as_bytes(), || {
+        match parse_bounded(NAME, line.as_bytes(), || {
             format!("{}:{}", path.display(), line_no + 1)
         }) {
             Ok(value) => entries.push(value),
@@ -709,15 +703,16 @@ const SESSION_COLUMNS: &[(&str, ColKind)] = &[
 /// columns omitted (spec.md#model-lossless-projection - every non-null column
 /// recoverable). Every column lands verbatim in `options.openclaw`.
 fn fetch_session_row(conn: &Connection, session_id: &str) -> Result<Option<Value>, AdapterError> {
-    let columns = SESSION_COLUMNS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ");
+    static SESSION_ROW_SQL: LazyLock<String> = LazyLock::new(|| {
+        let columns = SESSION_COLUMNS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {columns} FROM sessions WHERE session_id = ?1")
+    });
     let mut stmt = conn
-        .prepare_cached(&format!(
-            "SELECT {columns} FROM sessions WHERE session_id = ?1"
-        ))
+        .prepare_cached(&SESSION_ROW_SQL)
         .map_err(|error| db_error(Path::new("sessions"), "prepare session row", &error))?;
     let row = stmt
         .query_row([session_id], session_row_to_json)
@@ -743,24 +738,6 @@ fn session_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
         }
     }
     Ok(Value::Object(map))
-}
-
-/// Hard-error single-column fetch: a prepare/query failure is a substrate fault
-/// surfaced to the caller (spec.md#adapter-integrity-no-silent-drops), a missing
-/// row is `Ok(None)`. For columns that must be readable on a healthy DB.
-fn query_one_string(
-    conn: &Connection,
-    sql: &str,
-    param: &str,
-    label: &str,
-) -> Result<Option<String>, AdapterError> {
-    let mut stmt = conn
-        .prepare_cached(sql)
-        .map_err(|error| db_error(Path::new(label), "prepare", &error))?;
-    stmt.query_row([param], |row| row.get::<_, Option<String>>(0))
-        .optional()
-        .map(Option::flatten)
-        .map_err(|error| db_error(Path::new(label), "query", &error))
 }
 
 /// Best-effort single-value fetch: a missing table or any query error swallows
@@ -815,7 +792,7 @@ fn fetch_transcript_entries(
         })?;
     let mut out = Vec::with_capacity(raw.len());
     for (seq, data) in raw {
-        let value = parse_bounded(data.as_bytes(), || {
+        let value = parse_bounded(NAME, data.as_bytes(), || {
             format!("transcript_events session={session_id} seq={seq}")
         })?;
         out.push((seq, value));
@@ -841,29 +818,7 @@ fn db_session_watermark(conn: &Connection, session_id: &str) -> Option<i64> {
 
 fn entry_ts_micros(value: &Value) -> Option<i64> {
     let text = value.get("timestamp").and_then(Value::as_str)?;
-    Some(
-        DateTime::parse_from_rfc3339(text)
-            .ok()?
-            .with_timezone(&Utc)
-            .timestamp_micros(),
-    )
-}
-
-fn parse_bounded(bytes: &[u8], location: impl FnOnce() -> String) -> Result<Value, AdapterError> {
-    if bytes.len() > RECORD_CAP {
-        return Err(AdapterError::schema(
-            NAME,
-            location(),
-            format!(
-                "record exceeds adapter record cap: {} bytes > {RECORD_CAP}",
-                bytes.len()
-            ),
-        ));
-    }
-    let mut value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| AdapterError::parse(NAME, location(), 1, error))?;
-    bound_value(&mut value);
-    Ok(value)
+    parse_ts(text).map(|dt| dt.timestamp_micros())
 }
 
 // -- Session construction ---------------------------------------------------
@@ -1785,7 +1740,7 @@ impl OpenClawAdapter {
             for session_id in deleted {
                 // Only sessions pond already stored can be erased; the archived
                 // key is recovered from pond's stored project (= session_key).
-                let Some(session) = store.get_session(&session_id).await? else {
+                let Some(session) = store.find_session(&session_id).await? else {
                     report.preserved.push(PreserveNote {
                         agent_id: agent.agent_id.clone(),
                         session_id,
@@ -1793,7 +1748,7 @@ impl OpenClawAdapter {
                     });
                     continue;
                 };
-                let session_key = (*session.session.project).clone();
+                let session_key = (*session.project).clone();
                 let Some(conn) = &conn else {
                     report.preserved.push(PreserveNote {
                         agent_id: agent.agent_id.clone(),

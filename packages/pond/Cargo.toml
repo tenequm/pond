@@ -200,9 +200,6 @@ lance-index = "8.0.0"
 rmcp = { version = "1.7", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Re-declared so the openclaw adapter suite can synthesize zstd `.reset.`
-# archive bytes at test time (matching OpenClaw's archive-compression path).
-zstd = "0.13"
 insta = "1.47.2"
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.

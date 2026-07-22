@@ -50,6 +50,31 @@ pub(crate) fn source_line(options: &ProviderOptions) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+/// Enforce the record cap on `bytes`, parse as JSON, and bound every string
+/// leaf at the seam cap (spec.md#adapter-bounded-values) before it leaves the
+/// adapter. `location` names the fault site and is invoked only when building
+/// an error.
+pub(crate) fn parse_bounded(
+    adapter: &'static str,
+    bytes: &[u8],
+    location: impl FnOnce() -> String,
+) -> Result<Value, AdapterError> {
+    if bytes.len() > RECORD_CAP {
+        return Err(AdapterError::schema(
+            adapter,
+            location(),
+            format!(
+                "record exceeds adapter record cap: {} bytes > {RECORD_CAP}",
+                bytes.len()
+            ),
+        ));
+    }
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| AdapterError::parse(adapter, location(), 1, error))?;
+    bound_value(&mut value);
+    Ok(value)
+}
+
 /// A "walk a tree, one `.jsonl` per session, line equals record" adapter. The
 /// driver supplies the format-specific decode; [`jsonl_tree_events`] supplies
 /// the walk, freshness gate, bounded read, and error attribution.

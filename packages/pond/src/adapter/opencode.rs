@@ -50,8 +50,8 @@ use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
     config_path,
-    extract::{bound_value, extract_str, json_or_string},
-    jsonl::RECORD_CAP,
+    extract::{extract_str, json_or_string},
+    jsonl::{RECORD_CAP, parse_bounded},
     part_id, part_ordinal, raw_record, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
     validate_path_id,
@@ -1162,7 +1162,7 @@ fn reconstruct_record(
     session_id: &str,
     record_id: &str,
 ) -> Result<Value, AdapterError> {
-    let mut value = parse_bounded(data.as_bytes(), || {
+    let mut value = parse_bounded(NAME, data.as_bytes(), || {
         record_location(db_path, session_id, record_id)
     })?;
     if let Value::Object(map) = &mut value {
@@ -1180,28 +1180,6 @@ fn record_location(db_path: &Path, session_id: &str, record_id: &str) -> String 
     )
 }
 
-/// Enforce the record cap on `text`, parse it as JSON, and bound every string
-/// leaf at the seam cap (spec.md#adapter-bounded-values) before it leaves this
-/// module. Shared by [`read_json`] (file bytes) and [`reconstruct_record`] (a
-/// DB `data` blob). `location` names the fault site and is invoked only when
-/// building an error.
-fn parse_bounded(bytes: &[u8], location: impl FnOnce() -> String) -> Result<Value, AdapterError> {
-    if bytes.len() > RECORD_CAP {
-        return Err(AdapterError::schema(
-            NAME,
-            location(),
-            format!(
-                "record data exceeds adapter record cap: {} bytes > {RECORD_CAP}",
-                bytes.len()
-            ),
-        ));
-    }
-    let mut value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| AdapterError::parse(NAME, location(), 1, error))?;
-    bound_value(&mut value);
-    Ok(value)
-}
-
 /// Read one JSON file, bounding every string leaf at the seam cap
 /// (spec.md#adapter-bounded-values) before it leaves this module. The size gate
 /// runs on metadata BEFORE the read so the record cap stays a memory bound,
@@ -1217,7 +1195,7 @@ fn read_json(path: &Path) -> Result<Value, AdapterError> {
         ));
     }
     let bytes = std::fs::read(path).map_err(io)?;
-    parse_bounded(&bytes, || path.display().to_string())
+    parse_bounded(NAME, &bytes, || path.display().to_string())
 }
 
 /// List `*.json` files in `dir`, sorted by filename (= creation order, ids are

@@ -3242,7 +3242,9 @@ impl Store {
         self.handle.initialized().await
     }
 
-    async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
+    /// Single Sessions-table lookup - no message hydration. The cheap sibling
+    /// of [`Store::get_session`] for callers that only need session metadata.
+    pub(crate) async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
         let batch = self
             .handle
             .scan_batch(
