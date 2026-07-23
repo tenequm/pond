@@ -1,0 +1,17 @@
+name: pond
+version: 0.1.0
+description: "Durable, lossless recall over past agent sessions via read-only pond tools (pond_search, pond_get_session, pond_get_message, pond_sql). Managed mode supervises a local pond serve process; url mode attaches to an external one."
+author: tenequm
+kind: standalone
+# Registers four read-only tools under the `pond` toolset plus the
+# `hermes pond` CLI command (setup / status). No hooks that mutate
+# conversation, no memory-provider slot, no session_search override.
+provides_tools:
+  - pond_search
+  - pond_get_session
+  - pond_get_message
+  - pond_sql
+# The runtime has zero third-party Python dependencies: the MCP client is
+# pure stdlib, so enabling the plugin needs no pip install. Recall data comes
+# from the separately installed `pond` binary (see the README install steps).
+pip_dependencies: []
