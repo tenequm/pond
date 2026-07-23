@@ -32,7 +32,9 @@ mod claude_desktop_app;
 mod codex_cli;
 mod discovery;
 pub mod extract;
+mod hermes;
 mod jsonl;
+mod nanoclaw;
 mod openclaw;
 mod opencode;
 mod pi_coding_agent;
@@ -50,6 +52,8 @@ pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
 };
+pub use hermes::{HermesAdapter, HermesFactory};
+pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
 pub use openclaw::{
     EraseTarget, OpenClawAdapter, OpenClawFactory, PreserveNote, ReconciliationReport,
 };
@@ -515,6 +519,8 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &CodexCliFactory,
         &OpencodeFactory,
         &OpenClawFactory,
+        &NanoclawFactory,
+        &HermesFactory,
         &PiCodingAgentFactory,
     ]
 }

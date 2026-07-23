@@ -124,6 +124,14 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     fn skip_source(&self, _path: &Path) -> bool {
         false
     }
+
+    /// Whether a walked file is a transcript this adapter reads. Default: a
+    /// `.jsonl` extension. nanoclaw overrides it to also accept rotated
+    /// `<uuid>.jsonl.rotated-<epochMs>` transcripts, whose extension is not
+    /// `jsonl`.
+    fn is_transcript(&self, path: &Path) -> bool {
+        path.extension() == Some(OsStr::new("jsonl"))
+    }
 }
 
 /// Path-bearing io error; callers remap it into an [`AdapterError`].
@@ -132,9 +140,14 @@ pub(crate) struct IoAtPath {
     pub source: std::io::Error,
 }
 
-/// Walk `root` recursively for every `*.jsonl` file, sorted for deterministic
-/// ingest order.
-pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath> {
+/// Walk `root` recursively for every file `accept` matches, sorted for
+/// deterministic ingest order. `accept` is the per-adapter transcript predicate
+/// ([`JsonlTree::is_transcript`]) so a source with a non-`.jsonl` transcript name
+/// (nanoclaw's rotated files) is still walked.
+fn collect_tree_files(
+    root: &Path,
+    accept: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, IoAtPath> {
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -148,7 +161,7 @@ pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath>
             let child = entry.path();
             if file_type.is_dir() {
                 stack.push(child);
-            } else if child.extension() == Some(OsStr::new("jsonl")) {
+            } else if accept(&child) {
                 paths.push(child);
             }
         }
@@ -162,7 +175,7 @@ pub(crate) fn jsonl_tree_discover<D: JsonlTree>(driver: &D) -> DiscoverFuture<'_
     let name = driver.name();
     Box::pin(async move {
         tokio::task::spawn_blocking(move || {
-            collect_jsonl_files(driver.root())
+            collect_tree_files(driver.root(), &|path| driver.is_transcript(path))
                 .map(|files| {
                     files
                         .iter()
@@ -275,7 +288,7 @@ fn collect_heads<D: JsonlTree>(
     oracle_is_empty: bool,
 ) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
-    let mut files = collect_jsonl_files(driver.root())
+    let mut files = collect_tree_files(driver.root(), &|path| driver.is_transcript(path))
         .map_err(|io| AdapterError::io(name, io.path, io.source))?;
     files.retain(|path| !driver.skip_source(path));
     // The freshness peek (first line -> session id, file tail -> latest

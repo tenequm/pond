@@ -20,6 +20,8 @@ use pond::{
 use tempfile::TempDir;
 
 mod claude_code;
+mod hermes;
+mod nanoclaw;
 mod openclaw;
 mod opencode;
 
