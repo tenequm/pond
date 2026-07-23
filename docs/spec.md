@@ -155,6 +155,14 @@ Every row MUST have a deterministic primary key - source-supplied where the sour
 
 Schema versioning lives at the dataset level - the Lance manifest and a dataset-level metadata key - never as a per-row column. Why: a per-row version column pays storage on every row for a fact that is per-dataset.
 
+#### `local-store-durability`
+
+On a local-filesystem store, every object-store write MUST be made durable - file bytes and parent directory fsynced - before the write returns, applied through Lance's own object-store wrapping seam so `lance-chokepoints-storage` still holds (the wrapper wraps the store; no code reaches around Lance). Why: `LocalFileSystem` publishes a file's name via hard-link/rename without syncing its bytes, so a hard host stop (power loss, VM reset, kernel panic) can persist a manifest's name while dropping its content - a zero-byte manifest at the head of `_versions/` that permanently poisons the table. Syncing at the seam is ordering-correct by construction: each artifact is durable before Lance proceeds to the next, so data files and transactions are on disk before the manifest that references them commits. Object-store backends are exempt - PUT visibility is atomic and durability is server-side at ack - and the rule is unix-only; Windows relies on `local-store-self-heal`.
+
+#### `local-store-self-heal`
+
+When a local table fails to open, the substrate MUST attempt self-heal before surfacing the error: walk `_versions/` head-down to the newest fully readable version - readable means the manifest loads AND a real scan over its data pages completes, because a crash inside a multi-commit cycle can zero a data file that an older, intact manifest references - quarantine every unreadable manifest above that version by atomic same-directory rename to `<name>.manifest.corrupt` (never delete anything), retry the open once, and emit a loud notice naming the quarantined files, the version rolled back to, and that the next `pond sync` re-ingests the aborted commit. Heal is lossless for pond because source histories are the source of truth (`session-movement-complete`); the rolled-back rows are reconstructed, not lost. When no version is readable, or the failure is not manifest-shaped, heal MUST touch nothing and return the original error enriched with what was inspected and the concrete recovery. Why self-heal on open instead of a repair command: the damaged state is a crash remnant, not an operator decision - every surface (CLI, HTTP, MCP) opens through the same path, so healing there fixes the store on first touch with no human in the loop, and quarantine-by-rename keeps the evidence without leaving Lance anything to trip over.
+
 ### 3.4 Dataset parameters
 
 Every table is created with the current stable Lance file format, constant-time latest-manifest lookup, and a short manifest-retention window. v1 recovery beyond the window is via `pond copy --from <store> --to <file>` snapshots; deferred named-snapshot preservation via Lance tags is in Section 9. The retention window MUST stay above the longest single read (floor: one hour): a reader pins the manifest version it opened only for that request's duration, and version cleanup that reclaims a pinned version's files breaks the in-flight read on object-store backends.
@@ -667,6 +675,10 @@ A `pond_ingest` event is one canonical object - a Session, a Message, or a Part 
 The MCP transport exposes the read operations - `pond_search`, `pond_get_session`, `pond_get_message`, and `pond_sql` - as tools, plus the resources. Ingest stays HTTP-and-CLI only. Why: MCP's role is read access for an agent; ingest is an operator action.
 
 Tool metadata is a routing surface, designed for clients that defer tool descriptions behind tool search (Claude Code, Codex): the server `instructions` carry all routing (search finds, get reads - including analyze/review/summarize a session - and `pond_sql` is the self-demoting escape hatch), tool names alone must route correctly, descriptions lead with the verbs they claim, cookbook detail lives in the `schema://` resources, and error messages teach the correct next query at the point of failure.
+
+#### `mcp-read-only-heal-exception`
+
+`local-store-self-heal` (Section 3.3) is the single deliberate carve-out from the MCP surface's read-only rule: an open performed by the MCP server MAY execute heal's quarantine renames. This is substrate integrity restoration, not a write surface - rename-only, no user-data writes, no deletes, triggered only by an open that already failed - and the alternative is an MCP server that stays bricked on a crash-damaged store until an operator runs a CLI command. Every other MCP action remains read-only, hard-enforced; this exception is intentional and MUST NOT be read as precedent for MCP write paths.
 
 ### 7.8 CLI verbs
 

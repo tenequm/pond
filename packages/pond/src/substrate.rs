@@ -1672,9 +1672,10 @@ pub struct Handle {
     /// datasets when they first open, matching the eager `messages` open's
     /// scheme-keyed `refresh_after`.
     lazy_refresh_after: Duration,
-    /// Object-store wrapper (index disk cache + io-trace) applied on every
-    /// dataset open, including the lazy sessions/parts opens and any re-open.
-    index_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Object-store wrapper (fsync durability + index disk cache + io-trace)
+    /// applied on every dataset open, including the lazy sessions/parts opens
+    /// and any re-open.
+    store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -1892,7 +1893,7 @@ impl Handle {
         } else {
             Duration::from_secs(5)
         };
-        let index_wrapper = index_store_wrapper(location, index_cache_dir.as_deref());
+        let wrapper = store_wrapper(location, index_cache_dir.as_deref());
         let handle = Self {
             datasets: DatasetSet {
                 sessions: OnceCell::new(),
@@ -1904,7 +1905,7 @@ impl Handle {
                         sessions::message_schema(),
                         &session,
                         &storage_options,
-                        index_wrapper.clone(),
+                        wrapper.clone(),
                     )
                     .await?,
                     refresh_after,
@@ -1918,7 +1919,7 @@ impl Handle {
             storage_options,
             location: location.clone(),
             lazy_refresh_after: refresh_after,
-            index_wrapper,
+            store_wrapper: wrapper,
         };
         Ok(handle)
     }
@@ -2840,7 +2841,7 @@ impl Handle {
                 schema(),
                 &self.session,
                 &self.storage_options,
-                self.index_wrapper.clone(),
+                self.store_wrapper.clone(),
             )
             .await?;
             Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
@@ -3054,7 +3055,10 @@ async fn optimize_table_compact(
         // `_indices/<uuid>/` but does NOT remove the parent dir, so failed/no-op
         // index merges accumulate empty UUID dirs forever (one inode each).
         // Harmless beyond inode pressure; tracked upstream. No pond-side FS sweep
-        // here (spec.md#concurrency: Lance-native maintenance only).
+        // here (spec.md#concurrency: Lance-native maintenance only); the sole
+        // sanctioned direct-FS touches are the durability fsyncs inside Lance's
+        // wrapper seam (spec.md#local-store-durability) and heal's quarantine
+        // renames on an already-failed open (spec.md#local-store-self-heal).
         dataset
             .cleanup_old_versions(policy.cleanup_older_than, Some(false), Some(false))
             .await
@@ -3750,6 +3754,250 @@ pub mod index_cache {
     }
 }
 
+/// fsync-on-write wrapper for local stores (spec.md#local-store-durability):
+/// `LocalFileSystem` publishes a name (hard_link/rename) without syncing the
+/// bytes, so a hard host stop can persist the name over page-cache-only bytes -
+/// a zero-byte manifest that permanently poisons the table. This wrapper fsyncs
+/// the written file and its parent directory after the inner write returns, so
+/// every artifact is durable before Lance proceeds to the next step. Unix only:
+/// Windows commits route through a different handler with different dir-fsync
+/// semantics and rely on self-heal instead.
+#[cfg(unix)]
+pub mod durability {
+    use std::fs::File;
+    use std::io::ErrorKind;
+    use std::ops::Range;
+    use std::path::Path as FsPath;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use lance_io::object_store::WrappingObjectStore;
+    use object_store::path::Path as ObjPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OsResult,
+        UploadPart,
+    };
+
+    fn durability_error(op: &str, path: &FsPath, source: std::io::Error) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "fsync-durability",
+            source: format!("{op} {}: {source}", path.display()).into(),
+        }
+    }
+
+    /// fsync the file the write just published plus its parent directory: the
+    /// file `sync_all` makes the bytes durable, the dir `sync_all` makes the
+    /// name (the freshly linked/renamed entry) durable. Fsync failures are hard
+    /// errors - a silently no-op durability layer is worse than none - but a
+    /// vanished parent dir (concurrent cleanup) is tolerated.
+    fn sync_file_and_parent(location: &ObjPath) -> OsResult<()> {
+        let local = lance_io::local::to_local_path(location);
+        let path = FsPath::new(&local);
+        let file = File::open(path).map_err(|e| durability_error("open for fsync", path, e))?;
+        file.sync_all()
+            .map_err(|e| durability_error("fsync", path, e))?;
+        if let Some(parent) = path.parent() {
+            // Unix permits fsync on an O_RDONLY directory fd.
+            match File::open(parent) {
+                Ok(dir) => dir
+                    .sync_all()
+                    .map_err(|e| durability_error("fsync dir", parent, e))?,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(durability_error("open dir for fsync", parent, e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `WrappingObjectStore` factory: stateless, hands an `FsyncStore` to every
+    /// dataset open on a local store.
+    #[derive(Debug)]
+    pub struct FsyncOnWrite;
+
+    impl WrappingObjectStore for FsyncOnWrite {
+        fn wrap(&self, _store_prefix: &str, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(FsyncStore { inner })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FsyncStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for FsyncStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FsyncStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FsyncStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            sync_file_and_parent(location)?;
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            let upload = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(FsyncUpload {
+                inner: upload,
+                location: location.clone(),
+            }))
+        }
+
+        async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjPath,
+            ranges: &[Range<u64>],
+        ) -> OsResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OsResult<ObjPath>>,
+        ) -> BoxStream<'static, OsResult<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjPath>,
+            offset: &ObjPath,
+        ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &ObjPath, to: &ObjPath, opts: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(from, to, opts).await?;
+            sync_file_and_parent(to)?;
+            Ok(())
+        }
+
+        // Override so a rename keeps the inner store's native (atomic) semantics
+        // and we fsync the destination; the trait default would degrade it to
+        // copy+delete through our own `copy_opts`.
+        async fn rename_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            opts: RenameOptions,
+        ) -> OsResult<()> {
+            self.inner.rename_opts(from, to, opts).await?;
+            sync_file_and_parent(to)?;
+            Ok(())
+        }
+    }
+
+    /// Wraps the inner multipart upload so the final object (data and index
+    /// files) is fsynced once `complete()` publishes it; parts and abort pass
+    /// straight through.
+    #[derive(Debug)]
+    struct FsyncUpload {
+        inner: Box<dyn MultipartUpload>,
+        location: ObjPath,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FsyncUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> OsResult<PutResult> {
+            let result = self.inner.complete().await?;
+            sync_file_and_parent(&self.location)?;
+            Ok(result)
+        }
+
+        async fn abort(&mut self) -> OsResult<()> {
+            self.inner.abort().await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        use object_store::ObjectStoreExt;
+
+        // A prefix-less local store, so an object_store `Path` is the absolute
+        // FS path (leading `/` stripped) - exactly what `to_local_path` inverts.
+        fn wrapped() -> Arc<dyn ObjectStore> {
+            let inner: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+            FsyncOnWrite.wrap("test", inner)
+        }
+
+        fn obj_path(root: &FsPath, name: &str) -> ObjPath {
+            // object_store `Path` is the absolute FS path minus the leading `/`.
+            ObjPath::from(root.join(name).to_string_lossy().trim_start_matches('/'))
+        }
+
+        #[tokio::test]
+        async fn put_through_wrapper_round_trips_and_lands_on_disk() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = wrapped();
+            let path = obj_path(temp.path(), "sub/dir/manifest");
+            store
+                .put(&path, PutPayload::from_static(b"DURABLE"))
+                .await
+                .unwrap();
+            // Round-trips through the wrapper...
+            let got = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(got.as_ref(), b"DURABLE");
+            // ...and the fsync targeted the real file `to_local_path` maps to.
+            assert_eq!(
+                std::fs::read(temp.path().join("sub/dir/manifest")).unwrap(),
+                b"DURABLE",
+            );
+        }
+
+        #[tokio::test]
+        async fn multipart_through_wrapper_completes_and_round_trips() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = wrapped();
+            let path = obj_path(temp.path(), "data/part.lance");
+            let mut upload = store.put_multipart(&path).await.unwrap();
+            upload
+                .put_part(PutPayload::from_static(b"AB"))
+                .await
+                .unwrap();
+            upload
+                .put_part(PutPayload::from_static(b"CD"))
+                .await
+                .unwrap();
+            upload.complete().await.unwrap();
+            let got = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(got.as_ref(), b"ABCD");
+        }
+    }
+}
+
 /// Stable filesystem-safe key for a store URL: same URL -> same key, so sibling
 /// pond processes share one on-disk cache and distinct stores never collide.
 /// Shared by the rowmap (`sessions.rs`), the index disk cache, and the CLI's
@@ -3787,14 +4035,23 @@ fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet
     }
 }
 
-/// The object-store wrapper applied to every dataset open: the `_indices/*`
-/// disk cache (remote stores only, when a cache dir is supplied) chained with
-/// the diagnostic io-trace wrapper. `None` when neither is active.
-fn index_store_wrapper(
+/// The object-store wrapper applied to every dataset open: the fsync-on-write
+/// durability wrapper (local stores, unix), the `_indices/*` disk cache (remote
+/// stores only, when a cache dir is supplied), and the diagnostic io-trace
+/// wrapper. `None` when none is active. The durability and index-cache wrappers
+/// are backend-exclusive (local vs remote), so they never coexist.
+fn store_wrapper(
     location: &Url,
     index_cache_dir: Option<&std::path::Path>,
 ) -> Option<Arc<dyn WrappingObjectStore>> {
     let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
+    // Innermost, wrapping the real store directly: fsync must act on the final
+    // on-disk file the moment the inner write publishes its name, before any
+    // diagnostic wrapper's post-processing.
+    #[cfg(unix)]
+    if config::is_local(location) {
+        wrappers.push(Arc::new(durability::FsyncOnWrite));
+    }
     if let Some(dir) = index_cache_dir
         && !config::is_local(location)
     {
@@ -3834,29 +4091,37 @@ async fn open_or_create_via_ns(
             let location = response.location.with_context(|| {
                 format!("namespace returned no location for table {table_name}")
             })?;
-            let mut builder = DatasetBuilder::from_uri(&location).with_session(session.clone());
-            match wrapper {
-                Some(wrapper) => {
-                    builder = builder.with_store_params(ObjectStoreParams {
-                        object_store_wrapper: Some(wrapper),
-                        storage_options_accessor: (!storage_options.is_empty()).then(|| {
-                            Arc::new(StorageOptionsAccessor::with_static_options(
-                                storage_options.clone(),
-                            ))
-                        }),
-                        ..Default::default()
-                    });
-                }
-                None => {
-                    if !storage_options.is_empty() {
-                        builder = builder.with_storage_options(storage_options.clone());
+            let builder = apply_open_params(
+                DatasetBuilder::from_uri(&location).with_session(session.clone()),
+                &wrapper,
+                storage_options,
+            );
+            let mut dataset = match builder.load().await {
+                Ok(dataset) => dataset,
+                Err(load_error) => {
+                    let load_error = anyhow::Error::new(load_error)
+                        .context(format!("failed to open table {table_name}"));
+                    // A crashed local commit can leave a zero-byte/truncated head
+                    // manifest that poisons the table permanently (spec.md#local-store-self-heal);
+                    // self-heal by rolling back to the newest fully readable version.
+                    // Remote stores never produce this (atomic PUT), so heal is local-only.
+                    match config::local_path(&uri_to_url(&location)?) {
+                        Some(table_root) => {
+                            heal_local_dataset(
+                                &location,
+                                &table_root,
+                                table_name,
+                                session,
+                                storage_options,
+                                &wrapper,
+                                load_error,
+                            )
+                            .await?
+                        }
+                        None => return Err(load_error),
                     }
                 }
-            }
-            let mut dataset = builder
-                .load()
-                .await
-                .with_context(|| format!("failed to open table {table_name}"))?;
+            };
             ensure_current_schema(&mut dataset, schema.as_ref(), table_name).await?;
             return Ok(dataset);
         }
@@ -3876,11 +4141,17 @@ async fn open_or_create_via_ns(
     let mut write_params = sessions::write_params_for_create();
     write_params.session = Some(session.clone());
     write_params.mode = WriteMode::Create;
-    if !storage_options.is_empty() {
+    // The wrapper must ride the create write too, or a local store's very first
+    // manifest commit escapes fsync (local opens carry a wrapper but no
+    // storage_options, so the old `!is_empty()` gate skipped it entirely).
+    if wrapper.is_some() || !storage_options.is_empty() {
         write_params.store_params = Some(ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                storage_options.clone(),
-            ))),
+            object_store_wrapper: wrapper.clone(),
+            storage_options_accessor: (!storage_options.is_empty()).then(|| {
+                Arc::new(StorageOptionsAccessor::with_static_options(
+                    storage_options.clone(),
+                ))
+            }),
             ..Default::default()
         });
     }
@@ -3888,6 +4159,254 @@ async fn open_or_create_via_ns(
     Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
         .await
         .with_context(|| format!("failed to create table {table_name}"))
+}
+
+/// Apply the same session/wrapper/storage-option store params to a
+/// `DatasetBuilder` that every pond open uses, so the heal probe and retry open
+/// read the store identically to the real open.
+fn apply_open_params(
+    builder: DatasetBuilder,
+    wrapper: &Option<Arc<dyn WrappingObjectStore>>,
+    storage_options: &HashMap<String, String>,
+) -> DatasetBuilder {
+    match wrapper {
+        Some(wrapper) => builder.with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            storage_options_accessor: (!storage_options.is_empty()).then(|| {
+                Arc::new(StorageOptionsAccessor::with_static_options(
+                    storage_options.clone(),
+                ))
+            }),
+            ..Default::default()
+        }),
+        None if !storage_options.is_empty() => {
+            builder.with_storage_options(storage_options.clone())
+        }
+        None => builder,
+    }
+}
+
+/// Lance's `_versions/` subdirectory name (lance-table commit.rs:70).
+const VERSIONS_DIR_NAME: &str = "_versions";
+/// Cap on scan-verify probes during a heal walk; a real crash leaves 1-2 bad
+/// manifests, so a store needing more is pathological - fall through to the
+/// enriched error rather than probe unboundedly.
+const HEAL_MAX_PROBES: usize = 32;
+
+/// Parse a `_versions/` manifest filename to its version, following Lance's
+/// `ManifestNamingScheme` (lance-table commit.rs:114-153): V2 is a 20-digit
+/// `u64::MAX - version`, V1 is the plain version. Returns `None` for detached
+/// (`d`-prefixed) manifests and for anything not ending in `.manifest` - which
+/// skips prior `.corrupt` quarantines and Lance `.tmp_*` staging leftovers.
+fn parse_manifest_version(filename: &str) -> Option<u64> {
+    if filename.starts_with('d') {
+        return None;
+    }
+    let stem = filename.strip_suffix(".manifest")?;
+    if stem.len() == 20 {
+        stem.parse::<u64>().ok().map(|inverted| u64::MAX - inverted)
+    } else {
+        stem.parse::<u64>().ok()
+    }
+}
+
+/// Pin-open a specific version and drain a real scan over one narrow column.
+/// The pinned open resolves the manifest path deterministically and never lists
+/// the directory or reads the poisoned head (lance builder.rs:239); draining the
+/// scan forces data-page reads, which catches a zeroed data file that manifest
+/// metadata alone hides (spec.md#local-store-self-heal).
+async fn scan_verify_version(
+    table_uri: &str,
+    version: u64,
+    session: &Arc<Session>,
+    storage_options: &HashMap<String, String>,
+    wrapper: &Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<()> {
+    let builder = apply_open_params(
+        DatasetBuilder::from_uri(table_uri)
+            .with_session(session.clone())
+            .with_version(version),
+        wrapper,
+        storage_options,
+    );
+    let dataset = builder.load().await?;
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"])?;
+    let mut stream = scanner.try_into_stream().await?;
+    while let Some(batch) = stream.next().await {
+        batch?;
+    }
+    Ok(())
+}
+
+/// Self-heal a crash-damaged local table: walk `_versions/` head-down to the
+/// newest fully readable version, quarantine the unreadable manifests above it
+/// (atomic rename to `*.manifest.corrupt`, never delete), then retry the normal
+/// open once. Lossless for pond: source histories are truth and the next
+/// `pond sync` re-ingests the aborted commit (spec.md#local-store-self-heal).
+/// When nothing is quarantinable, returns the original error enriched (Layer 3).
+async fn heal_local_dataset(
+    table_uri: &str,
+    table_root: &std::path::Path,
+    table_name: &str,
+    session: &Arc<Session>,
+    storage_options: &HashMap<String, String>,
+    wrapper: &Option<Arc<dyn WrappingObjectStore>>,
+    load_error: anyhow::Error,
+) -> Result<Dataset> {
+    let versions_dir = table_root.join(VERSIONS_DIR_NAME);
+    let entries = match std::fs::read_dir(&versions_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return Err(enriched_open_error(
+                table_name,
+                format!(
+                    "open failed and no {} directory exists at {} - not a crash-damaged manifest",
+                    VERSIONS_DIR_NAME,
+                    versions_dir.display()
+                ),
+                load_error,
+            ));
+        }
+    };
+    let mut manifests: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", versions_dir.display()))?;
+        if let Some(version) = parse_manifest_version(&entry.file_name().to_string_lossy()) {
+            manifests.push((version, entry.path()));
+        }
+    }
+    manifests.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    let Some((_, newest_path)) = manifests.first().cloned() else {
+        return Err(enriched_open_error(
+            table_name,
+            format!(
+                "open failed and no manifest files exist under {} - not a crash-damaged manifest",
+                versions_dir.display()
+            ),
+            load_error,
+        ));
+    };
+    let newest_desc = || {
+        let name = newest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let bytes = std::fs::metadata(&newest_path).map(|m| m.len()).ok();
+        match bytes {
+            Some(bytes) => format!("newest manifest {name} ({bytes} bytes)"),
+            None => format!("newest manifest {name}"),
+        }
+    };
+
+    // Walk head-down to the newest fully readable version, collecting the
+    // unreadable manifests above it. Rename nothing until a rollback target is
+    // confirmed - a half-quarantine on a store we cannot repair is worse.
+    let mut doomed: Vec<PathBuf> = Vec::new();
+    let mut landed: Option<u64> = None;
+    let mut probes = 0usize;
+    for (version, path) in &manifests {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Lance's footer needs >=16 bytes (lance-io utils.rs:128); below that is
+        // definitively unreadable, so quarantine it without a probe.
+        if len < 16 {
+            doomed.push(path.clone());
+            continue;
+        }
+        if probes >= HEAL_MAX_PROBES {
+            break;
+        }
+        probes += 1;
+        match scan_verify_version(table_uri, *version, session, storage_options, wrapper).await {
+            Ok(()) => {
+                landed = Some(*version);
+                break;
+            }
+            Err(_) => doomed.push(path.clone()),
+        }
+    }
+
+    // No readable version at all (or hit the probe cap): touch nothing.
+    let Some(landed_version) = landed else {
+        return Err(enriched_open_error(
+            table_name,
+            format!(
+                "{} is unreadable (interrupted commit during a hard host stop) and no older version passed a scan-verify probe; nothing was quarantined",
+                newest_desc()
+            ),
+            load_error,
+        ));
+    };
+    // The head itself is readable: the open failure is not manifest-shaped.
+    if doomed.is_empty() {
+        return Err(enriched_open_error(
+            table_name,
+            format!(
+                "open failed but the manifest head under {} is readable - not a crash-damaged manifest",
+                versions_dir.display()
+            ),
+            load_error,
+        ));
+    }
+
+    // Quarantine each unreadable manifest above the rollback target: atomic
+    // in-place rename, never delete. A lost-race rename (NotFound) means a
+    // concurrent heal already moved it - treat as done and proceed.
+    let mut quarantined: Vec<String> = Vec::new();
+    for path in &doomed {
+        let mut corrupt = path.clone().into_os_string();
+        corrupt.push(".corrupt");
+        match std::fs::rename(path, &corrupt) {
+            Ok(()) => {
+                if let Some(name) = path.file_name() {
+                    quarantined.push(name.to_string_lossy().into_owned());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "table {table_name}: failed to quarantine corrupt manifest {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    // Retry the normal open once; the head is now the rollback target.
+    let builder = apply_open_params(
+        DatasetBuilder::from_uri(table_uri).with_session(session.clone()),
+        wrapper,
+        storage_options,
+    );
+    let dataset = builder.load().await.with_context(|| {
+        format!(
+            "table {table_name}: open still failed after quarantining {} corrupt manifest(s); restore from a `pond copy` replica or re-run `pond init`",
+            quarantined.len()
+        )
+    })?;
+
+    // Loud one-line notice: warns render on CLI stderr by default (main.rs
+    // init_tracing defaults to WARN level).
+    tracing::warn!(
+        "pond self-healed local table {table_name}: quarantined {} unreadable manifest(s) ({}) to {VERSIONS_DIR_NAME}/*.corrupt and rolled back to version {landed_version}. The interrupted commit's rows are reconstructed on the next `pond sync` from source histories.",
+        quarantined.len(),
+        quarantined.join(", "),
+    );
+
+    Ok(dataset)
+}
+
+/// Layer 3: wrap the raw open error with what heal inspected and the concrete
+/// recovery, so the caller sees a named fix instead of `Invalid range 0..0`.
+/// Never quarantines (the raw error stays in the cause chain).
+fn enriched_open_error(
+    table_name: &str,
+    finding: String,
+    load_error: anyhow::Error,
+) -> anyhow::Error {
+    load_error.context(format!(
+        "table {table_name}: {finding}. Restore this store from a `pond copy` replica or re-run `pond init` to re-sync from source histories"
+    ))
 }
 
 // lance-namespace sometimes nests one `lance::Error::Namespace` inside another
@@ -4175,6 +4694,22 @@ mod tests {
         prune_stale_uuid_dirs(temp.path(), &keep);
         assert!(indices.join("live").exists());
         assert!(!indices.join("dead").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_wrapper_present_for_local_absent_for_remote() {
+        // Local file:// stores get the fsync durability wrapper (no index cache
+        // dir, io-trace unarmed); remote stores get nothing here.
+        let local = Url::parse("file:///tmp/pond-wrapper-test").unwrap();
+        assert!(store_wrapper(&local, None).is_some());
+        for remote in ["memory:///pond-wrapper-test", "s3://bucket/prefix"] {
+            let url = Url::parse(remote).unwrap();
+            assert!(
+                store_wrapper(&url, None).is_none(),
+                "remote store must not carry the fsync wrapper: {remote}",
+            );
+        }
     }
 
     fn set(scope: Option<&str>) -> CredsSet {
@@ -4668,6 +5203,33 @@ mod tests {
             64,
             0.1
         ));
+    }
+
+    #[test]
+    fn parse_manifest_version_handles_all_naming_schemes() {
+        // V1: plain version.
+        assert_eq!(parse_manifest_version("5.manifest"), Some(5));
+        assert_eq!(parse_manifest_version("0.manifest"), Some(0));
+        // V2: 20-digit `u64::MAX - version`. u64::MAX renders as version 0.
+        assert_eq!(
+            parse_manifest_version("18446744073709551615.manifest"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_manifest_version("18446744073709551610.manifest"),
+            Some(5)
+        );
+        // Detached (`d`-prefixed) manifests are skipped.
+        assert_eq!(parse_manifest_version("d123.manifest"), None);
+        // Prior quarantines and Lance staging leftovers are skipped (not `.manifest`).
+        assert_eq!(parse_manifest_version("5.manifest.corrupt"), None);
+        assert_eq!(
+            parse_manifest_version(".tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d"),
+            None
+        );
+        // Unrelated files.
+        assert_eq!(parse_manifest_version("data.lance"), None);
+        assert_eq!(parse_manifest_version("notanumber.manifest"), None);
     }
 
     #[test]

@@ -49,7 +49,7 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## MCP surfaces are hard-enforced read-only
 
-- Every pond MCP action is read-only, hard-enforced (durable user constraint) - any new MCP tool that reaches the store must clear the same bar; never expose a write path through MCP. `pond_sql` proves it in two layers: (1) a pre-parse gate requiring exactly one `Statement::Query` - this also catches `EXPLAIN ANALYZE` / `DESCRIBE`, which DataFusion's `SQLOptions` alone misses; (2) `sql_with_options` with `allow_ddl` / `allow_dml` / `allow_statements` all false (only a bare `EXPLAIN` of a SELECT flips `allow_statements`). Fresh `SessionContext` per query.
+- Every pond MCP action is read-only, hard-enforced (durable user constraint) - any new MCP tool that reaches the store must clear the same bar; never expose a write path through MCP. One deliberate, documented carve-out exists: `local-store-self-heal` quarantine renames during an MCP-initiated open (spec.md#mcp-read-only-heal-exception) - do not "fix" heal as a rule violation. `pond_sql` proves it in two layers: (1) a pre-parse gate requiring exactly one `Statement::Query` - this also catches `EXPLAIN ANALYZE` / `DESCRIBE`, which DataFusion's `SQLOptions` alone misses; (2) `sql_with_options` with `allow_ddl` / `allow_dml` / `allow_statements` all false (only a bare `EXPLAIN` of a SELECT flips `allow_statements`). Fresh `SessionContext` per query.
 
 ## Sync change-detection oracle (S3 perf, measured)
 
