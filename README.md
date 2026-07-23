@@ -221,6 +221,8 @@ Issues and pull requests are welcome. The most useful contributions right now:
 
 For larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](.github/SECURITY.md).
 
+Questions or feedback? Start a [GitHub Discussion](https://github.com/tenequm/pond/discussions), or DM me on [Telegram](https://t.me/tenequm) or [X](https://x.com/opwizardx) - I answer personally.
+
 ## License
 
 [Apache-2.0](LICENSE) (c) 2026 tenequm
