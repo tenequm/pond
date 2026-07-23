@@ -4210,11 +4210,14 @@ fn parse_manifest_version(filename: &str) -> Option<u64> {
     }
 }
 
-/// Pin-open a specific version and drain a real scan over one narrow column.
-/// The pinned open resolves the manifest path deterministically and never lists
-/// the directory or reads the poisoned head (lance builder.rs:239); draining the
-/// scan forces data-page reads, which catches a zeroed data file that manifest
-/// metadata alone hides (spec.md#local-store-self-heal).
+/// Pin-open a specific version and drain a real scan over every column. The
+/// pinned open resolves the manifest path deterministically and never lists
+/// the directory or reads the poisoned head (lance builder.rs:239); draining
+/// the scan forces data-page reads, which catches a zeroed data file that
+/// manifest metadata alone hides. Full projection is load-bearing: a
+/// column-update commit (embed's write shape) puts later-added columns in
+/// their own per-fragment data files, which a narrower scan would never read
+/// (spec.md#local-store-self-heal).
 async fn scan_verify_version(
     table_uri: &str,
     version: u64,
@@ -4230,8 +4233,7 @@ async fn scan_verify_version(
         storage_options,
     );
     let dataset = builder.load().await?;
-    let mut scanner = dataset.scan();
-    scanner.project(&["id"])?;
+    let scanner = dataset.scan();
     let mut stream = scanner.try_into_stream().await?;
     while let Some(batch) = stream.next().await {
         batch?;
@@ -5230,6 +5232,68 @@ mod tests {
         // Unrelated files.
         assert_eq!(parse_manifest_version("data.lance"), None);
         assert_eq!(parse_manifest_version("notanumber.manifest"), None);
+    }
+
+    #[tokio::test]
+    async fn scan_verify_rejects_zeroed_column_add_data_file() {
+        // A column-update commit (embed's write shape) puts the new column in
+        // its own per-fragment data file; a narrow projection would declare the
+        // version healthy while that file is crash-zeroed.
+        let temp = tempfile::tempdir().unwrap();
+        let uri_owned = temp.path().join("t.lance");
+        let uri = uri_owned.to_str().unwrap();
+        let schema = Arc::new(lance::deps::arrow_schema::Schema::new(vec![
+            lance::deps::arrow_schema::Field::new(
+                "id",
+                lance::deps::arrow_schema::DataType::Utf8,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+        let data_files = || -> std::collections::BTreeSet<PathBuf> {
+            std::fs::read_dir(uri_owned.join("data"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        };
+        let before = data_files();
+        dataset
+            .add_columns(
+                lance::dataset::NewColumnTransform::SqlExpressions(vec![(
+                    "extra".to_string(),
+                    "id".to_string(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let column_add_file = data_files()
+            .difference(&before)
+            .next()
+            .cloned()
+            .expect("add_columns writes a new per-fragment data file");
+        let version = dataset.version().version;
+        drop(dataset);
+
+        // Fresh session per probe so nothing is served from cache.
+        let fresh = || Arc::new(Session::new(0, 0, Arc::new(ObjectStoreRegistry::default())));
+        scan_verify_version(uri, version, &fresh(), &HashMap::new(), &None)
+            .await
+            .expect("intact version must pass scan-verify");
+        std::fs::write(&column_add_file, b"").unwrap();
+        let verdict = scan_verify_version(uri, version, &fresh(), &HashMap::new(), &None).await;
+        assert!(
+            verdict.is_err(),
+            "zeroed column-add data file must fail scan-verify",
+        );
     }
 
     #[test]

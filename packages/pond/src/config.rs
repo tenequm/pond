@@ -115,10 +115,18 @@ pub fn is_local(url: &Url) -> bool {
 
 /// Extract the filesystem `PathBuf` for local URLs. `None` for remote.
 pub fn local_path(url: &Url) -> Option<PathBuf> {
-    if is_local(url) {
-        url.to_file_path().ok()
-    } else {
-        None
+    if !is_local(url) {
+        return None;
+    }
+    // `Url::to_file_path` only accepts the `file` scheme, and `set_scheme`
+    // can't cross the special/non-special boundary - rebuild `file+uring`
+    // URLs as `file` textually.
+    match url.as_str().strip_prefix("file+uring:") {
+        Some(rest) => Url::parse(&format!("file:{rest}"))
+            .ok()?
+            .to_file_path()
+            .ok(),
+        None => url.to_file_path().ok(),
     }
 }
 
@@ -885,6 +893,15 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_path_resolves_both_local_schemes() {
+        let plain = Url::parse("file:///tmp/pond-store").unwrap();
+        assert_eq!(local_path(&plain), Some(PathBuf::from("/tmp/pond-store")));
+        let uring = Url::parse("file+uring:///tmp/pond-store").unwrap();
+        assert_eq!(local_path(&uring), Some(PathBuf::from("/tmp/pond-store")));
+        assert_eq!(local_path(&Url::parse("s3://bucket/prefix").unwrap()), None);
+    }
 
     #[cfg(unix)]
     #[test]
