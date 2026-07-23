@@ -1,6 +1,6 @@
 # nanoclaw + hermes adapters - implementation plan (2026-07-23)
 
-Goal: add two new source adapters to pond in one PR on this branch (`feat/hermes-and-nanoclaw-support`): `nanoclaw` (NanoClaw, github.com/nanocoai/nanoclaw) and `hermes` (Hermes Agent, github.com/NousResearch/hermes-agent). Both source codebases are cloned for reference at `~/pjv/nanocoai/nanoclaw` and `~/pjv/nousresearch/hermes-agent` (refresh with `git pull` if needed; never clone into this repo).
+Goal: in one PR on this branch (`feat/hermes-and-nanoclaw-support`), add two new source adapters to pond - `nanoclaw` (NanoClaw, github.com/nanocoai/nanoclaw) and `hermes` (Hermes Agent, github.com/NousResearch/hermes-agent) - plus an installable hermes recall plugin package (`packages/hermes-pond`, section 5) that wires pond's read-only tools into hermes with a seamless onboarding flow. Both source codebases are cloned for reference at `~/pjv/nanocoai/nanoclaw` and `~/pjv/nousresearch/hermes-agent` (refresh with `git pull` if needed; never clone into this repo).
 
 This document is self-contained: it carries the source-format research (verified against the clones on 2026-07-23) plus all settled design decisions. Where it cites source files of nanoclaw/hermes, line numbers are as of the 2026-07-23 clones - re-verify against the clone before relying on them.
 
@@ -78,17 +78,18 @@ Hermes Agent (Python) persists everything in ONE SQLite database per profile. No
 
 ### 2.1 Location and discovery
 
-- Default home: `~/.hermes` (POSIX; env override `HERMES_HOME`; Windows `%LOCALAPPDATA%\hermes` - out of scope, pond is not doing Windows-specific probing).
+- Default home: `~/.hermes` (POSIX; env override `HERMES_HOME`; Windows `%LOCALAPPDATA%\hermes` - out of scope, pond is not doing Windows-specific probing). `HERMES_HOME` may point anywhere, not just under `~` - Docker installs use paths like `/opt/data` (`hermes_constants.py` handles the profiles walk-up for such layouts). An `active_profile` sticky file can select a profile implicitly; pond does not need to interpret it - enumerating `<home>/state.db` plus `<home>/profiles/*/state.db` under the configured home covers every case, and the adapter's `{path}` config must accept any directory.
 - DB: `<home>/state.db` (`DEFAULT_DB_PATH`, line ~154). Profiles: `<home>/profiles/<name>/state.db` - each profile is an independent DB; scan both.
 - WAL mode by default (sidecars `state.db-wal`/`state.db-shm` present while live), falls back to journal DELETE on network mounts. Hermes itself sanctions cross-process reads via `sqlite3.connect("file:<path>?mode=ro", uri=True)` (~1582-1588) - which is what `sqlite.rs::open_db` already does.
-- NOT transcripts, ignore: `kanban.db`, `sessions/sessions.json` (legacy routing index, no message content), `cron/`, `checkpoints/`, `logs/`, and the memory plugins (mem0/hindsight postgres/redis - a separate subsystem).
+- NOT transcripts, ignore: `kanban.db`, `sessions/sessions.json` (legacy routing index, no message content; superseded by the `gateway_routing` table inside state.db and now read only for one-time migration), `cron/`, `checkpoints/` (a git object store of working-directory file snapshots - no messages), `logs/`, and the memory plugins (mem0/hindsight postgres/redis - a separate subsystem).
+- Derived/opt-in JSONL side-channels that DUPLICATE conversation content on disk - deliberately NOT ingested (state.db is canonical; list these in the module header's documented non-ingest section): `<home>/moa-traces/<session_id>.jsonl` (opt-in `moa.save_traces`, full MoA turn traces), `trajectory_samples.jsonl` / `failed_trajectories.jsonl` (RL/datagen sampling), the trace-upload serializer's `sessions/<session_id>.jsonl` (redacted upload artifact), and `hermes sessions export` output (jsonl/markdown at user-chosen paths).
 - `schema_version` table holds a single row; `SCHEMA_VERSION = 23` at time of writing. Migrations auto-upgrade on open by hermes itself, so a live install reads at the current version. Treat drift like the openclaw adapter treats `schema_meta.schema_version`: best-effort with a warning, rule-3 carriers keep unknown shapes lossless.
 
 ### 2.2 `sessions` table (the session row)
 
-Key columns (full DDL at ~999-1047): `id TEXT PK`, `source TEXT` (surface: `local`, `telegram`, `discord`, `whatsapp`, `slack`, `signal`, `matrix`, `email`, ... plus non-gateway values `cli`, `tui`, `cron`, `acp`, `unknown`), `user_id`, `session_key` (platform+chat+thread routing key), `chat_id`, `chat_type` (`dm|group|channel|thread`), `thread_id`, `display_name`, `origin_json` (full serialized SessionSource: user_name, chat_name, scope_id, ...), `model`, `model_config` (JSON), `system_prompt`, `parent_session_id` (FK -> sessions.id), `started_at REAL` (unix epoch seconds, float, UTC), `ended_at`, `end_reason`, token counters, `cwd`, `git_branch`, `git_repo_root`, billing columns, `title`, `profile_name`, `rewind_count`, `archived`.
+Key columns (full DDL at ~999-1047): `id TEXT PK`, `source TEXT` - an OPEN vocabulary, not an enum: free-form TEXT, default `"unknown"`, currently ~25+ gateway platform tags (`telegram`, `discord`, `whatsapp`, `slack`, `signal`, `matrix`, `email`, `feishu`, `irc`, `teams`, ... plus plugin-registered platforms) and non-gateway values (`local`, `cli`, `tui`, `cron`, `acp`, `unknown`). Treat it as opaque data (carry verbatim into options/metadata); never enum-match beyond the specific values the taxonomy in 3.1 names - `user_id`, `session_key` (platform+chat+thread routing key), `chat_id`, `chat_type` (`dm|group|channel|thread`), `thread_id`, `display_name`, `origin_json` (full serialized SessionSource: user_name, chat_name, scope_id, ...), `model`, `model_config` (JSON), `system_prompt`, `parent_session_id` (FK -> sessions.id), `started_at REAL` (unix epoch seconds, float, UTC), `ended_at`, `end_reason`, token counters, `cwd`, `git_branch`, `git_repo_root`, billing columns, `title`, `profile_name`, `rewind_count`, `archived`.
 
-`parent_session_id` covers three lineage kinds (documented ~3328-3341): compression forks (a session ending `end_reason='compression'` forks a child continuing the same conversation), delegate/subagent spawns, and branch continuations. Compression-fork children inherit the parent's gateway routing columns; delegate children deliberately do not - that inheritance difference plus `end_reason` on the parent is how the adapter distinguishes fork kinds. `async_delegations` table (~1115-1134) carries delegation bookkeeping if needed for disambiguation.
+`parent_session_id` covers three lineage kinds (documented ~3328-3341): compression forks (a session ending `end_reason='compression'` forks a child continuing the same conversation), delegate/subagent spawns, and branch continuations (`/branch`, parent ends `end_reason='branched'`). Compression-fork children inherit the parent's gateway routing columns; delegate children deliberately do not - that inheritance difference plus `end_reason` on the parent is how the adapter distinguishes fork kinds. `async_delegations` table (~1115-1134) carries delegation bookkeeping if needed for disambiguation.
 
 ### 2.3 `messages` table (the transcript)
 
@@ -168,24 +169,61 @@ Suggested implementation order (each step leaves the tree green):
 6. hermes `serialize` (3.3) + conformance tests.
 7. Registry: two `mod`/`pub use` lines + two `&Factory` entries in `registry()` (`adapter/mod.rs`). Check `discovery.rs` and any user-facing adapter listings (README, `pond init` wizard source list) pick the new names up automatically; update `tests/fixtures/README.md` (nanoclaw section: note it is now exercised by the adapter; add a hermes section) and the README adapter/fixtures table.
 8. Integration suites: `packages/pond/tests/integration/adapter/nanoclaw.rs` and `.../hermes.rs`, each registered with a `#[path]` line in `tests/integration/adapter/mod.rs`. nanoclaw drives the committed fixtures (real + synthetic) plus synthetic metadata DBs; hermes builds a synthetic `state.db` from the real DDL (copy the CREATE TABLE shapes from `hermes_state.py` `SCHEMA_SQL`, subset to sessions/messages/schema_version) covering: multimodal `\x00json:` content, tool call/result linking, reasoning columns, compaction flag flips (`active=0,compacted=1` rows ingested), a delete+reinsert rewrite (new ids appear, old pond rows survive - additive re-sync test mirroring openclaw's), all three lineage kinds, profile enumeration, and skip taxonomy. Optionally add either adapter to the foreign-restore matrix in `adapter/mod.rs` (tests) - nice-to-have, not required for this PR.
-9. Docs pass: module headers carry the format matrix + documented non-ingest lists (openclaw.rs header is the template); each adapter documents WHAT it deliberately does not ingest (nanoclaw: conversations/*.md summaries, messages_in/out IPC bodies, codex sessions; hermes: kanban.db, sessions.json, memory plugins, FTS shadow tables).
+9. Docs pass: module headers carry the format matrix + documented non-ingest lists (openclaw.rs header is the template); each adapter documents WHAT it deliberately does not ingest (nanoclaw: conversations/*.md summaries, messages_in/out IPC bodies, codex sessions; hermes: kanban.db, sessions.json, memory plugins, FTS shadow tables, and the JSONL side-channels from 2.1).
+10. `packages/hermes-pond` plugin package (section 5): skeleton (`register(ctx)` + plugin.yaml), MCP client with managed/url modes, process manager, tool registration with routing-positioned descriptions, `hermes pond setup` onboarding (binary locate, bootstrap, platform allowlists), README with the exact install sequence.
+11. Plugin tests (5.5) + end-to-end verification on a clean `~/.hermes` sandbox.
 
-## 5. Test data caveats
+## 5. hermes recall plugin - `packages/hermes-pond` (in scope for this PR)
+
+Deliverable: an installable hermes plugin package that gives a hermes user pond capture + recall with zero pond knowledge: install, enable, done. Tools-only, mirroring `packages/openclaw-pond` v1 exactly - NO memory-provider slot, NO ambient recall / prompt injection, NO write surfaces. openclaw-pond is the reference implementation for scope, tone, budgets, and privacy posture; read its `index.ts`, `service.ts`, `tools.ts`, and README before starting.
+
+### 5.1 Attach point (settled - do not relitigate)
+
+- Hermes has a general plugin framework (`hermes_cli/plugins.py`): a plugin is a directory under `$HERMES_HOME/plugins/<name>/` with `__init__.py` exposing `register(ctx)` plus a `plugin.yaml` (name, version, description, pip_dependencies). Plugins are opt-in: they load only when enabled in config.yaml. `PluginContext.register_tool(name, toolset, schema, handler, ...)` registers native tools; `register_cli_command` adds `hermes <subcmd>` commands.
+- NOT the MemoryProvider slot (`plugins/memory/`): it allows one external provider at a time and pond would waste it (read-only recall; the slot's write hooks would all be no-ops). Using the general plugin system keeps pond compatible with whatever memory provider the user already runs.
+- NOT a `session_search` backend, and NOT an override of it. Verified 2026-07-23: `tools/session_search_tool.py` has no backend/provider seam - it is FTS5 directly over state.db, implemented inline. Hermes's only replacement mechanism is `register_tool(..., override=True)`, which requires the operator trust gate `plugins.entries.<plugin_id>.allow_tool_override: true` and would be a functional regression anyway: hermes's FTS sees the current session's messages live, pond's copy is sync-cadence stale, and pond search deliberately excludes tool/reasoning text. Coexist: register pond's tools alongside `session_search` and let tool descriptions route intent - pond = the durable CROSS-HARNESS archive (past sessions from Claude Code, OpenClaw, hermes, and every other ingested harness; survives resets and disk-budget pruning), `session_search` = live same-harness search. Apply the same routing-language discipline as pond's own MCP instructions (transport.rs `get_info`): names and short descriptions route, detail lives in resources/errors, don't fatten descriptions.
+- MCP note: hermes also supports MCP servers natively (`config.yaml mcp_servers:`, stdio + streamable HTTP + SSE, `tools/mcp_tool.py`). The plugin deliberately does not reduce to "document an mcp_servers entry": raw MCP config misses the onboarding bar, and gateway/API/cron surfaces exclude MCP servers by default. Registering through the plugin system makes the tool-availability story explicit and owned. (An `mcp_servers` recipe can still be documented in the README as the manual alternative.)
+
+### 5.2 Modes and process supervision
+
+- `managed` (default): the plugin owns a `pond serve --transport stdio --with-sync` child - lazy start, health check, restart with backoff, SIGTERM teardown on shutdown, low priority (`nice`), logs to a file. In-tree template: `plugins/google_meet/process_manager.py` (Popen + pid/state file + `stop()`). On unconfigured pond, start with `--bootstrap hermes` (the adapter from this PR is the bootstrap target) so the first sync ingests the user's existing hermes history; NEVER mutate an existing pond config (openclaw-pond rule, keep it).
+- `url`: attach to an external `pond serve` over streamable HTTP; no supervision. Same dual-mode split, one MCP client implementation for both (mirror `packages/openclaw-pond/src/mcp.ts` structurally, in Python).
+
+### 5.3 Tools
+
+`pond_search`, `pond_get_session`, `pond_get_message`, `pond_sql` registered via `register_tool` under one toolset (`pond`). Handlers forward to the MCP client and return JSON strings (hermes handler contract). Read-only holds by construction (pond's MCP surface is hard-enforced read-only). Response budgets: copy openclaw-pond's caps (limit defaults, response size, snippet length) rather than inventing new ones. v1 scoping: the tools expose whatever the operator's pond store holds - hermes has no per-agent session-visibility SDK equivalent to OpenClaw's, so there is no clamp to honor; state that plainly in the README (the operator chooses what pond ingests). If a scoping need emerges it is a follow-up, not this PR.
+
+### 5.4 Onboarding flow (the acceptance bar)
+
+Install must be: get the package -> enable -> everything works. The plugin handles, without the user touching pond:
+
+1. Locate the pond binary (PATH, then well-known install locations); if absent, fail with the exact install command (brew/cargo/GitHub releases) - locate + actionable hint, no silent downloads (openclaw-pond precedent).
+2. Bootstrap pond config (`--bootstrap hermes`) when unconfigured; leave existing config untouched.
+3. Make the tools actually appear where hermes users live: gateway platforms, the API server, and cron exclude non-allowlisted tools by default (CLI/TUI include plugin tools by default). The setup flow must write the per-platform tool allowlist entries, or users install the plugin and see nothing on chat surfaces. Verify the exact allowlist config keys against `hermes_cli/tools_config.py` (`_get_platform_tools`) at implementation time; expose the step as `hermes pond setup` via `register_cli_command` if the plugin system offers no first-class setup hook.
+4. Distribution: bundled plugins live in the hermes repo; third-party plugins live in `$HERMES_HOME/plugins/<name>/`. Pick the channel at implementation time - a PyPI package whose console entry point materializes/updates the plugin directory, or a documented one-command install - whichever is fewest steps on a stock hermes install. Document the exact sequence in the package README and verify it end-to-end on a clean `~/.hermes`.
+
+### 5.5 Package shape and tests
+
+- `packages/hermes-pond/` (Python, follows the repo's `packages/` conventions; NOT release-plz-managed - the crate is the only release-plz package; version the plugin in its own metadata).
+- Tests: pytest with a stubbed `PluginContext` and a fake pond MCP endpoint (golden tool fixtures - mirror `packages/openclaw-pond/test`'s fake-pond approach), plus a process-manager lifecycle test against a stub binary. No network, no real hermes install required.
+
+## 6. Test data caveats
 
 - Fixture corpora must stay synthetic or anonymized (repo rule; the nanoclaw real capture is already anonymized as `agentgroup-anon-001`). Never copy from a live `~/.hermes` or a real nanoclaw install into fixtures.
 - The committed nanoclaw fixtures may predate some current nanoclaw behaviors (rotation suffixes, `continuation:claude` key). Fixtures are ground truth for record SHAPES; the clone at `~/pjv/nanocoai/nanoclaw` is ground truth for layout/keys - extend the synthetic fixture set where the two disagree, do not mutate the real capture.
 - Real-corpus validation (optional, recommended before merge): the operator has live nanoclaw data on a remote host and can run `pond sync nanoclaw --dry-run` there; ask rather than assuming access.
 
-## 6. Process requirements
+## 7. Process requirements
 
 - One PR from this branch into main. Commits use conventional style; the feature commits should be `feat(adapter): ...` so release-plz derives the bump (do NOT open a release PR or pick a version - release-plz does both).
 - `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` green locally before every push. Test placement rule: unit tests in `#[cfg(test)] mod tests` at the bottom of the source file; only genuine cross-module suites in `tests/integration/adapter/`.
 - Keep `adapter/mod.rs` seam-pure: no nanoclaw/hermes specifics leak into it beyond the registry lines. The bounded-values, no-synthesis, and provenance rules are enforced by the type system - if something will not compile without a synthesized value, the design is wrong, not the seam.
 - MCP surfaces remain read-only; nothing in this work touches transport/handlers beyond what adapter registration already wires.
 
-## 7. Non-goals (this PR)
+## 8. Non-goals (this PR)
 
-- No nanoclaw or hermes RECALL integrations (plugins/providers projecting pond tools into those harnesses) - capture only. The hermes MemoryProvider frontend is a separate later phase (2607-17 research, section 6).
+- No nanoclaw recall integration (NanoClaw setups attach to an external `pond serve` via MCP today; a bespoke nanoclaw plugin is not this PR).
+- No hermes MemoryProvider integration, no ambient recall / prompt injection, no `session_search` override or backend hook (verified none exists) - the hermes plugin is tools-only per section 5.
 - No push/ingest API; capture stays tail-the-source-of-truth.
 - No Windows discovery for hermes.
 - No live-watch daemon changes; `pond sync` cadence is unchanged.
