@@ -12,7 +12,7 @@ use std::path::Path;
 
 use pond::{
     adapter::{AdapterFactory, OpenClawAdapter, OpenClawFactory, RestoreFidelity},
-    handlers::ingest_adapter,
+    handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::{SessionWithMessages, Store},
     wire::{Message, PartKind, Provenance},
 };
@@ -572,6 +572,86 @@ async fn zstd_reset_archive_ingests_as_ordinary_history() -> anyhow::Result<()> 
         session.messages.iter().any(|m| m.message.id() == "m-l1"),
         "reset archive is ordinary retained history",
     );
+    Ok(())
+}
+
+// -- Case (i) stable file-era store (openclaw <= 2026.7.1) --------------------
+
+// The layout every stable OpenClaw host has: sessions live as files
+// (sessions.json + a live bare `<sessionId>.jsonl`), while openclaw-agent.sqlite
+// exists (since 2026.6.5) but holds only auth/agent state - no `sessions` table.
+// The DB must be skipped silently and ingest must run clean off the file store.
+#[tokio::test(flavor = "multi_thread")]
+async fn stable_file_era_store_ingests_with_no_adapter_errors() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let agent_dir = root.path().join("agents").join("bot");
+
+    // Session-less openclaw-agent.sqlite: auth/agent-state tables only.
+    let db = db_path(root.path(), "bot");
+    std::fs::create_dir_all(db.parent().unwrap())?;
+    let conn = Connection::open(&db)?;
+    conn.execute_batch(
+        "CREATE TABLE auth_profile_store (store_key TEXT PRIMARY KEY, store_json TEXT);\n\
+         CREATE TABLE auth_profile_state (state_key TEXT PRIMARY KEY, state_json TEXT);",
+    )?;
+    drop(conn);
+
+    // File store: sessions.json map + a LIVE bare transcript (not an archive).
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)?;
+    std::fs::write(
+        sessions_dir.join("sessions.json"),
+        json!({ "agent:bot:main": { "sessionId": "sess-live" } }).to_string(),
+    )?;
+    let lines = [
+        header("sess-live", "/work/repo", None),
+        user_msg("m-u", None, 1, "what is the plan?"),
+        assistant_msg("m-a", Some("m-u"), 2, "here is the plan"),
+    ];
+    let jsonl: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(sessions_dir.join("sess-live.jsonl"), jsonl)?;
+
+    // Capture every per-session outcome so a spurious DB error would show up as
+    // a Skipped status.
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = OpenClawAdapter::new(root.path());
+    let mut skipped: Vec<String> = Vec::new();
+    let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
+        if let SyncEvent::SessionDone(outcome) = event
+            && let SyncStatus::Skipped { reason } = outcome.status
+        {
+            skipped.push(reason);
+        }
+    })
+    .await?;
+    assert!(
+        skipped.is_empty(),
+        "the session-less DB is skipped silently, never surfaced as an error: {skipped:?}",
+    );
+    assert_eq!(summary.skipped_files, 0, "nothing reported unreadable");
+
+    let session = store
+        .get_session("sess-live")
+        .await?
+        .expect("live file-era session ingests");
+    assert_eq!(*session.session.project, "agent:bot:main");
+    assert_eq!(session.session.source_agent, "openclaw");
+
+    let text_of = |id: &str| {
+        parts_of(&session, id).iter().find_map(|p| match &p.kind {
+            PartKind::Text { text } => text.as_deref().cloned(),
+            _ => None,
+        })
+    };
+    assert_eq!(text_of("m-u").as_deref(), Some("what is the plan?"));
+    assert_eq!(text_of("m-a").as_deref(), Some("here is the plan"));
+    let user = session
+        .messages
+        .iter()
+        .find(|m| m.message.id() == "m-u")
+        .expect("user message present");
+    assert!(matches!(user.message, Message::User { .. }));
     Ok(())
 }
 
