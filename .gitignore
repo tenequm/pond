@@ -27,7 +27,7 @@ tmp/
 /.claude
 .agents/
 skills-lock.json
-/benches/corpus/
+/packages/pond/benches/corpus/
 
 # AGENTS.md is the canonical, tracked instructions file; CLAUDE.md is a local
 # symlink to it for Claude Code (which reads CLAUDE.md). Keep the symlink local.
@@ -68,5 +68,5 @@ skills-lock.json
 # nix build output symlink
 /result
 
-# playwright-cli local session state
-/.playwright-cli/
+# playwright-cli local session state (directory, plus the stray marker file it drops)
+/.playwright-cli

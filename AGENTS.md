@@ -22,8 +22,8 @@
 
 > **PLACEMENT RULE - read before writing any test.** A test lives next to the code it exercises. If it tests one module's behavior - even when it goes through a `Store` or handler call - it is a UNIT test and belongs in `#[cfg(test)] mod tests` at the bottom of that `src/...` file. `tests/integration/` is ONLY for genuine cross-module integration: multiple subsystems wired end to end (e.g. ingest -> search -> get over a fixture corpus). A `Store`-level, single-module, or pure-helper test in `tests/integration/` is in the WRONG place - move it to `src/`. When in doubt, default to a unit test in `src/`.
 
-- Layout: unit tests live in `#[cfg(test)] mod tests` next to the code they test (`src/...`). All integration tests are bundled into one binary at `tests/integration.rs`, with each suite as a module under `tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
-- Adapter-specific integration tests go in `tests/integration/adapter/<adapter>.rs` (mirroring `src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `tests/integration/adapter/mod.rs`, the seam analog of `src/adapter/mod.rs`.
+- Layout (all crate paths are under `packages/pond/`): unit tests live in `#[cfg(test)] mod tests` next to the code they test (`packages/pond/src/...`). All integration tests are bundled into one binary at `packages/pond/tests/integration.rs`, with each suite as a module under `packages/pond/tests/integration/<name>.rs` and pulled in via `#[path = ...] mod <name>;`. Keep new integration suites in this folder and add a matching `#[path]` line - never drop a loose `tests/foo.rs` next to `integration.rs` (it would compile as a second binary and re-link the whole crate).
+- Adapter-specific integration tests go in `packages/pond/tests/integration/adapter/<adapter>.rs` (mirroring `packages/pond/src/adapter/<adapter>.rs`), not in concern-level files; keep cross-adapter interop (e.g. the foreign-restore matrix) in `packages/pond/tests/integration/adapter/mod.rs`, the seam analog of `packages/pond/src/adapter/mod.rs`.
 - Run everything: `cargo test`.
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
@@ -77,13 +77,13 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Errors
 
-- `anyhow::Result` internally. Typed `pond::Error` (thiserror, `src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
+- `anyhow::Result` internally. Typed `pond::Error` (thiserror, `packages/pond/src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`packages/pond/src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
 - When a command fails or detects a recoverable bad state, its output names the fix - the exact recovery command or concrete next step, not just the symptom (e.g. an incomplete index points the user at `pond optimize --only index`).
 
 ## Repo layout
 
-- One flat crate. `src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`). Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `tests/` is for cross-module integration only.
-- Root `SKILL.md` is compiled into the binary via `include_str!` (`pond skill` prints it; `pond init` installs it to `~/.claude/skills/pond/`), so it MUST stay out of Cargo.toml's `exclude` list - excluding it breaks the crates.io publish build.
+- `packages/` monorepo. The Rust crate is `packages/pond/` (a virtual-workspace member; the workspace `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` stay at the repo root, so `cargo build|test|clippy|fmt` still run from root). `packages/pond/src/` holds the `adapter/` module folder alongside top-level files (`handlers.rs`, `sessions.rs`, `substrate.rs`, `transport.rs`, `wire.rs`, `embed.rs`, `config.rs`, `main.rs`, `lib.rs`); `SKILL.md` sits at the crate root (embedded via `include_str!`). The OpenClaw plugin is `packages/openclaw-pond/` (npm package `openclaw-pond`). Repo-level dirs (`docs/`, `ops/`, `nix/`, `.github/`, `.moon/`) stay at root. Unit tests live in `#[cfg(test)] mod tests` inside the file they test; `packages/pond/tests/` is for cross-module integration only.
+- Crate-root `SKILL.md` (`packages/pond/SKILL.md`) is compiled into the binary via `include_str!` (`pond skill` prints it; `pond init` installs it to `~/.claude/skills/pond/`), so it MUST stay out of the crate Cargo.toml's `exclude` list - excluding it breaks the crates.io publish build.
 
 ## MCP tool routing is deliberate
 
@@ -103,7 +103,7 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ### Releasing
 
 - **NEVER open a "release PR" / "PR for vX.Y.Z", and NEVER pick the version number - release-plz does both.** A `feat/*` (or any) branch PR into `main` is the FEATURE landing; it is NOT the release and must not be described as "a PR for 0.X.Y". Once releasable commits are on `main`, release-plz *automatically* opens a separate `chore: release vX.Y.Z` PR and derives the version from the commit types itself: non-breaking commits (`feat`/`fix`/`perf`/`refactor`/`docs`/...) -> a **patch** bump (`0.11.0` -> `0.11.1`); a breaking `feat!:`/`fix!:` commit -> a minor bump (`0.11.0` -> `0.12.0`) - the marker only counts on `feat`/`fix` types with a real diff (see the release-plz bump note above). The agent's ONLY release actions are: **(1)** get commits onto `main` (feature branch -> its own normal PR, or direct commit), then **(2)** merge the `chore: release` PR release-plz already opened - that merge is what publishes. Do not invent a version, do not hand-craft a release PR, do not conflate the feature PR with the release PR.
-- Flow: commits land on `main` -> release-plz opens a `chore: release vX.Y.Z` PR -> **merge that PR** -> CI's `publish-release` job tags `vX.Y.Z` and publishes crates.io + the GitHub release (sole binary host) + the Homebrew formula + the root flake (`nix/pond.nix`) + the pond-nix legacy mirror.
+- Flow: commits land on `main` -> release-plz opens a `chore: release vX.Y.Z` PR -> **merge that PR** -> CI's `publish-release` job tags `vX.Y.Z` and publishes crates.io + the GitHub release (sole binary host) + the Homebrew formula + the repo flake (`ops/nix/pond.nix`) + the pond-nix legacy mirror.
 - **Always merge the release PR through GitHub** (`gh pr merge <N> --squash -t "chore: release vX.Y.Z"`; keep the `!` in the subject for a breaking release so it survives the squash). A release branch that looks like it's "missing my latest commits" is NOT a reason to do anything manual - the tag is cut on `main` *after* the merge, so it captures every commit. Check `gh pr view <N> --json mergeable,mergeStateStatus` and just merge.
 - Enrich the changelog before merging. release-plz auto-generates the `CHANGELOG.md` entry from commit *subjects* only (terse). Hand-edit the entry on the release PR branch into a meaningful note: a one-line summary plus grouped bullets carrying the key measured numbers. The GitHub release body is this section verbatim (release-plz `git_release_body` default `{{ changelog }}`), so the section format is load-bearing.
 - Changelog section headers are a fixed taxonomy - the `### ` group names generated by `[changelog].commit_parsers` in `.github/release-plz.toml` (the git-cliff config release-plz runs). When enriching, ONLY add prose/numbers *under* the generated headers; never rename, re-style, or drop them. Canonical set (keep the emoji + `<!-- N -->` form): `🛠 Breaking Changes`, `🎉 New Features`, `🐛 Bug Fixes`, `🚀 Performance`, `🚜 Refactor`, `📚 Documentation`, `🧹 Chores`, `🔧 Other`. `ops/scripts/check-changelog-headers.sh` (run by the `check-changelog` moon task in CI and the pre-commit hook) fails the build on any off-taxonomy header in the top section, so a de-styled entry can't merge.
@@ -116,7 +116,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## Adapter seam (load-bearing)
 
 - The adapter seam enforces correctness via types - synthesized values (sentinel strings, fallback defaults like `"unknown"`, `"function"`, `""`) MUST NOT compile, and the seam is transport-agnostic via `Source`/`Extracted<T>` so file, HTTP, and stream adapters share one set of primitives.
-- Keep `src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`src/adapter/<adapter>.rs`) next to the factory/reader they describe.
+- Keep `packages/pond/src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`packages/pond/src/adapter/<adapter>.rs`) next to the factory/reader they describe.
 - Unit tests live in `#[cfg(test)] mod tests` at the bottom of the source file they test; `tests/` is reserved for genuine cross-module integration suites only.
 
 ## Seam boundaries
@@ -127,7 +127,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 ## CLI output stack
 
 - User-facing CLI output uses `clap` (parsing) + `indicatif` (progress + spinners) + `dialoguer` (interactive prompts) + `comfy-table` (width-adaptive tables) + `anstyle` (color, gated through `pond::output::paint` which honors `NO_COLOR` and non-TTY stdout). Don't reach for `crossterm`, `terminal_size`, `owo-colors`, `colored`, or `tabled`; pond standardizes on the stack above.
-- New tabular surfaces should go through `pond::output` and the `new_table()` helper in `src/main.rs` so every command renders the same: borderless, dynamic-width, dim-bold headers.
+- New tabular surfaces should go through `pond::output` and the `new_table()` helper in `packages/pond/src/main.rs` so every command renders the same: borderless, dynamic-width, dim-bold headers.
 
 ## Test storage backends
 

@@ -1,0 +1,90 @@
+{
+  "id": "pond",
+  "name": "Pond",
+  "description": "Durable, lossless recall over past agent sessions. Read-only pond_search / pond_get_session / pond_get_message / pond_sql tools backed by a local pond store.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["pond_search", "pond_get_session", "pond_get_message", "pond_sql"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pond": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["managed", "url"],
+            "default": "managed"
+          },
+          "syncIntervalMinutes": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 1440,
+            "default": 5
+          },
+          "binaryPath": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "sources": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "maxItems": 50,
+        "default": ["openclaw"]
+      },
+      "groupSessions": {
+        "type": "string",
+        "enum": ["clamp", "inherit"],
+        "default": "clamp"
+      }
+    }
+  },
+  "uiHints": {
+    "pond.mode": {
+      "label": "Pond Mode",
+      "help": "managed: the plugin spawns and supervises a local pond process (default). url: attach to an external pond serve endpoint."
+    },
+    "pond.syncIntervalMinutes": {
+      "label": "Sync Interval (minutes)",
+      "help": "How often the managed pond process ingests new OpenClaw sessions."
+    },
+    "pond.binaryPath": {
+      "label": "Pond Binary Path",
+      "help": "Explicit path to the pond binary; defaults to searching PATH.",
+      "advanced": true
+    },
+    "pond.url": {
+      "label": "Pond URL",
+      "help": "External pond serve endpoint for url mode.",
+      "advanced": true
+    },
+    "pond.headers": {
+      "label": "Pond HTTP Headers",
+      "help": "Headers sent to the url-mode endpoint (e.g. Authorization for an auth shim).",
+      "advanced": true,
+      "sensitive": true
+    },
+    "sources": {
+      "label": "Corpus Sources",
+      "help": "pond source_agent filter. [\"openclaw\"] recalls OpenClaw sessions only; [\"*\"] opts into the whole cross-harness corpus."
+    },
+    "groupSessions": {
+      "label": "Group Session Scope",
+      "help": "clamp: group/channel callers are narrowed to their own session tree (default). inherit: groups use the operator-configured visibility.",
+      "advanced": true
+    }
+  }
+}

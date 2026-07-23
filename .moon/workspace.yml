@@ -1,6 +1,10 @@
-# moon v2.x workspace config. One flat crate at the repo root (per CLAUDE.md).
+# moon v2.x workspace config. packages/ monorepo: the Rust crate under
+# packages/pond, the OpenClaw plugin under packages/openclaw-pond, and repo-level
+# tasks (changelog gate, dist build) on the root `repo` project.
 projects:
-  pond: '.'
+  pond: 'packages/pond'
+  openclaw-pond: 'packages/openclaw-pond'
+  repo: '.'
 
 vcs:
   defaultBranch: 'main'

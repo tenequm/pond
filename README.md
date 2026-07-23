@@ -44,7 +44,7 @@ where we left off yesterday - check pond, then continue
 are you sure that won't break X? check in pond how we struggled with exactly this
 ```
 
-Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, and **pi-coding-agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
+Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, **pi-coding-agent**, and **OpenClaw**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
 ## Isn't this another memory tool?
 
@@ -66,7 +66,7 @@ Linux and macOS are supported; Windows is not in v1 scope.
 
 ```sh
 brew install tenequm/tap/pond                       # Homebrew
-nix profile add github:tenequm/pond#pond           # Nix
+nix profile add 'github:tenequm/pond?dir=ops/nix#pond'   # Nix
 cargo install pond-db                               # crates.io (installs the `pond` command)
 ```
 
@@ -75,13 +75,13 @@ cargo install pond-db                               # crates.io (installs the `p
 ```sh
 git clone https://github.com/tenequm/pond.git
 cd pond
-cargo install --path .
+cargo install --path packages/pond
 ```
 
 For CUDA acceleration on Linux:
 
 ```sh
-cargo install --path . --features cuda
+cargo install --path packages/pond --features cuda
 ```
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
@@ -200,7 +200,7 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 
 ## References
 
-The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `tests/fixtures/adapter/`.
+The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `packages/pond/tests/fixtures/adapter/`.
 
 | Source | Why it matters |
 |--------|----------------|
@@ -209,7 +209,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 | [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `tests/fixtures/adapter/` | Real session captures for nine source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, nanoclaw, openclaw, opencode, pi-coding-agent). Drives adapter design and serves as adapter test fixtures. |
+| `packages/pond/tests/fixtures/adapter/` | Real session captures for nine source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, nanoclaw, openclaw, opencode, pi-coding-agent). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

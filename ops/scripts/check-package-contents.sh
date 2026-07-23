@@ -4,6 +4,10 @@
 # `cargo install` (v0.10.0-v0.13.0 shipped broken: SKILL.md was excluded).
 set -euo pipefail
 
+# The crate lives at packages/pond; run from there so `src` and the
+# `cargo package --list` paths line up regardless of the caller's cwd.
+cd "$(git rev-parse --show-toplevel)/packages/pond"
+
 packaged=$(cargo package --list --allow-dirty)
 
 bad=0
