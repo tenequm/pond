@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.14.0](https://github.com/tenequm/pond/compare/v0.13.2...v0.14.0) - 2026-07-23
+
+Routes the MCP tool surface by intent, adds first-class OpenClaw ingestion, and makes local Lance stores crash-consistent (fsync on write + self-heal on open).
+
+### <!-- 0 -->🛠 Breaking Changes
+- **mcp:** [**breaking**] route the tool surface - rename pond_sql, split pond_get into pond_get_session/pond_get_message ([d72bd3b](https://github.com/tenequm/pond/commit/d72bd3b117800f42c6143daab01144bb720e42f4)) - `pond_sql` is now `pond_sql_query`, and the single `pond_get` splits into `pond_get_session` (reads a whole session) and `pond_get_message` (expands one message), so each tool routes on caller intent instead of guessing what an id means.
+
+### <!-- 1 -->🎉 New Features
+- OpenClaw integration - adapter, serve --with-sync, and openclaw-pond plugin ([#114](https://github.com/tenequm/pond/pull/114)) ([2f87e3f](https://github.com/tenequm/pond/commit/2f87e3fbc2c5efbd88e68e1347b993788034d0dd)) - a native OpenClaw session adapter, a `serve --with-sync` mode that keeps the store fresh while the MCP server runs, and the `openclaw-pond` plugin to wire it up.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **substrate:** self-heal crash-poisoned local stores and fsync local writes ([#118](https://github.com/tenequm/pond/pull/118)) ([05b9f24](https://github.com/tenequm/pond/commit/05b9f24a51a3a38980f09617319f8d5dab1c6bb8))
+  - Local writes now fsync the file and its parent directory after every put/copy/rename (unix, local stores only), so a crash can't leave a manifest published but unflushed. Measured cost is +4.2% (130.86s -> 136.40s) on the heaviest local path - a full 3.78M-row store copy with index rebuild - and effectively nil on routine incremental syncs, since Lance writes few large files and fsyncs amortize per file, not per row.
+  - A failed open now self-heals instead of staying wedged: it walks `_versions/` head-down, scan-verifies each manifest by draining a full-column scan, quarantines any crash-poisoned manifest by atomic rename to `*.manifest.corrupt` (never deletes), then retries the open once. Scan-verify projects every column because a column-update commit (embed's vector write) puts new columns in their own per-fragment data files a narrow scan would skip; `file+uring://` stores are healed too.
+- **embed:** two-step backlog gate - manifest-only lag fast path, exact-count confirm ([#73](https://github.com/tenequm/pond/pull/73)) ([464f954](https://github.com/tenequm/pond/commit/464f954828f590ffaf569a1f03802aba945f24e9)) - the embedding-backlog check first reads a cheap manifest-only lag signal and only falls back to an exact `count_rows` confirm when that signal says work may be pending, avoiding a full count on every gate.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.13.2...v0.14.0
+
 ## [0.13.2](https://github.com/tenequm/pond/compare/v0.13.1...v0.13.2) - 2026-07-14
 
 ### <!-- 2 -->🐛 Bug Fixes
