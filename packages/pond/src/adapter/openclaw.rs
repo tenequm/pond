@@ -1,19 +1,25 @@
 //! openclaw adapter (github.com/steipete/openclaw).
 //!
-//! OpenClaw keeps one WAL SQLite database per agent at
-//! `<root>/agents/<agentId>/agent/openclaw-agent.sqlite` (the Gateway process
-//! is the sole writer) plus a per-agent `<root>/agents/<agentId>/sessions/`
-//! directory holding archive files (`<sessionId>.jsonl.<reason>.<ts>[.zst]`,
-//! reason in {reset, bak, deleted}) and pre-SQLite legacy transcripts
-//! (`sessions.json` + `<sessionId>.jsonl`). `root` defaults to `~/.openclaw`,
-//! honors `$OPENCLAW_STATE_DIR`, and falls back to the legacy `~/.clawdbot`.
+//! Session storage moved into SQLite in openclaw 2026.7.2: the per-agent WAL
+//! database at `<root>/agents/<agentId>/agent/openclaw-agent.sqlite` (the
+//! Gateway process is the sole writer) grows `sessions` / `session_entries` /
+//! `transcript_events` tables holding the live transcript. Every stable release
+//! through 2026.7.1 stores sessions as files instead, under a per-agent
+//! `<root>/agents/<agentId>/sessions/` directory: `sessions.json` (the
+//! `sessionId` -> `sessionKey` map), live `<sessionId>.jsonl` transcripts, and
+//! archives (`<sessionId>.jsonl.<reason>.<ts>[.zst]`, reason in
+//! {reset, bak, deleted}). On 2026.6.5-2026.7.1 hosts openclaw-agent.sqlite
+//! already exists but carries only auth/agent state (no `sessions` table), so
+//! the DB is skipped and the file store is the sole session source. `root`
+//! defaults to `~/.openclaw`, honors `$OPENCLAW_STATE_DIR`, and falls back to
+//! the legacy `~/.clawdbot`.
 //!
 //! The transcript is a pi-coding-agent `FileEntry` stream: a `session` header
 //! then `message` / `custom_message` / `compaction` / `branch_summary` /
 //! `model_change` / `thinking_level_change` / `custom` / `label` /
 //! `session_info` entries, each with `id`/`parentId`/`timestamp`. pond already
-//! parses this family in `pi_coding_agent.rs`; OpenClaw's stream is richer and
-//! lives in SQLite, so the shapes are shared by precedent, not code.
+//! parses this family in `pi_coding_agent.rs`; OpenClaw's stream is richer, so
+//! the shapes are shared by precedent, not code.
 //!
 //! Tree-to-linear is A3 (locked plan decision 1): one pond session per OpenClaw
 //! session, ALL entries flattened in source order, `parentId` preserved in each
@@ -364,7 +370,17 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
             match open_db(db_path)
                 .and_then(|conn| list_db_sessions(&conn, db_path).map(|rows| (conn, rows)))
             {
-                Ok((conn, rows)) => {
+                Ok((_, DbSessions::NoSessionsTable)) => {
+                    // Stable pre-2026.7.2 host: openclaw-agent.sqlite exists but
+                    // carries only auth/agent state, so the file store below is
+                    // the session source. Not an error - it is the production
+                    // path for every stable release through 2026.7.1.
+                    tracing::debug!(
+                        path = %db_path.display(),
+                        "openclaw: openclaw-agent.sqlite has no sessions table; using file sessions",
+                    );
+                }
+                Ok((conn, DbSessions::Present(rows))) => {
                     for (session_id, session_key) in rows {
                         if adapter.is_skipped(&session_key) {
                             continue;
@@ -652,10 +668,33 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
     sqlite::join_error(NAME, join)
 }
 
-fn list_db_sessions(
-    conn: &Connection,
-    db_path: &Path,
-) -> Result<Vec<(String, String)>, AdapterError> {
+/// Outcome of enumerating a DB's `sessions` table: the routing rows, or the
+/// distinct "no such table" case a stable pre-2026.7.2 host presents (its
+/// openclaw-agent.sqlite holds only auth/agent state). The caller skips the
+/// latter silently rather than surfacing a spurious enumeration error.
+enum DbSessions {
+    Present(Vec<(String, String)>),
+    NoSessionsTable,
+}
+
+/// Detect the `sessions` table via `sqlite_master` before preparing the SELECT,
+/// so its absence is a clean control-flow signal (not a swallowed prepare error).
+fn has_sessions_table(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions' LIMIT 1",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+fn list_db_sessions(conn: &Connection, db_path: &Path) -> Result<DbSessions, AdapterError> {
+    if !has_sessions_table(conn)
+        .map_err(|error| db_error(db_path, "probe sessions table", &error))?
+    {
+        return Ok(DbSessions::NoSessionsTable);
+    }
     let mut stmt = conn
         .prepare("SELECT session_id, session_key FROM sessions ORDER BY session_id")
         .map_err(|error| db_error(db_path, "prepare session list", &error))?;
@@ -665,6 +704,7 @@ fn list_db_sessions(
         })
         .map_err(|error| db_error(db_path, "query session list", &error))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(DbSessions::Present)
         .map_err(|error| db_error(db_path, "read session row", &error))
 }
 
@@ -2057,6 +2097,59 @@ mod tests {
             resolve_root(home, Some(&override_dir)),
             Some(override_dir.clone())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_less_db_skips_silently_and_file_sessions_survive() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let agent_dir = root.path().join(AGENTS_SUBDIR).join("bot");
+
+        // Stable pre-2026.7.2 openclaw-agent.sqlite: auth/state tables only, no
+        // `sessions` table.
+        let db_path = agent_dir.join("agent").join("openclaw-agent.sqlite");
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE auth_profile_store (store_key TEXT PRIMARY KEY, store_json TEXT);",
+        )?;
+        drop(conn);
+
+        // File-era session store: a sessions.json map plus a live bare transcript.
+        let sessions_dir = agent_dir.join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&sessions_dir)?;
+        std::fs::write(
+            sessions_dir.join("sessions.json"),
+            json!({ "agent:bot:main": { "sessionId": "sess-file" } }).to_string(),
+        )?;
+        std::fs::write(
+            sessions_dir.join("sess-file.jsonl"),
+            "{\"type\":\"session\",\"id\":\"sess-file\"}\n",
+        )?;
+
+        let adapter = OpenClawAdapter::new(root.path());
+        let Enumerated {
+            entries,
+            superseded,
+            errors,
+        } = enumerate_and_peek(&adapter, false);
+        assert!(
+            errors.is_empty(),
+            "a session-less DB is skipped without pushing an enumeration error",
+        );
+        assert_eq!(superseded, 0);
+        assert_eq!(entries.len(), 1, "the file session is enumerated");
+        match &entries[0].source {
+            SessionSource::File {
+                session_id,
+                session_key,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-file");
+                assert_eq!(session_key, "agent:bot:main");
+            }
+            SessionSource::Db { .. } => panic!("expected a file session, not a DB session"),
+        }
         Ok(())
     }
 

@@ -27,6 +27,19 @@ response is size-bounded (32 KB cap, then truncated with a note), so recall
 never floods the agent's context - no memory slot means nothing is injected
 into prompts the agent didn't ask for.
 
+## Supported OpenClaw versions
+
+The floor is OpenClaw **2026.5.18** (the first release carrying every plugin-SDK
+surface this plugin uses). Both session-store layouts ingest transparently:
+
+- On stable hosts (<= 2026.7.1) pond reads the file-based session store -
+  `sessions.json` plus per-session `<sessionId>.jsonl` transcripts (and their
+  archives).
+- On 2026.7.2+ pond reads the SQLite session store in openclaw-agent.sqlite.
+
+A session present in both forms is deduplicated by id, with the SQLite entry
+superseding the same-id file.
+
 ## Install
 
 ```bash
