@@ -4245,17 +4245,20 @@ async fn run_embed_stage_with_limit(
         store.drop_vector_index().await?;
     }
 
-    // Backlog gate. `unindexed_vector_backlog` is a manifest-only count of rows
-    // the IVF_SQ index has not folded yet; an embedded row is folded right after,
-    // so it upper-bounds the true embed backlog. Zero (with the index present)
-    // proves nothing is unembedded - skip without the full-column
-    // `embed_backlog_count` scan. It can only over-estimate (a wasted worker pass
-    // that finds nothing), never miss a row. A forced re-embed redoes every row,
-    // so it counts the live eligible set directly.
-    let backlog = if swapped {
-        store.embed_backlog_count().await?
+    // Two-step backlog gate. `unindexed_vector_backlog` is a manifest-only
+    // upper bound on the embed backlog: zero proves nothing is unembedded, so
+    // the frequent idle sync skips without a data-page read. Non-zero is NOT
+    // proof of work - after a copy (rows arrive embedded, index unfolded) or
+    // between deferred sync folds the lag counts fully-embedded rows; a fresh
+    // S3 copy once read 104,994 "unindexed" against 0 actually-unembedded and
+    // drew a whole-corpus bar that looked hung. So confirm with the exact
+    // eligible count (search_text present, embedding_model null, narrow
+    // model-id column) before loading the embedder and sizing a bar. A forced
+    // re-embed redoes every row, so it counts the live eligible set directly.
+    let backlog = if !swapped && store.unindexed_vector_backlog().await? == 0 {
+        0
     } else {
-        store.unindexed_vector_backlog().await?
+        store.embed_backlog_count().await?
     };
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
