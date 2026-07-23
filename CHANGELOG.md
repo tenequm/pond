@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.0](https://github.com/tenequm/pond/compare/v0.13.2...v0.14.0) - 2026-07-23
+
+### <!-- 0 -->🛠 Breaking Changes
+- **mcp:** [**breaking**] route the tool surface - rename pond_sql, split pond_get into pond_get_session/pond_get_message ([d72bd3b](https://github.com/tenequm/pond/commit/d72bd3b117800f42c6143daab01144bb720e42f4))
+
+### <!-- 1 -->🎉 New Features
+- OpenClaw integration - adapter, serve --with-sync, and openclaw-pond plugin ([#114](https://github.com/tenequm/pond/pull/114)) ([2f87e3f](https://github.com/tenequm/pond/commit/2f87e3fbc2c5efbd88e68e1347b993788034d0dd))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **substrate:** self-heal crash-poisoned local stores and fsync local writes ([#118](https://github.com/tenequm/pond/pull/118)) ([05b9f24](https://github.com/tenequm/pond/commit/05b9f24a51a3a38980f09617319f8d5dab1c6bb8))
+- **embed:** two-step backlog gate - manifest-only lag fast path, exact-count confirm ([#73](https://github.com/tenequm/pond/pull/73)) ([464f954](https://github.com/tenequm/pond/commit/464f954828f590ffaf569a1f03802aba945f24e9))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.13.2...v0.14.0
+
 ## [0.13.2](https://github.com/tenequm/pond/compare/v0.13.1...v0.13.2) - 2026-07-14
 
 ### <!-- 2 -->🐛 Bug Fixes
