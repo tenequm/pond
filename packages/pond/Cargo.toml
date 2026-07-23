@@ -1,0 +1,283 @@
+[package]
+# Published to crates.io as `pond-db` (the `pond` name is taken by an unrelated
+# crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
+# command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
+name = "pond-db"
+version = "0.13.2"
+edition = "2024"
+# MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Lossless storage and search for sessions from any AI agent client"
+repository = "https://github.com/tenequm/pond"
+homepage = "https://pond.locker/"
+documentation = "https://pond.locker/"
+readme = "../../README.md"
+keywords = ["agents", "mcp", "lance", "search", "session-logs"]
+categories = ["command-line-utilities", "database", "artificial-intelligence"]
+# Publish only what `cargo install` compiles. The repo's bulk is dev-only:
+# tests/fixtures (~10 MiB) lives under tests/. Repo-level dirs (docs/, ops/,
+# .github/, ...) sit outside this crate root now, so cargo never packages them.
+# benches/ stays - the [[bench]] targets declare paths cargo resolves on build.
+# SKILL.md must ship: `pond skill` embeds it via include_str! (excluding it
+# broke `cargo install` for v0.10.0-v0.13.0; check-package guards this in CI).
+exclude = [
+    "tests/",
+    "**/.DS_Store",
+]
+
+# cargo-binstall: binaries live on this repo's release under tag `vX.Y.Z` with
+# `pond` at the archive root. The URL stays custom because binstall's default
+# filename template is `{ name }-{ target }`, and `{ name }` is the crate name
+# (`pond-db`) - our assets are named `pond-{ target }`, so the defaults miss.
+# `{ bin }` resolves to `pond` (the [[bin]] name).
+[package.metadata.binstall]
+pkg-url = "https://github.com/tenequm/pond/releases/download/v{ version }/pond-{ target }{ archive-suffix }"
+pkg-fmt = "txz"
+bin-dir = "{ bin }{ binary-ext }"
+
+# Windows ships a .zip; every other target is .tar.xz.
+[package.metadata.binstall.overrides."x86_64-pc-windows-gnu"]
+pkg-fmt = "zip"
+
+[lib]
+name = "pond"
+
+[[bin]]
+name = "pond"
+path = "src/main.rs"
+
+[dependencies]
+anstyle = "1"
+anyhow = "1.0.102"
+# Lock-free read of the loaded `RowKeyMap` on the hot search path; replaced
+# atomically when `ensure_rowmap` rebuilds. Already in the tree via lance.
+arc-swap = "1"
+# ndjson export writer for `pond_sql` (already in the tree via the arrow
+# stack; named directly here for the `LineDelimitedWriter`).
+arrow-json = "58.3"
+# Already in the tree via the arrow stack; named directly for
+# `filter_record_batch`, used to drop already-present rows from a grown-session
+# copy scan before appending (composite-PK filter, src/sessions.rs).
+arrow-select = "58.3"
+async-stream = "0.3.6"
+# Already in the tree via datafusion; named directly for the vendored fts()
+# TableProvider in `src/sql.rs` (datafusion's TableProvider trait needs it).
+async-trait = "0.1"
+axum = "0.8.9"
+base64 = "0.22"
+# Stable filesystem-safe `store_key` (hex digest of the store URL) for the
+# row-key map's cache filename. Already in the tree via the candle stack.
+blake3 = "1"
+# Zero-copy cast of the mmap'd row-key map's fixed-size records (`src/rowmap.rs`).
+# Already in the tree via the candle/safetensors stack.
+bytemuck = { version = "1.25", features = ["derive"] }
+bytes = "1"
+futures = "0.3"
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
+clap_complete = "4.6"
+# Clack-style prompt stack for `pond init` and the sync adapter picker; built on
+# console + indicatif, both already in the tree.
+cliclack = "0.5"
+comfy-table = "7"
+# Ctrl-C-as-Esc for the init wizard: a no-op handler makes `term.read_key()`
+# fail inside cliclack prompts, so cancellation flows through the same
+# `outro_cancel` path as Esc instead of killing the process in raw mode.
+ctrlc = "3"
+human-panic = { version = "2", default-features = false }
+# Embedding stack for `intfloat/multilingual-e5-small`: candle XLM-RoBERTa
+# FP16 on Metal (macOS) / CUDA (`--features cuda`) / CPU. `LazyEmbedder`
+# (`src/embed.rs`) idle-evicts the loaded backend after
+# `embed::DEFAULT_IDLE_EVICTION` (5 min) of no use - the macOS Metal-buffer-pool
+# retention costs phys_footprint only during the brief active query burst
+# after each idle period.
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+fastrand = "2"
+# Layered config (file -> env) with per-field provenance for `pond config
+# show`. The published 0.10.x has zero default features; `toml` + `env` gate
+# the two providers pond composes.
+figment = { version = "0.10.19", features = ["toml", "env"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+indicatif = "0.18"
+lance = { version = "8.0.0", features = ["protoc"] }
+lance-arrow = "8.0.0"
+# `pond_sql` registers lance's JSON / contains_tokens UDFs on the SQL
+# SessionContext via `lance_datafusion::udf::register_functions`. Already in
+# the tree transitively; named here to reach that one function.
+lance-datafusion = "8.0.0"
+half = { version = "2.1", default-features = false }
+# JSONB decode for the lenient json_get_* UDF shadows in `src/sql.rs` (lance's
+# strict versions abort a whole scan when one row's field is non-scalar).
+# Already in the tree via lance-datafusion; default-features OFF is load-bearing:
+# jsonb's defaults enable serde_json/preserve_order + arbitrary_precision, which
+# flip serde_json behavior crate-wide and change restore output key order.
+jsonb = { version = "0.5", default-features = false, features = ["databend"] }
+lance-file = "8.0.0"
+lance-index = "8.0.0"
+lance-io = "8.0.0"
+lance-linalg = "8.0.0"
+lance-namespace = "8.0.0"
+lance-namespace-impls = "8.0.0"
+# Memory-mapped, process-shareable row_id -> key map (`src/rowmap.rs`): the file
+# is mmap'd so the OS page cache holds one physical copy across pond instances.
+# Already in the tree via candle/safetensors.
+memmap2 = "0.9"
+# Already in the tree via lance-io; named directly so `pond storage check` can
+# drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
+# classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
+object_store = { version = "0.13", default-features = false }
+# Parquet export writer for `pond_sql`. The only genuinely new compiled
+# crate the SQL tool adds (lance reads/writes its own format, not parquet).
+# `arrow` feature only; results are written uncompressed via `ArrowWriter`.
+parquet = { version = "58.3", default-features = false, features = ["arrow"] }
+rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+# opencode's storage moved from a JSON file tree to a Drizzle-managed SQLite DB
+# (`opencode*.db`, WAL) in v1.2.0; the opencode adapter opens it read-only. First
+# SQLite dependency in the tree; `bundled` statically links libsqlite3 so the
+# binary stays self-contained.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# `~` + `$VAR` expansion for user-supplied paths in config values.
+shellexpand = "3.1"
+tempfile = "3.25"
+# Streaming JSON pull-parser for the adapter seam's oversized-line slow path:
+# records over `RECORD_CAP` are cap-parsed leaf-by-leaf so peak memory stays
+# bounded (see src/adapter/jsonl.rs).
+struson = "0.7"
+thiserror = "2.0.18"
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
+tokio = { version = "1.52", features = ["fs", "io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1.18"
+toml = "1.1"
+toml_edit = "0.25"
+tracing = "0.1.44"
+tracing-indicatif = "0.3.14"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.23", features = ["v7"] }
+walkdir = "2.5"
+# Ingest host provenance stamp (`options.pond`, src/sessions.rs). Already in
+# the tree transitively via hf-hub's xet stack; named directly for the
+# fallible username/hostname/devicename lookups.
+whoami = "2"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10", features = ["metal"] }
+candle-nn = { version = "0.10", features = ["metal"] }
+candle-transformers = { version = "0.10", features = ["metal"] }
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Diagnostic only: enables lance-io per-request IO recording so the
+# serve_mem_bench `--io-trace` mode can attribute exact S3 GET counts/paths
+# per query. Never enabled for release builds; `read_iops`/`read_bytes` are
+# tracked without it, only the per-request path list needs `test-util`.
+io-trace = ["lance-io/test-util"]
+
+[dev-dependencies]
+assert_cmd = "2"
+# `Jail` for env-mirror tests: sandboxed env vars + cwd without `unsafe`
+# `std::env::set_var` in pond's own code (the crate denies unsafe).
+figment = { version = "0.10.19", features = ["test"] }
+# Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
+lance-linalg = "8.0.0"
+# Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
+# inverted index under different tokenizers (ngram vs simple) via the raw lance
+# create_index API and measure the index-size / RAM / latency tradeoff.
+lance = { version = "8.0.0", features = ["protoc"] }
+lance-index = "8.0.0"
+# Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
+rmcp = { version = "1.7", features = ["client"] }
+# Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
+rusqlite = { version = "0.40", features = ["bundled"] }
+insta = "1.47.2"
+tempfile = "3.25"
+# Lets the HTTP integration test drive axum's `Router` without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+# 0.14, not 0.13: lance-io v8 pulls opendal 0.57, whose opendal-core needs the
+# md-5 0.11.0 release; s3s 0.13 pins md-5 =0.11.0-rc.5, which blocks resolution.
+# Coupled to the lance v8 bump - keep in lockstep.
+s3s = "0.14"
+s3s-fs = "0.14"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+
+# Bench memory sampling: `getrusage` peak-RSS in commands_bench (any unix),
+# plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+# Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
+[[bench]]
+name = "embed_bench"
+harness = false
+
+[[bench]]
+name = "ingest_bench"
+harness = false
+
+[[bench]]
+name = "backend_bench"
+harness = false
+
+[[bench]]
+name = "serve_mem_bench"
+harness = false
+
+[[bench]]
+name = "tokenizer_quality_bench"
+harness = false
+
+[[bench]]
+name = "multiwriter_bench"
+harness = false
+
+[[bench]]
+name = "write_bench"
+harness = false
+
+[[bench]]
+name = "read_bench"
+harness = false
+
+[[bench]]
+name = "ops_bench"
+harness = false
+
+[[bench]]
+name = "sync_oracle_bench"
+harness = false
+
+[[bench]]
+name = "commands_bench"
+harness = false
+
+[[bench]]
+name = "fmindex_probe"
+harness = false
+
+[lints.rust]
+# `deny` not `forbid` so candle's mmap-based safetensors loader (an inherently
+# unsafe FFI to memmap2) can be opted into per-call. See src/embed.rs.
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+expect_used = "warn"
+implicit_clone = "warn"
+print_stdout = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+uninlined_format_args = "warn"
+unwrap_used = "warn"

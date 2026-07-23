@@ -1,0 +1,35 @@
+language: rust
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cargo commands run from this project root (packages/pond); the workspace
+# lockfile and toolchain pin stay at the repo root, referenced workspace-relative
+# with a leading '/'.
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.toml'
+    - '/Cargo.lock'
+    - '/rust-toolchain.toml'
+  tests:
+    - 'tests/**/*'
+    - 'benches/**/*'
+
+tasks:
+  format:
+    command: 'cargo fmt --check'
+    inputs: ['@group(sources)', '@group(tests)']
+  lint:
+    command: 'cargo clippy --locked -- -D warnings'
+    inputs: ['@group(sources)', '@group(tests)']
+  test:
+    command: 'cargo test --locked'
+    inputs: ['@group(sources)', '@group(tests)']
+  # Cheap packaging gate: `cargo package --list` must contain every file the
+  # code embeds via include_str!/include_bytes! (a full verify build is skipped
+  # at publish time - publish_no_verify in .github/release-plz.toml). The script
+  # cd's to this crate root itself, so it is cwd-independent.
+  check-package:
+    command: 'bash ../../ops/scripts/check-package-contents.sh'
+    inputs: ['src/**/*', 'SKILL.md', '/ops/scripts/check-package-contents.sh']

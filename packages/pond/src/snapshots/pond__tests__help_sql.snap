@@ -1,0 +1,60 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Run one read-only SQL query over the corpus.
+
+DataFusion / PostgreSQL-compatible SELECT/WITH over the sessions, messages, and parts tables; writes and side-effecting statements are rejected. Same surface as the `pond_sql` MCP tool - the MCP resource `schema://pond-sql` documents columns, indexed predicates, and pagination patterns.
+
+Usage: pond sql [OPTIONS] <SQL>
+
+Arguments:
+  <SQL>
+          The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash
+
+Options:
+      --format <FORMAT>
+          Output format. text/ndjson go to stdout; parquet requires `--output-file` (binary). ndjson is the machine-readable JSON path
+          
+          [default: text]
+          [possible values: text, ndjson, parquet]
+
+      --limit <LIMIT>
+          Inline row cap for text output. Default 100, max 1000. Ignored for ndjson/parquet (which return every row)
+          
+          [default: 100]
+
+  -o, --output-file <OUTPUT_FILE>
+          Write the export bytes here instead of stdout (required for `--format parquet`; optional for ndjson). Ignored for text
+
+      --timeout <TIMEOUT>
+          Per-query timeout in seconds. Default 30, max 600 - raise it for a genuinely long-running query (e.g. a large remote-store scan)
+          
+          [default: 30]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond sql "SELECT count(*) FROM sessions"
+  pond sql "SELECT session_id, ts, role FROM messages WHERE contains_tokens(search_text, 'occ retry') LIMIT 20"
+  pond sql "SELECT * FROM messages" --format parquet -o messages.parquet

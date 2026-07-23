@@ -1,14 +1,16 @@
 ---
-description: pond's MCP tools - pond_search (vector or full-text search over agent sessions), pond_get (a full session or message by id), and pond_sql_query (read-only SQL over sessions, messages, and parts).
+description: pond's MCP tools - pond_search (vector or full-text search over agent sessions), pond_get_session (a whole session by id), pond_get_message (one message with full tool bodies), and pond_sql (read-only SQL over sessions, messages, and parts).
 ---
 
 # MCP tools
 
 What your agent gets when pond is registered as an MCP server ([Connect your agents](/get-started/connect-your-agents)). The wire schemas ship with the server; this page is the human-facing summary.
 
+Three tools cover almost every request: `pond_search` finds, `pond_get_session` reads a session, `pond_get_message` expands one message. `pond_sql` is the advanced escape hatch for what those cannot express.
+
 ## pond_search
 
-Semantic or keyword search over all stored sessions. Returns a readable transcript of ranked hits grouped by session, best session first.
+Find relevant messages across all stored sessions - semantic or keyword. Returns a readable transcript of ranked hits grouped by session, best session first.
 
 | Parameter | Meaning |
 |---|---|
@@ -22,20 +24,21 @@ Semantic or keyword search over all stored sessions. Returns a readable transcri
 
 Every response reports how many searchable messages the filters left in scope, so an empty result distinguishes "nothing relevant exists" from "my filters excluded everything". By default subagent (child) sessions are excluded; an explicit `session_id` or source-agent filter opts back in deliberately.
 
-Search indexes only conversational text (user and assistant turns). Tool calls, tool results, and reasoning are deliberately not indexed - reach them with `pond_sql_query`.
+Search indexes only conversational text (user and assistant turns). Tool calls, tool results, and reasoning are deliberately not indexed - reach them with `pond_sql`.
 
-## pond_get
+## pond_get_session
 
-Fetch stored content by id, as a readable transcript. Pass exactly one of:
+Read a whole session as a readable transcript - the tool for analyzing, reviewing, or summarizing a past session: user/assistant text plus one-line tool and file references. Takes one `id`; a message id also works and resolves to its parent session with the page anchored at that message. Page with `limit` (default 20 messages), `from: "start" | "end"` (`end` reads the most recent page first - the session's final state, e.g. recovering context after compaction), and `after_message_id` / `before_message_id` to page onward.
 
-- `session_id` - the whole session: user/assistant text plus one-line tool and file references. Page with `session_limit` (default 20 messages), `session_from: "start" | "end"` (`end` reads the most recent page first - e.g. recovering context after compaction), and `session_after_message_id` / `session_before_message_id` to page onward.
-- `message_id` - one message with its full parts, including tool call and result bodies, plus conversational neighbors (`message_context_before` / `message_context_after`, default 3 each side - like `grep -B/-A`).
+The first page lists the session's subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
 
-A session response lists its subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
+## pond_get_message
 
-## pond_sql_query
+Expand one message: its full parts, including tool call and result bodies, plus conversational neighbors (`context_before` / `context_after`, default 3 each side - like `grep -B/-A`). Takes one `id` (a message id; a session id is rejected with a hint naming `pond_get_session`).
 
-One read-only SQL query (SELECT/WITH only, DataFusion-planned) over the three tables: `sessions`, `messages`, `parts`. This is the escape hatch search deliberately doesn't cover: exact strings, identifiers, counts, joins, group-bys, tool-call archaeology through `parts.variant_data`, and subagent sessions (`parent_session_id`).
+## pond_sql
+
+The advanced escape hatch: one read-only SQL query (SELECT/WITH only, DataFusion-planned) over the three tables: `sessions`, `messages`, `parts`. Not for finding or reading conversations - that is search and get. It covers what they deliberately don't: exact strings, identifiers, counts, joins, group-bys, tool-call archaeology through `parts.variant_data` (a tool_call body is `{call_id, name, params}` - a Bash command lives at `json_extract(variant_data, '$.params.command')`), and subagent sessions (`parent_session_id`).
 
 Two useful full-text primitives:
 

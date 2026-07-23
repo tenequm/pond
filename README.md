@@ -28,11 +28,11 @@ Install, run guided setup, and ingest your local sessions:
 
 ```sh
 brew install tenequm/tap/pond
-pond init   # guided setup: storage, adapters, MCP registration, optional schedule
+pond init   # guided setup: storage, adapters, MCP + agent skill, optional schedule
 pond sync   # ingest, embed, update indexes - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients (by hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code (by hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: save `pond skill` output to `~/.claude/skills/pond/SKILL.md`). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -44,7 +44,7 @@ where we left off yesterday - check pond, then continue
 are you sure that won't break X? check in pond how we struggled with exactly this
 ```
 
-Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, and **pi-coding-agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
+Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, **pi-coding-agent**, and **OpenClaw**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
 ## Isn't this another memory tool?
 
@@ -66,7 +66,7 @@ Linux and macOS are supported; Windows is not in v1 scope.
 
 ```sh
 brew install tenequm/tap/pond                       # Homebrew
-nix profile add github:tenequm/pond#pond           # Nix
+nix profile add 'github:tenequm/pond?dir=ops/nix#pond'   # Nix
 cargo install pond-db                               # crates.io (installs the `pond` command)
 ```
 
@@ -75,13 +75,13 @@ cargo install pond-db                               # crates.io (installs the `p
 ```sh
 git clone https://github.com/tenequm/pond.git
 cd pond
-cargo install --path .
+cargo install --path packages/pond
 ```
 
 For CUDA acceleration on Linux:
 
 ```sh
-cargo install --path . --features cuda
+cargo install --path packages/pond --features cuda
 ```
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
@@ -116,14 +116,15 @@ pond mcp                           # alias for stdio MCP
 Fetch a single session or message, or move a whole corpus:
 
 ```sh
-pond get --session-id <id>
+pond get-session <id>
+pond get-message <id>
 pond copy --from local --to snapshot.pond
 pond copy --from snapshot.pond --to local
 ```
 
 ### Read-only SQL
 
-Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):
+Ask structured questions with read-only SQL (the same surface as the `pond_sql` MCP tool):
 
 ```sh
 pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DESC"
@@ -193,13 +194,13 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Index lifecycle decoupled from writes.** Writes commit data (embeddings included, computed inline at ingest) without folding the search indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
 - **Single-arm retrieval.** Each query runs one retriever - `vector` (cosine, with a gentle recency tiebreaker) or `fts` (BM25) - chosen per query; no server-side fusion. The vector arm falls back to full-text when the store has no embeddings, and `--sort-by recency` returns newest-first. Results group to one summary per session, keyed on `session_root`.
 - **Language-neutral full-text.** Word-level `simple` tokenizer with English stemming (ascii-folding on); tokens the stemmer does not recognize pass through unchanged and stay exact-matchable, so pond indexes sessions in any language alike.
-- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql_query` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
+- **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get_session`, `pond_get_message`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
 - **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.
 
 ## References
 
-The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `tests/fixtures/adapter/`.
+The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `packages/pond/tests/fixtures/adapter/`.
 
 | Source | Why it matters |
 |--------|----------------|
@@ -208,7 +209,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 | [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `tests/fixtures/adapter/` | Real session captures for nine source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, nanoclaw, openclaw, opencode, pi-coding-agent). Drives adapter design and serves as adapter test fixtures. |
+| `packages/pond/tests/fixtures/adapter/` | Real session captures for nine source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, nanoclaw, openclaw, opencode, pi-coding-agent). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

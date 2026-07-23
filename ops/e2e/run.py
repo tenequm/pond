@@ -271,9 +271,9 @@ def main() -> int:
     run("sql group-by", [B, "sql",
         "SELECT role, count(*) FROM messages GROUP BY role", *read], "real")
     if sid:
-        run("get --session-id", [B, "get", "--session-id", sid, *read], "real", timeout=600)
+        run("get-session", [B, "get-session", sid, *read], "real", timeout=600)
     if mid:
-        run("get --message-id", [B, "get", "--message-id", mid, *read], "real", timeout=600)
+        run("get-message", [B, "get-message", mid, *read], "real", timeout=600)
 
     # mcp initialize handshake over stdio
     init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -293,7 +293,7 @@ def main() -> int:
     # actually-malformed URL - here a local URL carrying query params, which the
     # storage parser rejects.
     run("bad url -> exit 2", [B, "status", "--storage-path", "file:///tmp/x?a=b"], "n/a", expect=2)
-    run("missing id -> exit 1", [B, "get", "--session-id", "nope", *read], "real", expect=1)
+    run("missing id -> exit 1", [B, "get-session", "nope", *read], "real", expect=1)
     run("verify empty -> exit 6",
         [B, "copy", "--verify-only", "--from", URL, "--to", EMPTY, "--config-file", CFG],
         "scratch", expect=6, timeout=1800)

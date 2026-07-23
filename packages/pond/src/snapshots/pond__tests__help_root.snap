@@ -1,0 +1,71 @@
+---
+source: src/main.rs
+expression: root_help
+---
+Lossless storage and semantic search for sessions from any AI agent client
+pond [VERSION]
+
+Usage: pond [OPTIONS] <COMMAND>
+
+Commands:
+  Setup
+    init         Set up pond (idempotent: safe to re-run)
+    adapters     Choose which adapters pond sync ingests
+    storage      Probe and switch storage destinations
+    creds        Manage URL-scoped credential sets
+    schedule     Manage the automatic sync schedule
+    config       Inspect configuration
+
+  Data flow
+    sync         Make pond current: import, embed, index
+    optimize     Embed the backlog, then fold the indexes
+    copy         Copy data between stores, archives, JSONL
+
+  Query
+    search       Search stored messages
+    get-session  Read a whole session as a transcript
+    get-message  Expand one message with its full part bodies
+    sql          Run one read-only SQL query
+    status       Show pond health, data, and adapters
+
+  Serve
+    serve        Run the HTTP API server
+    mcp          Serve the MCP tools over stdio
+
+  Shell
+    completions  Generate shell completions
+    skill        Print the agent-onboarding SKILL.md
+    help         Print this message or a subcommand's help
+
+Options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Getting started:
+  pond init                                  set up storage, adapters, MCP, and scheduling
+  pond sync                                  import new sessions, embed, update indexes
+  pond search "that auth refactor"           find past work
+  claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
+
+Every command documents itself: `pond <command> --help` carries examples.

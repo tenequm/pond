@@ -15,6 +15,20 @@ release_always = true
 # adds a multi-minute cold rustdoc build of the heavy dep tree to every release.
 semver_check = false
 
+# The crate now lives at packages/pond, so this is a cargo workspace. Without
+# these overrides release-plz would switch to workspace-style `pond-db-v{{
+# version }}` tags and write packages/pond/CHANGELOG.md - both would break the
+# release pipeline (the publish-release job, Homebrew formula, and nix flake all
+# key off a `vX.Y.Z` tag; the changelog gate reads the root CHANGELOG.md).
+[[package]]
+name = "pond-db"
+# Pin the pre-workspace tag + GitHub-release scheme.
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# Keep the changelog at the repo root (path is relative to the workspace root),
+# where check-changelog-headers.sh and the pre-commit hook already read it.
+changelog_path = "CHANGELOG.md"
+
 # Lance-style release notes: emoji-grouped sections, scope-bolded entries, PR
 # links, breaking markers, and a per-version compare link. release-plz strips the
 # `## [version]` heading line when posting the GitHub release body (GitHub shows

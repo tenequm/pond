@@ -1,0 +1,36 @@
+---
+source: src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Serve the MCP tools over stdio (for agent clients).
+
+Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get_session, pond_get_message, and pond_sql, with resources schema://pond, schema://pond-sql, and stats://pond.
+
+Usage: pond mcp [OPTIONS]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  claude mcp add -s user pond -- pond mcp    register in Claude Code
+  codex mcp add pond -- pond mcp             register in Codex CLI
