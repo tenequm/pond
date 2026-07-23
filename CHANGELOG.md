@@ -5,7 +5,7 @@
 Routes the MCP tool surface by intent, adds first-class OpenClaw ingestion, and makes local Lance stores crash-consistent (fsync on write + self-heal on open).
 
 ### <!-- 0 -->🛠 Breaking Changes
-- **mcp:** [**breaking**] route the tool surface - rename pond_sql, split pond_get into pond_get_session/pond_get_message ([d72bd3b](https://github.com/tenequm/pond/commit/d72bd3b117800f42c6143daab01144bb720e42f4)) - `pond_sql` is now `pond_sql_query`, and the single `pond_get` splits into `pond_get_session` (reads a whole session) and `pond_get_message` (expands one message), so each tool routes on caller intent instead of guessing what an id means.
+- **mcp:** [**breaking**] route the tool surface - rename pond_sql, split pond_get into pond_get_session/pond_get_message ([d72bd3b](https://github.com/tenequm/pond/commit/d72bd3b117800f42c6143daab01144bb720e42f4)) - `pond_sql_query` is now `pond_sql`, and the single `pond_get` splits into `pond_get_session` (reads a whole session) and `pond_get_message` (expands one message), so each tool routes on caller intent instead of guessing what an id means.
 
 ### <!-- 1 -->🎉 New Features
 - OpenClaw integration - adapter, serve --with-sync, and openclaw-pond plugin ([#114](https://github.com/tenequm/pond/pull/114)) ([2f87e3f](https://github.com/tenequm/pond/commit/2f87e3fbc2c5efbd88e68e1347b993788034d0dd)) - a native OpenClaw session adapter, a `serve --with-sync` mode that keeps the store fresh while the MCP server runs, and the `openclaw-pond` plugin to wire it up.
