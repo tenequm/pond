@@ -19,6 +19,7 @@ import select
 import signal
 import subprocess
 import threading
+import time
 import urllib.request
 from typing import Protocol
 
@@ -29,6 +30,14 @@ class McpError(Exception):
 
 PROTOCOL_VERSION = "2025-06-18"
 CLIENT_INFO = {"name": "hermes-pond", "version": "0.1.0"}
+
+# stdout read chunk, teardown grace before SIGKILL, and the fire-and-forget
+# notify timeout. A single response frame past this cap fails rather than growing
+# the buffer without bound - pond's recall responses are far smaller.
+READ_CHUNK_BYTES = 65536
+TERMINATE_GRACE_S = 5.0
+NOTIFY_TIMEOUT_S = 10.0
+MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 
 def extract_text(content: object) -> str:
@@ -73,34 +82,42 @@ class StdioTransport:
         log_path: str | None = None,
     ):
         self._log_fh = open(log_path, "ab", buffering=0) if log_path else subprocess.DEVNULL
-        self._proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self._log_fh,
-            env=env,
-            bufsize=0,
-        )
-        self._buf = b""
+        try:
+            self._proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._log_fh,
+                env=env,
+                bufsize=0,
+            )
+        except BaseException:
+            # A failed spawn (bad binary, ENOENT) must not leak the log fd - the
+            # object is discarded before close() can run.
+            if self._log_fh is not subprocess.DEVNULL:
+                self._log_fh.close()
+            raise
+        self._buf = bytearray()
         self._lock = threading.Lock()
 
     def _read_line(self, deadline: float) -> bytes:
-        import time
-
         assert self._proc.stdout is not None
         fd = self._proc.stdout.fileno()
-        while b"\n" not in self._buf:
+        while (newline := self._buf.find(b"\n")) == -1:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise McpError("timed out waiting for pond response")
             ready, _, _ = select.select([fd], [], [], remaining)
             if not ready:
                 continue
-            chunk = os.read(fd, 65536)
+            chunk = os.read(fd, READ_CHUNK_BYTES)
             if not chunk:
                 raise McpError("pond stdio closed (child exited)")
-            self._buf += chunk
-        line, self._buf = self._buf.split(b"\n", 1)
+            self._buf.extend(chunk)
+            if len(self._buf) > MAX_FRAME_BYTES:
+                raise McpError("pond response frame exceeded the size limit")
+        line = bytes(self._buf[:newline])
+        del self._buf[: newline + 1]
         return line
 
     def _write(self, message: dict) -> None:
@@ -113,8 +130,6 @@ class StdioTransport:
             raise McpError(f"pond stdin unavailable: {exc}") from exc
 
     def roundtrip(self, message: dict, timeout: float) -> dict:
-        import time
-
         deadline = time.monotonic() + timeout
         want = message.get("id")
         with self._lock:
@@ -147,15 +162,20 @@ class StdioTransport:
             except Exception:
                 pass
             try:
-                proc.terminate()  # SIGTERM
+                proc.terminate()
             except ProcessLookupError:
                 pass
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=TERMINATE_GRACE_S)
             except subprocess.TimeoutExpired:
                 try:
                     proc.send_signal(signal.SIGKILL)
                 except ProcessLookupError:
+                    pass
+                # Reap the killed child so it does not linger as a zombie.
+                try:
+                    proc.wait(timeout=TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
                     pass
         for stream in (proc.stdin, proc.stdout):
             try:
@@ -214,7 +234,7 @@ class HttpTransport:
 
     def notify(self, message: dict) -> None:
         try:
-            self._post(message, timeout=10.0)
+            self._post(message, timeout=NOTIFY_TIMEOUT_S)
         except Exception:
             # Notifications (e.g. initialized) are fire-and-forget; a 202 with
             # an empty body is normal and parse_http_body returns None for it.

@@ -239,6 +239,9 @@ pub(crate) fn claude_peek_watermark(path: &Path) -> crate::adapter::SourceWaterm
     // `permission-mode`, `bridge-session`, ...) with no timestamp after the
     // conversation, so the literal last line is usually not a message. Walk
     // back to the latest row that carries a timestamp - the real watermark.
+    // Taking only the last line stranded ~2k sessions perpetually un-fresh,
+    // re-decoding ~1.2M already-stored rows every sync; the Empty proof below is
+    // locked to real ingest by `keyless_file_peeks_empty_and_ingests_nothing`.
     if let Some(ts) = peek_last_mapped(path, |line| {
         let row: Value = serde_json::from_str(line).ok()?;
         Some(parse_timestamp(&row).ok()?.timestamp_micros())
@@ -428,22 +431,10 @@ impl JsonlTree for ClaudeCodeAdapter {
     }
 
     fn unsupported_reason(&self, path: &Path) -> Option<String> {
-        // A `.jsonl` under a `subagents/` ancestor that we can't resolve to a
-        // child id (its leaf isn't `agent-<hash>.jsonl`) must NOT fall back to
-        // its content `sessionId` - that id is the parent's, so it would
-        // silently merge into the parent session. Fail visibly and wait for an
-        // adapter update instead. The Workflow runner's `journal.jsonl` never
-        // reaches this check - `skip_source` excludes it from the walk - and if
-        // it ever did, a visible skip is the safe answer. See spec.md#datasets.
-        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-            return Some(format!(
-                "{}: subagent transcript layout not recognized by this pond version; \
-                 skipped so it is not merged into the parent session - update pond and \
-                 re-run `pond sync`",
-                path.display()
-            ));
-        }
-        None
+        // The Workflow runner's `journal.jsonl` never reaches this check -
+        // `skip_source` excludes it from the walk - and if it ever did, a visible
+        // skip is the safe answer. See spec.md#datasets.
+        subagent_unsupported_reason(path)
     }
 
     fn skip_source(&self, path: &Path) -> bool {
@@ -491,6 +482,40 @@ pub(crate) fn is_workflow_control_file(path: &Path) -> bool {
         && path.file_name().and_then(|n| n.to_str()) == Some("journal.jsonl")
 }
 
+/// A `.jsonl` under a `subagents/` ancestor whose leaf we can't resolve to a
+/// child id (it isn't `agent-<hash>.jsonl`) must NOT fall back to its content
+/// `sessionId` - that id is the parent's, so it would silently merge into the
+/// parent session. Every claude-JSONL source (claude_code, nanoclaw) refuses it
+/// identically; only the recovery surface differs. `unsupported_reason` returns
+/// the user-facing skip message; the ingest guard returns the typed refusal.
+pub(crate) fn subagent_unsupported_reason(path: &Path) -> Option<String> {
+    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        return Some(format!(
+            "{}: subagent transcript layout not recognized by this pond version; \
+             skipped so it is not merged into the parent session - update pond and \
+             re-run `pond sync`",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// The ingest-time analog of [`subagent_unsupported_reason`]: the typed schema
+/// error for an unresolved `subagents/` leaf, attributed to `adapter`.
+pub(crate) fn unresolved_subagent_error(
+    adapter: &'static str,
+    path: &Path,
+) -> Option<AdapterError> {
+    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        return Some(AdapterError::schema(
+            adapter,
+            path.display().to_string(),
+            "sidecar/control file under subagents/ has no session of its own",
+        ));
+    }
+    None
+}
+
 /// Walk one raw row's `message.content[]` array (if any) and stash every
 /// `tool_use` part's `id -> name` mapping into the per-file map. Idempotent
 /// and safe to call on every row regardless of role; non-assistant rows
@@ -521,12 +546,8 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
     // journal.jsonl) would borrow the parent's content `sessionId` and silently
     // merge; refuse structurally rather than rely on the row lacking one.
     // spec.md#datasets.
-    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-        return Err(AdapterError::schema(
-            NAME,
-            path_display,
-            "sidecar/control file under subagents/ has no session of its own",
-        ));
+    if let Some(error) = unresolved_subagent_error(NAME, path) {
+        return Err(error);
     }
     let mut created_at = None;
     let mut project: Option<Extracted<String>> = None;

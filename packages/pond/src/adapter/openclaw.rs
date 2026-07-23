@@ -69,7 +69,7 @@ use super::{
     extracted_text,
     jsonl::{parse_bounded, peek_last_mapped},
     jsonl_bytes, part_id, part_ordinal, raw_record,
-    sqlite::{self, CHANNEL_CAP, emit},
+    sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, row_to_json},
 };
 
 const NAME: &str = "openclaw";
@@ -708,12 +708,6 @@ fn list_db_sessions(conn: &Connection, db_path: &Path) -> Result<DbSessions, Ada
         .map_err(|error| db_error(db_path, "read session row", &error))
 }
 
-#[derive(Clone, Copy)]
-enum ColKind {
-    Str,
-    Int,
-}
-
 /// The `sessions` columns pond mirrors verbatim into `options.openclaw`, in
 /// SELECT order. This ONE table drives both the SELECT list and the row->JSON
 /// decode, so tracking OpenClaw's fast-moving schema is a one-line change here.
@@ -749,40 +743,19 @@ const SESSION_COLUMNS: &[(&str, ColKind)] = &[
 /// recoverable). Every column lands verbatim in `options.openclaw`.
 fn fetch_session_row(conn: &Connection, session_id: &str) -> Result<Option<Value>, AdapterError> {
     static SESSION_ROW_SQL: LazyLock<String> = LazyLock::new(|| {
-        let columns = SESSION_COLUMNS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("SELECT {columns} FROM sessions WHERE session_id = ?1")
+        format!(
+            "SELECT {} FROM sessions WHERE session_id = ?1",
+            columns_sql(SESSION_COLUMNS)
+        )
     });
     let mut stmt = conn
         .prepare_cached(&SESSION_ROW_SQL)
         .map_err(|error| db_error(Path::new("sessions"), "prepare session row", &error))?;
     let row = stmt
-        .query_row([session_id], session_row_to_json)
+        .query_row([session_id], |row| row_to_json(row, SESSION_COLUMNS))
         .optional()
         .map_err(|error| db_error(Path::new("sessions"), "query session row", &error))?;
     Ok(row)
-}
-
-fn session_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
-    let mut map = serde_json::Map::new();
-    for (idx, (name, kind)) in SESSION_COLUMNS.iter().enumerate() {
-        match kind {
-            ColKind::Str => {
-                if let Some(v) = row.get::<_, Option<String>>(idx)? {
-                    map.insert((*name).to_owned(), json!(v));
-                }
-            }
-            ColKind::Int => {
-                if let Some(v) = row.get::<_, Option<i64>>(idx)? {
-                    map.insert((*name).to_owned(), json!(v));
-                }
-            }
-        }
-    }
-    Ok(Value::Object(map))
 }
 
 /// Best-effort single-value fetch: a missing table or any query error swallows

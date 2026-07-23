@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 
 use async_stream::stream;
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
@@ -77,7 +77,9 @@ use super::{
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text, is_session_fresh, jsonl_bytes, part_id, part_ordinal, raw_record,
-    sqlite::{self, CHANNEL_CAP, emit},
+    source_options,
+    sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, row_to_json},
+    validate_path_id,
 };
 
 const NAME: &str = "hermes";
@@ -86,16 +88,6 @@ const NAME: &str = "hermes";
 /// (`_CONTENT_JSON_PREFIX`, `hermes_state.py` ~5530). The NUL is illegal in
 /// normal text, so this never collides with real user content.
 const CONTENT_JSON_PREFIX: &str = "\u{0}json:";
-
-/// Column kinds for the mirrored SELECT lists. `sessions` timestamps are SQLite
-/// `REAL` (unix epoch seconds, float), so this seam needs a float kind that
-/// openclaw's Str/Int pair lacks.
-#[derive(Clone, Copy)]
-enum ColKind {
-    Str,
-    Int,
-    Real,
-}
 
 /// The `sessions` columns pond mirrors verbatim into `options.hermes`, in SELECT
 /// order. This ONE list drives both the SELECT and the row->JSON decode, so
@@ -417,7 +409,7 @@ fn read_survivors(
     let mut conns: HashMap<PathBuf, Connection> = HashMap::new();
     for (db_path, session_id) in survivors {
         let keep = match connection(&mut conns, &db_path) {
-            Ok(conn) => read_session(conn, &session_id, tx),
+            Ok(conn) => read_session(conn, &db_path, &session_id, tx),
             Err(error) => tx.blocking_send(Err(error)).is_ok(),
         };
         if !keep {
@@ -428,9 +420,21 @@ fn read_survivors(
 
 fn read_session(
     conn: &Connection,
+    db_path: &Path,
     session_id: &str,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
+    // A hostile `sessions.id` becomes a restore filename (`serialize_session`);
+    // it fails here at ingest, typed and attributed, like opencode's DB ids.
+    if let Err(error) = validate_path_id(
+        NAME,
+        "session id",
+        session_id,
+        format!("{}#{session_id}", db_path.display()),
+    ) {
+        return tx.blocking_send(Err(error)).is_ok();
+    }
+
     let row = match fetch_session_row(conn, session_id) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -444,8 +448,24 @@ fn read_session(
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
     };
 
+    // `started_at` is NOT NULL in the source schema; a session missing it is
+    // corrupt and fails visibly rather than earning a synthesized wall-clock
+    // `created_at` (spec.md#model-no-synthesis).
+    let Some(created_at) = row
+        .get("started_at")
+        .and_then(Value::as_f64)
+        .and_then(secs_to_dt)
+    else {
+        let error = AdapterError::schema(
+            NAME,
+            session_id.to_owned(),
+            "session has no parseable started_at timestamp",
+        );
+        return tx.blocking_send(Err(error)).is_ok();
+    };
+
     let (relation, source_agent) = classify(conn, &row);
-    let session = build_session(session_id, &row, relation, source_agent);
+    let session = build_session(session_id, &row, relation, source_agent, created_at);
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
     let messages = match fetch_messages(conn, session_id) {
@@ -453,8 +473,13 @@ fn read_session(
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
     };
     for message_row in messages {
-        for event in message_events(session_id, &message_row) {
-            emit!(tx, Ok(AdapterYield::Event(event)));
+        match message_events(session_id, &message_row) {
+            Ok(events) => {
+                for event in events {
+                    emit!(tx, Ok(AdapterYield::Event(event)));
+                }
+            }
+            Err(error) => emit!(tx, Err(error)),
         }
     }
     true
@@ -469,11 +494,8 @@ fn fetch_session_row(conn: &Connection, session_id: &str) -> Result<Option<Value
         .prepare_cached(&sql)
         .map_err(|error| db_error(Path::new("sessions"), "prepare session row", &error))?;
     stmt.query_row([session_id], |row| row_to_json(row, SESSION_COLUMNS))
-        .map(Some)
-        .or_else(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(db_error(Path::new("sessions"), "query session row", &other)),
-        })
+        .optional()
+        .map_err(|error| db_error(Path::new("sessions"), "query session row", &error))
 }
 
 fn fetch_messages(conn: &Connection, session_id: &str) -> Result<Vec<Value>, AdapterError> {
@@ -568,13 +590,9 @@ fn build_session(
     row: &Value,
     relation: Option<Relation>,
     source_agent: String,
+    created_at: DateTime<Utc>,
 ) -> Session {
     let project = session_project(row, session_id);
-    let created_at = row
-        .get("started_at")
-        .and_then(Value::as_f64)
-        .and_then(secs_to_dt)
-        .unwrap_or_else(Utc::now);
     let parent_session_id = row
         .get("parent_session_id")
         .and_then(Value::as_str)
@@ -585,12 +603,8 @@ fn build_session(
         hermes.insert("relation".to_owned(), json!(relation.tag()));
     }
 
-    let mut options = ProviderOptions::new();
+    let mut options = source_options(NAME, row);
     options.insert("hermes".to_owned(), Value::Object(hermes));
-    options.insert(
-        "source".to_owned(),
-        json!({ "adapter": NAME, "raw_record": extract_raw_record(row) }),
-    );
 
     Session {
         id: session_id.to_owned(),
@@ -628,16 +642,30 @@ fn session_project(row: &Value, session_id: &str) -> Extracted<String> {
 
 // -- Message -> events ------------------------------------------------------
 
-fn message_events(session_id: &str, row: &Value) -> Vec<IngestEvent> {
+fn message_events(session_id: &str, row: &Value) -> Result<Vec<IngestEvent>, AdapterError> {
+    // `id` and `timestamp` are both NOT NULL in the source schema; a row missing
+    // either is corrupt, so it fails visibly rather than being dropped or given a
+    // synthesized wall-clock timestamp (spec.md#model-no-synthesis,
+    // spec.md#adapter-integrity-no-silent-drops).
     let Some(message_id_int) = row.get("id").and_then(Value::as_i64) else {
-        return Vec::new();
+        return Err(AdapterError::schema(
+            NAME,
+            session_id.to_owned(),
+            "message row has no integer id",
+        ));
     };
     let message_id = format!("{session_id}:{message_id_int}");
-    let timestamp = row
+    let Some(timestamp) = row
         .get("timestamp")
         .and_then(Value::as_f64)
         .and_then(secs_to_dt)
-        .unwrap_or_else(Utc::now);
+    else {
+        return Err(AdapterError::schema(
+            NAME,
+            message_id,
+            "message row has no parseable timestamp",
+        ));
+    };
     let options = message_options(row, message_id_int);
     let role = row.get("role").and_then(Value::as_str);
     let content = row.get("content").and_then(Value::as_str);
@@ -681,9 +709,23 @@ fn message_events(session_id: &str, row: &Value) -> Vec<IngestEvent> {
                     ordinal += 1;
                 }
             }
-            for call in tool_calls(row) {
-                parts.push(tool_call_part(session_id, &message_id, ordinal, &call));
-                ordinal += 1;
+            match tool_calls(row) {
+                ToolCalls::Parsed(calls) => {
+                    for call in calls {
+                        parts.push(tool_call_part(session_id, &message_id, ordinal, &call));
+                        ordinal += 1;
+                    }
+                }
+                ToolCalls::Corrupt(raw) => {
+                    let text = extract_str(&json!({ "content": raw }), "content");
+                    parts.push(text_part(
+                        session_id,
+                        &message_id,
+                        ordinal,
+                        text,
+                        Provenance::Conversational,
+                    ));
+                }
             }
             Message::Assistant {
                 id: message_id.clone(),
@@ -716,7 +758,7 @@ fn message_events(session_id: &str, row: &Value) -> Vec<IngestEvent> {
     let mut events = Vec::with_capacity(parts.len() + 1);
     events.push(IngestEvent::Message(message));
     events.extend(parts.into_iter().map(IngestEvent::Part));
-    events
+    Ok(events)
 }
 
 /// Decode a `content` string into conversational parts. A sentinel-prefixed JSON
@@ -842,23 +884,35 @@ fn multimodal_part(
     }
 }
 
+/// The assistant `tool_calls` column: parsed OpenAI tool-call objects, or the
+/// raw payload preserved on a decode failure (matching [`decode_content`]'s
+/// preserve-corrupt-as-text policy, never a silent drop -
+/// spec.md#adapter-integrity-no-silent-drops). `Ok(vec![])` means no column.
+enum ToolCalls {
+    Parsed(Vec<Value>),
+    Corrupt(String),
+}
+
 /// Parse the assistant `tool_calls` column into OpenAI tool-call objects. Old
 /// rows double-encode it as a JSON string (fixed upstream in #68856), so a
 /// string result is parsed once more.
-fn tool_calls(row: &Value) -> Vec<Value> {
+fn tool_calls(row: &Value) -> ToolCalls {
     let Some(raw) = row.get("tool_calls").and_then(Value::as_str) else {
-        return Vec::new();
+        return ToolCalls::Parsed(Vec::new());
     };
     let mut value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
-        Err(_) => return Vec::new(),
+        Err(_) => return ToolCalls::Corrupt(raw.to_owned()),
     };
     if let Value::String(inner) = &value
         && let Ok(parsed) = serde_json::from_str::<Value>(inner)
     {
         value = parsed;
     }
-    value.as_array().cloned().unwrap_or_default()
+    match value.as_array() {
+        Some(calls) => ToolCalls::Parsed(calls.clone()),
+        None => ToolCalls::Corrupt(raw.to_owned()),
+    }
 }
 
 fn tool_call_part(session_id: &str, message_id: &str, ordinal: usize, call: &Value) -> Part {
@@ -1045,38 +1099,6 @@ fn reconstruct_row(message: &MessageWithParts) -> Value {
 
 // -- Small helpers ----------------------------------------------------------
 
-fn columns_sql(columns: &[(&str, ColKind)]) -> String {
-    columns
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn row_to_json(row: &rusqlite::Row, columns: &[(&str, ColKind)]) -> rusqlite::Result<Value> {
-    let mut map = Map::new();
-    for (idx, (name, kind)) in columns.iter().enumerate() {
-        match kind {
-            ColKind::Str => {
-                if let Some(value) = row.get::<_, Option<String>>(idx)? {
-                    map.insert((*name).to_owned(), json!(value));
-                }
-            }
-            ColKind::Int => {
-                if let Some(value) = row.get::<_, Option<i64>>(idx)? {
-                    map.insert((*name).to_owned(), json!(value));
-                }
-            }
-            ColKind::Real => {
-                if let Some(value) = row.get::<_, Option<f64>>(idx)? {
-                    map.insert((*name).to_owned(), json!(value));
-                }
-            }
-        }
-    }
-    Ok(Value::Object(map))
-}
-
 /// Unix epoch seconds (hermes `REAL`) -> micros.
 fn secs_to_micros(secs: f64) -> i64 {
     (secs * 1_000_000.0).round() as i64
@@ -1109,7 +1131,6 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     /// The subset of hermes's `SCHEMA_SQL` pond reads, copied verbatim from

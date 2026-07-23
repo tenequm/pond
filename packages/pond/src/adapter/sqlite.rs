@@ -1,4 +1,5 @@
-//! Shared read-only SQLite plumbing for DB-backed adapters (opencode, openclaw).
+//! Shared read-only SQLite plumbing for DB-backed adapters (opencode, openclaw,
+//! hermes, nanoclaw).
 //!
 //! Seam rule (CLAUDE.md "Seam boundaries"): this module carries only
 //! cross-implementation infrastructure with two real callers and no
@@ -11,6 +12,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
+use serde_json::{Value, json};
 
 use super::AdapterError;
 
@@ -70,6 +72,56 @@ pub(crate) fn join_error(adapter: &'static str, join: tokio::task::JoinError) ->
         "blocking read task",
         std::io::Error::other(join.to_string()),
     )
+}
+
+/// SQLite affinity of each column in a mirrored SELECT list, so a row decodes to
+/// the right JSON scalar. `Real` covers float columns (hermes's epoch-second
+/// timestamps); openclaw's columns are all `Str`/`Int`.
+#[derive(Clone, Copy)]
+pub(crate) enum ColKind {
+    Str,
+    Int,
+    Real,
+}
+
+/// The column names of a `(name, kind)` list, in order, comma-joined for a SELECT.
+pub(crate) fn columns_sql(columns: &[(&str, ColKind)]) -> String {
+    columns
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Rebuild a row as a JSON object, column names kept verbatim, null columns
+/// omitted (spec.md#model-lossless-projection - every non-null column
+/// recoverable). One `(name, kind)` list drives both the SELECT and this decode,
+/// so the projection can never drift from the query.
+pub(crate) fn row_to_json(
+    row: &rusqlite::Row,
+    columns: &[(&str, ColKind)],
+) -> rusqlite::Result<Value> {
+    let mut map = serde_json::Map::new();
+    for (idx, (name, kind)) in columns.iter().enumerate() {
+        match kind {
+            ColKind::Str => {
+                if let Some(value) = row.get::<_, Option<String>>(idx)? {
+                    map.insert((*name).to_owned(), json!(value));
+                }
+            }
+            ColKind::Int => {
+                if let Some(value) = row.get::<_, Option<i64>>(idx)? {
+                    map.insert((*name).to_owned(), json!(value));
+                }
+            }
+            ColKind::Real => {
+                if let Some(value) = row.get::<_, Option<f64>>(idx)? {
+                    map.insert((*name).to_owned(), json!(value));
+                }
+            }
+        }
+    }
+    Ok(Value::Object(map))
 }
 
 /// Send one yield through a blocking read channel, returning `false` from the

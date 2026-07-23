@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_stream::stream;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 
@@ -78,24 +78,21 @@ use super::{
     claude_code::{
         FileState, SubagentDescriptor, claude_peek_watermark, claude_serialize,
         is_workflow_control_file, map_row_events, parse_timestamp, source_project_dir,
-        subagent_descriptor, subagent_ids, subagents_dir,
+        subagent_descriptor, subagent_ids, subagent_unsupported_reason, subagents_dir,
+        unresolved_subagent_error,
     },
     config_path,
     extract::{Extracted, extract_self_str},
     jsonl::{BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, jsonl_tree_plan},
-    opencode,
-    sqlite::DB_BUSY_TIMEOUT,
-    validate_path_id,
+    opencode, sqlite, validate_path_id,
 };
 
 const NAME: &str = "nanoclaw";
 
-/// Install-root candidates `probe_default` checks, in order.
-const PROBE_CANDIDATES: &[&[&str]] = &[
-    &["nanoclaw"],
-    &["pj", "nanoclaw"],
-    &["Projects", "nanoclaw"],
-];
+/// Install-root candidate `probe_default` checks. Installs live anywhere, so
+/// config-first is the normal path; the probe only offers `~/nanoclaw` as a
+/// convenience and is gated on it actually holding `data/v2-sessions/`.
+const PROBE_CANDIDATES: &[&[&str]] = &[&["nanoclaw"]];
 
 /// Stateless factory: opens [`NanoclawAdapter`] instances and probes the
 /// well-known install locations for a `data/v2-sessions/` dir.
@@ -131,7 +128,7 @@ impl AdapterFactory for NanoclawFactory {
         session: &crate::sessions::SessionWithMessages,
         fidelity: RestoreFidelity,
     ) -> Result<Vec<RestoredFile>, AdapterError> {
-        claude_serialize(NAME, session, fidelity, nanoclaw_transcript_path(session)?)
+        claude_serialize(NAME, session, fidelity, transcript_path(session)?)
     }
 }
 
@@ -200,7 +197,7 @@ impl Adapter for NanoclawAdapter {
                 let attribution = opencode::Attribution {
                     source_agent_root: NAME.to_owned(),
                     project: session.project,
-                    extra_options: Some(("nanoclaw".to_owned(), session.nanoclaw_options)),
+                    extra_options: ("nanoclaw".to_owned(), session.nanoclaw_options),
                 };
                 let mut composed =
                     opencode::composed_events_with(session.data_dir, oracle, attribution);
@@ -254,7 +251,7 @@ impl JsonlTree for NanoclawAdapter {
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
-        nanoclaw_session_from_rows(path, rows, self.metadata())
+        session_from_rows(path, rows, self.metadata())
     }
 
     fn events_from_row(
@@ -267,17 +264,7 @@ impl JsonlTree for NanoclawAdapter {
     }
 
     fn unsupported_reason(&self, path: &Path) -> Option<String> {
-        // Same structural guard as claude_code: a `subagents/` leaf we can't
-        // resolve must not borrow the parent's content `sessionId` and merge.
-        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-            return Some(format!(
-                "{}: subagent transcript layout not recognized by this pond version; \
-                 skipped so it is not merged into the parent session - update pond and \
-                 re-run `pond sync`",
-                path.display()
-            ));
-        }
-        None
+        subagent_unsupported_reason(path)
     }
 }
 
@@ -325,7 +312,7 @@ fn agent_group_from_path(path: &Path) -> Option<String> {
     None
 }
 
-fn nanoclaw_session_from_rows(
+fn session_from_rows(
     path: &Path,
     rows: &[BoundedRow],
     metadata: &HashMap<String, Value>,
@@ -333,12 +320,8 @@ fn nanoclaw_session_from_rows(
     let display = path.display().to_string();
     // A non-agent leaf under `subagents/` would borrow the parent's content
     // `sessionId` and silently merge; refuse structurally.
-    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-        return Err(AdapterError::schema(
-            NAME,
-            display,
-            "sidecar/control file under subagents/ has no session of its own",
-        ));
+    if let Some(error) = unresolved_subagent_error(NAME, path) {
+        return Err(error);
     }
 
     let agent_group_id = agent_group_from_path(path).ok_or_else(|| {
@@ -443,7 +426,7 @@ fn nanoclaw_session_from_rows(
 /// Native restore path from the install root: replays into the observed
 /// `data/v2-sessions/<agentGroupId>/.claude-shared/projects/<projectDir>/`
 /// layout, stored in `options.source` at ingest. Every id segment is validated.
-fn nanoclaw_transcript_path(
+fn transcript_path(
     session: &crate::sessions::SessionWithMessages,
 ) -> Result<PathBuf, AdapterError> {
     let source = session.session.options.get("source");
@@ -499,18 +482,20 @@ fn nanoclaw_transcript_path(
 
 // --- Read-only SQLite metadata join (best-effort, degrades to absent) --------
 
-/// Build `sdk_uuid -> options.nanoclaw` once, by scanning every
-/// `<group>/<sessionId>/outbound.db` for the transcript link, then joining each
-/// nanoclaw session against `data/v2.db`. Any unreadable DB or orphan is skipped;
-/// the result is only ever additive metadata.
-fn build_metadata(root: &Path) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
+/// Every real IPC session folder under `data/v2-sessions`, as
+/// `(agentGroupId, sessionId, sessionPath)`, sorted for deterministic order.
+/// Skips non-dirs and dotfile entries (`.claude-shared` holds transcripts, not a
+/// session folder). The metadata index and provider enumeration walk this same
+/// tree, so they share one implementation.
+fn walk_session_dirs(root: &Path) -> Vec<(String, String, PathBuf)> {
     let v2_sessions = root.join("data").join("v2-sessions");
-    let v2_db = root.join("data").join("v2.db");
+    let mut out = Vec::new();
     let Ok(groups) = std::fs::read_dir(&v2_sessions) else {
-        return map;
+        return out;
     };
-    for group in groups.flatten() {
+    let mut group_entries: Vec<_> = groups.flatten().collect();
+    group_entries.sort_by_key(std::fs::DirEntry::file_name);
+    for group in group_entries {
         if !group.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
@@ -520,7 +505,9 @@ fn build_metadata(root: &Path) -> HashMap<String, Value> {
         let Ok(sessions) = std::fs::read_dir(group.path()) else {
             continue;
         };
-        for session in sessions.flatten() {
+        let mut session_entries: Vec<_> = sessions.flatten().collect();
+        session_entries.sort_by_key(std::fs::DirEntry::file_name);
+        for session in session_entries {
             if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
@@ -528,29 +515,42 @@ fn build_metadata(root: &Path) -> HashMap<String, Value> {
             let Some(session_id) = name.to_str() else {
                 continue;
             };
-            // `.claude-shared` holds transcripts, not an IPC session folder.
             if session_id.starts_with('.') {
                 continue;
             }
-            let outbound = session.path().join("outbound.db");
-            if !outbound.exists() {
-                continue;
-            }
-            let Some(sdk_uuid) = read_continuation(&outbound) else {
-                continue;
-            };
-            let nanoclaw = nanoclaw_metadata_object(&v2_db, session_id, &group_id);
-            map.insert(sdk_uuid, Value::Object(nanoclaw));
+            out.push((group_id.clone(), session_id.to_owned(), session.path()));
         }
+    }
+    out
+}
+
+/// Build `sdk_uuid -> options.nanoclaw` once, by scanning every
+/// `<group>/<sessionId>/outbound.db` for the transcript link, then joining each
+/// nanoclaw session against `data/v2.db`. Any unreadable DB or orphan is skipped;
+/// the result is only ever additive metadata.
+fn build_metadata(root: &Path) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    let v2 = open_metadata_db(&root.join("data").join("v2.db"));
+    for (group_id, session_id, session_path) in walk_session_dirs(root) {
+        let outbound = session_path.join("outbound.db");
+        if !outbound.exists() {
+            continue;
+        }
+        let Some(sdk_uuid) = read_continuation(&outbound) else {
+            continue;
+        };
+        let nanoclaw = nanoclaw_metadata_object(v2.as_ref(), &session_id, &group_id);
+        map.insert(sdk_uuid, Value::Object(nanoclaw));
     }
     map
 }
 
 /// The `options.nanoclaw` object for one nanoclaw session: its id and agent group
-/// (always present, straight from the layout) plus the best-effort `v2.db` join.
-/// Shared by the claude metadata index and the opencode-provider composition.
+/// (always present, straight from the layout) plus the best-effort `v2.db` join
+/// against a shared connection (`None` when `v2.db` is unreadable). Shared by the
+/// claude metadata index and the opencode-provider composition.
 fn nanoclaw_metadata_object(
-    v2_db: &Path,
+    v2: Option<&Connection>,
     session_id: &str,
     group_id: &str,
 ) -> serde_json::Map<String, Value> {
@@ -563,42 +563,39 @@ fn nanoclaw_metadata_object(
         "agent_group_id".to_owned(),
         Value::String(group_id.to_owned()),
     );
-    for (key, value) in read_session_metadata(v2_db, session_id) {
-        nanoclaw.insert(key, value);
+    if let Some(conn) = v2 {
+        for (key, value) in read_session_metadata(conn, session_id) {
+            nanoclaw.insert(key, value);
+        }
     }
     nanoclaw
 }
 
-fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )?;
-    conn.busy_timeout(DB_BUSY_TIMEOUT)?;
-    Ok(conn)
+fn is_malformed(message: &str) -> bool {
+    message.contains("malformed")
 }
 
-fn is_malformed(error: &rusqlite::Error) -> bool {
-    error.to_string().contains("malformed")
-}
-
-/// Open `path` read-only and run `query`, retrying once on a Docker-Desktop
-/// page-cache `database disk image is malformed`. Any other failure degrades to
-/// `None` - metadata is best-effort and must never block ingestion.
-fn read_db<T>(path: &Path, query: impl Fn(&Connection) -> rusqlite::Result<T>) -> Option<T> {
+/// Open a metadata DB read-only (shared `sqlite::open_db`), retrying once on a
+/// Docker-Desktop page-cache `database disk image is malformed`. `None` on any
+/// other failure - metadata is best-effort and must never block ingestion. One
+/// open serves every session's join, not one per session.
+fn open_metadata_db(path: &Path) -> Option<Connection> {
     for attempt in 0..2 {
-        let conn = match open_read_only(path) {
-            Ok(conn) => conn,
-            Err(error) if attempt == 0 && is_malformed(&error) => continue,
-            Err(_) => return None,
-        };
-        match query(&conn) {
-            Ok(value) => return Some(value),
-            Err(error) if attempt == 0 && is_malformed(&error) => continue,
+        match sqlite::open_db(NAME, path) {
+            Ok(conn) => return Some(conn),
+            Err(error) if attempt == 0 && is_malformed(&error.to_string()) => continue,
             Err(_) => return None,
         }
     }
     None
+}
+
+/// Open `path` read-only and run `query` once, retrying the open on a malformed
+/// page cache. Any failure degrades to `None`. For the per-folder `outbound.db`
+/// reads, where each DB is opened exactly once anyway.
+fn read_db<T>(path: &Path, query: impl Fn(&Connection) -> rusqlite::Result<T>) -> Option<T> {
+    let conn = open_metadata_db(path)?;
+    query(&conn).ok()
 }
 
 /// The SDK session uuid this container's transcript resumes from - the
@@ -627,14 +624,16 @@ fn read_continuation(path: &Path) -> Option<String> {
     .flatten()
 }
 
-/// Join one nanoclaw session against `v2.db`. Prefers the full
-/// sessions/messaging_groups/agent_groups/container_configs join; on any error
-/// (a column absent on an old install, a corrupt DB) falls back to the minimal
-/// sessions-only projection, then to nothing. Only non-null columns are carried.
-fn read_session_metadata(v2_db: &Path, session_id: &str) -> Vec<(String, Value)> {
-    read_db(v2_db, |conn| join_full(conn, session_id))
+/// Join one nanoclaw session against a shared `v2.db` connection. Prefers the
+/// full sessions/messaging_groups/agent_groups/container_configs join; on any
+/// error (a column absent on an old install, a corrupt DB) falls back to the
+/// minimal sessions-only projection, then to nothing. Only non-null columns are
+/// carried.
+fn read_session_metadata(conn: &Connection, session_id: &str) -> Vec<(String, Value)> {
+    join_full(conn, session_id)
+        .ok()
         .flatten()
-        .or_else(|| read_db(v2_db, |conn| join_minimal(conn, session_id)).flatten())
+        .or_else(|| join_minimal(conn, session_id).ok().flatten())
         .unwrap_or_default()
 }
 
@@ -742,9 +741,8 @@ struct ResolvedSession {
 /// provider is `codex`). Both degrade to empty if `v2.db` is unreadable; opencode
 /// composition still runs from the filesystem alone.
 fn provider_work(root: &Path) -> ProviderWork {
-    let v2_sessions = root.join("data").join("v2-sessions");
-    let v2_db = root.join("data").join("v2.db");
-    let resolved = resolve_providers(&v2_db);
+    let v2 = open_metadata_db(&root.join("data").join("v2.db"));
+    let resolved = resolve_providers(v2.as_ref());
 
     let mut codex_skips: Vec<CodexSkip> = resolved
         .iter()
@@ -757,48 +755,23 @@ fn provider_work(root: &Path) -> ProviderWork {
     codex_skips.sort_by(|a, b| a.session_id.cmp(&b.session_id));
 
     let mut opencode = Vec::new();
-    if let Ok(groups) = std::fs::read_dir(&v2_sessions) {
-        let mut group_entries: Vec<_> = groups.flatten().collect();
-        group_entries.sort_by_key(std::fs::DirEntry::file_name);
-        for group in group_entries {
-            if !group.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let Some(group_id) = group.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            let Ok(sessions) = std::fs::read_dir(group.path()) else {
-                continue;
-            };
-            let mut session_entries: Vec<_> = sessions.flatten().collect();
-            session_entries.sort_by_key(std::fs::DirEntry::file_name);
-            for session in session_entries {
-                if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    continue;
-                }
-                let name = session.file_name();
-                let Some(session_id) = name.to_str() else {
-                    continue;
-                };
-                // `.claude-shared` holds transcripts, not an IPC session folder.
-                if session_id.starts_with('.') {
-                    continue;
-                }
-                let Some(data_dir) = opencode_data_dir(&session.path()) else {
-                    continue;
-                };
-                let Some(project) = extract_self_str(&Value::String(group_id.clone())) else {
-                    continue;
-                };
-                let nanoclaw_options =
-                    Value::Object(nanoclaw_metadata_object(&v2_db, session_id, &group_id));
-                opencode.push(OpencodeProviderSession {
-                    data_dir,
-                    project,
-                    nanoclaw_options,
-                });
-            }
-        }
+    for (group_id, session_id, session_path) in walk_session_dirs(root) {
+        let Some(data_dir) = opencode_data_dir(&session_path) else {
+            continue;
+        };
+        let Some(project) = extract_self_str(&Value::String(group_id.clone())) else {
+            continue;
+        };
+        let nanoclaw_options = Value::Object(nanoclaw_metadata_object(
+            v2.as_ref(),
+            &session_id,
+            &group_id,
+        ));
+        opencode.push(OpencodeProviderSession {
+            data_dir,
+            project,
+            nanoclaw_options,
+        });
     }
 
     ProviderWork {
@@ -819,11 +792,15 @@ fn opencode_data_dir(session_dir: &Path) -> Option<PathBuf> {
     Some(if nested.is_dir() { nested } else { xdg })
 }
 
-/// Resolve every session's provider from `v2.db`: `sessions.agent_provider`, else
-/// the group's `container_configs.provider` (default `claude` is applied by the
-/// caller when both are null). Degrades to an empty map on any read error.
-fn resolve_providers(v2_db: &Path) -> HashMap<String, ResolvedSession> {
-    read_db(v2_db, |conn| {
+/// Resolve every session's provider from a shared `v2.db` connection:
+/// `sessions.agent_provider`, else the group's `container_configs.provider`
+/// (default `claude` is applied by the caller when both are null). Degrades to an
+/// empty map when `v2.db` is unreadable or the query errors.
+fn resolve_providers(v2: Option<&Connection>) -> HashMap<String, ResolvedSession> {
+    let Some(conn) = v2 else {
+        return HashMap::new();
+    };
+    let query = |conn: &Connection| -> rusqlite::Result<HashMap<String, ResolvedSession>> {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.agent_group_id, s.agent_provider, cc.provider \
              FROM sessions s \
@@ -848,8 +825,8 @@ fn resolve_providers(v2_db: &Path) -> HashMap<String, ResolvedSession> {
             );
         }
         Ok(map)
-    })
-    .unwrap_or_default()
+    };
+    query(conn).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -910,7 +887,7 @@ mod tests {
         let env = Env::with_home(home);
         assert!(NanoclawFactory.probe_default(&env).is_none());
 
-        let root = home.join("pj").join("nanoclaw");
+        let root = home.join("nanoclaw");
         std::fs::create_dir_all(root.join("data").join("v2-sessions"))?;
         let probe = NanoclawFactory.probe_default(&env);
         let got = probe

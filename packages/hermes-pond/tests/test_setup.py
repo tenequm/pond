@@ -79,9 +79,9 @@ def test_target_platforms_all_excludes_cli(fake_hermes):
     assert {"telegram", "discord", "api_server", "cron"}.issubset(set(targets))
 
 
-def test_cmd_setup_writes_allowlist(fake_hermes, monkeypatch, capsys):
+def test_cmd_setup_writes_allowlist(fake_hermes, monkeypatch):
     fake_hermes["config"] = {"platform_toolsets": {"telegram": ["hermes-telegram"]}}
-    monkeypatch.setattr(setup_cmd, "_locate_binary", lambda: "/usr/local/bin/pond")
+    monkeypatch.setattr(setup_cmd, "_locate_binary", lambda _bp=None: "/usr/local/bin/pond")
 
     rc = setup_cmd._cmd_setup(all_platforms=False)
     assert rc == 0
@@ -94,7 +94,7 @@ def test_cmd_setup_writes_allowlist(fake_hermes, monkeypatch, capsys):
 
 
 def test_cmd_setup_missing_binary_fails_without_writing(fake_hermes, monkeypatch):
-    monkeypatch.setattr(setup_cmd, "_locate_binary", lambda: None)
+    monkeypatch.setattr(setup_cmd, "_locate_binary", lambda _bp=None: None)
     rc = setup_cmd._cmd_setup(all_platforms=False)
     assert rc == 1
     assert fake_hermes["saved"] is None

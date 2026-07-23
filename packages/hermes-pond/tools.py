@@ -15,6 +15,7 @@ distinct from hermes' live same-harness `session_search`. Kept short on purpose
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 
 SEARCH_DEFAULT_LIMIT = 10
@@ -23,8 +24,15 @@ SEARCH_MAX_QUERY_CHARS = 4096
 SQL_MAX_QUERY_CHARS = 8192
 RESPONSE_MAX_BYTES = 32 * 1024
 SQL_MAX_TIMEOUT_SECONDS = 600
+# Bounds on the small string/window args, named so the schemas read consistently.
+ID_MAX_CHARS = 512
+DATE_MAX_CHARS = 32
+GET_SESSION_MAX_LIMIT = 1000
+CONTEXT_MAX_MESSAGES = 25
 
 TOOLSET = "pond"
+
+logger = logging.getLogger(__name__)
 
 PondCaller = Callable[[str, dict], tuple[bool, str]]
 
@@ -70,10 +78,10 @@ SEARCH_SCHEMA = {
             "mode": {"type": "string", "enum": ["vector", "fts"]},
             "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
             "limit": {"type": "integer", "minimum": 1, "maximum": SEARCH_MAX_LIMIT},
-            "project": {"type": "string", "maxLength": 512},
-            "session_id": {"type": "string", "maxLength": 512},
-            "from_date": {"type": "string", "maxLength": 32},
-            "to_date": {"type": "string", "maxLength": 32},
+            "project": {"type": "string", "maxLength": ID_MAX_CHARS},
+            "session_id": {"type": "string", "maxLength": ID_MAX_CHARS},
+            "from_date": {"type": "string", "maxLength": DATE_MAX_CHARS},
+            "to_date": {"type": "string", "maxLength": DATE_MAX_CHARS},
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -92,11 +100,11 @@ GET_SESSION_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "maxLength": 512},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "id": {"type": "string", "maxLength": ID_MAX_CHARS},
+            "limit": {"type": "integer", "minimum": 1, "maximum": GET_SESSION_MAX_LIMIT},
             "from": {"type": "string", "enum": ["start", "end"]},
-            "after_message_id": {"type": "string", "maxLength": 512},
-            "before_message_id": {"type": "string", "maxLength": 512},
+            "after_message_id": {"type": "string", "maxLength": ID_MAX_CHARS},
+            "before_message_id": {"type": "string", "maxLength": ID_MAX_CHARS},
         },
         "required": ["id"],
         "additionalProperties": False,
@@ -114,9 +122,9 @@ GET_MESSAGE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "maxLength": 512},
-            "context_before": {"type": "integer", "minimum": 0, "maximum": 25},
-            "context_after": {"type": "integer", "minimum": 0, "maximum": 25},
+            "id": {"type": "string", "maxLength": ID_MAX_CHARS},
+            "context_before": {"type": "integer", "minimum": 0, "maximum": CONTEXT_MAX_MESSAGES},
+            "context_after": {"type": "integer", "minimum": 0, "maximum": CONTEXT_MAX_MESSAGES},
         },
         "required": ["id"],
         "additionalProperties": False,
@@ -153,6 +161,12 @@ def _resolve_source_agent(sources: list[str]) -> str | None:
     """pond's source_agent filter takes one source. "*" opts into the whole corpus."""
     if not sources or "*" in sources:
         return None
+    if len(sources) > 1:
+        logger.warning(
+            "pond source_agent filter takes a single source; using the first of %s "
+            '(add "*" to search the whole corpus)',
+            sources,
+        )
     return sources[0]
 
 

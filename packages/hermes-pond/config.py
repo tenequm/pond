@@ -8,6 +8,7 @@ pond store holds (the operator chooses what pond ingests). See the README.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 DEFAULT_SYNC_INTERVAL_MINUTES = 5
@@ -52,7 +53,7 @@ def parse_plugin_config(raw: object) -> PondPluginConfig:
     mode = "url" if pond.get("mode") == "url" else "managed"
 
     raw_interval = pond.get("syncIntervalMinutes", pond.get("sync_interval_minutes"))
-    if isinstance(raw_interval, (int, float)) and raw_interval == raw_interval:
+    if isinstance(raw_interval, (int, float)) and not math.isnan(raw_interval):
         sync_interval = max(1, int(raw_interval))
     else:
         sync_interval = DEFAULT_SYNC_INTERVAL_MINUTES

@@ -56,9 +56,9 @@ def pond_command(args: argparse.Namespace) -> int:
     return 2
 
 
-def _locate_binary() -> str | None:
+def _locate_binary(binary_path: str | None = None) -> str | None:
     try:
-        return resolve_pond_binary(None)
+        return resolve_pond_binary(binary_path)
     except Exception as exc:
         print(f"pond binary: NOT FOUND\n  {exc}")
         return None
@@ -101,11 +101,24 @@ def _ensure_pond_listed(config: dict, platform: str) -> bool:
 
 
 def _cmd_setup(*, all_platforms: bool) -> int:
-    pond_bin = _locate_binary()
-    if pond_bin is None:
-        print(f"\nfix: {INSTALL_HINT}")
-        return 1
-    print(f"pond binary: {pond_bin}")
+    from .config import load_plugin_config
+
+    plugin = load_plugin_config()
+    if plugin.mode == "url":
+        # url mode attaches to an external `pond serve`; no local binary is needed
+        # or spawned, so requiring one here would make setup impossible for it.
+        if not plugin.url:
+            print("pond.mode=url is set but pond.url is missing; add the endpoint url")
+            return 1
+        print(f"pond endpoint: {plugin.url} (url mode - no local binary needed)")
+    else:
+        # Validate the binary that will actually be spawned (config binaryPath),
+        # not a bare PATH lookup that could resolve to a different pond.
+        pond_bin = _locate_binary(plugin.binary_path)
+        if pond_bin is None:
+            print(f"\nfix: {INSTALL_HINT}")
+            return 1
+        print(f"pond binary: {pond_bin}")
 
     try:
         from hermes_cli.config import load_config, save_config
@@ -139,9 +152,17 @@ def _cmd_setup(*, all_platforms: bool) -> int:
 
 
 def _cmd_status() -> int:
-    pond_bin = _locate_binary()
-    if pond_bin is not None:
-        print(f"pond binary: {pond_bin}")
+    from .config import load_plugin_config
+
+    plugin = load_plugin_config()
+    if plugin.mode == "url":
+        reachable = bool(plugin.url)
+        print(f"pond endpoint: {plugin.url or 'MISSING (pond.mode=url needs pond.url)'}")
+    else:
+        pond_bin = _locate_binary(plugin.binary_path)
+        reachable = pond_bin is not None
+        if pond_bin is not None:
+            print(f"pond binary: {pond_bin}")
     try:
         from hermes_cli.config import load_config
 
@@ -155,4 +176,4 @@ def _cmd_status() -> int:
         print("pond toolset explicitly listed on: " + ", ".join(listed))
     else:
         print("pond toolset not explicitly listed on any platform (default-on where unconfigured)")
-    return 0 if pond_bin is not None else 1
+    return 0 if reachable else 1

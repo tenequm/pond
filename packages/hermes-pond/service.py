@@ -31,6 +31,10 @@ from .mcp_client import HttpTransport, McpError, PondMcpClient, StdioTransport
 # relative to the MCP default (60s) because this is a same-host child.
 DIAL_TIMEOUT_S = 10.0
 CALL_TIMEOUT_S = 120.0
+# A pond_sql call carries its own server-side timeout (up to 600s); the transport
+# deadline must outlive it, or a long query would trip McpError and tear down the
+# warm child. Grant the requested budget plus room for transfer + rendering.
+SQL_CALL_TIMEOUT_MARGIN_S = 30.0
 RESTART_BASE_DELAY_S = 0.5
 RESTART_MAX_DELAY_S = 30.0
 
@@ -71,6 +75,17 @@ def resolve_pond_binary(binary_path: str | None) -> str:
         if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
             return expanded
     raise McpError(f"pond binary not found on PATH. {INSTALL_HINT}")
+
+
+def _call_timeout(name: str, args: dict) -> float:
+    """Transport deadline for one tool call. pond_sql carries its own server-side
+    timeout, so the transport must wait at least that long plus a transfer margin;
+    every other tool uses the flat sidecar deadline."""
+    if name == "pond_sql":
+        requested = args.get("timeout_seconds")
+        if isinstance(requested, int) and requested > 0:
+            return float(requested) + SQL_CALL_TIMEOUT_MARGIN_S
+    return CALL_TIMEOUT_S
 
 
 def _log_dir() -> Path:
@@ -124,7 +139,7 @@ class PondController:
                     "unavailable. Check the hermes logs.",
                 )
             try:
-                return client.call_tool(name, args, timeout=CALL_TIMEOUT_S)
+                return client.call_tool(name, args, timeout=_call_timeout(name, args))
             except McpError as exc:
                 self._drop(f"tool call failed: {exc}")
                 return False, f"pond call failed: {exc}"
@@ -149,21 +164,35 @@ class PondController:
     def _dial(self) -> PondMcpClient | None:
         try:
             transport = self._dial_http() if self._config.mode == "url" else self._dial_stdio()
-            client = PondMcpClient(transport)
+        except (McpError, OSError) as exc:
+            self._on_dial_failure(exc)
+            return None
+        client = PondMcpClient(transport)
+        try:
             client.initialize(DIAL_TIMEOUT_S)
             # Probe so a dead transport fails here, not on the first tool call.
             client.list_tool_names(DIAL_TIMEOUT_S)
         except (McpError, OSError) as exc:
-            if self._config.mode == "url":
-                self._error(f"connection to {self._config.url or '(no url)'} failed: {exc}")
-            else:
-                self._error(f"failed to start: {exc}")
-            self._schedule_retry()
+            # Handshake/probe failed after the transport (and, in stdio mode, the
+            # child) was created - close it so a spawned `--with-sync` pond is not
+            # orphaned to keep syncing while the retry loop spawns another.
+            try:
+                transport.close()
+            except Exception:
+                pass
+            self._on_dial_failure(exc)
             return None
         self._attempt = 0
         self._client = client
         self._info(f"connected ({self._config.mode} mode).")
         return client
+
+    def _on_dial_failure(self, exc: Exception) -> None:
+        if self._config.mode == "url":
+            self._error(f"connection to {self._config.url or '(no url)'} failed: {exc}")
+        else:
+            self._error(f"failed to start: {exc}")
+        self._schedule_retry()
 
     def _dial_stdio(self) -> StdioTransport:
         pond_bin = resolve_pond_binary(self._config.binary_path)

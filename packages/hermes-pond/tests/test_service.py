@@ -15,8 +15,11 @@ STUB = Path(__file__).resolve().parent / "stub_pond_bin.py"
 
 @pytest.fixture(autouse=True)
 def _ensure_stub_executable():
+    # The stub is checked in mode 100755; only restore +x if a checkout dropped
+    # it, so a normal run never mutates the working tree.
     mode = STUB.stat().st_mode
-    STUB.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if not mode & stat.S_IXUSR:
+        STUB.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 @pytest.fixture

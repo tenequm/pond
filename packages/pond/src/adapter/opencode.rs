@@ -248,19 +248,20 @@ impl Adapter for OpencodeAdapter {
 /// reader against a foreign root (nanoclaw's opencode-provider sessions) relabels
 /// each yielded session: opencode still owns the main-vs-subagent decision from
 /// its own taxonomy, and the caller supplies only the new `source_agent` root, the
-/// `project` scope, and one options entry mirrored onto every session. opencode's
-/// own session/message/part ids stay canonical.
+/// `project` scope, and one `(key, value)` options entry mirrored onto every
+/// session. opencode's own session/message/part ids stay canonical.
 pub(crate) struct Attribution {
     pub source_agent_root: String,
     pub project: Extracted<String>,
-    pub extra_options: Option<(String, Value)>,
+    pub extra_options: (String, Value),
 }
 
 /// Stream opencode's `events_with` against `root`, applying `attribution` to every
 /// emitted `Session`; every other yield (messages, parts, skips, errors) passes
-/// through unchanged. The two callers (the `opencode` adapter itself and
-/// nanoclaw's composition) justify this seam; all opencode format knowledge stays
-/// here, so the caller supplies only the attribution.
+/// through unchanged. Composition-only: the `opencode` adapter's own ingest does
+/// not route through here (it emits its own stream). This seam keeps all opencode
+/// format knowledge in this module so the foreign caller supplies only the
+/// attribution; nanoclaw's provider composition is its one caller today.
 pub(crate) fn composed_events_with<'a>(
     root: PathBuf,
     oracle: &'a dyn SkipOracle,
@@ -289,9 +290,8 @@ fn reattribute(yielded: AdapterYield, attribution: &Attribution) -> AdapterYield
         format!("{}/subagent", attribution.source_agent_root)
     };
     session.project = attribution.project.clone();
-    if let Some((key, value)) = &attribution.extra_options {
-        session.options.insert(key.clone(), value.clone());
-    }
+    let (key, value) = &attribution.extra_options;
+    session.options.insert(key.clone(), value.clone());
     AdapterYield::Event(IngestEvent::Session(session))
 }
 
