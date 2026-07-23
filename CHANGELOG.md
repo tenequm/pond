@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.14.1](https://github.com/tenequm/pond/compare/v0.14.0...v0.14.1) - 2026-07-23
+
+### <!-- 2 -->🐛 Bug Fixes
+- **openclaw:** ingest stable file-era session stores cleanly and lower plugin floor to 2026.5.18 ([74ff3ad](https://github.com/tenequm/pond/commit/74ff3ad0bc31975ccb505757f5b3fb157bf103b7))
+
+### <!-- 5 -->📚 Documentation
+- add direct founder contact links (Telegram, X) to site and README ([#115](https://github.com/tenequm/pond/pull/115)) ([0e68339](https://github.com/tenequm/pond/commit/0e68339cef8bb6f9744b815defb6da4ac6881260))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.0...v0.14.1
+
 ## [0.14.0](https://github.com/tenequm/pond/compare/v0.13.2...v0.14.0) - 2026-07-23
 
 Routes the MCP tool surface by intent, adds first-class OpenClaw ingestion, and makes local Lance stores crash-consistent (fsync on write + self-heal on open).
