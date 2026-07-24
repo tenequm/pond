@@ -216,6 +216,8 @@ Writes commit data without folding indexes; index maintenance is operator-trigge
 
 Index maintenance skips indexes whose columns no write has touched; this is sound because Lance prunes index coverage only for indexes whose fields overlap a write's modified fields. Why operator-triggered: matching Lance's own design (`table.optimize()` is the canonical periodic-maintenance op) avoids per-write index rebuilds that would otherwise dominate write cost.
 
+The default compaction filter also requires a planned non-deletion task's row target to fit within half the configured output byte budget at every input fragment's observed live-row width. The headroom covers the re-encoding writer's soft byte limit and binary-copy compaction's whole-file granularity. Missing file sizes skip the optional rewrite. Deletion materialization remains eligible because removing tombstoned rows is useful even when fragment layout does not improve.
+
 ### 3.8 Forward-compatibility seams
 
 #### `lance-forward-compat`
