@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/tenequm/pond/compare/v0.14.1...v0.14.2) - 2026-07-24
+
+### <!-- 1 -->🎉 New Features
+- nanoclaw + hermes adapters and hermes-pond recall plugin ([#121](https://github.com/tenequm/pond/pull/121)) ([1ed0189](https://github.com/tenequm/pond/commit/1ed01895514d8257f9bd34774b4cd73c151b5dc9))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.1...v0.14.2
+
 ## [0.14.1](https://github.com/tenequm/pond/compare/v0.14.0...v0.14.1) - 2026-07-23
 
 ### <!-- 2 -->🐛 Bug Fixes
