@@ -1,0 +1,12 @@
+language: python
+
+# Runs the plugin's pytest suite via uv (pure-stdlib runtime; pytest is the only
+# dev dep). All paths are package-relative.
+tasks:
+  test:
+    command: 'uv run --group dev pytest'
+    toolchains: ['system']
+    inputs:
+      - '*.py'
+      - 'tests/**/*'
+      - 'pyproject.toml'

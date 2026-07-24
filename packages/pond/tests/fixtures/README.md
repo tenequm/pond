@@ -1,13 +1,15 @@
 # Session samples
 
-Curated, anonymized session captures from 8 agentic-client platforms. These files
+Curated, anonymized (or, where a real capture is infeasible, fully synthetic)
+session samples from 9 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
 
 Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
 claude_code nested workflow-subagent sample added 2026-06-04; opencode
-`opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15).
+`opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
+synthetic hermes `state.db` fixtures generated 2026-07-23).
 
 ## Why
 
@@ -44,6 +46,7 @@ adapter/
   claude_code/               Claude Code CLI
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
+  hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   openclaw/                  openclaw runtime
   opencode/                  opencode CLI
@@ -152,6 +155,42 @@ sample tree.
 - Samples: 2 sessions across 2 dates from the interactive `codex_cli_rs`
   originator, models `gpt-5` and `gpt-5-codex`.
 
+### hermes (Hermes Agent)
+
+- Source path: `~/.hermes/state.db` (default profile) plus
+  `~/.hermes/profiles/<name>/state.db` (named profiles). `$HERMES_HOME`
+  overrides the home root. One SQLite DB per profile - no JSONL, no per-session
+  files.
+- Layout: a single `state.db` per profile holding `sessions` (session rows,
+  free-form `source` gateway/platform tag, `parent_session_id` lineage,
+  `started_at`/`ended_at` REAL epoch seconds) and `messages` (`id` AUTOINCREMENT
+  transcript rows: `role` in user/assistant/tool/system, `content`,
+  `tool_calls` JSON, `tool_call_id`/`tool_name`, `reasoning`, `active`/
+  `compacted` flags, `timestamp` REAL). Message `content` is a plain string OR a
+  JSON payload prefixed with the `\x00json:` sentinel (NUL + `json:`) carrying a
+  multimodal part list. DDL copied verbatim from `hermes_state.py`
+  (SCHEMA_VERSION 23).
+- Samples: FULLY SYNTHETIC (the hermes runtime is inherently personal, so no
+  real capture is committed). Two DBs built from the verbatim SCHEMA_VERSION-23
+  DDL (the same schema the adapter unit tests embed):
+  - `state.db` - 6 sessions / 18 messages. `sess-root` is a telegram
+    conversation that exercises a reasoning column, a tool call + tool-result
+    pair (`weather`), a `\x00json:` multimodal user message (text + image_url),
+    and a compaction tail (a pre-compaction turn flipped to `active=0,
+    compacted=1` plus a `compacted=1` summary row). `sess-comp` is a compaction
+    successor (parent `sess-root` ended `end_reason='compression'`),
+    `sess-branch` a `/branch` child (`model_config._branched_from` marker),
+    `sess-delegate-parent` + `sess-sub` a delegate spawn pair
+    (`model_config._delegate_from`), and `sess-cron` a `source='cron'` session.
+  - `profiles/coder/state.db` - 1 session / 2 messages: a `source='cli'` session
+    with no gateway routing, so its `project` falls back to `cwd`.
+- Exercised by the `hermes` adapter: the integration suite
+  (`tests/integration/adapter/hermes.rs`) ingests both DBs through a real
+  `Store` (7 sessions) and asserts source_agent taxonomy
+  (`hermes` / `hermes/subagent` / `hermes/cron`), the three lineage relations,
+  project derivation, multimodal + tool part survival, searchability, and
+  additive re-sync freshness via the rowmap oracle.
+
 ### nanoclaw
 
 - Source path:
@@ -176,6 +215,14 @@ sample tree.
   The synthetic files exist because the nanoclaw runtime is inherently
   personal (founder-assistant sessions), making real captures hard to
   anonymize; the real `agentgroup-anon-001/` set remains the schema anchor.
+- Exercised by the `nanoclaw` adapter: the integration suite
+  (`tests/integration/adapter/nanoclaw.rs`) ingests this whole corpus (8
+  sessions - 3 top-level + 5 subagent sidecars) through a real `Store` and
+  asserts session/message counts, get round-trips, and searchability. The
+  opencode-provider composition and codex-provider skip cases build their
+  `opencode-xdg/` stores (from the committed `opencode` DB fixture) and
+  `v2.db` provider tables synthetically in-test, so no committed nanoclaw
+  fixture change was needed for them.
 
 ### openclaw
 

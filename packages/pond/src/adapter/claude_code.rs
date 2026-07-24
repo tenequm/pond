@@ -99,6 +99,21 @@ fn serialize_session(
     session: &crate::sessions::SessionWithMessages,
     fidelity: RestoreFidelity,
 ) -> Result<Vec<RestoredFile>, AdapterError> {
+    claude_serialize(NAME, session, fidelity, claude_relative_path(session))
+}
+
+/// Shared claude-JSONL restore: build the transcript records (native replays
+/// the stored `raw_record`s, foreign re-derives via [`claude_record`]) and write
+/// them to `transcript_path`, plus the subagent `.meta.json` sidecar when the
+/// session carries one. nanoclaw rides this with its own layout prefix; only
+/// `transcript_path` and the error-attribution `adapter` differ between the two
+/// claude-JSONL sources.
+pub(crate) fn claude_serialize(
+    adapter: &'static str,
+    session: &crate::sessions::SessionWithMessages,
+    fidelity: RestoreFidelity,
+    transcript_path: PathBuf,
+) -> Result<Vec<RestoredFile>, AdapterError> {
     let mut messages = session.messages.clone();
     if fidelity == RestoreFidelity::Native {
         messages.sort_by(|left, right| {
@@ -139,8 +154,8 @@ fn serialize_session(
     }
 
     let mut files = vec![RestoredFile::new(
-        claude_relative_path(session),
-        jsonl_bytes(NAME, &records)?,
+        transcript_path,
+        jsonl_bytes(adapter, &records)?,
         fidelity,
     )];
     if session.session.parent_session_id.is_some()
@@ -152,7 +167,7 @@ fn serialize_session(
             meta_path,
             serde_json::to_vec(&meta).map_err(|err| {
                 AdapterError::schema(
-                    NAME,
+                    adapter,
                     &session.session.id,
                     format!("json encode failed: {err}"),
                 )
@@ -194,7 +209,57 @@ fn encode_project(project: &str) -> String {
     project.replace(['/', '.'], "-")
 }
 
-fn subagent_meta_record(session: &crate::sessions::SessionWithMessages) -> Option<Value> {
+/// Shared claude-JSONL row mapping: replay dedup, `tool_use_id -> name`
+/// capture, then the per-row canonical events. nanoclaw reuses it verbatim
+/// (same transcript family) with its own session identity supplied via
+/// `session_id`/`created_at`.
+pub(crate) fn map_row_events(
+    session_id: &str,
+    created_at: DateTime<Utc>,
+    row: &BoundedRow,
+    state: &mut FileState,
+) -> Result<Vec<IngestEvent>, String> {
+    if let Some(uuid) = row.value.get("uuid").and_then(Value::as_str)
+        && !state
+            .seen_records
+            .insert((uuid.to_owned(), source_record_hash(&row.value)))
+    {
+        return Ok(Vec::new());
+    }
+    capture_tool_call_names(&row.value, &mut state.tool_call_names);
+    events_from_row(session_id, row.line, &row.value, created_at, state)
+}
+
+/// Shared claude-JSONL freshness watermark: the latest timestamped row from a
+/// bounded tail peek, or [`SourceWatermark::Empty`] when a whole-file scan finds
+/// no timestamped row (that file cannot anchor a session, so it ingests
+/// nothing). See the trait doc on [`JsonlTree::peek_watermark`].
+pub(crate) fn claude_peek_watermark(path: &Path) -> crate::adapter::SourceWatermark {
+    // Claude Code appends trailing metadata rows (`last-prompt`,
+    // `permission-mode`, `bridge-session`, ...) with no timestamp after the
+    // conversation, so the literal last line is usually not a message. Walk
+    // back to the latest row that carries a timestamp - the real watermark.
+    // Taking only the last line stranded ~2k sessions perpetually un-fresh,
+    // re-decoding ~1.2M already-stored rows every sync; the Empty proof below is
+    // locked to real ingest by `keyless_file_peeks_empty_and_ingests_nothing`.
+    if let Some(ts) = peek_last_mapped(path, |line| {
+        let row: Value = serde_json::from_str(line).ok()?;
+        Some(parse_timestamp(&row).ok()?.timestamp_micros())
+    }) {
+        return crate::adapter::SourceWatermark::At(ts);
+    }
+    // No timestamped row found. A whole-file scan (len <= TAIL_CAP) proving no
+    // timestamped row is a proof of emptiness (session anchoring runs the same
+    // `parse_timestamp`); a larger file's scan is a window, so it stays opaque.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() <= TAIL_CAP => crate::adapter::SourceWatermark::Empty,
+        _ => crate::adapter::SourceWatermark::Opaque,
+    }
+}
+
+pub(crate) fn subagent_meta_record(
+    session: &crate::sessions::SessionWithMessages,
+) -> Option<Value> {
     // Restore the sidecar `.meta.json` verbatim from the stored copy. A
     // subagent ingested without a meta file stored `meta: null` - nothing
     // to write back.
@@ -349,29 +414,7 @@ impl JsonlTree for ClaudeCodeAdapter {
     }
 
     fn peek_watermark(&self, path: &Path) -> crate::adapter::SourceWatermark {
-        // Claude Code appends trailing metadata rows (`last-prompt`,
-        // `permission-mode`, `bridge-session`, ...) with no timestamp after the
-        // conversation, so the literal last line is usually not a message. Walk
-        // back to the latest row that carries a timestamp - the real watermark.
-        // Taking only the last line stranded ~2k sessions perpetually un-fresh,
-        // re-decoding ~1.2M already-stored rows every sync.
-        if let Some(ts) = peek_last_mapped(path, |line| {
-            let row: Value = serde_json::from_str(line).ok()?;
-            Some(parse_timestamp(&row).ok()?.timestamp_micros())
-        }) {
-            return crate::adapter::SourceWatermark::At(ts);
-        }
-        // No timestamped row found. When the scan covered the WHOLE file
-        // (len <= TAIL_CAP) that is a proof of nothing ingestible: session
-        // anchoring runs the same `parse_timestamp` over the same lines
-        // (`session_from_rows`), so this file cannot anchor a session and
-        // ingests nothing - the invariant is locked by
-        // `keyless_file_peeks_empty_and_ingests_nothing`. A larger file's scan
-        // is a window, not a proof, so it stays opaque and re-reads.
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.len() <= TAIL_CAP => crate::adapter::SourceWatermark::Empty,
-            _ => crate::adapter::SourceWatermark::Opaque,
-        }
+        claude_peek_watermark(path)
     }
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -384,34 +427,14 @@ impl JsonlTree for ClaudeCodeAdapter {
         row: &BoundedRow,
         state: &mut Self::State,
     ) -> Result<Vec<IngestEvent>, String> {
-        if let Some(uuid) = row.value.get("uuid").and_then(Value::as_str)
-            && !state
-                .seen_records
-                .insert((uuid.to_owned(), source_record_hash(&row.value)))
-        {
-            return Ok(Vec::new());
-        }
-        capture_tool_call_names(&row.value, &mut state.tool_call_names);
-        events_from_row(&session.id, row.line, &row.value, session.created_at, state)
+        map_row_events(&session.id, session.created_at, row, state)
     }
 
     fn unsupported_reason(&self, path: &Path) -> Option<String> {
-        // A `.jsonl` under a `subagents/` ancestor that we can't resolve to a
-        // child id (its leaf isn't `agent-<hash>.jsonl`) must NOT fall back to
-        // its content `sessionId` - that id is the parent's, so it would
-        // silently merge into the parent session. Fail visibly and wait for an
-        // adapter update instead. The Workflow runner's `journal.jsonl` never
-        // reaches this check - `skip_source` excludes it from the walk - and if
-        // it ever did, a visible skip is the safe answer. See spec.md#datasets.
-        if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-            return Some(format!(
-                "{}: subagent transcript layout not recognized by this pond version; \
-                 skipped so it is not merged into the parent session - update pond and \
-                 re-run `pond sync`",
-                path.display()
-            ));
-        }
-        None
+        // The Workflow runner's `journal.jsonl` never reaches this check -
+        // `skip_source` excludes it from the walk - and if it ever did, a visible
+        // skip is the safe answer. See spec.md#datasets.
+        subagent_unsupported_reason(path)
     }
 
     fn skip_source(&self, path: &Path) -> bool {
@@ -454,9 +477,43 @@ fn source_record_hash(value: &Value) -> u64 {
 /// One accumulates per Workflow run, and none can ever earn a freshness key -
 /// left in the walk they'd grow `pond status`'s pending count without bound.
 /// See spec.md#datasets.
-fn is_workflow_control_file(path: &Path) -> bool {
+pub(crate) fn is_workflow_control_file(path: &Path) -> bool {
     subagents_dir(path).is_some()
         && path.file_name().and_then(|n| n.to_str()) == Some("journal.jsonl")
+}
+
+/// A `.jsonl` under a `subagents/` ancestor whose leaf we can't resolve to a
+/// child id (it isn't `agent-<hash>.jsonl`) must NOT fall back to its content
+/// `sessionId` - that id is the parent's, so it would silently merge into the
+/// parent session. Every claude-JSONL source (claude_code, nanoclaw) refuses it
+/// identically; only the recovery surface differs. `unsupported_reason` returns
+/// the user-facing skip message; the ingest guard returns the typed refusal.
+pub(crate) fn subagent_unsupported_reason(path: &Path) -> Option<String> {
+    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        return Some(format!(
+            "{}: subagent transcript layout not recognized by this pond version; \
+             skipped so it is not merged into the parent session - update pond and \
+             re-run `pond sync`",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// The ingest-time analog of [`subagent_unsupported_reason`]: the typed schema
+/// error for an unresolved `subagents/` leaf, attributed to `adapter`.
+pub(crate) fn unresolved_subagent_error(
+    adapter: &'static str,
+    path: &Path,
+) -> Option<AdapterError> {
+    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
+        return Some(AdapterError::schema(
+            adapter,
+            path.display().to_string(),
+            "sidecar/control file under subagents/ has no session of its own",
+        ));
+    }
+    None
 }
 
 /// Walk one raw row's `message.content[]` array (if any) and stash every
@@ -489,12 +546,8 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
     // journal.jsonl) would borrow the parent's content `sessionId` and silently
     // merge; refuse structurally rather than rely on the row lacking one.
     // spec.md#datasets.
-    if subagents_dir(path).is_some() && subagent_ids(path).is_none() {
-        return Err(AdapterError::schema(
-            NAME,
-            path_display,
-            "sidecar/control file under subagents/ has no session of its own",
-        ));
+    if let Some(error) = unresolved_subagent_error(NAME, path) {
+        return Err(error);
     }
     let mut created_at = None;
     let mut project: Option<Extracted<String>> = None;
@@ -635,7 +688,7 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
     })
 }
 
-fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
+pub(crate) fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
     // The project dir is the grandparent of `subagents/` regardless of how
     // deeply the transcript nests below it (`.../<project>/<parent_uuid>/
     // subagents/...`), so climb from the `subagents/` ancestor rather than a
@@ -655,7 +708,7 @@ fn source_project_dir(path: &Path, is_subagent: bool) -> Option<String> {
 /// matches both the flat `<parent_uuid>/subagents/agent-<hash>.jsonl` and the
 /// nested workflow `<parent_uuid>/subagents/workflows/<wf-id>/agent-<hash>.jsonl`
 /// layouts. The directory directly above it is the parent session uuid.
-fn subagents_dir(path: &Path) -> Option<&Path> {
+pub(crate) fn subagents_dir(path: &Path) -> Option<&Path> {
     let mut cur = path.parent();
     while let Some(dir) = cur {
         if dir.file_name().and_then(|n| n.to_str()) == Some("subagents") {
@@ -671,12 +724,12 @@ fn subagents_dir(path: &Path) -> Option<&Path> {
 /// file's full verbatim content so native restore reproduces it
 /// (spec.md#adapter-native-restore-lossless). Both are `None` when the meta file is
 /// absent or unreadable (the label falls back to `claude-code/subagent`).
-struct SubagentDescriptor {
-    parent_uuid: String,
-    child_suffix: String,
-    agent_hash: String,
-    agent_type: Option<String>,
-    meta: Option<Value>,
+pub(crate) struct SubagentDescriptor {
+    pub(crate) parent_uuid: String,
+    pub(crate) child_suffix: String,
+    pub(crate) agent_hash: String,
+    pub(crate) agent_type: Option<String>,
+    pub(crate) meta: Option<Value>,
 }
 
 /// `(parent_uuid, child_suffix, agent_hash)` for a subagent transcript, or
@@ -686,7 +739,7 @@ struct SubagentDescriptor {
 /// `agent-<hash>` flat, `workflows/<wf-id>/agent-<hash>` nested - so the derived
 /// child id `<parent_uuid>/<child_suffix>` round-trips back to the on-disk path
 /// on native restore. `agent_hash` keys the sibling `.meta.json` lookup.
-fn subagent_ids(path: &Path) -> Option<(String, String, String)> {
+pub(crate) fn subagent_ids(path: &Path) -> Option<(String, String, String)> {
     let file_name = path.file_name()?.to_str()?;
     let agent_hash = file_name
         .strip_prefix("agent-")?
@@ -708,7 +761,7 @@ fn subagent_ids(path: &Path) -> Option<(String, String, String)> {
 
 /// [`subagent_ids`] plus the sibling `agent-<hash>.meta.json` - `agentType` for
 /// the `source_agent` label, the whole file for lossless sidecar restore.
-fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
+pub(crate) fn subagent_descriptor(path: &Path) -> Option<SubagentDescriptor> {
     let (parent_uuid, child_suffix, agent_hash) = subagent_ids(path)?;
     let meta_path = path.parent()?.join(format!("agent-{agent_hash}.meta.json"));
     let (agent_type, meta) = match std::fs::read(&meta_path) {
@@ -1175,7 +1228,7 @@ fn attachment_content(value: &Value) -> Option<Extracted<String>> {
     extract_str(value, "content").or_else(|| extract_str(value, "stdout"))
 }
 
-fn parse_timestamp(value: &Value) -> anyhow::Result<DateTime<Utc>> {
+pub(crate) fn parse_timestamp(value: &Value) -> anyhow::Result<DateTime<Utc>> {
     let timestamp = value
         .get("timestamp")
         .and_then(Value::as_str)

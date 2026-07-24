@@ -115,14 +115,25 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
         None
     }
 
-    /// A file the adapter knows carries no session data (a runner control file
-    /// whose content duplicates real transcripts). Excluded from the walk
-    /// entirely: never counted as a source, never read, never pending. Only for
-    /// files whose non-session nature is structural and certain - anything the
-    /// adapter merely can't decode must stay IN the walk so it surfaces as a
-    /// visible skip instead of vanishing. Default: no such category.
+    /// A path the adapter knows carries no session data. Receives both files
+    /// (a runner control file whose content duplicates real transcripts) and
+    /// directories (a subtree another reader owns, e.g. nanoclaw's
+    /// `opencode-xdg/` stores) - returning `true` for a directory prunes the
+    /// whole subtree from the walk. Excluded paths are never counted as a
+    /// source, never read, never pending. Only for paths whose non-session
+    /// nature is structural and certain - anything the adapter merely can't
+    /// decode must stay IN the walk so it surfaces as a visible skip instead
+    /// of vanishing. Default: no such category.
     fn skip_source(&self, _path: &Path) -> bool {
         false
+    }
+
+    /// Whether a walked file is a transcript this adapter reads. Default: a
+    /// `.jsonl` extension. nanoclaw overrides it to also accept rotated
+    /// `<uuid>.jsonl.rotated-<epochMs>` transcripts, whose extension is not
+    /// `jsonl`.
+    fn is_transcript(&self, path: &Path) -> bool {
+        path.extension() == Some(OsStr::new("jsonl"))
     }
 }
 
@@ -132,11 +143,14 @@ pub(crate) struct IoAtPath {
     pub source: std::io::Error,
 }
 
-/// Walk `root` recursively for every `*.jsonl` file, sorted for deterministic
-/// ingest order.
-pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath> {
+/// Walk the driver's `root` recursively for every transcript file
+/// ([`JsonlTree::is_transcript`], so a non-`.jsonl` name like nanoclaw's rotated
+/// files is still collected), sorted for deterministic ingest order. Whole
+/// subtrees the driver excludes ([`JsonlTree::skip_source`], e.g. nanoclaw's
+/// `opencode-xdg/` stores) are pruned rather than walked then filtered.
+fn collect_tree_files<D: JsonlTree>(driver: &D) -> Result<Vec<PathBuf>, IoAtPath> {
     let mut paths = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![driver.root().to_path_buf()];
     while let Some(dir) = stack.pop() {
         let at_dir = |source| IoAtPath {
             path: dir.display().to_string(),
@@ -147,8 +161,10 @@ pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, IoAtPath>
             let file_type = entry.file_type().map_err(at_dir)?;
             let child = entry.path();
             if file_type.is_dir() {
-                stack.push(child);
-            } else if child.extension() == Some(OsStr::new("jsonl")) {
+                if !driver.skip_source(&child) {
+                    stack.push(child);
+                }
+            } else if driver.is_transcript(&child) {
                 paths.push(child);
             }
         }
@@ -162,7 +178,7 @@ pub(crate) fn jsonl_tree_discover<D: JsonlTree>(driver: &D) -> DiscoverFuture<'_
     let name = driver.name();
     Box::pin(async move {
         tokio::task::spawn_blocking(move || {
-            collect_jsonl_files(driver.root())
+            collect_tree_files(&driver)
                 .map(|files| {
                     files
                         .iter()
@@ -275,8 +291,8 @@ fn collect_heads<D: JsonlTree>(
     oracle_is_empty: bool,
 ) -> Result<Vec<FileHead>, AdapterError> {
     let name = driver.name();
-    let mut files = collect_jsonl_files(driver.root())
-        .map_err(|io| AdapterError::io(name, io.path, io.source))?;
+    let mut files =
+        collect_tree_files(driver).map_err(|io| AdapterError::io(name, io.path, io.source))?;
     files.retain(|path| !driver.skip_source(path));
     // The freshness peek (first line -> session id, file tail -> latest
     // timestamp) costs bounded reads + JSON decodes per file. On a first-time

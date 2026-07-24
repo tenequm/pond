@@ -1,0 +1,36 @@
+[project]
+name = "hermes-pond"
+version = "0.1.0"
+description = "Read-only pond recall tools for the Hermes agent (pond_search, pond_get_session, pond_get_message, pond_sql), with a managed local pond process."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tenequm" }]
+# Zero runtime dependencies: the MCP client is pure stdlib so enabling the
+# hermes plugin needs no pip install.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+# Not an installable package - this directory IS the hermes plugin (plugin.yaml
+# + __init__.py loaded in place). uv treats it as a virtual project for tests.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# importlib mode: the plugin's root __init__.py (required by the hermes
+# directory-plugin contract) must not be treated as a test-rooted package and
+# imported standalone - importlib mode imports each test module by path instead.
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501", "UP007"]
+exclude = [".git", ".venv", "__pycache__"]

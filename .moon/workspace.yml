@@ -1,9 +1,11 @@
 # moon v2.x workspace config. packages/ monorepo: the Rust crate under
-# packages/pond, the OpenClaw plugin under packages/openclaw-pond, and repo-level
-# tasks (changelog gate, dist build) on the root `repo` project.
+# packages/pond, the OpenClaw plugin under packages/openclaw-pond, the Hermes
+# plugin under packages/hermes-pond, and repo-level tasks (changelog gate, dist
+# build) on the root `repo` project.
 projects:
   pond: 'packages/pond'
   openclaw-pond: 'packages/openclaw-pond'
+  hermes-pond: 'packages/hermes-pond'
   repo: '.'
 
 vcs:

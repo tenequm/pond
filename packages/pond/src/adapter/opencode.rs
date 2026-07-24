@@ -50,7 +50,7 @@ use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
     config_path,
-    extract::{extract_str, json_or_string},
+    extract::{Extracted, extract_str, json_or_string},
     jsonl::{RECORD_CAP, parse_bounded},
     part_id, part_ordinal, raw_record, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
@@ -242,6 +242,57 @@ impl Adapter for OpencodeAdapter {
             }
         })
     }
+}
+
+/// Re-attribution for a composed opencode reader. A caller that runs opencode's
+/// reader against a foreign root (nanoclaw's opencode-provider sessions) relabels
+/// each yielded session: opencode still owns the main-vs-subagent decision from
+/// its own taxonomy, and the caller supplies only the new `source_agent` root, the
+/// `project` scope, and one `(key, value)` options entry mirrored onto every
+/// session. opencode's own session/message/part ids stay canonical.
+pub(crate) struct Attribution {
+    pub source_agent_root: String,
+    pub project: Extracted<String>,
+    pub extra_options: (String, Value),
+}
+
+/// Stream opencode's `events_with` against `root`, applying `attribution` to every
+/// emitted `Session`; every other yield (messages, parts, skips, errors) passes
+/// through unchanged. Composition-only: the `opencode` adapter's own ingest does
+/// not route through here (it emits its own stream). This seam keeps all opencode
+/// format knowledge in this module so the foreign caller supplies only the
+/// attribution; nanoclaw's provider composition is its one caller today.
+pub(crate) fn composed_events_with<'a>(
+    root: PathBuf,
+    oracle: &'a dyn SkipOracle,
+    attribution: Attribution,
+) -> AdapterYieldStream<'a> {
+    use tokio_stream::StreamExt;
+    Box::pin(stream! {
+        let adapter = OpencodeAdapter::new(root);
+        let mut inner = adapter.events_with(oracle);
+        while let Some(item) = inner.next().await {
+            yield item.map(|yielded| reattribute(yielded, &attribution));
+        }
+    })
+}
+
+/// Apply an [`Attribution`] to one yield. opencode labels a main session bare
+/// `opencode` and any subagent `opencode/<agent>` or `opencode/subagent`, so a
+/// non-bare label is exactly opencode's "this is a subagent" signal.
+fn reattribute(yielded: AdapterYield, attribution: &Attribution) -> AdapterYield {
+    let AdapterYield::Event(IngestEvent::Session(mut session)) = yielded else {
+        return yielded;
+    };
+    session.source_agent = if session.source_agent == NAME {
+        attribution.source_agent_root.clone()
+    } else {
+        format!("{}/subagent", attribution.source_agent_root)
+    };
+    session.project = attribution.project.clone();
+    let (key, value) = &attribution.extra_options;
+    session.options.insert(key.clone(), value.clone());
+    AdapterYield::Event(IngestEvent::Session(session))
 }
 
 /// A discovered session tagged by source, plus its freshness watermark peek in
