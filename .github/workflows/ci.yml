@@ -44,12 +44,39 @@ jobs:
       # heavy ones on its target-dir lock; format/changelog are instant).
       - run: moon run repo:check-changelog pond:check-package pond:format pond:lint pond:test
 
+  # Hosted, never pond-ci: those runner pods are unprivileged with a root-owned
+  # /nix (the image ships nix-bin only for `nix-hash`), so nix there would need
+  # its sandbox off - weaker conditions than the users this check protects.
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency: { group: "ci-flake-${{ github.ref }}", cancel-in-progress: true }
+    # The workflow-level env hands this secret to every job, and the last step
+    # runs a binary downloaded from a GitHub release. Blank it here.
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      # Without --all-systems the darwin and aarch64 outputs go unevaluated on
+      # an x86_64 runner and the job passes anyway.
+      - run: nix flake check --all-systems --no-update-lock-file
+      # ops/nix is a second flake with its own lock, not reached by the root
+      # check; it backs the older `?dir=ops/nix#pond` install URL.
+      - run: nix flake check ./ops/nix --all-systems --no-update-lock-file
+      # flake check only evaluates - nothing above ever fetches a tarball. This
+      # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
+      - run: nix run .#pond -- --version
+
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
   # whose tag already exists". (dry-run can't report this: in dry-run release-plz
   # always emits releases_created=false, it only logs the plan.)
   release-prep:
-    needs: build-and-test
+    # A skipped `needs` job skips its dependents, so flake-check must stay
+    # unconditional: give it a `paths:` filter or an `if:` and releases silently
+    # stop happening.
+    needs: [build-and-test, flake-check]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency: { group: "release-plz-${{ github.ref }}", cancel-in-progress: false }
@@ -134,7 +161,8 @@ jobs:
         run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
 
       # One rendered nix derivation feeds both the repo flake (canonical,
-      # github:tenequm/pond?dir=ops/nix) and the pond-nix legacy mirror.
+      # github:tenequm/pond - the root flake.nix callPackages this file) and
+      # the pond-nix legacy mirror.
       - name: Render nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
         env: { V: "${{ steps.ver.outputs.v }}" }
