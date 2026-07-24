@@ -44,12 +44,33 @@ jobs:
       # heavy ones on its target-dir lock; format/changelog are instant).
       - run: moon run repo:check-changelog pond:check-package pond:format pond:lint pond:test
 
+  # Guards the install path users actually run: `nix profile add
+  # github:tenequm/pond#pond`. Hosted, not pond-ci: those runner pods are
+  # unprivileged with a root-owned /nix (the image ships nix-bin only for
+  # `nix-hash`), so a nix build there would need the sandbox off - weaker
+  # conditions than the users this check exists to protect. Runs beside
+  # build-and-test, so a broken flake fails in ~2 min either way.
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency: { group: "ci-flake-${{ github.ref }}", cancel-in-progress: true }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      # --all-systems: the darwin and aarch64 outputs are never evaluated on an
+      # x86_64 runner otherwise. --no-update-lock-file: a stale flake.lock fails
+      # here instead of being silently re-resolved in memory.
+      - run: nix flake check --all-systems --no-update-lock-file
+      # A real build, not just eval: proves the rendered sha256/URLs still fetch
+      # and that autoPatchelfHook produces a runnable binary.
+      - run: nix run .#pond -- --version
+
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
   # whose tag already exists". (dry-run can't report this: in dry-run release-plz
   # always emits releases_created=false, it only logs the plan.)
   release-prep:
-    needs: build-and-test
+    needs: [build-and-test, flake-check]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency: { group: "release-plz-${{ github.ref }}", cancel-in-progress: false }
