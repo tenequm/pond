@@ -1,0 +1,26 @@
+/* Global styles. Vocs loads this file automatically (src/pages/_root.css). */
+
+/* Phone: docs code blocks inherit the 16px body size, so shell snippets run
+   hundreds of pixels past the viewport and read as truncated. Shrink the type
+   via the vocs token (--vocs-text-code-block), then wrap instead of scrolling:
+   a horizontally-scrolled block gives no affordance on touch, so the tail of
+   every long command looked simply cut off. */
+@media (max-width: 520px) {
+  :root {
+    --vocs-text-code-block: 0.8125rem;
+    --vocs-leading-code: 1.6;
+  }
+
+  article pre,
+  article pre code,
+  article pre code .line {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* Long inline identifiers (POND_CREDS_DEFAULT_SECRET_ACCESS_KEY) are a single
+     unbreakable token, so they push their paragraph past the viewport. */
+  article :not(pre) > code {
+    overflow-wrap: anywhere;
+  }
+}

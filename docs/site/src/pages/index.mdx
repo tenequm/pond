@@ -14,16 +14,37 @@ import { HomePage } from 'vocs'
       padding-top: 1.5rem;
       padding-bottom: 1rem;
     }
+    /* fit-content sizes the block to its longest line; without the cap a
+       <pre> (white-space: pre, so min-content == longest line) grows past
+       the viewport and margin-inline:auto splits the overflow evenly, so
+       the ancestor article's overflow-x:hidden clips BOTH edges and the
+       text is unreachable. Cap it and let the block scroll instead. */
     .pond-home pre {
       text-align: left;
       width: fit-content;
+      max-width: 100%;
       margin-inline: auto;
       padding-right: 3.5rem;
+      overflow-x: auto;
     }
     .pond-home video {
       max-height: clamp(260px, calc(100vh - 545px), 68vh);
       width: auto;
       max-width: min(960px, 100%);
+    }
+    /* Phone: wrap rather than scroll (see _root.css - a scrolled block reads as
+       truncated on touch), and reclaim most of the copy-button gutter. Sizing
+       comes from --vocs-text-code-block, set globally in _root.css. */
+    @media (max-width: 520px) {
+      .pond-home pre,
+      .pond-home pre code,
+      .pond-home pre code .line {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .pond-home pre {
+        padding-right: 2.25rem;
+      }
     }
   `}</style>
 
