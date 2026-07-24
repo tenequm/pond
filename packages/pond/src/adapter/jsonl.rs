@@ -115,12 +115,15 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
         None
     }
 
-    /// A file the adapter knows carries no session data (a runner control file
-    /// whose content duplicates real transcripts). Excluded from the walk
-    /// entirely: never counted as a source, never read, never pending. Only for
-    /// files whose non-session nature is structural and certain - anything the
-    /// adapter merely can't decode must stay IN the walk so it surfaces as a
-    /// visible skip instead of vanishing. Default: no such category.
+    /// A path the adapter knows carries no session data. Receives both files
+    /// (a runner control file whose content duplicates real transcripts) and
+    /// directories (a subtree another reader owns, e.g. nanoclaw's
+    /// `opencode-xdg/` stores) - returning `true` for a directory prunes the
+    /// whole subtree from the walk. Excluded paths are never counted as a
+    /// source, never read, never pending. Only for paths whose non-session
+    /// nature is structural and certain - anything the adapter merely can't
+    /// decode must stay IN the walk so it surfaces as a visible skip instead
+    /// of vanishing. Default: no such category.
     fn skip_source(&self, _path: &Path) -> bool {
         false
     }

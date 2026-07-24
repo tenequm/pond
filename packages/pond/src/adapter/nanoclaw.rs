@@ -834,7 +834,9 @@ mod tests {
     //! Conformance tests for the nanoclaw adapter: fixture-driven claude-JSONL
     //! mapping, queue-operation rule-3 carriers, subagent sidecar sessions, the
     //! read-only metadata join (synthetic DBs from the real DDL), graceful DB
-    //! degradation, rotated-file ingestion, and native restore.
+    //! degradation, rotated-file ingestion, native restore, and nanoclaw's own
+    //! wiring of the shared claude-JSONL seams (opencode-xdg pruning, the
+    //! unrecognized-subagents refusal, the watermark walk-back).
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
@@ -1261,5 +1263,167 @@ mod tests {
             source.path(),
         )
         .await
+    }
+
+    /// A decoy claude-style `.jsonl` planted under `opencode-xdg/` must never
+    /// ingest through the plain JSONL walk: `skip_source` prunes the whole
+    /// subtree, and that store is reachable only via the composed opencode
+    /// reader. Pre-guard, the decoy row is a fully valid transcript (it would
+    /// ingest as its own session), so this pins the pruning predicate rather
+    /// than relying on real stores happening to hold no `.jsonl`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_xdg_subtree_is_pruned_from_the_plain_walk() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let group = "grp-P";
+        let real_uuid = "55555555-5555-5555-5555-555555555555";
+        write_transcript(root.path(), group, real_uuid);
+
+        let decoy_uuid = "66666666-6666-6666-6666-666666666666";
+        let decoy_dir = root
+            .path()
+            .join("data")
+            .join("v2-sessions")
+            .join(group)
+            .join("sess-1777000000000-decoy")
+            .join("opencode-xdg")
+            .join("storage")
+            .join("session");
+        std::fs::create_dir_all(&decoy_dir)?;
+        let decoy_row = json!({
+            "type": "user",
+            "uuid": "u-decoy",
+            "sessionId": decoy_uuid,
+            "cwd": "/workspace/agent",
+            "timestamp": "2026-04-27T19:40:00.000Z",
+            "message": {"role": "user", "content": "must never ingest via the walk"},
+        });
+        std::fs::write(decoy_dir.join("decoy.jsonl"), format!("{decoy_row}\n"))?;
+
+        let adapter = NanoclawAdapter::new(root.path());
+        assert_eq!(
+            adapter.discover().await?,
+            1,
+            "discovery must see only the real transcript - opencode-xdg is pruned",
+        );
+
+        let (store, _guard) = ingest(root.path()).await?;
+        assert!(
+            store.get_session(real_uuid).await?.is_some(),
+            "the real transcript still ingests"
+        );
+        assert!(
+            store.get_session(decoy_uuid).await?.is_none(),
+            "nothing under opencode-xdg/ may ingest through the plain walk",
+        );
+        Ok(())
+    }
+
+    /// nanoclaw's wiring of the shared unrecognized-`subagents/`-leaf refusal
+    /// (`unsupported_reason` + the `session_from_rows` guard): a `.jsonl` under
+    /// `subagents/` whose leaf is not `agent-<hash>.jsonl` must surface as a
+    /// visible, counted skip and must NOT merge into the parent via its
+    /// borrowed content `sessionId`. Mirrors claude_code's
+    /// `unrecognized_subagents_file_fails_visibly_not_merged` through nanoclaw's
+    /// own hooks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrecognized_subagents_leaf_skips_visibly_not_merged() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let group = "grp-U";
+        let parent_uuid = "77777777-7777-7777-7777-777777777777";
+        let parent_path = write_transcript(root.path(), group, parent_uuid);
+
+        // Same parent sessionId AND same cwd: pre-guard this would have merged
+        // silently into the parent. The leaf name is not `agent-<hash>.jsonl`.
+        let unknown_dir = parent_path
+            .parent()
+            .expect("transcript has a project dir")
+            .join(parent_uuid)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_future01-aaa");
+        std::fs::create_dir_all(&unknown_dir)?;
+        let unknown_row = json!({
+            "type": "user",
+            "uuid": "u-should-not-merge",
+            "sessionId": parent_uuid,
+            "cwd": "/workspace/agent",
+            "timestamp": "2026-04-27T19:45:00.000Z",
+            "message": {"role": "user", "content": "must not land under parent"},
+        });
+        std::fs::write(
+            unknown_dir.join("transcript-001.jsonl"),
+            format!("{unknown_row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = NanoclawAdapter::new(root.path());
+        let summary =
+            ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        assert_eq!(
+            summary.skipped_files, 1,
+            "the unrecognized subagents/ transcript must be a visible, counted skip",
+        );
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests");
+        assert_eq!(
+            parent.messages.len(),
+            2,
+            "parent keeps only its own two rows - nothing merged in",
+        );
+        assert!(
+            parent
+                .messages
+                .iter()
+                .all(|m| m.message.id() != "u-should-not-merge"),
+            "parent must not absorb the unrecognized file's message",
+        );
+        Ok(())
+    }
+
+    /// nanoclaw's `peek_watermark` wiring of the shared walk-back: trailing
+    /// untimestamped metadata rows after the conversation must not hide the
+    /// last real message's timestamp. Exercised on a rotated transcript so the
+    /// walk-back and the non-`.jsonl` acceptance are pinned together through
+    /// nanoclaw's own hooks.
+    #[test]
+    fn peek_watermark_walks_back_past_trailing_rows_on_rotated_files() {
+        let root = TempDir::new().unwrap();
+        let dir = root
+            .path()
+            .join("data")
+            .join("v2-sessions")
+            .join("grp-W")
+            .join(".claude-shared")
+            .join("projects")
+            .join("-workspace-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let uuid = "88888888-8888-8888-8888-888888888888";
+        let message = json!({
+            "type": "user",
+            "uuid": "u-wm",
+            "sessionId": uuid,
+            "cwd": "/workspace/agent",
+            "timestamp": "2026-04-27T19:50:00.000Z",
+            "message": {"role": "user", "content": "hello"},
+        });
+        // Metadata rows Claude Code writes after the conversation - no timestamp.
+        let last_prompt = json!({"type": "last-prompt", "sessionId": uuid, "prompt": "hi"});
+        let permission = json!({"type": "permission-mode", "sessionId": uuid});
+        let path = dir.join(format!("{uuid}.jsonl.rotated-1777000000000"));
+        std::fs::write(&path, format!("{message}\n{last_prompt}\n{permission}\n")).unwrap();
+
+        let adapter = NanoclawAdapter::new(root.path());
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-04-27T19:50:00.000Z")
+            .unwrap()
+            .timestamp_micros();
+        assert_eq!(
+            adapter.peek_watermark(&path),
+            SourceWatermark::At(expected),
+            "walk back past trailing metadata to the last message's timestamp",
+        );
     }
 }
