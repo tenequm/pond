@@ -1358,8 +1358,7 @@ mod tests {
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let adapter = NanoclawAdapter::new(root.path());
-        let summary =
-            ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         assert_eq!(
             summary.skipped_files, 1,
