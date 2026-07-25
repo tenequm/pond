@@ -44,7 +44,16 @@ export default defineConfig({
     // (including in-page #anchors) resolves against production instead of the
     // host actually serving the page.
     base: false,
-    script: [{ src: '/mesh/script.js', defer: true, 'data-site-id': '878f707ff553' }],
+    script: [
+      { src: '/mesh/script.js', defer: true, 'data-site-id': '878f707ff553' },
+      // Ask AI is hidden via _root.css (vocs has no global off switch), but the
+      // component stays mounted and its Cmd+I listener would still open the
+      // dialog - swallow the shortcut in capture phase before it gets there.
+      {
+        innerHTML:
+          "window.addEventListener('keydown',function(e){if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='i')e.stopImmediatePropagation()},true)",
+      },
+    ],
   },
   changelog: Changelog.github({ repo: 'tenequm/pond' }),
   // 'detect' compiles .md as plain CommonMark (no JSX/`{expr}` parsing), so the
