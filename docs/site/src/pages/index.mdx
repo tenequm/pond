@@ -14,16 +14,37 @@ import { HomePage } from 'vocs'
       padding-top: 1.5rem;
       padding-bottom: 1rem;
     }
+    /* fit-content sizes the block to its longest line; without the cap a
+       <pre> (white-space: pre, so min-content == longest line) grows past
+       the viewport and margin-inline:auto splits the overflow evenly, so
+       the ancestor article's overflow-x:hidden clips BOTH edges and the
+       text is unreachable. Cap it and let the block scroll instead. */
     .pond-home pre {
       text-align: left;
       width: fit-content;
+      max-width: 100%;
       margin-inline: auto;
       padding-right: 3.5rem;
+      overflow-x: auto;
+    }
+    /* The pre sits in an anonymous wrapper that, as a centered flex child,
+       sizes to its content - so the pre's max-width:100% resolves against the
+       oversized wrapper and the block clips instead of scrolling. Cap the
+       wrapper at the container so the cap above actually binds. */
+    .pond-home :has(> pre) {
+      max-width: 100%;
     }
     .pond-home video {
       max-height: clamp(260px, calc(100vh - 545px), 68vh);
       width: auto;
       max-width: min(960px, 100%);
+    }
+    /* Phone: reclaim most of the copy-button gutter. Sizing comes from
+       --vocs-text-code-block, set globally in _root.css. */
+    @media (max-width: 520px) {
+      .pond-home pre {
+        padding-right: 2.25rem;
+      }
     }
   `}</style>
 
@@ -32,13 +53,11 @@ import { HomePage } from 'vocs'
 
 ```sh
 brew install tenequm/tap/pond
-pond init   # guided setup: storage, adapters, MCP
+pond init   # guided setup
 pond sync   # ingest, embed, index
 ```
 
-  <p style={{ fontSize: '0.875rem', opacity: 0.55, margin: 0 }}>
-    Works with Claude Code · Codex CLI · OpenCode · Claude Desktop · Claude.ai · Pi
-  </p>
+  <p style={{ fontSize: '0.875rem', opacity: 0.55, margin: 0 }}>Works with Claude Code · Codex CLI · OpenCode · Claude Desktop · Claude.ai · Pi</p>
 
   <HomePage.Buttons>
     <HomePage.Button href="/get-started/quickstart" variant="accent">Get started</HomePage.Button>
@@ -47,9 +66,6 @@ pond sync   # ingest, embed, index
   </HomePage.Buttons>
 
   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.6rem', marginTop: '0.5rem' }}>
-    <p style={{ fontStyle: 'italic', fontSize: '0.9375rem', opacity: 0.65, margin: 0 }}>
-      "check in pond how we solved this before, then apply the same fix here"
-    </p>
     <video
       src="/demo-search.mp4"
       autoPlay
@@ -60,7 +76,5 @@ pond sync   # ingest, embed, index
     />
   </div>
 
-  <p style={{ fontSize: '0.875rem', opacity: 0.55, margin: 0 }}>
-    Questions or feedback? Start a <a href="https://github.com/tenequm/pond/discussions">GitHub Discussion</a>, or DM me on <a href="https://t.me/tenequm">Telegram</a> or <a href="https://x.com/opwizardx">X</a> - I answer personally.
-  </p>
+  <p style={{ fontSize: '0.875rem', opacity: 0.55, margin: 0 }}>Questions or feedback? Start a <a href="https://github.com/tenequm/pond/discussions">GitHub Discussion</a>, or DM me on <a href="https://t.me/tenequm">Telegram</a> or <a href="https://x.com/opwizardx">X</a> - I answer personally.</p>
 </HomePage.Root>

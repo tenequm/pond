@@ -12,7 +12,7 @@
   "dependencies": {
     "react": "^19",
     "react-dom": "^19",
-    "vocs": "2.5.2",
+    "vocs": "2.6.2",
     "waku": "1.0.0-beta.1"
   },
   "devDependencies": {

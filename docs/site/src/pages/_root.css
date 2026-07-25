@@ -1,0 +1,106 @@
+/* Global styles. Vocs loads this file automatically (src/pages/_root.css). */
+
+/* Phone: docs code blocks inherit the 16px body size; shrink the type via the
+   vocs token so commands need less horizontal scrolling. Code blocks stay
+   one-line-per-command and scroll (the Claude Code docs convention) - wrapped
+   shell commands read worse than a scrollable tail. */
+@media (max-width: 520px) {
+  :root {
+    --vocs-text-code-block: 0.8125rem;
+    --vocs-leading-code: 1.6;
+  }
+
+  /* The copy button is pinned visible on touch (see below); give line ends
+     clearance so text is not hidden under the icon at scroll end. */
+  article pre {
+    padding-right: 2.5rem;
+  }
+
+  /* Long inline identifiers (POND_CREDS_DEFAULT_SECRET_ACCESS_KEY) are a single
+     unbreakable token, so they push their paragraph past the viewport. */
+  article :not(pre) > code {
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Atomic line-breaking for inline code: browsers may break after a hyphen (no
+   CSS property disables it), which splits flags like `-y` across lines. As an
+   inline-block the span moves to the next line whole; a token wider than the
+   line still wraps inside its own box via the overflow-wrap rules above. */
+article :not(pre) > code {
+  display: inline-block;
+  max-width: 100%;
+}
+
+/* Prose has no scrollable ancestor, so one unbreakable token pushes the rest
+   of the line out of reach rather than merely scrolling it - the changelog's
+   bare "Full Changelog: https://..." URLs, and identifiers written as plain
+   text (pond_get_session/pond_get_message). Links need `anywhere` because a
+   URL has no break opportunity a normal wrap would take. */
+article :is(p, li, td) {
+  overflow-wrap: break-word;
+}
+
+article :is(p, li, td) a {
+  overflow-wrap: anywhere;
+}
+
+/* vocs makes the pre the scroll container with the copy button absolutely
+   positioned inside it, so scrolling long code carries the button away.
+   Scroll the code element instead; the button stays pinned to the frame. */
+article pre[data-v] {
+  overflow-x: hidden;
+}
+
+article pre[data-v] > code {
+  overflow-x: auto;
+}
+
+/* vocs reveals both code-block copy buttons on :hover only, which never fires
+   on touch - so on a phone the copy affordance is invisible and snippets are
+   uncopyable. Pin them visible wherever hover isn't available. */
+@media (hover: none) {
+  pre[data-v] > button,
+  pre[data-v] [data-v-shell-copy] {
+    opacity: 1;
+  }
+}
+
+/* No Ask AI on this site. vocs only exposes a per-page frontmatter flag
+   (showAskAi), and setting it false also removes the copy-page button
+   (CopyForAi returns null on the same flag) - so hide the floating bar
+   here instead. */
+[data-v-ask-ai-container] {
+  display: none;
+}
+
+/* Relabel vocs' "Copy page for AI" to the conventional "Copy page". */
+[data-v-copy-for-ai] span {
+  font-size: 0;
+}
+
+[data-v-copy-for-ai] span::before {
+  content: 'Copy page';
+  font-size: 13px;
+}
+
+/* vocs drops the copy-page button into the article footer below 1376px and
+   into the outline rail above it - docs convention is a plate at the top
+   right of the content at every width. Reserve a strip above the title, pin
+   the footer instance there (display: block defeats vocs' min-[1376px]:hidden
+   on the wrapper), and hide the outline duplicate. */
+article[data-v-content]:has([data-v-copy-for-ai]) {
+  padding-top: calc(var(--vocs-spacing-content-py) + 2.75rem);
+}
+
+[data-v-content-footer] div:has(> [data-v-copy-for-ai]) {
+  display: block;
+  position: absolute;
+  top: var(--vocs-spacing-content-py);
+  right: var(--vocs-spacing-content-px);
+  margin: 0;
+}
+
+[data-v-outline] > [data-v-copy-for-ai] {
+  display: none;
+}
