@@ -94,6 +94,12 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 - **Prefer ASCII.** Default to plain ASCII in Markdown and other repo docs - it keeps diffs clean, greps simple, and rendering predictable across terminals.
 
+## Docs site (docs/site)
+
+- vocs app; all site-wide CSS overrides live in `docs/site/src/pages/_root.css` (vocs auto-loads it). Each rule's comment states its WHY - read them before touching. Deliberate choices, do not "fix": code blocks scroll horizontally, one line per command, never wrap (the Claude Code docs convention; wrapped shell commands read badly); the `code` element is the scroll container so the copy button stays pinned (vocs scrolls the `pre`, which carries its absolutely-positioned button away); Ask AI is hidden via CSS plus a Cmd+I swallow in `vocs.config.ts` head (vocs' only off switch is per-page `showAskAi`, which also removes the copy-page button); "Copy page" is a single plate pinned top-right of the content at every width (footer instance repositioned, outline duplicate hidden); inline code is `display: inline-block` so flags like `-y` never split after the hyphen (no CSS property disables hyphen break opportunities - tested; `hyphens`/`word-break`/`overflow-wrap` all fail).
+- Working on the site: check the reference first (code.claude.com/docs, i.e. Mintlify) with computed-style probes before inventing styling. Verify with Playwright at 320/390/430/1024/1440, emulating `hover: none` for touch, and test interaction states - scroll every code block and assert pinned controls, check each interactive element is visible and in its expected place per width (components move between breakpoint variants; that is how desktop lost the copy button once). Static geometry audits alone miss what a user feels.
+- Verify against `pnpm build` + a static server over `dist/public` - `vocs dev` crashes on a vite 8.0.16 HMR bug (null `url.replace` when a client reports an error). Clipboard APIs need a secure context: test copy flows over HTTPS (`tailscale serve`) or localhost, never over LAN-IP HTTP.
+
 ## Process
 
 - Don't write migration notes or compatibility shims; pond is pre-release and breaking changes are free.
