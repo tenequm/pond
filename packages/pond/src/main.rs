@@ -123,8 +123,8 @@ impl From<CliSessionFrom> for SessionFrom {
 }
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_indicatif::{IndicatifLayer, filter::IndicatifFilter};
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
@@ -1626,6 +1626,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn opt_in_indicatif_layer<S>(
+    layer: IndicatifLayer<S>,
+) -> tracing_subscriber::filter::Filtered<IndicatifLayer<S>, IndicatifFilter<S>, S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    layer.with_filter(IndicatifFilter::new(false))
+}
+
 fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
     // Lance's IVF_SQ builder warns once per empty centroid during merge
     // (rust/lance/src/index/vector/builder.rs: "partition N is empty, skipping").
@@ -1649,14 +1658,12 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
             "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error,lance::io::exec::count_pushdown=error"
         ))
     });
-    // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)
-    // and the fmt log writer through a shared draw target, so log lines
-    // never clobber an active progress bar. Today no pond span requests a
-    // bar, so the layer is essentially a "safe stderr writer for fmt that
-    // coexists with future bar-rendering spans"; the migration cost when we
-    // do start instrumenting spans (e.g. ingest, optimize) is zero.
+    // Keep progress bars opt-in. Without the filter, `-vv` turns every Lance
+    // and DataFusion span into a bar, and tracing-indicatif can panic when its
+    // pending footer is hidden by a non-terminal stderr target.
     let indicatif_layer = IndicatifLayer::new();
     let fmt_layer = fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
+    let indicatif_layer = opt_in_indicatif_layer(indicatif_layer);
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
@@ -5946,6 +5953,22 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn indicatif_layer_ignores_more_than_seven_unmarked_spans() {
+        fn enter_unmarked_spans(depth: usize) {
+            if depth == 0 {
+                return;
+            }
+            let span = tracing::info_span!("unmarked_test_span", depth);
+            let _guard = span.enter();
+            enter_unmarked_spans(depth - 1);
+        }
+
+        let subscriber =
+            tracing_subscriber::registry().with(opt_in_indicatif_layer(IndicatifLayer::new()));
+        tracing::subscriber::with_default(subscriber, || enter_unmarked_spans(8));
+    }
 
     #[test]
     fn serve_bootstrap_acts_only_on_a_fully_unconfigured_pond() -> anyhow::Result<()> {
