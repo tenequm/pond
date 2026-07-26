@@ -5231,15 +5231,6 @@ mod tests {
         // Remainder reaches largest / COMPACTION_ABSORB_FACTOR -> kept.
         let tiered = [stat(400_000), stat(60_000), stat(40_000)];
         assert!(task_is_kept(&tiered, derived_target_rows(&tiered)));
-
-        let off_boundary = [
-            fragment(99_900_000, 100_000, 0),
-            fragment(100_100_000, 100_000, 0),
-        ];
-        assert!(task_is_kept(
-            &off_boundary,
-            derived_target_rows(&off_boundary),
-        ));
     }
 
     #[test]
@@ -5279,7 +5270,24 @@ mod tests {
     fn compaction_veto_uses_physical_rows_after_deletions() {
         let partially_deleted = || fragment(100_000_000, 100_000, 9_000);
         let task: Vec<FragmentStat> = std::iter::repeat_with(partially_deleted).take(3).collect();
-        assert!(task_is_kept(&task, 134_217));
+        assert!(task_is_kept(&task, derived_target_rows(&task)));
+    }
+
+    #[test]
+    fn compaction_filter_keeps_above_budget_off_boundary_task() {
+        let table = [
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 50_000, 0),
+        ];
+        let task = &table[..3];
+        let target = derived_target_rows(&table);
+        let total_bytes = task.iter().map(|stat| stat.bytes.unwrap()).sum::<u64>();
+
+        assert!(total_bytes > TARGET_FRAGMENT_BYTES);
+        assert!(target < derived_target_rows(task));
+        assert!(task_is_kept(task, target));
     }
 
     #[test]
