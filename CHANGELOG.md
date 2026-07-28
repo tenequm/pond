@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.3](https://github.com/tenequm/pond/compare/v0.14.2...v0.14.3) - 2026-07-28
+
+### <!-- 2 -->🐛 Bug Fixes
+- **substrate:** prevent byte-capped compaction loops ([a115798](https://github.com/tenequm/pond/commit/a11579808e2b530d02a43e8142b8934e94c3bbc5))
+
+### <!-- 5 -->📚 Documentation
+- **maintenance:** align compaction cap comments with shrinkability gate ([8ae77e8](https://github.com/tenequm/pond/commit/8ae77e8e764d2fc4c21b722a07c31a99cdeaea8c))
+
+### <!-- 6 -->🧹 Chores
+- **nix:** add a canonical flake at the repo root ([#126](https://github.com/tenequm/pond/pull/126)) ([3fefa03](https://github.com/tenequm/pond/commit/3fefa03b994c329eac1f1b23bd1717b7c55f0ad6))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.2...v0.14.3
+
 ## [0.14.2](https://github.com/tenequm/pond/compare/v0.14.1...v0.14.2) - 2026-07-24
 
 ### <!-- 1 -->🎉 New Features
