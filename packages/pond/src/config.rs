@@ -237,9 +237,9 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # `pond sync` and `pond optimize`.
 #
 # - `compaction_fragment_cap` is the per-task fragment-count backstop: a
-#   planned compaction task touching at least this many fragments always runs
-#   even when the write-amplification veto would skip it. Default 64; 0
-#   disables the veto and runs every task Lance plans.
+#   planned compaction task touching at least this many fragments bypasses the
+#   write-amplification veto once its row target is attainable. Default 64; 0
+#   disables task filtering and runs every task Lance plans.
 # - `cleanup_older_than` is the manifest-retention window for the safe cleanup
 #   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
 #   what protects in-flight readers). Versions older than this are reclaimed
@@ -418,10 +418,8 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
-    /// Sub-target fragment count past which the compaction phase runs (it also
-    /// runs once those fragments hold a whole target fragment's worth of rows).
-    /// Default 64 stops the automated sync re-compacting the trailing fragment
-    /// every pass; 0 compacts every pass.
+    /// Per-task fragment-count backstop for the write-amplification veto.
+    /// Default 64; 0 disables all task filtering.
     #[serde(default)]
     pub compaction_fragment_cap: Option<usize>,
     /// Manifest-retention window for the safe cleanup pass. Accepts

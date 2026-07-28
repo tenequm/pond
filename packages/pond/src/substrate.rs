@@ -833,9 +833,9 @@ fn classify_check_error(
     }
 }
 
-/// Per-task fragment-count backstop: tasks this wide always run, bounding
-/// manifest growth even when the amplification veto would skip them. As
-/// policy cap, 0 disables the veto (tests).
+/// Per-task fragment-count backstop: tasks this wide bypass the amplification
+/// veto once their row target is attainable, bounding manifest growth. As
+/// policy cap, 0 disables all task filtering (tests).
 pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
 
 /// Fragments are sized by bytes, not Lance's 1M-row default: kilobyte-average
@@ -843,7 +843,6 @@ pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
 /// re-rewrites wholesale to absorb tiny appends (~190 GiB/day of churn).
 pub const TARGET_FRAGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
-const MIN_TARGET_ROWS_PER_FRAGMENT: u64 = 50_000;
 /// Ceiling = Lance's own default.
 const MAX_TARGET_ROWS_PER_FRAGMENT: u64 = 1024 * 1024;
 
@@ -1003,16 +1002,16 @@ fn fragment_stat(fragment: &lance::table::format::Fragment) -> FragmentStat {
     }
 }
 
-/// Candidacy/merge target: HALF the rows a [`TARGET_FRAGMENT_BYTES`] fragment
-/// holds at the table's average row size. Compaction byte-caps every output
-/// fragment at [`TARGET_FRAGMENT_BYTES`] (`max_bytes_per_file`), so deriving the
-/// target at the FULL byte budget made `target == the largest fragment
-/// compaction can produce`: no output could ever satisfy `physical_rows >=
-/// target`, so the table was re-compacted every sync for a net-zero fragment
-/// change (measured ~100-120s/sync on the remote store, 30->30 fragments).
+/// Candidacy/merge target: HALF the rows the [`TARGET_FRAGMENT_BYTES`] output
+/// budget holds at the table's average row size. Deriving the target at the
+/// FULL byte budget made `target == the largest fragment re-encoding could
+/// reliably produce`: no output could ever satisfy `physical_rows >= target`,
+/// so the table was re-compacted every sync for a net-zero fragment change
+/// (measured ~100-120s/sync on the remote store, 30->30 fragments).
 /// Halving leaves 2x headroom so a byte-capped fragment lands comfortably above
 /// the target and FREEZES, making compaction productive (merge small -> freeze
-/// -> stop) instead of perpetual churn.
+/// -> stop) instead of perpetual churn. A row floor would make the target
+/// unreachable again for sufficiently wide rows.
 fn derived_target_rows(stats: &[FragmentStat]) -> usize {
     let (mut bytes, mut rows) = (0u64, 0u64);
     for stat in stats {
@@ -1026,32 +1025,61 @@ fn derived_target_rows(stats: &[FragmentStat]) -> usize {
     if bytes == 0 || rows == 0 {
         return MAX_TARGET_ROWS_PER_FRAGMENT as usize;
     }
-    let avg_row_bytes = (bytes / rows).max(1);
-    (TARGET_FRAGMENT_BYTES / 2 / avg_row_bytes)
-        .clamp(MIN_TARGET_ROWS_PER_FRAGMENT, MAX_TARGET_ROWS_PER_FRAGMENT) as usize
+    ((u128::from(TARGET_FRAGMENT_BYTES / 2) * u128::from(rows) / u128::from(bytes))
+        .clamp(1, u128::from(MAX_TARGET_ROWS_PER_FRAGMENT))) as usize
 }
 
-/// Amplification veto: skip tasks that mostly rewrite one big fragment to
-/// absorb fresh appends. Deletion-materialization tasks always pass (vetoing
-/// them would leave tombstones unreclaimed forever); compared in bytes when
-/// every file size is known, rows otherwise.
-fn keep_task(stats: &[FragmentStat], cap: usize, deletion_threshold: f32) -> bool {
+/// Name the first reason an optional compaction task cannot make progress.
+/// Deletion materialization always passes because removing tombstones is useful.
+fn task_veto_reason(
+    stats: &[FragmentStat],
+    cap: usize,
+    deletion_threshold: f32,
+    target_rows_per_fragment: usize,
+    max_bytes_per_file: u64,
+) -> Option<&'static str> {
     if stats.iter().any(|stat| {
         stat.rows > 0 && (stat.deleted_rows as f32 / stat.rows as f32) > deletion_threshold
     }) {
-        return true;
+        return None;
+    }
+
+    let budget = u128::from(max_bytes_per_file);
+    if budget == 0 {
+        return Some("invalid_byte_budget");
+    }
+
+    let (mut total_bytes, mut largest) = (0u128, 0u128);
+    for stat in stats {
+        let Some(bytes) = stat.bytes.map(u128::from) else {
+            return Some("missing_sizes");
+        };
+        total_bytes += bytes;
+        largest = largest.max(bytes);
+    }
+
+    let minimum_outputs = total_bytes.div_ceil(budget).max(1);
+    if u128::try_from(stats.len()).unwrap_or(u128::MAX) <= minimum_outputs {
+        return Some("cannot_shrink");
     }
     if stats.len() >= cap {
-        return true;
+        return None;
     }
-    let weights: Vec<u64> = if stats.iter().all(|stat| stat.bytes.is_some()) {
-        stats.iter().filter_map(|stat| stat.bytes).collect()
-    } else {
-        stats.iter().map(|stat| stat.rows).collect()
-    };
-    let total: u64 = weights.iter().sum();
-    let largest = weights.iter().copied().max().unwrap_or(0);
-    (total - largest) * COMPACTION_ABSORB_FACTOR >= largest
+
+    if total_bytes > budget {
+        for stat in stats {
+            let bytes = u128::from(stat.bytes.unwrap_or(0));
+            let rows = u128::from(stat.rows);
+            if rows == 0 || bytes * target_rows_per_fragment as u128 * 2 > rows * budget {
+                return Some("row_target_unattainable");
+            }
+        }
+    }
+
+    if (total_bytes - largest) * u128::from(COMPACTION_ABSORB_FACTOR) < largest {
+        return Some("absorb_veto");
+    }
+    None
 }
 
 /// Declarative description of one index pond keeps on a table. Created when
@@ -2976,22 +3004,29 @@ async fn optimize_table_compact(
 
     let mut plan = plan_compaction(dataset, &compaction).await?;
     if policy.compaction_fragment_cap > 0 {
+        let max_bytes_per_file = compaction
+            .max_bytes_per_file
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or_default();
         plan.tasks.retain(|task| {
             let task_stats: Vec<FragmentStat> = task.fragments.iter().map(fragment_stat).collect();
-            let keep = keep_task(
+            let reason = task_veto_reason(
                 &task_stats,
                 policy.compaction_fragment_cap,
                 compaction.materialize_deletions_threshold,
+                compaction.target_rows_per_fragment,
+                max_bytes_per_file,
             );
-            if !keep {
+            if let Some(reason) = reason {
                 tracing::debug!(
                     target: "pond::perf",
                     table = table.as_str(),
                     fragments = task_stats.len(),
-                    "compaction task vetoed: merge dominated by one large fragment",
+                    reason,
+                    "compaction task vetoed",
                 );
             }
-            keep
+            reason.is_none()
         });
     }
     if plan.tasks.is_empty() {
@@ -5162,49 +5197,150 @@ mod tests {
         storage_check(&resolved).await.expect("memory probe passes");
     }
 
-    fn stat(bytes: u64) -> FragmentStat {
+    fn fragment(bytes: u64, rows: u64, deleted_rows: u64) -> FragmentStat {
         FragmentStat {
             bytes: Some(bytes),
-            rows: bytes / 1_000,
-            deleted_rows: 0,
+            rows,
+            deleted_rows,
         }
+    }
+
+    fn stat(bytes: u64) -> FragmentStat {
+        fragment(bytes, bytes / 1_000, 0)
+    }
+
+    fn task_is_kept(stats: &[FragmentStat], target_rows_per_fragment: usize) -> bool {
+        task_veto_reason(
+            stats,
+            64,
+            0.1,
+            target_rows_per_fragment,
+            TARGET_FRAGMENT_BYTES,
+        )
+        .is_none()
     }
 
     #[test]
     fn compaction_veto_blocks_absorb_keeps_peers() {
-        // One 665 MiB tail fragment + tiny appends -> vetoed.
-        let absorb = [stat(665_000_000), stat(1_000_000), stat(2_000_000)];
-        assert!(!keep_task(&absorb, 64, 0.1));
-        // Peer-sized merge halves fragment count -> kept.
-        let peers = [stat(300_000_000), stat(300_000_000)];
-        assert!(keep_task(&peers, 64, 0.1));
+        // One large candidate plus tiny appends -> vetoed.
+        let absorb = [stat(100_000_000), stat(1_000_000), stat(2_000_000)];
+        assert!(!task_is_kept(&absorb, derived_target_rows(&absorb)));
+        // Peer-sized candidates can merge and reach the target.
+        let peers = [stat(100_000_000), stat(100_000_000)];
+        assert!(task_is_kept(&peers, derived_target_rows(&peers)));
         // Remainder reaches largest / COMPACTION_ABSORB_FACTOR -> kept.
         let tiered = [stat(400_000), stat(60_000), stat(40_000)];
-        assert!(keep_task(&tiered, 64, 0.1));
+        assert!(task_is_kept(&tiered, derived_target_rows(&tiered)));
     }
 
     #[test]
     fn compaction_veto_passes_deletions_and_cap() {
         let mut deleting = stat(665_000_000);
         deleting.deleted_rows = deleting.rows / 5;
-        assert!(keep_task(&[deleting, stat(1_000)], 64, 0.1));
+        let deleting_task = [deleting, stat(1_000)];
+        assert!(task_is_kept(
+            &deleting_task,
+            derived_target_rows(&deleting_task),
+        ));
 
-        let wide: Vec<FragmentStat> = std::iter::once(stat(665_000_000))
-            .chain(std::iter::repeat_with(|| stat(1_000)).take(63))
+        let wide: Vec<FragmentStat> = std::iter::once(stat(100_000_000))
+            .chain(std::iter::repeat_with(|| stat(100_000)).take(63))
             .collect();
-        assert!(keep_task(&wide, 64, 0.1));
+        assert!(task_is_kept(&wide, derived_target_rows(&wide)));
     }
 
     #[test]
-    fn compaction_veto_falls_back_to_rows_on_unknown_sizes() {
+    fn compaction_veto_fails_closed_on_unknown_sizes() {
         let mut unknown = stat(665_000_000);
         unknown.bytes = None;
-        // Rows comparison: 665k vs 3k -> still vetoed.
-        assert!(!keep_task(
-            &[unknown, stat(1_000_000), stat(2_000_000)],
-            64,
-            0.1
-        ));
+        let task = [unknown, stat(665_000_000)];
+        assert_eq!(
+            task_veto_reason(
+                &task,
+                64,
+                0.1,
+                derived_target_rows(&task),
+                TARGET_FRAGMENT_BYTES
+            ),
+            Some("missing_sizes"),
+        );
+    }
+
+    #[test]
+    fn compaction_veto_uses_physical_rows_after_deletions() {
+        let partially_deleted = || fragment(100_000_000, 100_000, 9_000);
+        let task: Vec<FragmentStat> = std::iter::repeat_with(partially_deleted).take(3).collect();
+        assert!(task_is_kept(&task, derived_target_rows(&task)));
+    }
+
+    #[test]
+    fn compaction_filter_keeps_above_budget_off_boundary_task() {
+        let table = [
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 150_000, 0),
+            fragment(100_000_000, 50_000, 0),
+        ];
+        let task = &table[..3];
+        let target = derived_target_rows(&table);
+        let total_bytes = task.iter().map(|stat| stat.bytes.unwrap()).sum::<u64>();
+
+        assert!(total_bytes > TARGET_FRAGMENT_BYTES);
+        assert!(target < derived_target_rows(task));
+        assert!(task_is_kept(task, target));
+    }
+
+    #[test]
+    fn compaction_filter_keeps_real_mixed_width_tasks_below_budget() {
+        let four_fragment_task = [
+            fragment(26_612_870, 9_281, 0),
+            fragment(14_242_314, 4_400, 0),
+            fragment(54_111_122, 20_988, 0),
+            fragment(517_923, 166, 0),
+        ];
+        assert!(task_is_kept(&four_fragment_task, 58_468));
+
+        let nine_fragment_task = [
+            fragment(13_547_709, 3_946, 0),
+            fragment(344_320, 155, 0),
+            fragment(134_209, 34, 0),
+            fragment(54_624_719, 15_759, 0),
+            fragment(1_364_162, 292, 0),
+            fragment(110_225_801, 32_826, 0),
+            fragment(8_151_118, 1_840, 0),
+            fragment(728_590, 79, 0),
+            fragment(685_184, 128, 0),
+        ];
+        assert!(task_is_kept(&nine_fragment_task, 58_468));
+    }
+
+    #[test]
+    fn compaction_veto_rejects_byte_capped_second_cycle() {
+        // A 5 -> 4 rewrite still loops when all four outputs stay below target.
+        let wide_peer = || fragment(200_000_000, 2_000, 0);
+        let first_cycle: Vec<FragmentStat> = std::iter::repeat_with(wide_peer).take(5).collect();
+        let expected_outputs_by_bytes = 1_000_000_000u64.div_ceil(TARGET_FRAGMENT_BYTES) as usize;
+        assert_eq!(expected_outputs_by_bytes, 4);
+        assert!(expected_outputs_by_bytes < first_cycle.len());
+        let cap_sized_task: Vec<FragmentStat> =
+            std::iter::repeat_with(wide_peer).take(64).collect();
+
+        let second_cycle = [
+            fragment(TARGET_FRAGMENT_BYTES, 2_684, 0),
+            fragment(TARGET_FRAGMENT_BYTES, 2_684, 0),
+            fragment(TARGET_FRAGMENT_BYTES, 2_684, 0),
+            fragment(194_693_632, 1_948, 0),
+        ];
+
+        assert_eq!(
+            task_veto_reason(&first_cycle, 64, 0.1, 66_000, TARGET_FRAGMENT_BYTES),
+            Some("row_target_unattainable"),
+        );
+        assert!(task_is_kept(&cap_sized_task, 66_000));
+        assert_eq!(
+            task_veto_reason(&second_cycle, 64, 0.1, 66_000, TARGET_FRAGMENT_BYTES),
+            Some("cannot_shrink"),
+        );
     }
 
     #[test]
@@ -5312,7 +5448,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_target_rows_tracks_row_size_and_clamps() {
+    fn derived_target_rows_tracks_row_size_and_byte_cap() {
         // ~1.3 KiB rows -> ~100k-row target (half the byte budget, for freeze
         // headroom over the 256 MiB output cap).
         let parts_like = [FragmentStat {
@@ -5332,7 +5468,7 @@ mod tests {
             derived_target_rows(&unknown),
             MAX_TARGET_ROWS_PER_FRAGMENT as usize
         );
-        // Tiny rows clamp at the ceiling, huge rows at the floor.
+        // Tiny rows clamp at the ceiling.
         let tiny = [FragmentStat {
             bytes: Some(1_000_000),
             rows: 100_000,
@@ -5342,15 +5478,26 @@ mod tests {
             derived_target_rows(&tiny),
             MAX_TARGET_ROWS_PER_FRAGMENT as usize
         );
-        let huge = [FragmentStat {
-            bytes: Some(1_000_000_000),
-            rows: 100,
+
+        let incident_parts = [FragmentStat {
+            bytes: Some(1_027_449_798),
+            rows: 105_087,
             deleted_rows: 0,
         }];
-        assert_eq!(
-            derived_target_rows(&huge),
-            MIN_TARGET_ROWS_PER_FRAGMENT as usize
+        let incident_target = derived_target_rows(&incident_parts);
+        assert_eq!(incident_target, 13_727);
+        assert!(
+            u128::from(incident_parts[0].bytes.unwrap()) * incident_target as u128 * 2
+                <= u128::from(incident_parts[0].rows) * u128::from(TARGET_FRAGMENT_BYTES)
         );
+
+        // A row larger than the half-cap still needs a usable target.
+        let huge = [FragmentStat {
+            bytes: Some(1_000_000_000),
+            rows: 1,
+            deleted_rows: 0,
+        }];
+        assert_eq!(derived_target_rows(&huge), 1);
     }
 
     #[test]

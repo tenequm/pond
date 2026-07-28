@@ -185,6 +185,10 @@ An unenforced primary key on the primary-key columns, so merge-insert defaults t
 
 All of a consumer's datasets share one Lance cache and one object-store client. Why: one pool, rather than one per table, avoids multiplying connections and credential refreshes on object-store backends.
 
+#### `lance-compaction-filter`
+
+Automatic compaction runs only Lance-planned tasks that pass pond's filter. Tasks above the deletion-materialization threshold always run - reclaiming tombstones is useful even when layout does not improve. Any other task must strictly reduce the fragment count, and when its total bytes exceed one output file's byte budget, every input fragment's observed row width must let an output reach the row target within half that budget (headroom because re-encoding can widen rows relative to the input estimate). Missing file sizes fail closed and skip the optional rewrite. Why: Lance selects candidates by row count while the re-encoding writer splits output by bytes, so a task whose rows are too wide for the target emits outputs that are immediately re-selected - an unbounded rewrite loop (measured: a ~1 GB table rewrote ~30 GB across 31 syncs with zero net progress). A task whose whole volume fits one output cannot strand sub-target outputs, so the width test applies only beyond that point.
+
 ### 3.5 Concurrency
 
 pond processes are stateless workers. Several may write the same namespace at once; Lance optimistic concurrency control resolves append conflicts through manifest versioning. There is no external coordinator - object stores provide atomic conditional writes, the local filesystem uses Lance's commit lock - and no in-process write queue.
