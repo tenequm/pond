@@ -2,14 +2,16 @@
 
 ## [0.14.3](https://github.com/tenequm/pond/compare/v0.14.2...v0.14.3) - 2026-07-28
 
+Automatic compaction now provably converges: a task filter built on a shrinkability guarantee replaces the fixed row floor that could rewrite wide-row tables forever.
+
 ### <!-- 2 -->🐛 Bug Fixes
-- **substrate:** prevent byte-capped compaction loops ([a115798](https://github.com/tenequm/pond/commit/a11579808e2b530d02a43e8142b8934e94c3bbc5))
+- **substrate:** prevent byte-capped compaction loops ([a115798](https://github.com/tenequm/pond/commit/a11579808e2b530d02a43e8142b8934e94c3bbc5)) - pond's first community contribution, reported and fixed by @alexnayko ([#123](https://github.com/tenequm/pond/issues/123), [#124](https://github.com/tenequm/pond/pull/124)). The fixed 50,000-row candidacy floor made the row target unreachable for tables averaging over ~2.7 KB/row, so every sync re-rewrote the same live fragments: on the reporting store, a 1.03 GB table accumulated 32 GB physical across 31 full rewrites with zero net progress. The floor is gone, and the compaction filter now requires every planned rewrite to strictly shrink the fragment count, applying the per-fragment width check only when the byte cap can actually split the output - so ordinary small-fragment merges keep running while unwinnable rewrites are skipped. Every veto names its reason in the perf trace (`missing_sizes`, `cannot_shrink`, `row_target_unattainable`, `absorb_veto`, `invalid_byte_budget`), and the contract is now a named spec rule, `lance-compaction-filter` (section 3.4). Verified to reach a fixpoint: the reporter's live canary went 14 -> 6 fragments in one pass and the second pass changed zero files.
 
 ### <!-- 5 -->📚 Documentation
 - **maintenance:** align compaction cap comments with shrinkability gate ([8ae77e8](https://github.com/tenequm/pond/commit/8ae77e8e764d2fc4c21b722a07c31a99cdeaea8c))
 
 ### <!-- 6 -->🧹 Chores
-- **nix:** add a canonical flake at the repo root ([#126](https://github.com/tenequm/pond/pull/126)) ([3fefa03](https://github.com/tenequm/pond/commit/3fefa03b994c329eac1f1b23bd1717b7c55f0ad6))
+- **nix:** add a canonical flake at the repo root ([#126](https://github.com/tenequm/pond/pull/126)) ([3fefa03](https://github.com/tenequm/pond/commit/3fefa03b994c329eac1f1b23bd1717b7c55f0ad6)) - the install line is now `nix profile add github:tenequm/pond#pond`, no quoting and no `?dir=ops/nix` leaking the repo layout into the command.
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.2...v0.14.3
 
