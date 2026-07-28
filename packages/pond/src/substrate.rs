@@ -833,9 +833,9 @@ fn classify_check_error(
     }
 }
 
-/// Per-task fragment-count backstop: tasks this wide bypass the amplification
-/// veto once their row target is attainable, bounding manifest growth. As
-/// policy cap, 0 disables all task filtering (tests).
+/// Per-task fragment-count backstop: tasks this wide bypass the width and
+/// amplification checks once the merge can shrink the fragment count, bounding
+/// manifest growth. As policy cap, 0 disables all task filtering (tests).
 pub const DEFAULT_COMPACTION_FRAGMENT_CAP: usize = 64;
 
 /// Fragments are sized by bytes, not Lance's 1M-row default: kilobyte-average

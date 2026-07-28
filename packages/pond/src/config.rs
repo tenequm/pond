@@ -238,8 +238,9 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # - `compaction_fragment_cap` is the per-task fragment-count backstop: a
 #   planned compaction task touching at least this many fragments bypasses the
-#   write-amplification veto once its row target is attainable. Default 64; 0
-#   disables task filtering and runs every task Lance plans.
+#   width and write-amplification checks once the merge can shrink the
+#   fragment count. Default 64; 0 disables task filtering and runs every task
+#   Lance plans.
 # - `cleanup_older_than` is the manifest-retention window for the safe cleanup
 #   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
 #   what protects in-flight readers). Versions older than this are reclaimed
