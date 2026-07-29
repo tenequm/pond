@@ -1648,9 +1648,10 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
             "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error,lance::io::exec::count_pushdown=error"
         ))
     });
+    // stdout is reserved for JSON-RPC frames and machine-readable command output.
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .init();
 }
 
