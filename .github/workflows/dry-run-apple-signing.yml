@@ -1,0 +1,91 @@
+name: Dry run - Apple signing
+
+# TEMPORARY - delete this file before merging.
+#
+# dist-build and macos-verify in ci.yml only run on a release push, so a PR
+# never exercises them. This mirrors both against the PR head so the signing
+# path, the artifact handoff, and the macOS checks are proven before merge.
+# Same-repo PRs can read secrets, so this is a real signed + notarized run.
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  dry-dist:
+    runs-on: pond-ci
+    timeout-minutes: 90
+    outputs:
+      signed: ${{ steps.identity.outputs.signed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
+      - uses: ./.github/actions/bootstrap
+      - id: identity
+        run: echo "signed=${{ secrets.APPLE_P12_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build + package binaries
+        run: moon run repo:build-dist
+        env:
+          KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          KACHE_S3_REGION: nbg1
+          KACHE_S3_BUCKET: ttq
+          KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+          KACHE_S3_PREFIX: kache/pond
+          KACHE_CACHE_DIR: /ci-cache/kache
+          KACHE_MAX_SIZE: 20GiB
+          APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-darwin
+          path: dist/pond-aarch64-apple-darwin.tar.xz
+          if-no-files-found: error
+          retention-days: 1
+
+  dry-verify:
+    needs: [dry-dist]
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: dist-darwin }
+
+      - name: Launch the cross-compiled binary
+        run: |
+          set -euo pipefail
+          tar -xJf pond-aarch64-apple-darwin.tar.xz
+          ./pond --version
+          ./pond --help > /dev/null
+          ./pond completions zsh | grep -q '_pond'
+
+      - name: Verify code signature
+        if: needs.dry-dist.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 ./pond
+          codesign -dvvv ./pond 2>&1 | tee sig.txt
+          grep -q 'Authority=Developer ID Application' sig.txt
+          grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
+
+      - name: Notarize with Apple
+        if: needs.dry-dist.outputs.signed == 'true'
+        env:
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          ditto -c -k ./pond notarize.zip
+          creds="$(mktemp -d)"
+          printf '%s' "$APPLE_ASC_KEY_P8" | base64 --decode > "$creds/key.p8"
+          xcrun notarytool submit notarize.zip \
+            --key "$creds/key.p8" \
+            --key-id "$APPLE_ASC_KEY_ID" \
+            --issuer "$APPLE_ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json | tee result.json
+          rm -rf "$creds"
+          test "$(jq -r .status result.json)" = "Accepted"

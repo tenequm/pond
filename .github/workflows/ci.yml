@@ -36,7 +36,7 @@ jobs:
     steps:
       # Full history: moon's vcs layer resolves vcs.defaultBranch, which a
       # shallow PR checkout doesn't have (git exit 128).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: ./.github/actions/bootstrap
@@ -64,7 +64,7 @@ jobs:
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
       # Without --all-systems the darwin and aarch64 outputs go unevaluated on
       # an x86_64 runner and the job passes anyway.
@@ -91,13 +91,13 @@ jobs:
     outputs:
       is_release: ${{ steps.detect.outputs.is_release }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       # SHA-pinned, so the toolchain must be an explicit input (the action
       # otherwise derives it from the ref name).
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: stable }
-      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+      - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         with: { command: release-pr, config: .github/release-plz.toml }   # keep the release PR current; never publishes
         env:
           # PAT (not GITHUB_TOKEN) so the opened release PR triggers build-and-test.
@@ -113,29 +113,31 @@ jobs:
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # Build, then publish everywhere. release-plz publishes crates.io + cuts the
-  # tag/release HERE (after the build), so crates.io can't ship without binaries.
-  publish-release:
+  # Build + Developer ID sign. Split from publish-release so notarization and
+  # the macOS checks can gate the publish without re-running the 4-target build.
+  dist-build:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
-    # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
-    # the /ci-cache PVC (release-plz runs `cargo publish` here).
+    # ARC runner pod: zig/zigbuild/SDK/rcodesign come from the pond-runner
+    # image, incremental cache on /ci-cache - no docker, no buildkit.
     runs-on: pond-ci
     # A fully cold 4-target dist build measured 56m; warm runs are minutes.
     timeout-minutes: 90
-    permissions:
-      contents: write   # `gh release upload` to this repo via the workflow token
-    # Never cancel a release mid-publish: a newer push queues behind this run
-    # instead of killing it between release-plz tagging and the four publishes.
-    concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
+    concurrency: { group: "pond-dist-${{ github.ref }}", cancel-in-progress: false }
+    outputs:
+      v: ${{ steps.ver.outputs.v }}
+      signed: ${{ steps.identity.outputs.signed }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       - uses: ./.github/actions/bootstrap
 
-      # Machine cross-compile right on the runner (zig/zigbuild/SDK/rcodesign
-      # from the pond-runner image, incremental cache on /ci-cache) - no
-      # docker, no buildkit, no kubeconfig.
+      # Reports only whether the cert exists, never its value: the signature
+      # and notarize steps skip cleanly until the Apple secrets are populated,
+      # so this lands safely before the credentials do.
+      - id: identity
+        run: echo "signed=${{ secrets.APPLE_P12_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
+
       - name: Build + package binaries
         run: moon run repo:build-dist
         env:
@@ -149,11 +151,117 @@ jobs:
           # deltas; cap it well below the 100Gi shared PVC.
           KACHE_CACHE_DIR: /ci-cache/kache
           KACHE_MAX_SIZE: 20GiB
+          APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
 
       - id: ver
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
-      
-      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+
+      # Two artifacts, not one: the macOS jobs only need the 38MB darwin
+      # tarball, while publish needs all four plus checksums.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-darwin
+          path: dist/pond-aarch64-apple-darwin.tar.xz
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-all
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Notarization does NOT alter the artifact: a bare Mach-O has nowhere to hold
+  # a ticket, so Apple serves it online and every sha256 computed from the
+  # signed binary in dist-build stays valid.
+  #
+  # One macOS job does launch smoke, signature assertions, and notarization:
+  # macos-15 ships `xcrun notarytool`, so the Mac notarizes itself rather than
+  # bouncing the artifact through a second Linux job.
+  macos-verify:
+    needs: [dist-build]
+    runs-on: macos-15
+    timeout-minutes: 45
+    # Same rule as flake-check: this job runs a binary built elsewhere.
+    env: { BAZEL_REMOTE_AUTH: "" }
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: dist-darwin }
+
+      # The cross-compiled Mach-O is never built or run on macOS before this.
+      # `completions` is what the Homebrew formula shells out to at install
+      # time, so a binary that cannot run here breaks `brew install`, not just
+      # `pond`.
+      - name: Launch the cross-compiled binary
+        run: |
+          set -euo pipefail
+          tar -xJf pond-aarch64-apple-darwin.tar.xz
+          ./pond --version
+          ./pond --help > /dev/null
+          ./pond completions zsh | grep -q '_pond'
+
+      - name: Verify code signature
+        if: needs.dist-build.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 ./pond
+          # Gatekeeper cannot be asked directly: `spctl --assess --type exec`
+          # rejects ANY bare CLI binary ("does not seem to be an app"), even a
+          # correctly notarized one. Assert the two properties notarization
+          # actually requires instead.
+          codesign -dvvv ./pond 2>&1 | tee sig.txt
+          grep -q 'Authority=Developer ID Application' sig.txt
+          grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
+
+      - name: Notarize with Apple
+        if: needs.dist-build.outputs.signed == 'true'
+        env:
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          # The notary accepts .zip/.dmg/.pkg only - this zip is a submission
+          # envelope, never a released asset. A bare Mach-O cannot be stapled,
+          # so Apple serves the ticket online and the artifact is unchanged.
+          ditto -c -k ./pond notarize.zip
+          creds="$(mktemp -d)"
+          printf '%s' "$APPLE_ASC_KEY_P8" | base64 --decode > "$creds/key.p8"
+          # `notarytool submit --wait` exits 0 even when the notary returns
+          # Invalid, so the JSON status is the gate, not the exit code.
+          xcrun notarytool submit notarize.zip \
+            --key "$creds/key.p8" \
+            --key-id "$APPLE_ASC_KEY_ID" \
+            --issuer "$APPLE_ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json | tee result.json
+          rm -rf "$creds"
+          test "$(jq -r .status result.json)" = "Accepted"
+
+  # Publish everywhere. release-plz publishes crates.io + cuts the tag/release
+  # HERE (after build AND macos-verify), so crates.io can't ship without
+  # binaries, and no channel can ship a binary macOS refuses to run.
+  publish-release:
+    needs: [dist-build, macos-verify]
+    # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
+    # the /ci-cache PVC (release-plz runs `cargo publish` here).
+    runs-on: pond-ci
+    timeout-minutes: 30
+    permissions:
+      contents: write   # `gh release upload` to this repo via the workflow token
+    # Never cancel a release mid-publish: a newer push queues behind this run
+    # instead of killing it between release-plz tagging and the four publishes.
+    concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
+    env:
+      V: ${{ needs.dist-build.outputs.v }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: ./.github/actions/bootstrap
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: dist-all, path: dist }
+
+      - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
         env:
@@ -165,7 +273,7 @@ jobs:
       # mirror all fetch from it - so it must be complete before anything else.
       - name: Mirror binaries to pond release
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
 
       # One rendered nix derivation feeds both the repo flake (canonical,
@@ -173,7 +281,6 @@ jobs:
       # the pond-nix legacy mirror.
       - name: Render nix package
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { V: "${{ steps.ver.outputs.v }}" }
         run: |
           set -euo pipefail
           sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
@@ -242,7 +349,7 @@ jobs:
       # main is always current. [skip ci] keeps the push from triggering CI.
       - name: Point the repo flake at the new binaries
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
         run: |
           set -euo pipefail
           cp "$RUNNER_TEMP/pond.nix" ops/nix/pond.nix
@@ -254,7 +361,7 @@ jobs:
 
       - name: Publish Homebrew formula
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
         run: |
           set -euo pipefail
           base="https://github.com/tenequm/pond/releases/download/v$V"
@@ -278,15 +385,11 @@ jobs:
             end
 
             on_macos do
+              # Apple Silicon only: there is no x86_64-apple-darwin build, so
+              # depends_on refuses Intel before any download is attempted.
               depends_on arch: :arm64
-              on_arm do
-                url "$base/pond-aarch64-apple-darwin.tar.xz"
-                sha256 "$(sha aarch64-apple-darwin)"
-              end
-              on_intel do
-                url "$base/pond-aarch64-apple-darwin.tar.xz"
-                sha256 "$(sha aarch64-apple-darwin)"
-              end
+              url "$base/pond-aarch64-apple-darwin.tar.xz"
+              sha256 "$(sha aarch64-apple-darwin)"
             end
 
             on_linux do
@@ -320,7 +423,7 @@ jobs:
       # so pond-nix no longer gets releases of its own.
       - name: Update pond-nix legacy mirror
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}", V: "${{ steps.ver.outputs.v }}" }
+        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
         run: |
           set -euo pipefail
           nix="$RUNNER_TEMP/pond-nix"
