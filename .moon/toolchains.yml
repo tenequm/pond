@@ -18,12 +18,9 @@ node:
 
 npm:
   version: '11.19.0'
-
-# `unstable_` is the plugin's own maturity label, not a warning about these
-# pins - both are exercised by hermes-pond:test on every CI run.
-unstable_python:
-  version: '3.13.14'
-  packageManager: 'uv'
-
-unstable_uv:
-  version: '0.11.33'
+# No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv
+# plugin does not: it writes the version metadata and then fails to locate a
+# binary it never unpacked (proto::locate::missing_executable), on the CI runner
+# and once locally. uv is pinned in the CI bootstrap instead, and hermes-pond
+# runs on the system toolchain. Worth revisiting when those plugins leave
+# `unstable_` - the intent is for this file to own that too.

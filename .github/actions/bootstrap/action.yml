@@ -16,14 +16,15 @@ runs:
         MOON_VERSION=2.4.6
         PROTOC_VERSION=35.1
         KACHE_VERSION=0.9.0
+        UV_VERSION=0.11.33
 
         mkdir -p /ci-cache/bin /ci-cache/tmp
         echo "/ci-cache/bin" >> "$GITHUB_PATH"
         echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
-        # node, npm, python and uv are NOT installed here - moon provisions them
-        # through proto from .moon/toolchains.yml on first use. These only put
-        # proto's tool tree and the two package caches on the PVC, so the pods
-        # that follow reuse them instead of re-downloading a toolchain per job.
+        # node and npm are NOT installed here - moon provisions them through
+        # proto from .moon/toolchains.yml on first use. These only put proto's
+        # tool tree and the two package caches on the PVC, so the pods that
+        # follow reuse them instead of re-downloading a toolchain per job.
         {
           echo "CARGO_HOME=/ci-cache/cargo"
           echo "RUSTUP_HOME=/ci-cache/rustup"
@@ -47,10 +48,15 @@ runs:
         # truncated binary behind for the next job to execute.
         install_tool() {
           name=$1 url=$2 want=$3
+          # Strip the archive's leading directory only when `want` names one, so
+          # a nested layout (moon, uv) and a flat one (kache) both land at
+          # $tmp/<file> regardless of compression.
+          strip=0
+          case $want in */*) strip=1 ;; esac
           tmp=$(mktemp -d /ci-cache/tmp/"$name".XXXXXX)
           case $url in
-            *.tar.xz) curl -fsSL "$url" | tar -xJ -C "$tmp" --strip-components=1 "$want" ;;
-            *.tar.gz) curl -fsSL "$url" | tar -xz -C "$tmp" "$want" ;;
+            *.tar.xz) curl -fsSL "$url" | tar -xJ -C "$tmp" --strip-components=$strip "$want" ;;
+            *.tar.gz) curl -fsSL "$url" | tar -xz -C "$tmp" --strip-components=$strip "$want" ;;
           esac
           mv -f "$tmp/$(basename "$want")" /ci-cache/bin/"$name"
           rm -rf "$tmp"
@@ -67,6 +73,20 @@ runs:
             "https://github.com/kunobi-ninja/kache/releases/download/v$KACHE_VERSION/kache-x86_64-unknown-linux-musl.tar.gz" \
             kache
         fi
+
+        # uv is here rather than in .moon/toolchains.yml because proto's uv
+        # plugin does not install reliably: it writes the version metadata, then
+        # `locate_executables` fails on a binary that was never unpacked
+        # (proto::locate::missing_executable). Reproduced on this runner and
+        # once locally. node and npm come from moon and are fine; only uv is
+        # pinned by hand. `uv --version` prints a build suffix, so match on the
+        # prefix. uv downloads its own managed Python, so none is installed here.
+        case "$(/ci-cache/bin/uv --version 2>/dev/null)" in
+          "uv $UV_VERSION"*) ;;
+          *) install_tool uv \
+               "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz" \
+               uv-x86_64-unknown-linux-gnu/uv ;;
+        esac
 
         if [ "$(/ci-cache/bin/protoc --version 2>/dev/null)" != "libprotoc $PROTOC_VERSION" ]; then
           tmp=$(mktemp -d /ci-cache/tmp/protoc.XXXXXX)
