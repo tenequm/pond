@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.14.4](https://github.com/tenequm/pond/compare/v0.14.3...v0.14.4) - 2026-07-30
+
+### <!-- 2 -->🐛 Bug Fixes
+- **cli:** gate log color on a tty, and cover the stdout contract ([e617b3f](https://github.com/tenequm/pond/commit/e617b3f3fce57c2b90e702fe8d90c1999680fd38))
+- **cli:** remove unused tracing progress layer ([#129](https://github.com/tenequm/pond/pull/129)) ([74f2659](https://github.com/tenequm/pond/commit/74f2659bde3c3bed00a09c0374abf99c30491bc1))
+
+### <!-- 6 -->🧹 Chores
+- **ci:** prune stale lock entries and close moon cache-input gaps ([058c3c9](https://github.com/tenequm/pond/commit/058c3c98001be23a7c0d54981329538642e933fd))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.3...v0.14.4
+
 ## [0.14.3](https://github.com/tenequm/pond/compare/v0.14.2...v0.14.3) - 2026-07-28
 
 Automatic compaction now provably converges: a task filter built on a shrinkability guarantee replaces the fixed row floor that could rewrite wide-row tables forever.
