@@ -72,7 +72,22 @@ tasks:
       # reject its duplicate libobjc load command; rewrite the recorded sdk to
       # 15.0 and ad-hoc re-sign (the byte-patch invalidates the signature).
       python3 ops/scripts/patch-macos-sdk.py target/dist/pond-aarch64-apple-darwin
-      rcodesign --config-file /dev/null sign target/dist/pond-aarch64-apple-darwin
+      # Developer ID + hardened runtime when the cert is present (release CI),
+      # ad-hoc otherwise so local and fork builds still get a loadable arm64
+      # binary. Gatekeeper denies unnotarized Developer ID outright, so the
+      # cert path is only ever taken by CI, which pairs it with notarization.
+      if [ -n "${APPLE_P12_BASE64:-}" ]; then
+        creds="$(mktemp -d)"
+        printf '%s' "$APPLE_P12_BASE64" | base64 -d > "$creds/id.p12"
+        printf '%s' "${APPLE_P12_PASSWORD:-}" > "$creds/id.pass"
+        rcodesign --config-file /dev/null sign \
+          --p12-file "$creds/id.p12" --p12-password-file "$creds/id.pass" \
+          --code-signature-flags runtime \
+          target/dist/pond-aarch64-apple-darwin
+        rm -rf "$creds"
+      else
+        rcodesign --config-file /dev/null sign target/dist/pond-aarch64-apple-darwin
+      fi
       cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu
       cp "$TD/x86_64-unknown-linux-gnu/dist/pond" target/dist/pond-x86_64-unknown-linux-gnu
       cp "$TD/x86_64-pc-windows-gnu/dist/pond.exe" target/dist/pond-x86_64-pc-windows-gnu.exe
