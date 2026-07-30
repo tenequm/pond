@@ -6,10 +6,17 @@ env:
 # Repo-level project: tasks that operate on the whole tree from the repo root
 # (changelog gate, the multi-target dist build that writes dist/ + target/ at
 # root). The crate itself is the `pond` project under packages/pond.
+#
+# Same completeness rule as the crate's own group: SKILL.md is embedded into the
+# binary via include_str!, and this root manifest carries every [profile.*], so
+# both must invalidate the dist build - a cached dist/ would otherwise ship the
+# previous skill text or the previous dist profile.
 fileGroups:
   sources:
     - 'packages/pond/src/**/*'
+    - 'packages/pond/SKILL.md'
     - 'packages/pond/Cargo.toml'
+    - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
   tests:

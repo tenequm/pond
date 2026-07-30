@@ -8,7 +8,12 @@ set -euo pipefail
 # `cargo package --list` paths line up regardless of the caller's cwd.
 cd "$(git rev-parse --show-toplevel)/packages/pond"
 
-packaged=$(cargo package --list --allow-dirty)
+# --locked: this resolves the graph, so without it cargo silently rewrites a
+# stale Cargo.lock as a side effect. That repair used to run first under moon's
+# fan-out and hand the later `--locked` gates a lockfile the commit never
+# contained, turning a stale lockfile into a green build that goes red the
+# moment this task cache-hits instead.
+packaged=$(cargo package --list --locked --allow-dirty)
 
 bad=0
 while IFS= read -r hit; do

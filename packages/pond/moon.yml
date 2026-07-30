@@ -4,12 +4,19 @@ env:
   CARGO_TERM_COLOR: always
 
 # Cargo commands run from this project root (packages/pond); the workspace
-# lockfile and toolchain pin stay at the repo root, referenced workspace-relative
-# with a leading '/'.
+# lockfile, workspace manifest, and toolchain pin stay at the repo root,
+# referenced workspace-relative with a leading '/'.
+#
+# Every file that changes the compiled output belongs here, or moon serves a
+# cached result for a tree that would build differently: SKILL.md is embedded
+# via include_str!, and the root manifest carries every [profile.*] (cargo
+# honors profiles only at the workspace root).
 fileGroups:
   sources:
     - 'src/**/*'
+    - 'SKILL.md'
     - 'Cargo.toml'
+    - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'
   tests:
@@ -30,6 +37,11 @@ tasks:
   # code embeds via include_str!/include_bytes! (a full verify build is skipped
   # at publish time - publish_no_verify in .github/release-plz.toml). The script
   # cd's to this crate root itself, so it is cwd-independent.
+  #
+  # Takes the full sources group, not just src/ + SKILL.md: `cargo package
+  # --list` resolves the graph, so it reads the manifests and the lockfile too.
+  # Understating that let a stale Cargo.lock cache-hit this task while lint and
+  # test - which do take the lockfile as input - failed on it.
   check-package:
     command: 'bash ../../ops/scripts/check-package-contents.sh'
-    inputs: ['src/**/*', 'SKILL.md', '/ops/scripts/check-package-contents.sh']
+    inputs: ['@group(sources)', '/ops/scripts/check-package-contents.sh']
