@@ -104,9 +104,19 @@ tasks:
       rm -rf completions
       ( cd dist && sha256sum pond-* > checksums.txt )
       ls -lh dist/
+    # No @group(tests): tests and benches are not linked into the shipped
+    # binary, so a test-only change cannot alter dist/ and should not pay a
+    # four-target cross-compile.
+    #
+    # Caveat worth knowing before narrowing these further: the script bakes
+    # `git rev-parse HEAD` into the binary via POND_BUILD_COMMIT, and no
+    # content hash can represent HEAD. What keeps a cache hit from shipping a
+    # stale commit string is that this task only runs on a release, and a
+    # release commit always bumps the version in packages/pond/Cargo.toml,
+    # which IS an input. Re-running the same release commit is the case the
+    # cache is for, and there HEAD is unchanged.
     inputs:
       - '@group(sources)'
-      - '@group(tests)'
       - 'ops/scripts/patch-macos-sdk.py'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'

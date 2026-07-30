@@ -2,12 +2,32 @@ language: typescript
 
 # Minimal wrappers over the package's own npm scripts (tsc + vitest). Uses the
 # system node toolchain; all paths inside the package are already package-relative.
+#
+# package-lock.json is an input to both: it pins the installed tree, so a
+# dependency bump changes what tsc and vitest actually run against. Without it
+# a lockfile-only commit serves a cached pass for a tree that was never
+# checked.
 tasks:
   typecheck:
     command: 'npm run typecheck'
     toolchains: ['system']
-    inputs: ['src/**/*', 'test/**/*', 'index.ts', 'tsconfig.json', 'tsconfig.build.json', 'package.json']
+    inputs:
+      - 'src/**/*'
+      - 'test/**/*'
+      - 'index.ts'
+      - 'tsconfig.json'
+      - 'tsconfig.build.json'
+      - 'package.json'
+      - 'package-lock.json'
   test:
     command: 'npm test'
     toolchains: ['system']
-    inputs: ['src/**/*', 'test/**/*', 'index.ts', 'vitest.config.ts', 'tsconfig.json', 'package.json']
+    inputs:
+      - 'src/**/*'
+      - 'test/**/*'
+      - 'index.ts'
+      - 'vitest.config.ts'
+      - 'tsconfig.json'
+      - 'tsconfig.build.json'
+      - 'package.json'
+      - 'package-lock.json'

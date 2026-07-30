@@ -1649,9 +1649,20 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
         ))
     });
     // stdout is reserved for JSON-RPC frames and machine-readable command output.
+    //
+    // `with_ansi` has to be set explicitly: the fmt layer's default keys color
+    // off `NO_COLOR` alone and never checks whether the writer is a terminal,
+    // so `pond -vv 2>log` otherwise fills the file with SGR escapes. This
+    // mirrors what the user-facing CLI surface already does in
+    // `pond::output::use_color`, but against stderr, because that is where
+    // these lines go.
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()),
+        )
         .init();
 }
 

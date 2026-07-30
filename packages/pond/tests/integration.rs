@@ -12,6 +12,8 @@
 
 #[path = "integration/adapter/mod.rs"]
 mod adapter;
+#[path = "integration/cli_stdout_contract.rs"]
+mod cli_stdout_contract;
 #[path = "integration/copy.rs"]
 mod copy;
 #[path = "integration/embed.rs"]
