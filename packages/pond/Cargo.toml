@@ -156,7 +156,6 @@ tokio-stream = "0.1.18"
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1.44"
-tracing-indicatif = "0.3.14"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.23", features = ["v7"] }

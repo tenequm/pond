@@ -123,7 +123,6 @@ impl From<CliSessionFrom> for SessionFrom {
 }
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -1649,18 +1648,10 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
             "{cli_level},lance::index::vector::builder=error,aws_config=error,lance::object_store::throttle=error,lance::io::exec::count_pushdown=error"
         ))
     });
-    // `IndicatifLayer` routes both spans (when they opt-in via `pb_set_*`)
-    // and the fmt log writer through a shared draw target, so log lines
-    // never clobber an active progress bar. Today no pond span requests a
-    // bar, so the layer is essentially a "safe stderr writer for fmt that
-    // coexists with future bar-rendering spans"; the migration cost when we
-    // do start instrumenting spans (e.g. ingest, optimize) is zero.
-    let indicatif_layer = IndicatifLayer::new();
-    let fmt_layer = fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
+    // stdout is reserved for JSON-RPC frames and machine-readable command output.
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt_layer)
-        .with(indicatif_layer)
+        .with(fmt::layer().with_writer(std::io::stderr))
         .init();
 }
 
