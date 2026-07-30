@@ -41,8 +41,16 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/bootstrap
       # One moon session: independent tasks interleave (cargo serializes the
-      # heavy ones on its target-dir lock; format/changelog are instant).
-      - run: moon run repo:check-changelog pond:check-package pond:format pond:lint pond:test
+      # heavy ones on its target-dir lock; format/changelog are instant). The
+      # plugin suites run here too - they cost seconds next to the Rust build,
+      # and moon provisions their node/uv itself, so they need nothing from the
+      # bootstrap.
+      - run: >
+          moon run
+          repo:check-changelog
+          pond:check-package pond:format pond:lint pond:test
+          openclaw-pond:typecheck openclaw-pond:test
+          hermes-pond:test
 
   # Hosted, never pond-ci: those runner pods are unprivileged with a root-owned
   # /nix (the image ships nix-bin only for `nix-hash`), so nix there would need

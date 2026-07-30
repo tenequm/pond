@@ -13,19 +13,27 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        MOON_VERSION=2.3.5
+        MOON_VERSION=2.4.6
         PROTOC_VERSION=35.1
         KACHE_VERSION=0.9.0
 
         mkdir -p /ci-cache/bin /ci-cache/tmp
         echo "/ci-cache/bin" >> "$GITHUB_PATH"
         echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
+        # node, npm, python and uv are NOT installed here - moon provisions them
+        # through proto from .moon/toolchains.yml on first use. These only put
+        # proto's tool tree and the two package caches on the PVC, so the pods
+        # that follow reuse them instead of re-downloading a toolchain per job.
         {
           echo "CARGO_HOME=/ci-cache/cargo"
           echo "RUSTUP_HOME=/ci-cache/rustup"
           echo "CARGO_TARGET_DIR=/ci-cache/target"
+          echo "PROTO_HOME=/ci-cache/proto"
+          echo "npm_config_cache=/ci-cache/npm"
+          echo "UV_CACHE_DIR=/ci-cache/uv"
         } >> "$GITHUB_ENV"
         export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
+        export PROTO_HOME=/ci-cache/proto
         export PATH="/ci-cache/bin:/ci-cache/cargo/bin:$PATH"
 
         # /ci-cache is one RWO PVC shared by every runner pod on the node, so two

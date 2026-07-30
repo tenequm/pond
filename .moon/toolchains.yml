@@ -1,0 +1,29 @@
+# Toolchains moon provisions itself, through proto, on first use of a task that
+# needs them. This is what lets the plugin suites run on a bare CI runner
+# without the bootstrap hand-installing node or uv: the runner only supplies
+# moon, and moon supplies the rest.
+#
+# The Rust toolchain is deliberately absent. rust-toolchain.toml pins it and
+# the bootstrap materializes that pin with rustup; declaring `rust` here would
+# be a second pin resolving against a different source.
+#
+# Versions are exact for the same reason every other tool in this repo is
+# pinned exactly (protoc, moon, kache): a floating '24' silently changes what
+# CI ran between two builds of the same commit. Each is the latest of its line
+# as resolved by proto.
+javascript: {}
+
+node:
+  version: '24.18.1'
+
+npm:
+  version: '11.19.0'
+
+# `unstable_` is the plugin's own maturity label, not a warning about these
+# pins - both are exercised by hermes-pond:test on every CI run.
+unstable_python:
+  version: '3.13.14'
+  packageManager: 'uv'
+
+unstable_uv:
+  version: '0.11.33'

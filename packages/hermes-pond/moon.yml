@@ -1,11 +1,15 @@
 language: python
 
 # Runs the plugin's pytest suite via uv (pure-stdlib runtime; pytest is the only
-# dev dep). All paths are package-relative.
+# dev dep). python and uv come from the moon toolchain (.moon/toolchains.yml),
+# provisioned via proto, and `uv run` resolves the dev group from pyproject.toml
+# itself - so unlike the TypeScript plugin this needs no separate install task.
+# There is no uv.lock to declare as an input; pytest is the only dev dep, and
+# its floating resolution is the trade for not carrying a lockfile here.
+# All paths are package-relative.
 tasks:
   test:
     command: 'uv run --group dev pytest'
-    toolchains: ['system']
     inputs:
       - '*.py'
       - 'tests/**/*'
