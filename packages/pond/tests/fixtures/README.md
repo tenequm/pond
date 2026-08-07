@@ -347,7 +347,31 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
   Assistant messages carry rich provenance: `usage` (input / output /
   cacheRead / cacheWrite / totalTokens), `stopReason`, `api`, `provider`,
   `model`, `responseId`, full `cost` breakdown.
-- Samples: 3 sessions across 3 anonymized projects.
+- Samples: 3 anonymized v3 sessions across 3 projects, plus the harness-v2
+  formats below.
+- **harness-v2 (v4 JSONL + the SQLite backend)**, added 2026-08-06. Same
+  `sessions/` root - v3 and v4 files coexist, detected per file, so the
+  discovery tree stays one directory. A v4 file's first line is
+  `{kind:"header", version:4, id, createdAt, cwd, parentSessionId?, metadata?}`
+  and every later line is a `seq`-ordered mutation: `entry` (the conversation
+  tree), `record` (harness orchestration), `lane` (branch pointers), `fact`
+  (session name / entry labels). `sqlite/pi-sessions.sqlite` is the
+  `@earendil-works/pi-session-backend-sqlite-node` database - one file hosting
+  many sessions, whose `entries` / `records` / `lane_moves` / `facts` rows carry
+  the same payload shapes as the v4 mutations.
+  - `--Users-user-Projects-harness-v2--/*_v4-main-session.jsonl` exercises every
+    entry type, every record type, a second lane, both fact kinds, and a tool
+    call whose result and usage records tie back to it;
+    `*_v4-fork-session.jsonl` is a fork carrying `parentSessionId`.
+  - Regenerate with `pi-coding-agent/generate-v4-fixtures.mjs`, which drives
+    pi's OWN storage code (`JsonlSessionRepo`, `SqliteSessionRepository`) so the
+    committed bytes are whatever pi writes; the script's header comment carries
+    the exact invocation and the pi version last used. Ids are caller-supplied
+    and `Date.now` is faked, so a re-run on an unchanged pi is byte-identical
+    and any diff is a real format change.
+  - Torn tails and unknown future mutation kinds are NOT committed as fixtures:
+    both are derived in-test from a copy of the v4 file, which keeps the
+    round-trip corpus exactly the set of files native restore must reproduce.
 
 ## Cross-platform schema variation
 

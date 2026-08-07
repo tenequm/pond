@@ -207,6 +207,16 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
 # re-enable via `pond adapters enable <adapter>`.
+#
+# The value shape is adapter-owned; most take just `path`. pi-coding-agent also
+# accepts `sqlite_path`, its harness-v2 database backend, read alongside the
+# JSONL sessions dir. It has no auto-discovery because pi's coding agent does
+# not write that backend by default yet, so there is no canonical path to probe:
+#
+# [adapters.pi-coding-agent]
+# enabled = true
+# path = \"~/.pi/agent/sessions\"
+# sqlite_path = \"~/.pi/agent/sessions.sqlite\"
 
 # Embeddings. Search defaults to the vector arm (matching on meaning) when the
 # store has any vectors, falling back to FTS otherwise - the model loads lazily

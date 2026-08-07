@@ -648,62 +648,25 @@ pub(crate) fn validate_path_id(
     Ok(())
 }
 
-/// Atomically write a batch of `RestoredFile`s under `root`. Every path
-/// segment is re-validated and the joined path is required to stay inside
+/// Resolve each `RestoredFile` to its absolute destination under `root`. Every
+/// path segment is re-validated and the joined path is required to stay inside
 /// `root` (spec.md#adapter-native-restore-lossless: restore writes are
-/// adapter-supplied, but the gate lives at the writer so a single audit
-/// covers every adapter today and tomorrow). On partial failure the
-/// half-written tree is discarded before the error is returned.
-///
-/// Currently exercised only by adapter tests; the production restore CLI
-/// will route through this same helper when it lands.
-#[allow(dead_code)]
-pub(crate) fn write_restored_files(
+/// adapter-supplied, but the gate lives at the writer so a single audit covers
+/// every adapter today and tomorrow). Separate from the write so a caller
+/// restoring a whole lineage can refuse a collision across ALL its files before
+/// any of them touch disk.
+pub fn restore_destinations(
     root: &Path,
-    files: Vec<RestoredFile>,
-) -> Result<(), AdapterError> {
-    // Stage under a sibling temp dir and atomically rename so a partial
-    // failure cannot leave a half-populated restore in place.
-    let parent = root.parent().unwrap_or_else(|| Path::new("."));
-    let stem = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("restore");
-    let staging = parent.join(format!(".{stem}.tmp"));
-    let io =
-        |location: String, source: std::io::Error| AdapterError::io("restore", location, source);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| io(staging.display().to_string(), e))?;
-
-    let result = (|| -> Result<(), AdapterError> {
-        for file in files {
-            write_one_into_staging(&staging, &file)?;
-        }
-        Ok(())
-    })();
-
-    if let Err(error) = result {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-
-    // Replace any existing restore root; the staging dir becomes the new root.
-    let _ = std::fs::remove_dir_all(root);
-    if let Some(parent) = root.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
-    }
-    std::fs::rename(&staging, root).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&staging);
-        io(root.display().to_string(), e)
-    })?;
-    Ok(())
+    files: &[RestoredFile],
+) -> Result<Vec<PathBuf>, AdapterError> {
+    files
+        .iter()
+        .map(|file| restore_destination(root, file))
+        .collect()
 }
 
-#[allow(dead_code)]
-fn write_one_into_staging(staging: &Path, file: &RestoredFile) -> Result<(), AdapterError> {
-    // Validate every segment of the supplied relative path.
+fn restore_destination(root: &Path, file: &RestoredFile) -> Result<PathBuf, AdapterError> {
+    let at = || file.relative_path.display().to_string();
     for component in file.relative_path.components() {
         use std::path::Component;
         let segment = match component {
@@ -714,7 +677,7 @@ fn write_one_into_staging(staging: &Path, file: &RestoredFile) -> Result<(), Ada
             _ => {
                 return Err(AdapterError::schema(
                     "restore",
-                    file.relative_path.display().to_string(),
+                    at(),
                     "relative_path component is not a normal name",
                 ));
             }
@@ -722,35 +685,71 @@ fn write_one_into_staging(staging: &Path, file: &RestoredFile) -> Result<(), Ada
         let Some(text) = segment.to_str() else {
             return Err(AdapterError::schema(
                 "restore",
-                file.relative_path.display().to_string(),
+                at(),
                 "relative_path segment is not UTF-8",
             ));
         };
-        validate_path_id(
-            "restore",
-            "relative_path segment",
-            text,
-            file.relative_path.display().to_string(),
-        )?;
+        validate_path_id("restore", "relative_path segment", text, at())?;
     }
-
-    let dest = staging.join(&file.relative_path);
-    // Defense-in-depth: confirm the joined path is still inside the staging
-    // dir even if every individual segment passed the syntactic check.
-    if !dest.starts_with(staging) {
+    let dest = root.join(&file.relative_path);
+    // Defense-in-depth: confirm the joined path is still inside `root` even if
+    // every individual segment passed the syntactic check.
+    if !dest.starts_with(root) {
         return Err(AdapterError::schema(
             "restore",
-            file.relative_path.display().to_string(),
+            at(),
             "relative_path escaped the restore root after join",
         ));
     }
+    Ok(dest)
+}
+
+/// Write a batch of `RestoredFile`s under `root`, creating parent directories
+/// as needed and returning what was written. Restore NEVER overwrites and never
+/// removes: `root` is a live client's data directory (`~/.pi/agent`, say), so
+/// an existing destination is refused - naming every colliding path - before
+/// the first byte is written. A mid-batch io failure removes the files this
+/// call created, leaving the directory as it was found.
+pub fn write_restored_files(
+    root: &Path,
+    files: Vec<RestoredFile>,
+) -> Result<Vec<PathBuf>, AdapterError> {
+    let dests = restore_destinations(root, &files)?;
+    let existing: Vec<String> = dests
+        .iter()
+        .filter(|dest| dest.exists())
+        .map(|dest| dest.display().to_string())
+        .collect();
+    if !existing.is_empty() {
+        return Err(AdapterError::schema(
+            "restore",
+            root.display().to_string(),
+            format!(
+                "refusing to overwrite existing files: {}",
+                existing.join(", ")
+            ),
+        ));
+    }
+
     let io =
         |location: String, source: std::io::Error| AdapterError::io("restore", location, source);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
+    let mut written = Vec::with_capacity(dests.len());
+    for (dest, file) in dests.into_iter().zip(files) {
+        let result = (|| -> Result<(), AdapterError> {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
+            }
+            std::fs::write(&dest, &file.bytes).map_err(|e| io(dest.display().to_string(), e))
+        })();
+        if let Err(error) = result {
+            for path in &written {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        written.push(dest);
     }
-    std::fs::write(&dest, &file.bytes).map_err(|e| io(dest.display().to_string(), e))?;
-    Ok(())
+    Ok(written)
 }
 
 pub(crate) fn extracted_text(value: &Option<Extracted<String>>) -> &str {
