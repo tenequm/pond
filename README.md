@@ -223,6 +223,12 @@ For larger changes, open an issue first to discuss the direction. For security i
 
 Questions or feedback? Start a [GitHub Discussion](https://github.com/tenequm/pond/discussions), or DM me on [Telegram](https://t.me/tenequm) or [X](https://x.com/opwizardx) - I answer personally.
 
+## Links
+
+- Docs: [pond.locker](https://pond.locker/)
+- Crate: [pond-db on crates.io](https://crates.io/crates/pond-db)
+- MCP Registry name: `mcp-name: io.github.tenequm/pond`
+
 ## License
 
 [Apache-2.0](LICENSE) (c) 2026 tenequm

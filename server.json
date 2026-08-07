@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tenequm/pond",
+  "title": "pond",
+  "description": "Lossless archive and search for AI agent sessions across clients, exposed to agents over MCP.",
+  "repository": {
+    "url": "https://github.com/tenequm/pond",
+    "source": "github"
+  },
+  "version": "0.14.5",
+  "websiteUrl": "https://pond.locker/",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "pond-db",
+      "version": "0.14.5",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
