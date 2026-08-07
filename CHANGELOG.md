@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/tenequm/pond/compare/v0.14.5...v0.14.6) - 2026-08-07
+
+### <!-- 2 -->🐛 Bug Fixes
+- exit quietly on a closed pipe instead of panicking ([3961cb3](https://github.com/tenequm/pond/commit/3961cb300b8d1e58677380e04e5d6030bda3813c))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.5...v0.14.6
+
 ## [0.14.5](https://github.com/tenequm/pond/compare/v0.14.4...v0.14.5) - 2026-08-07
 
 ### <!-- 5 -->📚 Documentation
