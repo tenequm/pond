@@ -10,11 +10,18 @@ Branch on exit codes, not output text.
 |---|---|---|
 | 0 | success / synced | all |
 | 1 | generic failure - I/O, config, any unhandled error | all |
+| 1 | session is not stored | resume |
 | 2 | URL parse error | storage check, storage use |
 | 2 | disallowed statement (SQL surface is read-only) | sql |
+| 2 | unanswerable request - unknown adapter, lineage too deep | resume |
 | 3 | no credentials matched | storage, copy |
+| 3 | a target file already exists (nothing was written) | resume |
 | 4 | auth failed | storage, copy |
 | 5 | store lacks conditional-put (OCC) | storage, copy |
 | 6 | destination missing source rows, or duplicate destination rows | copy |
 
+Codes are scoped to the command, so the same number can mean different things across families - always branch on the pair, not the number alone.
+
 `copy` exit `6` is recoverable: re-run, the union merge converges. A malformed URL passed to `copy` fails with the generic exit `1`; only `storage check` / `storage use` exit `2` on it.
+
+`resume` exit `3` is not an error to recover from - it means that session is already resumed. The refusal names the existing file, so the useful response is to open it. With `--format json` every one of these outcomes arrives as `{"error": ...}` on stdout.
