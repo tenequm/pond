@@ -199,7 +199,11 @@ jobs:
           tar -xJf pond-aarch64-apple-darwin.tar.xz
           ./pond --version
           ./pond --help > /dev/null
-          ./pond completions zsh | grep -q '_pond'
+          # Redirect, don't pipe: `grep -q` closes the pipe at its first match,
+          # and the EPIPE that hands the still-writing binary is an unwrap inside
+          # clap_complete, so the assertion killed the release it was gating.
+          ./pond completions zsh > completions.zsh
+          grep -q '_pond' completions.zsh
 
       - name: Verify code signature
         if: needs.dist-build.outputs.signed == 'true'
