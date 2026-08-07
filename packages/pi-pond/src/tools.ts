@@ -7,8 +7,9 @@
 // No scope layer: pi is single-user, so the tools default to the WHOLE archive.
 // Cross-agent recall - finding what Claude Code or Codex did last week from
 // inside pi - is the product, not a leak.
-import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { TSchema } from "typebox";
+import { defineTool } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import type { Static, TSchema } from "typebox";
 import type { PondCallResult } from "./mcp.ts";
 import {
   RESPONSE_MAX_BYTES,
@@ -18,10 +19,6 @@ import {
   GetSessionParamsSchema,
   GetMessageParamsSchema,
   SqlParamsSchema,
-  type GetSessionParams,
-  type GetMessageParams,
-  type SearchParams,
-  type SqlParams,
   type ToolOutput,
 } from "./schemas.ts";
 
@@ -37,11 +34,6 @@ export const POND_TOOL_NAMES = {
 
 export type PondCaller = (name: string, args: Record<string, unknown>) => Promise<PondCallResult>;
 
-export type AgentToolResult<T> = {
-  content: { type: "text"; text: string }[];
-  details: T;
-};
-
 function result(details: ToolOutput, text: string): AgentToolResult<ToolOutput> {
   return { content: [{ type: "text", text }], details };
 }
@@ -55,11 +47,12 @@ function errorResult(error: string): AgentToolResult<ToolOutput> {
 }
 
 function boundedText(raw: string): string {
-  const buffer = Buffer.from(raw, "utf8");
-  if (buffer.byteLength <= RESPONSE_MAX_BYTES) {
+  // Measure without copying: pond's untruncated text can be far larger than the
+  // budget, and the copy is only needed on the rare over-budget path.
+  if (Buffer.byteLength(raw, "utf8") <= RESPONSE_MAX_BYTES) {
     return raw;
   }
-  const clipped = buffer.subarray(0, RESPONSE_MAX_BYTES).toString("utf8");
+  const clipped = Buffer.from(raw, "utf8").subarray(0, RESPONSE_MAX_BYTES).toString("utf8");
   return `${clipped}\n\n[pond: response truncated to ${RESPONSE_MAX_BYTES} bytes; narrow the query or lower limit]`;
 }
 
@@ -114,34 +107,31 @@ function text(value: unknown): string {
  * a pond binary is actually reachable: a tool that always errors is worse than
  * no tool.
  */
-export function createPondTools(callPond: PondCaller): ToolDefinition<TSchema, ToolOutput>[] {
-  const define = <TParams>(
+export function createPondTools(callPond: PondCaller) {
+  // `defineTool` exists to preserve parameter inference through the tool
+  // literal, so `toArgs` receives the schema's own Static type with no cast.
+  const define = <TParams extends TSchema>(
     name: string,
     label: string,
     description: string,
-    parameters: TSchema,
-    toArgs: (params: TParams) => Record<string, unknown> | string,
-  ): ToolDefinition<TSchema, ToolOutput> => ({
-    name,
-    label,
-    description,
-    promptSnippet: POND_PROMPT_SNIPPET,
-    promptGuidelines: POND_PROMPT_GUIDELINES,
-    parameters,
-    async execute(
-      _toolCallId: string,
-      params: unknown,
-      _signal: AbortSignal | undefined,
-      _onUpdate: unknown,
-      _ctx: ExtensionContext,
-    ) {
-      const args = toArgs(params as TParams);
-      return typeof args === "string" ? errorResult(args) : relay(callPond, name, args);
-    },
-  });
+    parameters: TParams,
+    toArgs: (params: Static<TParams>) => Record<string, unknown> | string,
+  ) =>
+    defineTool<TParams, ToolOutput>({
+      name,
+      label,
+      description,
+      promptSnippet: POND_PROMPT_SNIPPET,
+      promptGuidelines: POND_PROMPT_GUIDELINES,
+      parameters,
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        const args = toArgs(params);
+        return typeof args === "string" ? errorResult(args) : relay(callPond, name, args);
+      },
+    });
 
   return [
-    define<SearchParams>(
+    define(
       POND_TOOL_NAMES.search,
       "Pond Search",
       SEARCH_DESCRIPTION,
@@ -164,7 +154,7 @@ export function createPondTools(callPond: PondCaller): ToolDefinition<TSchema, T
         return args;
       },
     ),
-    define<GetSessionParams>(
+    define(
       POND_TOOL_NAMES.getSession,
       "Pond Get Session",
       GET_SESSION_DESCRIPTION,
@@ -190,7 +180,7 @@ export function createPondTools(callPond: PondCaller): ToolDefinition<TSchema, T
         return args;
       },
     ),
-    define<GetMessageParams>(
+    define(
       POND_TOOL_NAMES.getMessage,
       "Pond Get Message",
       GET_MESSAGE_DESCRIPTION,
@@ -210,7 +200,7 @@ export function createPondTools(callPond: PondCaller): ToolDefinition<TSchema, T
         return args;
       },
     ),
-    define<SqlParams>(
+    define(
       POND_TOOL_NAMES.sql,
       "Pond SQL",
       SQL_DESCRIPTION,

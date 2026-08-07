@@ -737,37 +737,65 @@ mod restore_handler {
     //! child that is itself a parent means a deeper graph, which is a typed
     //! error - never a silently flattened restore.
 
-    use anyhow::{Context, Result, bail};
+    use anyhow::{Context, Result};
 
     use crate::sessions::{SessionWithMessages, Store};
 
-    pub async fn restore_lineage(
-        store: &Store,
-        session_id: &str,
-    ) -> Result<Vec<SessionWithMessages>> {
+    /// The two ways a lineage can be unanswerable, separated from io failure so
+    /// a CLI can map them to distinct exit codes without matching on prose.
+    #[derive(Debug)]
+    pub enum Lineage {
+        /// The named session plus its direct children, in that order.
+        Complete(Vec<SessionWithMessages>),
+        /// Nothing is stored under that id (erased and denylisted sessions
+        /// report the same way - they are simply not there).
+        NotFound,
+        /// A child is itself a parent, so restoring would either flatten the
+        /// graph or write only part of it.
+        TooDeep { child_id: String },
+    }
+
+    pub async fn restore_lineage(store: &Store, session_id: &str) -> Result<Lineage> {
         let Some(parent) = store.get_session(session_id).await? else {
-            bail!("export: session not found: {session_id}");
+            return Ok(Lineage::NotFound);
         };
+        let children = store.child_sessions(session_id).await?;
+        // The grandchild probes are independent of each other; on a remote
+        // store each is a round trip, so they run together rather than in
+        // series behind K awaits.
+        let deeper = futures::future::try_join_all(
+            children
+                .iter()
+                .map(|child| async { store.child_sessions(&child.id).await }),
+        )
+        .await?;
+        if let Some(child) = children
+            .iter()
+            .zip(&deeper)
+            .find(|(_, grandchildren)| !grandchildren.is_empty())
+            .map(|(child, _)| child)
+        {
+            return Ok(Lineage::TooDeep {
+                child_id: child.id.clone(),
+            });
+        }
+
         let mut sessions = vec![parent];
-        for child in store.child_sessions(session_id).await? {
-            if !store.child_sessions(&child.id).await?.is_empty() {
-                bail!(
-                    "adapter-lineage-complete-restore supports one subagent level; session {} has child sessions",
-                    child.id
-                );
-            }
+        for child in children {
             let child_id = child.id;
+            // A child that lists but will not load is a broken lineage, never a
+            // session to quietly leave out of the restore.
             let stored = store
                 .get_session(&child_id)
                 .await?
-                .with_context(|| format!("export: child session disappeared: {child_id}"))?;
+                .with_context(|| format!("child session disappeared: {child_id}"))?;
             sessions.push(stored);
         }
-        Ok(sessions)
+        Ok(Lineage::Complete(sessions))
     }
 }
 
-pub use restore_handler::restore_lineage;
+pub use restore_handler::{Lineage, restore_lineage};
 
 mod get_handler {
     use crate::{
@@ -2116,16 +2144,24 @@ mod tests {
             .unwrap();
 
         // Restoring A reaches child B, then finds B is itself a parent of C.
-        let err = restore_lineage(&store, "a").await.unwrap_err();
-        assert!(
-            err.to_string().contains("one subagent level"),
-            "expected the deeper-graph error, got: {err}"
-        );
+        // The verdict is typed, so a caller branches on it instead of on prose.
+        let Lineage::TooDeep { child_id } = restore_lineage(&store, "a").await.unwrap() else {
+            panic!("a two-level graph must report TooDeep");
+        };
+        assert_eq!(child_id, "b");
 
         // Restoring B is a clean one-level graph: B plus its single child C.
-        let lineage = restore_lineage(&store, "b").await.unwrap();
+        let Lineage::Complete(lineage) = restore_lineage(&store, "b").await.unwrap() else {
+            panic!("a one-level graph restores complete");
+        };
         let ids: Vec<&str> = lineage.iter().map(|s| s.session.id.as_str()).collect();
         assert_eq!(ids, ["b", "c"]);
+
+        // A session nobody stored is a distinct outcome from a bad graph.
+        assert!(matches!(
+            restore_lineage(&store, "nope").await.unwrap(),
+            Lineage::NotFound
+        ));
     }
 
     #[test]

@@ -584,10 +584,17 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
     }
     let cfg: Cfg = serde_json::from_value(config)
         .map_err(|err| AdapterError::config(adapter, format!("bad config blob: {err}")))?;
-    Ok(match std::env::var_os("HOME") {
-        Some(home) => crate::config::expand_home_under(&cfg.path, Path::new(&home)),
-        None => cfg.path,
-    })
+    Ok(expand_home(cfg.path))
+}
+
+/// Expand a leading `~` against `$HOME`, or return the path untouched when the
+/// env has no `HOME` (CI, post-install hooks, sandboxes). Shared because an
+/// adapter whose config carries more than one path cannot use [`config_path`].
+pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => crate::config::expand_home_under(&path, Path::new(&home)),
+        None => path,
+    }
 }
 
 pub(crate) fn raw_record(options: &ProviderOptions) -> Option<Value> {
@@ -706,10 +713,15 @@ fn restore_destination(root: &Path, file: &RestoredFile) -> Result<PathBuf, Adap
 
 /// Write a batch of `RestoredFile`s under `root`, creating parent directories
 /// as needed and returning what was written. Restore NEVER overwrites and never
-/// removes: `root` is a live client's data directory (`~/.pi/agent`, say), so
-/// an existing destination is refused - naming every colliding path - before
-/// the first byte is written. A mid-batch io failure removes the files this
-/// call created, leaving the directory as it was found.
+/// removes: `root` is a live client's own data directory, so an existing
+/// destination is refused - naming every colliding path - before the first byte
+/// is written. A mid-batch io failure removes the files this call created,
+/// leaving the directory as it was found.
+///
+/// Callers restoring a lineage MUST pass the whole lineage in one call: the
+/// no-overwrite refusal and the unwind are both batch-scoped, so splitting a
+/// lineage across calls reintroduces the partial write they exist to prevent
+/// (spec.md#adapter-lineage-complete-restore).
 pub fn write_restored_files(
     root: &Path,
     files: Vec<RestoredFile>,
@@ -717,7 +729,7 @@ pub fn write_restored_files(
     let dests = restore_destinations(root, &files)?;
     let existing: Vec<String> = dests
         .iter()
-        .filter(|dest| dest.exists())
+        .filter(|dest| exists_even_if_dangling(dest))
         .map(|dest| dest.display().to_string())
         .collect();
     if !existing.is_empty() {
@@ -739,7 +751,20 @@ pub fn write_restored_files(
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
             }
-            std::fs::write(&dest, &file.bytes).map_err(|e| io(dest.display().to_string(), e))
+            // `create_new` is the guard, not the pre-check above: it is O_EXCL,
+            // so it refuses any existing path - including a symlink, which
+            // `fs::write` would instead follow to a target outside `root`,
+            // defeating the containment check in `restore_destination`. It also
+            // closes the window between that pre-check and this write, and
+            // catches two `RestoredFile`s claiming one path. The pre-check
+            // survives only to name every collision at once.
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|e| io(dest.display().to_string(), e))?;
+            std::io::Write::write_all(&mut handle, &file.bytes)
+                .map_err(|e| io(dest.display().to_string(), e))
         })();
         if let Err(error) = result {
             for path in &written {
@@ -750,6 +775,13 @@ pub fn write_restored_files(
         written.push(dest);
     }
     Ok(written)
+}
+
+/// Does anything occupy this path? `Path::exists` follows symlinks, so a
+/// DANGLING one reads as absent - and a restore that trusted it would write
+/// through the link, outside the root. `symlink_metadata` sees the link itself.
+fn exists_even_if_dangling(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 pub(crate) fn extracted_text(value: &Option<Extracted<String>>) -> &str {

@@ -167,13 +167,13 @@ await main.appendRecord({
   attempt: 1,
   stopReason: "toolUse",
   usage: {
-        input: 120,
-        output: 44,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 164,
-        cost: { input: 0.003, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.004 },
-      },
+    input: 120,
+    output: 44,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 164,
+    cost: { input: 0.003, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.004 },
+  },
 });
 await main.appendRecord({
   id: "v4-queue-1",
@@ -357,13 +357,13 @@ await dbMain.appendRecord({
   attempt: 1,
   stopReason: "toolUse",
   usage: {
-        input: 40,
-        output: 20,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 60,
-        cost: { input: 0.0008, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.001 },
-      },
+    input: 40,
+    output: 20,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 60,
+    cost: { input: 0.0008, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+  },
 });
 await dbMain.appendRecord({
   id: "sqlite-finish-1",

@@ -63,12 +63,12 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
-    by_timestamp_then_id, compact_json, empty_options,
+    by_timestamp_then_id, compact_json, empty_options, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text, is_session_fresh,
     jsonl::{
-        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_first_line,
-        peek_last_line, source_line,
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, parse_bounded,
+        peek_first_line, peek_last_line, source_line,
     },
     jsonl_bytes, part_id, part_ordinal, raw_record,
     sqlite::{CHANNEL_CAP, ColKind, columns_sql, db_error, emit, join_error, open_db, row_to_json},
@@ -360,13 +360,9 @@ impl PiCodingAgentAdapter {
     fn from_config(config: Value) -> Result<Self, AdapterError> {
         let cfg: PiCodingAgentConfig = serde_json::from_value(config)
             .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
-        let expand = |path: PathBuf| match std::env::var_os("HOME") {
-            Some(home) => crate::config::expand_home_under(&path, Path::new(&home)),
-            None => path,
-        };
         Ok(Self {
-            root: expand(cfg.path),
-            sqlite_path: cfg.sqlite_path.map(expand),
+            root: expand_home(cfg.path),
+            sqlite_path: cfg.sqlite_path.map(expand_home),
         })
     }
 }
@@ -378,13 +374,20 @@ impl Adapter for PiCodingAgentAdapter {
             return files;
         };
         Box::pin(async move {
+            // Two independent io jobs producing independent counts - overlap
+            // them rather than making the directory walk wait on the database.
             let db_sessions = tokio::task::spawn_blocking(move || {
                 let conn = open_db(NAME, &db_path)?;
-                list_db_sessions(&conn, &db_path).map(|rows| rows.len())
-            })
-            .await
-            .map_err(|join| join_error(NAME, join))??;
-            Ok(files.await? + db_sessions)
+                // A count, not the rows: `list_db_sessions` would materialize
+                // every session's metadata blob only to measure the vec.
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| usize::try_from(count).unwrap_or(0))
+                .map_err(|error| db_error(NAME, &db_path, "count sessions", &error))
+            });
+            let (files, db_sessions) = tokio::join!(files, db_sessions);
+            Ok(files? + db_sessions.map_err(|join| join_error(NAME, join))??)
         })
     }
 
@@ -402,15 +405,16 @@ impl Adapter for PiCodingAgentAdapter {
             return files;
         };
         Box::pin(async move {
-            let db_plan = sqlite_plan(db_path, oracle).await?;
-            Ok(match (files.await?, db_plan) {
-                (Some(files), db) => Some(SyncPlan {
-                    sessions: files.sessions + db.sessions,
-                    fresh: files.fresh + db.fresh,
-                    pending: files.pending + db.pending,
-                }),
-                (None, db) => Some(db),
-            })
+            let (files, db) = tokio::join!(files, sqlite_plan(db_path, oracle));
+            let db = db?;
+            // `None` from the file half means "cannot preview cheaply". Folding
+            // it into the database counts would report a partial total as the
+            // whole, so the preview stays unknown instead.
+            Ok(files?.map(|files| SyncPlan {
+                sessions: files.sessions + db.sessions,
+                fresh: files.fresh + db.fresh,
+                pending: files.pending + db.pending,
+            }))
         })
     }
 }
@@ -1073,23 +1077,44 @@ fn list_db_sessions(conn: &Connection, db_path: &Path) -> Result<Vec<DbSession>,
     Ok(out)
 }
 
+/// The four per-session mutation tables and whether their rows carry a
+/// timestamp. All four are indexed on `(session_id, seq)` by pi's own schema.
+const MUTATION_TABLES: &[(&str, bool)] = &[
+    ("entries", true),
+    ("records", true),
+    ("lane_moves", false),
+    ("facts", false),
+];
+
 /// Timestamp of the highest-`seq` mutation, or `None` when that mutation is a
 /// `lane_moves` / `facts` row (which carry none) - the same rule, and the same
 /// reason, as the JSONL [`JsonlTree::peek_watermark`] above.
+///
+/// One bounded `ORDER BY seq DESC LIMIT 1` per table, maxed here, rather than a
+/// `UNION ALL` the planner has to sort: each of these is a plain index seek on
+/// `(session_id, seq)`, while the union form builds a temp b-tree over every
+/// mutation the session ever recorded - on the freshness path, for sessions that
+/// have not changed.
 fn db_session_watermark(conn: &Connection, session_id: &str) -> Option<i64> {
-    let text: Option<String> = conn
-        .query_row(
-            "SELECT timestamp FROM (
-                 SELECT seq, timestamp FROM entries WHERE session_id = ?1
-                 UNION ALL SELECT seq, timestamp FROM records WHERE session_id = ?1
-                 UNION ALL SELECT seq, NULL FROM lane_moves WHERE session_id = ?1
-                 UNION ALL SELECT seq, NULL FROM facts WHERE session_id = ?1
-             ) ORDER BY seq DESC LIMIT 1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .ok()?;
-    parse_db_timestamp(&text?).map(|dt| dt.timestamp_micros())
+    let mut best: Option<(i64, Option<String>)> = None;
+    for (table, has_timestamp) in MUTATION_TABLES {
+        let column = if *has_timestamp { "timestamp" } else { "NULL" };
+        let row = conn
+            .prepare_cached(&format!(
+                "SELECT seq, {column} FROM {table} WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1"
+            ))
+            .ok()?
+            .query_row([session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .ok();
+        if let Some((seq, timestamp)) = row
+            && best.as_ref().is_none_or(|(best_seq, _)| seq > *best_seq)
+        {
+            best = Some((seq, timestamp));
+        }
+    }
+    parse_db_timestamp(&best?.1?).map(|dt| dt.timestamp_micros())
 }
 
 fn parse_db_timestamp(text: &str) -> Option<DateTime<Utc>> {
@@ -1275,6 +1300,18 @@ fn db_header_value(row: &Value) -> Value {
     Value::Object(header)
 }
 
+/// One `entries` row, read before any JSON is parsed: decoding happens outside
+/// the `query_map` closure so the bounded parse can surface a typed
+/// [`AdapterError`] instead of being flattened into a `rusqlite` error.
+struct EntryRow {
+    seq: i64,
+    id: String,
+    parent_id: Option<String>,
+    kind: String,
+    timestamp: String,
+    payload: String,
+}
+
 /// Every mutation for one session, in `seq` order, each rebuilt as the v4 value
 /// pi's JSONL codec would have written for it.
 fn db_mutations(
@@ -1282,134 +1319,167 @@ fn db_mutations(
     db_path: &Path,
     session_id: &str,
 ) -> Result<Vec<(i64, Value)>, AdapterError> {
+    let at = |seq: i64| format!("{}#{session_id}:{seq}", db_path.display());
     let mut out = Vec::new();
-    collect_db_rows(
+
+    for row in query_db_rows(
         conn,
         db_path,
         session_id,
         "SELECT seq, id, parent_id, type, timestamp, payload FROM entries WHERE session_id = ?1",
         |row| {
-            let seq: i64 = row.get(0)?;
-            let mut map = payload_object(&row.get::<_, String>(5)?);
-            map.insert("kind".to_owned(), json!("entry"));
-            map.insert("id".to_owned(), json!(row.get::<_, String>(1)?));
-            map.insert(
-                "parentId".to_owned(),
-                row.get::<_, Option<String>>(2)?
-                    .map_or(Value::Null, |p| json!(p)),
-            );
-            map.insert("type".to_owned(), json!(row.get::<_, String>(3)?));
-            map.insert("seq".to_owned(), json!(seq));
-            insert_db_timestamp(&mut map, &row.get::<_, String>(4)?);
-            Ok((seq, Value::Object(map)))
+            Ok(EntryRow {
+                seq: row.get(0)?,
+                id: row.get(1)?,
+                parent_id: row.get(2)?,
+                kind: row.get(3)?,
+                timestamp: row.get(4)?,
+                payload: row.get(5)?,
+            })
         },
-        &mut out,
-    )?;
-    collect_db_rows(
+    )? {
+        let mut map = payload_object(&row.payload, &at(row.seq))?;
+        map.insert("kind".to_owned(), json!("entry"));
+        map.insert("id".to_owned(), json!(row.id));
+        map.insert(
+            "parentId".to_owned(),
+            row.parent_id.map_or(Value::Null, |parent| json!(parent)),
+        );
+        map.insert("type".to_owned(), json!(row.kind));
+        map.insert("seq".to_owned(), json!(row.seq));
+        insert_db_timestamp(&mut map, &row.timestamp);
+        out.push((row.seq, Value::Object(map)));
+    }
+
+    // The records payload already carries id / lane / type verbatim
+    // (`repo.ts::decodeRecord` only re-adds seq and timestamp).
+    for (seq, timestamp, payload) in query_db_rows(
         conn,
         db_path,
         session_id,
         "SELECT seq, timestamp, payload FROM records WHERE session_id = ?1",
         |row| {
-            let seq: i64 = row.get(0)?;
-            // The records payload already carries id / lane / type verbatim
-            // (`repo.ts::decodeRecord` only re-adds seq and timestamp).
-            let mut map = payload_object(&row.get::<_, String>(2)?);
-            map.insert("kind".to_owned(), json!("record"));
-            map.insert("seq".to_owned(), json!(seq));
-            insert_db_timestamp(&mut map, &row.get::<_, String>(1)?);
-            Ok((seq, Value::Object(map)))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         },
-        &mut out,
-    )?;
-    collect_db_rows(
+    )? {
+        let mut map = payload_object(&payload, &at(seq))?;
+        map.insert("kind".to_owned(), json!("record"));
+        map.insert("seq".to_owned(), json!(seq));
+        insert_db_timestamp(&mut map, &timestamp);
+        out.push((seq, Value::Object(map)));
+    }
+
+    for (seq, lane, leaf_id) in query_db_rows(
         conn,
         db_path,
         session_id,
         "SELECT seq, lane, leaf_id FROM lane_moves WHERE session_id = ?1",
         |row| {
-            let seq: i64 = row.get(0)?;
             Ok((
-                seq,
-                json!({
-                    "kind": "lane",
-                    "seq": seq,
-                    "lane": row.get::<_, String>(1)?,
-                    "leafId": row.get::<_, Option<String>>(2)?,
-                }),
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
             ))
         },
-        &mut out,
-    )?;
-    collect_db_rows(
+    )? {
+        out.push((
+            seq,
+            json!({ "kind": "lane", "seq": seq, "lane": lane, "leafId": leaf_id }),
+        ));
+    }
+
+    for (seq, kind, key, value) in query_db_rows(
         conn,
         db_path,
         session_id,
         "SELECT seq, kind, key, value FROM facts WHERE session_id = ?1",
         |row| {
-            let seq: i64 = row.get(0)?;
-            let kind: String = row.get(1)?;
-            // Fact values are JSON-encoded scalars in SQLite; the JSONL codec
-            // writes them bare.
-            let decoded = row
-                .get::<_, Option<String>>(3)?
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-            let mut map = serde_json::Map::new();
-            map.insert("kind".to_owned(), json!("fact"));
-            map.insert("seq".to_owned(), json!(seq));
-            map.insert("fact".to_owned(), json!(kind));
-            if let Some(target) = row.get::<_, Option<String>>(2)? {
-                map.insert("targetId".to_owned(), json!(target));
-            }
-            if let Some(decoded) = decoded {
-                map.insert(
-                    if kind == "name" { "name" } else { "label" }.to_owned(),
-                    decoded,
-                );
-            }
-            Ok((seq, Value::Object(map)))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
         },
-        &mut out,
-    )?;
+    )? {
+        let mut map = serde_json::Map::new();
+        map.insert("kind".to_owned(), json!("fact"));
+        map.insert("seq".to_owned(), json!(seq));
+        map.insert("fact".to_owned(), json!(kind));
+        if let Some(target) = key {
+            map.insert("targetId".to_owned(), json!(target));
+        }
+        // Fact values are JSON-encoded scalars in SQLite; the JSONL codec
+        // writes them bare. Bounded like every other source value.
+        if let Some(text) = value {
+            let decoded = parse_bounded(NAME, text.as_bytes(), || at(seq))?;
+            map.insert(
+                if kind == "name" { "name" } else { "label" }.to_owned(),
+                decoded,
+            );
+        }
+        out.push((seq, Value::Object(map)));
+    }
+
     out.sort_by_key(|(seq, _)| *seq);
     Ok(out)
 }
 
-fn collect_db_rows(
+/// Read every row of one per-session query. `prepare_cached` because these four
+/// statements are re-executed for every pending session of every sync and never
+/// change.
+fn query_db_rows<T>(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
     sql: &str,
-    map: impl Fn(&rusqlite::Row) -> rusqlite::Result<(i64, Value)>,
-    out: &mut Vec<(i64, Value)>,
-) -> Result<(), AdapterError> {
+    map: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Result<Vec<T>, AdapterError> {
     let mut stmt = conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .map_err(|error| db_error(NAME, db_path, "prepare mutations", &error))?;
     let rows = stmt
         .query_map([session_id], map)
         .map_err(|error| db_error(NAME, db_path, "query mutations", &error))?;
-    for row in rows {
-        out.push(row.map_err(|error| db_error(NAME, db_path, "read mutation row", &error))?);
-    }
-    Ok(())
+    rows.map(|row| row.map_err(|error| db_error(NAME, db_path, "read mutation row", &error)))
+        .collect()
 }
 
-/// A payload column as the object the v4 mutation is built on. pi always writes
-/// a JSON object there; anything else is wrapped rather than dropped, so a
-/// surprise payload still reaches canonical
-/// (spec.md#adapter-integrity-no-silent-drops).
-fn payload_object(text: &str) -> serde_json::Map<String, Value> {
-    match serde_json::from_str(text) {
-        Ok(Value::Object(map)) => map,
-        Ok(other) => json!({ "payload": other })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-        Err(_) => json!({ "payload": text })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+/// A payload column as the object the v4 mutation is built on.
+///
+/// Routed through [`parse_bounded`] - the same gate `jsonl.rs` applies to every
+/// line it reads (spec.md#adapter-bounded-values): a payload over `RECORD_CAP`
+/// is refused and every string leaf is capped at `LEAF_CAP`. Bytes arriving from
+/// a column instead of a file do not get to skip it, or an oversized leaf reaches
+/// canonical through the raw-`Value` slots (`ToolResult.result`, `ToolCall.params`)
+/// and overflows Arrow's i32 offsets. Same treatment openclaw and opencode give
+/// their own DB payload columns.
+///
+/// pi's schema guarantees an object here (`entryPayload` / `JSON.stringify`), so
+/// anything else is corruption and surfaces as a typed error rather than a
+/// silently reshaped row.
+fn payload_object(text: &str, at: &str) -> Result<serde_json::Map<String, Value>, AdapterError> {
+    match parse_bounded(NAME, text.as_bytes(), || at.to_owned())? {
+        Value::Object(map) => Ok(map),
+        other => Err(AdapterError::schema(
+            NAME,
+            at.to_owned(),
+            format!(
+                "payload column is {}, not a JSON object",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::String(_) => "a string",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => unreachable!("matched above"),
+                }
+            ),
+        )),
     }
 }
 
@@ -2190,6 +2260,48 @@ mod tests {
             std::fs::read(&sibling)?,
             b"untouched",
             "a refused restore leaves the directory exactly as it was",
+        );
+        Ok(())
+    }
+
+    /// A DANGLING symlink at a destination reads as absent to `Path::exists`,
+    /// and a plain `fs::write` would follow it and land the file wherever it
+    /// points - outside the restore root, defeating the containment check. The
+    /// write is `O_EXCL`, so the link itself is what refuses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_refuses_a_destination_occupied_by_a_dangling_symlink() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _) =
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+        let session = store
+            .get_session(V4_SESSION)
+            .await?
+            .expect("v4 fixture session lands");
+        let files = PiCodingAgentFactory.serialize(&session, RestoreFidelity::Native)?;
+
+        let root = temp.path().join("pi-home");
+        let outside = temp.path().join("outside-the-root.jsonl");
+        let dest = crate::adapter::restore_destinations(&root, &files)?
+            .into_iter()
+            .next()
+            .expect("one file per session");
+        std::fs::create_dir_all(dest.parent().expect("dest has a parent"))?;
+        std::os::unix::fs::symlink(&outside, &dest)?;
+
+        let error = crate::adapter::write_restored_files(&root, files)
+            .expect_err("a destination occupied by a symlink must be refused");
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "the refusal names the occupied path: {error}",
+        );
+        assert!(
+            !outside.exists(),
+            "nothing may be written through the link, outside the restore root",
+        );
+        assert!(
+            std::fs::symlink_metadata(&dest).is_ok(),
+            "the pre-existing link is not this restore's to remove",
         );
         Ok(())
     }

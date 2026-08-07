@@ -51,7 +51,7 @@ export async function pickPondHit(
       container.addChild(list);
       container.addChild(
         new Text(
-          theme.fg("dim", "enter resume here  •  i insert as context  •  esc cancel"),
+          theme.fg("dim", "enter resume here | i insert as context | esc cancel"),
           1,
           0,
         ),

@@ -1752,34 +1752,39 @@ async fn run_resume(
     let loaded = Config::load(config_path(config))?;
     let (_, store) = open_store(storage_path, &loaded, false, false).await?;
 
+    // The reported paths are absolute even when `--out-dir` is relative (it
+    // defaults to `.`): a plugin hands them straight to its own client, which
+    // resolves them against ITS cwd, not pond's. `absolute` is purely lexical,
+    // so it works before the directory exists.
+    let out_dir = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    let out_dir = out_dir.as_path();
+
     // spec.md#adapter-lineage-complete-restore: a session restores together
     // with its child sessions, or not at all. An erased or denylisted session
     // is simply not stored, so it reports as not found.
-    let Some(root) = store.get_session(session_id).await? else {
-        return fail(
-            1,
-            serde_json::json!({"error": "not_found", "session_id": session_id}),
-            format!("session {session_id} is not in this pond. Find one with: pond search <query>",),
-        );
-    };
-    let mut sessions = vec![root];
-    for child in store.child_sessions(session_id).await? {
-        if !store.child_sessions(&child.id).await?.is_empty() {
+    let sessions = match handlers::restore_lineage(&store, session_id).await? {
+        handlers::Lineage::Complete(sessions) => sessions,
+        handlers::Lineage::NotFound => {
             return fail(
-                2,
-                serde_json::json!({"error": "lineage_too_deep", "session_id": child.id}),
+                1,
+                serde_json::json!({"error": "not_found", "session_id": session_id}),
                 format!(
-                    "session {session_id} has a grandchild session ({}); pond restores one level \
-                     of lineage, so this would be a partial write. Resume {} directly instead.",
-                    child.id, child.id,
+                    "session {session_id} is not in this pond. Find one with: pond search <query>",
                 ),
             );
         }
-        let Some(loaded_child) = store.get_session(&child.id).await? else {
-            continue;
-        };
-        sessions.push(loaded_child);
-    }
+        handlers::Lineage::TooDeep { child_id } => {
+            return fail(
+                2,
+                serde_json::json!({"error": "lineage_too_deep", "session_id": child_id}),
+                format!(
+                    "session {session_id} has a grandchild session ({child_id}); pond restores one \
+                     level of lineage, so this would be a partial write. Resume {child_id} \
+                     directly instead.",
+                ),
+            );
+        }
+    };
 
     // Fidelity is the system's decision, never the caller's: same origin means
     // a value-complete replay is available (`source_agent` is exact-or-subpath,
@@ -1798,8 +1803,9 @@ async fn run_resume(
     }
 
     // Refuse across the WHOLE lineage before writing any of it, so a collision
-    // on the second file cannot leave the first one on disk. The named paths
-    // are what an idempotent caller re-uses ("already resumed - open this").
+    // on a later session cannot leave an earlier one's files on disk. The named
+    // paths are what an idempotent caller re-uses ("already resumed - open
+    // this").
     let mut existing = Vec::new();
     for (_, files) in &planned {
         for dest in adapter::restore_destinations(out_dir, files)? {
@@ -1819,25 +1825,50 @@ async fn run_resume(
         );
     }
 
-    let mut report = Vec::with_capacity(planned.len());
-    for (session, files) in planned {
-        // Report what was actually served, not what was asked for: one
-        // downgraded file makes the session foreign
-        // (spec.md#adapter-native-restore-lossless).
-        let fidelity = if files
+    // One call for the whole lineage: the writer's unwind is batch-scoped, so
+    // splitting it per session would let an io failure on the child leave the
+    // parent's files behind - the partial write the check above and
+    // spec.md#adapter-lineage-complete-restore both forbid.
+    let counts: Vec<usize> = planned.iter().map(|(_, files)| files.len()).collect();
+    // Report what was actually served, not what was asked for: one downgraded
+    // file makes that session foreign (spec.md#adapter-native-restore-lossless).
+    let fidelities: Vec<&'static str> = planned
+        .iter()
+        .map(|(_, files)| {
+            fidelity_label(
+                if files
+                    .iter()
+                    .all(|file| file.actual_fidelity == adapter::RestoreFidelity::Native)
+                {
+                    adapter::RestoreFidelity::Native
+                } else {
+                    adapter::RestoreFidelity::Foreign
+                },
+            )
+        })
+        .collect();
+    let written = adapter::write_restored_files(
+        out_dir,
+        planned
             .iter()
-            .all(|file| file.actual_fidelity == adapter::RestoreFidelity::Native)
-        {
-            adapter::RestoreFidelity::Native
-        } else {
-            adapter::RestoreFidelity::Foreign
-        };
-        let written = adapter::write_restored_files(out_dir, files)?;
+            .flat_map(|(_, files)| files.iter().cloned())
+            .collect(),
+    )?;
+
+    // `write_restored_files` preserves input order, so each session's files are
+    // the next `counts[i]` paths.
+    let mut report = Vec::with_capacity(planned.len());
+    let mut paths = written.iter();
+    for (((session, _), count), fidelity) in planned.iter().zip(counts).zip(fidelities) {
         report.push(serde_json::json!({
             "session_id": session.session.id,
             "source_agent": session.session.source_agent,
-            "actual_fidelity": fidelity_label(fidelity),
-            "files": written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "actual_fidelity": fidelity,
+            "files": paths
+                .by_ref()
+                .take(count)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
         }));
     }
 

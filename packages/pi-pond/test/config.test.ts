@@ -7,7 +7,6 @@ import {
   loadPondConfig,
   parsePondConfig,
   piAgentDir,
-  piSessionsRoot,
   recordCaptureConsent,
 } from "../src/config.ts";
 import { pondChildEnv } from "../src/service.ts";
@@ -56,9 +55,8 @@ describe("config", () => {
     expect(loadPondConfig(path).captureConsent).toBe("declined");
   });
 
-  it("resolves pi's own directories, which is where resumed files must land", () => {
+  it("resolves pi's agent dir, the root a resumed session is written under", () => {
     expect(piAgentDir("/home/u")).toBe("/home/u/.pi/agent");
-    expect(piSessionsRoot("/home/u")).toBe("/home/u/.pi/agent/sessions");
   });
 });
 

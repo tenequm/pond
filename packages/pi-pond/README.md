@@ -53,7 +53,9 @@ Optional, at `~/.pi/agent/pond-pi.json`:
   { "mode": "url", "url": "http://127.0.0.1:9797/mcp" }
   ```
 
-The same file records your answer to the one-time capture prompt (`captureConsent`). You are asked once, only in an interactive session, and only when pond is already capturing something else on this machine but not pi - the case pond's own `--bootstrap` cannot cover. Either answer is remembered; the extension never writes pond's config by any other path.
+The same file records your answer to the one-time capture prompt (`captureConsent`). You are asked once, only in an interactive session, and only when pond is already capturing something else on this machine but not pi - the case pond's own `--bootstrap` cannot cover. Either answer is remembered.
+
+The prompt is not the only way your pond config can change. On a pond with **no** adapters configured at all, the managed child's `--bootstrap pi-coding-agent` enables the pi adapter on its first run, without asking - that is what makes the zero-config install work. It never touches a pond that already has adapters, and a disabled adapter stays disabled. If you would rather nothing be written on your behalf, run `pond init` first or use `mode: "url"`.
 
 Where the archive lives is pond's business, not this extension's: set `POND_STORAGE_PATH` (or run `pond storage use <url>`) to point it at S3 or a shared volume.
 

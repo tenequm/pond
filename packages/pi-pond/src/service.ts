@@ -100,8 +100,10 @@ function isExecutable(path: string): boolean {
   }
 }
 
-/// Resolve the pond binary the way a shell would, so a missing install fails
-/// with a named fix rather than an opaque spawn ENOENT deep inside the transport.
+/**
+ * Resolve the pond binary the way a shell would, so a missing install fails
+ * with a named fix rather than an opaque spawn ENOENT deep inside the transport.
+ */
 export function resolvePondBinary(binaryPath: string | undefined): string {
   if (binaryPath) {
     if (!isExecutable(binaryPath)) {
@@ -124,12 +126,19 @@ export function resolvePondBinary(binaryPath: string | undefined): string {
   throw new Error(`pond binary not found on PATH. ${INSTALL_HINT}`);
 }
 
-/** Is a pond binary reachable at all? Gates tool registration and the consent prompt. */
-export function pondBinaryPath(binaryPath: string | undefined): string | undefined {
+/**
+ * Where pond is, or why it could not be found. Gates tool registration and the
+ * consent prompt. The reason is carried rather than collapsed to "not found":
+ * a configured-but-wrong `binaryPath` needs to say so, not send the operator
+ * off to reinstall something they already have.
+ */
+export function pondBinaryPath(
+  binaryPath: string | undefined,
+): { path: string } | { error: string } {
   try {
-    return resolvePondBinary(binaryPath);
-  } catch {
-    return undefined;
+    return { path: resolvePondBinary(binaryPath) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -171,6 +180,11 @@ export class PondController {
       clearTimeout(this.restartTimer);
       this.restartTimer = undefined;
     }
+    // A dial in flight has already spawned the child but has not yet assigned
+    // the client, so closing now would be a no-op and the child would outlive
+    // the session. Let it finish (it re-checks `stopped` and closes itself),
+    // then close whatever it left.
+    await this.starting?.catch(() => {});
     await this.client.close();
   }
 
@@ -201,6 +215,12 @@ export class PondController {
       // Probe the handshake so a dead transport fails here, not on first tool
       // call. A source-less pond is NOT a dial failure: `pond serve` starts and
       // lists tools regardless; bootstrap/sync WARN logs name the fix.
+      // The session can end during the dial; the child exists by now, so this
+      // is the point that must notice and reap it.
+      if (this.stopped) {
+        await this.client.close().catch(() => {});
+        return;
+      }
       await this.client.listToolNames({ timeoutMs: DIAL_TIMEOUT_MS });
       this.attempt = 0;
       this.onState("connected");
@@ -263,7 +283,7 @@ export class PondController {
       return;
     }
     this.logger.warn("pond connection closed; scheduling reconnect.");
-    void this.client.close();
+    void this.client.close().catch(() => {});
     this.onState("reconnecting");
     this.scheduleRestart();
   }

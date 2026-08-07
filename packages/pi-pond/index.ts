@@ -43,8 +43,11 @@ export default function piPond(pi: ExtensionAPI): void {
   const config = loadPondConfig();
   // In url mode the binary is someone else's problem; in managed mode a missing
   // pond means no tools at all - a tool that always errors is worse AX than no
-  // tool - and exactly one notify naming the install fix.
-  const binary = config.mode === "url" ? "pond" : pondBinaryPath(config.binaryPath);
+  // tool - and exactly one notify carrying the REASON (a wrong configured
+  // binaryPath needs a different fix than a missing install).
+  const resolved = config.mode === "url" ? { path: "pond" } : pondBinaryPath(config.binaryPath);
+  const binary = "path" in resolved ? resolved.path : undefined;
+  const unavailable = "error" in resolved ? resolved.error : undefined;
   // The session's UI, captured for the footer. Held only between session_start
   // and session_shutdown, which is exactly the controller's own lifetime.
   let ui: ExtensionContext["ui"] | undefined;
@@ -67,7 +70,7 @@ export default function piPond(pi: ExtensionAPI): void {
     if (!binary) {
       // Fire-and-forget, once per session, and nothing else breaks: pi works
       // normally without pond.
-      ctx.ui.notify(`pond not found - ${INSTALL_HINT}`, "warning");
+      ctx.ui.notify(unavailable ?? `pond not found - ${INSTALL_HINT}`, "warning");
       return;
     }
     ui = ctx.ui;
@@ -89,7 +92,7 @@ export default function piPond(pi: ExtensionAPI): void {
     description: "Search past agent sessions; resume one here or insert a reference to it",
     handler: async (args, ctx) => {
       if (!binary) {
-        ctx.ui.notify(`pond not found - ${INSTALL_HINT}`, "warning");
+        ctx.ui.notify(unavailable ?? `pond not found - ${INSTALL_HINT}`, "warning");
         return;
       }
       await runPondCommand(pi, ctx, args, controller, binary);
@@ -131,11 +134,17 @@ async function maybeAskForCapture(
     return;
   }
   if (configured.length === 0) {
-    // `--bootstrap pi-coding-agent` handles this on the next tool call.
+    // `--bootstrap pi-coding-agent` handles this on the next tool call, and it
+    // will leave the adapter enabled - so this is not yet a settled answer and
+    // deliberately stays unrecorded.
     return;
   }
   const entry = configured.find((candidate) => candidate.name === ADAPTER);
   if (entry?.enabled === true) {
+    // Already capturing pi - the question is answered. Record it, or every
+    // interactive session start pays another `pond adapters list` subprocess
+    // to re-learn the same thing, forever.
+    recordCaptureConsent("granted");
     return;
   }
 

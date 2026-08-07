@@ -27,10 +27,6 @@ export function piAgentDir(home: string = homedir()): string {
   return join(home, ".pi", "agent");
 }
 
-export function piSessionsRoot(home: string = homedir()): string {
-  return join(piAgentDir(home), "sessions");
-}
-
 export function configPath(home: string = homedir()): string {
   return join(piAgentDir(home), "pond-pi.json");
 }
