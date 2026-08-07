@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/tenequm/pond/compare/v0.14.4...v0.14.5) - 2026-08-07
+
+### <!-- 5 -->📚 Documentation
+- add server.json and MCP Registry name for official registry publishing ([59c926a](https://github.com/tenequm/pond/commit/59c926a9dcd8e6fd74345fc74d5daef6fcaba46e))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.4...v0.14.5
+
 ## [0.14.4](https://github.com/tenequm/pond/compare/v0.14.3...v0.14.4) - 2026-07-30
 
 ### <!-- 2 -->🐛 Bug Fixes
