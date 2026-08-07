@@ -1060,6 +1060,14 @@ fn try_raise_fd_limit(_target: u64) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    unsafe {
+        // Rust ignores SIGPIPE at startup; restore the Unix default so a closed
+        // pipe exits quietly instead of panicking inside clap_complete's unwrap.
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
