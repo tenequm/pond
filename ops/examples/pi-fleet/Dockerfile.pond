@@ -1,0 +1,27 @@
+# A pond image for the example, built from the released Linux binary - the
+# GitHub release is pond's sole binary host, so this uses the same artifact a
+# user would install. Building from source instead would mean a Rust + candle
+# compile on every `docker compose up`.
+FROM debian:bookworm-slim
+
+ARG POND_VERSION=latest
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl xz-utils jq; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) target=x86_64-unknown-linux-gnu ;; \
+      arm64) target=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    if [ "$POND_VERSION" = "latest" ]; then \
+      base=https://github.com/tenequm/pond/releases/latest/download; \
+    else \
+      base="https://github.com/tenequm/pond/releases/download/v${POND_VERSION}"; \
+    fi; \
+    curl -fsSL "${base}/pond-${target}.tar.xz" -o /tmp/pond.tar.xz; \
+    tar -xJf /tmp/pond.tar.xz -C /usr/local/bin pond; \
+    rm /tmp/pond.tar.xz; \
+    pond --version
+
+ENTRYPOINT ["pond"]
