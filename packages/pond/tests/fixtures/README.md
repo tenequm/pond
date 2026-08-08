@@ -371,7 +371,9 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
     and any diff is a real format change.
   - Torn tails and unknown future mutation kinds are NOT committed as fixtures:
     both are derived in-test from a copy of the v4 file, which keeps the
-    round-trip corpus exactly the set of files native restore must reproduce.
+    round-trip corpus exactly the set of files the codec must reproduce.
+    (Codec replay is asserted for every format; `pond resume` deliberately
+    emits v3 for all of them - see the adapter header for why.)
 
 ## Cross-platform schema variation
 

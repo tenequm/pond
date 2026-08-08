@@ -141,10 +141,12 @@ async fn native_resume_writes_a_pi_session_file_for_the_whole_lineage() {
         "got {ids:?}"
     );
 
-    // spec.md#adapter-native-restore-lossless: same origin, so the system
-    // decides native - the caller never asked for a fidelity.
+    // spec.md#adapter-native-restore-lossless: fidelity is the system's call and
+    // it is reported honestly. These fixtures are v4-origin, and resume emits
+    // the v3 pi can actually open, so a value-complete replay is impossible -
+    // "foreign" is the truthful answer, not a bug.
     for entry in doc["sessions"].as_array().expect("sessions array") {
-        assert_eq!(entry["actual_fidelity"], "native", "{entry}");
+        assert_eq!(entry["actual_fidelity"], "foreign", "{entry}");
     }
 
     for path in files_of(&doc, PI_SESSION) {
@@ -168,8 +170,10 @@ async fn native_resume_writes_a_pi_session_file_for_the_whole_lineage() {
                 .expect("resumed file has a header"),
         )
         .expect("header parses");
-        assert_eq!(head["kind"], "header");
-        assert_eq!(head["version"], 4, "a v4-origin session resumes as v4");
+        // v3, not the v4 it was captured from: a byte-faithful file pi refuses
+        // to load is not a restore (pi 0.84.1 rejects v4 outright).
+        assert_eq!(head["type"], "session");
+        assert_eq!(head["version"], 3, "resume emits the format pi can open");
     }
 }
 

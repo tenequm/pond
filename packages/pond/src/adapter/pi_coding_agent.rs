@@ -29,22 +29,26 @@
 //! collapsed into `parent_message_id` but preserved verbatim in
 //! `options.source.raw_record` for a future branching consumer.
 //!
-//! Resume (`pond resume --to pi-coding-agent`, the adapter serialize face):
-//! native replays the stored `raw_record` rows verbatim, so a v3-origin session
-//! resumes as v3 and a v4- or SQLite-origin session resumes as a v4 `.jsonl`
-//! (a file is the portable artifact - writing into a live pi database from
-//! outside would race its writer lease). Foreign sessions - including
-//! v3-origin pi sessions asked for a value-complete replay they cannot serve -
-//! are reconstructed as **v3**, because v3 is what every shipped pi loads and
-//! harness-v2 guarantees read-only v3 normalization. Revisit when pi ships v4
-//! as its default write format.
+//! Resume (`pond resume --to pi-coding-agent`, the adapter serialize face)
+//! emits **v3, always** - the only format a released pi can open. A v3-origin
+//! session replays its stored rows verbatim and reports `Native`; a v4- or
+//! SQLite-origin session is reconstructed as v3 and reports `Foreign`, because
+//! a byte-faithful v4 file that pi refuses to load is not a restore. Verified,
+//! not assumed: pi 0.84.1 answers a v4 file with "Session file is not a valid
+//! pi session". The verbatim replay still exists - `replay_source_rows` - and
+//! the round-trip conformance tests assert it for every format; it is only not
+//! what resume hands out. (A file is also the portable artifact for a
+//! SQLite-origin session: writing into a live pi database from outside would
+//! race its writer lease.)
 //!
 //! Format watch: harness-v2's v3-normalization work packages (J4/J5) and the
 //! coding-agent migration were unfinished at pi commit `6fb2d766a` (0.84.1), so
-//! v4 and SQLite are real and testable but not yet what a released pi writes by
-//! default. On each pi release until then: `git -C ~/pjv/earendil-works/pi pull`,
-//! re-run `tests/fixtures/adapter/pi-coding-agent/generate-v4-fixtures.mjs`, and
-//! diff against the committed fixtures. A diff is scheduled maintenance.
+//! v4 and SQLite are real and testable but not yet what a released pi writes -
+//! or reads. On each pi release: `git -C ~/pjv/earendil-works/pi pull`, re-run
+//! `tests/fixtures/adapter/pi-coding-agent/generate-v4-fixtures.mjs`, and diff
+//! against the committed fixtures. A diff is scheduled maintenance. The trigger
+//! for making resume emit v4 is pi being able to READ v4, which is a strictly
+//! later event than pi writing it.
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +84,12 @@ const NAME: &str = "pi-coding-agent";
 /// other version is a visible, counted skip that names the file - never a
 /// half-understood ingest.
 const SUPPORTED_JSONL_VERSION: i64 = 4;
+
+/// The shipped pi session format: what every released pi writes AND, more to the
+/// point, the only one it can read. Resume targets it (see `serialize_session`),
+/// and a session whose `options` never recorded a format is one of these - the
+/// field postdates the v3-only adapter.
+const V3_FORMAT: i64 = 3;
 
 /// Stateless factory: opens [`PiCodingAgentAdapter`] instances and probes for the
 /// canonical install location under `~/.pi/agent/sessions`.
@@ -123,58 +133,67 @@ struct PiCodingAgentConfig {
 
 // -- Serialize (the `pond resume` face) -------------------------------------
 
+/// Verbatim replay of the stored source rows in source order: the header line
+/// first, then one per message. This is the CODEC's round-trip face
+/// (spec.md#adapter-native-restore-lossless) - it reproduces whatever format the
+/// session was captured from, and the conformance tests assert byte-value
+/// equality against the fixtures through it.
+///
+/// It is deliberately NOT what `serialize` hands back for every session; see
+/// the note there. Replay echoes a frozen snapshot, safe only while canonical is
+/// append-only (spec.md#adapter-integrity-additive-sync). `None` when the
+/// session carries no stored `raw_record` and so cannot be replayed at all.
+fn replay_source_rows(session: &crate::sessions::SessionWithMessages) -> Option<Vec<Value>> {
+    let mut records = vec![raw_record(&session.session.options)?];
+    // Sort message references rather than cloning the whole vec; restore is a
+    // hot path when users resume large sessions.
+    let mut messages: Vec<&crate::sessions::MessageWithParts> = session.messages.iter().collect();
+    messages.sort_by(|left, right| {
+        source_line(left.message.options())
+            .cmp(&source_line(right.message.options()))
+            .then_with(|| by_timestamp_then_id(left, right))
+    });
+    for message in messages {
+        records.push(raw_record(message.message.options())?);
+    }
+    Some(records)
+}
+
 fn serialize_session(
     session: &crate::sessions::SessionWithMessages,
     fidelity: RestoreFidelity,
 ) -> Result<Vec<RestoredFile>, AdapterError> {
-    // Native replays the verbatim `options.source.raw_record` rows (the header
-    // line first, then one per message in source order) - so the emitted file
-    // is in whatever format the session was captured from. `pi_record` below is
-    // the foreign-only v3 reconstruction. Replay echoes a frozen snapshot -
-    // safe only while canonical is append-only
-    // (spec.md#adapter-integrity-additive-sync).
+    // Resume emits what the pi you are running can actually OPEN, which is v3.
     //
-    // spec.md#adapter-native-restore-lossless: if Native is requested but the
-    // session has no stored `raw_record`, we downgrade to foreign and stamp
-    // `actual_fidelity` so the caller can signal the downgrade. Mirrors
-    // opencode's behavior - both adapters serve the best they can and tell
-    // the truth about what they served.
-    let session_raw = raw_record(&session.session.options);
-    let actual = match fidelity {
-        RestoreFidelity::Native if session_raw.is_some() => RestoreFidelity::Native,
-        _ => RestoreFidelity::Foreign,
-    };
-
-    let mut records = Vec::new();
-    if actual == RestoreFidelity::Native {
-        records.push(session_raw.unwrap_or_else(|| pi_session_record(session)));
-    } else {
-        records.push(pi_session_record(session));
+    // A verbatim v4 replay is byte-faithful and useless: pi 0.84.1 rejects a v4
+    // file with "Session file is not a valid pi session" (verified against a
+    // real install), because no released pi reads v4 yet - it still writes v3.
+    // A losslessly-replayed file the client refuses to load is not a restore, so
+    // a v4- or SQLite-origin session is reconstructed as v3 and reports
+    // `actual_fidelity: Foreign` - the honest downgrade
+    // (spec.md#adapter-native-restore-lossless) rather than a silent one.
+    //
+    // The v4 replay itself is not lost: `replay_source_rows` keeps it, and the
+    // round-trip conformance tests still assert it byte-for-byte. Flip this back
+    // to native replay when pi can READ v4, not merely when it writes it - the
+    // format watch in the module header is the trigger.
+    let native_replayable =
+        session_format(&session.session) == V3_FORMAT && fidelity == RestoreFidelity::Native;
+    if native_replayable && let Some(records) = replay_source_rows(session) {
+        return Ok(vec![RestoredFile::new(
+            pi_relative_path(session),
+            jsonl_bytes(NAME, &records)?,
+            RestoreFidelity::Native,
+        )]);
     }
 
-    // Sort message references rather than cloning the whole vec; restore is a
-    // hot path when users resume large sessions.
+    let mut records = vec![pi_session_record(session)];
     let mut messages: Vec<&crate::sessions::MessageWithParts> = session.messages.iter().collect();
-    if actual == RestoreFidelity::Native {
-        messages.sort_by(|left, right| {
-            source_line(left.message.options())
-                .cmp(&source_line(right.message.options()))
-                .then_with(|| by_timestamp_then_id(left, right))
-        });
-    } else {
-        messages.sort_by(|left, right| by_timestamp_then_id(left, right));
-    }
-
-    for message in &messages {
-        if actual == RestoreFidelity::Native
-            && let Some(raw) = raw_record(message.message.options())
-        {
-            records.push(raw);
-            continue;
-        }
-        // Foreign restore: a System carrier (a model/compaction record, or any
-        // harness-v2 orchestration mutation) has no idiomatic home in another
-        // client's transcript - drop it; the content stays in canonical
+    messages.sort_by(|left, right| by_timestamp_then_id(left, right));
+    for message in messages {
+        // A System carrier (a model/compaction record, or any harness-v2
+        // orchestration mutation) has no idiomatic home in a v3 transcript -
+        // drop it; the content stays in canonical
         // (spec.md#adapter-native-restore-lossless, foreign clause).
         if matches!(message.message, Message::System { .. }) {
             continue;
@@ -185,7 +204,7 @@ fn serialize_session(
     Ok(vec![RestoredFile::new(
         pi_relative_path(session),
         jsonl_bytes(NAME, &records)?,
-        actual,
+        RestoreFidelity::Foreign,
     )])
 }
 
@@ -232,7 +251,7 @@ fn encode_project(project: &str) -> String {
 fn pi_session_record(session: &crate::sessions::SessionWithMessages) -> Value {
     json!({
         "type": "session",
-        "version": 3,
+        "version": V3_FORMAT,
         "id": session.session.id,
         "timestamp": session.session.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "cwd": &*session.session.project,
@@ -526,7 +545,7 @@ fn session_format(session: &Session) -> i64 {
         .get("source")
         .and_then(|source| source.get("format"))
         .and_then(Value::as_i64)
-        .unwrap_or(3)
+        .unwrap_or(V3_FORMAT)
 }
 
 fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError> {
@@ -610,7 +629,7 @@ fn v3_session_from_row(
         "source".to_owned(),
         json!({
             "adapter": NAME,
-            "format": 3,
+            "format": V3_FORMAT,
             "version": row.get("version"),
             "project_slug": placement.project_slug,
             "file_name": placement.file_name,
@@ -1520,19 +1539,101 @@ mod tests {
         )
     }
 
+    /// Codec round-trip (spec.md#adapter-native-restore-lossless): every stored
+    /// session replays back to its source file, value-for-value, in EVERY
+    /// format - v3 and v4 alike.
+    ///
+    /// Asserted through `replay_source_rows` rather than through `serialize`,
+    /// because those two deliberately differ for pi: resume emits v3 for a
+    /// v4-origin session (see `serialize_session`), while the codec must still
+    /// reproduce the v4 bytes it read. The shared `assert_native_restore`
+    /// helper conflates the two, so pi spells it out.
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
-        let adapter = PiCodingAgentAdapter::new(FIXTURES);
-        crate::adapter::test_support::assert_native_restore(
-            &PiCodingAgentFactory,
-            &adapter,
-            // pi-coding-agent relative paths embed the `sessions/` segment, so the corpus
-            // root is FIXTURES' parent, not FIXTURES itself.
-            std::path::Path::new(FIXTURES)
-                .parent()
-                .expect("FIXTURES is nested under a corpus root"),
-        )
-        .await
+    async fn codec_replays_every_fixture_back_to_its_source_bytes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _) =
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+        // pi relative paths embed the `sessions/` segment, so the corpus root is
+        // FIXTURES' parent, not FIXTURES itself.
+        let corpus = Path::new(FIXTURES)
+            .parent()
+            .expect("FIXTURES is nested under a corpus root");
+
+        let mut replayed = std::collections::BTreeSet::new();
+        for session_id in store.session_ids().await? {
+            let session = store
+                .get_session(&session_id)
+                .await?
+                .expect("session round-trips");
+            let records =
+                replay_source_rows(&session).expect("a fixture session carries its source rows");
+            let relative = pi_relative_path(&session);
+            let expected = std::fs::read_to_string(corpus.join(&relative))?;
+            let expected: Vec<Value> = expected
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                records,
+                expected,
+                "replay mismatch at {}",
+                relative.display()
+            );
+            replayed.insert(relative);
+        }
+
+        let mut on_disk = std::collections::BTreeSet::new();
+        for dir in std::fs::read_dir(FIXTURES)? {
+            for file in std::fs::read_dir(dir?.path())? {
+                let path = file?.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    on_disk.insert(path.strip_prefix(corpus)?.to_path_buf());
+                }
+            }
+        }
+        assert_eq!(
+            replayed, on_disk,
+            "every fixture file must be covered by exactly one replayed session",
+        );
+        Ok(())
+    }
+
+    /// Resume hands pi a file pi can OPEN. v3-origin replays verbatim and says
+    /// `Native`; v4-origin is rebuilt as v3 and says `Foreign` - honest about
+    /// the downgrade rather than shipping bytes pi rejects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_emits_v3_for_every_origin_and_reports_the_downgrade() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _) =
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+
+        for (session_id, expected_fidelity) in [
+            // Captured from v4, so a value-complete replay is impossible in a
+            // format pi reads.
+            (V4_SESSION, RestoreFidelity::Foreign),
+            // A v3-origin session replays exactly.
+            (
+                "019dd55d-99a4-7344-aa11-d1d71d2c80fb",
+                RestoreFidelity::Native,
+            ),
+        ] {
+            let session = store
+                .get_session(session_id)
+                .await?
+                .unwrap_or_else(|| panic!("{session_id} lands"));
+            let files = PiCodingAgentFactory.serialize(&session, RestoreFidelity::Native)?;
+            let file = files.first().expect("one file per session");
+            assert_eq!(
+                file.actual_fidelity, expected_fidelity,
+                "{session_id} fidelity",
+            );
+            let head: Value =
+                serde_json::from_str(std::str::from_utf8(&file.bytes)?.lines().next().unwrap())?;
+            assert_eq!(head.get("type"), Some(&json!("session")), "{session_id}");
+            assert_eq!(head.get("version"), Some(&json!(3)), "{session_id}");
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2075,29 +2176,6 @@ mod tests {
         Ok(())
     }
 
-    /// Foreign resume targets v3: it is what every shipped pi loads, so a
-    /// session that cannot be replayed verbatim is reconstructed as v3 rather
-    /// than as a format no released pi reads.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn foreign_resume_of_a_v4_session_emits_v3() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
-        let session = store
-            .get_session(V4_SESSION)
-            .await?
-            .expect("v4 fixture session lands");
-
-        let files = PiCodingAgentFactory.serialize(&session, RestoreFidelity::Foreign)?;
-        let file = files.first().expect("one file per session");
-        assert_eq!(file.actual_fidelity, RestoreFidelity::Foreign);
-        let head: Value =
-            serde_json::from_str(std::str::from_utf8(&file.bytes)?.lines().next().unwrap())?;
-        assert_eq!(head.get("type"), Some(&json!("session")));
-        assert_eq!(head.get("version"), Some(&json!(3)));
-        Ok(())
-    }
-
     // -- harness-v2: SQLite backend ------------------------------------------
 
     const SQLITE_DB: &str = concat!(
@@ -2182,11 +2260,12 @@ mod tests {
         Ok(())
     }
 
-    /// A SQLite-origin session has no source file, so native resume writes the
-    /// portable artifact: a v4 `.jsonl` pi can load. Round-tripping it back
-    /// through the JSONL reader is the conformance check.
+    /// A SQLite-origin session has no source file, so resume writes the portable
+    /// artifact - and it is a v3 `.jsonl`, not v4, because that is the format pi
+    /// can open. Round-tripping it back through the JSONL reader is the
+    /// conformance check.
     #[tokio::test(flavor = "multi_thread")]
-    async fn sqlite_native_resume_emits_a_loadable_v4_jsonl() -> anyhow::Result<()> {
+    async fn sqlite_resume_emits_a_v3_jsonl_pi_can_open() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let adapter = sqlite_only_adapter(&temp)?;
         let (store, _) = ingest_into_temp_store(&temp, &adapter).await?;
@@ -2197,7 +2276,11 @@ mod tests {
 
         let files = PiCodingAgentFactory.serialize(&session, RestoreFidelity::Native)?;
         let file = files.first().expect("one file per session");
-        assert_eq!(file.actual_fidelity, RestoreFidelity::Native);
+        assert_eq!(
+            file.actual_fidelity,
+            RestoreFidelity::Foreign,
+            "a database-origin session cannot replay into a format pi reads",
+        );
         assert_eq!(
             file.relative_path,
             Path::new("sessions")
@@ -2207,8 +2290,8 @@ mod tests {
         );
         let head: Value =
             serde_json::from_str(std::str::from_utf8(&file.bytes)?.lines().next().unwrap())?;
-        assert_eq!(head.get("kind"), Some(&json!("header")));
-        assert_eq!(head.get("version"), Some(&json!(4)));
+        assert_eq!(head.get("type"), Some(&json!("session")));
+        assert_eq!(head.get("version"), Some(&json!(3)));
 
         let restored_root = temp.path().join("pi-home");
         crate::adapter::write_restored_files(&restored_root, files)?;
@@ -2228,7 +2311,17 @@ mod tests {
             .expect("the resumed file reads back as the same session");
         assert_eq!(round_tripped.session.project, session.session.project);
         assert_eq!(round_tripped.session.created_at, session.session.created_at);
-        assert_eq!(round_tripped.messages.len(), session.messages.len());
+        // The conversation survives; the orchestration carriers do not, which is
+        // what a v3 transcript can express (the full record stays in canonical).
+        let conversational = |session: &crate::sessions::SessionWithMessages| {
+            session
+                .messages
+                .iter()
+                .filter(|stored| !matches!(stored.message, Message::System { .. }))
+                .count()
+        };
+        assert_eq!(conversational(&round_tripped), conversational(&session));
+        assert!(conversational(&session) > 0, "the fixture has conversation");
         Ok(())
     }
 
