@@ -48,6 +48,7 @@ adapter/
   codex_cli/                 OpenAI Codex CLI
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
+  oh-my-pi/                  oh-my-pi (`omp`), a pi fork with its own sessions root
   openclaw/                  openclaw runtime
   opencode/                  opencode CLI
   pi-coding-agent/           pi-coding-agent CLI
@@ -374,6 +375,35 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
     round-trip corpus exactly the set of files the codec must reproduce.
     (Codec replay is asserted for every format; `pond resume` deliberately
     emits v3 for all of them - see the adapter header for why.)
+
+### oh-my-pi (`omp`)
+
+- Source path: `~/.omp/agent/sessions/<bucket>/<timestamp>_<sessionId>.jsonl`, where
+  `<bucket>` is scope-encoded from the cwd: `-<home-relative>` under `$HOME`,
+  `-tmp-<rel>` under the temp root, else `--<encoded-absolute>--`. (A hashed
+  `<scope>-<basename>-<sha256>` form exists in the wild from omp 17.2.5-17.2.8,
+  which reverted it; omp migrates those dirs back into the encoded name.)
+- Layout: a pi fork that kept pi's version-3 record model, so the entries are pi
+  v3 (`{type:"session", id, timestamp, cwd}` header, then `message` and
+  state-carrier entries chained by `id` / `parentId`). Two container differences
+  matter: the bucket directory is scope-encoded rather than pi's always-absolute
+  `--<encoded-cwd>--` slug, and current files begin with a fixed-width **256-byte
+  `{"type":"title","v":1,...}` slot** whose line precedes the session header.
+  omp's loader strips that slot and folds it into the logical header, and so does
+  the adapter (into `options.source.title_slot`).
+- Samples: 2 slot-fronted sessions (one carrying the opaque `parentSession`
+  lineage marker, an omp-only `ttsr_injection` entry, a `blob:sha256:` image ref,
+  and a `model_change` / `branch_summary` carrier) plus 1 legacy slot-less file.
+- Regenerate with `oh-my-pi/generate-fixtures.mjs`, whose header comment carries
+  the exact invocation and the omp version last used. It imports omp's OWN
+  `serializeTitleSlot`, so the slot bytes are omp's, and a slot-shape change
+  shows up as a fixture diff. omp ships raw TypeScript with extensionless
+  imports, so the script runs under **bun** (omp's own runtime), not plain node -
+  the script's header says the same, so the two cannot drift. Timestamps and ids
+  are literal, so a re-run on an unchanged omp is byte-identical. The bucket
+  directory name is the home-scope encoded form omp writes for
+  `/Users/user/Projects/omp-demo`; the adapter treats it as an inert placement
+  hint either way.
 
 ## Cross-platform schema variation
 

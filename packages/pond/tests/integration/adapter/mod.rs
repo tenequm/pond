@@ -22,6 +22,7 @@ use tempfile::TempDir;
 mod claude_code;
 mod hermes;
 mod nanoclaw;
+mod oh_my_pi;
 mod openclaw;
 mod opencode;
 

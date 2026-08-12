@@ -44,7 +44,7 @@ where we left off yesterday - check pond, then continue
 are you sure that won't break X? check in pond how we struggled with exactly this
 ```
 
-Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, **pi-coding-agent**, **OpenClaw**, **NanoClaw**, and **Hermes Agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
+Sessions are picked up automatically from **Claude Code**, the **Claude desktop app** (local agent mode), **Codex CLI**, **opencode**, **pi-coding-agent**, **oh-my-pi**, **OpenClaw**, **NanoClaw**, and **Hermes Agent**. A Claude.ai data export imports with `pond sync claude-ai-export --path <path>` (manual download, so not auto-discovered).
 
 ## Isn't this another memory tool?
 
@@ -209,7 +209,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 | [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `packages/pond/tests/fixtures/adapter/` | Session samples for ten source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, hermes, nanoclaw, openclaw, opencode, pi-coding-agent; real captures except the synthetic hermes `state.db`). Drives adapter design and serves as adapter test fixtures. |
+| `packages/pond/tests/fixtures/adapter/` | Session samples for eleven source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, hermes, nanoclaw, oh-my-pi, openclaw, opencode, pi-coding-agent; real captures except the synthetic hermes `state.db` and the generated oh-my-pi corpus). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

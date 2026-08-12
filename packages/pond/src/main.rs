@@ -1766,6 +1766,17 @@ async fn run_resume(
         );
     };
 
+    // An ingest-only client is unanswerable, not a failed write: ask before
+    // planning so the caller gets exit 2 and a document rather than a serialize
+    // error surfacing as the generic exit 1.
+    if let Some(reason) = factory.restore_unsupported() {
+        return fail(
+            2,
+            serde_json::json!({"error": "restore_unsupported", "adapter": to, "reason": reason}),
+            reason.to_owned(),
+        );
+    }
+
     let loaded = Config::load(config_path(config))?;
     let (_, store) = open_store(storage_path, &loaded, false, false).await?;
 

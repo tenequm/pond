@@ -85,7 +85,10 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
     fn root(&self) -> &Path;
 
     /// Session id for the freshness gate, from a file's raw first non-empty
-    /// line; `None` disables the skip for that file.
+    /// line; `None` disables the skip for that file. An implementor whose first
+    /// line is container framing rather than the session head may read further
+    /// via `path` (bounded - see [`peek_nth_line`]); the alternative is a gate
+    /// that disables itself on every file of that format.
     fn peek_session_id(&self, path: &Path, first_line: &str) -> Option<String>;
 
     /// Source-side freshness verdict for a non-empty file: the latest
@@ -373,9 +376,27 @@ fn peek_head<D: JsonlTree>(driver: &D, path: &Path) -> FileHead {
 /// First non-empty line of `path`, read bounded so a pathological first line
 /// cannot blow up the cheap freshness peek. Any io error yields `None`.
 pub(crate) fn peek_first_line(path: &Path) -> Option<String> {
+    peek_nth_line(path, 1)
+}
+
+/// `n`th non-empty line of `path` (1-based), bounded like [`peek_first_line`].
+/// Formats whose physical first line is container framing rather than the
+/// session head need the line behind it to answer the freshness peek at all.
+///
+/// `n = 0` names no line and answers `None` without reading: the counter is
+/// 1-based, so scanning would run to EOF - a whole-file read for a null answer
+/// on the multi-GB transcripts this peek exists to avoid touching.
+pub(crate) fn peek_nth_line(path: &Path, n: usize) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
     let mut reader = BufReader::new(std::fs::File::open(path).ok()?);
+    let mut seen = 0;
+    // One buffer for the whole scan: every line before the target is read and
+    // discarded, so allocating per line would charge the caller for skipping.
+    let mut buf = Vec::new();
     loop {
-        let mut buf = Vec::new();
+        buf.clear();
         let read = (&mut reader)
             .take(RECORD_CAP as u64)
             .read_until(b'\n', &mut buf)
@@ -386,7 +407,10 @@ pub(crate) fn peek_first_line(path: &Path) -> Option<String> {
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        return Some(String::from_utf8_lossy(&buf).into_owned());
+        seen += 1;
+        if seen == n {
+            return Some(String::from_utf8_lossy(&buf).into_owned());
+        }
     }
 }
 

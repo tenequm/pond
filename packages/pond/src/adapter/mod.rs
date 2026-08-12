@@ -35,6 +35,7 @@ pub mod extract;
 mod hermes;
 mod jsonl;
 mod nanoclaw;
+mod oh_my_pi;
 mod openclaw;
 mod opencode;
 mod pi_coding_agent;
@@ -54,6 +55,7 @@ pub use extract::{
 };
 pub use hermes::{HermesAdapter, HermesFactory};
 pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
+pub use oh_my_pi::{OhMyPiAdapter, OhMyPiFactory};
 pub use openclaw::{
     EraseTarget, OpenClawAdapter, OpenClawFactory, PreserveNote, ReconciliationReport,
 };
@@ -82,6 +84,18 @@ pub trait AdapterFactory: Send + Sync {
     /// `env.home`; adapters with no auto-discovery rule (e.g. API adapters
     /// that need explicit creds) return `None`.
     fn probe_default(&self, env: &Env) -> Option<Value>;
+
+    /// `None` when this factory can restore; `Some(reason)` when it is
+    /// ingest-only, and the reason names the caller's alternative.
+    ///
+    /// A capability query, not a runtime failure: `pond resume` asks BEFORE it
+    /// plans a lineage, so an ingest-only client is a typed unanswerable request
+    /// (exit 2) instead of an error surfacing from [`Self::serialize`] as a
+    /// generic exit 1. The reason string lives with the adapter that owns it so
+    /// the CLI carries no per-adapter advice.
+    fn restore_unsupported(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Restore one canonical session into this adapter's native file layout.
     fn serialize(
@@ -522,6 +536,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &NanoclawFactory,
         &HermesFactory,
         &PiCodingAgentFactory,
+        &OhMyPiFactory,
     ]
 }
 

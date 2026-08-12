@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"legacy00000001","timestamp":"2026-08-12T09:00:00.000Z","cwd":"/Users/user/Projects/omp-demo"}
+{"type":"message","id":"cccc0001","parentId":null,"timestamp":"2026-08-12T09:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"legacy file, no slot"}]}}
