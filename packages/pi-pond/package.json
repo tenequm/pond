@@ -1,6 +1,6 @@
 {
   "name": "pi-pond",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Capture pi sessions into a durable pond archive and recall them from inside pi: four read-only tools (pond_search, pond_get_session, pond_get_message, pond_sql) plus a /pond search-and-resume command.",
   "type": "module",
   "license": "MIT",
