@@ -11,6 +11,7 @@ pi gets a memory that outlives the session, and pond gets a way to hand a sessio
   - `pi-pond`, the pi extension: one managed `pond serve --transport stdio --with-sync` child serves the four read-only recall tools and keeps the store synced; `/pond <query>` searches, then enter resumes a past session in place or `i` pastes a reference to it. Install with `pi install npm:pi-pond`.
   - A runnable fleet-capture example (`ops/examples/pi-fleet/`): dockerized pi workers pushing sessions to one shared S3 store, plus the deployment reference to go with it.
   - Safety fix swept in: the restore writer previously replaced its whole output root, so the first `pond resume --out-dir ~/.pi/agent` would have deleted the user's entire pi state. It now refuses to overwrite anything, ever.
+  - Both extensions are now on npm alongside this release: `pi install npm:pi-pond` (`pi-pond@0.2.0`) and `openclaw plugins install openclaw-pond` (`openclaw-pond@0.1.0`) resolve from the registry - no checkout needed.
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7
 
