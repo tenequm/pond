@@ -373,7 +373,15 @@ fn peek_head<D: JsonlTree>(driver: &D, path: &Path) -> FileHead {
 /// First non-empty line of `path`, read bounded so a pathological first line
 /// cannot blow up the cheap freshness peek. Any io error yields `None`.
 pub(crate) fn peek_first_line(path: &Path) -> Option<String> {
+    peek_nth_line(path, 1)
+}
+
+/// `n`th non-empty line of `path` (1-based), bounded like [`peek_first_line`].
+/// Formats whose physical first line is container framing rather than the
+/// session head need the line behind it to answer the freshness peek at all.
+pub(crate) fn peek_nth_line(path: &Path, n: usize) -> Option<String> {
     let mut reader = BufReader::new(std::fs::File::open(path).ok()?);
+    let mut seen = 0usize;
     loop {
         let mut buf = Vec::new();
         let read = (&mut reader)
@@ -386,7 +394,10 @@ pub(crate) fn peek_first_line(path: &Path) -> Option<String> {
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        return Some(String::from_utf8_lossy(&buf).into_owned());
+        seen += 1;
+        if seen == n {
+            return Some(String::from_utf8_lossy(&buf).into_owned());
+        }
     }
 }
 

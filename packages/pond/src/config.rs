@@ -217,6 +217,13 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # enabled = true
 # path = \"~/.pi/agent/sessions\"
 # sqlite_path = \"~/.pi/agent/sessions.sqlite\"
+#
+# oh-my-pi (the `omp` binary) is a separate adapter, not a path on the pi one:
+# its sessions are its own harness and carry their own source_agent.
+#
+# [adapters.oh-my-pi]
+# enabled = true
+# path = \"~/.omp/agent/sessions\"
 
 # Embeddings. Search defaults to the vector arm (matching on meaning) when the
 # store has any vectors, falling back to FTS otherwise - the model loads lazily

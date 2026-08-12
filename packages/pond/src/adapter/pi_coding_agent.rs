@@ -577,7 +577,7 @@ fn is_session_head(row: &Value) -> bool {
 
 /// A row's own event timestamp: v3 writes RFC3339 strings, v4 writes epoch
 /// milliseconds, and v4 `lane` / `fact` mutations write none.
-fn row_timestamp(row: &Value) -> Option<DateTime<Utc>> {
+pub(crate) fn row_timestamp(row: &Value) -> Option<DateTime<Utc>> {
     match row.get("timestamp") {
         Some(Value::String(text)) => DateTime::parse_from_rfc3339(text)
             .ok()
@@ -629,20 +629,28 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
             "first row must be a v3 `session` record or a v4 `header`",
         ));
     }
-    v3_session_from_row(row, &at_first, &placement)
+    v3_session_from_row(NAME, row, &at_first, &placement)
 }
 
 /// Where a JSONL session lives on disk. `None` for a SQLite-origin session,
 /// which has no source file - restore then derives pi's own naming.
 #[derive(Debug, Default, Clone)]
-struct SourcePlacement {
-    project_slug: Option<String>,
-    file_name: Option<String>,
+pub(crate) struct SourcePlacement {
+    pub(crate) project_slug: Option<String>,
+    pub(crate) file_name: Option<String>,
 }
 
 // -- v3 ---------------------------------------------------------------------
 
-fn v3_session_from_row(
+/// Map a v3 `session` header row into a canonical [`Session`].
+///
+/// `name` is the reading adapter, not a constant, because pi's v3 record model
+/// is also what its forks write: `oh-my-pi` reads its own sessions through this
+/// mapper and must stamp its OWN `source_agent` and error attribution. Every
+/// other v3 detail (the required `id` / `timestamp` / `cwd`, the `options.source`
+/// shape) is genuinely shared, so it lives here rather than being copied.
+pub(crate) fn v3_session_from_row(
+    name: &'static str,
     row: &Value,
     at_first: &str,
     placement: &SourcePlacement,
@@ -651,7 +659,7 @@ fn v3_session_from_row(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            AdapterError::schema(NAME, at_first.to_owned(), "session record missing id")
+            AdapterError::schema(name, at_first.to_owned(), "session record missing id")
         })?
         .to_owned();
     let created_at = row
@@ -661,7 +669,7 @@ fn v3_session_from_row(
         .map(|dt| dt.with_timezone(&Utc))
         .ok_or_else(|| {
             AdapterError::schema(
-                NAME,
+                name,
                 at_first.to_owned(),
                 "session record has no parseable timestamp",
             )
@@ -669,14 +677,14 @@ fn v3_session_from_row(
     let project = extract_str(row, "cwd").ok_or_else(|| {
         // spec.md#model-project-non-empty: pi always records `cwd` on the
         // session line; its absence is a malformed session, not a default.
-        AdapterError::schema(NAME, at_first.to_owned(), "session record missing cwd")
+        AdapterError::schema(name, at_first.to_owned(), "session record missing cwd")
     })?;
 
     let mut options = ProviderOptions::new();
     options.insert(
         "source".to_owned(),
         json!({
-            "adapter": NAME,
+            "adapter": name,
             "format": V3_FORMAT,
             "version": row.get("version"),
             "project_slug": placement.project_slug,
@@ -689,7 +697,7 @@ fn v3_session_from_row(
         id,
         parent_session_id: None,
         parent_message_id: None,
-        source_agent: NAME.to_owned(),
+        source_agent: name.to_owned(),
         created_at,
         project,
         options,
@@ -700,7 +708,10 @@ fn v3_session_from_row(
 /// consumed up front (eventless here); `model_change` / `thinking_level_change`
 /// / `compaction` become System carriers; `message` becomes a User / Assistant
 /// / Tool message plus its content Parts.
-fn v3_events_from_row(
+///
+/// Adapter-agnostic on purpose: every error here is a plain `String` the seam
+/// attributes to the reading adapter, so pi and its forks share one mapper.
+pub(crate) fn v3_events_from_row(
     session_id: &str,
     line: usize,
     row: &Value,

@@ -35,6 +35,7 @@ pub mod extract;
 mod hermes;
 mod jsonl;
 mod nanoclaw;
+mod oh_my_pi;
 mod openclaw;
 mod opencode;
 mod pi_coding_agent;
@@ -54,6 +55,7 @@ pub use extract::{
 };
 pub use hermes::{HermesAdapter, HermesFactory};
 pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
+pub use oh_my_pi::{OhMyPiAdapter, OhMyPiFactory};
 pub use openclaw::{
     EraseTarget, OpenClawAdapter, OpenClawFactory, PreserveNote, ReconciliationReport,
 };
@@ -522,6 +524,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &NanoclawFactory,
         &HermesFactory,
         &PiCodingAgentFactory,
+        &OhMyPiFactory,
     ]
 }
 

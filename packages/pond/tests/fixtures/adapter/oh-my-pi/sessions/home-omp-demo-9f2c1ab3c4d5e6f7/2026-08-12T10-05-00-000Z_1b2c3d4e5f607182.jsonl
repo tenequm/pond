@@ -1,0 +1,4 @@
+{"type":"title","v":1,"title":"debugger angle","source":"auto","updatedAt":"2026-08-12T10:00:00.000Z","pad":"                                                                                                                                                "}
+{"type":"session","version":3,"id":"1b2c3d4e5f607182","timestamp":"2026-08-12T10:00:00.000Z","cwd":"/Users/user/Projects/omp-demo","title":"debugger angle","titleSource":"auto","parentSession":"0a1b2c3d4e5f6071"}
+{"type":"branch_summary","id":"bbbb0001","parentId":null,"timestamp":"2026-08-12T10:05:00.000Z","fromId":"aaaa0002","summary":"abandoned the LSP tangent"}
+{"type":"message","id":"bbbb0002","parentId":"bbbb0001","timestamp":"2026-08-12T10:05:04.000Z","message":{"role":"user","content":[{"type":"text","text":"try the debugger angle instead"}]}}
