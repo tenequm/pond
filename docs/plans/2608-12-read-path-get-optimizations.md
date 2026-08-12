@@ -44,3 +44,25 @@ When the loaded map's version equals the current `messages` version (one cheap m
 ## Ship
 
 Feature branch `feat/read-performance-optimizations` -> PR -> `main`; then merge the `chore: release vX.Y.Z` PR release-plz opens (patch bump; commits are `perf:`/`docs:` types).
+
+## Session state (2026-08-12 pre-compaction checkpoint - resume here)
+
+Working tree: the `feat/read-performance-optimizations` worktree at `.claude/worktrees/feat+read-performance-optimizations`, `origin/main` (827ba3c, the pi PR) merged in. **Implementation is COMPLETE and validated locally but NOT yet committed** - src changes are uncommitted by design until the final remote verification passes.
+
+Implemented (all in working tree):
+- `rowmap.rs`: `RowMetaMap::session_id_for_message` (linear header scan, length-check first), `RowMetaMap::session_row_ids` (all roles), both mirrored on `RowMetaSet` (deltas-first for the id lookup); unit test `message_and_conversational_lookups_cover_the_chain`.
+- `sessions.rs`: `session_id_for_message` consults the map first (hit definitive - append-only + immutable ids); `session_rows_resident` (version-gated map source) feeding `conversational_rows_resident` (session_view) and `message_scan_rows_resident` (message_view; returns None for a system-role target so its `content` - absent from the map - survives via the scan). Store test `get_paths_serve_from_resident_map_and_fall_back_on_staleness` covers map/scan page equality, map id-resolution, staleness fallback (uses `ingest_events`, NOT `IngestValidator`, for the second batch - the validator enforces Session-first ordering), message_view siblings, and the system-target content fallback.
+- `main.rs`: GetSession/GetMessage/Sql now open with the disk index cache; the two gets call `load_rowmap_if_present` (installs only on exact version match - fine because sync re-extends the chain before exiting).
+
+Validation state: `cargo fmt` clean, `cargo clippy --all-targets -- -D warnings` clean, full `cargo test` green (277+32+83 tests). Remote (live store, baselines from pond 0.14.6 measured today): get-session by session id 73s -> 67/50s; by MESSAGE id 166s -> ~68s (the ~93s unindexed-id scan eliminated); get-message 153s -> ~61s; map-vs-scan CLI output **byte-identical** (probe script `get_probes_patched.sh` in the session scratchpad checks this via XDG_CACHE_HOME override). io-trace after fix A only: warm pond_get_message 10,900 -> 3,977 GETs; the message_view map path (added after that run) targets the remaining ~4k.
+
+Probe ids: session `8b7b9e47-66d2-464b-8ec6-0ad70855ff57`, message `419caaa5-13d7-448a-807c-5fb5105112a7`. Bench: `cargo bench --bench serve_mem_bench --features io-trace -- --storage-path 's3+https://nbg1.your-objectstorage.com/pondarium/pond' --io-trace`.
+
+REMAINING (in order):
+1. Collect the in-flight background run: release rebuild + probe rerun (expect get-message to drop further; equivalence must stay OK).
+2. Final io-trace run: warm `pond_get_message` GETs should collapse toward the parts-window residual (hundreds, not thousands); `pond_search` components must not regress vs (fts 32-50 / vector ~101 / search ~291-331 iops p50).
+3. Commit src + tests as `perf(read): resolve message ids and serve session pages from the resident rowmap` (user authorized ship); researches doc `docs/researches/2608-12-read-path-where-time-goes.md` rides the same PR.
+4. Push branch, open the feature PR (NOT a release PR), merge to main after CI.
+5. release-plz auto-opens `chore: release vX.Y.Z` (patch); enrich the changelog entry under the canonical headers with the measured numbers, then merge it - that merge publishes.
+
+Known follow-ups (explicitly deferred, do not fold into this PR): erase-vs-stale-map can return `internal` instead of `not_found` for <=30s in long-lived servers (downgrade in handler later); 5c parts-summary residency; FTS postings prewarm; concurrency semaphore; serve-topology recommendation (`pond serve --with-sync` + HTTP MCP registration); Lance v10 upgrade track (unblocks timestamp zonemap under DataFusion 54, COUNT(*) pushdown with stable row ids, FTS format v2 via index rebuild, `LANCE_MINIBLOCK_MAX_VALUES` for variant_data, exact-IS-NULL zonemaps).
