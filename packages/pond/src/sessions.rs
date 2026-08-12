@@ -1493,20 +1493,23 @@ impl Store {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        let source_rows = match self.conversational_rows_resident(session_id).await? {
-            Some(rows) => rows,
-            None => self.scan_conversational_messages(session_id).await?,
+        // Map-served rows keep only the conversational subset (non-empty
+        // text), matching the scan's IsNotNull(search_text) pushdown.
+        let mut rows: Vec<ScanRow> = match self.session_scan_rows_resident(session_id).await? {
+            Some(rows) => rows.into_iter().filter(|row| row.text.is_some()).collect(),
+            None => self
+                .scan_conversational_messages(session_id)
+                .await?
+                .into_iter()
+                .map(|row| ScanRow {
+                    id: row.message_id,
+                    role: row.role,
+                    timestamp: row.timestamp,
+                    text: Some(row.text.into_inner()),
+                    content: None,
+                })
+                .collect(),
         };
-        let mut rows: Vec<ScanRow> = source_rows
-            .into_iter()
-            .map(|row| ScanRow {
-                id: row.message_id,
-                role: row.role,
-                timestamp: row.timestamp,
-                text: Some(row.text.into_inner()),
-                content: None,
-            })
-            .collect();
         rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
 
         let size = |row: &ScanRow| row.text.as_deref().map_or(0, str::len);
@@ -1593,12 +1596,19 @@ impl Store {
         let Some(session) = self.find_session(&session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        let mut rows = match self
-            .message_scan_rows_resident(&session_id, message_id)
-            .await?
-        {
-            Some(rows) => rows,
-            None => self.scan_all_messages(&session_id).await?,
+        // Map-served only when the map actually holds the target and it is
+        // not a system message: a system target's `content` lives only in
+        // storage, and a version-matched map missing the target (corruption)
+        // must scan rather than answer a false NotFound.
+        let mut rows = match self.session_scan_rows_resident(&session_id).await? {
+            Some(rows)
+                if rows
+                    .iter()
+                    .any(|row| row.id == message_id && row.role != Role::System) =>
+            {
+                rows
+            }
+            _ => self.scan_all_messages(&session_id).await?,
         };
         // Siblings are always the conversational view: in carrier-heavy sessions
         // the system/tool rows would otherwise fill the whole window and push
@@ -1691,79 +1701,44 @@ impl Store {
         Ok(rows)
     }
 
-    /// A session's rows served from the resident meta map - zero object-store
-    /// reads. `None` (caller scans) unless the loaded chain covers the exact
-    /// `messages` version the cached handle serves: a stale map may never drop
-    /// a synced message from a page, and matching the handle's version gives
-    /// the map path the same read semantics as the scan it replaces
-    /// (spec.md#lance-handle-freshness). The map carries no `content`, so rows
-    /// come back with `content: None` - callers that need a system message's
-    /// content must not use a map-served row for it.
-    async fn session_rows_resident(&self, session_id: &str) -> Result<Option<Vec<RowMetaEntry>>> {
+    /// A session's rows served from the resident meta map as [`ScanRow`]s -
+    /// zero object-store reads. `None` (caller scans) unless the loaded chain
+    /// covers the exact `messages` version the cached handle serves: a stale
+    /// map may never drop a synced message from a page, and matching the
+    /// handle's version gives the map path the same read semantics as the
+    /// scan it replaces (spec.md#lance-handle-freshness). Any map anomaly -
+    /// malformed record, hydrate miss, undecodable role or timestamp - also
+    /// returns `None`, so the store scan stays the authority over a damaged
+    /// map. The map carries no `content` (only system messages have one), so
+    /// rows come back with `content: None` - callers gate on that. The
+    /// version gate assumes append-only rows; a future `pond erase` must make
+    /// this row-set-aware, not just version-aware.
+    async fn session_scan_rows_resident(&self, session_id: &str) -> Result<Option<Vec<ScanRow>>> {
         let Some(map) = self.rowmap.load_full() else {
             return Ok(None);
         };
         if map.version() != self.messages_version().await? {
             return Ok(None);
         }
-        let rowids = map.session_row_ids(session_id);
+        let Some(rowids) = map.session_row_ids(session_id) else {
+            return Ok(None);
+        };
         let (entries, misses) = map.hydrate(&rowids);
         if !misses.is_empty() {
             return Ok(None);
         }
-        Ok(Some(entries))
-    }
-
-    /// Conversational rows from the resident map: the non-empty-text subset
-    /// (storage guarantees `search_text` null-or-non-empty; the map stores
-    /// null as empty). `None` -> caller scans.
-    async fn conversational_rows_resident(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<Vec<ConversationalRow>>> {
-        let Some(entries) = self.session_rows_resident(session_id).await? else {
-            return Ok(None);
-        };
         let mut rows = Vec::with_capacity(entries.len());
         for entry in entries {
-            if entry.search_text.is_empty() {
-                continue;
-            }
-            rows.push(ConversationalRow {
-                session_id: session_id.to_owned(),
-                message_id: entry.message_id,
-                role: role_from_str(&entry.role)?,
-                timestamp: DateTime::from_timestamp_micros(entry.timestamp_micros)
-                    .context("row meta timestamp out of range")?,
-                text: SearchText(entry.search_text),
-            });
-        }
-        Ok(Some(rows))
-    }
-
-    /// `message_view`'s row source from the resident map: every session row as
-    /// a [`ScanRow`]. `None` (caller scans) when the map is unusable, or when
-    /// the target is a system message - its `content` lives only in storage,
-    /// and a map-served row would silently blank it.
-    async fn message_scan_rows_resident(
-        &self,
-        session_id: &str,
-        target_message_id: &str,
-    ) -> Result<Option<Vec<ScanRow>>> {
-        let Some(entries) = self.session_rows_resident(session_id).await? else {
-            return Ok(None);
-        };
-        let mut rows = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let role = role_from_str(&entry.role)?;
-            if entry.message_id == target_message_id && role == Role::System {
+            let Ok(role) = role_from_str(&entry.role) else {
                 return Ok(None);
-            }
+            };
+            let Some(timestamp) = DateTime::from_timestamp_micros(entry.timestamp_micros) else {
+                return Ok(None);
+            };
             rows.push(ScanRow {
                 id: entry.message_id,
                 role,
-                timestamp: DateTime::from_timestamp_micros(entry.timestamp_micros)
-                    .context("row meta timestamp out of range")?,
+                timestamp,
                 text: (!entry.search_text.is_empty()).then_some(entry.search_text),
                 content: None,
             });
@@ -1824,7 +1799,7 @@ impl Store {
     /// (measured ~93 s vs resident ~50 ms on the 2.6M-row corpus).
     pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
         if let Some(map) = self.rowmap.load_full()
-            && let Some(session_id) = map.session_id_for_message(message_id)
+            && let Some(session_id) = map.lookup_session_for_message(message_id)
         {
             return Ok(Some(session_id.to_owned()));
         }
@@ -6572,7 +6547,7 @@ mod tests {
             budget_bytes: 1_000_000,
             session_from: SessionFrom::Start,
         };
-        let page_ids = |lookup: GetLookup<SessionPage>| match lookup {
+        let page_rows = |lookup: GetLookup<SessionPage>| match lookup {
             GetLookup::Found(page) => page
                 .messages
                 .iter()
@@ -6580,11 +6555,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             other => panic!("expected a page, got {other:?}"),
         };
+        let view_params = MessageViewParams {
+            context_before: 5,
+            context_after: 5,
+            budget_bytes: 1_000_000,
+        };
+        let view_rows = |lookup: GetLookup<MessagePage>| match lookup {
+            GetLookup::Found(page) => (
+                page.target.text.clone(),
+                page.siblings
+                    .iter()
+                    .map(|sibling| sibling.id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            other => panic!("expected a message page, got {other:?}"),
+        };
 
-        let scanned = page_ids(store.session_view(&session.id, params.clone()).await?);
+        let scanned = page_rows(store.session_view(&session.id, params.clone()).await?);
+        let scanned_view = view_rows(store.message_view("m2", view_params.clone()).await?);
         store.ensure_rowmap(&cache).await?;
-        let resident = page_ids(store.session_view(&session.id, params.clone()).await?);
+        let resident = page_rows(store.session_view(&session.id, params.clone()).await?);
         assert_eq!(resident, scanned, "map-served page must match the scan");
+        let resident_view = view_rows(store.message_view("m2", view_params.clone()).await?);
+        assert_eq!(
+            resident_view, scanned_view,
+            "map-served message window must match the scan"
+        );
         assert_eq!(
             store.session_id_for_message("m2").await?.as_deref(),
             Some(session.id.as_str()),
@@ -6605,7 +6601,7 @@ mod tests {
         )
         .await?;
 
-        let stale_map_page = page_ids(store.session_view(&session.id, params).await?);
+        let stale_map_page = page_rows(store.session_view(&session.id, params).await?);
         assert_eq!(stale_map_page.len(), 3, "stale map must not hide m3");
         assert_eq!(stale_map_page[2].0, "m3");
         assert_eq!(
@@ -6633,11 +6629,6 @@ mod tests {
         .await?;
         store.ensure_rowmap(&cache).await?;
 
-        let view_params = MessageViewParams {
-            context_before: 5,
-            context_after: 5,
-            budget_bytes: 1_000_000,
-        };
         let target_page = match store.message_view("m2", view_params.clone()).await? {
             GetLookup::Found(page) => page,
             other => panic!("expected a message page, got {other:?}"),

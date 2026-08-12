@@ -557,68 +557,77 @@ impl RowMetaMap {
     /// Whole-session message count for `session_id`. `None` if the session is
     /// not in this map (caller falls back to the `session_id IN (...)` scan).
     pub fn lookup_count(&self, session_id: &str) -> Option<usize> {
-        let entries = self.session_entries();
-        let idx = entries
-            .binary_search_by(|entry| self.blob_str(entry.sid_off, entry.sid_len).cmp(session_id))
-            .ok()?;
-        Some(entries[idx].count as usize)
+        let idx = self.session_index(session_id)?;
+        Some(self.session_entries()[idx].count as usize)
     }
 
     /// Max message timestamp (micros) stored for `session_id` - the watermark the
     /// sync skip oracle compares against the source's latest message timestamp.
     /// `None` if the session is not in this map.
     pub fn lookup_max_ts(&self, session_id: &str) -> Option<i64> {
-        let entries = self.session_entries();
-        let idx = entries
+        let idx = self.session_index(session_id)?;
+        Some(self.session_entries()[idx].max_ts_micros)
+    }
+
+    /// Index into `session_entries` for `session_id` - the shared binary
+    /// search behind every per-session accessor.
+    fn session_index(&self, session_id: &str) -> Option<usize> {
+        self.session_entries()
             .binary_search_by(|entry| self.blob_str(entry.sid_off, entry.sid_len).cmp(session_id))
-            .ok()?;
-        Some(entries[idx].max_ts_micros)
+            .ok()
+    }
+
+    /// A record's blob header slice. Checked so a corrupt map yields `None`
+    /// (-> caller falls back to the store), not a panic.
+    fn header_at(&self, record: &Record) -> Option<&[u8]> {
+        let base = self.blob_offset.checked_add(record.blob_off as usize)?;
+        self.mmap.get(base..base.checked_add(ROW_HEADER_LEN)?)
     }
 
     /// Resolve a message id to its session id by scanning the record headers -
-    /// resident memory only, never a store read. Linear over the segment
-    /// (length-check first, so most rows cost one integer compare); `None` is
-    /// a miss, including on a corrupt map.
-    pub fn session_id_for_message(&self, message_id: &str) -> Option<&str> {
+    /// resident memory only, never a store read. Newest rows first: recent
+    /// messages are the likely targets, and records are laid out in ascending
+    /// `row_id` order. Length-check first, so most rows cost one integer
+    /// compare. `None` is a miss, including on a corrupt map - an empty or
+    /// unresolvable session string must never suppress the store scan.
+    pub fn lookup_session_for_message(&self, message_id: &str) -> Option<&str> {
         let needle = message_id.as_bytes();
-        for record in self.records() {
-            let base = self.blob_offset.checked_add(record.blob_off as usize)?;
-            let header = self.mmap.get(base..base.checked_add(ROW_HEADER_LEN)?)?;
+        for record in self.records().iter().rev() {
+            let header = self.header_at(record)?;
             if read_u32(header, 24)? != needle.len() {
                 continue;
             }
+            let base = self.blob_offset.checked_add(record.blob_off as usize)?;
             let start = base + ROW_HEADER_LEN;
             if self.mmap.get(start..start.checked_add(needle.len())?)? == needle {
-                return Some(self.session_str(read_u32(header, 8)?));
+                let session_id = self.session_str(read_u32(header, 8)?);
+                return (!session_id.is_empty()).then_some(session_id);
             }
         }
         None
     }
 
-    /// Row ids of every `session_id` row in this segment (all roles; callers
-    /// distinguish conversational rows by the hydrated text - storage
-    /// guarantees `search_text` is null-or-non-empty and the build writes null
-    /// as empty). Empty when the session is not in this segment.
-    pub fn session_row_ids(&self, session_id: &str) -> Vec<u64> {
-        let entries = self.session_entries();
-        let Ok(session_idx) = entries
-            .binary_search_by(|entry| self.blob_str(entry.sid_off, entry.sid_len).cmp(session_id))
-        else {
-            return Vec::new();
+    /// Row ids of every `session_id` row in this segment, `Some(empty)` when
+    /// the session is not here. `None` on any malformed record: a silently
+    /// dropped row would serve an incomplete page with no fallback, so
+    /// corruption aborts the map path instead. The session entry's row count
+    /// bounds the walk - it stops at the session's last row.
+    pub fn session_row_ids(&self, session_id: &str) -> Option<Vec<u64>> {
+        let Some(session_idx) = self.session_index(session_id) else {
+            return Some(Vec::new());
         };
-        let mut out = Vec::new();
+        let count = self.session_entries()[session_idx].count as usize;
+        let mut out = Vec::with_capacity(count);
         for record in self.records() {
-            let Some(base) = self.blob_offset.checked_add(record.blob_off as usize) else {
-                continue;
-            };
-            let Some(header) = self.mmap.get(base..base + ROW_HEADER_LEN) else {
-                continue;
-            };
-            if read_u32(header, 8) == Some(session_idx) {
+            let header = self.header_at(record)?;
+            if read_u32(header, 8)? == session_idx {
                 out.push(record.row_id);
+                if out.len() == count {
+                    break;
+                }
             }
         }
-        out
+        Some(out)
     }
 
     /// Slice `len` UTF-8 bytes at `*at`, advancing `*at`. Checked so a corrupt
@@ -819,20 +828,22 @@ impl RowMetaSet {
     /// Resolve a message id to its session id, newest segment first (recent
     /// messages - the likely targets - live in the small deltas). `None` is a
     /// miss the caller resolves against the store.
-    pub fn session_id_for_message(&self, message_id: &str) -> Option<&str> {
+    pub fn lookup_session_for_message(&self, message_id: &str) -> Option<&str> {
         self.segments
             .iter()
             .rev()
-            .find_map(|seg| seg.session_id_for_message(message_id))
+            .find_map(|seg| seg.lookup_session_for_message(message_id))
     }
 
     /// A session's row ids across the chain (rows are disjoint across
-    /// segments, so this concatenates).
-    pub fn session_row_ids(&self, session_id: &str) -> Vec<u64> {
-        self.segments
-            .iter()
-            .flat_map(|seg| seg.session_row_ids(session_id))
-            .collect()
+    /// segments, so this concatenates). `None` if any segment reports a
+    /// malformed record - the caller falls back to the store.
+    pub fn session_row_ids(&self, session_id: &str) -> Option<Vec<u64>> {
+        let mut out = Vec::new();
+        for seg in &self.segments {
+            out.extend(seg.session_row_ids(session_id)?);
+        }
+        Some(out)
     }
 
     /// Every row across all segments, newest-segment-wins on `row_id`
@@ -934,19 +945,23 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(set.session_id_for_message("msg-1"), Some("sess-a"));
+        assert_eq!(set.lookup_session_for_message("msg-1"), Some("sess-a"));
         assert_eq!(
-            set.session_id_for_message("msg-9"),
+            set.lookup_session_for_message("msg-9"),
             Some("sess-a"),
             "delta hit"
         );
-        assert_eq!(set.session_id_for_message("msg-3"), Some("sess-b"));
-        assert_eq!(set.session_id_for_message("absent"), None);
+        assert_eq!(set.lookup_session_for_message("msg-3"), Some("sess-b"));
+        assert_eq!(set.lookup_session_for_message("absent"), None);
 
-        let mut ids = set.session_row_ids("sess-a");
+        let mut ids = set.session_row_ids("sess-a").expect("intact map");
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2, 9], "all roles, base and delta");
-        assert!(set.session_row_ids("missing").is_empty());
+        assert_eq!(
+            set.session_row_ids("missing").expect("intact map"),
+            Vec::<u64>::new(),
+            "absent session is empty, not a corruption signal"
+        );
     }
 
     #[test]

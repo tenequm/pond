@@ -148,6 +148,16 @@ fn default_cache_dir() -> PathBuf {
     )
 }
 
+/// Best-effort rowmap load for one-shot read commands: a warm sibling's chain
+/// makes search hydration, message-id resolution, and the get page sources
+/// resident; absent or version-mismatched chains leave the store-scan
+/// fallback in place.
+async fn load_rowmap_quietly(store: &Store) {
+    if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+        tracing::debug!(%error, "rowmap load skipped; reads fall back to store scans");
+    }
+}
+
 /// Adapter clap can call to parse `--storage-path` / `POND_STORAGE_PATH`:
 /// bare paths, `~/...`, `file://`, and the remote URL grammar
 /// (spec.md#storage-url-grammar) including the fat `s3+https://` form. The bare
@@ -1476,11 +1486,7 @@ async fn main() -> anyhow::Result<()> {
                 output(&plans)?;
                 return Ok(());
             }
-            // A warm sibling's rowmap makes hydration resident; absent one,
-            // search falls back to take_rows for this one-shot invocation.
-            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
-                tracing::debug!(%error, "rowmap load skipped; hydration uses take_rows");
-            }
+            load_rowmap_quietly(&store).await;
             let envelope =
                 handlers::pond_search(&store, &embedder, request.clone(), &loaded.search).await;
             if !render_search_envelope(format, &envelope, &request)? {
@@ -1498,11 +1504,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
-            // A warm sibling's rowmap serves the page and the message-id
-            // resolution residently; absent one, get falls back to scans.
-            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
-                tracing::debug!(%error, "rowmap load skipped; get falls back to scans");
-            }
+            load_rowmap_quietly(&store).await;
             let first_page = after_message_id.is_none() && before_message_id.is_none();
             let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1539,11 +1541,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
-            // The rowmap resolves the message id residently (the alternative is
-            // a full remote scan of the unindexed `id` column).
-            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
-                tracing::debug!(%error, "rowmap load skipped; get falls back to scans");
-            }
+            load_rowmap_quietly(&store).await;
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -2026,10 +2024,12 @@ async fn open_store(
     let storage = resolve_storage_location(explicit, loaded)?;
     let resolved = storage.resolve(&loaded.creds)?;
     warn_unmatched_sets(&[&resolved], loaded)?;
-    // The disk index cache is scoped to the read-serving commands (serve, mcp,
-    // search) - the ones that repeatedly pay the cold index load. Every other
-    // command skips it: caching their index reads buys nothing and would
-    // populate a cache they never GC (GC runs in the server's prewarm loop).
+    // The disk index cache serves every command that queries the store (serve,
+    // mcp, search, get-session, get-message, sql), so one-shot reads skip the
+    // cold S3 index load. Write/maintenance commands skip it: their index
+    // reads are one-off. The cache dir is shared per store, and the serve/mcp
+    // prewarm loop GCs superseded entries for every populator, including the
+    // one-shot commands.
     let index_cache_dir = index_cache.then(default_cache_dir);
     let store = if spinner {
         open_store_with_spinner(
