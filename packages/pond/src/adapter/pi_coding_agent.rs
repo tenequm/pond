@@ -32,7 +32,9 @@
 //! Resume (`pond resume --to pi-coding-agent`, the adapter serialize face)
 //! emits **v3, always** - the only format a released pi can open. A v3-origin
 //! session replays its stored rows verbatim and reports `Native`; a v4- or
-//! SQLite-origin session is reconstructed as v3 and reports `Foreign`, because
+//! SQLite-origin session is reconstructed as v3 and reports `Foreign` - under a
+//! file name of its own, so it never collides with the v4 source it was
+//! downgraded away from (`reconstructed_relative_path`) - because
 //! a byte-faithful v4 file that pi refuses to load is not a restore. Verified,
 //! not assumed: pi 0.84.1 answers a v4 file with "Session file is not a valid
 //! pi session". The verbatim replay still exists - `replay_source_rows` - and
@@ -72,7 +74,7 @@ use super::{
     extracted_text, is_session_fresh,
     jsonl::{
         BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, parse_bounded,
-        peek_first_line, peek_last_line, source_line,
+        peek_last_line, source_line,
     },
     jsonl_bytes, part_id, part_ordinal, raw_record,
     sqlite::{CHANNEL_CAP, ColKind, columns_sql, db_error, emit, join_error, open_db, row_to_json},
@@ -179,9 +181,12 @@ fn serialize_session(
     // format watch in the module header is the trigger.
     let native_replayable =
         session_format(&session.session) == V3_FORMAT && fidelity == RestoreFidelity::Native;
-    if native_replayable && let Some(records) = replay_source_rows(session) {
+    if native_replayable
+        && let Some(records) = replay_source_rows(session)
+        && let Some(path) = captured_relative_path(session)
+    {
         return Ok(vec![RestoredFile::new(
-            pi_relative_path(session),
+            path,
             jsonl_bytes(NAME, &records)?,
             RestoreFidelity::Native,
         )]);
@@ -202,32 +207,75 @@ fn serialize_session(
     }
 
     Ok(vec![RestoredFile::new(
-        pi_relative_path(session),
+        reconstructed_relative_path(session),
         jsonl_bytes(NAME, &records)?,
         RestoreFidelity::Foreign,
     )])
 }
 
-/// Reproduce the on-disk `sessions/<slug>/<file>.jsonl` path from the slug and
-/// file name captured at ingest. Falls back to pi's own naming scheme when a
-/// foreign or SQLite-origin session never carried them, so the emitted file
-/// lands exactly where pi's session list looks for it.
-fn pi_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
-    let source = session.session.options.get("source");
-    let slug = source
-        .and_then(|s| s.get("project_slug"))
+/// The exact `sessions/<slug>/<file>.jsonl` the session was read from, rebuilt
+/// from the slug and file name captured at ingest - `None` for a session that
+/// never carried a pi file placement (SQLite-origin, or any foreign origin).
+///
+/// This is the codec's replay destination
+/// (spec.md#adapter-native-restore-lossless) and the restore destination of a
+/// v3-origin session ONLY: there the file already at that path IS the transcript
+/// pi opens, so the no-overwrite refusal reads as "already resumed - open it".
+fn captured_relative_path(session: &crate::sessions::SessionWithMessages) -> Option<PathBuf> {
+    let slug = captured_slug(session)?;
+    let file_name = session
+        .session
+        .options
+        .get("source")?
+        .get("file_name")
+        .and_then(Value::as_str)?;
+    Some(PathBuf::from("sessions").join(slug).join(file_name))
+}
+
+/// The pi project-slug directory a session was captured from - the one place
+/// this pi-only source key is read. `None` for any session that never came from
+/// a pi file placement, which is what makes the reconstruction's
+/// [`encode_project`] fallback the explicit foreign path.
+fn captured_slug(session: &crate::sessions::SessionWithMessages) -> Option<&str> {
+    session
+        .session
+        .options
+        .get("source")?
+        .get("project_slug")
         .and_then(Value::as_str)
+}
+
+/// Where a v3 RECONSTRUCTION lands: the session's own project-slug directory,
+/// under a name derived from canonical alone
+/// (spec.md#adapter-restore-distinct-reconstruction).
+///
+/// The name deliberately differs from the captured source file name. Reusing it
+/// made every downgraded restore collide with the very file the downgrade exists
+/// to route around: `pond resume --to pi-coding-agent --out-dir ~/.pi/agent` on a
+/// locally-captured v4 session refused with "already exists" and pointed the
+/// caller back at the v4 transcript pi cannot open. `-pond-v3` marks the
+/// reconstruction as pond's own artifact instead.
+///
+/// The `_<session-id>.jsonl` tail is load-bearing twice over: the pi-pond
+/// extension picks the file to open by that suffix, and harness-v2's own
+/// existence check (`jsonl/repo.ts::sessionIdExists`) reads it the same way, so a
+/// future pi sees "this session is already here" rather than minting a duplicate.
+/// Everything before the tail is inert to pi 0.84.1 - the shipped listing and
+/// load paths filter on `.jsonl` alone and take every field from the header line
+/// (`session-manager.ts::listSessionsFromDir` / `buildSessionInfo`), so the extra
+/// segment cannot hide the file.
+///
+/// Deterministic, because `created_at` and the id are both immutable: resuming
+/// twice names the same path, so the second attempt refuses against the v3 file
+/// it wrote rather than against the source.
+fn reconstructed_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
+    let slug = captured_slug(session)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| encode_project(&session.session.project));
-    let file_name = source
-        .and_then(|s| s.get("file_name"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            let ts = session.session.created_at.format("%Y-%m-%dT%H-%M-%S-%3fZ");
-            format!("{ts}_{}.jsonl", session.session.id)
-        });
-    PathBuf::from("sessions").join(slug).join(file_name)
+    let ts = session.session.created_at.format("%Y-%m-%dT%H-%M-%S-%3fZ");
+    PathBuf::from("sessions")
+        .join(slug)
+        .join(format!("{ts}-pond-v3_{}.jsonl", session.session.id))
 }
 
 /// pi's `sessionDirectoryName` (`jsonl/repo.ts`): strip the leading separator,
@@ -481,11 +529,11 @@ impl JsonlTree for PiCodingAgentAdapter {
         }
     }
 
-    fn unsupported_reason(&self, path: &Path) -> Option<String> {
+    fn unsupported_reason(&self, path: &Path, rows: &[BoundedRow]) -> Option<String> {
         // A harness-v2 header naming a version this build does not decode is a
         // recognized-but-unsupported sidecar: a visible, counted skip that
         // names the file and the fix, never a content-borrowed id.
-        let row: Value = serde_json::from_str(&peek_first_line(path)?).ok()?;
+        let row = &rows.first()?.value;
         let version = row.get("version").and_then(Value::as_i64)?;
         (row.get("kind").and_then(Value::as_str) == Some("header")
             && version != SUPPORTED_JSONL_VERSION)
@@ -1011,18 +1059,28 @@ fn tool_result_part(session_id: &str, message_id: &str, message_value: &Value) -
 /// replays the source log in source order regardless of which format it came
 /// from.
 fn row_options(row: &Value, order: i64) -> ProviderOptions {
-    let mut options = ProviderOptions::new();
-    options.insert(
-        "source".to_owned(),
-        json!({
-            "line": order,
-            "seq": row.get("seq"),
-            "lane": row.get("lane"),
-            "parent_id": row.get("parentId"),
-            "raw_type": row.get("type"),
-            "raw_record": extract_raw_record(row),
-        }),
+    let mut source = serde_json::Map::new();
+    source.insert("line".to_owned(), json!(order));
+    // harness-v2 keys only: a v3 row carries neither, and every released pi
+    // writes v3 - inserting them unconditionally would store a null pair on
+    // every message of the whole corpus.
+    for key in ["seq", "lane"] {
+        if let Some(value) = row.get(key) {
+            source.insert(key.to_owned(), value.clone());
+        }
+    }
+    source.insert(
+        "parent_id".to_owned(),
+        row.get("parentId").cloned().unwrap_or(Value::Null),
     );
+    source.insert(
+        "raw_type".to_owned(),
+        row.get("type").cloned().unwrap_or(Value::Null),
+    );
+    source.insert("raw_record".to_owned(), extract_raw_record(row));
+
+    let mut options = ProviderOptions::new();
+    options.insert("source".to_owned(), Value::Object(source));
     options
 }
 
@@ -1055,9 +1113,9 @@ fn thinking_options(item: &Value) -> ProviderOptions {
 // One database hosts many sessions. Its `entries` / `records` / `lane_moves` /
 // `facts` rows store exactly the v4 mutation payloads, so each row is rebuilt
 // into the v4 mutation value pi itself would have written and handed to the one
-// v4 mapper - and native resume replays those values into a portable v4
-// `.jsonl` (writing into a live pi database from outside would race its
-// per-session writer lease, so that is deliberately out of scope).
+// v4 mapper. Resume then hands out a v3 `.jsonl` reconstructed from canonical -
+// the only format a released pi opens - never a write back into the database,
+// which would race its per-session writer lease.
 
 const DB_SESSION_COLUMNS: &[(&str, ColKind)] = &[
     ("id", ColKind::Str),
@@ -1096,13 +1154,16 @@ fn list_db_sessions(conn: &Connection, db_path: &Path) -> Result<Vec<DbSession>,
     Ok(out)
 }
 
-/// The four per-session mutation tables and whether their rows carry a
-/// timestamp. All four are indexed on `(session_id, seq)` by pi's own schema.
-const MUTATION_TABLES: &[(&str, bool)] = &[
-    ("entries", true),
-    ("records", true),
-    ("lane_moves", false),
-    ("facts", false),
+/// The highest-`seq` probe for each of the four per-session mutation tables,
+/// written out once instead of formatted per table per session. `lane_moves` and
+/// `facts` have no `timestamp` column, so they select a literal `NULL` to keep
+/// one row shape across all four. All four are indexed on `(session_id, seq)` by
+/// pi's own schema, so each is a plain index seek.
+const WATERMARK_SQL: &[&str] = &[
+    "SELECT seq, timestamp FROM entries WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+    "SELECT seq, timestamp FROM records WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+    "SELECT seq, NULL FROM lane_moves WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+    "SELECT seq, NULL FROM facts WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
 ];
 
 /// Timestamp of the highest-`seq` mutation, or `None` when that mutation is a
@@ -1110,18 +1171,14 @@ const MUTATION_TABLES: &[(&str, bool)] = &[
 /// reason, as the JSONL [`JsonlTree::peek_watermark`] above.
 ///
 /// One bounded `ORDER BY seq DESC LIMIT 1` per table, maxed here, rather than a
-/// `UNION ALL` the planner has to sort: each of these is a plain index seek on
-/// `(session_id, seq)`, while the union form builds a temp b-tree over every
-/// mutation the session ever recorded - on the freshness path, for sessions that
-/// have not changed.
+/// `UNION ALL` the planner has to sort: the union form builds a temp b-tree over
+/// every mutation the session ever recorded - on the freshness path, for
+/// sessions that have not changed.
 fn db_session_watermark(conn: &Connection, session_id: &str) -> Option<i64> {
     let mut best: Option<(i64, Option<String>)> = None;
-    for (table, has_timestamp) in MUTATION_TABLES {
-        let column = if *has_timestamp { "timestamp" } else { "NULL" };
+    for sql in WATERMARK_SQL {
         let row = conn
-            .prepare_cached(&format!(
-                "SELECT seq, {column} FROM {table} WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1"
-            ))
+            .prepare_cached(sql)
             .ok()?
             .query_row([session_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
@@ -1254,6 +1311,16 @@ fn read_db_session(
                 return true;
             }
         };
+    // The Session is emitted BEFORE any mutation is read, so a single bad row
+    // costs that row and nothing else. Read first and the row's error would
+    // arrive with no session in flight, which the ingest handler can only read
+    // as "this whole source is unusable" - one oversized payload would then
+    // discard an entire conversation, permanently (the JSONL reader has always
+    // dropped just the torn line).
+    emit!(
+        tx,
+        Ok(AdapterYield::Event(IngestEvent::Session(session.clone())))
+    );
     let mutations = match db_mutations(conn, db_path, &session.id) {
         Ok(mutations) => mutations,
         Err(error) => {
@@ -1261,11 +1328,14 @@ fn read_db_session(
             return true;
         }
     };
-    emit!(
-        tx,
-        Ok(AdapterYield::Event(IngestEvent::Session(session.clone())))
-    );
     for (seq, mutation) in mutations {
+        let mutation = match mutation {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                emit!(tx, Err(error));
+                continue;
+            }
+        };
         match v4_events_from_mutation(&session.id, seq, &mutation, session.created_at) {
             Ok(events) => {
                 for event in events {
@@ -1286,8 +1356,9 @@ fn read_db_session(
 }
 
 /// Rebuild the v4 header line pi's JSONL repo would have written for this
-/// database row, so the SQLite and JSONL paths share one session mapper - and
-/// so native resume emits a loadable v4 `.jsonl`.
+/// database row, so the SQLite and JSONL paths share one session mapper. It is
+/// a parse-side shape only: resume downgrades every v4-origin session to v3
+/// (see `serialize_session`), because that is what pi can open.
 fn db_header_value(row: &Value) -> Value {
     let mut header = serde_json::Map::new();
     header.insert("kind".to_owned(), json!("header"));
@@ -1331,14 +1402,26 @@ struct EntryRow {
     payload: String,
 }
 
+/// One rebuilt v4 mutation keyed by the source `seq` it came from, or the error
+/// that row - and only that row - failed with.
+type DbMutation = (i64, Result<Value, AdapterError>);
+
 /// Every mutation for one session, in `seq` order, each rebuilt as the v4 value
 /// pi's JSONL codec would have written for it.
+///
+/// A row that cannot be rebuilt - an unparseable or over-`RECORD_CAP` payload -
+/// occupies its own slot as an `Err`, so it is the only thing lost; the outer
+/// `Err` is reserved for a database fault (prepare / query / column read), which
+/// no single row can be blamed for. This is the SQLite half of the JSONL
+/// reader's per-line tolerance: one bad row is a counted drop, never a discarded
+/// conversation.
 fn db_mutations(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
-) -> Result<Vec<(i64, Value)>, AdapterError> {
-    let at = |seq: i64| format!("{}#{session_id}:{seq}", db_path.display());
+) -> Result<Vec<DbMutation>, AdapterError> {
+    // Names the exact row to look at: database, session, table, seq.
+    let at = |table: &str, seq: i64| format!("{}#{session_id}.{table}:{seq}", db_path.display());
     let mut out = Vec::new();
 
     for row in query_db_rows(
@@ -1357,17 +1440,20 @@ fn db_mutations(
             })
         },
     )? {
-        let mut map = payload_object(&row.payload, &at(row.seq))?;
-        map.insert("kind".to_owned(), json!("entry"));
-        map.insert("id".to_owned(), json!(row.id));
-        map.insert(
-            "parentId".to_owned(),
-            row.parent_id.map_or(Value::Null, |parent| json!(parent)),
-        );
-        map.insert("type".to_owned(), json!(row.kind));
-        map.insert("seq".to_owned(), json!(row.seq));
-        insert_db_timestamp(&mut map, &row.timestamp);
-        out.push((row.seq, Value::Object(map)));
+        let seq = row.seq;
+        let mutation = payload_object(&row.payload, || at("entries", seq)).map(|mut map| {
+            map.insert("kind".to_owned(), json!("entry"));
+            map.insert("id".to_owned(), json!(row.id));
+            map.insert(
+                "parentId".to_owned(),
+                row.parent_id.map_or(Value::Null, |parent| json!(parent)),
+            );
+            map.insert("type".to_owned(), json!(row.kind));
+            map.insert("seq".to_owned(), json!(seq));
+            insert_db_timestamp(&mut map, &row.timestamp);
+            Value::Object(map)
+        });
+        out.push((seq, mutation));
     }
 
     // The records payload already carries id / lane / type verbatim
@@ -1385,11 +1471,13 @@ fn db_mutations(
             ))
         },
     )? {
-        let mut map = payload_object(&payload, &at(seq))?;
-        map.insert("kind".to_owned(), json!("record"));
-        map.insert("seq".to_owned(), json!(seq));
-        insert_db_timestamp(&mut map, &timestamp);
-        out.push((seq, Value::Object(map)));
+        let mutation = payload_object(&payload, || at("records", seq)).map(|mut map| {
+            map.insert("kind".to_owned(), json!("record"));
+            map.insert("seq".to_owned(), json!(seq));
+            insert_db_timestamp(&mut map, &timestamp);
+            Value::Object(map)
+        });
+        out.push((seq, mutation));
     }
 
     for (seq, lane, leaf_id) in query_db_rows(
@@ -1407,7 +1495,7 @@ fn db_mutations(
     )? {
         out.push((
             seq,
-            json!({ "kind": "lane", "seq": seq, "lane": lane, "leafId": leaf_id }),
+            Ok(json!({ "kind": "lane", "seq": seq, "lane": lane, "leafId": leaf_id })),
         ));
     }
 
@@ -1434,14 +1522,19 @@ fn db_mutations(
         }
         // Fact values are JSON-encoded scalars in SQLite; the JSONL codec
         // writes them bare. Bounded like every other source value.
-        if let Some(text) = value {
-            let decoded = parse_bounded(NAME, text.as_bytes(), || at(seq))?;
-            map.insert(
-                if kind == "name" { "name" } else { "label" }.to_owned(),
-                decoded,
-            );
-        }
-        out.push((seq, Value::Object(map)));
+        let mutation = match value {
+            None => Ok(Value::Object(map)),
+            Some(text) => {
+                parse_bounded(NAME, text.as_bytes(), || at("facts", seq)).map(|decoded| {
+                    map.insert(
+                        if kind == "name" { "name" } else { "label" }.to_owned(),
+                        decoded,
+                    );
+                    Value::Object(map)
+                })
+            }
+        };
+        out.push((seq, mutation));
     }
 
     out.sort_by_key(|(seq, _)| *seq);
@@ -1481,12 +1574,15 @@ fn query_db_rows<T>(
 /// pi's schema guarantees an object here (`entryPayload` / `JSON.stringify`), so
 /// anything else is corruption and surfaces as a typed error rather than a
 /// silently reshaped row.
-fn payload_object(text: &str, at: &str) -> Result<serde_json::Map<String, Value>, AdapterError> {
-    match parse_bounded(NAME, text.as_bytes(), || at.to_owned())? {
+fn payload_object(
+    text: &str,
+    at: impl Fn() -> String,
+) -> Result<serde_json::Map<String, Value>, AdapterError> {
+    match parse_bounded(NAME, text.as_bytes(), &at)? {
         Value::Object(map) => Ok(map),
         other => Err(AdapterError::schema(
             NAME,
-            at.to_owned(),
+            at(),
             format!(
                 "payload column is {}, not a JSON object",
                 match other {
@@ -1567,7 +1663,8 @@ mod tests {
                 .expect("session round-trips");
             let records =
                 replay_source_rows(&session).expect("a fixture session carries its source rows");
-            let relative = pi_relative_path(&session);
+            let relative = captured_relative_path(&session)
+                .expect("a fixture session carries its file placement");
             let expected = std::fs::read_to_string(corpus.join(&relative))?;
             let expected: Vec<Value> = expected
                 .lines()
@@ -1633,6 +1730,69 @@ mod tests {
             assert_eq!(head.get("type"), Some(&json!("session")), "{session_id}");
             assert_eq!(head.get("version"), Some(&json!(3)), "{session_id}");
         }
+        Ok(())
+    }
+
+    /// spec.md#adapter-restore-distinct-reconstruction: a downgraded restore must
+    /// NOT be named after the source file it was downgraded away from - that file
+    /// is precisely the one pi cannot open, so reusing its name turns every
+    /// resume into an "already exists" refusal pointing at the unloadable
+    /// transcript. A v3 origin is the opposite case and must not change: its own
+    /// source file IS what pi opens, so restore points back at it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_downgraded_restore_is_named_apart_from_its_source_file() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _) =
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+
+        let v4 = store
+            .get_session(V4_SESSION)
+            .await?
+            .expect("v4 fixture session lands");
+        let captured =
+            captured_relative_path(&v4).expect("a v4 fixture session carries its placement");
+        let restored = PiCodingAgentFactory.serialize(&v4, RestoreFidelity::Native)?;
+        let path = restored
+            .first()
+            .expect("one file per session")
+            .relative_path
+            .clone();
+        assert_ne!(
+            path, captured,
+            "the v3 reconstruction may not claim the v4 source file's name",
+        );
+        assert_eq!(
+            path.parent(),
+            captured.parent(),
+            "it still lands in the session's own project-slug directory",
+        );
+        assert!(
+            path.to_str()
+                .expect("utf-8 path")
+                .ends_with(&format!("_{V4_SESSION}.jsonl")),
+            "the pi-pond extension picks the file to open by this suffix: {}",
+            path.display(),
+        );
+        let again = PiCodingAgentFactory.serialize(&v4, RestoreFidelity::Native)?;
+        assert_eq!(
+            again.first().expect("one file per session").relative_path,
+            path,
+            "the name is deterministic, so a second resume refuses against it",
+        );
+
+        let v3 = store
+            .get_session("019dd55d-99a4-7344-aa11-d1d71d2c80fb")
+            .await?
+            .expect("v3 fixture session lands");
+        let v3_files = PiCodingAgentFactory.serialize(&v3, RestoreFidelity::Native)?;
+        assert_eq!(
+            v3_files
+                .first()
+                .expect("one file per session")
+                .relative_path,
+            captured_relative_path(&v3).expect("a v3 session carries its placement"),
+            "a v3-origin replay still restores to its own source file",
+        );
         Ok(())
     }
 
@@ -2147,6 +2307,31 @@ mod tests {
         Ok(())
     }
 
+    /// The verdict comes from the parsed rows the seam already holds, so the
+    /// hook never re-opens the file - proven by judging a path that does not exist.
+    #[test]
+    fn unsupported_reason_reads_rows_not_the_file() {
+        let adapter = PiCodingAgentAdapter::new("/tmp/pond-test-root");
+        let absent = Path::new("/tmp/pond-test-root/does-not-exist.jsonl");
+        let head = |version: i64| {
+            vec![BoundedRow {
+                line: 1,
+                value: json!({"kind": "header", "version": version, "id": "s1"}),
+            }]
+        };
+        assert!(
+            adapter
+                .unsupported_reason(absent, &head(SUPPORTED_JSONL_VERSION + 1))
+                .is_some_and(|reason| reason.contains("upgrade pond")),
+        );
+        assert!(
+            adapter
+                .unsupported_reason(absent, &head(SUPPORTED_JSONL_VERSION))
+                .is_none(),
+        );
+        assert!(adapter.unsupported_reason(absent, &[]).is_none());
+    }
+
     /// A trailing `lane` / `fact` mutation carries no timestamp, so the
     /// freshness gate must NOT reuse an older line's watermark - otherwise the
     /// trailing mutation could never be ingested
@@ -2260,6 +2445,87 @@ mod tests {
         Ok(())
     }
 
+    /// One unreadable row is one counted drop, exactly as a torn JSONL line is:
+    /// the session and every other row still ingest. Reading the mutations before
+    /// emitting the Session made a single oversized or corrupt payload discard the
+    /// WHOLE conversation - unrecoverably, since the next sync would find the
+    /// session just as unreadable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_a_corrupt_row_drops_only_itself() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("pi-sessions.sqlite");
+        // pi's own schema (`pi-session-backend-sqlite-node`), indexes omitted.
+        Connection::open(&db_path)?.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, cwd TEXT NOT NULL,
+                 parent_session_id TEXT NULL, metadata TEXT NULL);
+             CREATE TABLE entries (
+                 session_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL,
+                 parent_id TEXT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL,
+                 payload TEXT NOT NULL, PRIMARY KEY (session_id, id));
+             CREATE TABLE records (
+                 session_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL,
+                 lane TEXT NOT NULL, run_id TEXT NULL, type TEXT NOT NULL,
+                 op_kind TEXT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL,
+                 PRIMARY KEY (session_id, id));
+             CREATE TABLE lane_moves (
+                 session_id TEXT NOT NULL, seq INTEGER NOT NULL, lane TEXT NOT NULL,
+                 leaf_id TEXT NULL, PRIMARY KEY (session_id, seq));
+             CREATE TABLE facts (
+                 session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+                 key TEXT NULL, value TEXT NULL, PRIMARY KEY (session_id, seq));
+
+             INSERT INTO sessions VALUES
+                 ('torn-session', '2026-08-06T00:00:00.000Z', '/Users/user/Projects/torn', NULL, NULL);
+             INSERT INTO entries (session_id, seq, id, parent_id, type, timestamp, payload) VALUES
+                 ('torn-session', 1, 'good-user', NULL, 'message', '2026-08-06T00:00:01.000Z',
+                  '{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"kept\"}]}}'),
+                 ('torn-session', 2, 'corrupt-entry', NULL, 'message', '2026-08-06T00:00:02.000Z',
+                  '{\"message\":{\"role\":\"user\",'),
+                 ('torn-session', 3, 'good-assistant', 'good-user', 'message', '2026-08-06T00:00:03.000Z',
+                  '{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answered\"}]}}');
+             INSERT INTO facts (session_id, seq, kind, key, value) VALUES
+                 ('torn-session', 4, 'name', NULL, '\"still named\"'),
+                 ('torn-session', 5, 'label', 'good-user', '{\"torn');",
+        )?;
+
+        let root = temp.path().join("empty-sessions");
+        std::fs::create_dir_all(&root)?;
+        let adapter = PiCodingAgentAdapter::new(root).with_sqlite(&db_path);
+        let (store, summary) = ingest_into_temp_store(&temp, &adapter).await?;
+
+        assert_eq!(
+            summary.dropped_events, 2,
+            "the two unparseable payloads are counted drops, nothing else",
+        );
+        assert_eq!(
+            summary.skipped_files, 0,
+            "a bad row is not a whole-source failure",
+        );
+        let session = store
+            .get_session("torn-session")
+            .await?
+            .expect("the session survives its bad rows");
+        let ids: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|stored| stored.message.id())
+            .collect();
+        assert!(
+            ids.contains(&"good-user") && ids.contains(&"good-assistant"),
+            "the readable conversation lands: {ids:?}",
+        );
+        assert!(
+            ids.contains(&"torn-session:4"),
+            "the readable fact lands: {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"corrupt-entry") && !ids.contains(&"torn-session:5"),
+            "only the unreadable rows are missing: {ids:?}",
+        );
+        Ok(())
+    }
+
     /// A SQLite-origin session has no source file, so resume writes the portable
     /// artifact - and it is a v3 `.jsonl`, not v4, because that is the format pi
     /// can open. Round-tripping it back through the JSONL reader is the
@@ -2285,8 +2551,8 @@ mod tests {
             file.relative_path,
             Path::new("sessions")
                 .join("--Users-user-Projects-harness-v2--")
-                .join("2026-08-06T00-00-32-000Z_sqlite-main-session.jsonl"),
-            "restore reproduces pi's own directory and file naming",
+                .join("2026-08-06T00-00-32-000Z-pond-v3_sqlite-main-session.jsonl"),
+            "a reconstruction lands in pi's own directory layout under pond's own name",
         );
         let head: Value =
             serde_json::from_str(std::str::from_utf8(&file.bytes)?.lines().next().unwrap())?;

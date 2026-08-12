@@ -17,6 +17,7 @@ Branch on exit codes, not output text.
 | 3 | no credentials matched | storage, copy |
 | 3 | a target file already exists (nothing was written) | resume |
 | 4 | auth failed | storage, copy |
+| 4 | could not write the restored files (no restored session file was left behind) | resume |
 | 5 | store lacks conditional-put (OCC) | storage, copy |
 | 6 | destination missing source rows, or duplicate destination rows | copy |
 
@@ -24,4 +25,4 @@ Codes are scoped to the command, so the same number can mean different things ac
 
 `copy` exit `6` is recoverable: re-run, the union merge converges. A malformed URL passed to `copy` fails with the generic exit `1`; only `storage check` / `storage use` exit `2` on it.
 
-`resume` exit `3` is not an error to recover from - it means that session is already resumed. The refusal names the existing file, so the useful response is to open it. With `--format json` every one of these outcomes arrives as `{"error": ...}` on stdout.
+`resume` exit `3` is not an error to recover from - it means that session is already resumed. The refusal names the existing file, so the useful response is to open it. Exit `4` is the opposite: the write failed (permissions, no space), the partial write was unwound, so there is nothing to open - fix the directory or pass another `--out-dir`. With `--format json` every one of these outcomes arrives as `{"error": ...}` on stdout.

@@ -101,11 +101,17 @@ function errorResult(error: string): AgentToolResult<ToolOutput> {
 
 function boundedText(raw: string): string {
   const redacted = redactToolPayloadText(raw);
-  const buffer = Buffer.from(redacted, "utf8");
-  if (buffer.byteLength <= RESPONSE_MAX_BYTES) {
+  // Measure without copying: pond's untruncated text can be far larger than the
+  // budget, and the copy is only needed on the rare over-budget path.
+  if (Buffer.byteLength(redacted, "utf8") <= RESPONSE_MAX_BYTES) {
     return redacted;
   }
-  const clipped = buffer.subarray(0, RESPONSE_MAX_BYTES).toString("utf8");
+  // Encode straight into a budget-sized buffer instead of copying the whole
+  // response first. `Buffer.write` never emits a partially encoded character,
+  // so the cut lands on a code-point boundary and no U+FFFD is invented.
+  const budget = Buffer.alloc(RESPONSE_MAX_BYTES);
+  const written = budget.write(redacted, 0, RESPONSE_MAX_BYTES, "utf8");
+  const clipped = budget.toString("utf8", 0, written);
   return `${clipped}\n\n[pond: response truncated to ${RESPONSE_MAX_BYTES} bytes; narrow the query or lower limit]`;
 }
 

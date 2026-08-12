@@ -1,8 +1,8 @@
-// Managed-mode supervisor: locate the pond binary, spawn
-// `pond serve --transport stdio --with-sync --bootstrap pi-coding-agent`, speak
-// MCP over its stdio, and restart with backoff on unexpected exit. In url mode
-// it instead dials an external `pond serve` over streamable HTTP. Either way it
-// exposes one callTool seam the tools use.
+// Managed-mode supervisor: locate the pond binary, spawn `pond serve
+// --transport stdio --with-sync` (plus `--bootstrap`, unless capture was
+// declined), speak MCP over its stdio, and restart with backoff on unexpected
+// exit. In url mode it instead dials an external `pond serve` over streamable
+// HTTP. Either way it exposes one callTool seam the tools use.
 //
 // The child starts LAZILY, on the first tool call - not in the extension
 // factory and not on `session_start`. Orchestrator extensions spawn headless
@@ -45,6 +45,10 @@ const DIAL_TIMEOUT_MS = 10_000;
 // USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
 // relocated via XDG vars would open as a different, empty store. Build the
 // child env explicitly: the SDK's safelist plus pond's own knobs.
+//
+// Twin of CHILD_ENV_VARS in packages/openclaw-pond/src/service.ts: a var added
+// or dropped here must be mirrored there (and back) until the shared package is
+// extracted - the failure mode of a drift is a silently relocated store.
 const CHILD_ENV_VARS = [
   "HOME",
   "LOGNAME",
@@ -52,6 +56,7 @@ const CHILD_ENV_VARS = [
   "SHELL",
   "TERM",
   "USER",
+  "XDG_CACHE_HOME",
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
   "XDG_STATE_HOME",
@@ -66,6 +71,30 @@ export function pondChildEnv(source: NodeJS.ProcessEnv = process.env): Record<st
     }
   }
   return env;
+}
+
+/**
+ * The `pond serve` argv of the managed child. Split out of the transport so the
+ * consent gate on `--bootstrap` can be asserted without spawning anything.
+ */
+export function pondServeArgs(config: PondConfig): string[] {
+  return [
+    "serve",
+    "--transport",
+    "stdio",
+    // One child serves the read tools AND runs the periodic sync, sharing a
+    // single embedding model - instead of a `pond sync` child per trigger, each
+    // cold-loading its own.
+    "--with-sync",
+    "--sync-every",
+    String(config.syncIntervalMinutes),
+    // Init-equivalent, first-run only: when pond has NO adapters configured at
+    // all, enable the pi adapter so the first sync ingests something. A recorded
+    // decline is binding and takes it away; every other state keeps it, so a
+    // headless-only install (never asked, because a prompt needs a UI) still
+    // captures out of the box.
+    ...(config.captureConsent === "declined" ? [] : ["--bootstrap", "pi-coding-agent"]),
+  ];
 }
 
 // The one production mapping from a thrown MCP call (JSON-RPC error envelopes:
@@ -250,23 +279,7 @@ export class PondController {
     const prefix = posix ? ["-n", "19", pondBin] : [];
     return createStdioTransport({
       command,
-      args: [
-        ...prefix,
-        "serve",
-        "--transport",
-        "stdio",
-        // One child serves the read tools AND runs the periodic sync, sharing a
-        // single embedding model - instead of a `pond sync` child per trigger,
-        // each cold-loading its own.
-        "--with-sync",
-        "--sync-every",
-        String(this.config.syncIntervalMinutes),
-        // Init-equivalent, first-run only: when pond has NO adapters configured
-        // at all, enable the pi adapter so the first sync ingests something.
-        // Never touches an existing pond config.
-        "--bootstrap",
-        "pi-coding-agent",
-      ],
+      args: [...prefix, ...pondServeArgs(this.config)],
       env: pondChildEnv(),
     });
   }
@@ -296,7 +309,11 @@ export class PondController {
     const delay = Math.min(RESTART_MAX_DELAY_MS, RESTART_BASE_DELAY_MS * 2 ** (this.attempt - 1));
     this.restartTimer = setTimeout(() => {
       this.restartTimer = undefined;
-      void this.dial();
+      // Through the same single-flight gate as a tool call: dialling directly
+      // would race a call landing in the backoff window, and the second
+      // connect() overwrites `client` - orphaning the first `pond serve` child
+      // that stop() then never closes.
+      void this.ensureStarted().catch(() => {});
     }, delay);
     this.restartTimer.unref?.();
   }

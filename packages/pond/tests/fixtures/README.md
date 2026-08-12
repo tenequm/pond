@@ -347,7 +347,7 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
   Assistant messages carry rich provenance: `usage` (input / output /
   cacheRead / cacheWrite / totalTokens), `stopReason`, `api`, `provider`,
   `model`, `responseId`, full `cost` breakdown.
-- Samples: 3 anonymized v3 sessions across 3 projects, plus the harness-v2
+- Samples: 4 anonymized v3 sessions across 4 projects, plus the harness-v2
   formats below.
 - **harness-v2 (v4 JSONL + the SQLite backend)**, added 2026-08-06. Same
   `sessions/` root - v3 and v4 files coexist, detected per file, so the

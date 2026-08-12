@@ -263,7 +263,7 @@ impl JsonlTree for NanoclawAdapter {
         map_row_events(&session.id, session.created_at, row, state)
     }
 
-    fn unsupported_reason(&self, path: &Path) -> Option<String> {
+    fn unsupported_reason(&self, path: &Path, _rows: &[BoundedRow]) -> Option<String> {
         subagent_unsupported_reason(path)
     }
 }

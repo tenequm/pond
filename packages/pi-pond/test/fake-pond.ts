@@ -1,6 +1,9 @@
 // A fake pond MCP endpoint over an in-memory transport pair. Records the tool
 // arguments the plugin forwards (golden-request assertions) and returns canned
 // text (golden-response assertions), matching pond's real text-only tool output.
+//
+// Twin of packages/openclaw-pond/test/fake-pond.ts - keep both in step until
+// the shared package is extracted.
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {

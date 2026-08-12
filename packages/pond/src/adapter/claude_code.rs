@@ -430,7 +430,7 @@ impl JsonlTree for ClaudeCodeAdapter {
         map_row_events(&session.id, session.created_at, row, state)
     }
 
-    fn unsupported_reason(&self, path: &Path) -> Option<String> {
+    fn unsupported_reason(&self, path: &Path, _rows: &[BoundedRow]) -> Option<String> {
         // The Workflow runner's `journal.jsonl` never reaches this check -
         // `skip_source` excludes it from the walk - and if it ever did, a visible
         // skip is the safe answer. See spec.md#datasets.
@@ -2510,7 +2510,7 @@ mod tests {
             "/root/-proj/PARENT/subagents/workflows/wf_x/transcript-001.jsonl",
         );
         assert!(
-            adapter.unsupported_reason(unknown).is_some(),
+            adapter.unsupported_reason(unknown, &[]).is_some(),
             "an unrecognized non-agent, non-journal leaf must still fail visibly",
         );
         assert!(!is_workflow_control_file(unknown));
@@ -2522,7 +2522,7 @@ mod tests {
 
         let agent = std::path::Path::new("/root/-proj/PARENT/subagents/agent-abc123def456.jsonl");
         assert!(
-            adapter.unsupported_reason(agent).is_none(),
+            adapter.unsupported_reason(agent, &[]).is_none(),
             "a recognized agent transcript is resolvable, not unsupported",
         );
     }

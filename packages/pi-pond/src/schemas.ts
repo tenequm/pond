@@ -72,8 +72,4 @@ export const ToolOutputSchema = Type.Union([
   Type.Object({ status: Type.Literal("error"), error: Type.String() }, additional),
 ]);
 
-export type SearchParams = Static<typeof SearchParamsSchema>;
-export type GetSessionParams = Static<typeof GetSessionParamsSchema>;
-export type GetMessageParams = Static<typeof GetMessageParamsSchema>;
-export type SqlParams = Static<typeof SqlParamsSchema>;
 export type ToolOutput = Static<typeof ToolOutputSchema>;

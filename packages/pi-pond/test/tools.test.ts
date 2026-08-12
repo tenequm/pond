@@ -87,6 +87,18 @@ describe("pond tools", () => {
     expect(text).toContain("response truncated");
   });
 
+  it("cuts the truncation on a code-point boundary, never mid-character", async () => {
+    // The last multi-byte character straddles the budget: a byte-wise cut would
+    // hand the model a U+FFFD replacement char.
+    const huge = `${"x".repeat(RESPONSE_MAX_BYTES - 1)}é${"y".repeat(4096)}`;
+    const { byName } = await tools({ responses: { pond_search: () => huge } });
+    const result = await run(byName, POND_TOOL_NAMES.search, { query: "hi" });
+    const body = result.text.split("\n\n[pond:")[0] ?? "";
+    expect(body).toBe("x".repeat(RESPONSE_MAX_BYTES - 1));
+    expect(result.text).not.toContain("�");
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(RESPONSE_MAX_BYTES);
+  });
+
   it("surfaces pond's own error text - the message that teaches the next query", async () => {
     const { byName } = await tools({
       responses: {

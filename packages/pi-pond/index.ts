@@ -2,11 +2,11 @@
 // inside pi.
 //
 // Two halves, one process. A single managed `pond serve --transport stdio
-// --with-sync --bootstrap pi-coding-agent` child both serves the four read-only
-// recall tools over MCP and runs pond's periodic sync loop, sharing one
-// embedding model. Tools only - no memory slot, no auto-recall, no prompt hooks
-// (see README for the positioning); the `/pond` command adds a search picker
-// that can resume a past session or paste a reference to it.
+// --with-sync` child both serves the four read-only recall tools over MCP and
+// runs pond's periodic sync loop, sharing one embedding model. Tools only - no
+// memory slot, no auto-recall, no prompt hooks (see README for the
+// positioning); the `/pond` command adds a search picker that can resume a past
+// session or paste a reference to it.
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -16,6 +16,7 @@ import {
   type CaptureConsent,
   loadPondConfig,
   piAgentDir,
+  type PondConfig,
   recordCaptureConsent,
 } from "./src/config.ts";
 import { hitReference, hitLabel, parsePondHits, type PondHit } from "./src/hits.ts";
@@ -77,7 +78,7 @@ export default function piPond(pi: ExtensionAPI): void {
     // `idle`, not `ready`: the pond child starts on the first tool call, and a
     // footer that claims a running process before there is one is a lie.
     ctx.ui.setStatus(STATUS_KEY, STATUS_TEXT.idle);
-    await maybeAskForCapture(pi, ctx, binary, config.captureConsent);
+    await maybeAskForCapture(pi, ctx, binary, config);
   });
 
   // Idempotent, and the only place the child is reaped: no orphan pond process
@@ -95,65 +96,57 @@ export default function piPond(pi: ExtensionAPI): void {
         ctx.ui.notify(unavailable ?? `pond not found - ${INSTALL_HINT}`, "warning");
         return;
       }
-      await runPondCommand(pi, ctx, args, controller, binary);
+      await runPondCommand(pi, ctx, args, controller, binary, config);
     },
   });
 }
 
 /**
- * One-time, UI-only capture consent.
+ * One-time, UI-only capture consent - the recorded answer that decides whether
+ * pond's config may be written on the user's behalf, by `pond adapters enable`
+ * here or by the child's `--bootstrap`.
  *
- * `--bootstrap` already covers the cold start where pond has NO adapters. The
- * gap it deliberately leaves is a pond that already captures something else
- * (claude-code, say) but not pi: sync runs and quietly stores no pi sessions.
- * This asks once, remembers either answer forever, and never writes pond config
- * by any path other than the consented `pond adapters enable`.
+ * Asked at most once and remembered forever, in either direction: granted
+ * enables the pi adapter now, declined takes `--bootstrap` off the child's argv
+ * for good.
  *
- * Headless sessions (json/print, orchestrator-spawned children) skip the whole
- * flow - no exec, no prompt - so nothing can block on a dialog nobody can see.
+ * Granted-and-enabled, declined, and already-enabled all settle, so an answered
+ * question never re-spawns `pond adapters list` on the next session start. A
+ * granted answer whose `pond adapters enable` FAILED is deliberately left
+ * unrecorded - the next session asks again rather than remembering a consent
+ * that never took effect.
+ *
+ * Skipped entirely in url mode (that pond's config belongs to whoever runs it)
+ * and in headless sessions (json/print, orchestrator-spawned children) - no
+ * exec, no prompt - so nothing can block on a dialog nobody can see.
  */
-async function maybeAskForCapture(
+export async function maybeAskForCapture(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   binary: string,
-  consent: CaptureConsent | undefined,
+  config: PondConfig,
 ): Promise<void> {
-  if (!ctx.hasUI || consent !== undefined) {
+  if (config.mode === "url" || !ctx.hasUI || config.captureConsent !== undefined) {
     return;
   }
-  let configured: { name?: unknown; enabled?: unknown }[];
-  try {
-    const listed = await pi.exec(binary, ["adapters", "list", "--format", "json"], {
-      timeout: ADAPTERS_TIMEOUT_MS,
-    });
-    const doc = JSON.parse(listed.stdout) as { configured?: unknown };
-    configured = Array.isArray(doc.configured) ? (doc.configured as typeof configured) : [];
-  } catch {
-    // An unreadable adapter list is not a reason to nag; `--bootstrap` still
-    // covers the case that matters most.
-    return;
-  }
-  if (configured.length === 0) {
-    // `--bootstrap pi-coding-agent` handles this on the next tool call, and it
-    // will leave the adapter enabled - so this is not yet a settled answer and
-    // deliberately stays unrecorded.
-    return;
-  }
+  const configured = await listConfiguredAdapters(pi, binary);
   const entry = configured.find((candidate) => candidate.name === ADAPTER);
   if (entry?.enabled === true) {
     // Already capturing pi - the question is answered. Record it, or every
     // interactive session start pays another `pond adapters list` subprocess
     // to re-learn the same thing, forever.
-    recordCaptureConsent("granted");
+    settleCaptureConsent(config, "granted");
     return;
   }
 
   const yes = await ctx.ui.confirm(
     "Pond found",
-    "Capture pi sessions into your pond archive? (pond already captures other agents on this machine)",
+    configured.length > 0
+      ? "Capture pi sessions into your pond archive? (pond already captures other agents on this machine)"
+      : "Capture pi sessions into your pond archive?",
   );
   if (!yes) {
-    recordCaptureConsent("declined");
+    settleCaptureConsent(config, "declined");
     return;
   }
   try {
@@ -161,7 +154,7 @@ async function maybeAskForCapture(
       timeout: ADAPTERS_TIMEOUT_MS,
     });
     if (enabled.code === 0) {
-      recordCaptureConsent("granted");
+      settleCaptureConsent(config, "granted");
       ctx.ui.notify("pond will now capture pi sessions.", "info");
       return;
     }
@@ -174,12 +167,39 @@ async function maybeAskForCapture(
   }
 }
 
+/** pond's configured adapters, or an empty list when the answer is unreadable. */
+async function listConfiguredAdapters(
+  pi: ExtensionAPI,
+  binary: string,
+): Promise<{ name?: unknown; enabled?: unknown }[]> {
+  try {
+    const listed = await pi.exec(binary, ["adapters", "list", "--format", "json"], {
+      timeout: ADAPTERS_TIMEOUT_MS,
+    });
+    const doc = JSON.parse(listed.stdout) as { configured?: unknown };
+    return Array.isArray(doc.configured)
+      ? (doc.configured as { name?: unknown; enabled?: unknown }[])
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function settleCaptureConsent(config: PondConfig, consent: CaptureConsent): void {
+  // Mirrored onto the live config, not only the file: the controller reads it
+  // when it spawns the child, so `--bootstrap` reflects this answer already in
+  // the session that gave it.
+  config.captureConsent = consent;
+  recordCaptureConsent(consent);
+}
+
 async function runPondCommand(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   args: string,
   controller: PondController,
   binary: string,
+  config: PondConfig,
 ): Promise<void> {
   const query = args.trim() || (ctx.hasUI ? await ctx.ui.input("Search pond for:") : undefined);
   if (!query?.trim()) {
@@ -210,7 +230,7 @@ async function runPondCommand(
     ctx.ui.pasteToEditor(hitReference(choice.hit));
     return;
   }
-  await resumeHere(pi, ctx, choice.hit, binary);
+  await resumeHere(pi, ctx, choice.hit, binary, config);
 }
 
 async function chooseHit(
@@ -247,18 +267,31 @@ async function chooseHit(
   return { action: action.startsWith("Resume") ? "resume" : "insert", hit };
 }
 
+export const RESUME_NEEDS_LOCAL_POND =
+  'pond: resume needs a local pond, and this session is in "url" mode - read-only recall over ' +
+  "someone else's pond serve. Insert a reference instead, or switch to managed mode in " +
+  "~/.pi/agent/pond-pi.json.";
+
 /**
  * Resume: write the stored session back out as a pi session file, then switch
  * this pi to it. `--out-dir` is pi's agent dir because the pi adapter's own
  * relative paths carry the `sessions/--<cwd-slug>--/` layout, so the file lands
  * exactly where pi's session list looks for it.
  */
-async function resumeHere(
+export async function resumeHere(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   hit: PondHit,
   binary: string,
+  config: PondConfig,
 ): Promise<void> {
+  if (config.mode === "url") {
+    // The only local-binary path left in url mode, and it cannot be assumed:
+    // the pond holding this session runs elsewhere, so there is nothing here to
+    // shell out to.
+    ctx.ui.notify(RESUME_NEEDS_LOCAL_POND, "warning");
+    return;
+  }
   const outcome = await resumeSession({
     exec: (command, execArgs, options) => pi.exec(command, execArgs, options),
     binary,

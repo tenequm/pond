@@ -66,6 +66,11 @@ describe("child env", () => {
       HOME: "/home/u",
       PATH: "/usr/bin",
       XDG_DATA_HOME: "/home/u/data",
+      // pond's own default_cache_dir() reads it; dropping it sends the child to
+      // a different cache than every other pond on this machine.
+      XDG_CACHE_HOME: "/home/u/cache",
+      XDG_CONFIG_HOME: "/home/u/config",
+      XDG_STATE_HOME: "/home/u/state",
       POND_STORAGE_PATH: "s3://bucket/pond",
       UNRELATED: "no",
     });
@@ -73,6 +78,9 @@ describe("child env", () => {
       HOME: "/home/u",
       PATH: "/usr/bin",
       XDG_DATA_HOME: "/home/u/data",
+      XDG_CACHE_HOME: "/home/u/cache",
+      XDG_CONFIG_HOME: "/home/u/config",
+      XDG_STATE_HOME: "/home/u/state",
       POND_STORAGE_PATH: "s3://bucket/pond",
     });
   });

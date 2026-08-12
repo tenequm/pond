@@ -32,6 +32,10 @@ const DIAL_TIMEOUT_MS = 10_000;
 // USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
 // relocated via XDG vars would open as a different, empty store. Build the
 // child env explicitly: the SDK's safelist plus pond's own knobs.
+//
+// Twin of CHILD_ENV_VARS in packages/pi-pond/src/service.ts: a var added or
+// dropped here must be mirrored there (and back) until the shared package is
+// extracted - the failure mode of a drift is a silently relocated store.
 const CHILD_ENV_VARS = [
   "HOME",
   "LOGNAME",
@@ -39,6 +43,7 @@ const CHILD_ENV_VARS = [
   "SHELL",
   "TERM",
   "USER",
+  "XDG_CACHE_HOME",
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
   "XDG_STATE_HOME",

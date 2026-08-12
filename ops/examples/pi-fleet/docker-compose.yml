@@ -40,8 +40,10 @@ services:
     depends_on:
       minio-init: { condition: service_completed_successfully }
     environment:
-      # Any provider pi supports; ANTHROPIC_API_KEY is the default path.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set a provider API key - see README}
+      # Any provider pi supports; ANTHROPIC_API_KEY is the default path. Left
+      # optional because compose interpolates the whole file even when you start
+      # only the pond half - worker.sh is where a missing key reports itself.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       PI_PROMPT: ${PI_PROMPT:-Explain in two sentences what a write-ahead log is for.}
       HOME: /pi
     volumes:
@@ -62,15 +64,28 @@ services:
     depends_on:
       minio-init: { condition: service_completed_successfully }
     environment:
-      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo
-      POND_CREDS_ACCESS_KEY_ID: pondadmin
-      POND_CREDS_SECRET_ACCESS_KEY: pondadmin123
-      # Workers ingest fts-only; one central `pond optimize --only embed` does
-      # the vectors, so no worker pod holds an embedding model.
-      POND_EMBEDDINGS_ENABLED: "false"
+      # pond defaults `s3+` endpoints to virtual-hosted addressing (the Hetzner /
+      # R2 / B2 shape) and only auto-flips to path-style for IP hosts, so a
+      # DNS-named MinIO needs the override or it dials `pond.minio:9000`.
+      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo?virtual_hosted_style_request=false
+      # POND_CREDS_<SET>_<FIELD>: `default` is just the set name, and a set with
+      # no `scope` matches any storage URL. Omitting the set name silently makes
+      # a `[creds.access]` / `[creds.secret]` set and fails config load.
+      POND_CREDS_DEFAULT_ACCESS_KEY_ID: pondadmin
+      POND_CREDS_DEFAULT_SECRET_ACCESS_KEY: pondadmin123
+      # pond logs at WARN by default, which hides every sync outcome - a sidecar
+      # that silently ingests nothing looks identical to a healthy one. This one
+      # target is the per-tick summary, without `-v`'s Lance-internal firehose.
+      # RUST_LOG replaces pond's own filter, so re-silence the unactionable Lance
+      # count-pushdown WARN it would otherwise let back in.
+      RUST_LOG: warn,pond::sync=info,lance::io::exec::count_pushdown=error
       HOME: /pi
     volumes:
       - pi-sessions:/pi/.pi
+    # --bootstrap probes for the pi adapter exactly once, at startup, by testing
+    # whether the sessions dir exists - and worker-pi only creates it minutes
+    # later, after `npm install`. Creating it here makes discovery order-independent.
+    entrypoint: ["sh", "-c", "mkdir -p /pi/.pi/agent/sessions && exec pond \"$$@\"", "pond"]
     command:
       - serve
       - --transport
@@ -91,9 +106,9 @@ services:
       # Only for the image, which worker-pond's `build` produces.
       worker-pond: { condition: service_started }
     environment:
-      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo
-      POND_CREDS_ACCESS_KEY_ID: pondadmin
-      POND_CREDS_SECRET_ACCESS_KEY: pondadmin123
+      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo?virtual_hosted_style_request=false
+      POND_CREDS_DEFAULT_ACCESS_KEY_ID: pondadmin
+      POND_CREDS_DEFAULT_SECRET_ACCESS_KEY: pondadmin123
     ports: ["9797:9797"]
     command: ["serve", "--transport", "http", "--host", "0.0.0.0"]
 

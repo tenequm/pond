@@ -1717,9 +1717,10 @@ fn output_err(message: &str) -> anyhow::Result<()> {
 ///
 /// Exit codes are distinct so a caller can branch without parsing prose: 1 the
 /// session is not stored, 2 the request is unanswerable (unknown adapter, a
-/// lineage deeper than pond restores), 3 a destination already exists. `--format
-/// json` emits the same outcomes as one document on stdout - `{"error": ...}`
-/// included - so a plugin never has to scrape text.
+/// lineage deeper than pond restores), 3 a destination already exists, 4 the
+/// write itself failed (and was unwound). `--format json` emits the same
+/// outcomes as one document on stdout - `{"error": ...}` included - so a plugin
+/// never has to scrape text.
 async fn run_resume(
     session_id: &str,
     to: &str,
@@ -1776,7 +1777,7 @@ async fn run_resume(
         handlers::Lineage::TooDeep { child_id } => {
             return fail(
                 2,
-                serde_json::json!({"error": "lineage_too_deep", "session_id": child_id}),
+                serde_json::json!({"error": "lineage_too_deep", "session_id": session_id, "child_id": child_id}),
                 format!(
                     "session {session_id} has a grandchild session ({child_id}); pond restores one \
                      level of lineage, so this would be a partial write. Resume {child_id} \
@@ -1806,24 +1807,32 @@ async fn run_resume(
     // on a later session cannot leave an earlier one's files on disk. The named
     // paths are what an idempotent caller re-uses ("already resumed - open
     // this").
-    let mut existing = Vec::new();
+    let mut destinations = Vec::new();
     for (_, files) in &planned {
-        for dest in adapter::restore_destinations(out_dir, files)? {
-            if dest.exists() {
-                existing.push(dest.display().to_string());
-            }
-        }
+        destinations.extend(adapter::restore_destinations(out_dir, files)?);
     }
-    if !existing.is_empty() {
-        return fail(
+    // Symlink-aware on purpose: a dangling link is a collision the writer's
+    // `create_new` refuses anyway, so seeing it here keeps it the typed "already
+    // resumed" answer instead of a write failure.
+    let refuse_if_occupied = |dests: &[PathBuf]| -> anyhow::Result<()> {
+        let existing: Vec<String> = dests
+            .iter()
+            .filter(|dest| adapter::exists_even_if_dangling(dest))
+            .map(|dest| dest.display().to_string())
+            .collect();
+        if existing.is_empty() {
+            return Ok(());
+        }
+        fail(
             3,
             serde_json::json!({"error": "already_exists", "session_id": session_id, "existing": existing}),
             format!(
                 "already resumed - refusing to overwrite:\n  {}",
                 existing.join("\n  "),
             ),
-        );
-    }
+        )
+    };
+    refuse_if_occupied(&destinations)?;
 
     // One call for the whole lineage: the writer's unwind is batch-scoped, so
     // splitting it per session would let an io failure on the child leave the
@@ -1847,19 +1856,51 @@ async fn run_resume(
             )
         })
         .collect();
-    let written = adapter::write_restored_files(
+    // The files are MOVED into the writer, never cloned: they carry every
+    // restored session's whole bytes, and the report below needs only the ids
+    // borrowed from `sessions` plus the counts and fidelities already taken.
+    let (restored_sessions, batches): (Vec<_>, Vec<Vec<adapter::RestoredFile>>) =
+        planned.into_iter().unzip();
+    let written = match adapter::write_restored_files(
         out_dir,
-        planned
-            .iter()
-            .flat_map(|(_, files)| files.iter().cloned())
-            .collect(),
-    )?;
+        batches.into_iter().flatten().collect(),
+    ) {
+        Ok(written) => written,
+        // A write failure is an outcome of `resume`, not a crash: it gets its
+        // own typed document so `--format json` still answers on stdout, and it
+        // is distinct from exit 3 because nothing is on disk to open.
+        Err(error) => {
+            // A Schema kind from the writer can only be its own overwrite
+            // refusal: `restore_destinations` already ran over these same files
+            // at the pre-check above, so a containment error would have exited
+            // before the write. Something therefore claimed a destination in
+            // between - the same "already resumed" answer, just noticed later.
+            if matches!(error.kind, adapter::AdapterErrorKind::Schema(_)) {
+                refuse_if_occupied(&destinations)?;
+            }
+            return fail(
+                4,
+                serde_json::json!({
+                    "error": "write_failed",
+                    "session_id": session_id,
+                    "out_dir": out_dir.display().to_string(),
+                    "detail": error.to_string(),
+                }),
+                format!(
+                    "could not write into {}: {error}\nno restored session file was left behind. \
+                     Fix the directory's permissions or free up space, or restore elsewhere with: \
+                     pond resume {session_id} --to {to} --out-dir <path>",
+                    out_dir.display(),
+                ),
+            );
+        }
+    };
 
     // `write_restored_files` preserves input order, so each session's files are
     // the next `counts[i]` paths.
-    let mut report = Vec::with_capacity(planned.len());
+    let mut report = Vec::with_capacity(restored_sessions.len());
     let mut paths = written.iter();
-    for (((session, _), count), fidelity) in planned.iter().zip(counts).zip(fidelities) {
+    for ((session, count), fidelity) in restored_sessions.iter().zip(counts).zip(fidelities) {
         report.push(serde_json::json!({
             "session_id": session.session.id,
             "source_agent": session.session.source_agent,

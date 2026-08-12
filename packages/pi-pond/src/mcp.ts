@@ -2,6 +2,10 @@
 // `pond serve --transport stdio` (managed) or an external `pond serve` over
 // streamable HTTP (url). Transports are injectable so tests drive an in-memory
 // pair against a fake pond endpoint.
+//
+// Near-identical twin of packages/openclaw-pond/src/mcp.ts (only CLIENT_INFO
+// differs). Until the shared package is extracted, a fix here must be applied
+// there too, and back.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";

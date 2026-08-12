@@ -5,6 +5,11 @@
 # the pond sidecar shares.
 set -eu
 
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "worker: ANTHROPIC_API_KEY is empty - export it and re-run, or use the README's 'Without an API key' flow" >&2
+  exit 1
+fi
+
 npm install -g --silent @earendil-works/pi-coding-agent@latest
 
 echo "worker: running prompt"

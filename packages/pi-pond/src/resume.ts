@@ -28,11 +28,11 @@ function asStrings(value: unknown): string[] {
 
 /**
  * The `.jsonl` a pi session lives in. `pond resume` may write several files for
- * one lineage (a session plus its children); the one to switch to is the one
- * named after the session that was asked for.
+ * one lineage (a session plus its children), so the match is exact - the caller
+ * decides whether falling back to another file in the list is safe.
  */
 function pickSessionFile(files: string[], sessionId: string): string | undefined {
-  return files.find((file) => file.endsWith(`_${sessionId}.jsonl`)) ?? files[0];
+  return files.find((file) => file.endsWith(`_${sessionId}.jsonl`));
 }
 
 export async function resumeSession(params: {
@@ -77,10 +77,23 @@ export async function resumeSession(params: {
   // Exit 3 / already_exists is the happy path for a re-resume: the file pond
   // refused to overwrite is exactly the one to switch to.
   if (document.error === "already_exists") {
-    const existing = pickSessionFile(asStrings(document.existing), params.sessionId);
-    return existing
-      ? { ok: true, sessionFile: existing, fidelity: "existing", alreadyResumed: true }
-      : { ok: false, error: "pond resume reported an existing file but did not name it." };
+    // `existing` spans the WHOLE lineage (parent plus children), so there is no
+    // safe fallback here: switching to a sibling's file would silently open a
+    // different session than the one that was asked for.
+    const existing = asStrings(document.existing);
+    const file = pickSessionFile(existing, params.sessionId);
+    if (file) {
+      return { ok: true, sessionFile: file, fidelity: "existing", alreadyResumed: true };
+    }
+    return {
+      ok: false,
+      error:
+        existing.length === 0
+          ? "pond resume reported an existing file but did not name it."
+          : `pond resume: the stored file for ${params.sessionId} is missing, but other files ` +
+            `from its lineage are still on disk (${existing.join(", ")}). Move them aside and ` +
+            "resume again, or resume the child session directly.",
+    };
   }
   if (typeof document.error === "string") {
     return { ok: false, error: `pond resume: ${document.error}` };
@@ -93,7 +106,10 @@ export async function resumeSession(params: {
   if (!target) {
     return { ok: false, error: "pond resume did not report the requested session." };
   }
-  const sessionFile = pickSessionFile(asStrings(target.files), params.sessionId);
+  // `target.files` is this one session's own list, so the first entry is a safe
+  // fallback for an adapter that names files by something other than the id.
+  const files = asStrings(target.files);
+  const sessionFile = pickSessionFile(files, params.sessionId) ?? files[0];
   if (!sessionFile) {
     return { ok: false, error: "pond resume reported no file for the session." };
   }

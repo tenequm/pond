@@ -64,7 +64,7 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text,
     jsonl::{parse_bounded, peek_last_mapped},
@@ -178,12 +178,8 @@ impl OpenClawAdapter {
     pub fn from_config(config: Value) -> Result<Self, AdapterError> {
         let cfg: OpenClawConfig = serde_json::from_value(config)
             .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
-        let root = match std::env::var_os("HOME") {
-            Some(home) => crate::config::expand_home_under(&cfg.path, Path::new(&home)),
-            None => cfg.path,
-        };
         Ok(Self {
-            root,
+            root: expand_home(cfg.path),
             skip_kinds: cfg.skip_kinds,
             ingest_deleted: cfg.ingest_deleted,
             reconcile_deletions: cfg.reconcile_deletions,

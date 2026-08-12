@@ -25,7 +25,7 @@ Nothing here is new pond machinery - it is a deployment shape assembled from pri
              +------------+--------------+
              |                           |
      pond serve --transport http    pond optimize --only embed
-       (central read side)             (one embedding cron)
+       (central read side)          (backlog / re-embed cron)
 ```
 
 Each worker pod runs pi and a pond sidecar that share a volume: pi appends to its session files, pond tails them. Writes from every worker land in one store; pond's optimistic concurrency (spec 3.5) is what makes N concurrent writers to one Lance store safe, with no coordinator and no lock service.
@@ -38,9 +38,11 @@ A worker image ships no config file. Every knob pond needs is an env var (spec 3
 
 ```
 POND_STORAGE_PATH=s3+https://s3.example.com/bucket/tenants/acme
-POND_CREDS_ACCESS_KEY_ID=...
-POND_CREDS_SECRET_ACCESS_KEY=...
+POND_CREDS_DEFAULT_ACCESS_KEY_ID=...
+POND_CREDS_DEFAULT_SECRET_ACCESS_KEY=...
 ```
+
+The mirror's grammar is `POND_CREDS_<SET>_<FIELD>`, so the set name is not optional: `default` above is a `[creds.default]` set, and a set with no `scope` matches every storage URL (spec 3.9). Dropping the set name does not fall back to an implicit set - it declares `[creds.access]` and `[creds.secret]`, whose fields fail `deny_unknown_fields` and take the process down at config load.
 
 The sidecar's whole command line is then:
 
@@ -61,14 +63,15 @@ s3://bucket/tenants/globex
 
 Two tenants share no bytes, no manifest, and no index. A tenant's whole corpus is one prefix: to export it, copy the prefix; to delete it, delete the prefix. Credentials scoped per prefix make the isolation enforceable at the object store rather than in pond.
 
-## Split the embedding work off the workers
+## Embedding happens on every worker, and cannot currently be moved
 
-Embedding is the expensive half of ingest and it does not need to happen on the worker. Run the workers fts-only and let one central cron do the vectors:
+Embedding is the expensive half of ingest, and the obvious fleet lever is to run the workers full-text-only and let one central cron do the vectors. **That lever does not exist today.** `[embeddings]` accepts only `model` and `dim`, the env mirror passes only `storage_path` and `creds_*`, and the sidecar's inline embed-at-ingest is unconditional. So plan for it rather than around it:
 
-- **Workers**: turn embedding off at ingest (`[embeddings] enabled = false`, or `POND_EMBEDDINGS_ENABLED=false`). Sessions land immediately and are full-text searchable; no ~500 MB model is loaded per pod.
-- **Central**: one `pond optimize --only embed` on a schedule fills the backlog and folds the semantic index.
+- Every worker pod loads the ~500 MB model on its first embeddable row and holds it resident. N pods is N times that memory, for work one process could batch.
+- The model comes from HuggingFace into `$HOME/.cache/huggingface`. Bake it into the worker image or mount a shared cache, or each replacement pod re-downloads it.
+- The load failure is not a soft degrade: a pod that cannot reach the model aborts the write, so the sync ingests nothing rather than landing full-text-only rows.
 
-This is the single biggest lever on fleet cost: N worker pods each holding an embedding model is N times the memory for work one process can do in batches.
+`pond optimize --only embed` on a schedule stays worth having, but on this topology it finds an empty backlog. Its real jobs are sessions that arrive unembedded by another route (`pond copy`) and the model-swap re-embed (`--force-embed`).
 
 ## Compliance
 

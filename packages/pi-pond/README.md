@@ -8,7 +8,7 @@ Give [pi](https://github.com/earendil-works/pi) a memory that outlives the sessi
 pi install npm:pi-pond
 ```
 
-That is the whole setup, assuming pond is installed. On first use the extension starts a pond that both serves the tools and keeps the archive current; if pond has no adapters configured at all, it enables the pi one itself.
+That is the whole setup, assuming pond is installed. On first use the extension starts a pond that both serves the tools and keeps the archive current, and asks you once whether to capture your pi sessions into it.
 
 ## Install pond
 
@@ -47,15 +47,17 @@ Optional, at `~/.pi/agent/pond-pi.json`:
 ```
 
 - `mode: "managed"` (default) - the extension supervises its own `pond serve` child for the lifetime of the pi session, started lazily on the first tool call.
-- `mode: "url"` - talk to an external `pond serve --transport http` instead, so many pi sessions share one process and one embedding model:
+- `mode: "url"` - talk to an external `pond serve --transport http` instead, so many pi sessions share one process and one embedding model. This is read-only recall: the tools work, nothing local is written (no capture prompt, no adapter changes), and `/pond` resume is unavailable because it needs a local pond.
 
   ```json
   { "mode": "url", "url": "http://127.0.0.1:9797/mcp" }
   ```
 
-The same file records your answer to the one-time capture prompt (`captureConsent`). You are asked once, only in an interactive session, and only when pond is already capturing something else on this machine but not pi - the case pond's own `--bootstrap` cannot cover. Either answer is remembered.
+The same file records your answer to the one-time capture prompt (`captureConsent`). You are asked once, only in an interactive session, and only when pond is not already capturing pi. Either answer is remembered.
 
-The prompt is not the only way your pond config can change. On a pond with **no** adapters configured at all, the managed child's `--bootstrap pi-coding-agent` enables the pi adapter on its first run, without asking - that is what makes the zero-config install work. It never touches a pond that already has adapters, and a disabled adapter stays disabled. If you would rather nothing be written on your behalf, run `pond init` first or use `mode: "url"`.
+The prompt is not the only way your pond config can change. On a pond with **no** adapters configured at all, the managed child's `--bootstrap pi-coding-agent` enables the pi adapter on its first run - that is what makes the zero-config install work, including in headless sessions, which are never asked anything. It never touches a pond that already has adapters, and a disabled adapter stays disabled.
+
+Declining is binding, though: a recorded `"declined"` keeps `--bootstrap` off the child's command line for good, so nothing is written on your behalf. If you would rather nothing be written before you are asked at all, run `pond init` first or use `mode: "url"`.
 
 Where the archive lives is pond's business, not this extension's: set `POND_STORAGE_PATH` (or run `pond storage use <url>`) to point it at S3 or a shared volume.
 

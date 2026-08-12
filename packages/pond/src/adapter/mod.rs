@@ -715,8 +715,10 @@ fn restore_destination(root: &Path, file: &RestoredFile) -> Result<PathBuf, Adap
 /// as needed and returning what was written. Restore NEVER overwrites and never
 /// removes: `root` is a live client's own data directory, so an existing
 /// destination is refused - naming every colliding path - before the first byte
-/// is written. A mid-batch io failure removes the files this call created,
-/// leaving the directory as it was found.
+/// is written. A mid-batch io failure unwinds to the tree as it was found: every
+/// file this call created is removed (including one only half written), and
+/// every directory it created is removed if it is still empty - a directory
+/// something else has since populated stays.
 ///
 /// Callers restoring a lineage MUST pass the whole lineage in one call: the
 /// no-overwrite refusal and the unwind are both batch-scoped, so splitting a
@@ -746,10 +748,22 @@ pub fn write_restored_files(
     let io =
         |location: String, source: std::io::Error| AdapterError::io("restore", location, source);
     let mut written = Vec::with_capacity(dests.len());
-    for (dest, file) in dests.into_iter().zip(files) {
-        let result = (|| -> Result<(), AdapterError> {
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let outcome = (|| -> Result<(), AdapterError> {
+        for (dest, file) in dests.into_iter().zip(files) {
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| io(parent.display().to_string(), e))?;
+                // `create_dir_all` reports nothing about which ancestors it had
+                // to bring into being, so name them before the call - that list
+                // is the unwind's only record of what this batch added to the
+                // tree.
+                let created: Vec<PathBuf> = parent
+                    .ancestors()
+                    .take_while(|dir| !dir.exists())
+                    .map(Path::to_path_buf)
+                    .collect();
+                let result = std::fs::create_dir_all(parent);
+                created_dirs.extend(created);
+                result.map_err(|error| io(parent.display().to_string(), error))?;
             }
             // `create_new` is the guard, not the pre-check above: it is O_EXCL,
             // so it refuses any existing path - including a symlink, which
@@ -762,25 +776,42 @@ pub fn write_restored_files(
                 .write(true)
                 .create_new(true)
                 .open(&dest)
-                .map_err(|e| io(dest.display().to_string(), e))?;
-            std::io::Write::write_all(&mut handle, &file.bytes)
-                .map_err(|e| io(dest.display().to_string(), e))
-        })();
-        if let Err(error) = result {
-            for path in &written {
-                let _ = std::fs::remove_file(path);
-            }
-            return Err(error);
+                .map_err(|error| io(dest.display().to_string(), error))?;
+            // The path exists from here on, so it joins the unwind BEFORE the
+            // write that can still fail: a truncated leftover is
+            // indistinguishable from a finished restore on the retry, which
+            // would then report "already resumed" over a broken file.
+            written.push(dest);
+            std::io::Write::write_all(&mut handle, &file.bytes).map_err(|error| {
+                // The path just pushed is the one being written.
+                let location = written
+                    .last()
+                    .map_or_else(String::new, |dest| dest.display().to_string());
+                io(location, error)
+            })?;
         }
-        written.push(dest);
+        Ok(())
+    })();
+    let Err(error) = outcome else {
+        return Ok(written);
+    };
+    for path in &written {
+        let _ = std::fs::remove_file(path);
     }
-    Ok(written)
+    // Deepest first, because `remove_dir` only takes empty directories - and
+    // that emptiness check is what keeps the unwind from removing a directory
+    // someone else has since put files in.
+    created_dirs.sort_unstable_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in &created_dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Err(error)
 }
 
 /// Does anything occupy this path? `Path::exists` follows symlinks, so a
 /// DANGLING one reads as absent - and a restore that trusted it would write
 /// through the link, outside the root. `symlink_metadata` sees the link itself.
-fn exists_even_if_dangling(path: &Path) -> bool {
+pub fn exists_even_if_dangling(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
@@ -805,6 +836,102 @@ pub(crate) fn by_timestamp_then_id(
 #[inline]
 pub(crate) fn empty_options() -> ProviderOptions {
     ProviderOptions::new()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use tempfile::TempDir;
+
+    use super::{RestoreFidelity, RestoredFile, write_restored_files};
+
+    /// A failed batch leaves nothing of itself behind - not the files it wrote,
+    /// and not the directories it had to create to write them.
+    #[test]
+    fn a_failed_batch_removes_the_files_and_the_directories_it_created() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().join("client-home");
+        // A regular file where the second destination needs a directory: the
+        // batch fails at `create_dir_all`, after the first file has landed.
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("blocked"), b"in the way").expect("blocker");
+
+        let error = write_restored_files(
+            &root,
+            vec![
+                RestoredFile::new(
+                    "sessions/deep/first.jsonl",
+                    b"first".to_vec(),
+                    RestoreFidelity::Foreign,
+                ),
+                RestoredFile::new(
+                    "blocked/second.jsonl",
+                    b"second".to_vec(),
+                    RestoreFidelity::Foreign,
+                ),
+            ],
+        )
+        .expect_err("a destination whose parent is a file must fail the batch");
+        assert!(error.to_string().contains("io error"), "{error}");
+
+        assert!(
+            !root.join("sessions/deep/first.jsonl").exists(),
+            "the file written before the failure survived the unwind",
+        );
+        assert!(
+            !root.join("sessions/deep").exists() && !root.join("sessions").exists(),
+            "directories this batch created survived the unwind",
+        );
+        assert!(
+            root.join("blocked").is_file() && root.is_dir(),
+            "the unwind removed something it did not create",
+        );
+    }
+
+    /// The unwind is scoped to this batch: a directory it did not create keeps
+    /// standing, and everything already inside it stays.
+    #[test]
+    fn the_unwind_keeps_a_directory_it_did_not_create() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().join("client-home");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("blocked"), b"in the way").expect("blocker");
+
+        write_restored_files(
+            &root,
+            vec![RestoredFile::new(
+                "sessions/first.jsonl",
+                b"first".to_vec(),
+                RestoreFidelity::Foreign,
+            )],
+        )
+        .expect("the first batch writes cleanly");
+        let intruder = root.join("sessions/not-ours.txt");
+        std::fs::write(&intruder, b"someone else's").expect("intruder");
+
+        write_restored_files(
+            &root,
+            vec![
+                RestoredFile::new(
+                    "sessions/second.jsonl",
+                    b"second".to_vec(),
+                    RestoreFidelity::Foreign,
+                ),
+                RestoredFile::new(
+                    "blocked/third.jsonl",
+                    b"third".to_vec(),
+                    RestoreFidelity::Foreign,
+                ),
+            ],
+        )
+        .expect_err("the second batch fails on the blocked destination");
+        assert!(
+            !root.join("sessions/second.jsonl").exists(),
+            "the failed batch's own file survived",
+        );
+        assert!(intruder.is_file(), "the unwind removed a foreign file");
+    }
 }
 
 #[cfg(test)]
