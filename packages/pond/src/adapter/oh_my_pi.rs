@@ -13,10 +13,15 @@
 //!   header, and so does this adapter - the slot's title / source / updatedAt
 //!   land in `options.source.title_slot`, never dropped
 //!   (spec.md#adapter-integrity-no-silent-drops) and never a message.
-//! - **The sessions directory.** `~/.omp/agent/sessions/<scope>-<basename>-<sha256(cwd)>/`
-//!   instead of pi's `--<encoded-cwd>--`. Inert here: the project comes from the
-//!   header's `cwd`, and the directory name is kept only as the placement hint
-//!   every JSONL adapter records.
+//! - **The sessions directory.** `~/.omp/agent/sessions/<bucket>/`, where the
+//!   bucket is scope-encoded from the cwd (`session-paths.ts`): `-<home-relative>`
+//!   under `$HOME`, `-tmp-<rel>` under the temp root, else pi's
+//!   `--<encoded-absolute>--`. A hashed `<scope>-<basename>-<sha256>` form also
+//!   exists in the wild - omp 17.2.5-17.2.8 wrote it before reverting - and omp
+//!   migrates those dirs back into the encoded name on access. Inert either way:
+//!   the project comes from the header's `cwd`, and the directory name is kept
+//!   only as the placement hint every JSONL adapter records. Verified against
+//!   omp 17.2.15 by reading what its own `SessionManager` writes.
 //!
 //! omp's entry taxonomy is much wider than pi's (`ttsr_injection`,
 //! `credential_pin`, `session_init`, `mode_change`, `label`, `title_change`,
@@ -379,7 +384,7 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/adapter/oh-my-pi/sessions"
     );
-    const BUCKET: &str = "home-omp-demo-9f2c1ab3c4d5e6f7";
+    const BUCKET: &str = "-Projects-omp-demo";
     const MAIN: &str = "0a1b2c3d4e5f6071";
     const FORK: &str = "1b2c3d4e5f607182";
     const LEGACY: &str = "legacy00000001";
@@ -444,7 +449,11 @@ mod tests {
             "the stripped slot survives in options rather than being dropped",
         );
         // The placement hint is omp's hashed bucket, not a pi-style slug.
-        assert_eq!(source.get("project_slug"), Some(&json!(BUCKET)));
+        assert_eq!(
+            source.get("project_slug"),
+            Some(&json!(BUCKET)),
+            "the placement hint is omp's scope-encoded bucket, verbatim",
+        );
 
         assert!(
             !main.messages.iter().any(|message| matches!(

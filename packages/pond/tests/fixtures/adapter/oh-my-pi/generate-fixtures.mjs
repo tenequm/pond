@@ -39,12 +39,13 @@ if (!out) {
 const { serializeTitleSlot } = await import("@oh-my-pi/pi-coding-agent/session/session-title-slot");
 
 const CWD = "/Users/user/Projects/omp-demo";
-// A stand-in shaped like omp's bucket (<scope>-<basename>-<sha256(canonical-cwd)>),
-// not the real digest of CWD: omp's exact scoping and truncation rules are not
-// published, and the adapter treats the directory name as an inert placement
-// hint (project comes from the header `cwd`), so faking precision here would
-// claim more than we verified.
-const BUCKET = "home-omp-demo-9f2c1ab3c4d5e6f7";
+// The bucket omp writes for a cwd under $HOME: `session-paths.ts` encodes the
+// home-relative path with `/ \ :` mapped to `-`. (The hashed
+// `<scope>-<basename>-<sha256>` form only ever shipped in 17.2.5-17.2.8, which
+// reverted it - omp migrates those dirs back into this name.) Hardcoded rather
+// than derived because deriving it needs a sandboxed $HOME, and the adapter
+// treats the name as an inert placement hint.
+const BUCKET = "-Projects-omp-demo";
 const SESSION_ID = "0a1b2c3d4e5f6071";
 const FORK_ID = "1b2c3d4e5f607182";
 

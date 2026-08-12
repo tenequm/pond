@@ -378,12 +378,16 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
 
 ### oh-my-pi (`omp`)
 
-- Source path: `~/.omp/agent/sessions/<scope>-<project-basename>-<sha256(canonical-cwd)>/<timestamp>_<sessionId>.jsonl`
+- Source path: `~/.omp/agent/sessions/<bucket>/<timestamp>_<sessionId>.jsonl`, where
+  `<bucket>` is scope-encoded from the cwd: `-<home-relative>` under `$HOME`,
+  `-tmp-<rel>` under the temp root, else `--<encoded-absolute>--`. (A hashed
+  `<scope>-<basename>-<sha256>` form exists in the wild from omp 17.2.5-17.2.8,
+  which reverted it; omp migrates those dirs back into the encoded name.)
 - Layout: a pi fork that kept pi's version-3 record model, so the entries are pi
   v3 (`{type:"session", id, timestamp, cwd}` header, then `message` and
   state-carrier entries chained by `id` / `parentId`). Two container differences
-  matter: the bucket directory is a cwd hash rather than pi's `--<encoded-cwd>--`
-  slug, and current files begin with a fixed-width **256-byte
+  matter: the bucket directory is scope-encoded rather than pi's always-absolute
+  `--<encoded-cwd>--` slug, and current files begin with a fixed-width **256-byte
   `{"type":"title","v":1,...}` slot** whose line precedes the session header.
   omp's loader strips that slot and folds it into the logical header, and so does
   the adapter (into `options.source.title_slot`).
@@ -397,9 +401,9 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
   imports, so the script runs under **bun** (omp's own runtime), not plain node -
   the script's header says the same, so the two cannot drift. Timestamps and ids
   are literal, so a re-run on an unchanged omp is byte-identical. The bucket
-  directory name is a stand-in shaped like omp's, not a real cwd digest: omp's
-  scoping and truncation rules are unpublished and the adapter treats the name as
-  an inert placement hint.
+  directory name is the home-scope encoded form omp writes for
+  `/Users/user/Projects/omp-demo`; the adapter treats it as an inert placement
+  hint either way.
 
 ## Cross-platform schema variation
 
