@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.7](https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7) - 2026-08-12
+
+### <!-- 1 -->🎉 New Features
+- pi integration - pond resume, harness-v2 adapters, and the pi-pond extension ([39f4cb2](https://github.com/tenequm/pond/commit/39f4cb29c464cde8cc016b065513d1ac9bfbf7e8))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7
+
 ## [0.14.6](https://github.com/tenequm/pond/compare/v0.14.5...v0.14.6) - 2026-08-07
 
 ### <!-- 2 -->🐛 Bug Fixes
