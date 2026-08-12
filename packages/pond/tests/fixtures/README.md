@@ -394,9 +394,12 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
   the exact invocation and the omp version last used. It imports omp's OWN
   `serializeTitleSlot`, so the slot bytes are omp's, and a slot-shape change
   shows up as a fixture diff. omp ships raw TypeScript with extensionless
-  imports, so the script runs under **bun** (omp's own runtime), not plain node.
-  Timestamps and ids are literal, so a re-run on an unchanged omp is
-  byte-identical.
+  imports, so the script runs under **bun** (omp's own runtime), not plain node -
+  the script's header says the same, so the two cannot drift. Timestamps and ids
+  are literal, so a re-run on an unchanged omp is byte-identical. The bucket
+  directory name is a stand-in shaped like omp's, not a real cwd digest: omp's
+  scoping and truncation rules are unpublished and the adapter treats the name as
+  an inert placement hint.
 
 ## Cross-platform schema variation
 

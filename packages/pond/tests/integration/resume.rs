@@ -401,6 +401,34 @@ async fn an_unknown_client_lists_the_ones_that_exist() {
     assert!(known.contains(&"pi-coding-agent"), "got {known:?}");
 }
 
+/// An ingest-only client is an unanswerable request, not a failed write: the
+/// capability is asked before any planning, so the caller gets exit 2 and a
+/// document naming the alternative rather than a serialize error surfacing as
+/// the generic exit 1 (which collides with "session is not stored").
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ingest_only_client_refuses_with_the_alternative() {
+    let sandbox = Sandbox::with_pi_corpus().await;
+    let out_dir = sandbox.out_dir();
+    let (code, doc) = sandbox.resume_json(&[
+        PI_SESSION,
+        "--to",
+        "oh-my-pi",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(code, 2, "ingest-only is unanswerable, not a not-found");
+    assert_eq!(doc["error"], "restore_unsupported");
+    assert_eq!(doc["adapter"], "oh-my-pi");
+    let reason = doc["reason"]
+        .as_str()
+        .expect("reason names the alternative");
+    assert!(reason.contains("pi-coding-agent"), "got {reason}");
+    assert!(!out_dir.exists(), "a refused resume writes nothing");
+}
+
 /// The relative layout `--out-dir` gets filled with, learned by restoring once
 /// into a throwaway root - the adapter owns that layout, so a test must not
 /// hard-code it to seed a destination.

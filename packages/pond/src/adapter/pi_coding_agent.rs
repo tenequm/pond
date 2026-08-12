@@ -604,20 +604,7 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
     let row = &first.value;
     let at_first = format!("{path_display}:{}", first.line);
 
-    // Capture the exact on-disk path components so native restore reproduces
-    // the source file byte-for-byte (the slug encoding and filename timestamp
-    // are not recomputable from canonical alone).
-    let placement = SourcePlacement {
-        project_slug: path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(ToOwned::to_owned),
-        file_name: path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(ToOwned::to_owned),
-    };
+    let placement = SourcePlacement::from_path(path);
 
     if row.get("kind").and_then(Value::as_str) == Some("header") {
         return v4_session_from_header(row, &at_first, &placement);
@@ -638,6 +625,27 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
 pub(crate) struct SourcePlacement {
     pub(crate) project_slug: Option<String>,
     pub(crate) file_name: Option<String>,
+}
+
+impl SourcePlacement {
+    /// Capture the exact on-disk path components so native restore reproduces
+    /// the source file byte-for-byte: neither the directory name nor the
+    /// filename timestamp is recomputable from canonical alone. Shared with the
+    /// forks that reuse this v3 codec, so one definition decides what "where it
+    /// came from" means.
+    pub(crate) fn from_path(path: &Path) -> Self {
+        Self {
+            project_slug: path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned),
+            file_name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned),
+        }
+    }
 }
 
 // -- v3 ---------------------------------------------------------------------

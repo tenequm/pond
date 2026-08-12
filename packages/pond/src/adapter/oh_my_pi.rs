@@ -46,15 +46,14 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, expand_home,
+    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, config_path,
     jsonl::{
-        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, peek_last_line,
-        peek_nth_line,
+        BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, jsonl_tree_plan,
+        peek_last_line, peek_nth_line,
     },
     pi_coding_agent::{SourcePlacement, row_timestamp, v3_events_from_row, v3_session_from_row},
 };
@@ -65,7 +64,31 @@ const NAME: &str = "oh-my-pi";
 /// The only session version this adapter decodes. omp is at 3 and migrates
 /// older files up on load, so a header naming anything higher is a format move
 /// this build predates - a visible, counted skip rather than a half ingest.
+///
+/// Numerically equal to pi's `V3_FORMAT`, which is the tag the shared mapper
+/// STAMPS, while this is the highest version this reader ACCEPTS. Same value
+/// today, different jobs: if omp's record model ever moves off pi's, this one
+/// rises and the stamped tag does not.
 const SUPPORTED_SESSION_VERSION: i64 = 3;
+
+/// The physical line the title slot occupies. omp writes it at byte 0 and
+/// rewrites it in place, so framing is a position, not a shape that could
+/// appear anywhere.
+const FRAMING_LINE: usize = 1;
+
+/// omp's title-slot record type (`session-title-slot.ts`).
+const TITLE_SLOT_TYPE: &str = "title";
+
+/// omp's fixed-width title slot shape marker (`session-title-slot.ts` writes
+/// `v: 1` and its own parser rejects anything else). A different value is a
+/// container move this build has not seen, not a slot to fold.
+const SUPPORTED_TITLE_SLOT_VERSION: i64 = 1;
+
+/// Why restore is refused, shared by the capability query and `serialize` so the
+/// two surfaces can never drift.
+const RESTORE_UNSUPPORTED: &str = "oh-my-pi captures sessions but cannot restore them yet; \
+     `pond resume <id> --to pi-coding-agent --out-dir ~/.omp/agent` writes a v3 transcript \
+     omp reads as a legacy session file";
 
 /// Stateless factory: opens [`OhMyPiAdapter`] instances and probes for omp's
 /// canonical install location under `~/.omp/agent/sessions`.
@@ -77,7 +100,7 @@ impl AdapterFactory for OhMyPiFactory {
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
-        Ok(Box::new(OhMyPiAdapter::from_config(config)?))
+        Ok(Box::new(OhMyPiAdapter::new(config_path(NAME, config)?)))
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
@@ -88,28 +111,23 @@ impl AdapterFactory for OhMyPiFactory {
     /// Ingest-only: omp restore is not implemented, and a restore pond cannot
     /// verify against a real omp is worse than no restore
     /// (spec.md#adapter-native-restore-lossless - fidelity is reported, never
-    /// assumed). The refusal names the working alternative instead of the
-    /// symptom, per the CLI error contract: omp loads a slot-less v3 file as a
-    /// legacy session, which is exactly what the pi serializer emits.
+    /// assumed). The reason names the working alternative rather than the
+    /// symptom: omp loads a slot-less v3 file as a legacy session, which is
+    /// exactly what the pi serializer emits.
+    fn restore_unsupported(&self) -> Option<&'static str> {
+        Some(RESTORE_UNSUPPORTED)
+    }
+
+    /// Unreachable through `pond resume`, which asks [`Self::restore_unsupported`]
+    /// first. Kept honest rather than `unreachable!` so a future caller that
+    /// skips the capability query gets an error, not a panic.
     fn serialize(
         &self,
         _session: &crate::sessions::SessionWithMessages,
         _fidelity: RestoreFidelity,
     ) -> Result<Vec<RestoredFile>, AdapterError> {
-        Err(AdapterError::schema(
-            NAME,
-            NAME,
-            "oh-my-pi captures sessions but cannot restore them yet; \
-             `pond resume <id> --to pi-coding-agent --out-dir ~/.omp/agent` writes a v3 \
-             transcript omp reads as a legacy session file",
-        ))
+        Err(AdapterError::schema(NAME, NAME, RESTORE_UNSUPPORTED))
     }
-}
-
-/// `[adapters.oh-my-pi]` config blob: the JSONL sessions root.
-#[derive(Debug, Clone, Deserialize)]
-struct OhMyPiConfig {
-    path: PathBuf,
 }
 
 /// Configured omp reader: a tree of `*.jsonl` session files under one sessions
@@ -124,14 +142,6 @@ impl OhMyPiAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
-
-    fn from_config(config: Value) -> Result<Self, AdapterError> {
-        let cfg: OhMyPiConfig = serde_json::from_value(config)
-            .map_err(|err| AdapterError::config(NAME, format!("bad config blob: {err}")))?;
-        Ok(Self {
-            root: expand_home(cfg.path),
-        })
-    }
 }
 
 impl Adapter for OhMyPiAdapter {
@@ -144,7 +154,7 @@ impl Adapter for OhMyPiAdapter {
     }
 
     fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> super::PlanFuture<'a> {
-        super::jsonl::jsonl_tree_plan(self, oracle)
+        jsonl_tree_plan(self, oracle)
     }
 }
 
@@ -170,21 +180,26 @@ impl JsonlTree for OhMyPiAdapter {
         } else {
             first
         };
-        is_session_head(&head)
-            .then(|| head.get("id").and_then(Value::as_str))
-            .flatten()
+        if !is_session_head(&head) {
+            return None;
+        }
+        head.get("id")
+            .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     }
 
     fn peek_watermark(&self, path: &Path) -> SourceWatermark {
         // Append-ordered, so the last line is the latest event. A file holding
         // only its slot and header has no ingestible content yet and reads as
-        // `Opaque` (re-read) rather than fresh, and the slot itself is rewritten
-        // in place on every rename - its `updatedAt` is not an event time, which
-        // is why `row_timestamp` (keyed on `timestamp`) is the right reader.
+        // `Opaque` (re-read) rather than fresh.
+        //
+        // The header needs an explicit guard because it carries a `timestamp`
+        // that would read as an event time. The slot needs none: it records
+        // `updatedAt`, and `row_timestamp` keys on `timestamp` alone, so a
+        // slot-only file falls out as `Opaque` on its own.
         let last = || -> Option<i64> {
             let row: Value = serde_json::from_str(&peek_last_line(path)?).ok()?;
-            if is_title_slot(&row) || is_session_head(&row) {
+            if is_session_head(&row) {
                 return None;
             }
             row_timestamp(&row).map(|ts| ts.timestamp_micros())
@@ -196,7 +211,39 @@ impl JsonlTree for OhMyPiAdapter {
     }
 
     fn unsupported_reason(&self, path: &Path, rows: &[BoundedRow]) -> Option<String> {
+        // Three format moves, one visible outcome. Without this a moved
+        // container falls through `session()` into `SkipReason::Empty`, which
+        // renders as `empty` with NO reason and shrinks the progress
+        // denominator - so an entire unreadable corpus would report as a clean
+        // sync with nothing to do (spec.md#adapter-integrity-no-silent-drops).
+        let unsupported = |what: String| {
+            Some(format!(
+                "{}: {what} is newer than this pond build understands; upgrade pond",
+                path.display(),
+            ))
+        };
+
+        let first = rows.first().map(|row| &row.value)?;
+        if first.get("type").and_then(Value::as_str) == Some(TITLE_SLOT_TYPE)
+            && first.get("v").and_then(Value::as_i64) != Some(SUPPORTED_TITLE_SLOT_VERSION)
+        {
+            let version = first.get("v").cloned().unwrap_or(Value::Null);
+            return unsupported(format!(
+                "oh-my-pi title-slot version {version} (supported: \
+                 {SUPPORTED_TITLE_SLOT_VERSION})"
+            ));
+        }
+
         let head = &logical_head(rows)?.value;
+        // A `kind: "header"` container is the harness-v2 move pi already made;
+        // omp has not, and this reader decodes only the v3 record model.
+        if head.get("kind").and_then(Value::as_str) == Some("header") {
+            let version = head.get("version").cloned().unwrap_or(Value::Null);
+            return unsupported(format!(
+                "the oh-my-pi session container (`kind: \"header\"`, version {version})"
+            ));
+        }
+
         let version = head.get("version").and_then(Value::as_i64)?;
         (is_session_head(head) && version > SUPPORTED_SESSION_VERSION).then(|| {
             format!(
@@ -227,19 +274,9 @@ impl JsonlTree for OhMyPiAdapter {
             ));
         }
 
-        let placement = SourcePlacement {
-            project_slug: path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(ToOwned::to_owned),
-            file_name: path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(ToOwned::to_owned),
-        };
+        let placement = SourcePlacement::from_path(path);
         let mut session = v3_session_from_row(NAME, &head.value, &at_head, &placement)?;
-        fold_title_slot(&mut session, rows.first().map(|row| &row.value));
+        fold_title_slot(&mut session, rows.first(), &at_head)?;
         Ok(session)
     }
 
@@ -254,7 +291,7 @@ impl JsonlTree for OhMyPiAdapter {
         // writes it. A `title`-shaped row anywhere else is not framing, so it
         // rides the carrier path and stays visible
         // (spec.md#adapter-integrity-no-silent-drops).
-        if row.line == 1 && is_title_slot(&row.value) {
+        if row.line == FRAMING_LINE && is_title_slot(&row.value) {
             return Ok(Vec::new());
         }
         v3_events_from_row(&session.id, row.line, &row.value, session.created_at)
@@ -262,10 +299,10 @@ impl JsonlTree for OhMyPiAdapter {
 }
 
 /// omp's fixed-width first-line title slot (`session-title-slot.ts`): `type`
-/// plus the `v: 1` shape marker, which is what separates it from a real entry.
+/// plus the shape marker, which is what separates it from a real entry.
 fn is_title_slot(row: &Value) -> bool {
-    row.get("type").and_then(Value::as_str) == Some("title")
-        && row.get("v").and_then(Value::as_i64) == Some(1)
+    row.get("type").and_then(Value::as_str) == Some(TITLE_SLOT_TYPE)
+        && row.get("v").and_then(Value::as_i64) == Some(SUPPORTED_TITLE_SLOT_VERSION)
 }
 
 fn is_session_head(row: &Value) -> bool {
@@ -280,26 +317,47 @@ fn logical_head(rows: &[BoundedRow]) -> Option<&BoundedRow> {
 }
 
 /// Carry the stripped slot into the session's source options so folding it is
-/// lossless. Absent for a legacy slot-less file, which is why this is not an
-/// error path.
-fn fold_title_slot(session: &mut Session, first: Option<&Value>) {
-    let Some(slot) = first.filter(|row| is_title_slot(row)) else {
-        return;
+/// lossless. Absent for a legacy slot-less file, which is why a missing slot is
+/// not an error.
+///
+/// Keyed on the PHYSICAL first line, the same key
+/// [`JsonlTree::events_from_row`] skips on, so the two can never disagree about
+/// which row is framing: a slot anywhere else is left to the carrier path
+/// instead of being both folded and carried.
+fn fold_title_slot(
+    session: &mut Session,
+    first: Option<&BoundedRow>,
+    at_head: &str,
+) -> Result<(), AdapterError> {
+    let Some(slot) = first
+        .filter(|row| row.line == FRAMING_LINE && is_title_slot(&row.value))
+        .map(|row| &row.value)
+    else {
+        return Ok(());
     };
-    if let Some(source) = session
+    // `v3_session_from_row` always inserts `source` as an object, so this is an
+    // invariant, not a fallible lookup - surfaced rather than skipped, because
+    // silently returning here would drop the slot the caller just stripped.
+    let source = session
         .options
         .get_mut("source")
         .and_then(Value::as_object_mut)
-    {
-        source.insert(
-            "title_slot".to_owned(),
-            json!({
-                "title": slot.get("title"),
-                "source": slot.get("source"),
-                "updated_at": slot.get("updatedAt"),
-            }),
-        );
-    }
+        .ok_or_else(|| {
+            AdapterError::schema(
+                NAME,
+                at_head.to_owned(),
+                "session options carry no `source` object to fold the title slot into",
+            )
+        })?;
+    source.insert(
+        "title_slot".to_owned(),
+        json!({
+            "title": slot.get("title"),
+            "source": slot.get("source"),
+            "updated_at": slot.get("updatedAt"),
+        }),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -326,6 +384,18 @@ mod tests {
     const FORK: &str = "1b2c3d4e5f607182";
     const LEGACY: &str = "legacy00000001";
     const PROJECT: &str = "/Users/user/Projects/omp-demo";
+
+    fn a_session() -> Session {
+        Session {
+            id: "sess1".to_owned(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: NAME.to_owned(),
+            created_at: chrono::Utc::now(),
+            project: crate::adapter::extract::Extracted::from_test_value(PROJECT.to_owned()),
+            options: crate::wire::ProviderOptions::new(),
+        }
+    }
 
     fn main_file() -> PathBuf {
         Path::new(FIXTURES)
@@ -427,9 +497,7 @@ mod tests {
             .messages
             .iter()
             .filter_map(|message| match &message.message {
-                Message::System { content, .. } => {
-                    Some(content.as_deref().map(ToString::to_string))
-                }
+                Message::System { content, .. } => Some(content.as_deref().cloned()),
                 _ => None,
             })
             .collect();
@@ -442,20 +510,15 @@ mod tests {
             "a shared pi carrier still maps: {carriers:?}",
         );
 
-        let count = |kind: &str| {
+        let count = |want: fn(&Message) -> bool| {
             main.messages
                 .iter()
-                .filter(|message| match &message.message {
-                    Message::User { .. } => kind == "user",
-                    Message::Assistant { .. } => kind == "assistant",
-                    Message::Tool { .. } => kind == "tool",
-                    Message::System { .. } => kind == "system",
-                })
+                .filter(|message| want(&message.message))
                 .count()
         };
-        assert_eq!(count("user"), 2);
-        assert_eq!(count("assistant"), 1);
-        assert_eq!(count("tool"), 1);
+        assert_eq!(count(|m| matches!(m, Message::User { .. })), 2);
+        assert_eq!(count(|m| matches!(m, Message::Assistant { .. })), 1);
+        assert_eq!(count(|m| matches!(m, Message::Tool { .. })), 1);
 
         let fork = store.get_session(FORK).await?.expect("fork session lands");
         assert!(
@@ -494,15 +557,7 @@ mod tests {
     #[test]
     fn a_title_shaped_row_off_line_one_stays_visible() {
         let adapter = OhMyPiAdapter::new(FIXTURES);
-        let session = Session {
-            id: "sess1".to_owned(),
-            parent_session_id: None,
-            parent_message_id: None,
-            source_agent: NAME.to_owned(),
-            created_at: chrono::Utc::now(),
-            project: crate::adapter::extract::Extracted::from_test_value(PROJECT.to_owned()),
-            options: crate::wire::ProviderOptions::new(),
-        };
+        let session = a_session();
         let slot = json!({"type": "title", "v": 1, "title": "t", "updatedAt": "x", "pad": " "});
 
         let framing = adapter
@@ -610,28 +665,82 @@ mod tests {
         );
     }
 
+    /// A moved CONTAINER must be as visible as a moved version. Without this the
+    /// file falls through `session()` into `SkipReason::Empty`, which prints
+    /// `empty` with no reason and shrinks the progress denominator - so a wholly
+    /// unreadable corpus would report as a clean sync with nothing to do.
+    #[test]
+    fn a_moved_container_is_a_named_skip_not_an_empty_file() {
+        let adapter = OhMyPiAdapter::new(FIXTURES);
+        let path = Path::new("/tmp/omp/sessions/bucket/x.jsonl");
+        let head = json!({
+            "type": "session", "version": 3, "id": "sess1",
+            "timestamp": "2026-08-12T10:00:00.000Z", "cwd": PROJECT,
+        });
+
+        // A slot shape this build does not know.
+        let bumped_slot = vec![
+            BoundedRow {
+                line: 1,
+                value: json!({"type": "title", "v": 2, "title": "t", "pad": " "}),
+            },
+            BoundedRow {
+                line: 2,
+                value: head.clone(),
+            },
+        ];
+        let reason = adapter
+            .unsupported_reason(path, &bumped_slot)
+            .expect("a bumped slot version is unsupported");
+        assert!(reason.contains("title-slot version 2"), "{reason}");
+        assert!(reason.contains("upgrade pond"), "{reason}");
+
+        // The harness-v2 container move pi already made, which this reader does
+        // not decode - it must not read as an empty file.
+        let v4_container = vec![BoundedRow {
+            line: 1,
+            value: json!({"kind": "header", "version": 4, "id": "sess1", "cwd": PROJECT}),
+        }];
+        let reason = adapter
+            .unsupported_reason(path, &v4_container)
+            .expect("a kind:header container is unsupported");
+        assert!(reason.contains("version 4"), "{reason}");
+        assert!(reason.contains("upgrade pond"), "{reason}");
+
+        // And the shipped shape still reads normally.
+        assert!(
+            adapter
+                .unsupported_reason(
+                    path,
+                    &[BoundedRow {
+                        line: 1,
+                        value: head
+                    }]
+                )
+                .is_none(),
+        );
+    }
+
     /// Ingest-only: the refusal names the working alternative, per the CLI error
     /// contract.
     #[test]
     fn restore_refuses_and_names_the_alternative() {
         let session = crate::sessions::SessionWithMessages {
-            session: Session {
-                id: "sess1".to_owned(),
-                parent_session_id: None,
-                parent_message_id: None,
-                source_agent: NAME.to_owned(),
-                created_at: chrono::Utc::now(),
-                project: crate::adapter::extract::Extracted::from_test_value(PROJECT.to_owned()),
-                options: crate::wire::ProviderOptions::new(),
-            },
+            session: a_session(),
             messages: Vec::new(),
         };
 
+        // The CLI asks this BEFORE planning, so it is the surface that decides
+        // the exit code; `serialize` only backs it up for a caller that skips it.
+        let reason = OhMyPiFactory
+            .restore_unsupported()
+            .expect("oh-my-pi is ingest-only");
+        assert!(reason.contains("pi-coding-agent"), "{reason}");
+        assert!(reason.contains("--out-dir ~/.omp/agent"), "{reason}");
+
         let error = OhMyPiFactory
             .serialize(&session, RestoreFidelity::Native)
-            .expect_err("oh-my-pi is ingest-only");
-        let text = error.to_string();
-        assert!(text.contains("pi-coding-agent"), "{text}");
-        assert!(text.contains("--out-dir ~/.omp/agent"), "{text}");
+            .expect_err("serialize stays an error, not a panic");
+        assert!(error.to_string().contains(reason), "both surfaces agree");
     }
 }
