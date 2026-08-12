@@ -50,6 +50,7 @@ jobs:
           repo:check-changelog
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
+          pi-pond:typecheck pi-pond:test
           hermes-pond:test
 
   # Hosted, never pond-ci: those runner pods are unprivileged with a root-owned

@@ -1,0 +1,118 @@
+# A one-tenant slice of the fleet topology in docs/references/2608-06-pi-fleet-capture.md:
+# a pi worker with a pond sidecar sharing its sessions volume, writing to one
+# object store, plus a separate read side on the same store URL.
+#
+# Everything pond needs is environment (spec 3.9 storage-env-mirror), which is
+# why no service mounts a pond config file.
+
+name: pond-pi-fleet
+
+services:
+  # The object store. In production this is S3 / R2 / Hetzner; MinIO makes the
+  # example self-contained and speaks the same protocol.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: pondadmin
+      MINIO_ROOT_PASSWORD: pondadmin123
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: create the bucket the tenant prefixes live under.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 pondadmin pondadmin123 &&
+             mc mb --ignore-existing local/pond &&
+             echo 'bucket ready'"
+
+  # The worker: pi running a scripted prompt in print mode. It writes session
+  # files to the shared volume and knows nothing about pond.
+  worker-pi:
+    image: node:22-alpine
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    environment:
+      # Any provider pi supports; ANTHROPIC_API_KEY is the default path. Left
+      # optional because compose interpolates the whole file even when you start
+      # only the pond half - worker.sh is where a missing key reports itself.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      PI_PROMPT: ${PI_PROMPT:-Explain in two sentences what a write-ahead log is for.}
+      HOME: /pi
+    volumes:
+      - pi-sessions:/pi/.pi
+      - ./worker.sh:/worker.sh:ro
+    command: ["sh", "/worker.sh"]
+
+  # The sidecar: same volume, tails what pi writes, syncs to the store every
+  # minute. --bootstrap enables the pi adapter on a pond that has none, so the
+  # image needs no pond config and no setup step.
+  worker-pond:
+    build:
+      context: .
+      dockerfile: Dockerfile.pond
+      args:
+        POND_VERSION: ${POND_VERSION:-latest}
+    image: pond-example:${POND_VERSION:-latest}
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    environment:
+      # pond defaults `s3+` endpoints to virtual-hosted addressing (the Hetzner /
+      # R2 / B2 shape) and only auto-flips to path-style for IP hosts, so a
+      # DNS-named MinIO needs the override or it dials `pond.minio:9000`.
+      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo?virtual_hosted_style_request=false
+      # POND_CREDS_<SET>_<FIELD>: `default` is just the set name, and a set with
+      # no `scope` matches any storage URL. Omitting the set name silently makes
+      # a `[creds.access]` / `[creds.secret]` set and fails config load.
+      POND_CREDS_DEFAULT_ACCESS_KEY_ID: pondadmin
+      POND_CREDS_DEFAULT_SECRET_ACCESS_KEY: pondadmin123
+      # pond logs at WARN by default, which hides every sync outcome - a sidecar
+      # that silently ingests nothing looks identical to a healthy one. This one
+      # target is the per-tick summary, without `-v`'s Lance-internal firehose.
+      # RUST_LOG replaces pond's own filter, so re-silence the unactionable Lance
+      # count-pushdown WARN it would otherwise let back in.
+      RUST_LOG: warn,pond::sync=info,lance::io::exec::count_pushdown=error
+      HOME: /pi
+    volumes:
+      - pi-sessions:/pi/.pi
+    # --bootstrap probes for the pi adapter exactly once, at startup, by testing
+    # whether the sessions dir exists - and worker-pi only creates it minutes
+    # later, after `npm install`. Creating it here makes discovery order-independent.
+    entrypoint: ["sh", "-c", "mkdir -p /pi/.pi/agent/sessions && exec pond \"$$@\"", "pond"]
+    command:
+      - serve
+      - --transport
+      - http
+      - --host
+      - 0.0.0.0
+      - --with-sync
+      - --sync-every
+      - "1"
+      - --bootstrap
+      - pi-coding-agent
+
+  # The read side: same store URL, no adapters, no sync. Writes nothing, so it
+  # scales and restarts independently of the workers.
+  read-side:
+    image: pond-example:${POND_VERSION:-latest}
+    depends_on:
+      # Only for the image, which worker-pond's `build` produces.
+      worker-pond: { condition: service_started }
+    environment:
+      POND_STORAGE_PATH: s3+http://minio:9000/pond/tenants/demo?virtual_hosted_style_request=false
+      POND_CREDS_DEFAULT_ACCESS_KEY_ID: pondadmin
+      POND_CREDS_DEFAULT_SECRET_ACCESS_KEY: pondadmin123
+    ports: ["9797:9797"]
+    command: ["serve", "--transport", "http", "--host", "0.0.0.0"]
+
+volumes:
+  # The volume is what bounds the loss window: outliving the worker pod means
+  # the next one syncs whatever the last one left behind.
+  pi-sessions:

@@ -3,7 +3,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { parsePluginConfig } from "../src/config.js";
 import { PondMcpClient } from "../src/mcp.js";
-import { PondController, type PondLogger } from "../src/service.js";
+import { PondController, pondChildEnv, type PondLogger } from "../src/service.js";
 
 function collectingLogger(): { logger: PondLogger; errors: string[] } {
   const errors: string[] = [];
@@ -73,6 +73,32 @@ describe("PondController.stop", () => {
     await controller.stop();
     const out = await controller.callTool("pond_search", { query: "q" });
     expect(out.ok).toBe(false);
+  });
+});
+
+describe("child env", () => {
+  it("forwards the XDG and POND_ knobs the SDK safelist would drop", () => {
+    const env = pondChildEnv({
+      HOME: "/home/u",
+      PATH: "/usr/bin",
+      XDG_DATA_HOME: "/home/u/data",
+      // pond's own default_cache_dir() reads it; dropping it sends the child to
+      // a different cache than every other pond on this machine.
+      XDG_CACHE_HOME: "/home/u/cache",
+      XDG_CONFIG_HOME: "/home/u/config",
+      XDG_STATE_HOME: "/home/u/state",
+      POND_STORAGE_PATH: "s3://bucket/pond",
+      UNRELATED: "no",
+    });
+    expect(env).toEqual({
+      HOME: "/home/u",
+      PATH: "/usr/bin",
+      XDG_DATA_HOME: "/home/u/data",
+      XDG_CACHE_HOME: "/home/u/cache",
+      XDG_CONFIG_HOME: "/home/u/config",
+      XDG_STATE_HOME: "/home/u/state",
+      POND_STORAGE_PATH: "s3://bucket/pond",
+    });
   });
 });
 

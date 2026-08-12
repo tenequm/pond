@@ -1,0 +1,10 @@
+{"kind":"header","version":4,"id":"v4-fork-session","createdAt":1785974426000,"cwd":"/Users/user/Projects/harness-v2","parentSessionId":"v4-main-session"}
+{"kind":"entry","id":"v4-entry-model","type":"model_change","provider":"anthropic","modelId":"claude-opus-5","parentId":null,"seq":1,"timestamp":1785974402000}
+{"kind":"entry","id":"v4-entry-thinking","type":"thinking_level_change","thinkingLevel":"high","parentId":"v4-entry-model","seq":2,"timestamp":1785974403000}
+{"kind":"entry","id":"v4-entry-tools","type":"active_tools_change","activeToolNames":["bash","read"],"parentId":"v4-entry-thinking","seq":3,"timestamp":1785974404000}
+{"kind":"entry","id":"v4-entry-user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Summarize the harness-v2 storage rewrite."}],"timestamp":1785974405000},"parentId":"v4-entry-tools","seq":4,"timestamp":1785974406000}
+{"kind":"entry","id":"v4-entry-assistant","type":"message","message":{"role":"assistant","api":"anthropic-messages","provider":"anthropic","model":"claude-opus-5","content":[{"type":"thinking","thinking":"Two storage generations coexist.","thinkingSignature":"sig-1"},{"type":"text","text":"Reading the session module now."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"session/types.ts"}}],"usage":{"input":120,"output":44,"cacheRead":0,"cacheWrite":0,"totalTokens":164,"cost":{"input":0.003,"output":0.001,"cacheRead":0,"cacheWrite":0,"total":0.004}},"stopReason":"toolUse","timestamp":1785974409000},"parentId":"v4-entry-user","seq":5,"timestamp":1785974410000}
+{"kind":"lane","seq":6,"lane":"main","leafId":"v4-entry-assistant"}
+{"kind":"fact","seq":7,"fact":"name","name":"harness-v2 storage rewrite"}
+{"kind":"fact","seq":8,"fact":"label","targetId":"v4-entry-assistant","label":"key turn"}
+{"kind":"entry","lane":"main","id":"v4-fork-entry","type":"message","message":{"role":"user","content":[{"type":"text","text":"continue on the fork"}],"timestamp":1785974427000},"parentId":"v4-entry-assistant","seq":9,"timestamp":1785974428000}

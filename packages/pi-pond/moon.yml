@@ -1,0 +1,49 @@
+language: typescript
+
+# Wrappers over the package's own npm scripts (tsc + vitest). node and npm come
+# from the moon toolchain (.moon/toolchains.yml), which provisions them via
+# proto, so these run on a machine that has never had node installed.
+#
+# package-lock.json is an input everywhere: it pins the installed tree, so a
+# dependency bump changes what tsc and vitest actually run against. Without it
+# a lockfile-only commit serves a cached pass for a tree that was never checked.
+tasks:
+  # moon provisions node and npm but does not install the package's own
+  # dependencies: the JavaScript toolchain's install only triggers for a
+  # package.json at a JS workspace root, and this one is a lone manifest inside
+  # a Rust-first monorepo. So the install is declared.
+  #
+  # cache: false is load-bearing. The cache key would be the lockfile while the
+  # real artifact is node_modules/, which a fresh CI checkout never has - a hit
+  # would skip `npm ci` and leave the dependents with no tsc and no vitest,
+  # which is precisely how this suite failed before it was wired up.
+  install:
+    command: 'npm ci'
+    inputs:
+      - 'package.json'
+      - 'package-lock.json'
+    options:
+      cache: false
+
+  typecheck:
+    command: 'npm run typecheck'
+    deps: ['~:install']
+    inputs:
+      - 'src/**/*'
+      - 'test/**/*'
+      - 'index.ts'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'
+
+  test:
+    command: 'npm test'
+    deps: ['~:install']
+    inputs:
+      - 'src/**/*'
+      - 'test/**/*'
+      - 'index.ts'
+      - 'vitest.config.ts'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'

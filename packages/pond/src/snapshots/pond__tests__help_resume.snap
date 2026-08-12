@@ -1,0 +1,57 @@
+---
+source: packages/pond/src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Resume a stored session in a client's own format.
+
+Writes the session - and its child sessions - back out as the target client's native files, so you can open it there and keep going. Fidelity is decided by pond, never asked for: a session captured from that same client resumes value-complete (native); anything else is a best-effort idiomatic reconstruction (foreign). Nothing is ever overwritten.
+
+Usage: pond resume [OPTIONS] --to <ADAPTER> <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>
+          Session id (from `pond search`)
+
+Options:
+      --to <ADAPTER>
+          Target client (pi-coding-agent, claude-code, codex-cli, ...)
+
+      --out-dir <OUT_DIR>
+          Root the written files are placed under. Default: the current directory
+          
+          [default: .]
+
+      --format <FORMAT>
+          Output format: `text` (one line per session) or `json` (one document)
+          
+          [default: text]
+          [possible values: text, json]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond resume 019dd55d-99a4-7344-aa11-d1d71d2c80fb --to pi-coding-agent --out-dir ~/.pi/agent
+  pond resume <id> --to claude-code --format json     machine-readable file list
+
+--out-dir is the directory the adapter's own layout is rooted at, so for
+pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.

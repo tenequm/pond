@@ -246,6 +246,7 @@ Commands:
     get-session  Read a whole session as a transcript
     get-message  Expand one message with its full part bodies
     sql          Run one read-only SQL query
+    resume       Resume a stored session in a client's own format
     status       Show pond health, data, and adapters
 
   Serve
@@ -417,7 +418,7 @@ enum Command {
   pond status                       the one-screen overview
   pond status --hosts               which machines feed this store, and when
   pond status --include-subagents   count each subagent as its own adapter")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Status {
         /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
         /// as its own adapter. Default counts only main agents.
@@ -591,6 +592,34 @@ enum Command {
         #[arg(long, default_value_t = pond::sql::DEFAULT_QUERY_TIMEOUT_SECS)]
         timeout: u64,
     },
+    /// Resume a stored session in a client's own format.
+    ///
+    /// Writes the session - and its child sessions - back out as the target
+    /// client's native files, so you can open it there and keep going. Fidelity
+    /// is decided by pond, never asked for: a session captured from that same
+    /// client resumes value-complete (native); anything else is a best-effort
+    /// idiomatic reconstruction (foreign). Nothing is ever overwritten.
+    #[command(after_long_help = "Examples:
+  pond resume 019dd55d-99a4-7344-aa11-d1d71d2c80fb --to pi-coding-agent --out-dir ~/.pi/agent
+  pond resume <id> --to claude-code --format json     machine-readable file list
+
+--out-dir is the directory the adapter's own layout is rooted at, so for
+pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
+    #[command(display_order = 14)]
+    Resume {
+        /// Session id (from `pond search`).
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Target client (pi-coding-agent, claude-code, codex-cli, ...).
+        #[arg(long = "to", value_name = "ADAPTER")]
+        to: String,
+        /// Root the written files are placed under. Default: the current directory.
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// Output format: `text` (one line per session) or `json` (one document).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
     /// Run the HTTP API server (or MCP over stdio with --transport stdio).
     ///
     /// Serves the wire protocol over HTTP on --host:--port. Most agent
@@ -600,7 +629,7 @@ enum Command {
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`")]
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
         #[arg(long, value_enum, default_value_t = ServeTransport::Http)]
@@ -646,7 +675,7 @@ enum Command {
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Mcp {},
     /// Manage the automatic sync schedule.
     ///
@@ -754,7 +783,7 @@ enum Command {
   fish:  pond completions fish > ~/.config/fish/completions/pond.fish
 
 Homebrew and nix packages ship these pre-installed.")]
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
@@ -763,7 +792,7 @@ Homebrew and nix packages ship these pre-installed.")]
     ///
     /// The same file an agent loads as a skill, emitted to stdout so it stays in
     /// lockstep with the binary (no separate copy to drift).
-    #[command(display_order = 18)]
+    #[command(display_order = 19)]
     Skill,
     /// Keep the lake queryable: embed the backlog, then fold the search indexes.
     ///
@@ -1517,6 +1546,14 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Resume {
+            session_id,
+            to,
+            out_dir,
+            format,
+        } => {
+            run_resume(&session_id, &to, &out_dir, format, storage_path, config).await?;
+        }
         Command::Config { command } => {
             run_config_command(command, storage_path, config).await?;
         }
@@ -1681,6 +1718,248 @@ fn output(message: &str) -> anyhow::Result<()> {
 
 fn output_err(message: &str) -> anyhow::Result<()> {
     pond::output::line_err(message)
+}
+
+/// `pond resume <session-id> --to <adapter>`: write a stored session back out
+/// in a client's own format via the adapter serialize face (spec.md 7.8).
+///
+/// Exit codes are distinct so a caller can branch without parsing prose: 1 the
+/// session is not stored, 2 the request is unanswerable (unknown adapter, a
+/// lineage deeper than pond restores), 3 a destination already exists, 4 the
+/// write itself failed (and was unwound). `--format json` emits the same
+/// outcomes as one document on stdout - `{"error": ...}` included - so a plugin
+/// never has to scrape text.
+async fn run_resume(
+    session_id: &str,
+    to: &str,
+    out_dir: &Path,
+    format: OutputFormat,
+    storage_path: Option<StorageUrl>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let json = matches!(format, OutputFormat::Json);
+    let fail = |code: i32, doc: serde_json::Value, text: String| -> anyhow::Result<()> {
+        if json {
+            output(&serde_json::to_string_pretty(&doc)?)?;
+        } else {
+            output_err(&text)?;
+        }
+        std::process::exit(code);
+    };
+
+    let Some(factory) = adapter::by_name(to) else {
+        return fail(
+            2,
+            serde_json::json!({"error": "unknown_adapter", "adapter": to, "known": adapter::known_names()}),
+            format!(
+                "unknown client {to:?}. Known: {}",
+                adapter::known_names().join(", "),
+            ),
+        );
+    };
+
+    let loaded = Config::load(config_path(config))?;
+    let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+
+    // The reported paths are absolute even when `--out-dir` is relative (it
+    // defaults to `.`): a plugin hands them straight to its own client, which
+    // resolves them against ITS cwd, not pond's. `absolute` is purely lexical,
+    // so it works before the directory exists.
+    let out_dir = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    let out_dir = out_dir.as_path();
+
+    // spec.md#adapter-lineage-complete-restore: a session restores together
+    // with its child sessions, or not at all. An erased or denylisted session
+    // is simply not stored, so it reports as not found.
+    let sessions = match handlers::restore_lineage(&store, session_id).await? {
+        handlers::Lineage::Complete(sessions) => sessions,
+        handlers::Lineage::NotFound => {
+            return fail(
+                1,
+                serde_json::json!({"error": "not_found", "session_id": session_id}),
+                format!(
+                    "session {session_id} is not in this pond. Find one with: pond search <query>",
+                ),
+            );
+        }
+        handlers::Lineage::TooDeep { child_id } => {
+            return fail(
+                2,
+                serde_json::json!({"error": "lineage_too_deep", "session_id": session_id, "child_id": child_id}),
+                format!(
+                    "session {session_id} has a grandchild session ({child_id}); pond restores one \
+                     level of lineage, so this would be a partial write. Resume {child_id} \
+                     directly instead.",
+                ),
+            );
+        }
+    };
+
+    // Fidelity is the system's decision, never the caller's: same origin means
+    // a value-complete replay is available (`source_agent` is exact-or-subpath,
+    // so a subagent of the target client counts as native).
+    let mut planned = Vec::with_capacity(sessions.len());
+    for session in &sessions {
+        let files = factory.serialize(
+            session,
+            if is_same_origin(&session.session.source_agent, to) {
+                adapter::RestoreFidelity::Native
+            } else {
+                adapter::RestoreFidelity::Foreign
+            },
+        )?;
+        planned.push((session, files));
+    }
+
+    // Refuse across the WHOLE lineage before writing any of it, so a collision
+    // on a later session cannot leave an earlier one's files on disk. The named
+    // paths are what an idempotent caller re-uses ("already resumed - open
+    // this").
+    let mut destinations = Vec::new();
+    for (_, files) in &planned {
+        destinations.extend(adapter::restore_destinations(out_dir, files)?);
+    }
+    // Symlink-aware on purpose: a dangling link is a collision the writer's
+    // `create_new` refuses anyway, so seeing it here keeps it the typed "already
+    // resumed" answer instead of a write failure.
+    let refuse_if_occupied = |dests: &[PathBuf]| -> anyhow::Result<()> {
+        let existing: Vec<String> = dests
+            .iter()
+            .filter(|dest| adapter::exists_even_if_dangling(dest))
+            .map(|dest| dest.display().to_string())
+            .collect();
+        if existing.is_empty() {
+            return Ok(());
+        }
+        fail(
+            3,
+            serde_json::json!({"error": "already_exists", "session_id": session_id, "existing": existing}),
+            format!(
+                "already resumed - refusing to overwrite:\n  {}",
+                existing.join("\n  "),
+            ),
+        )
+    };
+    refuse_if_occupied(&destinations)?;
+
+    // One call for the whole lineage: the writer's unwind is batch-scoped, so
+    // splitting it per session would let an io failure on the child leave the
+    // parent's files behind - the partial write the check above and
+    // spec.md#adapter-lineage-complete-restore both forbid.
+    let counts: Vec<usize> = planned.iter().map(|(_, files)| files.len()).collect();
+    // Report what was actually served, not what was asked for: one downgraded
+    // file makes that session foreign (spec.md#adapter-native-restore-lossless).
+    let fidelities: Vec<&'static str> = planned
+        .iter()
+        .map(|(_, files)| {
+            fidelity_label(
+                if files
+                    .iter()
+                    .all(|file| file.actual_fidelity == adapter::RestoreFidelity::Native)
+                {
+                    adapter::RestoreFidelity::Native
+                } else {
+                    adapter::RestoreFidelity::Foreign
+                },
+            )
+        })
+        .collect();
+    // The files are MOVED into the writer, never cloned: they carry every
+    // restored session's whole bytes, and the report below needs only the ids
+    // borrowed from `sessions` plus the counts and fidelities already taken.
+    let (restored_sessions, batches): (Vec<_>, Vec<Vec<adapter::RestoredFile>>) =
+        planned.into_iter().unzip();
+    let written = match adapter::write_restored_files(
+        out_dir,
+        batches.into_iter().flatten().collect(),
+    ) {
+        Ok(written) => written,
+        // A write failure is an outcome of `resume`, not a crash: it gets its
+        // own typed document so `--format json` still answers on stdout, and it
+        // is distinct from exit 3 because nothing is on disk to open.
+        Err(error) => {
+            // A Schema kind from the writer can only be its own overwrite
+            // refusal: `restore_destinations` already ran over these same files
+            // at the pre-check above, so a containment error would have exited
+            // before the write. Something therefore claimed a destination in
+            // between - the same "already resumed" answer, just noticed later.
+            if matches!(error.kind, adapter::AdapterErrorKind::Schema(_)) {
+                refuse_if_occupied(&destinations)?;
+            }
+            return fail(
+                4,
+                serde_json::json!({
+                    "error": "write_failed",
+                    "session_id": session_id,
+                    "out_dir": out_dir.display().to_string(),
+                    "detail": error.to_string(),
+                }),
+                format!(
+                    "could not write into {}: {error}\nno restored session file was left behind. \
+                     Fix the directory's permissions or free up space, or restore elsewhere with: \
+                     pond resume {session_id} --to {to} --out-dir <path>",
+                    out_dir.display(),
+                ),
+            );
+        }
+    };
+
+    // `write_restored_files` preserves input order, so each session's files are
+    // the next `counts[i]` paths.
+    let mut report = Vec::with_capacity(restored_sessions.len());
+    let mut paths = written.iter();
+    for ((session, count), fidelity) in restored_sessions.iter().zip(counts).zip(fidelities) {
+        report.push(serde_json::json!({
+            "session_id": session.session.id,
+            "source_agent": session.session.source_agent,
+            "actual_fidelity": fidelity,
+            "files": paths
+                .by_ref()
+                .take(count)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    if json {
+        output(&serde_json::to_string_pretty(&serde_json::json!({
+            "adapter": to,
+            "out_dir": out_dir.display().to_string(),
+            "sessions": report,
+        }))?)?;
+        return Ok(());
+    }
+    let dim = pond::output::dim();
+    for entry in &report {
+        output(&format!(
+            "{} {} -> {to} ({})",
+            pond::output::paint("resumed", dim),
+            entry["session_id"].as_str().unwrap_or_default(),
+            entry["actual_fidelity"].as_str().unwrap_or_default(),
+        ))?;
+        for file in entry["files"].as_array().into_iter().flatten() {
+            output(&format!("  {}", file.as_str().unwrap_or_default()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Did this session come from the adapter being resumed into? The same
+/// exact-or-subpath rule the wire's `source_agent` filter uses
+/// (`wire.rs::SearchFilters::source_agent`): `pi-coding-agent` covers
+/// `pi-coding-agent/<kind>` subagents but never a sibling brand that merely
+/// shares a prefix.
+fn is_same_origin(source_agent: &str, adapter: &str) -> bool {
+    source_agent
+        .strip_prefix(adapter)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn fidelity_label(fidelity: adapter::RestoreFidelity) -> &'static str {
+    match fidelity {
+        adapter::RestoreFidelity::Native => "native",
+        adapter::RestoreFidelity::Foreign => "foreign",
+    }
 }
 
 /// Open the store with an indicatif spinner ticking while

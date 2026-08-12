@@ -70,3 +70,10 @@ skills-lock.json
 
 # playwright-cli local session state (directory, plus the stray marker file it drops)
 /.playwright-cli
+
+# SQLite reader artifacts next to the fixture databases. The pi fixture DB is a
+# real WAL database - that is the shape the adapter meets in production, so it
+# stays WAL - and any read-only open materializes a `-shm` (plus an empty
+# `-wal`). Transient process state, never fixture content.
+/packages/pond/tests/fixtures/**/*-shm
+/packages/pond/tests/fixtures/**/*-wal

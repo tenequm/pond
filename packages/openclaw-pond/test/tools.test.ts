@@ -113,6 +113,19 @@ describe("pond_search", () => {
     expect(details(out).text).toContain("truncated");
   });
 
+  it("cuts the truncation on a code-point boundary, never mid-character", async () => {
+    // The last multi-byte character straddles the budget: a byte-wise cut would
+    // hand the model a U+FFFD replacement char.
+    const big = `${"x".repeat(RESPONSE_MAX_BYTES - 1)}é${"y".repeat(4096)}`;
+    const { factories } = await harness({ responses: { pond_search: () => big } });
+    const out = await factories.search(mainCtx())!.execute("id", { query: "q" });
+    const text = details(out).text!;
+    const body = text.split("\n\n[pond:")[0] ?? "";
+    expect(body).toBe("x".repeat(RESPONSE_MAX_BYTES - 1));
+    expect(text).not.toContain("�");
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(RESPONSE_MAX_BYTES);
+  });
+
   it("surfaces a pond tool error as a typed error result", async () => {
     const { factories } = await harness({
       responses: { pond_search: () => ({ text: "store unavailable", isError: true }) },

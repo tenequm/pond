@@ -1,5 +1,5 @@
 ---
-source: src/main.rs
+source: packages/pond/src/main.rs
 expression: root_help
 ---
 Lossless storage and semantic search for sessions from any AI agent client
@@ -26,6 +26,7 @@ Commands:
     get-session  Read a whole session as a transcript
     get-message  Expand one message with its full part bodies
     sql          Run one read-only SQL query
+    resume       Resume a stored session in a client's own format
     status       Show pond health, data, and adapters
 
   Serve

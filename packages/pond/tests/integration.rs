@@ -28,6 +28,8 @@ mod optimize_under_contention;
 mod recovery;
 #[path = "integration/remote_backend.rs"]
 mod remote_backend;
+#[path = "integration/resume.rs"]
+mod resume;
 #[path = "integration/s3_backend.rs"]
 mod s3_backend;
 #[path = "integration/schema_migration.rs"]
