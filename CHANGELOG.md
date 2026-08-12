@@ -2,8 +2,15 @@
 
 ## [0.14.7](https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7) - 2026-08-12
 
+pi gets a memory that outlives the session, and pond gets a way to hand a session back: `pond resume` restores stored sessions into a client's own files, the pi adapter learns harness-v2 (v4 JSONL and SQLite), and the new `pi-pond` extension wires recall and resume into pi itself.
+
 ### <!-- 1 -->🎉 New Features
 - pi integration - pond resume, harness-v2 adapters, and the pi-pond extension ([39f4cb2](https://github.com/tenequm/pond/commit/39f4cb29c464cde8cc016b065513d1ac9bfbf7e8))
+  - `pond resume <id> --to <adapter>` writes a stored session back out as the target client's own files, whole child lineage or nothing. It never overwrites: every destination is pre-checked and created with `O_EXCL`, a collision fails the batch before the first byte and names every existing path (exit 3), and a mid-batch write failure unwinds everything it created so no restored file is left behind (exit 4). Fidelity is the system's decision and is reported per session - same-origin replays are `native`, everything else an honest `foreign` reconstruction - and pi resume always emits v3, the one format every shipped pi loads (verified against a real pi 0.84.1 install).
+  - The `pi-coding-agent` adapter now ingests harness-v2 sessions - v4 JSONL and the SQLite backend - detected per file and per database alongside v3. v4 headers give pi sessions a real `parent_session_id` and a `cwd`-derived project. The SQLite freshness watermark runs as four index seeks instead of a `UNION ALL` over the full mutation history (measured ~59x faster on a 300-session / 300k-row database).
+  - `pi-pond`, the pi extension: one managed `pond serve --transport stdio --with-sync` child serves the four read-only recall tools and keeps the store synced; `/pond <query>` searches, then enter resumes a past session in place or `i` pastes a reference to it. Install with `pi install npm:pi-pond`.
+  - A runnable fleet-capture example (`ops/examples/pi-fleet/`): dockerized pi workers pushing sessions to one shared S3 store, plus the deployment reference to go with it.
+  - Safety fix swept in: the restore writer previously replaced its whole output root, so the first `pond resume --out-dir ~/.pi/agent` would have deleted the user's entire pi state. It now refuses to overwrite anything, ever.
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7
 
