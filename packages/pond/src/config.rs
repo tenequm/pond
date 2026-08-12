@@ -832,12 +832,26 @@ pub fn contract_home_under(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// [`contract_home_under`] against the process `HOME`. Returns the input
+/// The user's home directory, resolved per-OS from the process environment.
+/// Windows reads `USERPROFILE` (the native home; `HOME`, when present at all,
+/// is a POSIX-style path set by git-bash/msys/Cygwin and points somewhere a
+/// native binary must not follow). Unix reads `HOME`. Empty values are treated
+/// as unset. Every home-relative default path and the adapter auto-discovery
+/// probes resolve through this, so pond finds `~/.claude`, `~/.omp`, and
+/// friends on Windows the same way it does on Unix.
+pub fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// [`contract_home_under`] against the process home. Returns the input
 /// rendered for humans; machine surfaces (JSON output, the wire) keep
 /// absolute paths.
 pub fn contract_home(path: &Path) -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => contract_home_under(path, Path::new(&home)),
+    match home_dir() {
+        Some(home) => contract_home_under(path, &home),
         None => path.to_path_buf(),
     }
 }
@@ -905,14 +919,24 @@ mod tests {
 
     use super::*;
     use serde_json::Value;
+    // Only the unix-gated 0600-permissions test uses TempDir here.
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[test]
     fn local_path_resolves_both_local_schemes() {
-        let plain = Url::parse("file:///tmp/pond-store").unwrap();
-        assert_eq!(local_path(&plain), Some(PathBuf::from("/tmp/pond-store")));
-        let uring = Url::parse("file+uring:///tmp/pond-store").unwrap();
-        assert_eq!(local_path(&uring), Some(PathBuf::from("/tmp/pond-store")));
+        // file and file+uring resolve to the same local path; remote -> None.
+        // Built from a platform-absolute path so the round-trip is exercised on
+        // Windows drive paths too, not just POSIX ones.
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\tmp\\pond-store")
+        } else {
+            PathBuf::from("/tmp/pond-store")
+        };
+        let plain = url_for_path(&path).unwrap();
+        assert_eq!(local_path(&plain), Some(path.clone()));
+        let uring = Url::parse(&plain.as_str().replacen("file:", "file+uring:", 1)).unwrap();
+        assert_eq!(local_path(&uring), Some(path));
         assert_eq!(local_path(&Url::parse("s3://bucket/prefix").unwrap()), None);
     }
 
@@ -992,22 +1016,24 @@ mod tests {
 
     #[test]
     fn default_storage_path_follows_xdg_then_home() {
-        // An absolute XDG_DATA_HOME wins.
-        let resolved =
-            default_storage_path(Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home")))
-                .unwrap();
+        // An absolute XDG_DATA_HOME wins; use a platform-absolute root so the
+        // is_absolute() gate behaves identically on Windows (a driveless path
+        // like /xdg is relative there).
+        let (xdg, home) = if cfg!(windows) {
+            (PathBuf::from("C:\\xdg"), PathBuf::from("C:\\home"))
+        } else {
+            (PathBuf::from("/xdg"), PathBuf::from("/home"))
+        };
+        let resolved = default_storage_path(Some(xdg.clone()), Some(home.clone())).unwrap();
         assert!(is_local(&resolved));
-        assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
+        assert_eq!(local_path(&resolved).unwrap(), xdg.join("pond"));
 
         // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
-        let resolved = default_storage_path(
-            Some(PathBuf::from("relative")),
-            Some(PathBuf::from("/home")),
-        )
-        .unwrap();
+        let resolved =
+            default_storage_path(Some(PathBuf::from("relative")), Some(home.clone())).unwrap();
         assert_eq!(
             local_path(&resolved).unwrap(),
-            PathBuf::from("/home/.local/share/pond"),
+            home.join(".local").join("share").join("pond"),
         );
 
         // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.

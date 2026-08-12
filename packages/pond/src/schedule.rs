@@ -11,7 +11,7 @@
 //!
 //! Bin-only module: OS-scheduler integration has no library callers.
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
 
@@ -50,7 +50,7 @@ impl ScheduleEvery {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn from_secs(secs: u32) -> Option<Self> {
         [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
             .into_iter()
@@ -89,12 +89,15 @@ pub(crate) enum ScheduleCmd {
     },
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) use windows::{run, start, status_line, status_snapshot};
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn run(_command: ScheduleCmd) -> Result<()> {
-    bail!("pond schedule is not supported on Windows yet; run `pond sync` from Task Scheduler")
+    bail!("pond schedule is not supported on this platform yet")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn status_line() -> String {
     use pond::output::{dim, paint};
     format!(
@@ -103,12 +106,12 @@ pub(crate) fn status_line() -> String {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
-    bail!("pond schedule is not supported on Windows yet")
+    bail!("pond schedule is not supported on this platform yet")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
     ScheduleSnapshot {
         line: status_line(),
@@ -912,5 +915,319 @@ mod tests {
             assert_eq!(ScheduleEvery::from_secs(every.secs()), Some(every));
         }
         assert_eq!(ScheduleEvery::from_secs(123), None);
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    //! Windows Task Scheduler backend, the peer of the launchd/systemd/cron
+    //! `unix` module. The scheduled action is a small generated `.cmd` wrapper
+    //! (`<state>/pond-sync.cmd`) that runs `pond sync -q --no-wait` and appends
+    //! to `<state>/sync.log`. Running a wrapper file - rather than embedding a
+    //! quoted command line in the `schtasks /TR` value - keeps pond out of
+    //! Windows command-line quoting entirely, the same way the unix backend
+    //! bakes paths into a plist/cron artifact.
+    //!
+    //! The task runs as the current user in their session (schtasks' default:
+    //! no stored password, runs only when logged on), which matches launchd's
+    //! per-user GUI-context agent. `-q --no-wait` mirrors the unix job exactly:
+    //! never `--yes` (an unattended tick must not auto-enable adapters) and a
+    //! tick that lands while another sync holds the per-store lock exits 0
+    //! rather than queueing.
+
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use anyhow::{Context, Result, bail};
+
+    use super::{ScheduleCmd, ScheduleEvery};
+    use pond::output::{dim, line, line_err, paint};
+
+    const TASK_NAME: &str = "pond-sync";
+
+    pub(crate) fn run(command: ScheduleCmd) -> Result<()> {
+        match command {
+            ScheduleCmd::Start { every } => start(every),
+            ScheduleCmd::Stop => stop(),
+            ScheduleCmd::Status => {
+                let state = probe()?;
+                line(&render_state(&state))?;
+                if let Active { .. } = state {
+                    line(&format!(
+                        "{}      {}  (pond schedule logs)",
+                        paint("logs", dim()),
+                        crate::config::display(&crate::config::url_for_path(log_path())?),
+                    ))?;
+                    Ok(())
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            ScheduleCmd::Logs { lines } => logs(lines),
+        }
+    }
+
+    pub(crate) fn status_line() -> String {
+        status_snapshot().line
+    }
+
+    pub(crate) fn status_snapshot() -> super::ScheduleSnapshot {
+        match probe() {
+            Ok(state) => {
+                let (active, backend, every) = match &state {
+                    Active { backend, every } => (true, Some(*backend), *every),
+                    Inactive => (false, None, None),
+                };
+                super::ScheduleSnapshot {
+                    line: render_state(&state),
+                    active,
+                    backend,
+                    every,
+                }
+            }
+            Err(_) => super::ScheduleSnapshot {
+                line: format!(
+                    "{}  unknown (scheduler probe failed)",
+                    paint("schedule", dim())
+                ),
+                active: false,
+                backend: None,
+                every: None,
+            },
+        }
+    }
+
+    enum State {
+        Active {
+            backend: &'static str,
+            every: Option<ScheduleEvery>,
+        },
+        Inactive,
+    }
+    use State::{Active, Inactive};
+
+    fn render_state(state: &State) -> String {
+        match state {
+            Active { backend, every } => format!(
+                "{}  active ({backend}{})",
+                paint("schedule", dim()),
+                every
+                    .map(|every| format!(", every {}", every.label()))
+                    .unwrap_or_default(),
+            ),
+            Inactive => format!(
+                "{}  not configured - run `pond schedule start` to sync automatically",
+                paint("schedule", dim()),
+            ),
+        }
+    }
+
+    /// Register (or replace, via `/F`) the Task Scheduler job. Shared by
+    /// `pond schedule start` and the `pond init` schedule section.
+    pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
+        let bin = pond_bin();
+        let log = log_path();
+        let state = crate::syncstate::pond_state_dir();
+        std::fs::create_dir_all(&state)
+            .with_context(|| format!("failed to create {}", state.display()))?;
+
+        // The task runs this wrapper (.cmd files are executed through cmd, so
+        // the `>>` redirection works) instead of a quoted `schtasks /TR`
+        // command line, keeping every path out of schtasks quoting.
+        let wrapper = wrapper_path();
+        let wrapper_body = format!(
+            "@echo off\r\n\"{}\" sync -q --no-wait >> \"{}\" 2>&1\r\n",
+            bin.display(),
+            log.display(),
+        );
+        std::fs::write(&wrapper, wrapper_body)
+            .with_context(|| format!("failed to write {}", wrapper.display()))?;
+
+        let (schedule, modifier) = schtasks_cadence(every);
+        let output = Command::new("schtasks")
+            .args([
+                "/Create",
+                "/TN",
+                TASK_NAME,
+                "/TR",
+                &format!("\"{}\"", wrapper.display()),
+                "/SC",
+                schedule,
+                "/MO",
+                &modifier,
+                "/F",
+            ])
+            .output()
+            .context("failed to run schtasks /Create")?;
+        if !output.status.success() {
+            bail!(
+                "schtasks /Create failed: {}",
+                decode_console(&output.stderr).trim()
+            );
+        }
+        line(&format!(
+            "schedule active (task-scheduler, every {})",
+            every.label()
+        ))?;
+        Ok(())
+    }
+
+    fn stop() -> Result<()> {
+        let existed = task_exists();
+        if existed {
+            let output = Command::new("schtasks")
+                .args(["/Delete", "/TN", TASK_NAME, "/F"])
+                .output()
+                .context("failed to run schtasks /Delete")?;
+            if !output.status.success() {
+                bail!(
+                    "schtasks /Delete failed: {}",
+                    decode_console(&output.stderr).trim()
+                );
+            }
+        }
+        // Leave the wrapper + log in place on stop: removing the task is the
+        // contract, and the log stays readable via `pond schedule logs`.
+        if existed {
+            line("schedule removed")?;
+        } else {
+            line("nothing was scheduled")?;
+        }
+        Ok(())
+    }
+
+    fn probe() -> Result<State> {
+        if task_exists() {
+            Ok(Active {
+                backend: "task-scheduler",
+                every: read_interval(),
+            })
+        } else {
+            Ok(Inactive)
+        }
+    }
+
+    fn logs(lines: usize) -> Result<()> {
+        let path = log_path();
+        line_err(&paint(
+            &format!(
+                "log file: {}",
+                crate::config::display(&crate::config::url_for_path(&path)?)
+            ),
+            dim(),
+        ))?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                line("(no log yet - the first scheduled run hasn't happened)")?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let all: Vec<&str> = text.lines().collect();
+        let tail = all.len().saturating_sub(lines);
+        for entry in &all[tail..] {
+            line(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Does the pond task exist? `schtasks /Query /TN` exits 0 when present,
+    /// non-zero when absent.
+    fn task_exists() -> bool {
+        Command::new("schtasks")
+            .args(["/Query", "/TN", TASK_NAME])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The registered task's cadence, recovered from its XML so `pond status`
+    /// can name it. `None` when the task lacks a recognized interval (it is
+    /// still reported active).
+    fn read_interval() -> Option<ScheduleEvery> {
+        let output = Command::new("schtasks")
+            .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let xml = decode_console(&output.stdout);
+        // MINUTE/HOURLY tasks carry `<Interval>PT<n>M</Interval>` /
+        // `PT<n>H</Interval>` inside `<Repetition>`; a DAILY task carries
+        // `<DaysInterval>1</DaysInterval>` and no `<Interval>`.
+        let secs = if let Some(minutes) = between(&xml, "<Interval>PT", "M</Interval>") {
+            minutes.parse::<u32>().ok().map(|m| m * 60)
+        } else if let Some(hours) = between(&xml, "<Interval>PT", "H</Interval>") {
+            hours.parse::<u32>().ok().map(|h| h * 3_600)
+        } else if between(&xml, "<DaysInterval>", "</DaysInterval>").is_some() {
+            Some(86_400)
+        } else {
+            None
+        }?;
+        ScheduleEvery::from_secs(secs)
+    }
+
+    /// The substring of `text` between the first `open` and the next `close`
+    /// after it, or `None`.
+    fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        let start = text.find(open)? + open.len();
+        let rest = &text[start..];
+        let end = rest.find(close)?;
+        Some(&rest[..end])
+    }
+
+    /// Map a cadence to the `schtasks /SC ... /MO ...` pair.
+    fn schtasks_cadence(every: ScheduleEvery) -> (&'static str, String) {
+        match every {
+            ScheduleEvery::M5 => ("MINUTE", "5".to_owned()),
+            ScheduleEvery::M15 => ("MINUTE", "15".to_owned()),
+            ScheduleEvery::H1 => ("HOURLY", "1".to_owned()),
+            ScheduleEvery::H6 => ("HOURLY", "6".to_owned()),
+            ScheduleEvery::D1 => ("DAILY", "1".to_owned()),
+        }
+    }
+
+    /// The binary path baked into the wrapper. Prefer `pond.exe` on PATH (a
+    /// stable install location that survives upgrades); fall back to this
+    /// running exe.
+    fn pond_bin() -> PathBuf {
+        crate::find_on_path("pond.exe")
+            .or_else(|| crate::find_on_path("pond"))
+            .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
+    }
+
+    /// `<state>/sync.log`, the same state dir manual syncs use.
+    fn log_path() -> PathBuf {
+        crate::syncstate::pond_state_dir().join("sync.log")
+    }
+
+    /// `<state>/pond-sync.cmd`, the generated task action.
+    fn wrapper_path() -> PathBuf {
+        crate::syncstate::pond_state_dir().join("pond-sync.cmd")
+    }
+
+    /// Decode process output that may be UTF-16 (schtasks `/XML` and some
+    /// localized consoles) or UTF-8. A UTF-16LE BOM or interleaved NUL bytes
+    /// select the wide decode; otherwise it is a lossy UTF-8 read.
+    fn decode_console(bytes: &[u8]) -> String {
+        if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+            return decode_utf16le(&bytes[2..]);
+        }
+        if bytes.iter().take(64).filter(|&&b| b == 0).count() >= 2 {
+            return decode_utf16le(bytes);
+        }
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    fn decode_utf16le(bytes: &[u8]) -> String {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
     }
 }

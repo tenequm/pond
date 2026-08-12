@@ -608,8 +608,15 @@ fn run_secret_command(set: &str, field: &str, command: &str) -> Result<String> {
     {
         return Ok(hit.clone());
     }
-    let output = std::process::Command::new("sh")
-        .arg("-c")
+    // The command is a shell line (pipes, `op read`, etc.), so run it through
+    // the platform shell: `cmd /C` on Windows, `sh -c` elsewhere.
+    let (shell, shell_flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let output = std::process::Command::new(shell)
+        .arg(shell_flag)
         .arg(command)
         .output()
         .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?;
@@ -4766,8 +4773,13 @@ mod tests {
     fn storage_url_translation_table() {
         // file (Lance's `uri_to_url` appends the trailing slash; `child_uri`
         // trims it downstream)
-        let local = StorageUrl::parse("/srv/pond").unwrap();
-        assert_eq!(local.lance_url().as_str(), "file:///srv/pond/");
+        let (local_input, local_expected) = if cfg!(windows) {
+            ("C:\\srv\\pond", "file:///C:/srv/pond/")
+        } else {
+            ("/srv/pond", "file:///srv/pond/")
+        };
+        let local = StorageUrl::parse(local_input).unwrap();
+        assert_eq!(local.lance_url().as_str(), local_expected);
         assert!(local.is_local());
         assert!(local.scheme_options.is_empty());
         // s3 passthrough
@@ -5049,7 +5061,14 @@ mod tests {
             CredsSet {
                 access_key_id_file: Some(key_path),
                 // Two trailing newlines: exactly one is stripped.
-                secret_access_key_command: Some("printf 'from-command\\n\\n'".to_owned()),
+                secret_access_key_command: Some(
+                    if cfg!(windows) {
+                        "echo from-command&echo."
+                    } else {
+                        "printf 'from-command\\n\\n'"
+                    }
+                    .to_owned(),
+                ),
                 ..CredsSet::default()
             },
         );
@@ -5061,7 +5080,11 @@ mod tests {
         );
         assert_eq!(
             opts(&resolved, "secret_access_key").as_deref(),
-            Some("from-command\n"),
+            Some(if cfg!(windows) {
+                "from-command\r\n"
+            } else {
+                "from-command\n"
+            }),
         );
 
         // A failing command surfaces its text and exit status.

@@ -103,7 +103,10 @@ fastrand = "2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
-lance = { version = "8.0.0", features = ["protoc"] }
+# On unix, lance's `protoc` feature vendors protoc via protobuf-src (built from
+# source). protobuf-src does not link on Windows (absl/UCRT unresolved externals),
+# so Windows builds omit the feature and use a system protoc found via PATH/PROTOC.
+lance = { version = "8.0.0" }
 lance-arrow = "8.0.0"
 # `pond_sql` registers lance's JSON / contains_tokens UDFs on the SQL
 # SessionContext via `lance_datafusion::udf::register_functions`. Already in
@@ -170,6 +173,9 @@ zstd = "0.13"
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
 libc = "0.2"
+# Vendor protoc via protobuf-src on unix (builds from source, links cleanly).
+# Windows uses a system protoc instead - see the [dependencies] lance note.
+lance = { version = "8.0.0", features = ["protoc"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
@@ -194,7 +200,9 @@ lance-linalg = "8.0.0"
 # Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
 # inverted index under different tokenizers (ngram vs simple) via the raw lance
 # create_index API and measure the index-size / RAM / latency tradeoff.
-lance = { version = "8.0.0", features = ["protoc"] }
+# The `protoc` feature is unix-only (see the [dependencies] lance note); on
+# Windows this dev-dep uses a system protoc, matching the main dependency.
+lance = { version = "8.0.0" }
 lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
@@ -215,6 +223,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 # plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+lance = { version = "8.0.0", features = ["protoc"] }
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]

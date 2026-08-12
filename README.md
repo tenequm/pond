@@ -60,7 +60,7 @@ The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over thr
 
 ## Install
 
-Linux and macOS are supported; Windows is not in v1 scope.
+Linux, macOS, and Windows are supported.
 
 **Package Managers (macOS and Linux):**
 
@@ -85,6 +85,8 @@ cargo install --path packages/pond --features cuda
 ```
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
+
+On Windows, the Homebrew/Nix packages do not apply; install with `cargo install pond-db` or build from source. Both need a protobuf compiler (`protoc`) on `PATH` first (`winget install Google.Protobuf`), because the vendored protoc build used on Unix does not link with MSVC. Embeddings run on the CPU backend.
 
 ## Usage
 

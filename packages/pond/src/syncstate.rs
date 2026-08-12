@@ -6,7 +6,6 @@
 //! CLI-surface state.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,7 +19,7 @@ pub(crate) fn state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| crate::config::home_dir().map(|home| home.join(".local/state")))
         .unwrap_or_else(|| PathBuf::from(".pond-state"))
 }
 
@@ -61,7 +60,12 @@ pub(crate) fn try_acquire_sync_lock(store_key: &str) -> Result<SyncLockState> {
 fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(format!("sync-{store_key}.lock"));
-    let mut file = File::options()
+    // Holder info lives in a sibling file, not the lock file itself: Windows
+    // takes a mandatory whole-file lock, so a blocked sibling cannot read
+    // bytes out of the locked file to name the holder. A plain unlocked file
+    // is readable on every platform.
+    let holder_path = dir.join(format!("sync-{store_key}.holder.json"));
+    let file = File::options()
         .read(true)
         .write(true)
         .create(true)
@@ -74,15 +78,14 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 pid: std::process::id(),
                 started_at: Utc::now(),
             };
-            // Best-effort holder info; the lock itself is the flock, not the bytes.
-            let _ = file.set_len(0);
-            let _ = file.seek(SeekFrom::Start(0));
-            let _ = serde_json::to_vec(&holder).map(|bytes| file.write_all(&bytes));
-            let _ = file.flush();
+            // Best-effort breadcrumb; the lock itself is the flock, not the bytes.
+            if let Ok(bytes) = serde_json::to_vec(&holder) {
+                let _ = std::fs::write(&holder_path, bytes);
+            }
             Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let holder = std::fs::read_to_string(&path)
+            let holder = std::fs::read_to_string(&holder_path)
                 .ok()
                 .and_then(|text| serde_json::from_str(&text).ok());
             Ok(SyncLockState::Busy(holder))

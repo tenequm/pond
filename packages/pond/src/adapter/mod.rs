@@ -379,13 +379,11 @@ pub struct Env {
 }
 
 impl Env {
-    /// Read `home` from the `HOME` env var. Returns `None` when `HOME` is
-    /// unset (CI, post-install hooks, sandboxed runs).
+    /// Read `home` from the environment portably ([`crate::config::home_dir`]:
+    /// `HOME`, then `USERPROFILE` on Windows). Returns `None` when neither is
+    /// set (CI, post-install hooks, sandboxed runs).
     pub fn from_env() -> Option<Self> {
-        let home = std::env::var_os("HOME")?;
-        Some(Self {
-            home: PathBuf::from(home),
-        })
+        crate::config::home_dir().map(|home| Self { home })
     }
 
     /// Construct an `Env` with an explicit home. Tests use this to inject a
@@ -602,12 +600,14 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
     Ok(expand_home(cfg.path))
 }
 
-/// Expand a leading `~` against `$HOME`, or return the path untouched when the
-/// env has no `HOME` (CI, post-install hooks, sandboxes). Shared because an
-/// adapter whose config carries more than one path cannot use [`config_path`].
+/// Expand a leading `~` against the user's home directory, or return the path
+/// untouched when the env has no home (CI, post-install hooks, sandboxes).
+/// Shared because an adapter whose config carries more than one path cannot use
+/// [`config_path`]. Home resolution is portable ([`crate::config::home_dir`]:
+/// `HOME`, then `USERPROFILE` on Windows).
 pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => crate::config::expand_home_under(&path, Path::new(&home)),
+    match crate::config::home_dir() {
+        Some(home) => crate::config::expand_home_under(&path, &home),
         None => path,
     }
 }

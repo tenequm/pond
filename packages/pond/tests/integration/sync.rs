@@ -71,6 +71,11 @@ async fn ensure_rowmap_rebuilds_an_unreadable_map() -> anyhow::Result<()> {
     // Build a valid map, then overwrite every segment with bytes no current
     // pond can open (simulating an older MAGIC / corruption).
     store.ensure_rowmap(&cache).await?;
+    // Release our mapping before rewriting the segment files: Windows forbids
+    // writing a file that has a live memory map (POSIX allows it), so the store
+    // holding the freshly built mmap must drop it first. A fresh store is opened
+    // below to prove the rebuild-on-unreadable path.
+    drop(store);
     let mut corrupted = 0;
     for entry in std::fs::read_dir(&cache)? {
         let path = entry?.path();

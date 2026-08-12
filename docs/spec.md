@@ -109,7 +109,10 @@ These are stable positions. pond will not:
 
 ### 2.4 Platform
 
-Linux and macOS. Windows is not in v1 scope.
+Linux, macOS, and Windows. On Windows the vendored protoc build (`protobuf-src`)
+does not link, so a system `protoc` is used at build time; the scheduler backs
+onto Task Scheduler in place of launchd/systemd. Embeddings run on the CPU
+backend (Metal is macOS-only, CUDA is Linux opt-in).
 
 ---
 
