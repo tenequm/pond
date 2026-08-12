@@ -1497,7 +1497,12 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            // A warm sibling's rowmap serves the page and the message-id
+            // resolution residently; absent one, get falls back to scans.
+            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+                tracing::debug!(%error, "rowmap load skipped; get falls back to scans");
+            }
             let first_page = after_message_id.is_none() && before_message_id.is_none();
             let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1533,7 +1538,12 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            // The rowmap resolves the message id residently (the alternative is
+            // a full remote scan of the unindexed `id` column).
+            if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+                tracing::debug!(%error, "rowmap load skipped; get falls back to scans");
+            }
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -1591,7 +1601,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),

@@ -575,6 +575,52 @@ impl RowMetaMap {
         Some(entries[idx].max_ts_micros)
     }
 
+    /// Resolve a message id to its session id by scanning the record headers -
+    /// resident memory only, never a store read. Linear over the segment
+    /// (length-check first, so most rows cost one integer compare); `None` is
+    /// a miss, including on a corrupt map.
+    pub fn session_id_for_message(&self, message_id: &str) -> Option<&str> {
+        let needle = message_id.as_bytes();
+        for record in self.records() {
+            let base = self.blob_offset.checked_add(record.blob_off as usize)?;
+            let header = self.mmap.get(base..base.checked_add(ROW_HEADER_LEN)?)?;
+            if read_u32(header, 24)? != needle.len() {
+                continue;
+            }
+            let start = base + ROW_HEADER_LEN;
+            if self.mmap.get(start..start.checked_add(needle.len())?)? == needle {
+                return Some(self.session_str(read_u32(header, 8)?));
+            }
+        }
+        None
+    }
+
+    /// Row ids of every `session_id` row in this segment (all roles; callers
+    /// distinguish conversational rows by the hydrated text - storage
+    /// guarantees `search_text` is null-or-non-empty and the build writes null
+    /// as empty). Empty when the session is not in this segment.
+    pub fn session_row_ids(&self, session_id: &str) -> Vec<u64> {
+        let entries = self.session_entries();
+        let Ok(session_idx) = entries
+            .binary_search_by(|entry| self.blob_str(entry.sid_off, entry.sid_len).cmp(session_id))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for record in self.records() {
+            let Some(base) = self.blob_offset.checked_add(record.blob_off as usize) else {
+                continue;
+            };
+            let Some(header) = self.mmap.get(base..base + ROW_HEADER_LEN) else {
+                continue;
+            };
+            if read_u32(header, 8) == Some(session_idx) {
+                out.push(record.row_id);
+            }
+        }
+        out
+    }
+
     /// Slice `len` UTF-8 bytes at `*at`, advancing `*at`. Checked so a corrupt
     /// map yields `None` (-> take fallback), not a panic.
     fn slice_str(&self, at: &mut usize, len: usize) -> Option<&str> {
@@ -770,6 +816,25 @@ impl RowMetaSet {
             .max()
     }
 
+    /// Resolve a message id to its session id, newest segment first (recent
+    /// messages - the likely targets - live in the small deltas). `None` is a
+    /// miss the caller resolves against the store.
+    pub fn session_id_for_message(&self, message_id: &str) -> Option<&str> {
+        self.segments
+            .iter()
+            .rev()
+            .find_map(|seg| seg.session_id_for_message(message_id))
+    }
+
+    /// A session's row ids across the chain (rows are disjoint across
+    /// segments, so this concatenates).
+    pub fn session_row_ids(&self, session_id: &str) -> Vec<u64> {
+        self.segments
+            .iter()
+            .flat_map(|seg| seg.session_row_ids(session_id))
+            .collect()
+    }
+
     /// Every row across all segments, newest-segment-wins on `row_id`
     /// collision - the input to a base rebuild at compaction.
     pub fn merged_entries(&self) -> Vec<RowMetaEntry> {
@@ -839,6 +904,49 @@ mod tests {
             timestamp_micros,
             search_text: search_text.to_owned(),
         }
+    }
+
+    #[test]
+    fn message_and_conversational_lookups_cover_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = RowMetaMap::path_for(dir.path(), "s", 1);
+        RowMetaMap::build(
+            &base_path,
+            1,
+            vec![
+                entry(1, "sess-a", "msg-1", 1_000, "hello"),
+                entry(2, "sess-a", "msg-2", 2_000, ""), // bare tool call: not conversational
+                entry(3, "sess-b", "msg-3", 3_000, "there"),
+            ],
+        )
+        .unwrap();
+        let delta_path = RowMetaMap::delta_path(dir.path(), "s", 2);
+        RowMetaMap::build(
+            &delta_path,
+            2,
+            vec![entry(9, "sess-a", "msg-9", 9_000, "newest")],
+        )
+        .unwrap();
+        let set = RowMetaSet::open(&ChainPaths {
+            base: base_path,
+            base_version: 1,
+            deltas: vec![(2, delta_path)],
+        })
+        .unwrap();
+
+        assert_eq!(set.session_id_for_message("msg-1"), Some("sess-a"));
+        assert_eq!(
+            set.session_id_for_message("msg-9"),
+            Some("sess-a"),
+            "delta hit"
+        );
+        assert_eq!(set.session_id_for_message("msg-3"), Some("sess-b"));
+        assert_eq!(set.session_id_for_message("absent"), None);
+
+        let mut ids = set.session_row_ids("sess-a");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 9], "all roles, base and delta");
+        assert!(set.session_row_ids("missing").is_empty());
     }
 
     #[test]

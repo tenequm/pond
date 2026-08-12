@@ -1493,9 +1493,11 @@ impl Store {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        let mut rows: Vec<ScanRow> = self
-            .scan_conversational_messages(session_id)
-            .await?
+        let source_rows = match self.conversational_rows_resident(session_id).await? {
+            Some(rows) => rows,
+            None => self.scan_conversational_messages(session_id).await?,
+        };
+        let mut rows: Vec<ScanRow> = source_rows
             .into_iter()
             .map(|row| ScanRow {
                 id: row.message_id,
@@ -1591,7 +1593,13 @@ impl Store {
         let Some(session) = self.find_session(&session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        let mut rows = self.scan_all_messages(&session_id).await?;
+        let mut rows = match self
+            .message_scan_rows_resident(&session_id, message_id)
+            .await?
+        {
+            Some(rows) => rows,
+            None => self.scan_all_messages(&session_id).await?,
+        };
         // Siblings are always the conversational view: in carrier-heavy sessions
         // the system/tool rows would otherwise fill the whole window and push
         // the actual conversation out of it. The target stays regardless of its
@@ -1683,6 +1691,86 @@ impl Store {
         Ok(rows)
     }
 
+    /// A session's rows served from the resident meta map - zero object-store
+    /// reads. `None` (caller scans) unless the loaded chain covers the exact
+    /// `messages` version the cached handle serves: a stale map may never drop
+    /// a synced message from a page, and matching the handle's version gives
+    /// the map path the same read semantics as the scan it replaces
+    /// (spec.md#lance-handle-freshness). The map carries no `content`, so rows
+    /// come back with `content: None` - callers that need a system message's
+    /// content must not use a map-served row for it.
+    async fn session_rows_resident(&self, session_id: &str) -> Result<Option<Vec<RowMetaEntry>>> {
+        let Some(map) = self.rowmap.load_full() else {
+            return Ok(None);
+        };
+        if map.version() != self.messages_version().await? {
+            return Ok(None);
+        }
+        let rowids = map.session_row_ids(session_id);
+        let (entries, misses) = map.hydrate(&rowids);
+        if !misses.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(entries))
+    }
+
+    /// Conversational rows from the resident map: the non-empty-text subset
+    /// (storage guarantees `search_text` null-or-non-empty; the map stores
+    /// null as empty). `None` -> caller scans.
+    async fn conversational_rows_resident(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<ConversationalRow>>> {
+        let Some(entries) = self.session_rows_resident(session_id).await? else {
+            return Ok(None);
+        };
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.search_text.is_empty() {
+                continue;
+            }
+            rows.push(ConversationalRow {
+                session_id: session_id.to_owned(),
+                message_id: entry.message_id,
+                role: role_from_str(&entry.role)?,
+                timestamp: DateTime::from_timestamp_micros(entry.timestamp_micros)
+                    .context("row meta timestamp out of range")?,
+                text: SearchText(entry.search_text),
+            });
+        }
+        Ok(Some(rows))
+    }
+
+    /// `message_view`'s row source from the resident map: every session row as
+    /// a [`ScanRow`]. `None` (caller scans) when the map is unusable, or when
+    /// the target is a system message - its `content` lives only in storage,
+    /// and a map-served row would silently blank it.
+    async fn message_scan_rows_resident(
+        &self,
+        session_id: &str,
+        target_message_id: &str,
+    ) -> Result<Option<Vec<ScanRow>>> {
+        let Some(entries) = self.session_rows_resident(session_id).await? else {
+            return Ok(None);
+        };
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let role = role_from_str(&entry.role)?;
+            if entry.message_id == target_message_id && role == Role::System {
+                return Ok(None);
+            }
+            rows.push(ScanRow {
+                id: entry.message_id,
+                role,
+                timestamp: DateTime::from_timestamp_micros(entry.timestamp_micros)
+                    .context("row meta timestamp out of range")?,
+                text: (!entry.search_text.is_empty()).then_some(entry.search_text),
+                content: None,
+            });
+        }
+        Ok(Some(rows))
+    }
+
     /// Conversational scan over one session: rows ordered by
     /// `(timestamp, id)`, `IsNotNull("search_text")` pushed down at the
     /// read seam (spec.md#search-prefilter-pushdown).
@@ -1728,9 +1816,18 @@ impl Store {
         Ok(rows)
     }
 
-    /// Locate the session id for a stored message. Cheap when only the routing
-    /// hint is needed - callers that need the messages use `scan_all_messages`.
+    /// Locate the session id for a stored message. The resident meta map is
+    /// consulted first: pond is append-only and message ids are immutable, so
+    /// a map hit is definitive at any map version - no freshness gate. Only a
+    /// miss (a message newer than the map, or no map loaded) pays the store
+    /// scan, which on a remote store reads the whole unindexed `id` column
+    /// (measured ~93 s vs resident ~50 ms on the 2.6M-row corpus).
     pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
+        if let Some(map) = self.rowmap.load_full()
+            && let Some(session_id) = map.session_id_for_message(message_id)
+        {
+            return Ok(Some(session_id.to_owned()));
+        }
         let batch = self
             .handle
             .scan_batch(
@@ -6413,6 +6510,158 @@ mod tests {
         assert_eq!(
             resident[0].timestamp.timestamp_micros(),
             1_700_000_000_123_456
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_paths_serve_from_resident_map_and_fall_back_on_staleness() -> anyhow::Result<()> {
+        // The get path must produce identical pages from the resident map and
+        // from the scan it replaces, resolve message ids from the map, and
+        // fall back to scans the moment the store moves past the map version.
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("map-served-get");
+        let cache = temp.path().join("cache");
+
+        let seed = |mid: &str, text: &str, micros: i64| {
+            let message = Message::User {
+                id: mid.to_owned(),
+                session_id: session.id.clone(),
+                timestamp: DateTime::from_timestamp_micros(micros).unwrap(),
+                options: ProviderOptions::new(),
+            };
+            let part = Part {
+                session_id: session.id.clone(),
+                id: format!("{mid}-p0"),
+                message_id: mid.to_owned(),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(text.to_owned())),
+                },
+            };
+            (message, part)
+        };
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        let mut seq = 1;
+        for (mid, text, micros) in [
+            ("m1", "first page text", 1_700_000_000_000_000_i64),
+            ("m2", "second page text", 1_700_000_001_000_000),
+        ] {
+            let (message, part) = seed(mid, text, micros);
+            validator
+                .push(&store, seq, IngestEvent::Message(message))
+                .await?;
+            validator
+                .push(&store, seq + 1, IngestEvent::Part(part))
+                .await?;
+            seq += 2;
+        }
+        validator.finish(&store).await?;
+
+        let params = SessionViewParams {
+            at_message_id: None,
+            after_message_id: None,
+            before_message_id: None,
+            limit: 50,
+            budget_bytes: 1_000_000,
+            session_from: SessionFrom::Start,
+        };
+        let page_ids = |lookup: GetLookup<SessionPage>| match lookup {
+            GetLookup::Found(page) => page
+                .messages
+                .iter()
+                .map(|message| (message.id.clone(), message.text.clone()))
+                .collect::<Vec<_>>(),
+            other => panic!("expected a page, got {other:?}"),
+        };
+
+        let scanned = page_ids(store.session_view(&session.id, params.clone()).await?);
+        store.ensure_rowmap(&cache).await?;
+        let resident = page_ids(store.session_view(&session.id, params.clone()).await?);
+        assert_eq!(resident, scanned, "map-served page must match the scan");
+        assert_eq!(
+            store.session_id_for_message("m2").await?.as_deref(),
+            Some(session.id.as_str()),
+            "message id resolves from the resident map"
+        );
+
+        // Advance the store past the map: the page must include the new
+        // message (version-gate fallback) and the new id must still resolve
+        // (map miss -> scan fallback).
+        let (message, part) = seed("m3", "post-map text", 1_700_000_002_000_000);
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(session.clone()),
+                IngestEvent::Message(message),
+                IngestEvent::Part(part),
+            ],
+        )
+        .await?;
+
+        let stale_map_page = page_ids(store.session_view(&session.id, params).await?);
+        assert_eq!(stale_map_page.len(), 3, "stale map must not hide m3");
+        assert_eq!(stale_map_page[2].0, "m3");
+        assert_eq!(
+            store.session_id_for_message("m3").await?.as_deref(),
+            Some(session.id.as_str()),
+            "post-map message id resolves via the scan fallback"
+        );
+
+        // message_view: map-served window (map refreshed to current version)
+        // matches storage, and a system-role target falls back to the scan so
+        // its content - which the map does not carry - survives.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(session.clone()),
+                IngestEvent::Message(Message::System {
+                    id: "sys-1".to_owned(),
+                    session_id: session.id.clone(),
+                    timestamp: DateTime::from_timestamp_micros(1_700_000_003_000_000).unwrap(),
+                    content: Some(Extracted::from_test_value("system says hello".to_owned())),
+                    options: ProviderOptions::new(),
+                }),
+            ],
+        )
+        .await?;
+        store.ensure_rowmap(&cache).await?;
+
+        let view_params = MessageViewParams {
+            context_before: 5,
+            context_after: 5,
+            budget_bytes: 1_000_000,
+        };
+        let target_page = match store.message_view("m2", view_params.clone()).await? {
+            GetLookup::Found(page) => page,
+            other => panic!("expected a message page, got {other:?}"),
+        };
+        assert_eq!(target_page.target.text.as_deref(), Some("second page text"));
+        let sibling_ids: Vec<&str> = target_page
+            .siblings
+            .iter()
+            .map(|sibling| sibling.id.as_str())
+            .collect();
+        assert_eq!(
+            sibling_ids,
+            vec!["m1", "m3"],
+            "map-served siblings are the conversational neighbors"
+        );
+
+        let system_page = match store.message_view("sys-1", view_params).await? {
+            GetLookup::Found(page) => page,
+            other => panic!("expected the system message page, got {other:?}"),
+        };
+        assert_eq!(
+            system_page.target.content.as_deref(),
+            Some("system says hello"),
+            "system target must fall back to the scan and keep its content"
         );
         Ok(())
     }
