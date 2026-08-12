@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.8](https://github.com/tenequm/pond/compare/v0.14.7...v0.14.8) - 2026-08-12
+
+### <!-- 3 -->🚀 Performance
+- **read:** rowmap-served message-id resolution and get-family pages ([#141](https://github.com/tenequm/pond/pull/141)) ([a7abc72](https://github.com/tenequm/pond/commit/a7abc72a656b96288abcd044e8023bc5d753a096))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.7...v0.14.8
+
 ## [0.14.7](https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7) - 2026-08-12
 
 pi gets a memory that outlives the session, and pond gets a way to hand a session back: `pond resume` restores stored sessions into a client's own files, the pi adapter learns harness-v2 (v4 JSONL and SQLite), and the new `pi-pond` extension wires recall and resume into pi itself.
