@@ -1,6 +1,6 @@
 # Read path: get-family optimizations (ship 2026-08-12)
 
-Status: implementing. Evidence base: `docs/researches/2608-12-read-path-where-time-goes.md` (all numbers measured on the live `s3+https://nbg1.../pondarium/pond` store, 14.3k sessions / 2.64M messages, 2026-08-12).
+Status: shipped (PR #141). Evidence base: `docs/researches/2608-12-read-path-where-time-goes.md` (all numbers measured on the live `s3+https://nbg1.../pondarium/pond` store, 14.3k sessions / 2.64M messages, 2026-08-12).
 
 ## Problem
 
@@ -45,9 +45,9 @@ When the loaded map's version equals the current `messages` version (one cheap m
 
 Feature branch `feat/read-performance-optimizations` -> PR -> `main`; then merge the `chore: release vX.Y.Z` PR release-plz opens (patch bump; commits are `perf:`/`docs:` types).
 
-## Session state (2026-08-12 pre-compaction checkpoint - resume here)
+## Shipped state (2026-08-12, PR #141)
 
-Working tree: the `feat/read-performance-optimizations` worktree at `.claude/worktrees/feat+read-performance-optimizations`, `origin/main` (827ba3c, the pi PR) merged in. **Implementation is COMPLETE and validated locally but NOT yet committed** - src changes are uncommitted by design until the final remote verification passes.
+Landed via `feat/read-performance-optimizations`. What shipped, where it lives, and the measured outcome:
 
 Implemented (all in working tree):
 - `rowmap.rs`: `RowMetaMap::session_id_for_message` (linear header scan, length-check first), `RowMetaMap::session_row_ids` (all roles), both mirrored on `RowMetaSet` (deltas-first for the id lookup); unit test `message_and_conversational_lookups_cover_the_chain`.
@@ -60,8 +60,10 @@ Probe ids: session `8b7b9e47-66d2-464b-8ec6-0ad70855ff57`, message `419caaa5-13d
 
 Verification COMPLETE (2026-08-12): probe round 2 - get-session by session id 47/53s, by message id 68/97s (one sync-contended outlier), get-message 49/39s, map-vs-scan output byte-identical. Final io-trace: warm `pond_get_message` 4,003 GETs p50 (vs 10,900 baseline, -63%); unchanged vs the fix-A-only run, which isolates the residual: **the `parts_for_messages` leg flat-reads ~4k data pages of the 2.9M-row parts table per warm get** - the next target, promoted below. Search components unregressed (fts 52 / vector 102 / search 304 iops p50).
 
-REMAINING (in order):
-1. Commit src + tests as `perf(read): resolve message ids and serve session pages from the resident rowmap`; push, open the feature PR (NOT a release PR), merge to main after CI.
-2. release-plz auto-opens `chore: release vX.Y.Z` (patch); enrich the changelog entry under the canonical headers with the measured numbers, then merge it - that merge publishes.
+A four-lens polish review (cleanliness / design / efficiency / side-effect gating) ran over the PR and its fixes landed in a follow-up commit: corrupt-map fail-open and fail-closed paths now all degrade to the store scan, `session_row_ids` aborts on malformed records instead of silently dropping rows, the per-session walk early-exits on the session entry's row count, the message-id walk runs newest-first, the duplicated resident helpers collapsed into one `ScanRow` source, and the map accessors follow the `lookup_*` convention.
+
+Release: merge the feature PR into main, then merge the `chore: release` PR release-plz opens (patch; enrich the changelog entry with the measured numbers first).
+
+RESUME POINTER (only relevant until the release lands): the polish fixes described above sit in the worktree; fmt/clippy/full tests are green on them. Pending, in order: (1) collect the in-flight remote re-verification (release rebuild + `get_probes_patched.sh` probes; the script's byte-equivalence check must print EQUIVALENCE OK), (2) commit the fixes as one `perf(read)`/`refactor(read)`-typed commit and push - PR #141 already exists and CI re-runs on push, (3) `gh pr merge 141 --squash` once green, (4) enrich + merge the release-plz `chore: release` PR. User authorization for commit/merge/release: given 2026-08-12 ("implement ... and get them out today"), reconfirmed by "fix all identified issues".
 
 Known follow-ups (explicitly deferred, do not fold into this PR): **parts read path (now the top target)** - a warm get's residual ~4,000 GETs are the `parts_for_messages` scan over the parts table; establish whether the `(session_id, message_id)` btrees actually engage for the `In` predicate (io-trace shows the reads land on DATA pages, not index pages) and give parts the summary-residency ("5c") or index-pushdown treatment; erase-vs-stale-map can return `internal` instead of `not_found` for <=30s in long-lived servers (downgrade in handler later); 5c parts-summary residency; FTS postings prewarm; concurrency semaphore; serve-topology recommendation (`pond serve --with-sync` + HTTP MCP registration); Lance v10 upgrade track (unblocks timestamp zonemap under DataFusion 54, COUNT(*) pushdown with stable row ids, FTS format v2 via index rebuild, `LANCE_MINIBLOCK_MAX_VALUES` for variant_data, exact-IS-NULL zonemaps).
