@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.8](https://github.com/tenequm/pond/compare/v0.14.7...v0.14.8) - 2026-08-12
+
+The get family stops paying S3 for data it already holds resident: message-id resolution and session pages are now served from the mmap'd rowmap, cutting a cold `get-session <message-id>` from 166s to ~61s and a warm get's S3 round-trips by 63%.
+
+### <!-- 3 -->🚀 Performance
+- **read:** rowmap-served message-id resolution and get-family pages ([#141](https://github.com/tenequm/pond/pull/141)) ([a7abc72](https://github.com/tenequm/pond/commit/a7abc72a656b96288abcd044e8023bc5d753a096))
+  - Message-id -> session resolution consults the resident rowmap before falling back to the full remote scan of the unindexed `messages.id` column - the scan cost ~93s of every by-message-id get and is eliminated on a map hit, which is definitive at any map version because the store is append-only and message ids are immutable. Session pages are likewise served from the map when its version matches the store, with fallback to the scan path on any staleness, corruption, or decode anomaly - staleness can never drop a newly synced message from a page.
+  - `pond get-session`, `pond get-message`, and `pond sql` now open with the disk index cache and load the published rowmap chain, giving one-shot CLI reads the same warm path as the MCP server.
+  - Measured on the live 14.3k-session / 2.65M-message S3 store: get-session by message id 166s -> ~61s, get-message 153s -> ~40s, warm get_message S3 range-GETs 10,900 -> ~4,000 (-63%), map-served output verified byte-identical to scan-served, search components unregressed.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.7...v0.14.8
+
 ## [0.14.7](https://github.com/tenequm/pond/compare/v0.14.6...v0.14.7) - 2026-08-12
 
 pi gets a memory that outlives the session, and pond gets a way to hand a session back: `pond resume` restores stored sessions into a client's own files, the pi adapter learns harness-v2 (v4 JSONL and SQLite), and the new `pi-pond` extension wires recall and resume into pi itself.
