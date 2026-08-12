@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.9](https://github.com/tenequm/pond/compare/v0.14.8...v0.14.9) - 2026-08-12
+
+### <!-- 1 -->🎉 New Features
+- **adapter:** capture oh-my-pi (omp) sessions ([#142](https://github.com/tenequm/pond/pull/142)) ([f9e949e](https://github.com/tenequm/pond/commit/f9e949e285270db67bb0f8973de51742ab994b71))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.8...v0.14.9
+
 ## [0.14.8](https://github.com/tenequm/pond/compare/v0.14.7...v0.14.8) - 2026-08-12
 
 The get family stops paying S3 for data it already holds resident: message-id resolution and session pages are now served from the mmap'd rowmap, cutting a cold `get-session <message-id>` from 166s to ~61s and a warm get's S3 round-trips by 63%.
