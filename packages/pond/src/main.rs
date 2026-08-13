@@ -3197,13 +3197,19 @@ fn enable_adapter(config_file: &Path, name: &str) -> anyhow::Result<bool> {
     // Flipping in place is only enough when the entry already names a source.
     // A pathless decline stub would otherwise end up `enabled = true` with no
     // `path`, which every later `pond sync` rejects as a bad config blob - so
-    // it falls through to discovery instead.
-    let has_path = Config::load(config_file).is_ok_and(|config| {
-        config
-            .adapters
-            .get(name)
-            .is_some_and(|blob| blob.get("path").is_some())
-    });
+    // it falls through to discovery instead. An unreadable config must fail
+    // here rather than fall through: discovery persists the probed default,
+    // which would overwrite the customized path this check exists to protect.
+    let has_path = Config::load(config_file)
+        .with_context(|| {
+            format!(
+                "cannot enable {name:?} without reading {}; fix the config error first (`pond config show` names it)",
+                config_file.display(),
+            )
+        })?
+        .adapters
+        .get(name)
+        .is_some_and(|blob| blob.get("path").is_some());
     if has_path && adapter::set_adapter_enabled(config_file, name, true)? {
         return Ok(false);
     }
@@ -6770,6 +6776,35 @@ mod tests {
         assert_eq!(value[0]["name"], "work");
         assert_eq!(value[0]["access_key"], "********");
         assert_eq!(value[0]["secret"], "********");
+    }
+
+    /// An unreadable config must never fall through to discovery: that path
+    /// persists the probed default and would overwrite the customized (or
+    /// multi-path) `path` the enable flow exists to preserve.
+    #[test]
+    fn enable_adapter_refuses_to_touch_an_unreadable_config() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let config_file = temp.path().join("config.toml");
+        // Valid TOML (so the toml_edit write path would happily proceed) but
+        // invalid config: an unknown key fails Config::load's schema check.
+        std::fs::write(
+            &config_file,
+            "[storage]\nnot_a_real_field = 1\n\n[adapters.claude-code]\nenabled = false\npath = \"/srv/custom\"\n",
+        )?;
+        let before = std::fs::read_to_string(&config_file)?;
+
+        let error = enable_adapter(&config_file, "claude-code")
+            .expect_err("an unreadable config must not be written through");
+        assert!(
+            format!("{error:#}").contains("fix the config error first"),
+            "error should name the fix: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_file)?,
+            before,
+            "the customized path must survive untouched"
+        );
+        Ok(())
     }
 
     #[test]
