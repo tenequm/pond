@@ -654,13 +654,22 @@ impl Config {
     ) -> Result<Vec<(String, Value, Option<String>)>> {
         match adapter {
             None => {
-                let mut resolved = Vec::new();
-                for (name, blob) in self
+                // A malformed entry fails the whole resolve rather than being
+                // skipped: `factory.open` already aborts a run on a bad blob
+                // (missing `path`), and softening only this class would leave
+                // two per-adapter config errors behaving differently - one
+                // skipped politely, one aborting mid-run after commits. Scoped
+                // `pond sync <name>` still bypasses a sibling's bad entry, so
+                // the blast radius is bounded and the errors below name it.
+                let enabled: Vec<_> = self
                     .adapters
                     .iter()
                     .filter_map(|(name, blob)| take_enabled(name, blob))
-                {
-                    resolved.extend(expand_path_array(name, blob)?);
+                    .collect();
+                let total = enabled.len();
+                let mut resolved = Vec::new();
+                for (name, blob) in enabled {
+                    resolved.extend(expand_path_array(name, blob, total)?);
                 }
                 Ok(resolved)
             }
@@ -674,7 +683,7 @@ impl Config {
                         "adapter [{name}] is disabled (enabled = false); run `pond adapters enable {name}` to re-enable, then `pond sync {name}`"
                     )
                 })?;
-                expand_path_array(name, blob)
+                expand_path_array(name, blob, 1)
             }
         }
     }
@@ -819,13 +828,25 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
 /// read once per dir - wasteful on a first sync, harmless under PK
 /// idempotency - accepted because the config layer cannot know which of an
 /// adapter's keys are path-like.
-fn expand_path_array(name: String, blob: Value) -> Result<Vec<(String, Value, Option<String>)>> {
+fn expand_path_array(
+    name: String,
+    blob: Value,
+    enabled_total: usize,
+) -> Result<Vec<(String, Value, Option<String>)>> {
     let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
         return Ok(vec![(name, blob, None)]);
     };
+    // A config error halts every adapter's sync, so each message states the
+    // blast radius and the way to keep working meanwhile.
+    let others = match enabled_total.saturating_sub(1) {
+        0 => String::new(),
+        n => format!(
+            " ({n} other enabled adapter(s) are unaffected - `pond sync <adapter>` syncs one meanwhile, `pond adapters list` shows every configured path)"
+        ),
+    };
     if paths.is_empty() {
         bail!(
-            "[adapters.{name}] has an empty `path` array; list at least one directory, or disable the adapter with `pond adapters disable {name}`"
+            "[adapters.{name}] has an empty `path` array; list at least one directory, or disable the adapter with `pond adapters disable {name}`{others}"
         );
     }
     let multi = paths.len() > 1;
@@ -834,7 +855,7 @@ fn expand_path_array(name: String, blob: Value) -> Result<Vec<(String, Value, Op
     for path in &paths {
         let Some(path) = path.as_str() else {
             bail!(
-                "[adapters.{name}] `path` array holds a non-string element ({path}); every element must be a directory path string"
+                "[adapters.{name}] `path` array holds a non-string element ({path}); every element must be a directory path string{others}"
             );
         };
         // Literal duplicates only, as a typo courtesy. Aliases (`~/x` vs its
@@ -843,7 +864,7 @@ fn expand_path_array(name: String, blob: Value) -> Result<Vec<(String, Value, Op
         // `open()`, and an aliased re-read is harmless under PK-idempotent
         // ingest - not worth a filesystem-semantics rabbit hole here.
         if !seen.insert(path) {
-            bail!("[adapters.{name}] `path` lists {path:?} twice; remove the duplicate");
+            bail!("[adapters.{name}] `path` lists {path:?} twice; remove the duplicate{others}");
         }
         let mut single = blob.clone();
         if let Some(obj) = single.as_object_mut() {

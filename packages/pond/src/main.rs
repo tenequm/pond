@@ -1142,17 +1142,21 @@ async fn main() -> anyhow::Result<()> {
             let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
-                // A malformed [adapters] section still counts as configured:
-                // the fix is repairing config.toml (sync names it), not the
-                // "run `pond init`" hint the no-adapters rendering gives.
-                let has_adapters = loaded
-                    .resolve_adapters(None)
-                    .map(|adapters| !adapters.is_empty())
-                    .unwrap_or(true);
+                let (has_adapters, adapters_error) = match loaded.resolve_adapters(None) {
+                    Ok(adapters) => (!adapters.is_empty(), None),
+                    Err(error) => (true, Some(format!("{error:#}"))),
+                };
                 match format {
-                    OutputFormat::Json => output(&status_json_empty(&resolved)?)?,
+                    OutputFormat::Json => {
+                        output(&status_json_empty(&resolved, adapters_error.as_deref())?)?;
+                    }
                     OutputFormat::Text => {
-                        render_empty_status("pond status", &resolved, has_adapters)?;
+                        render_empty_status(
+                            "pond status",
+                            &resolved,
+                            has_adapters,
+                            adapters_error.as_deref(),
+                        )?;
                         output(&crate::schedule::status_line())?;
                         if hosts {
                             output_err(&pond::output::paint(
@@ -3158,13 +3162,14 @@ fn adapters_list(loaded: &Config, format: OutputFormat) -> anyhow::Result<()> {
 
 fn adapters_discover(config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
-    // Probe only unconfigured adapters: an existing entry may carry a
-    // customized or multi-path `path`, and persisting a re-discovered pick
-    // would silently overwrite it with the single default dir.
-    let candidates = adapter::probe_unconfigured(&loaded.adapters);
+    // Skip entries that already name a source `path` (a hand-written dir or a
+    // multi-path array would be overwritten by the probed default); pathless
+    // decline stubs stay re-offerable, so declining an adapter never
+    // dead-ends the route back to it.
+    let candidates = adapter::probe_pathless(&loaded.adapters);
     if candidates.is_empty() && !loaded.adapters.is_empty() {
         output(&format!(
-            "no new adapters detected - {} already configured (pond adapters list)",
+            "no new adapters detected - {} already configured with a source path (pond adapters list); enable or disable one by name with `pond adapters enable|disable <adapter>`",
             loaded.adapters.len(),
         ))?;
         return Ok(());
@@ -3189,7 +3194,17 @@ fn enable_adapter(config_file: &Path, name: &str) -> anyhow::Result<bool> {
     if !known.contains(&name) {
         bail!("unknown adapter {name:?}; known: {}", known.join(", "));
     }
-    if adapter::set_adapter_enabled(config_file, name, true)? {
+    // Flipping in place is only enough when the entry already names a source.
+    // A pathless decline stub would otherwise end up `enabled = true` with no
+    // `path`, which every later `pond sync` rejects as a bad config blob - so
+    // it falls through to discovery instead.
+    let has_path = Config::load(config_file).is_ok_and(|config| {
+        config
+            .adapters
+            .get(name)
+            .is_some_and(|blob| blob.get("path").is_some())
+    });
+    if has_path && adapter::set_adapter_enabled(config_file, name, true)? {
         return Ok(false);
     }
     let candidate = adapter::discover(Some(name))
@@ -4004,20 +4019,14 @@ async fn run_sync_pipeline(
     // Deletion reconciliation (decision 7): only when openclaw is in scope, so
     // a non-openclaw sync pays nothing. Detection-only - it names the erase
     // set and preserves for the summary; the byte-purge waits on `pond erase`.
-    // A multi-path entry reconciles every dir, merging into one report.
-    let mut merged: Option<adapter::ReconciliationReport> = None;
-    for config in openclaw_in_scope(loaded, invocation)? {
+    // A multi-path entry reconciles every dir, merged into one report.
+    let roots = openclaw_in_scope(loaded, invocation)?;
+    let mut reports = Vec::with_capacity(roots.len());
+    for config in roots {
         let adapter = adapter::OpenClawAdapter::from_config(config)?;
-        let recon = adapter.reconcile_deletions(store).await?;
-        match &mut merged {
-            None => merged = Some(recon),
-            Some(merged) => {
-                merged.erase.extend(recon.erase);
-                merged.preserved.extend(recon.preserved);
-            }
-        }
+        reports.push(adapter.reconcile_deletions(store).await?);
     }
-    if let Some(recon) = merged {
+    if let Some(recon) = merge_reconciliation(reports) {
         emit_reconciliation(sink, &recon)?;
         report.reconciliation = Some(recon);
     }
@@ -4150,6 +4159,42 @@ fn reconciliation_lines(recon: &adapter::ReconciliationReport) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// Fold each openclaw root's reconciliation into one report; `None` when no
+/// root ran. Across several roots the erase set is downgraded to preserves:
+/// each root decides erase-vs-preserve from its OWN archives and agent DB,
+/// while `find_session` is store-global, so a session archived as deleted
+/// under one root but still live under another would land in `erase` and the
+/// next sync would re-ingest it. Cross-root liveness is not observable from
+/// these reports (a root holding the session live simply says nothing about
+/// it), so the adapter's own rule applies - ambiguity resolves to preserve.
+fn merge_reconciliation(
+    reports: Vec<adapter::ReconciliationReport>,
+) -> Option<adapter::ReconciliationReport> {
+    let multi_root = reports.len() > 1;
+    let mut merged: Option<adapter::ReconciliationReport> = None;
+    for report in reports {
+        let merged = merged.get_or_insert_with(Default::default);
+        merged.preserved.extend(report.preserved);
+        if multi_root {
+            merged
+                .preserved
+                .extend(report.erase.into_iter().map(|target| {
+                    adapter::PreserveNote {
+                        agent_id: target.agent_id,
+                        session_id: target.session_id,
+                        reason:
+                            "several openclaw source paths are configured; another path may still \
+                             hold this session live - preserved for safety"
+                                .to_owned(),
+                    }
+                }));
+        } else {
+            merged.erase.extend(report.erase);
+        }
+    }
+    merged
 }
 
 /// The openclaw adapter's resolved config blobs when it is in this sync's
@@ -5611,7 +5656,10 @@ fn index_status_label(status: &IndexStatus, fold_threshold: u64) -> &'static str
 /// `pond status --format json` for a configured-but-never-synced store: just
 /// the storage destination, no corpus/indexes/embedding (spec parity with the
 /// text path's "no data yet" line).
-fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
+fn status_json_empty(
+    resolved: &ResolvedStorage,
+    adapters_error: Option<&str>,
+) -> anyhow::Result<String> {
     let doc = serde_json::json!({
         "pond_version": VERSION.as_str(),
         "storage": {
@@ -5619,9 +5667,12 @@ fn status_json_empty(resolved: &ResolvedStorage) -> anyhow::Result<String> {
             "binding": resolved.binding.describe(),
         },
         // Explicit nulls so a consumer keying on `.local`/`.hosts` sees the
-        // fields exist and `initialized: false` explains their absence.
+        // fields exist and `initialized: false` explains their absence. The
+        // adapters error rides at top level for the same reason: `local` is
+        // null here, so it has nowhere else to go.
         "local": serde_json::Value::Null,
         "hosts": serde_json::Value::Null,
+        "adapters_error": adapters_error,
         "initialized": false,
     });
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
@@ -5747,19 +5798,32 @@ fn render_empty_status(
     title: &str,
     resolved: &ResolvedStorage,
     has_adapters: bool,
+    adapters_error: Option<&str>,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     render_status_storage_line(title, resolved)?;
     // With no adapters enabled, `pond sync` dead-ends ("no adapters
     // configured") - point the first-run user at the command that works.
-    let fix = if has_adapters {
-        "run `pond sync` to import sessions"
-    } else {
-        "run `pond init` to set up adapters and import sessions"
+    // A malformed [adapters] section is neither case: naming the config error
+    // beats "run `pond sync`", which would just fail the same way.
+    let fix = match (adapters_error, has_adapters) {
+        (Some(error), _) => return render_empty_adapters_error(error),
+        (None, true) => "run `pond sync` to import sessions",
+        (None, false) => "run `pond init` to set up adapters and import sessions",
     };
     output(&format!(
         "{}    no data yet - {fix}",
         paint("stored", dim())
+    ))?;
+    Ok(())
+}
+
+fn render_empty_adapters_error(error: &str) -> anyhow::Result<()> {
+    use pond::output::{dim, paint, red};
+    output(&format!(
+        "{}    no data yet - {}",
+        paint("stored", dim()),
+        paint(&format!("adapters config error - {error}"), red()),
     ))?;
     Ok(())
 }
@@ -6695,6 +6759,93 @@ mod tests {
         assert_eq!(value[0]["name"], "work");
         assert_eq!(value[0]["access_key"], "********");
         assert_eq!(value[0]["secret"], "********");
+    }
+
+    #[test]
+    fn adapter_label_marks_only_fanned_entries() {
+        assert_eq!(adapter_label("claude-code", None), "claude-code");
+        assert_eq!(
+            adapter_label("claude-code", Some("/srv/work")),
+            "claude-code (/srv/work)"
+        );
+    }
+
+    #[test]
+    fn contracted_paths_renders_scalars_arrays_and_malformed_values() {
+        let scalar = serde_json::json!({ "path": "/srv/cc" });
+        assert_eq!(contracted_paths(&scalar), Some(vec!["/srv/cc".to_owned()]));
+
+        let array = serde_json::json!({ "path": ["/srv/a", "/srv/b"] });
+        assert_eq!(
+            contracted_paths(&array),
+            Some(vec!["/srv/a".to_owned(), "/srv/b".to_owned()])
+        );
+
+        // Malformed values render as themselves - `adapters list` is where a
+        // user looks after sync rejects the entry.
+        assert_eq!(contracted_paths(&serde_json::json!({})), None);
+        assert_eq!(
+            contracted_paths(&serde_json::json!({ "path": [] })),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            contracted_paths(&serde_json::json!({ "path": ["/srv/a", 3] })),
+            Some(vec!["/srv/a".to_owned(), "3".to_owned()])
+        );
+    }
+
+    #[test]
+    fn openclaw_in_scope_returns_every_fanned_root() -> anyhow::Result<()> {
+        let config = Config::load_str(
+            "[adapters.openclaw]\nenabled = true\npath = [\"/srv/oc-a\", \"/srv/oc-b\"]\n",
+        )?;
+        let roots = openclaw_in_scope(&config, &SyncInvocation::defaults())?;
+        let paths: Vec<_> = roots
+            .iter()
+            .filter_map(|blob| blob.get("path").and_then(Value::as_str))
+            .collect();
+        assert_eq!(paths, vec!["/srv/oc-a", "/srv/oc-b"]);
+
+        // A non-openclaw scope skips reconciliation entirely.
+        let scoped = SyncInvocation {
+            adapter: Some("claude-code".to_owned()),
+            ..SyncInvocation::defaults()
+        };
+        assert!(openclaw_in_scope(&config, &scoped)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_reconciliation_preserves_erase_targets_across_several_roots() {
+        let target = |id: &str| adapter::EraseTarget {
+            agent_id: "bot".to_owned(),
+            session_id: id.to_owned(),
+            session_key: format!("agent:bot:{id}"),
+        };
+        let report = |id: &str| adapter::ReconciliationReport {
+            erase: vec![target(id)],
+            preserved: Vec::new(),
+        };
+
+        assert!(merge_reconciliation(Vec::new()).is_none());
+
+        // Single root: the erase set stands.
+        let single = merge_reconciliation(vec![report("s1")]).expect("one report merges");
+        assert_eq!(single.erase.len(), 1);
+        assert!(single.preserved.is_empty());
+
+        // Several roots: no root can see another's live sessions, so every
+        // erase target downgrades to a preserve naming the ambiguity.
+        let multi = merge_reconciliation(vec![report("s1"), report("s2")]).expect("reports merge");
+        assert!(multi.erase.is_empty(), "erase must not survive a fan-out");
+        assert_eq!(multi.preserved.len(), 2);
+        assert!(
+            multi.preserved[0]
+                .reason
+                .contains("still hold this session live"),
+            "reason must name the cross-root ambiguity: {}",
+            multi.preserved[0].reason,
+        );
     }
 
     #[test]
