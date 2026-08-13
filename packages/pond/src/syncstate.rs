@@ -41,25 +41,22 @@ pub(crate) fn state_root() -> PathBuf {
 
 /// The directory where the scheduler log, sync lock, and last-sync record live.
 ///
-/// On all platforms, `XDG_STATE_HOME/pond` when `XDG_STATE_HOME` is set.
-/// On Windows (native): `%LOCALAPPDATA%\pond\state` - `state_root()` already
-/// points here, so no extra `\pond` subdirectory is added (there are no sibling
-/// app state dirs to separate from under that root).
+/// On all platforms, `XDG_STATE_HOME/pond` when `XDG_STATE_HOME` is set - except
+/// on Windows, where the per-app `\pond` suffix is omitted because `state_root()`
+/// already points to a pond-specific dir (`%LOCALAPPDATA%\pond\state`). This also
+/// keeps the scheduler-pinning contract: the wrapper sets
+/// `XDG_STATE_HOME=state_root()`, and the scheduled job calls `pond_state_dir()`
+/// which on Windows returns `state_root()` = the same value, with no double suffix.
+///
 /// On Unix: `$HOME/.local/state/pond` (one app under the shared XDG state home).
 pub(crate) fn pond_state_dir() -> PathBuf {
-    // When XDG_STATE_HOME is set, state_root() returns it; we add \pond to
-    // stay in the XDG-convention "one subdir per app" lane on all platforms.
-    if std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .is_some()
-    {
-        return state_root().join("pond");
-    }
-    // Native Windows: state_root() IS the pond state dir already.
+    // On Windows: state_root() is already pond's state dir (no \pond suffix),
+    // whether XDG_STATE_HOME is set by the user or by the scheduler wrapper.
     #[cfg(windows)]
-    return state_root();
-    // Unix: state_root() is the XDG state home; add the app subdirectory.
+    {
+        state_root()
+    }
+    // Unix: add \pond so other apps can coexist under the shared XDG state home.
     #[cfg(not(windows))]
     state_root().join("pond")
 }
