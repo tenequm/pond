@@ -1,14 +1,14 @@
 ---
-description: Install pond on macOS and Linux via Homebrew (tenequm/tap/pond), Nix, or Cargo (the pond-db crate). One Rust binary, no external services.
+description: Install pond on macOS, Linux, or Windows via Homebrew (tenequm/tap/pond), Nix, Cargo (the pond-db crate), or cargo-binstall.
 ---
 
 # Install
 
-macOS and Linux. Windows is out of v1 scope.
+macOS, Linux, and Windows.
 
-:::code-group
+::::code-group
 
-```sh [Homebrew]
+```sh [Homebrew (macOS / Linux)]
 brew install tenequm/tap/pond
 ```
 
@@ -17,11 +17,10 @@ nix profile add github:tenequm/pond#pond
 ```
 
 ```sh [Cargo]
+# Requires protoc on PATH: winget install Google.Protobuf (Windows) or system package manager.
 cargo install pond-db   # installs the `pond` binary
 ```
 
-:::
-
-macOS selects the Metal backend automatically; elsewhere a CPU fallback runs.
+::::
 
 Next: [Quickstart](/get-started/quickstart).

@@ -474,28 +474,51 @@ impl Default for EmbeddingsConfig {
 }
 
 /// The platform-local default storage path, used when neither
-/// `--storage-path` / `POND_STORAGE_PATH` nor `[storage].path` is set:
-/// `$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`, then `.pond`.
-/// `xdg_data_home` is honored only if absolute, per the XDG base-directory
-/// spec.
+/// `--storage-path` / `POND_STORAGE_PATH` nor `[storage].path` is set.
+///
+/// On Windows: `%LOCALAPPDATA%\pond` (native per-user local app data dir).
+/// On other platforms: `$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`,
+/// then `.pond` as a last resort. `xdg_data_home` is honored only if
+/// absolute, per the XDG base-directory spec.
 pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<Url> {
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return url_for_path(local_app_data.join("pond"));
+    }
+    #[cfg(not(windows))]
     if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
         return url_for_path(xdg.join("pond"));
     }
+    // Suppress unused-variable warning on Windows where xdg_data_home is not consulted.
+    let _ = xdg_data_home;
     if let Some(home) = home {
         return url_for_path(home.join(".local").join("share").join("pond"));
     }
-    // No HOME and no usable XDG var - stay usable rather than panic.
+    // No home dir and no usable platform dir - stay usable rather than panic.
     url_for_path(PathBuf::from(".pond"))
 }
 
-/// Cache dir for rebuildable artifacts (the search row meta map): the XDG-cache
-/// analog of [`default_storage_path`]. Separate root because the contents are
-/// regenerated from the store, not durable data.
+/// Cache dir for rebuildable artifacts (the search row meta map).
+///
+/// On Windows: `%LOCALAPPDATA%\pond\cache` (native per-user local app data).
+/// On other platforms: `$XDG_CACHE_HOME/pond`, then `$HOME/.cache/pond`,
+/// then `.pond-cache` as a last resort.
 pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return local_app_data.join("pond").join("cache");
+    }
+    #[cfg(not(windows))]
     if let Some(xdg) = xdg_cache_home.filter(|path| path.is_absolute()) {
         return xdg.join("pond");
     }
+    let _ = xdg_cache_home;
     if let Some(home) = home {
         return home.join(".cache").join("pond");
     }
@@ -504,12 +527,24 @@ pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>
 
 /// Local default path for `config.toml`. URI-backed data dirs always land
 /// here because the config file has to be local (it names the bucket and
-/// any creds). XDG hierarchy: `$XDG_CONFIG_HOME/pond/config.toml`, then
+/// any creds).
+///
+/// On Windows: `%APPDATA%\pond\config.toml` (native per-user roaming app data).
+/// On other platforms: `$XDG_CONFIG_HOME/pond/config.toml`, then
 /// `$HOME/.config/pond/config.toml`, then `.pond.toml` in cwd.
 pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return app_data.join("pond").join("config.toml");
+    }
+    #[cfg(not(windows))]
     if let Some(xdg) = xdg_config_home.filter(|path| path.is_absolute()) {
         return xdg.join("pond").join("config.toml");
     }
+    let _ = xdg_config_home;
     if let Some(home) = home {
         return home.join(".config").join("pond").join("config.toml");
     }
@@ -1014,16 +1049,11 @@ mod tests {
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn default_storage_path_follows_xdg_then_home() {
-        // An absolute XDG_DATA_HOME wins; use a platform-absolute root so the
-        // is_absolute() gate behaves identically on Windows (a driveless path
-        // like /xdg is relative there).
-        let (xdg, home) = if cfg!(windows) {
-            (PathBuf::from("C:\\xdg"), PathBuf::from("C:\\home"))
-        } else {
-            (PathBuf::from("/xdg"), PathBuf::from("/home"))
-        };
+        let xdg = PathBuf::from("/xdg");
+        let home = PathBuf::from("/home");
         let resolved = default_storage_path(Some(xdg.clone()), Some(home.clone())).unwrap();
         assert!(is_local(&resolved));
         assert_eq!(local_path(&resolved).unwrap(), xdg.join("pond"));
@@ -1037,14 +1067,26 @@ mod tests {
         );
 
         // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
-        // The result is absolute (Lance's URL conversion requires it), so we
-        // just check that the URL ends with the relative path's components.
         let resolved = default_storage_path(None, None).unwrap();
         assert!(is_local(&resolved));
         assert!(
             local_path(&resolved).unwrap().ends_with(".pond"),
             "fallback path should end with .pond: {resolved}",
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_storage_path_windows_native() {
+        // On Windows the function uses %LOCALAPPDATA% (native Windows data dir)
+        // regardless of the XDG/home parameters.
+        let resolved = default_storage_path(None, None).unwrap();
+        assert!(is_local(&resolved));
+        let path = local_path(&resolved).unwrap();
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .expect("LOCALAPPDATA must be set in Windows test environment");
+        assert_eq!(path, local_app_data.join("pond"));
     }
 
     #[test]

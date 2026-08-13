@@ -23,6 +23,7 @@ fn status(temp: &TempDir, args: &[&str]) -> (String, String) {
         .arg("status")
         .args(args)
         .env("HOME", temp.path().join("home"))
+        .env("USERPROFILE", temp.path().join("home"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))

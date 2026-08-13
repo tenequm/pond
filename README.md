@@ -143,7 +143,7 @@ pond optimize --only index
 
 ### Scheduled sync
 
-Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
+Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux, Task Scheduler on Windows):
 
 ```sh
 pond schedule start                # every 5m by default (--every 15m|1h|6h|1d)

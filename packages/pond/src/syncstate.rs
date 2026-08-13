@@ -31,7 +31,8 @@ pub(crate) fn pond_state_dir() -> PathBuf {
     state_root().join("pond")
 }
 
-/// Who holds the sync lock, written into the lock file on acquire so a
+/// Who holds the sync lock. Written into a sibling `.holder.json` file (not the
+/// lock file itself, which is whole-file-locked on Windows) on acquire so a
 /// blocked sibling can name what it is waiting for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SyncLockHolder {
@@ -49,8 +50,17 @@ pub(crate) enum SyncLockState {
 /// Held for the whole sync run. The OS drops the flock when the file closes,
 /// so a killed sync can never leave a stale lock. The lock file is never
 /// unlinked - unlink while a sibling holds the path open hands out two locks.
+/// `SyncLockGuard::drop` removes the sibling `.holder.json` best-effort.
 pub(crate) struct SyncLockGuard {
     _file: File,
+    holder_path: PathBuf,
+}
+
+impl Drop for SyncLockGuard {
+    fn drop(&mut self) {
+        // Best-effort: the file may already be absent (concurrent stop, etc.).
+        let _ = std::fs::remove_file(&self.holder_path);
+    }
 }
 
 pub(crate) fn try_acquire_sync_lock(store_key: &str) -> Result<SyncLockState> {
@@ -78,11 +88,19 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 pid: std::process::id(),
                 started_at: Utc::now(),
             };
-            // Best-effort breadcrumb; the lock itself is the flock, not the bytes.
+            // Use temp + rename so a concurrent reader never sees a partial
+            // write (same pattern as write_last_sync_in). Best-effort: the
+            // lock itself is the flock, not the holder bytes.
             if let Ok(bytes) = serde_json::to_vec(&holder) {
-                let _ = std::fs::write(&holder_path, bytes);
+                let tmp = holder_path.with_extension("json.tmp");
+                if std::fs::write(&tmp, &bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &holder_path);
+                }
             }
-            Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
+            Ok(SyncLockState::Acquired(SyncLockGuard {
+                _file: file,
+                holder_path,
+            }))
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             let holder = std::fs::read_to_string(&holder_path)
@@ -100,7 +118,10 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 path = %path.display(),
                 "sync lock unsupported on this filesystem; proceeding without single-flight"
             );
-            Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
+            Ok(SyncLockState::Acquired(SyncLockGuard {
+                _file: file,
+                holder_path,
+            }))
         }
     }
 }

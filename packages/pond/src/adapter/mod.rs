@@ -380,8 +380,8 @@ pub struct Env {
 
 impl Env {
     /// Read `home` from the environment portably ([`crate::config::home_dir`]:
-    /// `HOME`, then `USERPROFILE` on Windows). Returns `None` when neither is
-    /// set (CI, post-install hooks, sandboxed runs).
+    /// `USERPROFILE` on Windows, `HOME` on Unix). Returns `None` when unset
+    /// (CI, post-install hooks, sandboxed runs).
     pub fn from_env() -> Option<Self> {
         crate::config::home_dir().map(|home| Self { home })
     }
@@ -604,7 +604,7 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
 /// untouched when the env has no home (CI, post-install hooks, sandboxes).
 /// Shared because an adapter whose config carries more than one path cannot use
 /// [`config_path`]. Home resolution is portable ([`crate::config::home_dir`]:
-/// `HOME`, then `USERPROFILE` on Windows).
+/// `USERPROFILE` on Windows, `HOME` on Unix).
 pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
     match crate::config::home_dir() {
         Some(home) => crate::config::expand_home_under(&path, &home),

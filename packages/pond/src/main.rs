@@ -1114,6 +1114,7 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(MAIN_STACK_SIZE)
+                .max_blocking_threads(64)
                 .build()?;
             runtime.block_on(run())
         })?;
