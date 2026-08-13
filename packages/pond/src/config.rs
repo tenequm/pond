@@ -524,6 +524,18 @@ pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBu
     PathBuf::from(".pond.toml")
 }
 
+/// One `[adapters.*]` entry resolved into a single ingest pass: the adapter
+/// name, the opaque blob its factory's `open()` takes, and - for an entry
+/// fanned out of a multi-path `path` array - the dir this pass reads, which
+/// display surfaces append to the name so otherwise-identical rows are
+/// distinguishable. See [`Config::resolve_adapters`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAdapter {
+    pub name: String,
+    pub config: Value,
+    pub fanout_path: Option<String>,
+}
+
 impl Config {
     /// Load `config.toml` from `path` (if it exists) layered under the
     /// `POND_*` env mirror, and validate. A missing file yields the built-in
@@ -640,18 +652,13 @@ impl Config {
     /// `enabled = false` (or absent) are treated as opt-out and the
     /// per-adapter blob (minus `enabled`) is handed to the factory's
     /// `open()`. An entry whose `path` is an array fans out into one
-    /// single-path entry per element, so every configured location rides the
-    /// same sync (relocated state dirs: two subscriptions of one tool on one
-    /// machine); each tuple's third field is that element's dir (`Some` only
-    /// on multi-path fan-out), so callers can label otherwise-identical rows
-    /// without re-deriving the fan-out. With `adapter = None` returns every
-    /// enabled entry; with `Some(name)` returns just that one - and errors if
-    /// it's not in config OR if it's currently disabled (the caller should
-    /// then re-prompt or report).
-    pub fn resolve_adapters(
-        &self,
-        adapter: Option<&str>,
-    ) -> Result<Vec<(String, Value, Option<String>)>> {
+    /// [`ResolvedAdapter`] per element, so every configured location rides
+    /// the same sync (relocated state dirs: two subscriptions of one tool on
+    /// one machine). With `adapter = None` returns every enabled entry; with
+    /// `Some(name)` returns just that one - and errors if it's not in config
+    /// OR if it's currently disabled (the caller should then re-prompt or
+    /// report).
+    pub fn resolve_adapters(&self, adapter: Option<&str>) -> Result<Vec<ResolvedAdapter>> {
         match adapter {
             None => {
                 // A malformed entry fails the whole resolve rather than being
@@ -820,21 +827,25 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
 /// only ever see a scalar `path`, so the seam and every factory stay
 /// untouched; ingest is idempotent on deterministic PKs, so several dirs
 /// merging into one store is safe by design. A scalar `path` - or no `path`
-/// at all; the blob shape is adapter-owned - passes through unchanged. The
-/// third tuple field marks genuine fan-out (`Some(dir)` only when the array
-/// held more than one element - a single-element array needs no
-/// disambiguation and resolves like a scalar). Copying siblings verbatim
-/// means a key naming a second source (pi-coding-agent's `sqlite_path`) is
-/// read once per dir - wasteful on a first sync, harmless under PK
-/// idempotency - accepted because the config layer cannot know which of an
-/// adapter's keys are path-like.
+/// at all; the blob shape is adapter-owned - passes through unchanged.
+/// `fanout_path` is `Some(dir)` only when the array held more than one
+/// element: a single-element array needs no disambiguation, so it resolves
+/// exactly like a scalar. Copying siblings verbatim means a key naming a
+/// second source (pi-coding-agent's `sqlite_path`) is read once per dir -
+/// wasteful on a first sync, harmless under PK idempotency - accepted
+/// because the config layer cannot know which of an adapter's keys are
+/// path-like.
 fn expand_path_array(
     name: String,
     blob: Value,
     enabled_total: usize,
-) -> Result<Vec<(String, Value, Option<String>)>> {
+) -> Result<Vec<ResolvedAdapter>> {
     let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
-        return Ok(vec![(name, blob, None)]);
+        return Ok(vec![ResolvedAdapter {
+            name,
+            config: blob,
+            fanout_path: None,
+        }]);
     };
     // A config error halts every adapter's sync, so each message states the
     // blast radius and the way to keep working meanwhile.
@@ -870,7 +881,11 @@ fn expand_path_array(
         if let Some(obj) = single.as_object_mut() {
             obj.insert("path".to_owned(), Value::String(path.to_owned()));
         }
-        fanned.push((name.clone(), single, multi.then(|| path.to_owned())));
+        fanned.push(ResolvedAdapter {
+            name: name.clone(),
+            config: single,
+            fanout_path: multi.then(|| path.to_owned()),
+        });
     }
     Ok(fanned)
 }
@@ -1200,20 +1215,23 @@ enabled = false
             // None -> only enabled entries
             let all = config.resolve_adapters(None).unwrap();
             assert_eq!(all.len(), 2);
-            let names: Vec<_> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+            let names: Vec<_> = all.iter().map(|entry| entry.name.as_str()).collect();
             assert!(names.contains(&"claude-code"));
             assert!(names.contains(&"codex-cli"));
             // The `enabled` discriminator never reaches the adapter blob.
-            for (_, blob, _) in &all {
-                assert!(blob.get("enabled").is_none(), "enabled should be stripped");
+            for entry in &all {
+                assert!(
+                    entry.config.get("enabled").is_none(),
+                    "enabled should be stripped"
+                );
             }
 
             // Some(name) -> one entry, opaque JSON blob
             let one = config.resolve_adapters(Some("codex-cli")).unwrap();
             assert_eq!(one.len(), 1);
-            assert_eq!(one[0].0, "codex-cli");
+            assert_eq!(one[0].name, "codex-cli");
             assert_eq!(
-                one[0].1.get("path").and_then(Value::as_str),
+                one[0].config.get("path").and_then(Value::as_str),
                 Some("/srv/codex"),
             );
 
@@ -1266,11 +1284,11 @@ path = [\"/srv/solo\"]
             let all = config.resolve_adapters(None).unwrap();
             let flat: Vec<(&str, Option<&str>, bool)> = all
                 .iter()
-                .map(|(n, b, fanout)| {
+                .map(|entry| {
                     (
-                        n.as_str(),
-                        b.get("path").and_then(Value::as_str),
-                        fanout.is_some(),
+                        entry.name.as_str(),
+                        entry.config.get("path").and_then(Value::as_str),
+                        entry.fanout_path.is_some(),
                     )
                 })
                 .collect();
@@ -1286,9 +1304,9 @@ path = [\"/srv/solo\"]
                 ],
             );
             // Sibling keys ride along into every fanned entry.
-            for (_, blob, _) in all.iter().filter(|(n, _, _)| n == "pi-coding-agent") {
+            for entry in all.iter().filter(|entry| entry.name == "pi-coding-agent") {
                 assert_eq!(
-                    blob.get("sqlite_path").and_then(Value::as_str),
+                    entry.config.get("sqlite_path").and_then(Value::as_str),
                     Some("/srv/pi.sqlite"),
                 );
             }

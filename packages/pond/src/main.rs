@@ -4218,8 +4218,8 @@ fn openclaw_in_scope(loaded: &Config, invocation: &SyncInvocation) -> anyhow::Re
     )?;
     Ok(adapters
         .into_iter()
-        .filter(|(name, _, _)| name == "openclaw")
-        .map(|(_, blob, _)| blob)
+        .filter(|resolved| resolved.name == "openclaw")
+        .map(|resolved| resolved.config)
         .collect())
 }
 
@@ -4273,26 +4273,24 @@ async fn run_sync_dry_run(
         plan: Option<pond::adapter::SyncPlan>,
     }
     let mut rows: Vec<DryRunRow> = Vec::new();
-    for (name, blob, fanout) in adapters {
-        let factory = adapter::by_name(&name).ok_or_else(|| {
+    for resolved in adapters {
+        let factory = adapter::by_name(&resolved.name).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown adapter {name:?}; known: {}",
+                "unknown adapter {:?}; known: {}",
+                resolved.name,
                 adapter::known_names().join(", "),
             )
         })?;
-        let source_path = blob
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let opened = factory.open(blob)?;
+        let source_path = source_path(&resolved.config);
+        let opened = factory.open(resolved.config)?;
         let plan = opened.plan(oracle).await?;
         let sessions = match &plan {
             Some(plan) => plan.sessions,
             None => opened.discover().await?,
         };
         rows.push(DryRunRow {
-            name,
-            fanout,
+            name: resolved.name,
+            fanout: resolved.fanout_path,
             source_path,
             sessions,
             plan,
@@ -4619,10 +4617,8 @@ async fn run_import_stage(
         indicatif::ProgressDrawTarget::stderr_with_hz(8)
     });
     let mut total = IngestSummary::default();
-    for (name, blob, fanout) in adapters {
-        let label = adapter_label(&name, fanout.as_deref());
-        let summary =
-            sync_with_progress(store, &mp, &name, &label, blob, oracle, flush_hud, quiet).await?;
+    for resolved in adapters {
+        let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
         total.merge(&summary);
     }
     Ok(total)
@@ -4630,12 +4626,26 @@ async fn run_import_stage(
 
 /// `name (path)` for an entry fanned out of a multi-path `[adapters.<name>]`
 /// array (otherwise-identical rows need the disambiguator), plain `name` for
-/// the common single-path entry.
+/// the common single-path entry. The dir is home-contracted, matching every
+/// other surface that prints a configured path.
 fn adapter_label(name: &str, fanout_path: Option<&str>) -> String {
     match fanout_path {
-        Some(path) => format!("{name} ({path})"),
+        Some(path) => format!("{name} ({})", contract_display(path)),
         None => name.to_owned(),
     }
+}
+
+/// A config blob's source dir, home-contracted for display. `None` for an
+/// adapter whose blob carries no `path` (the blob shape is adapter-owned).
+fn source_path(config: &Value) -> Option<String> {
+    config
+        .get("path")
+        .and_then(Value::as_str)
+        .map(contract_display)
+}
+
+fn contract_display(path: &str) -> String {
+    config::contract_home(Path::new(path)).display().to_string()
 }
 
 /// Cheap (LIMIT-1) model-swap guard for the sync path, which embeds inline and
@@ -5043,7 +5053,7 @@ fn resolve_sync_adapters(
     config: &Config,
     name: Option<&str>,
     path: Option<PathBuf>,
-) -> anyhow::Result<Vec<(String, Value, Option<String>)>> {
+) -> anyhow::Result<Vec<pond::config::ResolvedAdapter>> {
     if let Some(path) = path {
         let name = name.ok_or_else(|| {
             anyhow::anyhow!("--path requires an explicit <adapter> positional argument")
@@ -5054,7 +5064,11 @@ fn resolve_sync_adapters(
         }
         // `--path` is a filesystem-shaped override. Adapters that need
         // a richer config blob can't use this path; they must edit config.toml.
-        return Ok(vec![(name.to_owned(), json!({ "path": path }), None)]);
+        return Ok(vec![pond::config::ResolvedAdapter {
+            name: name.to_owned(),
+            config: json!({ "path": path }),
+            fanout_path: None,
+        }]);
     }
 
     if let Some(name) = name {
@@ -5087,27 +5101,27 @@ fn resolve_sync_adapters(
 const SYNC_HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 /// Run one adapter's ingest pass into `store` with a live progress bar and
-/// one greppable log line per finished (or skipped) session. `label` is the
-/// display form of `name` - `name (path)` when a multi-path entry fanned out
-/// into several otherwise-identical rows (see [`adapter_label`]).
-#[allow(clippy::too_many_arguments)]
+/// one greppable log line per finished (or skipped) session.
 async fn sync_with_progress(
     store: &Store,
     mp: &indicatif::MultiProgress,
-    name: &str,
-    label: &str,
-    config: Value,
+    resolved: pond::config::ResolvedAdapter,
     oracle: &dyn pond::adapter::SkipOracle,
     flush_hud: &FlushHud,
     quiet: bool,
 ) -> anyhow::Result<IngestSummary> {
+    let name = resolved.name.as_str();
     let factory = adapter::by_name(name).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown adapter {name:?}; known: {}",
             adapter::known_names().join(", "),
         )
     })?;
-    let adapter = factory.open(config)?;
+    // Displayed instead of the bare name so the fanned passes of a
+    // multi-path entry are distinguishable (see [`adapter_label`]).
+    let label = adapter_label(name, resolved.fanout_path.as_deref());
+    let label = label.as_str();
+    let adapter = factory.open(resolved.config)?;
 
     // Template is `{wide_msg}`-only and the whole status line is built into the
     // message (see `sync_status_line`): `{wide_msg}` is the one segment
@@ -5946,12 +5960,11 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
 /// locally cached freshness map (see [`local_status`]).
 struct LocalAdapterStatus {
     name: String,
-    /// The entry's resolved source dir (`None` for adapters without a `path`
-    /// key). JSON status carries it verbatim.
+    /// The entry's resolved source dir, home-contracted (`None` for adapters
+    /// without a `path` key). JSON status carries it verbatim.
     path: Option<String>,
-    /// True when the entry fanned out of a multi-path array - the text
-    /// renderer appends the dir to the name only then, so single-path output
-    /// stays unchanged.
+    /// Whether this entry came from a multi-path fan-out; only then does the
+    /// text renderer append the dir to the name.
     fanned: bool,
     sessions: Option<usize>,
     plan: Option<pond::adapter::SyncPlan>,
@@ -6001,16 +6014,14 @@ async fn local_status(
         Ok(resolved) => (resolved, None),
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
     };
-    for (name, blob, fanout) in resolved {
-        let Some(factory) = adapter::by_name(&name) else {
+    for entry in resolved {
+        let Some(factory) = adapter::by_name(&entry.name) else {
             continue;
         };
-        let path = blob
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let fanned = fanout.is_some();
-        let Ok(opened) = factory.open(blob) else {
+        let name = entry.name;
+        let path = source_path(&entry.config);
+        let fanned = entry.fanout_path.is_some();
+        let Ok(opened) = factory.open(entry.config) else {
             adapters.push(LocalAdapterStatus {
                 name,
                 path,
@@ -6489,7 +6500,7 @@ mod tests {
         assert!(!enable_adapter(&config_file, "openclaw")?);
         let config = Config::load(&config_file)?;
         let resolved = config.resolve_adapters(Some("openclaw"))?;
-        assert_eq!(resolved[0].0, "openclaw");
+        assert_eq!(resolved[0].name, "openclaw");
         Ok(())
     }
 
@@ -6874,9 +6885,9 @@ mod tests {
         let resolved =
             resolve_sync_adapters(&configured, Some("claude-code"), None).expect("resolves");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].0, "claude-code");
+        assert_eq!(resolved[0].name, "claude-code");
         assert!(
-            resolved[0].1.get("enabled").is_none(),
+            resolved[0].config.get("enabled").is_none(),
             "enabled discriminator must not reach the factory blob",
         );
 
