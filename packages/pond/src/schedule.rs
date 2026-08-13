@@ -3,17 +3,23 @@
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
 //! span sleep). Linux prefers systemd user timers (`Persistent=true` catches
-//! up after downtime) and falls back to a fenced crontab block. The
-//! scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an unattended
-//! run can never auto-enable freshly-detected adapters, and `--no-wait` so a
-//! tick that lands while another sync holds the per-store lock skips cleanly
-//! (exit 0) instead of queueing behind it.
+//! up after downtime) and falls back to a fenced crontab block. Windows uses
+//! Task Scheduler: a generated `.cmd` wrapper keeps every path out of
+//! schtasks quoting, and the task XML provides the settings that align it
+//! with the launchd/systemd posture (battery-friendly, catch-up after missed
+//! runs, windowless launch).
+//!
+//! The scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an
+//! unattended run can never auto-enable freshly-detected adapters, and
+//! `--no-wait` so a tick that lands while another sync holds the per-store
+//! lock skips cleanly (exit 0) instead of queueing behind it.
 //!
 //! Bin-only module: OS-scheduler integration has no library callers.
 
-#[cfg(not(any(unix, windows)))]
-use anyhow::{Result, bail};
+use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
+use pond::output::{dim, line, line_err, paint};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ScheduleEvery {
@@ -50,7 +56,6 @@ impl ScheduleEvery {
         }
     }
 
-    #[cfg(any(unix, windows))]
     fn from_secs(secs: u32) -> Option<Self> {
         [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
             .into_iter()
@@ -89,38 +94,6 @@ pub(crate) enum ScheduleCmd {
     },
 }
 
-#[cfg(windows)]
-pub(crate) use windows::{run, start, status_line, status_snapshot};
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn run(_command: ScheduleCmd) -> Result<()> {
-    bail!("pond schedule is not supported on this platform yet")
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn status_line() -> String {
-    use pond::output::{dim, paint};
-    format!(
-        "{}  not supported on this platform",
-        paint("schedule", dim())
-    )
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
-    bail!("pond schedule is not supported on this platform yet")
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn status_snapshot() -> ScheduleSnapshot {
-    ScheduleSnapshot {
-        line: status_line(),
-        active: false,
-        backend: None,
-        every: None,
-    }
-}
-
 /// One scheduler probe's answer, shared by the `pond status` text line and
 /// the JSON document (which needs the fields structured, not pre-rendered).
 pub(crate) struct ScheduleSnapshot {
@@ -130,8 +103,199 @@ pub(crate) struct ScheduleSnapshot {
     pub every: Option<ScheduleEvery>,
 }
 
+// ===========================================================================
+// Shared across all platforms
+// ===========================================================================
+
+/// Internal state of the OS scheduler for the pond-sync registration.
+enum State {
+    Active {
+        backend: &'static str,
+        every: Option<ScheduleEvery>,
+    },
+    Inactive,
+}
+use State::{Active, Inactive};
+
+fn render_state(state: &State) -> String {
+    match state {
+        Active { backend, every } => format!(
+            "{}  active ({backend}{})",
+            paint("schedule", dim()),
+            every
+                .map(|every| format!(", every {}", every.label()))
+                .unwrap_or_default(),
+        ),
+        Inactive => format!(
+            "{}  not configured - run `pond schedule start` to sync automatically",
+            paint("schedule", dim()),
+        ),
+    }
+}
+
+/// The log file path: `<pond_state_dir>/sync.log`. Single source of truth
+/// used by both platform modules and the shared `logs()` function.
+pub(crate) fn log_path() -> PathBuf {
+    crate::syncstate::pond_state_dir().join("sync.log")
+}
+
+pub(crate) fn status_line() -> String {
+    status_snapshot().line
+}
+
+pub(crate) fn status_snapshot() -> ScheduleSnapshot {
+    match platform_probe() {
+        Ok(state) => {
+            let (active, backend, every) = match &state {
+                Active { backend, every } => (true, Some(*backend), *every),
+                Inactive => (false, None, None),
+            };
+            ScheduleSnapshot {
+                line: render_state(&state),
+                active,
+                backend,
+                every,
+            }
+        }
+        Err(_) => ScheduleSnapshot {
+            line: format!(
+                "{}  unknown (scheduler probe failed)",
+                paint("schedule", dim())
+            ),
+            active: false,
+            backend: None,
+            every: None,
+        },
+    }
+}
+
+pub(crate) fn run(command: ScheduleCmd) -> Result<()> {
+    match command {
+        ScheduleCmd::Start { every } => platform_start(every),
+        ScheduleCmd::Stop => platform_stop(),
+        ScheduleCmd::Status => {
+            let state = platform_probe()?;
+            line(&render_state(&state))?;
+            if let Active { .. } = state {
+                line(&format!(
+                    "{}      {}  (pond schedule logs)",
+                    paint("logs", dim()),
+                    crate::config::display(&crate::config::url_for_path(log_path())?),
+                ))?;
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        ScheduleCmd::Logs { lines } => logs(lines),
+    }
+}
+
+/// Print the last `lines` lines of the sync log. On Linux+systemd, delegates
+/// to journalctl; everywhere else reads the log file the wrapper writes.
+pub(crate) fn logs(lines: usize) -> Result<()> {
+    // Linux + systemd: the unit output goes to the journal, not a file.
+    #[cfg(target_os = "linux")]
+    if unix::systemd_timer_enabled() {
+        let status = std::process::Command::new("journalctl")
+            .args([
+                "--user",
+                "-u",
+                "pond-sync.service",
+                "-n",
+                &lines.to_string(),
+                "--no-pager",
+            ])
+            .status()
+            .context("failed to run journalctl")?;
+        if !status.success() {
+            anyhow::bail!("journalctl exited {status}");
+        }
+        return Ok(());
+    }
+
+    let path = log_path();
+    line_err(&paint(
+        &format!(
+            "log file: {}",
+            crate::config::display(&crate::config::url_for_path(&path)?)
+        ),
+        dim(),
+    ))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            line("(no log yet - the first scheduled run hasn't happened)")?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let all: Vec<&str> = text.lines().collect();
+    let tail = all.len().saturating_sub(lines);
+    for entry in &all[tail..] {
+        line(entry)?;
+    }
+    Ok(())
+}
+
+// Re-export `start` for `pond init`, which calls `schedule::start` directly.
 #[cfg(unix)]
-pub(crate) use unix::{run, start, status_line, status_snapshot};
+pub(crate) use unix::start;
+#[cfg(windows)]
+pub(crate) use windows::start;
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
+    anyhow::bail!("pond schedule is not supported on this platform yet")
+}
+
+// ---------------------------------------------------------------------------
+// Platform dispatchers
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn platform_probe() -> Result<State> {
+    windows::probe()
+}
+#[cfg(unix)]
+fn platform_probe() -> Result<State> {
+    unix::probe()
+}
+#[cfg(not(any(unix, windows)))]
+fn platform_probe() -> Result<State> {
+    Ok(Inactive)
+}
+
+#[cfg(windows)]
+fn platform_start(every: ScheduleEvery) -> Result<()> {
+    windows::start(every)
+}
+#[cfg(unix)]
+fn platform_start(every: ScheduleEvery) -> Result<()> {
+    unix::start(every)
+}
+#[cfg(not(any(unix, windows)))]
+fn platform_start(_every: ScheduleEvery) -> Result<()> {
+    anyhow::bail!("pond schedule is not supported on this platform yet")
+}
+
+#[cfg(windows)]
+fn platform_stop() -> Result<()> {
+    windows::stop()
+}
+#[cfg(unix)]
+fn platform_stop() -> Result<()> {
+    unix::stop()
+}
+#[cfg(not(any(unix, windows)))]
+fn platform_stop() -> Result<()> {
+    anyhow::bail!("pond schedule is not supported on this platform yet")
+}
+
+// ===========================================================================
+// Platform: unix (launchd / systemd / cron)
+// ===========================================================================
 
 #[cfg(unix)]
 mod unix {
@@ -140,94 +304,32 @@ mod unix {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{ScheduleCmd, ScheduleEvery};
-    use pond::output::{dim, line, line_err, paint};
+    use super::{ScheduleEvery, State};
+    use State::{Active, Inactive};
 
     const LAUNCHD_LABEL: &str = "sh.pond.sync";
     const CRON_FENCE_BEGIN: &str = "# BEGIN POND SYNC (maintained by pond; do not edit)";
     const CRON_FENCE_END: &str = "# END POND SYNC";
 
-    pub(crate) fn run(command: ScheduleCmd) -> Result<()> {
-        match command {
-            ScheduleCmd::Start { every } => start(every),
-            ScheduleCmd::Stop => stop(),
-            ScheduleCmd::Status => {
-                let state = probe()?;
-                line(&render_state(&state))?;
-                if let Active { .. } = state {
-                    line(&format!(
-                        "{}      {}  (pond schedule logs)",
-                        paint("logs", dim()),
-                        crate::config::display(&crate::config::url_for_path(log_path())?),
-                    ))?;
-                    Ok(())
-                } else {
-                    std::process::exit(1);
+    pub(super) fn probe() -> Result<State> {
+        match std::env::consts::OS {
+            "macos" => probe_launchd(),
+            "linux" => {
+                if systemd_timer_enabled() {
+                    return Ok(Active {
+                        backend: "systemd",
+                        every: read_systemd_interval(),
+                    });
                 }
-            }
-            ScheduleCmd::Logs { lines } => logs(lines),
-        }
-    }
-
-    /// The `pond status` schedule line: active backend + cadence, or the
-    /// command that would set one up. Never errors - status must render even
-    /// when the scheduler probe can't run.
-    pub(crate) fn status_line() -> String {
-        status_snapshot().line
-    }
-
-    /// One probe (a launchctl/systemctl spawn) serving every `pond status`
-    /// need: the rendered schedule line plus the structured active/backend/
-    /// cadence fields (status combines the cadence with the last-sync record
-    /// to estimate the next run; JSON emits the fields directly).
-    pub(crate) fn status_snapshot() -> super::ScheduleSnapshot {
-        match probe() {
-            Ok(state) => {
-                let (active, backend, every) = match &state {
-                    Active { backend, every } => (true, Some(*backend), *every),
-                    Inactive => (false, None, None),
-                };
-                super::ScheduleSnapshot {
-                    line: render_state(&state),
-                    active,
-                    backend,
-                    every,
+                if let Some(entry) = read_cron_fence_entry()? {
+                    return Ok(Active {
+                        backend: "cron",
+                        every: cron_entry_interval(&entry),
+                    });
                 }
+                Ok(Inactive)
             }
-            Err(_) => super::ScheduleSnapshot {
-                line: format!(
-                    "{}  unknown (scheduler probe failed)",
-                    paint("schedule", dim())
-                ),
-                active: false,
-                backend: None,
-                every: None,
-            },
-        }
-    }
-
-    enum State {
-        Active {
-            backend: &'static str,
-            every: Option<ScheduleEvery>,
-        },
-        Inactive,
-    }
-    use State::{Active, Inactive};
-
-    fn render_state(state: &State) -> String {
-        match state {
-            Active { backend, every } => format!(
-                "{}  active ({backend}{})",
-                paint("schedule", dim()),
-                every
-                    .map(|every| format!(", every {}", every.label()))
-                    .unwrap_or_default(),
-            ),
-            Inactive => format!(
-                "{}  not configured - run `pond schedule start` to sync automatically",
-                paint("schedule", dim()),
-            ),
+            _ => Ok(Inactive),
         }
     }
 
@@ -235,7 +337,7 @@ mod unix {
     /// `pond init` schedule section (which calls it after the config write).
     pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
         let bin = pond_bin();
-        let log = log_path();
+        let log = super::log_path();
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -279,7 +381,7 @@ mod unix {
         }
     }
 
-    fn stop() -> Result<()> {
+    pub(super) fn stop() -> Result<()> {
         let removed = match std::env::consts::OS {
             "macos" => stop_launchd()?,
             "linux" => {
@@ -290,108 +392,33 @@ mod unix {
             other => bail!("pond schedule is not supported on {other} yet"),
         };
         if removed {
-            line("schedule removed")?;
+            pond::output::line("schedule removed")?;
         } else {
-            line("nothing was scheduled")?;
+            pond::output::line("nothing was scheduled")?;
         }
         Ok(())
     }
 
-    fn probe() -> Result<State> {
-        match std::env::consts::OS {
-            "macos" => probe_launchd(),
-            "linux" => {
-                if systemd_timer_enabled() {
-                    return Ok(Active {
-                        backend: "systemd",
-                        every: read_systemd_interval(),
-                    });
-                }
-                if let Some(entry) = read_cron_fence_entry()? {
-                    return Ok(Active {
-                        backend: "cron",
-                        every: cron_entry_interval(&entry),
-                    });
-                }
-                Ok(Inactive)
-            }
-            _ => Ok(Inactive),
-        }
-    }
-
-    fn logs(lines: usize) -> Result<()> {
-        // systemd routes unit output to the journal; everything else writes
-        // the log file named in the plist / cron entry.
-        if std::env::consts::OS == "linux" && systemd_timer_enabled() {
-            let status = Command::new("journalctl")
-                .args([
-                    "--user",
-                    "-u",
-                    "pond-sync.service",
-                    "-n",
-                    &lines.to_string(),
-                    "--no-pager",
-                ])
-                .status()
-                .context("failed to run journalctl")?;
-            if !status.success() {
-                bail!("journalctl exited {status}");
-            }
-            return Ok(());
-        }
-        let path = log_path();
-        line_err(&paint(
-            &format!(
-                "log file: {}",
-                crate::config::display(&crate::config::url_for_path(&path)?)
-            ),
-            dim(),
-        ))?;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                line("(no log yet - the first scheduled run hasn't happened)")?;
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to read {}", path.display()));
-            }
-        };
-        let all: Vec<&str> = text.lines().collect();
-        let tail = all.len().saturating_sub(lines);
-        for entry in &all[tail..] {
-            line(entry)?;
-        }
-        Ok(())
+    /// True when the systemd pond-sync.timer is enabled. Exposed `pub(super)`
+    /// so the parent module's shared `logs()` can delegate to journalctl on
+    /// Linux+systemd without duplicating the probe.
+    pub(super) fn systemd_timer_enabled() -> bool {
+        Command::new("systemctl")
+            .args(["--user", "is-enabled", "pond-sync.timer"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     /// The binary path baked into the scheduler registration. Prefer the
-    /// `pond` on PATH: that's a stable symlink (`/opt/homebrew/bin/pond`,
-    /// `~/.cargo/bin/pond`, a nix profile path) that survives upgrades.
+    /// `pond` on PATH: that's a stable symlink that survives upgrades.
     /// `current_exe()` is the fallback - on Homebrew it resolves into a
-    /// versioned Cellar path that the next upgrade deletes, which is a known
-    /// way to silently kill a schedule.
+    /// versioned Cellar path that the next upgrade deletes.
     fn pond_bin() -> PathBuf {
         crate::find_on_path("pond")
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
-    }
-
-    /// `$XDG_STATE_HOME/pond/sync.log`, default `~/.local/state/pond/sync.log`.
-    fn log_path() -> PathBuf {
-        crate::syncstate::pond_state_dir().join("sync.log")
-    }
-
-    /// Numeric uid for the `gui/<uid>` launchd domain. Shelled out to
-    /// `id -u`: pond denies `unsafe`, so `libc::getuid()` is off the table.
-    fn current_uid() -> Result<String> {
-        let output = Command::new("id")
-            .arg("-u")
-            .output()
-            .context("failed to run `id -u`")?;
-        if !output.status.success() {
-            bail!("`id -u` exited {}", output.status);
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
     // ----- launchd (macOS) -------------------------------------------------
@@ -460,7 +487,7 @@ mod unix {
             .map(|existing| existing == body)
             .unwrap_or(false);
         if unchanged && launchd_registered(&uid) {
-            line(&format!("already scheduled (every {})", every.label()))?;
+            pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
         if let Some(parent) = plist.parent() {
@@ -490,13 +517,13 @@ mod unix {
                 plist.display(),
             );
         }
-        line(&render_state(&Active {
+        pond::output::line(&super::render_state(&super::State::Active {
             backend: "launchd",
             every: Some(every),
         }))?;
-        line(&format!(
+        pond::output::line(&format!(
             "{}      {}  (pond schedule logs)",
-            paint("logs", dim()),
+            pond::output::paint("logs", pond::output::dim()),
             crate::config::display(&crate::config::url_for_path(log)?),
         ))?;
         Ok(())
@@ -512,8 +539,7 @@ mod unix {
             .stderr(Stdio::null())
             .status();
         // Remove unconditionally: a missing plist means nothing to clean up,
-        // not an error (stop is documented to succeed when nothing is
-        // registered, and bootout/a racing stop may have removed it already).
+        // not an error.
         let had_plist = match std::fs::remove_file(&plist) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -549,21 +575,22 @@ mod unix {
         ScheduleEvery::from_secs(secs)
     }
 
+    fn current_uid() -> Result<String> {
+        let output = Command::new("id")
+            .arg("-u")
+            .output()
+            .context("failed to run `id -u`")?;
+        if !output.status.success() {
+            bail!("`id -u` exited {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     // ----- systemd user timers (Linux) -------------------------------------
 
     fn systemd_user_available() -> bool {
         Command::new("systemctl")
             .args(["--user", "list-timers"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    fn systemd_timer_enabled() -> bool {
-        Command::new("systemctl")
-            .args(["--user", "is-enabled", "pond-sync.timer"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -625,7 +652,7 @@ mod unix {
                 .map(|existing| existing == timer)
                 .unwrap_or(false);
         if unchanged && systemd_timer_enabled() {
-            line(&format!("already scheduled (every {})", every.label()))?;
+            pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
         std::fs::write(&service_path, service)
@@ -649,13 +676,13 @@ mod unix {
                 );
             }
         }
-        line(&render_state(&Active {
+        pond::output::line(&super::render_state(&super::State::Active {
             backend: "systemd",
             every: Some(every),
         }))?;
-        line(&format!(
+        pond::output::line(&format!(
             "{}      journalctl --user -u pond-sync.service  (pond schedule logs)",
-            paint("logs", dim()),
+            pond::output::paint("logs", pond::output::dim()),
         ))?;
         Ok(())
     }
@@ -672,8 +699,7 @@ mod unix {
                 .stderr(Stdio::null())
                 .status();
         }
-        // Remove unconditionally; a missing unit is not an error (disable
-        // --now or a racing stop may have already taken it).
+        // Remove unconditionally; a missing unit is not an error.
         let mut removed_units = false;
         for path in [&service_path, &timer_path] {
             match std::fs::remove_file(path) {
@@ -814,7 +840,7 @@ mod unix {
         format!("{CRON_FENCE_BEGIN}\n{entry}\n{CRON_FENCE_END}\n")
     }
 
-    /// Pull pond's fenced cron entry out of a crontab body already in hand.
+    /// Pull pond's fenced cron entry out of a crontab body.
     fn fence_entry_in(text: &str) -> Option<String> {
         let after = text.split(CRON_FENCE_BEGIN).nth(1)?;
         let block = after.split(CRON_FENCE_END).next().unwrap_or_default();
@@ -841,7 +867,7 @@ mod unix {
             && entry.contains("--no-wait")
             && entry.contains("XDG_STATE_HOME=")
         {
-            line(&format!("already scheduled (every {})", every.label()))?;
+            pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
         let entry = cron_entry(bin, every, log, fastrand::u32(0..60), state);
@@ -851,13 +877,13 @@ mod unix {
         }
         body.push_str(&fence_block(&entry));
         write_crontab(&body)?;
-        line(&render_state(&Active {
+        pond::output::line(&super::render_state(&super::State::Active {
             backend: "cron",
             every: Some(every),
         }))?;
-        line(&format!(
+        pond::output::line(&format!(
             "{}      {}  (pond schedule logs)",
-            paint("logs", dim()),
+            pond::output::paint("logs", pond::output::dim()),
             crate::config::display(&crate::config::url_for_path(log)?),
         ))?;
         Ok(())
@@ -897,282 +923,257 @@ mod unix {
     }
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use super::*;
-
-    #[test]
-    fn every_round_trips_through_secs_and_labels() {
-        for every in [
-            ScheduleEvery::M5,
-            ScheduleEvery::M15,
-            ScheduleEvery::H1,
-            ScheduleEvery::H6,
-            ScheduleEvery::D1,
-        ] {
-            assert_eq!(ScheduleEvery::from_secs(every.secs()), Some(every));
-        }
-        assert_eq!(ScheduleEvery::from_secs(123), None);
-    }
-}
+// ===========================================================================
+// Platform: windows (Task Scheduler)
+// ===========================================================================
 
 #[cfg(windows)]
 mod windows {
-    //! Windows Task Scheduler backend, the peer of the launchd/systemd/cron
-    //! `unix` module. The scheduled action is a small generated `.cmd` wrapper
-    //! (`<state>/pond-sync.cmd`) that runs `pond sync -q --no-wait` and appends
-    //! to `<state>/sync.log`. Running a wrapper file - rather than embedding a
-    //! quoted command line in the `schtasks /TR` value - keeps pond out of
-    //! Windows command-line quoting entirely, the same way the unix backend
-    //! bakes paths into a plist/cron artifact.
+    //! Windows Task Scheduler backend. The scheduled action is a generated
+    //! `.cmd` wrapper (`<pond_state_dir>/pond-sync.cmd`) that pins
+    //! `XDG_STATE_HOME`, runs `pond sync -q --no-wait`, and appends output to
+    //! `<pond_state_dir>/sync.log`. Using a wrapper file keeps pond out of
+    //! schtasks quoting entirely - the same idea as the unix plist/cron file.
     //!
-    //! The task runs as the current user in their session (schtasks' default:
-    //! no stored password, runs only when logged on), which matches launchd's
-    //! per-user GUI-context agent. `-q --no-wait` mirrors the unix job exactly:
-    //! never `--yes` (an unattended tick must not auto-enable adapters) and a
-    //! tick that lands while another sync holds the per-store lock exits 0
-    //! rather than queueing.
+    //! The task is created via `/XML` so we can provide a `<Settings>` block:
+    //! AllowStartIfOnBatteries + DontStopIfGoingOnBatteries (battery-friendly),
+    //! StartWhenAvailable (catch-up after downtime - analog of systemd's
+    //! `Persistent=true`), and Hidden (windowless, no console on each tick).
 
     use std::path::PathBuf;
     use std::process::Command;
 
     use anyhow::{Context, Result, bail};
 
-    use super::{ScheduleCmd, ScheduleEvery};
-    use pond::output::{dim, line, line_err, paint};
+    use super::{ScheduleEvery, State};
+    use State::{Active, Inactive};
 
     const TASK_NAME: &str = "pond-sync";
 
-    pub(crate) fn run(command: ScheduleCmd) -> Result<()> {
-        match command {
-            ScheduleCmd::Start { every } => start(every),
-            ScheduleCmd::Stop => stop(),
-            ScheduleCmd::Status => {
-                let state = probe()?;
-                line(&render_state(&state))?;
-                if let Active { .. } = state {
-                    line(&format!(
-                        "{}      {}  (pond schedule logs)",
-                        paint("logs", dim()),
-                        crate::config::display(&crate::config::url_for_path(log_path())?),
-                    ))?;
-                    Ok(())
-                } else {
-                    std::process::exit(1);
-                }
-            }
-            ScheduleCmd::Logs { lines } => logs(lines),
+    /// Probe existence + cadence in a single `schtasks /Query /XML ONE` call.
+    pub(super) fn probe() -> Result<State> {
+        let output = Command::new("schtasks")
+            .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
+            .output()
+            .context("failed to run schtasks /Query")?;
+        if !output.status.success() {
+            return Ok(Inactive);
         }
-    }
-
-    pub(crate) fn status_line() -> String {
-        status_snapshot().line
-    }
-
-    pub(crate) fn status_snapshot() -> super::ScheduleSnapshot {
-        match probe() {
-            Ok(state) => {
-                let (active, backend, every) = match &state {
-                    Active { backend, every } => (true, Some(*backend), *every),
-                    Inactive => (false, None, None),
-                };
-                super::ScheduleSnapshot {
-                    line: render_state(&state),
-                    active,
-                    backend,
-                    every,
-                }
-            }
-            Err(_) => super::ScheduleSnapshot {
-                line: format!(
-                    "{}  unknown (scheduler probe failed)",
-                    paint("schedule", dim())
-                ),
-                active: false,
-                backend: None,
-                every: None,
-            },
-        }
-    }
-
-    enum State {
-        Active {
-            backend: &'static str,
-            every: Option<ScheduleEvery>,
-        },
-        Inactive,
-    }
-    use State::{Active, Inactive};
-
-    fn render_state(state: &State) -> String {
-        match state {
-            Active { backend, every } => format!(
-                "{}  active ({backend}{})",
-                paint("schedule", dim()),
-                every
-                    .map(|every| format!(", every {}", every.label()))
-                    .unwrap_or_default(),
-            ),
-            Inactive => format!(
-                "{}  not configured - run `pond schedule start` to sync automatically",
-                paint("schedule", dim()),
-            ),
-        }
+        let xml = decode_console(&output.stdout);
+        Ok(Active {
+            backend: "task-scheduler",
+            every: parse_interval_from_xml(&xml),
+        })
     }
 
     /// Register (or replace, via `/F`) the Task Scheduler job. Shared by
     /// `pond schedule start` and the `pond init` schedule section.
     pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
         let bin = pond_bin();
-        let log = log_path();
-        let state = crate::syncstate::pond_state_dir();
-        std::fs::create_dir_all(&state)
-            .with_context(|| format!("failed to create {}", state.display()))?;
+        let log = super::log_path();
+        // state_root is what we pin into XDG_STATE_HOME; pond_state_dir is
+        // the subdirectory where the wrapper, log, and lock files live.
+        let state_root = crate::syncstate::state_root();
+        let pond_state = crate::syncstate::pond_state_dir();
+        std::fs::create_dir_all(&pond_state)
+            .with_context(|| format!("failed to create {}", pond_state.display()))?;
 
-        // The task runs this wrapper (.cmd files are executed through cmd, so
-        // the `>>` redirection works) instead of a quoted `schtasks /TR`
-        // command line, keeping every path out of schtasks quoting.
-        let wrapper = wrapper_path();
+        // The `.cmd` wrapper runs under cmd.exe so `>>` redirection works
+        // without quoting the entire command line inside schtasks.
+        // `%` is expansion-active in batch even inside double-quoted `set`
+        // values, so escape it as `%%` in all three embedded paths.
+        let escape_batch = |s: &str| s.replace('%', "%%");
+        let wrapper = pond_state.join("pond-sync.cmd");
         let wrapper_body = format!(
-            "@echo off\r\n\"{}\" sync -q --no-wait >> \"{}\" 2>&1\r\n",
-            bin.display(),
-            log.display(),
+            "@echo off\r\n\
+             set \"XDG_STATE_HOME={state}\"\r\n\
+             \"{bin}\" sync -q --no-wait >> \"{log}\" 2>&1\r\n",
+            state = escape_batch(&state_root.display().to_string()),
+            bin = escape_batch(&bin.display().to_string()),
+            log = escape_batch(&log.display().to_string()),
         );
-        std::fs::write(&wrapper, wrapper_body)
-            .with_context(|| format!("failed to write {}", wrapper.display()))?;
 
-        let (schedule, modifier) = schtasks_cadence(every);
-        let output = Command::new("schtasks")
+        // Already-scheduled no-op: wrapper content unchanged and task exists
+        // at the same cadence means registration is not needed.
+        let unchanged = std::fs::read_to_string(&wrapper)
+            .map(|existing| existing == wrapper_body)
+            .unwrap_or(false);
+        if unchanged
+            && let Ok(Active {
+                every: registered, ..
+            }) = probe()
+            && registered == Some(every)
+        {
+            pond::output::line(&format!("already scheduled (every {})", every.label()))?;
+            return Ok(());
+        }
+
+        // Write the XML task definition to a temp file; schtasks /Create /XML
+        // requires a file path, not stdin.
+        let xml = task_xml(&wrapper, every);
+        let tmp_xml = pond_state.join("pond-sync-task.xml.tmp");
+        std::fs::write(&tmp_xml, &xml)
+            .with_context(|| format!("failed to write {}", tmp_xml.display()))?;
+        let create_result = Command::new("schtasks")
             .args([
                 "/Create",
                 "/TN",
                 TASK_NAME,
-                "/TR",
-                &format!("\"{}\"", wrapper.display()),
-                "/SC",
-                schedule,
-                "/MO",
-                &modifier,
+                "/XML",
+                tmp_xml.to_str().unwrap_or("pond-sync-task.xml.tmp"),
                 "/F",
             ])
             .output()
-            .context("failed to run schtasks /Create")?;
+            .context("failed to run schtasks /Create");
+        let _ = std::fs::remove_file(&tmp_xml); // best-effort temp cleanup
+
+        let output = create_result?;
         if !output.status.success() {
             bail!(
                 "schtasks /Create failed: {}",
                 decode_console(&output.stderr).trim()
             );
         }
-        line(&format!(
-            "schedule active (task-scheduler, every {})",
-            every.label()
+
+        // Write the wrapper AFTER /Create succeeds: a failed /Create must not
+        // leave a wrapper that points at a non-existent task.
+        std::fs::write(&wrapper, &wrapper_body)
+            .with_context(|| format!("failed to write {}", wrapper.display()))?;
+
+        pond::output::line(&super::render_state(&super::State::Active {
+            backend: "task-scheduler",
+            every: Some(every),
+        }))?;
+        pond::output::line(&format!(
+            "{}      {}  (pond schedule logs)",
+            pond::output::paint("logs", pond::output::dim()),
+            crate::config::display(&crate::config::url_for_path(log)?),
         ))?;
         Ok(())
     }
 
-    fn stop() -> Result<()> {
-        let existed = task_exists();
-        if existed {
-            let output = Command::new("schtasks")
-                .args(["/Delete", "/TN", TASK_NAME, "/F"])
-                .output()
-                .context("failed to run schtasks /Delete")?;
-            if !output.status.success() {
+    pub(super) fn stop() -> Result<()> {
+        let output = Command::new("schtasks")
+            .args(["/Delete", "/TN", TASK_NAME, "/F"])
+            .output()
+            .context("failed to run schtasks /Delete")?;
+        if output.status.success() {
+            // Leave the wrapper + log in place; the log stays readable via
+            // `pond schedule logs`.
+            pond::output::line("schedule removed")?;
+            return Ok(());
+        }
+        // Delete failed. Disambiguate TOCTOU: if the task is now gone (it
+        // wasn't there, or was removed concurrently) report nothing-was-scheduled;
+        // if it still exists the failure is genuine.
+        match probe()? {
+            Inactive => pond::output::line("nothing was scheduled")?,
+            Active { .. } => {
                 bail!(
                     "schtasks /Delete failed: {}",
                     decode_console(&output.stderr).trim()
                 );
             }
         }
-        // Leave the wrapper + log in place on stop: removing the task is the
-        // contract, and the log stays readable via `pond schedule logs`.
-        if existed {
-            line("schedule removed")?;
-        } else {
-            line("nothing was scheduled")?;
-        }
         Ok(())
     }
 
-    fn probe() -> Result<State> {
-        if task_exists() {
-            Ok(Active {
-                backend: "task-scheduler",
-                every: read_interval(),
-            })
-        } else {
-            Ok(Inactive)
-        }
-    }
-
-    fn logs(lines: usize) -> Result<()> {
-        let path = log_path();
-        line_err(&paint(
-            &format!(
-                "log file: {}",
-                crate::config::display(&crate::config::url_for_path(&path)?)
-            ),
-            dim(),
-        ))?;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                line("(no log yet - the first scheduled run hasn't happened)")?;
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+    /// Generate Task Scheduler XML for the pond-sync task.
+    fn task_xml(wrapper: &std::path::Path, every: ScheduleEvery) -> String {
+        let trigger = match every {
+            ScheduleEvery::D1 => "    <CalendarTrigger>\n\
+                 \x20\x20\x20\x20  <StartBoundary>2000-01-01T03:00:00</StartBoundary>\n\
+                 \x20\x20\x20\x20  <Enabled>true</Enabled>\n\
+                 \x20\x20\x20\x20  <ScheduleByDay>\
+                 <DaysInterval>1</DaysInterval>\
+                 </ScheduleByDay>\n\
+                 \x20\x20\x20\x20</CalendarTrigger>"
+                .to_owned(),
+            _ => {
+                let interval = match every {
+                    ScheduleEvery::M5 => "PT5M",
+                    ScheduleEvery::M15 => "PT15M",
+                    ScheduleEvery::H1 => "PT1H",
+                    ScheduleEvery::H6 => "PT6H",
+                    ScheduleEvery::D1 => unreachable!(),
+                };
+                format!(
+                    "    <TimeTrigger>\n\
+                     \x20\x20\x20\x20  <Repetition>\n\
+                     \x20\x20\x20\x20    <Interval>{interval}</Interval>\n\
+                     \x20\x20\x20\x20    <StopAtDurationEnd>false</StopAtDurationEnd>\n\
+                     \x20\x20\x20\x20  </Repetition>\n\
+                     \x20\x20\x20\x20  <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n\
+                     \x20\x20\x20\x20  <Enabled>true</Enabled>\n\
+                     \x20\x20\x20\x20</TimeTrigger>"
+                )
             }
         };
-        let all: Vec<&str> = text.lines().collect();
-        let tail = all.len().saturating_sub(lines);
-        for entry in &all[tail..] {
-            line(entry)?;
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+             <Task version=\"1.2\" \
+             xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+             \x20\x20<RegistrationInfo>\n\
+             \x20\x20  <Description>pond sync (managed by pond; do not edit)</Description>\n\
+             \x20\x20</RegistrationInfo>\n\
+             \x20\x20<Triggers>\n\
+             {trigger}\n\
+             \x20\x20</Triggers>\n\
+             \x20\x20<Settings>\n\
+             \x20\x20  <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+             \x20\x20  <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+             \x20\x20  <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+             \x20\x20  <StartWhenAvailable>true</StartWhenAvailable>\n\
+             \x20\x20  <Hidden>true</Hidden>\n\
+             \x20\x20  <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>\n\
+             \x20\x20  <Priority>7</Priority>\n\
+             \x20\x20</Settings>\n\
+             \x20\x20<Actions Context=\"Author\">\n\
+             \x20\x20  <Exec>\n\
+             \x20\x20    <Command>{cmd}</Command>\n\
+             \x20\x20  </Exec>\n\
+             \x20\x20</Actions>\n\
+             </Task>\n",
+            cmd = xml_escape(&wrapper.display().to_string()),
+        )
+    }
+
+    /// Escape XML special characters in element text / attribute values.
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    /// Recover the registered cadence from a `schtasks /Query /XML ONE` body.
+    fn parse_interval_from_xml(xml: &str) -> Option<ScheduleEvery> {
+        // Repetition-based cadences carry <Interval>PT5M</Interval> etc.
+        if let Some(interval) = between(xml, "<Interval>", "</Interval>") {
+            let secs = if let Some(m) = interval
+                .strip_prefix("PT")
+                .and_then(|s| s.strip_suffix('M'))
+            {
+                m.parse::<u32>().ok().map(|m| m * 60)
+            } else if let Some(h) = interval
+                .strip_prefix("PT")
+                .and_then(|s| s.strip_suffix('H'))
+            {
+                h.parse::<u32>().ok().map(|h| h * 3_600)
+            } else {
+                return None;
+            }?;
+            return ScheduleEvery::from_secs(secs);
         }
-        Ok(())
-    }
-
-    /// Does the pond task exist? `schtasks /Query /TN` exits 0 when present,
-    /// non-zero when absent.
-    fn task_exists() -> bool {
-        Command::new("schtasks")
-            .args(["/Query", "/TN", TASK_NAME])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-
-    /// The registered task's cadence, recovered from its XML so `pond status`
-    /// can name it. `None` when the task lacks a recognized interval (it is
-    /// still reported active).
-    fn read_interval() -> Option<ScheduleEvery> {
-        let output = Command::new("schtasks")
-            .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+        // Daily tasks carry <DaysInterval>1</DaysInterval> instead.
+        if between(xml, "<DaysInterval>", "</DaysInterval>").is_some() {
+            return ScheduleEvery::from_secs(86_400);
         }
-        let xml = decode_console(&output.stdout);
-        // MINUTE/HOURLY tasks carry `<Interval>PT<n>M</Interval>` /
-        // `PT<n>H</Interval>` inside `<Repetition>`; a DAILY task carries
-        // `<DaysInterval>1</DaysInterval>` and no `<Interval>`.
-        let secs = if let Some(minutes) = between(&xml, "<Interval>PT", "M</Interval>") {
-            minutes.parse::<u32>().ok().map(|m| m * 60)
-        } else if let Some(hours) = between(&xml, "<Interval>PT", "H</Interval>") {
-            hours.parse::<u32>().ok().map(|h| h * 3_600)
-        } else if between(&xml, "<DaysInterval>", "</DaysInterval>").is_some() {
-            Some(86_400)
-        } else {
-            None
-        }?;
-        ScheduleEvery::from_secs(secs)
+        None
     }
 
-    /// The substring of `text` between the first `open` and the next `close`
-    /// after it, or `None`.
+    /// Substring of `text` strictly between the first `open` and the `close`
+    /// that follows it. Returns `None` when either delimiter is absent.
     fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
         let start = text.find(open)? + open.len();
         let rest = &text[start..];
@@ -1180,39 +1181,16 @@ mod windows {
         Some(&rest[..end])
     }
 
-    /// Map a cadence to the `schtasks /SC ... /MO ...` pair.
-    fn schtasks_cadence(every: ScheduleEvery) -> (&'static str, String) {
-        match every {
-            ScheduleEvery::M5 => ("MINUTE", "5".to_owned()),
-            ScheduleEvery::M15 => ("MINUTE", "15".to_owned()),
-            ScheduleEvery::H1 => ("HOURLY", "1".to_owned()),
-            ScheduleEvery::H6 => ("HOURLY", "6".to_owned()),
-            ScheduleEvery::D1 => ("DAILY", "1".to_owned()),
-        }
-    }
-
     /// The binary path baked into the wrapper. Prefer `pond.exe` on PATH (a
-    /// stable install location that survives upgrades); fall back to this
-    /// running exe.
+    /// stable install location that survives upgrades); fall back to this exe.
     fn pond_bin() -> PathBuf {
         crate::find_on_path("pond.exe")
             .or_else(|| crate::find_on_path("pond"))
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
     }
 
-    /// `<state>/sync.log`, the same state dir manual syncs use.
-    fn log_path() -> PathBuf {
-        crate::syncstate::pond_state_dir().join("sync.log")
-    }
-
-    /// `<state>/pond-sync.cmd`, the generated task action.
-    fn wrapper_path() -> PathBuf {
-        crate::syncstate::pond_state_dir().join("pond-sync.cmd")
-    }
-
     /// Decode process output that may be UTF-16 (schtasks `/XML` and some
-    /// localized consoles) or UTF-8. A UTF-16LE BOM or interleaved NUL bytes
-    /// select the wide decode; otherwise it is a lossy UTF-8 read.
+    /// localized consoles) or UTF-8.
     fn decode_console(bytes: &[u8]) -> String {
         if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
             return decode_utf16le(&bytes[2..]);
@@ -1229,5 +1207,80 @@ mod windows {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16_lossy(&units)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        use super::*;
+
+        #[test]
+        fn all_cadences_round_trip_through_task_xml() {
+            let wrapper = std::path::Path::new("C:\\pond\\pond-sync.cmd");
+            for every in [
+                ScheduleEvery::M5,
+                ScheduleEvery::M15,
+                ScheduleEvery::H1,
+                ScheduleEvery::H6,
+                ScheduleEvery::D1,
+            ] {
+                let xml = task_xml(wrapper, every);
+                let parsed = parse_interval_from_xml(&xml);
+                assert_eq!(parsed, Some(every), "cadence {every:?} did not round-trip");
+            }
+        }
+
+        #[test]
+        fn between_finds_content_between_delimiters() {
+            assert_eq!(between("<Foo>42</Foo>", "<Foo>", "</Foo>"), Some("42"));
+            assert_eq!(between("<A>x</A><B>y</B>", "<B>", "</B>"), Some("y"));
+            assert_eq!(between("no match", "<X>", "</X>"), None);
+            assert_eq!(between("<Open>missing close", "<Open>", "</Open>"), None);
+        }
+
+        #[test]
+        fn decode_console_handles_utf8_and_utf16le_bom() {
+            assert_eq!(decode_console(b"hello world"), "hello world");
+            let text = "hello";
+            let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            assert_eq!(decode_console(&bytes), "hello");
+        }
+
+        #[test]
+        fn task_xml_contains_expected_settings() {
+            let wrapper = std::path::Path::new("C:\\pond\\pond-sync.cmd");
+            let xml = task_xml(wrapper, ScheduleEvery::M5);
+            assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+            assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+            assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+            assert!(xml.contains("<Hidden>true</Hidden>"));
+        }
+    }
+}
+
+// ===========================================================================
+// Tests shared across all platforms
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn every_round_trips_through_secs_and_labels() {
+        for every in [
+            ScheduleEvery::M5,
+            ScheduleEvery::M15,
+            ScheduleEvery::H1,
+            ScheduleEvery::H6,
+            ScheduleEvery::D1,
+        ] {
+            assert_eq!(ScheduleEvery::from_secs(every.secs()), Some(every));
+        }
+        assert_eq!(ScheduleEvery::from_secs(123), None);
     }
 }
