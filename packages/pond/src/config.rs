@@ -8,7 +8,7 @@
 //! at all (spec.md#storage-configless) - URLs + env vars are sufficient.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -207,6 +207,14 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
 # re-enable via `pond adapters enable <adapter>`.
+#
+# `path` also accepts an array when one tool keeps several transcript trees
+# (e.g. a relocated CLAUDE_CONFIG_DIR for a second subscription); every listed
+# dir rides the same sync:
+#
+# [adapters.claude-code]
+# enabled = true
+# path = [\"~/.claude/projects\", \"~/work-claude/projects\"]
 #
 # The value shape is adapter-owned; most take just `path`. pi-coding-agent also
 # accepts `sqlite_path`, its harness-v2 database backend, read alongside the
@@ -631,27 +639,42 @@ impl Config {
     /// sections with `enabled = true` flow through; sections with
     /// `enabled = false` (or absent) are treated as opt-out and the
     /// per-adapter blob (minus `enabled`) is handed to the factory's
-    /// `open()`. With `adapter = None` returns every enabled entry; with
-    /// `Some(name)` returns just that one - and errors if it's not in
-    /// config OR if it's currently disabled (the caller should then
-    /// re-prompt or report).
-    pub fn resolve_adapters(&self, adapter: Option<&str>) -> Result<Vec<(String, Value)>> {
+    /// `open()`. An entry whose `path` is an array fans out into one
+    /// single-path entry per element, so every configured location rides the
+    /// same sync (relocated state dirs: two subscriptions of one tool on one
+    /// machine); each tuple's third field is that element's dir (`Some` only
+    /// on multi-path fan-out), so callers can label otherwise-identical rows
+    /// without re-deriving the fan-out. With `adapter = None` returns every
+    /// enabled entry; with `Some(name)` returns just that one - and errors if
+    /// it's not in config OR if it's currently disabled (the caller should
+    /// then re-prompt or report).
+    pub fn resolve_adapters(
+        &self,
+        adapter: Option<&str>,
+    ) -> Result<Vec<(String, Value, Option<String>)>> {
         match adapter {
-            None => Ok(self
-                .adapters
-                .iter()
-                .filter_map(|(name, blob)| take_enabled(name, blob))
-                .collect()),
+            None => {
+                let mut resolved = Vec::new();
+                for (name, blob) in self
+                    .adapters
+                    .iter()
+                    .filter_map(|(name, blob)| take_enabled(name, blob))
+                {
+                    resolved.extend(expand_path_array(name, blob)?);
+                }
+                Ok(resolved)
+            }
             Some(name) => {
                 let blob = self
                     .adapters
                     .get(name)
                     .ok_or_else(|| anyhow!("no [adapters.{name}] entry in config"))?;
-                take_enabled(name, blob).map(|entry| vec![entry]).ok_or_else(|| {
+                let (name, blob) = take_enabled(name, blob).ok_or_else(|| {
                     anyhow!(
                         "adapter [{name}] is disabled (enabled = false); run `pond adapters enable {name}` to re-enable, then `pond sync {name}`"
                     )
-                })
+                })?;
+                expand_path_array(name, blob)
             }
         }
     }
@@ -781,6 +804,54 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
         "config {} uses a [sources.*] block; the adapter map was renamed to [adapters.*]. Run `pond init` to migrate it, or rename each `[sources.<name>]` header to `[adapters.<name>]` by hand.",
         path.display(),
     ))
+}
+
+/// Fan an entry whose `path` is an array out into one single-path entry per
+/// element (other keys copied verbatim), preserving config order. Adapters
+/// only ever see a scalar `path`, so the seam and every factory stay
+/// untouched; ingest is idempotent on deterministic PKs, so several dirs
+/// merging into one store is safe by design. A scalar `path` - or no `path`
+/// at all; the blob shape is adapter-owned - passes through unchanged. The
+/// third tuple field marks genuine fan-out (`Some(dir)` only when the array
+/// held more than one element - a single-element array needs no
+/// disambiguation and resolves like a scalar). Copying siblings verbatim
+/// means a key naming a second source (pi-coding-agent's `sqlite_path`) is
+/// read once per dir - wasteful on a first sync, harmless under PK
+/// idempotency - accepted because the config layer cannot know which of an
+/// adapter's keys are path-like.
+fn expand_path_array(name: String, blob: Value) -> Result<Vec<(String, Value, Option<String>)>> {
+    let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
+        return Ok(vec![(name, blob, None)]);
+    };
+    if paths.is_empty() {
+        bail!(
+            "[adapters.{name}] has an empty `path` array; list at least one directory, or disable the adapter with `pond adapters disable {name}`"
+        );
+    }
+    let multi = paths.len() > 1;
+    let mut seen = BTreeSet::new();
+    let mut fanned = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(path) = path.as_str() else {
+            bail!(
+                "[adapters.{name}] `path` array holds a non-string element ({path}); every element must be a directory path string"
+            );
+        };
+        // Literal duplicates only, as a typo courtesy. Aliases (`~/x` vs its
+        // expansion, symlinks, trailing slashes) are deliberately not
+        // canonicalized: expansion happens later inside each factory's
+        // `open()`, and an aliased re-read is harmless under PK-idempotent
+        // ingest - not worth a filesystem-semantics rabbit hole here.
+        if !seen.insert(path) {
+            bail!("[adapters.{name}] `path` lists {path:?} twice; remove the duplicate");
+        }
+        let mut single = blob.clone();
+        if let Some(obj) = single.as_object_mut() {
+            obj.insert("path".to_owned(), Value::String(path.to_owned()));
+        }
+        fanned.push((name.clone(), single, multi.then(|| path.to_owned())));
+    }
+    Ok(fanned)
 }
 
 /// Inner helper: return `Some((name, blob))` when the adapter section is
@@ -1108,11 +1179,11 @@ enabled = false
             // None -> only enabled entries
             let all = config.resolve_adapters(None).unwrap();
             assert_eq!(all.len(), 2);
-            let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
+            let names: Vec<_> = all.iter().map(|(n, _, _)| n.as_str()).collect();
             assert!(names.contains(&"claude-code"));
             assert!(names.contains(&"codex-cli"));
             // The `enabled` discriminator never reaches the adapter blob.
-            for (_, blob) in &all {
+            for (_, blob, _) in &all {
                 assert!(blob.get("enabled").is_none(), "enabled should be stripped");
             }
 
@@ -1140,6 +1211,102 @@ enabled = false
             assert_eq!(config.disabled_adapter_names(), vec!["opencode"]);
             Ok(())
         });
+    }
+
+    #[test]
+    fn resolve_adapters_fans_out_path_arrays() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "\
+[adapters.claude-code]
+enabled = true
+path = [\"/srv/personal\", \"/srv/work\"]
+
+[adapters.pi-coding-agent]
+enabled = true
+path = [\"/srv/pi-a\", \"/srv/pi-b\"]
+sqlite_path = \"/srv/pi.sqlite\"
+
+[adapters.codex-cli]
+enabled = true
+path = \"/srv/codex\"
+
+[adapters.opencode]
+enabled = true
+path = [\"/srv/solo\"]
+",
+            )?;
+            let config = Config::load("config.toml").unwrap();
+
+            // None -> arrays fan out, scalars pass through, config order kept.
+            // The fan-out marker is Some only for genuine multi-path entries:
+            // a single-element array resolves like a scalar.
+            let all = config.resolve_adapters(None).unwrap();
+            let flat: Vec<(&str, Option<&str>, bool)> = all
+                .iter()
+                .map(|(n, b, fanout)| {
+                    (
+                        n.as_str(),
+                        b.get("path").and_then(Value::as_str),
+                        fanout.is_some(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                flat,
+                vec![
+                    ("claude-code", Some("/srv/personal"), true),
+                    ("claude-code", Some("/srv/work"), true),
+                    ("codex-cli", Some("/srv/codex"), false),
+                    ("opencode", Some("/srv/solo"), false),
+                    ("pi-coding-agent", Some("/srv/pi-a"), true),
+                    ("pi-coding-agent", Some("/srv/pi-b"), true),
+                ],
+            );
+            // Sibling keys ride along into every fanned entry.
+            for (_, blob, _) in all.iter().filter(|(n, _, _)| n == "pi-coding-agent") {
+                assert_eq!(
+                    blob.get("sqlite_path").and_then(Value::as_str),
+                    Some("/srv/pi.sqlite"),
+                );
+            }
+
+            // Some(name) fans out too.
+            let one = config.resolve_adapters(Some("claude-code")).unwrap();
+            assert_eq!(one.len(), 2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolve_adapters_rejects_malformed_path_arrays() {
+        for (body, expected) in [
+            (
+                "[adapters.claude-code]\nenabled = true\npath = []\n",
+                "empty `path` array",
+            ),
+            (
+                "[adapters.claude-code]\nenabled = true\npath = [\"/srv/a\", \"/srv/a\"]\n",
+                "twice",
+            ),
+            (
+                "[adapters.claude-code]\nenabled = true\npath = [\"/srv/a\", 3]\n",
+                "non-string element",
+            ),
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file("config.toml", body)?;
+                let config = Config::load("config.toml").unwrap();
+                let err = config
+                    .resolve_adapters(None)
+                    .expect_err("malformed path array must error")
+                    .to_string();
+                assert!(err.contains(expected), "want {expected:?} in: {err}");
+                assert!(err.contains("[adapters.claude-code]"), "got: {err}");
+                Ok(())
+            });
+        }
     }
 
     #[test]

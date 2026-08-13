@@ -1142,10 +1142,13 @@ async fn main() -> anyhow::Result<()> {
             let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
+                // A malformed [adapters] section still counts as configured:
+                // the fix is repairing config.toml (sync names it), not the
+                // "run `pond init`" hint the no-adapters rendering gives.
                 let has_adapters = loaded
                     .resolve_adapters(None)
                     .map(|adapters| !adapters.is_empty())
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 match format {
                     OutputFormat::Json => output(&status_json_empty(&resolved)?)?,
                     OutputFormat::Text => {
@@ -3053,15 +3056,38 @@ fn set_creds_set(
 fn run_adapters(command: AdaptersCmd, config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
     match command {
         AdaptersCmd::List { format } => adapters_list(loaded, format),
-        AdaptersCmd::Discover => adapters_discover(config_file),
+        AdaptersCmd::Discover => adapters_discover(config_file, loaded),
         AdaptersCmd::Enable { name } => adapters_enable(config_file, &name),
         AdaptersCmd::Disable { name } => adapters_disable(config_file, &name),
     }
 }
 
+/// The dirs an `[adapters.*]` entry's `path` names, home-contracted for
+/// display; `None` when the entry has no `path` key. Malformed values (an
+/// empty array, non-string elements) render faithfully rather than as "no
+/// path": `adapters list` is where a user looks after sync rejects the
+/// entry, so it must show what is configured, not hide it.
+fn contracted_paths(blob: &serde_json::Value) -> Option<Vec<String>> {
+    let contract = |p: &str| config::contract_home(Path::new(p)).display().to_string();
+    match blob.get("path")? {
+        serde_json::Value::String(path) => Some(vec![contract(path)]),
+        serde_json::Value::Array(paths) => Some(
+            paths
+                .iter()
+                .map(|element| match element.as_str() {
+                    Some(path) => contract(path),
+                    None => element.to_string(),
+                })
+                .collect(),
+        ),
+        other => Some(vec![other.to_string()]),
+    }
+}
+
 /// The `pond adapters list --format json` document: configured adapters
-/// (enabled state, home-contracted path or null) plus detected-but-unconfigured
-/// ones, sharing the exact `path` contraction the text table applies.
+/// (enabled state; `path` as a string, an array for multi-path entries, or
+/// null when absent) plus detected-but-unconfigured ones, sharing the exact
+/// `path` contraction the text table applies.
 fn adapters_list_json(loaded: &Config) -> anyhow::Result<String> {
     let detected = adapter::probe_unconfigured(&loaded.adapters);
     let configured: Vec<serde_json::Value> = loaded
@@ -3072,10 +3098,13 @@ fn adapters_list_json(loaded: &Config) -> anyhow::Result<String> {
                 .get("enabled")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let path = blob
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(|p| config::contract_home(Path::new(p)).display().to_string());
+            // One dir stays the scalar string consumers already expect; the
+            // array form is reserved for genuinely multi-dir entries.
+            let path = match contracted_paths(blob) {
+                None => serde_json::Value::Null,
+                Some(mut paths) if paths.len() == 1 => serde_json::Value::String(paths.remove(0)),
+                Some(paths) => serde_json::json!(paths),
+            };
             serde_json::json!({ "name": name, "enabled": enabled, "path": path })
         })
         .collect();
@@ -3106,11 +3135,13 @@ fn adapters_list(loaded: &Config, format: OutputFormat) -> anyhow::Result<()> {
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let path = blob
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(|p| config::contract_home(Path::new(p)).display().to_string())
-            .unwrap_or_else(|| "-".to_owned());
+        let path = match contracted_paths(blob) {
+            None => "-".to_owned(),
+            // An empty array is a config error sync rejects; show it as
+            // itself, not as "no path".
+            Some(paths) if paths.is_empty() => "[]".to_owned(),
+            Some(paths) => paths.join(", "),
+        };
         let state = if enabled { "yes" } else { "no" }.to_owned();
         table.add_row(vec![name.clone(), state, path]);
     }
@@ -3125,9 +3156,19 @@ fn adapters_list(loaded: &Config, format: OutputFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn adapters_discover(config_file: &Path) -> anyhow::Result<()> {
+fn adapters_discover(config_file: &Path, loaded: &Config) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
-    let candidates = adapter::discover(None);
+    // Probe only unconfigured adapters: an existing entry may carry a
+    // customized or multi-path `path`, and persisting a re-discovered pick
+    // would silently overwrite it with the single default dir.
+    let candidates = adapter::probe_unconfigured(&loaded.adapters);
+    if candidates.is_empty() && !loaded.adapters.is_empty() {
+        output(&format!(
+            "no new adapters detected - {} already configured (pond adapters list)",
+            loaded.adapters.len(),
+        ))?;
+        return Ok(());
+    }
     let picks = adapter::prompt_and_persist(config_file, &candidates, io::stdin().is_terminal())?;
     let names: Vec<&str> = picks.iter().map(|c| c.name.as_str()).collect();
     output(&format!(
@@ -3963,9 +4004,20 @@ async fn run_sync_pipeline(
     // Deletion reconciliation (decision 7): only when openclaw is in scope, so
     // a non-openclaw sync pays nothing. Detection-only - it names the erase
     // set and preserves for the summary; the byte-purge waits on `pond erase`.
-    if let Some(config) = openclaw_in_scope(loaded, invocation)? {
+    // A multi-path entry reconciles every dir, merging into one report.
+    let mut merged: Option<adapter::ReconciliationReport> = None;
+    for config in openclaw_in_scope(loaded, invocation)? {
         let adapter = adapter::OpenClawAdapter::from_config(config)?;
         let recon = adapter.reconcile_deletions(store).await?;
+        match &mut merged {
+            None => merged = Some(recon),
+            Some(merged) => {
+                merged.erase.extend(recon.erase);
+                merged.preserved.extend(recon.preserved);
+            }
+        }
+    }
+    if let Some(recon) = merged {
         emit_reconciliation(sink, &recon)?;
         report.reconciliation = Some(recon);
     }
@@ -4100,20 +4152,19 @@ fn reconciliation_lines(recon: &adapter::ReconciliationReport) -> Vec<String> {
     lines
 }
 
-/// The openclaw adapter's resolved config blob when it is in this sync's scope,
-/// else `None` so a non-openclaw sync skips reconciliation entirely. Reuses the
-/// same resolver the import stage ran, so scope (`--adapter`/`--path`, enabled
+/// The openclaw adapter's resolved config blobs when it is in this sync's
+/// scope, else empty so a non-openclaw sync skips reconciliation entirely.
+/// Every fanned entry of a multi-path `path = [...]` is returned - each dir
+/// must be examined for deletions, not just the first. Reuses the same
+/// resolver the import stage ran, so scope (`--adapter`/`--path`, enabled
 /// set) stays identical.
-fn openclaw_in_scope(
-    loaded: &Config,
-    invocation: &SyncInvocation,
-) -> anyhow::Result<Option<Value>> {
+fn openclaw_in_scope(loaded: &Config, invocation: &SyncInvocation) -> anyhow::Result<Vec<Value>> {
     if invocation
         .adapter
         .as_deref()
         .is_some_and(|name| name != "openclaw")
     {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let adapters = resolve_sync_adapters(
         loaded,
@@ -4122,8 +4173,9 @@ fn openclaw_in_scope(
     )?;
     Ok(adapters
         .into_iter()
-        .find(|(name, _)| name == "openclaw")
-        .map(|(_, blob)| blob))
+        .filter(|(name, _, _)| name == "openclaw")
+        .map(|(_, blob, _)| blob)
+        .collect())
 }
 
 /// `pond sync --dry-run`: the freshness gate run standalone. Prints what the
@@ -4168,31 +4220,49 @@ async fn run_sync_dry_run(
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
-    let mut rows: Vec<(String, usize, Option<pond::adapter::SyncPlan>)> = Vec::new();
-    for (name, blob) in adapters {
+    struct DryRunRow {
+        name: String,
+        fanout: Option<String>,
+        source_path: Option<String>,
+        sessions: usize,
+        plan: Option<pond::adapter::SyncPlan>,
+    }
+    let mut rows: Vec<DryRunRow> = Vec::new();
+    for (name, blob, fanout) in adapters {
         let factory = adapter::by_name(&name).ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown adapter {name:?}; known: {}",
                 adapter::known_names().join(", "),
             )
         })?;
+        let source_path = blob
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let opened = factory.open(blob)?;
         let plan = opened.plan(oracle).await?;
         let sessions = match &plan {
             Some(plan) => plan.sessions,
             None => opened.discover().await?,
         };
-        rows.push((name, sessions, plan));
+        rows.push(DryRunRow {
+            name,
+            fanout,
+            source_path,
+            sessions,
+            plan,
+        });
     }
     if json {
         let adapters: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, sessions, plan)| {
+            .map(|row| {
                 serde_json::json!({
-                    "name": name,
-                    "sessions": sessions,
-                    "fresh": plan.map(|plan| plan.fresh),
-                    "pending": plan.map(|plan| plan.pending),
+                    "name": row.name,
+                    "path": row.source_path,
+                    "sessions": row.sessions,
+                    "fresh": row.plan.map(|plan| plan.fresh),
+                    "pending": row.plan.map(|plan| plan.pending),
                 })
             })
             .collect();
@@ -4203,26 +4273,27 @@ async fn run_sync_dry_run(
         return Ok(());
     }
     let label = pond::output::paint("plan", pond::output::dim());
-    for (name, sessions, plan) in &rows {
-        let detail = match plan {
+    for row in &rows {
+        let detail = match &row.plan {
             Some(plan) if plan.pending == 0 => {
                 format!(
                     "{} sessions - up to date",
-                    format_thousands(*sessions as u64)
+                    format_thousands(row.sessions as u64)
                 )
             }
             Some(plan) => format!(
                 "{} sessions - {} to sync, {} fresh",
-                format_thousands(*sessions as u64),
+                format_thousands(row.sessions as u64),
                 format_thousands(plan.pending as u64),
                 format_thousands(plan.fresh as u64),
             ),
             None => format!(
                 "{} sessions (pending unknown - this adapter has no cheap freshness preview)",
-                format_thousands(*sessions as u64),
+                format_thousands(row.sessions as u64),
             ),
         };
-        output(&format!("{label}      {name:<12} {detail}"))?;
+        let display = adapter_label(&row.name, row.fanout.as_deref());
+        output(&format!("{label}      {display:<12} {detail}"))?;
     }
     output(&pond::output::paint(
         "dry run - nothing written to the store",
@@ -4503,11 +4574,23 @@ async fn run_import_stage(
         indicatif::ProgressDrawTarget::stderr_with_hz(8)
     });
     let mut total = IngestSummary::default();
-    for (name, blob) in adapters {
-        let summary = sync_with_progress(store, &mp, &name, blob, oracle, flush_hud, quiet).await?;
+    for (name, blob, fanout) in adapters {
+        let label = adapter_label(&name, fanout.as_deref());
+        let summary =
+            sync_with_progress(store, &mp, &name, &label, blob, oracle, flush_hud, quiet).await?;
         total.merge(&summary);
     }
     Ok(total)
+}
+
+/// `name (path)` for an entry fanned out of a multi-path `[adapters.<name>]`
+/// array (otherwise-identical rows need the disambiguator), plain `name` for
+/// the common single-path entry.
+fn adapter_label(name: &str, fanout_path: Option<&str>) -> String {
+    match fanout_path {
+        Some(path) => format!("{name} ({path})"),
+        None => name.to_owned(),
+    }
 }
 
 /// Cheap (LIMIT-1) model-swap guard for the sync path, which embeds inline and
@@ -4915,7 +4998,7 @@ fn resolve_sync_adapters(
     config: &Config,
     name: Option<&str>,
     path: Option<PathBuf>,
-) -> anyhow::Result<Vec<(String, Value)>> {
+) -> anyhow::Result<Vec<(String, Value, Option<String>)>> {
     if let Some(path) = path {
         let name = name.ok_or_else(|| {
             anyhow::anyhow!("--path requires an explicit <adapter> positional argument")
@@ -4926,7 +5009,7 @@ fn resolve_sync_adapters(
         }
         // `--path` is a filesystem-shaped override. Adapters that need
         // a richer config blob can't use this path; they must edit config.toml.
-        return Ok(vec![(name.to_owned(), json!({ "path": path }))]);
+        return Ok(vec![(name.to_owned(), json!({ "path": path }), None)]);
     }
 
     if let Some(name) = name {
@@ -4959,12 +5042,15 @@ fn resolve_sync_adapters(
 const SYNC_HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 /// Run one adapter's ingest pass into `store` with a live progress bar and
-/// one greppable log line per finished (or skipped) session.
+/// one greppable log line per finished (or skipped) session. `label` is the
+/// display form of `name` - `name (path)` when a multi-path entry fanned out
+/// into several otherwise-identical rows (see [`adapter_label`]).
 #[allow(clippy::too_many_arguments)]
 async fn sync_with_progress(
     store: &Store,
     mp: &indicatif::MultiProgress,
     name: &str,
+    label: &str,
     config: Value,
     oracle: &dyn pond::adapter::SkipOracle,
     flush_hud: &FlushHud,
@@ -4988,7 +5074,7 @@ async fn sync_with_progress(
         ProgressStyle::with_template("{wide_msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     bar.set_message(sync_status_line(
-        name,
+        label,
         0,
         0,
         Duration::ZERO,
@@ -5005,7 +5091,7 @@ async fn sync_with_progress(
     // Quiet (in-serve) runs treat stderr as a TTY so the off-TTY heartbeat
     // lines stay silent too; the serve loop logs one summary line per cycle.
     let stderr_tty = quiet || io::stderr().is_terminal();
-    flush_hud.attach(name, &bar, started, stderr_tty);
+    flush_hud.attach(label, &bar, started, stderr_tty);
     // Repaint the bar; off-TTY (where indicatif draws nothing) also emit the
     // same line as a plain log heartbeat so the run is never silent. The
     // throttle lives in the flush HUD slot so this path and the embed-flush
@@ -5093,7 +5179,11 @@ async fn sync_with_progress(
                 outcome.status,
                 SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty | SyncStatus::Superseded
             ) {
-                let _ = mp.println(format_sync_line(name, &outcome, optional_reason.as_deref()));
+                let _ = mp.println(format_sync_line(
+                    label,
+                    &outcome,
+                    optional_reason.as_deref(),
+                ));
             }
             match optional_reason.as_deref() {
                 None => tracing::info!(
@@ -5126,7 +5216,7 @@ async fn sync_with_progress(
             }
             let tail = format_bar_message(messages, drops, errors, started.elapsed());
             let line = sync_status_line(
-                name,
+                label,
                 bar_ref.position(),
                 bar_ref.length().unwrap_or(0),
                 started.elapsed(),
@@ -5148,7 +5238,7 @@ async fn sync_with_progress(
             }
             let tail = format_bar_message(messages, drops, errors, started.elapsed());
             let line = sync_status_line(
-                name,
+                label,
                 bar_ref.position(),
                 bar_ref.length().unwrap_or(0),
                 started.elapsed(),
@@ -5164,7 +5254,7 @@ async fn sync_with_progress(
             // the flush HUD then counts the embedding up within it.
             flush_hud.set_pending(pending);
             let line = sync_status_line(
-                name,
+                label,
                 bar_ref.position(),
                 bar_ref.length().unwrap_or(0),
                 started.elapsed(),
@@ -5182,7 +5272,7 @@ async fn sync_with_progress(
     flush_hud.detach();
     let tail = format_sync_outcome(&summary, drops, errors, started.elapsed());
     let final_line = sync_status_line(
-        name,
+        label,
         bar.position(),
         bar.length().unwrap_or(0),
         started.elapsed(),
@@ -5576,6 +5666,7 @@ fn status_json(
         .map(|adapter| {
             serde_json::json!({
                 "name": adapter.name,
+                "path": adapter.path,
                 "sessions": adapter.sessions,
                 "fresh": adapter.plan.map(|plan| plan.fresh),
                 "pending": adapter.plan.map(|plan| plan.pending),
@@ -5617,6 +5708,7 @@ fn status_json(
         "local": {
             "host": local.hostname,
             "adapters": local_adapters,
+            "adapters_error": local.adapters_error,
             "pending_known": local.pending_known,
             "last_sync": local
                 .last_sync
@@ -5790,6 +5882,13 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
 /// locally cached freshness map (see [`local_status`]).
 struct LocalAdapterStatus {
     name: String,
+    /// The entry's resolved source dir (`None` for adapters without a `path`
+    /// key). JSON status carries it verbatim.
+    path: Option<String>,
+    /// True when the entry fanned out of a multi-path array - the text
+    /// renderer appends the dir to the name only then, so single-path output
+    /// stays unchanged.
+    fanned: bool,
     sessions: Option<usize>,
     plan: Option<pond::adapter::SyncPlan>,
 }
@@ -5797,6 +5896,10 @@ struct LocalAdapterStatus {
 struct LocalStatus {
     hostname: Option<String>,
     adapters: Vec<LocalAdapterStatus>,
+    /// A malformed `[adapters]` section (e.g. a bad `path` array) empties
+    /// `adapters`; this carries the resolver's message so status names the
+    /// problem instead of silently showing no sources.
+    adapters_error: Option<String>,
     /// Whether a locally cached rowmap chain existed: without one (a host
     /// that never synced) pending counts are unknown, never scanned for.
     pending_known: bool,
@@ -5830,13 +5933,24 @@ async fn local_status(
     let pending_known = rowmap.is_some();
     let oracle = pond::sessions::RowmapOracle(rowmap);
     let mut adapters = Vec::new();
-    for (name, blob) in loaded.resolve_adapters(None).unwrap_or_default() {
+    let (resolved, adapters_error) = match loaded.resolve_adapters(None) {
+        Ok(resolved) => (resolved, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
+    for (name, blob, fanout) in resolved {
         let Some(factory) = adapter::by_name(&name) else {
             continue;
         };
+        let path = blob
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let fanned = fanout.is_some();
         let Ok(opened) = factory.open(blob) else {
             adapters.push(LocalAdapterStatus {
                 name,
+                path,
+                fanned,
                 sessions: None,
                 plan: None,
             });
@@ -5853,6 +5967,8 @@ async fn local_status(
         };
         adapters.push(LocalAdapterStatus {
             name,
+            path,
+            fanned,
             sessions,
             plan,
         });
@@ -5867,6 +5983,7 @@ async fn local_status(
     LocalStatus {
         hostname,
         adapters,
+        adapters_error,
         pending_known,
         last_sync,
         schedule,
@@ -5881,15 +5998,19 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
     if let Some(hostname) = &local.hostname {
         output(&format!("{}      {hostname}", paint("host", dim())))?;
     }
-    // Pad the name column to the longest adapter name: a fixed width fused
+    // Pad the name column to the longest adapter label: a fixed width fused
     // long names with their counts ("claude-desktop-app11 sessions").
-    let name_width = local
+    let labels: Vec<String> = local
         .adapters
         .iter()
-        .map(|adapter| adapter.name.len())
-        .max()
-        .unwrap_or(0)
-        + 2;
+        .map(|adapter| {
+            adapter_label(
+                &adapter.name,
+                adapter.path.as_deref().filter(|_| adapter.fanned),
+            )
+        })
+        .collect();
+    let name_width = labels.iter().map(String::len).max().unwrap_or(0) + 2;
     for (index, adapter) in local.adapters.iter().enumerate() {
         let label = if index == 0 {
             paint("local", dim()) + "     "
@@ -5926,8 +6047,15 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
         };
         output(&format!(
             "{label}{:<name_width$}{detail}",
-            adapter.name,
+            labels[index],
             name_width = name_width,
+        ))?;
+    }
+    if let Some(error) = &local.adapters_error {
+        output(&format!(
+            "{}     {}",
+            paint("local", dim()),
+            paint(&format!("adapters config error - {error}"), red()),
         ))?;
     }
     if !local.adapters.is_empty() && !local.pending_known {
@@ -6532,6 +6660,20 @@ mod tests {
         assert_eq!(first["name"], "claude-code");
         assert_eq!(first["enabled"], true);
         assert_eq!(first["path"], "/tmp/cc");
+    }
+
+    #[test]
+    fn adapters_list_json_mirrors_a_multi_path_entry_as_an_array() {
+        let config = Config::load_str(
+            "[adapters.claude-code]\nenabled = true\npath = [\"/tmp/cc\", \"/tmp/cc-work\"]\n",
+        )
+        .expect("configured");
+        let json = adapters_list_json(&config).expect("json builds");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            value["configured"][0]["path"],
+            serde_json::json!(["/tmp/cc", "/tmp/cc-work"]),
+        );
     }
 
     #[test]

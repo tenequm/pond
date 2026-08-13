@@ -20,6 +20,14 @@ secret_access_key = "..."
 enabled = true
 ```
 
+An adapter's `path` accepts a single dir or an array - useful when one tool keeps several transcript trees (e.g. a relocated `CLAUDE_CONFIG_DIR` for a work subscription); every listed dir rides the same sync:
+
+```toml
+[adapters.claude-code]
+enabled = true
+path = ["~/.claude/projects", "~/work-claude/projects"]
+```
+
 ## Environment
 
 - `POND_STORAGE_PATH` - storage URL (overrides `[storage].path`)
