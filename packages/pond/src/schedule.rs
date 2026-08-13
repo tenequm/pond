@@ -1036,10 +1036,16 @@ mod windows {
 
         // Write the XML task definition to a temp file; schtasks /Create /XML
         // requires a file path. Pass the PathBuf directly to avoid to_str()
-        // panics on non-UTF-8 paths.
+        // panics on non-UTF-8 paths. The bytes MUST be UTF-16LE with a BOM:
+        // schtasks reads a BOM-less file through the ANSI code page, so a
+        // UTF-8 write would mojibake any non-ASCII state path (e.g. a
+        // non-ASCII Windows username) into a task action pointing at a
+        // nonexistent shim - registration "succeeds" and every tick silently
+        // does nothing. UTF-16LE+BOM matches the declaration in `task_xml`
+        // and the encoding Task Scheduler's own XML export produces.
         let xml = task_xml(&vbs, every);
         let tmp_xml = pond_state.join("pond-sync-task.xml.tmp");
-        std::fs::write(&tmp_xml, &xml)
+        std::fs::write(&tmp_xml, utf16le_bom(&xml))
             .with_context(|| format!("failed to write {}", tmp_xml.display()))?;
         let create_result = Command::new("schtasks")
             .args(["/Create", "/TN", TASK_NAME, "/XML"])
@@ -1241,6 +1247,18 @@ mod windows {
         String::from_utf16_lossy(&units)
     }
 
+    /// Encode `text` as UTF-16LE with a BOM - the shape `schtasks /Create
+    /// /XML` decodes correctly on every system code page (a BOM-less file is
+    /// read as ANSI, mojibaking non-ASCII paths).
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
     #[cfg(test)]
     mod tests {
         #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -1279,6 +1297,19 @@ mod windows {
                 bytes.extend_from_slice(&unit.to_le_bytes());
             }
             assert_eq!(decode_console(&bytes), "hello");
+        }
+
+        #[test]
+        fn utf16le_bom_leads_with_bom_and_round_trips_non_ascii() {
+            // The task XML file MUST carry a UTF-16LE BOM: schtasks reads a
+            // BOM-less file as ANSI, mojibaking non-ASCII state paths.
+            let text = "C:\\Users\\p\u{f6}nd \u{e9}tat\\pond-sync.vbs";
+            let bytes = utf16le_bom(text);
+            assert_eq!(&bytes[..2], &[0xFF, 0xFE], "BOM must lead the file");
+            assert_eq!(bytes.len(), 2 + text.encode_utf16().count() * 2);
+            // decode_console is the module's own BOM-aware reader; the pair
+            // must round-trip exactly.
+            assert_eq!(decode_console(&bytes), text);
         }
 
         #[test]
