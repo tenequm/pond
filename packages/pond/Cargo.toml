@@ -103,9 +103,10 @@ fastrand = "2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 indicatif = "0.18"
-# On unix, lance's `protoc` feature vendors protoc via protobuf-src (built from
-# source). protobuf-src does not link on Windows (absl/UCRT unresolved externals),
-# so Windows builds omit the feature and use a system protoc found via PATH/PROTOC.
+# lance's `protoc` feature vendors protoc via protobuf-src (built from source).
+# protobuf-src does not link with MSVC (absl/UCRT unresolved externals), so MSVC
+# builds use a system protoc found via PATH/PROTOC. The feature is activated for
+# non-MSVC targets (unix + windows-gnu) via the per-target gate below.
 lance = { version = "8.0.0" }
 lance-arrow = "8.0.0"
 # `pond_sql` registers lance's JSON / contains_tokens UDFs on the SQL
@@ -173,8 +174,11 @@ zstd = "0.13"
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
 libc = "0.2"
-# Vendor protoc via protobuf-src on unix (builds from source, links cleanly).
-# Windows uses a system protoc instead - see the [dependencies] lance note.
+
+# Vendor protoc via protobuf-src on all non-MSVC targets: unix (links cleanly)
+# and windows-gnu (the cargo-zigbuild cross-build used by the release pipeline).
+# MSVC builds use a system protoc instead (see the [dependencies] lance note).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
 lance = { version = "8.0.0", features = ["protoc"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -200,8 +204,7 @@ lance-linalg = "8.0.0"
 # Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
 # inverted index under different tokenizers (ngram vs simple) via the raw lance
 # create_index API and measure the index-size / RAM / latency tradeoff.
-# The `protoc` feature is unix-only (see the [dependencies] lance note); on
-# Windows this dev-dep uses a system protoc, matching the main dependency.
+# The `protoc` feature is activated via the non-MSVC per-target gate below.
 lance = { version = "8.0.0" }
 lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
@@ -223,6 +226,10 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 # plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# Vendor protoc for integration/bench tests on non-MSVC targets, matching the
+# main [dependencies] gate (see the [dependencies] lance note).
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 lance = { version = "8.0.0", features = ["protoc"] }
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
