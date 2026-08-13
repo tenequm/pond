@@ -608,16 +608,22 @@ fn run_secret_command(set: &str, field: &str, command: &str) -> Result<String> {
     {
         return Ok(hit.clone());
     }
-    // The command is a shell line (pipes, `op read`, etc.), so run it through
-    // the platform shell: `cmd /C` on Windows, `sh -c` elsewhere.
-    let (shell, shell_flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+    // On Windows, pass the command string verbatim with `raw_arg` so cmd.exe
+    // receives it without MSVCRT-style re-quoting (`arg` would quote/escape the
+    // string, and cmd does not parse that escaping scheme). `COMSPEC` is the
+    // canonical way to locate cmd.exe; `sh -c` handles all other platforms.
+    #[cfg(windows)]
+    let output = {
+        use std::os::windows::process::CommandExt as _;
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd".into());
+        std::process::Command::new(shell)
+            .raw_arg(format!("/C {command}"))
+            .output()
+            .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?
     };
-    let output = std::process::Command::new(shell)
-        .arg(shell_flag)
-        .arg(command)
+    #[cfg(not(windows))]
+    let output = std::process::Command::new("sh")
+        .args(["-c", command])
         .output()
         .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?;
     if !output.status.success() {
@@ -4724,6 +4730,16 @@ mod tests {
 
         let io_fault = anyhow::anyhow!("connection reset").context("optimize_indices failed");
         assert!(!is_index_error(&io_fault));
+    }
+
+    #[test]
+    fn secret_command_with_space_round_trips() {
+        // The command has spaces; with the old Windows `arg(command)` code
+        // cmd.exe would receive the whole string MSVCRT-quoted and misparse it.
+        // With `raw_arg(format!("/C {command}"))` it receives the raw form.
+        // Both Unix (sh -c) and Windows (cmd /C) should produce the word "hello".
+        let result = run_secret_command("test", "field", "echo hello").unwrap();
+        assert_eq!(result, "hello");
     }
 
     #[test]
