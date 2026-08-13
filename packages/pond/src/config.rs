@@ -914,12 +914,13 @@ impl EmbeddingsConfig {
     }
 }
 
-/// Write `config.toml` with owner-only perms (0600). The file can carry a
+/// Write `config.toml` with owner-only perms on Unix (0600). The file can carry a
 /// plaintext `secret_access_key` (inline `[creds.*]`), so it must never be
 /// group/world-readable - matching the AWS CLI's 0600 on its credentials file.
-/// Unix only; Windows is out of v1 scope. Order is truncate -> chmod -> write,
-/// so the secret is only ever written once perms are already 0600, even when
-/// repairing a pre-existing 0644 file.
+/// On Unix, order is truncate -> chmod -> write so the secret is only written
+/// once perms are already 0600, even when repairing a pre-existing 0644 file.
+/// On Windows, the file is written with default ACLs (user-scoped under
+/// `%APPDATA%\pond`); explicit ACL hardening is not applied.
 pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {

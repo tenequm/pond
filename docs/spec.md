@@ -110,9 +110,13 @@ These are stable positions. pond will not:
 ### 2.4 Platform
 
 Linux, macOS, and Windows. On Windows the vendored protoc build (`protobuf-src`)
-does not link, so a system `protoc` is used at build time; the scheduler backs
-onto Task Scheduler in place of launchd/systemd. Embeddings run on the CPU
-backend (Metal is macOS-only, CUDA is Linux opt-in).
+does not link with MSVC, so a system `protoc` is used at build time (the published
+binary is a windows-gnu cross-compile and vendors protoc via the same path as
+Linux/macOS; only `cargo install` on an MSVC toolchain needs a system `protoc`).
+The scheduler backs onto Task Scheduler in place of launchd/systemd.
+`local-store-durability` (Section 3.3) relies on `local-store-self-heal` on
+Windows instead of the Unix fsync wrapper (dir-fsync semantics differ).
+Embeddings run on the CPU backend (Metal is macOS-only, CUDA is Linux opt-in).
 
 ---
 
@@ -160,7 +164,7 @@ Schema versioning lives at the dataset level - the Lance manifest and a dataset-
 
 #### `local-store-durability`
 
-On a local-filesystem store on **unix**, every object-store write MUST be made durable - file bytes and parent directory fsynced - before the write returns, applied through Lance's own object-store wrapping seam so `lance-chokepoints-storage` still holds. **Windows** does not apply this rule: its local stores rely on `local-store-self-heal` for crash recovery instead (a different trade-off chosen because the UCRT fsync semantics differ from POSIX). Why (unix): `LocalFileSystem` publishes a file's name via hard-link/rename without syncing its bytes, so a hard host stop (power loss, VM reset, kernel panic) can persist a manifest's name while dropping its content - a zero-byte manifest at the head of `_versions/` that permanently poisons the table.
+On a local-filesystem store on **unix**, every object-store write MUST be made durable - file bytes and parent directory fsynced - before the write returns, applied through Lance's own object-store wrapping seam so `lance-chokepoints-storage` still holds (the wrapper wraps the store; no code reaches around Lance). **Windows** does not apply this rule: Windows local commits route through a different handler with different directory-fsync semantics, and local stores rely on `local-store-self-heal` for crash recovery instead. Why (unix): `LocalFileSystem` publishes a file's name via hard-link/rename without syncing its bytes, so a hard host stop (power loss, VM reset, kernel panic) can persist a manifest's name while dropping its content - a zero-byte manifest at the head of `_versions/` that permanently poisons the table. Syncing at the seam is ordering-correct by construction: each artifact is durable before Lance proceeds to the next, so data files and transaction manifests are on disk before the commit that names them.
 
 #### `local-store-self-heal`
 

@@ -4743,6 +4743,22 @@ mod tests {
     }
 
     #[test]
+    fn secret_command_with_space_and_quote_round_trips() {
+        // The reviewer explicitly required a case with BOTH a space AND a quote.
+        // Old Windows `arg(command)` would MSVCRT-escape the quotes, making
+        // cmd.exe see a backslash-mangled string. With `raw_arg` it is literal.
+        let result = run_secret_command("test2", "q", r#"echo "hello world""#).unwrap();
+        // cmd /C echo "hello world" preserves the outer quotes in its output;
+        // sh -c 'echo "hello world"' strips them (shell quoting, not echoed).
+        #[cfg(windows)]
+        assert_eq!(
+            result, r#""hello world""#,
+            "cmd echo must preserve outer quotes"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(result, "hello world", "sh must strip outer quotes");
+    }
+    #[test]
     fn prune_keeps_live_uuid_dirs_and_drops_dead_ones() {
         let temp = TempDir::new().unwrap();
         let indices = temp.path().join("bkt/messages.lance/_indices");

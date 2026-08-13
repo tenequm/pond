@@ -929,16 +929,17 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    //! Windows Task Scheduler backend. The scheduled action is a generated
-    //! `.cmd` wrapper (`<pond_state_dir>/pond-sync.cmd`) that pins
-    //! `XDG_STATE_HOME`, runs `pond sync -q --no-wait`, and appends output to
-    //! `<pond_state_dir>/sync.log`. Using a wrapper file keeps pond out of
-    //! schtasks quoting entirely - the same idea as the unix plist/cron file.
+    //! Windows Task Scheduler backend. The scheduled action chain:
     //!
-    //! The task is created via `/XML` so we can provide a `<Settings>` block:
-    //! AllowStartIfOnBatteries + DontStopIfGoingOnBatteries (battery-friendly),
-    //! StartWhenAvailable (catch-up after downtime - analog of systemd's
-    //! `Persistent=true`), and Hidden (windowless, no console on each tick).
+    //! 1. `.cmd` wrapper (`<pond_state_dir>/pond-sync.cmd`): pins `XDG_STATE_HOME`,
+    //!    runs `pond sync -q --no-wait`, appends output to the sync log.
+    //! 2. `.vbs` shim (`<pond_state_dir>/pond-sync.vbs`): launches the `.cmd` via
+    //!    `WScript.Shell.Run(..., 0, False)` - the `0` WindowStyle suppresses the
+    //!    console window that `cmd.exe` would otherwise pop on every tick.
+    //!    `<Hidden>` in the task XML only hides the task in Task Scheduler UI; the
+    //!    shim is what prevents a visible terminal from flashing every 5 minutes.
+    //! 3. Task created via `/XML` with a `<Settings>` block: battery-friendly,
+    //!    `StartWhenAvailable` (catch-up after downtime, systemd `Persistent=true`).
 
     use std::path::PathBuf;
     use std::process::Command;
@@ -972,14 +973,26 @@ mod windows {
         let bin = pond_bin();
         let log = super::log_path();
         // state_root is what we pin into XDG_STATE_HOME; pond_state_dir is
-        // the subdirectory where the wrapper, log, and lock files live.
+        // the subdirectory where the wrapper, shim, log, and lock files live.
         let state_root = crate::syncstate::state_root();
         let pond_state = crate::syncstate::pond_state_dir();
         std::fs::create_dir_all(&pond_state)
             .with_context(|| format!("failed to create {}", pond_state.display()))?;
 
-        // The `.cmd` wrapper runs under cmd.exe so `>>` redirection works
-        // without quoting the entire command line inside schtasks.
+        // Gate on % in the state dir: the .vbs path goes into the XML <Arguments>
+        // element, where Task Scheduler expands %VAR% at runtime with NO escape
+        // syntax. Mirror the unix gate that blocks % in cron/plist templates.
+        let state_str = state_root.display().to_string();
+        if state_str.contains('%') {
+            bail!(
+                "state dir {state_str:?} contains '%' which Task Scheduler expands \
+                 in the task XML arguments with no escape syntax; it resolves from \
+                 XDG_STATE_HOME, falling back to %USERPROFILE%\\.local\\state - set \
+                 XDG_STATE_HOME to a path without '%' and re-run `pond schedule start`"
+            );
+        }
+
+        // The `.cmd` wrapper runs under cmd.exe so `>>` redirection works.
         // `%` is expansion-active in batch even inside double-quoted `set`
         // values, so escape it as `%%` in all three embedded paths.
         let escape_batch = |s: &str| s.replace('%', "%%");
@@ -988,16 +1001,29 @@ mod windows {
             "@echo off\r\n\
              set \"XDG_STATE_HOME={state}\"\r\n\
              \"{bin}\" sync -q --no-wait >> \"{log}\" 2>&1\r\n",
-            state = escape_batch(&state_root.display().to_string()),
+            state = escape_batch(&state_str),
             bin = escape_batch(&bin.display().to_string()),
             log = escape_batch(&log.display().to_string()),
         );
 
-        // Already-scheduled no-op: wrapper content unchanged and task exists
-        // at the same cadence means registration is not needed.
+        // The `.vbs` shim invokes the `.cmd` with WindowStyle=0 (hidden), so
+        // cmd.exe does not pop a visible console window on every tick.
+        // `<Hidden>true</Hidden>` in the task XML only hides the task in the
+        // Task Scheduler UI; the shim is what prevents the console flash.
+        let vbs = pond_state.join("pond-sync.vbs");
+        let vbs_body = format!(
+            "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\"\", 0, False\r\n",
+            wrapper.display(),
+        );
+
+        // Already-scheduled no-op: both artifact bodies unchanged and task
+        // exists at the same cadence means registration is not needed.
         let unchanged = std::fs::read_to_string(&wrapper)
             .map(|existing| existing == wrapper_body)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && std::fs::read_to_string(&vbs)
+                .map(|existing| existing == vbs_body)
+                .unwrap_or(false);
         if unchanged
             && let Ok(Active {
                 every: registered, ..
@@ -1009,20 +1035,16 @@ mod windows {
         }
 
         // Write the XML task definition to a temp file; schtasks /Create /XML
-        // requires a file path, not stdin.
-        let xml = task_xml(&wrapper, every);
+        // requires a file path. Pass the PathBuf directly to avoid to_str()
+        // panics on non-UTF-8 paths.
+        let xml = task_xml(&vbs, every);
         let tmp_xml = pond_state.join("pond-sync-task.xml.tmp");
         std::fs::write(&tmp_xml, &xml)
             .with_context(|| format!("failed to write {}", tmp_xml.display()))?;
         let create_result = Command::new("schtasks")
-            .args([
-                "/Create",
-                "/TN",
-                TASK_NAME,
-                "/XML",
-                tmp_xml.to_str().unwrap_or("pond-sync-task.xml.tmp"),
-                "/F",
-            ])
+            .args(["/Create", "/TN", TASK_NAME, "/XML"])
+            .arg(&tmp_xml)
+            .arg("/F")
             .output()
             .context("failed to run schtasks /Create");
         let _ = std::fs::remove_file(&tmp_xml); // best-effort temp cleanup
@@ -1035,10 +1057,12 @@ mod windows {
             );
         }
 
-        // Write the wrapper AFTER /Create succeeds: a failed /Create must not
-        // leave a wrapper that points at a non-existent task.
+        // Write both artifacts AFTER /Create succeeds: a failed /Create must not
+        // leave a wrapper or shim that points at a non-existent task.
         std::fs::write(&wrapper, &wrapper_body)
             .with_context(|| format!("failed to write {}", wrapper.display()))?;
+        std::fs::write(&vbs, &vbs_body)
+            .with_context(|| format!("failed to write {}", vbs.display()))?;
 
         pond::output::line(&super::render_state(&super::State::Active {
             backend: "task-scheduler",
@@ -1079,7 +1103,12 @@ mod windows {
     }
 
     /// Generate Task Scheduler XML for the pond-sync task.
-    fn task_xml(wrapper: &std::path::Path, every: ScheduleEvery) -> String {
+    ///
+    /// The `<Action>` runs `wscript.exe //B //NoLogo <vbs>` rather than the `.cmd`
+    /// wrapper directly: WScript.Shell.Run with WindowStyle=0 suppresses the
+    /// console window that `cmd.exe` would otherwise show on every tick. The `.vbs`
+    /// shim calls the `.cmd` with Run(..., 0, False).
+    fn task_xml(vbs: &std::path::Path, every: ScheduleEvery) -> String {
         let trigger = match every {
             ScheduleEvery::D1 => "    <CalendarTrigger>\n\
                  \x20\x20\x20\x20  <StartBoundary>2000-01-01T03:00:00</StartBoundary>\n\
@@ -1109,6 +1138,9 @@ mod windows {
                 )
             }
         };
+        // Task Scheduler expands %VAR% in <Arguments> at runtime; the % gate in
+        // start() ensures the vbs path is free of '%' before we reach here.
+        let vbs_str = xml_escape(&vbs.display().to_string());
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
              <Task version=\"1.2\" \
@@ -1130,11 +1162,11 @@ mod windows {
              \x20\x20</Settings>\n\
              \x20\x20<Actions Context=\"Author\">\n\
              \x20\x20  <Exec>\n\
-             \x20\x20    <Command>{cmd}</Command>\n\
+             \x20\x20    <Command>wscript.exe</Command>\n\
+             \x20\x20    <Arguments>//B //NoLogo &quot;{vbs_str}&quot;</Arguments>\n\
              \x20\x20  </Exec>\n\
              \x20\x20</Actions>\n\
-             </Task>\n",
-            cmd = xml_escape(&wrapper.display().to_string()),
+             </Task>\n"
         )
     }
 
@@ -1216,7 +1248,7 @@ mod windows {
 
         #[test]
         fn all_cadences_round_trip_through_task_xml() {
-            let wrapper = std::path::Path::new("C:\\pond\\pond-sync.cmd");
+            let vbs = std::path::Path::new("C:\\pond\\pond-sync.vbs");
             for every in [
                 ScheduleEvery::M5,
                 ScheduleEvery::M15,
@@ -1224,7 +1256,7 @@ mod windows {
                 ScheduleEvery::H6,
                 ScheduleEvery::D1,
             ] {
-                let xml = task_xml(wrapper, every);
+                let xml = task_xml(vbs, every);
                 let parsed = parse_interval_from_xml(&xml);
                 assert_eq!(parsed, Some(every), "cadence {every:?} did not round-trip");
             }
@@ -1250,13 +1282,35 @@ mod windows {
         }
 
         #[test]
-        fn task_xml_contains_expected_settings() {
-            let wrapper = std::path::Path::new("C:\\pond\\pond-sync.cmd");
-            let xml = task_xml(wrapper, ScheduleEvery::M5);
+        fn task_xml_uses_wscript_and_contains_expected_settings() {
+            let vbs = std::path::Path::new("C:\\pond\\pond-sync.vbs");
+            let xml = task_xml(vbs, ScheduleEvery::M5);
+            // wscript.exe action - no console window on each tick
+            assert!(xml.contains("<Command>wscript.exe</Command>"));
+            assert!(xml.contains("//B //NoLogo"));
+            assert!(xml.contains("pond-sync.vbs"));
+            // battery + catch-up settings
             assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
             assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
             assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
             assert!(xml.contains("<Hidden>true</Hidden>"));
+        }
+
+        #[test]
+        fn vbs_body_has_windowstyle_zero_and_quotes_wrapper() {
+            // The .vbs shim must pass WindowStyle=0 (hidden) and wrap the
+            // wrapper path in VBScript double-quotes so spaces survive.
+            let wrapper = std::path::Path::new("C:\\Users\\Adam\\pond sync\\pond-sync.cmd");
+            let wrapper_str = wrapper.display().to_string();
+            // Simulate what start() builds for the vbs_body.
+            let vbs_body = format!(
+                "CreateObject(\"WScript.Shell\").Run \"\"\"{wrapper_str}\"\"\", 0, False\r\n",
+            );
+            assert!(vbs_body.contains(", 0, False"), "must pass WindowStyle=0");
+            assert!(
+                vbs_body.contains(&format!("\"\"\"{wrapper_str}\"\"\"")),
+                "path must be triple-double-quoted (VBS literal-quote idiom)"
+            );
         }
     }
 }

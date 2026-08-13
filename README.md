@@ -86,7 +86,12 @@ cargo install --path packages/pond --features cuda
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
 
-On Windows, the Homebrew/Nix packages do not apply; install with `cargo install pond-db` or build from source. Both need a protobuf compiler (`protoc`) on `PATH` first (`winget install Google.Protobuf`), because the vendored protoc build used on Unix does not link with MSVC. Embeddings run on the CPU backend.
+On Windows, the Homebrew/Nix packages do not apply. The easiest install is
+`cargo binstall pond-db` (downloads the prebuilt windows-gnu binary, no `protoc`
+needed). Alternatively `cargo install pond-db` builds from source - this requires
+`protoc` on `PATH` (`winget install Google.Protobuf`) because `protobuf-src` does
+not link with MSVC; the published binary uses windows-gnu and vendors protoc
+automatically. Embeddings run on the CPU backend.
 
 ## Usage
 

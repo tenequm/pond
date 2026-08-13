@@ -110,6 +110,8 @@ impl Sandbox {
             .arg(self.store_path())
             .env("HOME", self.temp.path().join("home"))
             .env("USERPROFILE", self.temp.path().join("home"))
+            .env("APPDATA", self.temp.path().join("config"))
+            .env("LOCALAPPDATA", self.temp.path().join("data"))
             .env("XDG_DATA_HOME", self.temp.path().join("data"))
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("XDG_CACHE_HOME", self.temp.path().join("cache"))
