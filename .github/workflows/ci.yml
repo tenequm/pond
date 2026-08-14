@@ -108,7 +108,12 @@ jobs:
     # serializing the release path behind them. Two full dep-graph compiles
     # (test profile, then dist) on a 4-vCPU hosted runner need the headroom.
     timeout-minutes: 120
-    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: true }
+    # Not cancellable, same rule as dist-build: this job produces a release
+    # artifact that publish-release needs. Cancelling it mid-release would
+    # cancel publish-release with it, and after release-plz cuts the tag the
+    # is_release gate is false forever - an interrupted publish cannot
+    # auto-recover. Ordinary builds stay cancellable; artifact producers do not.
+    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: false }
     # Two variables are deliberately absent here.
     #
     # CARGO_TARGET_DIR: a short absolute target dir would dodge MSVC's MAX_PATH
@@ -320,7 +325,8 @@ jobs:
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
 
       # Two artifacts, not one: the macOS jobs only need the 38MB darwin
-      # tarball, while publish needs all four plus checksums.
+      # tarball, while publish needs all three cross-compiled tarballs plus
+      # checksums (the Windows zip reaches it separately, from windows-verify).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-darwin
