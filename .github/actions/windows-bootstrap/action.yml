@@ -80,6 +80,14 @@ runs:
         s3-access-key-id: ${{ inputs.kache-access-key-id }}
         s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
         github-cache: false
+        # Pinned, because the action's default is "resolve latest at run time" -
+        # so an upstream release can change this job with no commit here. kache
+        # 0.14.0 bumped CACHE_KEY_VERSION to 25, which invalidates every stored
+        # entry: the first run after it took 138 min against 9.5 min warm. That
+        # cost is fine when we choose it and unacceptable as a surprise. Bump
+        # deliberately, expecting one slow rewarming run. Matches how
+        # .github/actions/bootstrap pins KACHE_VERSION for Linux.
+        version: v0.14.2
         manifest-key: ${{ inputs.manifest-key }}
         # The hosted runner's disk is far smaller than kache's 50GiB default,
         # and an evicted local entry costs a remote fetch, not a rebuild.
