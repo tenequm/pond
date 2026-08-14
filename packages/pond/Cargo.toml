@@ -79,8 +79,11 @@ clap = { version = "4.6", features = ["derive", "env"] }
 clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
 clap_complete = "4.6"
 # Clack-style prompt stack for `pond init` and the sync adapter picker; built on
-# console + indicatif, both already in the tree.
-cliclack = "0.5"
+# console + indicatif, both already in the tree. 0.5.6 is a floor, not a
+# preference: through 0.5.4 a prompt left `ENABLE_PROCESSED_INPUT` on, so on
+# Windows Ctrl-C reached the handler thread while the prompt kept waiting -
+# the wizard could not be cancelled at all.
+cliclack = "0.5.6"
 comfy-table = "7"
 # Ctrl-C-as-Esc for the init wizard: a no-op handler makes `term.read_key()`
 # fail inside cliclack prompts, so cancellation flows through the same

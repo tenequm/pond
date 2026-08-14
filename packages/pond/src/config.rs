@@ -8,6 +8,7 @@
 //! at all (spec.md#storage-configless) - URLs + env vars are sufficient.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
@@ -138,7 +139,9 @@ pub fn local_path(url: &Url) -> Option<PathBuf> {
 pub fn child_uri(base: &Url, suffix: &str) -> String {
     // For local URLs we strip the `file://` prefix so log lines and error
     // messages render as plain paths (`/srv/pond/sessions.lance`), matching
-    // what pond used to emit before the URL migration.
+    // what pond used to emit before the URL migration. On Windows that emits a
+    // native `C:\...` path, which Lance reads back through the drive-letter
+    // branch of `uri_to_url` (pinned by `child_uri_round_trips_a_windows_drive_path`).
     if let Some(path) = local_path(base) {
         return path.join(suffix).display().to_string();
     }
@@ -944,13 +947,24 @@ fn take_enabled(name: &str, blob: &Value) -> Option<(String, Value)> {
 /// process-wide `HOME` env var (`std::env::set_var` is `unsafe` under
 /// edition 2024 and pond forbids unsafe code). Unset vars and `~user` forms
 /// pass through unchanged - never guess.
+///
+/// The var syntax is `$VAR` on every platform, deliberately: `%VAR%` does not
+/// expand on Windows. One config file has to mean one thing everywhere, and a
+/// bare `%` is a legal filename character that must survive verbatim.
 pub fn expand_home_under(path: &Path, home: &Path) -> PathBuf {
     let Some(text) = path.to_str() else {
         return path.to_path_buf();
     };
+    // shellexpand only knows `~/`, but `~\` is the natural Windows spelling and
+    // lance's own tilde expansion accepts it - diverging would put pond's store
+    // and lance's URL expansion in different directories.
+    let text = match text.strip_prefix("~\\") {
+        Some(rest) if cfg!(windows) => Cow::Owned(format!("~/{rest}")),
+        _ => Cow::Borrowed(text),
+    };
     let home_text = home.to_string_lossy();
     let expanded = shellexpand::full_with_context_no_errors(
-        text,
+        text.as_ref(),
         || Some(home_text.clone()),
         |var| std::env::var(var).ok(),
     );
@@ -969,18 +983,19 @@ pub fn contract_home_under(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// The user's home directory, resolved per-OS from the process environment.
-/// Windows reads `USERPROFILE` (the native home; `HOME`, when present at all,
-/// is a POSIX-style path set by git-bash/msys/Cygwin and points somewhere a
-/// native binary must not follow). Unix reads `HOME`. Empty values are treated
-/// as unset. Every home-relative default path and the adapter auto-discovery
-/// probes resolve through this, so pond finds `~/.claude`, `~/.omp`, and
-/// friends on Windows the same way it does on Unix.
+/// The user's home directory. Every home-relative default path and every
+/// adapter auto-discovery probe resolves through this, so pond finds
+/// `~/.claude`, `~/.omp`, and friends on Windows the same way it does on unix.
+///
+/// Delegated to std rather than read from the environment directly, because
+/// lance expands `~` in storage URLs through this same function - reimplementing
+/// it is how pond's home and lance's home come to disagree. std reads `HOME` on
+/// unix - falling back to the passwd entry when it is unset, where pond used to
+/// give up - and on Windows `USERPROFILE` then `GetUserProfileDirectory`
+/// (`HOME`, when set there at all, is a POSIX path from git-bash/msys that a
+/// native binary must not follow).
 pub fn home_dir() -> Option<PathBuf> {
-    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
 }
 
 /// [`contract_home_under`] against the process home. Returns the input
@@ -1021,8 +1036,9 @@ impl EmbeddingsConfig {
 /// group/world-readable - matching the AWS CLI's 0600 on its credentials file.
 /// On Unix, order is truncate -> chmod -> write so the secret is only written
 /// once perms are already 0600, even when repairing a pre-existing 0644 file.
-/// On Windows, the file is written with default ACLs (user-scoped under
-/// `%APPDATA%\pond`); explicit ACL hardening is not applied.
+/// On Windows no ACL code runs: a file under `%APPDATA%` inherits ACLs granting
+/// only the user, SYSTEM, and Administrators, which is the platform analog of
+/// 0600 - the same best-effort-within-the-home-dir posture as unix.
 pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1213,6 +1229,30 @@ mod tests {
             expand_home_under(Path::new("~user/elsewhere"), home),
             PathBuf::from("~user/elsewhere"),
         );
+    }
+
+    #[test]
+    fn expand_home_under_leaves_windows_paths_intact() {
+        let home = Path::new(r"C:\Users\me");
+        // A drive path survives byte-for-byte: shellexpand must not read any
+        // backslash as an escape.
+        assert_eq!(
+            expand_home_under(Path::new(r"C:\Users\me\.claude\projects"), home),
+            PathBuf::from(r"C:\Users\me\.claude\projects"),
+        );
+        // `%VAR%` is not the var syntax - a literal `%` is a legal filename
+        // character and must survive.
+        assert_eq!(
+            expand_home_under(Path::new(r"%APPDATA%\pond"), home),
+            PathBuf::from(r"%APPDATA%\pond"),
+        );
+        // `~\` is the Windows spelling of `~/`, and only expands there.
+        let expanded = expand_home_under(Path::new(r"~\.claude"), home);
+        if cfg!(windows) {
+            assert_eq!(expanded, PathBuf::from(r"C:\Users\me/.claude"));
+        } else {
+            assert_eq!(expanded, PathBuf::from(r"~\.claude"));
+        }
     }
 
     #[test]

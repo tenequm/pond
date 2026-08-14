@@ -2113,8 +2113,13 @@ impl Store {
 
     /// Remove this store's segment files (`-v{V}` bases, `-d{V}` deltas) for
     /// versions strictly older than `keep` (best-effort). A newer file belongs
-    /// to a sibling that advanced past us; unlinking a superseded file is safe
-    /// even if a sibling has it mapped - Unix keeps the inode alive until unmap.
+    /// to a sibling that advanced past us.
+    ///
+    /// Unlinking a superseded segment a sibling still has mapped is safe on
+    /// unix (the inode outlives the name) but simply *fails* on Windows, which
+    /// refuses to delete a mapped file at all. That leaks a stale `.rmm` until
+    /// the next build sweeps again - which is why every sweep is unconditional
+    /// rather than one-shot, and why the failure is logged, not swallowed.
     fn sweep_stale_rowmaps(cache_dir: &Path, store_key: &str, keep: u64) {
         let prefix = format!("rowmetamap-{store_key}-");
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
@@ -2136,15 +2141,32 @@ impl Store {
             if let Some(version) = version
                 && version < keep
             {
-                let _ = std::fs::remove_file(entry.path());
+                Self::reclaim(&entry.path());
             }
+        }
+    }
+
+    /// Best-effort delete of a rowmap cache artifact. Logged rather than
+    /// swallowed: on Windows this fails outright while any process holds the
+    /// file mapped, and the leaked segment would otherwise be invisible.
+    fn reclaim(path: &Path) {
+        if let Err(error) = std::fs::remove_file(path) {
+            tracing::debug!(
+                %error,
+                path = %path.display(),
+                "rowmap cache file not reclaimed; retried on the next sweep",
+            );
         }
     }
 
     /// Remove every segment file (`-v{V}` / `-d{V}`) for this store regardless of
     /// version - used when a discovered chain is unreadable (older MAGIC after an
     /// upgrade, or corruption) so the next build starts clean. Sound under the
-    /// build lock; POSIX keeps any inode a sibling still has mapped alive.
+    /// build lock.
+    ///
+    /// A segment a sibling still has mapped survives the purge on Windows (see
+    /// [`Self::sweep_stale_rowmaps`]); the rebuild below then republishes the
+    /// same version over it, which is the cycle `rowmap_purge_probe` pins down.
     fn purge_rowmaps(cache_dir: &Path, store_key: &str) {
         let prefix = format!("rowmetamap-{store_key}-");
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
@@ -2155,7 +2177,7 @@ impl Store {
                 && name.starts_with(&prefix)
                 && name.ends_with(".rmm")
             {
-                let _ = std::fs::remove_file(entry.path());
+                Self::reclaim(&entry.path());
             }
         }
     }
@@ -2171,7 +2193,7 @@ impl Store {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if crate::rowmap::is_orphan_temp(name, store_key) {
-                let _ = std::fs::remove_file(entry.path());
+                Self::reclaim(&entry.path());
             }
         }
     }

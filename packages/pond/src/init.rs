@@ -848,6 +848,31 @@ fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<
     wiz(picker.interact())
 }
 
+/// Run an agent CLI at its resolved path, never by bare name: Windows
+/// `CreateProcess` appends only `.exe`, so a `claude.cmd` shim is unspawnable
+/// and goes through the interpreter instead. `raw_arg` because MSVCRT argument
+/// quoting is not what cmd.exe parses (the trap `substrate::run_command`
+/// documents); the outer quote pair survives cmd's strip-first-and-last rule
+/// whether or not the path has spaces. `args` reach cmd unquoted, which both
+/// call sites satisfy by passing fixed literals.
+fn agent_command(bin: &Path, args: &[&str]) -> Command {
+    #[cfg(windows)]
+    if bin
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        use std::os::windows::process::CommandExt as _;
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd".into());
+        let mut command = Command::new(shell);
+        command.raw_arg(format!("/C \"\"{}\" {}\"", bin.display(), args.join(" ")));
+        return command;
+    }
+    let mut command = Command::new(bin);
+    command.args(args);
+    command
+}
+
 /// Detect agent CLIs and offer MCP registration plus the bundled skill.
 /// claude has an idempotent CLI surface (`mcp get` / `mcp add`), so pond
 /// drives it directly; codex gets the exact command to run instead - pond
@@ -861,9 +886,8 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
         )?;
         return Ok(());
     }
-    if claude.is_some() {
-        let registered = Command::new("claude")
-            .args(["mcp", "get", "pond"])
+    if let Some(claude) = &claude {
+        let registered = agent_command(claude, &["mcp", "get", "pond"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -885,10 +909,12 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
                 auto
             };
             if add {
-                let output = Command::new("claude")
-                    .args(["mcp", "add", "-s", "user", "pond", "--", "pond", "mcp"])
-                    .output()
-                    .context("failed to run `claude mcp add`")?;
+                let output = agent_command(
+                    claude,
+                    &["mcp", "add", "-s", "user", "pond", "--", "pond", "mcp"],
+                )
+                .output()
+                .context("failed to run `claude mcp add`")?;
                 if output.status.success() {
                     cliclack::log::success("mcp: registered in Claude Code (user scope)")?;
                 } else {
@@ -1161,6 +1187,28 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn agent_command_spawns_the_resolved_binary() {
+        let plain = Path::new("/opt/claude/bin/claude");
+        let command = agent_command(plain, &["mcp", "get", "pond"]);
+        assert_eq!(command.get_program(), plain.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["mcp", "get", "pond"],
+        );
+
+        #[cfg(windows)]
+        {
+            let shim = Path::new(r"C:\Program Files\nodejs\claude.cmd");
+            let command = agent_command(shim, &["mcp", "get", "pond"]);
+            assert_ne!(command.get_program(), shim.as_os_str());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [r#"/C ""C:\Program Files\nodejs\claude.cmd" mcp get pond""#],
+            );
+        }
+    }
 
     #[test]
     fn skill_sync_installs_updates_and_respects_declines() {

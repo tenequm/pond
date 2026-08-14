@@ -667,7 +667,43 @@ pub(crate) fn validate_path_id(
             format!("{kind} contains a path separator or traversal marker: {id}"),
         ));
     }
+    if let Some(reason) = windows_hostile(id) {
+        return Err(AdapterError::schema(
+            adapter,
+            location,
+            format!("{kind} {reason}: {id}"),
+        ));
+    }
     Ok(())
+}
+
+/// Matched without the extension - `NUL.jsonl` opens the NUL device too.
+const WINDOWS_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Why `segment` cannot be a filesystem name on Windows, or `None`. Enforced on
+/// every platform because archives are portable, and because each of these
+/// fails *silently* on Windows rather than loudly.
+fn windows_hostile(segment: &str) -> Option<&'static str> {
+    if segment.contains(':') {
+        return Some("contains ':', which names an NTFS alternate data stream on Windows");
+    }
+    if segment.ends_with('.') || segment.ends_with(' ') {
+        return Some("ends with a dot or space, which Windows silently strips");
+    }
+    let stem = segment
+        .split_once('.')
+        .map_or(segment, |(head, _)| head)
+        .trim_end();
+    if WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+    {
+        return Some("is a reserved Windows device name");
+    }
+    None
 }
 
 /// Resolve each `RestoredFile` to its absolute destination under `root`. Every
@@ -859,7 +895,25 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{RestoreFidelity, RestoredFile, write_restored_files};
+    use super::{RestoreFidelity, RestoredFile, validate_path_id, write_restored_files};
+
+    #[test]
+    fn validate_path_id_refuses_windows_hostile_segments() {
+        let ok = |id: &str| validate_path_id("t", "id", id, "loc").is_ok();
+        assert!(ok("ses_01HXY"));
+        assert!(ok("msg-1.jsonl"));
+        assert!(!ok("NUL"));
+        assert!(!ok("nul.jsonl"));
+        assert!(!ok("CoM9.txt"));
+        // A device name only as the whole stem.
+        assert!(ok("console.jsonl"));
+        assert!(ok("nullable"));
+        // Windows strips these, collapsing two ids onto one file.
+        assert!(!ok("session."));
+        assert!(!ok("session "));
+        assert!(!ok("C:session"));
+        assert!(!ok("session:stream"));
+    }
 
     /// A failed batch leaves nothing of itself behind - not the files it wrote,
     /// and not the directories it had to create to write them.

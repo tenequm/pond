@@ -178,10 +178,64 @@ fn parse_storage_path(input: &str) -> anyhow::Result<StorageUrl> {
 /// probe and the scheduler's stable-binary resolution (`schedule::pond_bin`).
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        let candidate = dir.join(name);
-        is_executable(&candidate).then_some(candidate)
+    find_in_dirs(name, std::env::split_paths(&paths))
+}
+
+/// [`find_on_path`] against explicit directories, so tests need not mutate the
+/// process `PATH` (`set_var` is unsafe under edition 2024, which pond denies).
+/// The `PATHEXT` leg is what finds the npm `claude.cmd` shim under the bare
+/// name `claude`.
+fn find_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.flat_map(|dir| {
+        let base = dir.join(name);
+        std::iter::once(base.clone()).chain(
+            executable_extensions()
+                .iter()
+                .map(move |ext| with_extension_appended(&base, ext)),
+        )
     })
+    .find(|candidate| is_executable(candidate))
+}
+
+/// Appends, unlike `Path::set_extension`, which would rewrite `pond.exe`.
+fn with_extension_appended(path: &Path, ext: &str) -> PathBuf {
+    let mut appended = path.as_os_str().to_owned();
+    appended.push(ext);
+    PathBuf::from(appended)
+}
+
+/// Nothing to append: on unix the execute bit, not the name, decides.
+#[cfg(unix)]
+fn executable_extensions() -> &'static [String] {
+    &[]
+}
+
+/// `PATHEXT`, or the documented default when unset. Normalized to uppercase
+/// with a leading dot so membership is a plain comparison, and resolved once -
+/// `is_executable` consults it per candidate.
+#[cfg(not(unix))]
+fn executable_extensions() -> &'static [String] {
+    static EXTENSIONS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        const DEFAULT: &str = ".COM;.EXE;.BAT;.CMD";
+        let configured = std::env::var("PATHEXT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT.to_owned());
+        configured
+            .split(';')
+            .map(str::trim)
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| {
+                let upper = ext.to_ascii_uppercase();
+                if upper.starts_with('.') {
+                    upper
+                } else {
+                    format!(".{upper}")
+                }
+            })
+            .collect()
+    });
+    &EXTENSIONS
 }
 
 #[cfg(unix)]
@@ -192,9 +246,14 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows has no execute bit - the extension decides. Checked before the stat.
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    let ext = format!(".{}", ext.to_ascii_uppercase());
+    executable_extensions().contains(&ext) && path.is_file()
 }
 
 /// Help palette tied to `pond::output`: bold headers/usage, cyan literals,
@@ -6494,6 +6553,51 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn find_in_dirs_resolves_a_bare_name_per_platform() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let dir = temp.path().to_path_buf();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(dir.join("claude.cmd"), "shim")?;
+            std::fs::write(dir.join("codex"), "not executable")?;
+            assert_eq!(find_in_dirs("claude", [dir.clone()].into_iter()), None);
+            assert_eq!(find_in_dirs("codex", [dir.clone()].into_iter()), None);
+
+            let exe = dir.join("codex");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+            assert_eq!(find_in_dirs("codex", [dir].into_iter()), Some(exe));
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(dir.join("claude.cmd"), "shim")?;
+            let found = find_in_dirs("claude", [dir.clone()].into_iter())
+                .expect("a bare name must resolve through PATHEXT");
+            // The candidate carries PATHEXT's uppercase extension while the
+            // file on disk is lowercase: NTFS matches either, but `Path`
+            // equality compares bytes even where the filesystem does not.
+            assert!(
+                found
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(dir.join("claude.cmd").to_string_lossy().as_ref()),
+                "got: {}",
+                found.display(),
+            );
+            // Appended, not replaced: `pond.exe` never becomes `pond.CMD`.
+            std::fs::write(dir.join("pond.exe"), "exe")?;
+            assert_eq!(
+                find_in_dirs("pond.exe", [dir.clone()].into_iter()),
+                Some(dir.join("pond.exe")),
+            );
+            std::fs::write(dir.join("codex"), "extensionless")?;
+            assert_eq!(find_in_dirs("codex", [dir].into_iter()), None);
+        }
+        Ok(())
+    }
 
     #[test]
     fn serve_bootstrap_acts_only_on_a_fully_unconfigured_pond() -> anyhow::Result<()> {

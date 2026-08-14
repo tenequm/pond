@@ -104,6 +104,21 @@ struct S3Endpoint {
 /// the object store as part of the path.
 const RECOGNIZED_QUERY_PARAMS: [&str; 3] = ["creds", "region", "virtual_hosted_style_request"];
 
+/// Refused at the seam rather than left to fail deep inside Lance:
+/// `object_store::Path::from_absolute_path` drops the UNC host
+/// ([arrow-rs-object-store#715](https://github.com/apache/arrow-rs-object-store/issues/715))
+/// and Lance fails end to end on shares
+/// ([lance#6616](https://github.com/lance-format/lance/issues/6616)), so an
+/// ungated network store opens somewhere else entirely. Lift when both land.
+fn network_store_rejected(input: &str) -> anyhow::Error {
+    anyhow!(
+        "storage path {input:?} is a Windows network path; the storage stack drops the host, so \
+         the store would silently open elsewhere. Use a path on a local drive, or a remote scheme \
+         (s3://, s3+https://, gs://, az://). Mapped network drives have the same fault and cannot \
+         be detected here."
+    )
+}
+
 impl StorageUrl {
     /// Parse a storage address (spec.md#storage-url-grammar): bare/`~` paths,
     /// `file://`, `s3://`, `s3+https://` / `s3+http://`, `gs://`, `az://`,
@@ -116,8 +131,38 @@ impl StorageUrl {
         // Bare paths, `~/...`, and `file://` go through Lance's own
         // `uri_to_url` so pond accepts exactly what Lance accepts.
         if !trimmed.contains("://") || trimmed.starts_with("file://") {
+            // Before Lance sees it. Order matters: an extended-length prefix
+            // can wrap either a share or a local drive, and only the first is
+            // a network path.
+            if trimmed
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+            {
+                return Err(network_store_rejected(trimmed));
+            }
+            if trimmed.starts_with(r"\\?\") {
+                bail!(
+                    "storage path {trimmed:?} uses the extended-length `\\\\?\\` prefix, which \
+                     pond does not accept: it is not understood consistently below pond, and it \
+                     leaks into every path handed to another program. Use the ordinary form \
+                     (`C:\\srv\\pond`)."
+                );
+            }
+            // `\\host\share` and `//host/share` are both UNC on Windows.
+            if trimmed.starts_with(r"\\") || (cfg!(windows) && trimmed.starts_with("//")) {
+                return Err(network_store_rejected(trimmed));
+            }
             let url =
                 uri_to_url(trimmed).with_context(|| format!("invalid storage path {trimmed:?}"))?;
+            // A `file://` URL with a host is the URL spelling of the same UNC
+            // path, on every platform - except `localhost`, which RFC 8089
+            // defines as equivalent to an empty host.
+            if url
+                .host_str()
+                .is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
+            {
+                return Err(network_store_rejected(trimmed));
+            }
             // Bare paths percent-encode `?` (a legal filename character), so
             // only an explicit `file://...?x=y` parses a query here. No local
             // scheme takes one; reject like the remote schemes do instead of
@@ -1454,6 +1499,10 @@ fn lance_progress(
 /// (`CommitConflict`, `RetryableCommitConflict`, `TooMuchWriteContention`).
 /// Everything else (timeouts, IAM denials, disk errors) is not a conflict.
 pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
+    #[cfg(windows)]
+    if is_transient_sharing_violation(error) {
+        return true;
+    }
     error.downcast_ref::<lance::Error>().is_some_and(|err| {
         matches!(
             err,
@@ -1461,6 +1510,23 @@ pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
                 | lance::Error::RetryableCommitConflict { .. }
                 | lance::Error::TooMuchWriteContention { .. }
         )
+    })
+}
+
+/// A local commit on Windows is a hard-link-then-delete (`RenameCommitHandler`),
+/// and either half fails while a scanner or sibling reader holds the staging
+/// manifest - transient, and the retry converges. Narrow on purpose: a real
+/// access-denied must fail rather than spin. `test` so it is exercised off
+/// Windows too; only the call site is platform-gated.
+#[cfg(any(windows, test))]
+fn is_transient_sharing_violation(error: &anyhow::Error) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    const CONTENDED: [i32; 2] = [32, 33];
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| CONTENDED.contains(&code))
     })
 }
 
@@ -4056,7 +4122,8 @@ pub fn store_key(location: &Url) -> String {
 
 /// Reclaim cached `_indices/<uuid>` dirs whose UUID is not in `keep`. Recurses
 /// to each `_indices` dir (the bucket prefix varies) and prunes its dead UUID
-/// children. Best-effort; unlink-safe (POSIX keeps an in-flight reader's inode).
+/// children. Best-effort: unlink-safe on unix, and on Windows a dir a reader
+/// still has open simply stays until the next prune.
 fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -4073,8 +4140,13 @@ fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet
             for child in children.flatten() {
                 if child.path().is_dir()
                     && !keep.contains(child.file_name().to_string_lossy().as_ref())
+                    && let Err(error) = std::fs::remove_dir_all(child.path())
                 {
-                    let _ = std::fs::remove_dir_all(child.path());
+                    tracing::debug!(
+                        %error,
+                        path = %child.path().display(),
+                        "stale index cache dir not reclaimed; retried on the next prune",
+                    );
                 }
             }
         } else {
@@ -4414,8 +4486,11 @@ async fn heal_local_dataset(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
+                // Windows refuses to rename a file another handle holds open,
+                // so name that case: opens are short-lived, and the next one
+                // heals. Without it this surfaces as a bare os error 5.
                 return Err(anyhow::Error::new(error).context(format!(
-                    "table {table_name}: failed to quarantine corrupt manifest {}",
+                    "table {table_name}: failed to quarantine corrupt manifest {}. If another pond process (or a scanner) has it open, close it and re-run - heal retries on the next open.",
                     path.display()
                 )));
             }
@@ -4720,6 +4795,28 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Built as layers, not a bare io error: the matcher has to see through
+    /// object_store's box, Lance's box, and the anyhow context.
+    #[test]
+    fn a_contended_windows_commit_reads_through_the_whole_error_chain() {
+        let contended = |raw: i32| {
+            let source = object_store::Error::Generic {
+                store: "LocalFileSystem",
+                source: Box::new(std::io::Error::from_raw_os_error(raw)),
+            };
+            anyhow::Error::from(lance::Error::from(source)).context("commit sessions")
+        };
+
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+        assert!(is_transient_sharing_violation(&contended(32)));
+        assert!(is_transient_sharing_violation(&contended(33)));
+        // ERROR_ACCESS_DENIED: a real permissions fault, never retried.
+        assert!(!is_transient_sharing_violation(&contended(5)));
+        assert!(!is_transient_sharing_violation(&anyhow::anyhow!(
+            "no io in this chain"
+        )));
+    }
+
     #[test]
     fn is_index_error_matches_lance_index_class_through_context() {
         let index_fault = anyhow::Error::from(lance::Error::index(
@@ -4921,6 +5018,53 @@ mod tests {
         assert!(err.contains("query params"), "got: {err}");
         // `?` in a bare path is a filename character, not a query.
         assert!(StorageUrl::parse("/tmp/a?b").is_ok());
+    }
+
+    /// `child_uri` hands Lance a native `C:\...` path for a local store, which
+    /// only works because `uri_to_url` reads a one-letter scheme as a drive.
+    #[cfg(windows)]
+    #[test]
+    fn child_uri_round_trips_a_windows_drive_path() {
+        let store = StorageUrl::parse(r"C:\srv\pond").unwrap();
+        let child = crate::config::child_uri(store.lance_url(), "sessions.lance");
+        assert!(child.starts_with(r"C:\srv\pond\"), "got: {child}");
+        assert!(StorageUrl::parse(&child).is_ok(), "got: {child}");
+    }
+
+    #[test]
+    fn storage_url_refuses_windows_network_paths() {
+        for input in [
+            r"\\fileserver\share\pond",
+            "file://fileserver/share/pond",
+            // A share wearing the extended-length prefix is still a share.
+            r"\\?\UNC\fileserver\share\pond",
+        ] {
+            let err = StorageUrl::parse(input)
+                .expect_err("a network path must be refused at the seam")
+                .to_string();
+            assert!(err.contains("Windows network path"), "got: {err}");
+        }
+        // An extended-length *local* path is refused too, but for its own
+        // reason - calling it a network path would be a lie.
+        let err = StorageUrl::parse(r"\\?\C:\srv\pond")
+            .expect_err("extended-length paths are refused")
+            .to_string();
+        assert!(err.contains("extended-length"), "got: {err}");
+        assert!(!err.contains("network path"), "got: {err}");
+
+        // Drive letters are not network paths, in either slash direction, and
+        // neither is a hostless `file://` URL - nor `localhost`, which RFC 8089
+        // makes equivalent to one.
+        assert!(StorageUrl::parse("file:///C:/srv/pond").is_ok());
+        assert!(StorageUrl::parse("file://localhost/srv/pond").is_ok());
+        #[cfg(windows)]
+        {
+            assert!(StorageUrl::parse(r"C:\srv\pond").is_ok());
+            assert!(StorageUrl::parse("C:/srv/pond").is_ok());
+            // Forward-slash UNC is UNC too, but only on Windows: on unix
+            // `//host/share` is an ordinary absolute path.
+            assert!(StorageUrl::parse("//fileserver/share/pond").is_err());
+        }
     }
 
     #[test]
