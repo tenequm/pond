@@ -41,7 +41,7 @@ tasks:
       cache: false
       outputStyle: stream
 
-  # The dist compile below is mirrored by hand in ci.yml's windows-verify job
+  # The dist compile below is mirrored by hand in ci.yml's windows-dist job
   # as `cargo build --locked --profile dist --target x86_64-pc-windows-msvc`,
   # which is where the Windows artifact now comes from. Same reason as the
   # `test` task in packages/pond/moon.yml: moon's fingerprint carries no OS, so
@@ -78,7 +78,7 @@ tasks:
       # candle's macOS-only `metal`, which the linux pair must not see.
       #
       # Windows is not here at all - the msvc zip is built natively by the
-      # windows-verify job in ci.yml and handed to publish-release as its own
+      # windows-dist job in ci.yml and handed to publish-release as its own
       # artifact. Cross-compiling Windows was dropped with the gnu target: it
       # never worked at runtime and no CI job ever executed it.
       cargo zigbuild --locked --profile dist --target aarch64-apple-darwin

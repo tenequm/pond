@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual trigger, added for windows-verify: that job is skipped on ordinary
-  # PRs, so dispatch is the only way to exercise a Windows change before it
+  # Manual trigger, added for the Windows jobs: windows-dist is release-gated,
+  # so dispatch is the only way to exercise the shipped-artifact path before it
   # reaches main. Side effect accepted: build-and-test and flake-check carry no
   # event condition, so they run on dispatch too. release-prep and everything
   # downstream stay push-gated.
@@ -83,156 +83,96 @@ jobs:
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
 
-  # Native Windows gate, and the source of the shipped msvc zip - nothing else
-  # in the pipeline ever executes a Windows binary.
+  # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
+  # (20.7 test + 23.8 dist). Split, they start together on separate hosted
+  # runners - separate machines, separate disks, nothing shared - so Windows
+  # contributes the longer of the two to a release, not the sum.
   #
-  # Plain cargo, NOT moon, and the reason is load-bearing: moon's task
+  # Plain cargo in both, NOT moon, and the reason is load-bearing: moon's task
   # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
   # architecture (crates/task-hasher/src/task_fingerprint.rs). `moon run
   # pond:test` here would compute the hash the Linux runner already stored for
   # this commit, report "cached", and go green without compiling a single line
-  # on Windows - exactly the failure this job exists to prevent. The commands
-  # below mirror packages/pond/moon.yml `test` and the dist leg of the root
-  # moon.yml `build-dist`; keep them in lockstep by hand.
+  # on Windows - exactly the failure these jobs exist to prevent. They mirror
+  # packages/pond/moon.yml `test` and the dist leg of the root moon.yml
+  # `build-dist`; keep them in lockstep by hand.
+  #
+  # The two carry DIFFERENT kache manifest-keys. Sharing one would make each
+  # overwrite the other's warm-prefetch manifest, silently dropping both to a
+  # near-cold fetch.
+
+  # The gate: the full suite, natively. Runs on ordinary PRs too - at 20.7 min
+  # warm there is no reason to defer a Windows regression to release time (the
+  # plan deferred it only because a run was estimated at 50-75 min, before kache).
+  # Skipped for fork PRs: they get no secrets, so kache has no S3 credentials.
   windows-verify:
-    # Skipped on ordinary PRs, so as a required status check it only actually
-    # gates release PRs (GitHub treats a skipped required check as satisfied).
-    # release-plz's branch prefix is its default `release-plz-`; pond's
-    # .github/release-plz.toml does not override it.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: windows-2025
-    # No `needs:` - this starts at t=0 alongside the Linux jobs instead of
-    # serializing the release path behind them.
-    #
-    # 180, not 120, and the number is measured: the first cold run spent 76
-    # minutes on the test leg alone, leaving a thin-LTO codegen-units=1 `dist`
-    # compile to finish inside the remaining 44. Overrunning is worse than it
-    # looks - a killed job never runs the cache action's save step, so the next
-    # run starts cold too and the overrun repeats. Warm runs land far under this.
+    # No `needs:` - starts at t=0 alongside the Linux jobs and windows-dist.
+    # 180 is measured headroom: this leg was 76 min on a fully cold cache.
     timeout-minutes: 180
-    # Not cancellable, same rule as dist-build: this job produces a release
-    # artifact that publish-release needs. Cancelling it mid-release would
-    # cancel publish-release with it, and after release-plz cuts the tag the
-    # is_release gate is false forever - an interrupted publish cannot
-    # auto-recover. Ordinary builds stay cancellable; artifact producers do not.
-    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: false }
-    # Two variables are deliberately absent here.
-    #
-    # CARGO_TARGET_DIR: the plan called for a short absolute dir (C:\t) to dodge
-    # MSVC's MAX_PATH link limit, but that limit is not actually binding - lance's
-    # own Windows CI builds the same aws-lc-sys from a deeper path
-    # (D:\a\lance\lance\rust\target\...) with the default dir. Left unset so the
-    # layout stays boring. If a link ever fails with LNK1104 / os error 206,
-    # setting it is safe with kache, which restores into target/ by path rather
-    # than caching a fixed directory.
-    #
-    # RUSTFLAGS: setting it anywhere in this job silently REPLACES the
-    # +crt-static rustflags from .cargo/config.toml.
+    # Cancellable, like build-and-test: a newer push supersedes it. Only the
+    # artifact producers below are protected from cancellation.
+    concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
+    # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
+    # REPLACES the +crt-static rustflags from .cargo/config.toml.
     env:
-      # Same rule as flake-check/macos-verify: no moon runs here, and this job
-      # compiles third-party build scripts on a hosted runner.
       BAZEL_REMOTE_AUTH: ""
     steps:
-      # MUST precede checkout. pond's longest tracked path is 456 characters -
-      # a claude-desktop fixture that nests an encoded project slug inside a
-      # session directory - and Git for Windows refuses to create it
-      # ("Filename too long", exit 128) regardless of the LongPathsEnabled
+      # MUST precede checkout, and cannot live in the composite action (a local
+      # action only resolves once the repo is checked out). pond's longest
+      # tracked path is 456 characters - a claude-desktop fixture nesting an
+      # encoded project slug inside a session dir - and Git for Windows refuses
+      # it ("Filename too long", exit 128) regardless of the LongPathsEnabled
       # registry key, because git only opts into `\\?\` paths when
       # core.longpaths is set. --system, not --global: actions/checkout
-      # relocates HOME while it edits global config, so a --global setting is
-      # not reliably in scope by the time it checks the ref out.
+      # relocates HOME while it edits global config.
       - name: Allow long paths in git
         shell: pwsh
         run: git config --system core.longpaths true
-
-      # fetch-depth 1 is enough: no moon here, and POND_BUILD_COMMIT needs only HEAD.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # The windows-2025 image ships neither protoc nor NASM. protoc: direct
-      # zip, matching lance's own windows-build job (dependency-free, no third
-      # party action). NASM: required by aws-lc-sys, and an installed NASM
-      # always wins over its `prebuilt-nasm` feature.
-      - name: Install protoc
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
-          $v = '35.1'
-          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
-          Expand-Archive protoc.zip -DestinationPath C:\protoc
-          "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Install NASM
-        shell: pwsh
-        run: choco install nasm -y --no-progress
-
-      # rustup honors rust-toolchain.toml; the host triple IS the build target,
-      # so no extra rust-std is downloaded.
-      - name: Materialize the pinned toolchain
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          rustup toolchain install --no-self-update
-          rustup show active-toolchain
-          cargo --version
-
-      # Load-bearing, not incidental: a cold run here is two full compiles of a
-      # lance + datafusion + candle dep graph on 4 vCPUs.
-      #
-      # kache on S3, deliberately NOT GitHub's cache. GitHub caps a repository
-      # at 10 GB - raisable only as a paid metered SKU - and scopes entries per
-      # branch, so a sibling branch can never restore another's. This graph's
-      # cache does not fit that budget, and Windows work happens on feature
-      # branches. kache stores content-addressed artifacts in the same Hetzner
-      # bucket the dist build already uses: no size ceiling, no GitHub storage
-      # billing, and keys portable across branches, runners and checkouts.
-      # `github-cache: false` makes the absence of a GitHub fallback explicit
-      # rather than accidental.
-      #
-      # Honest limitation, recorded so nobody re-derives it: kache is a
-      # RUSTC_WRAPPER, so it caches rustc units but not build-script
-      # EXECUTION - aws-lc-sys under cmake + NASM, plus ring, blake3 and
-      # zstd-sys, recompile their native halves every run. That is the accepted
-      # cost of keeping the cache off GitHub's meter.
-      #
-      # Its post step is `post-if: success() || failure()`, so a red run still
-      # saves - which matters, because the expected way to iterate here is a
-      # platform-specific test failing after an hour of compiling.
-      # Pinned to main, NOT the v1 tag, and that is deliberate: v1 (Jun 2026)
-      # predates Windows support and fails this job outright with "Unsupported
-      # platform: win32-x64". main maps win32-x64 -> x86_64-pc-windows-msvc and
-      # is also where the max-size / pr-comment inputs exist. Still immutable -
-      # it is a SHA, not a moving ref. Move back to a tag once one ships with
-      # Windows in it.
-      - uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main @ 2026-06-19
+      - uses: ./.github/actions/windows-bootstrap
         with:
-          s3-bucket: ttq
-          s3-endpoint: https://nbg1.your-objectstorage.com
-          s3-region: nbg1
-          # Same prefix as the dist build's raw-kache usage. The store is
-          # content-addressed and keys carry the target triple, so sharing it
-          # can only add hits, never cross-contaminate.
-          s3-prefix: kache/pond
-          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
-          github-cache: false
-          # Scopes the warm-prefetch manifest. Without a distinct key every
-          # build sharing this bucket writes the same triple-keyed default and
-          # they clobber each other, silently dropping prefetch to near zero.
+          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          # The hosted runner's disk is far smaller than kache's 50GiB default,
-          # and an evicted local entry costs a remote fetch, not a rebuild.
-          max-size: 20GiB
-          # Would require `pull-requests: write`, which this workflow
-          # deliberately does not grant. The job summary carries the same report.
-          pr-comment: false
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       - name: Test
         run: cargo test --locked --target x86_64-pc-windows-msvc
+
+  # The shipped msvc zip. Release-gated rather than per-PR: it produces an
+  # artifact nobody consumes outside a release, and it is the only thing in the
+  # pipeline that ever executes a Windows binary.
+  windows-dist:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+    runs-on: windows-2025
+    timeout-minutes: 180
+    # Not cancellable, same rule as dist-build: this produces a release artifact
+    # publish-release needs. Cancelling it mid-release cancels the publish with
+    # it, and after release-plz cuts the tag the is_release gate is false
+    # forever - an interrupted publish cannot auto-recover.
+    concurrency: { group: "ci-windows-dist-${{ github.ref }}", cancel-in-progress: false }
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      - name: Allow long paths in git
+        shell: pwsh
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/windows-bootstrap
+        with:
+          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          manifest-key: windows-dist
 
       # --profile dist, not --release: `release` is pond's no-LTO iteration
       # profile, and every shipped binary is built with `dist`. Without
@@ -245,9 +185,10 @@ jobs:
           $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
           cargo build --locked --profile dist --target x86_64-pc-windows-msvc
 
-      # Mirrors macos-verify's launch smoke. Redirect, never pipe: a closed pipe
-      # hands the still-writing binary an EPIPE that is an unwrap inside
-      # clap_complete, and that assertion once killed the release it gated.
+      # Mirrors macos-verify's launch smoke, and for the same reason: no channel
+      # should ship a binary the OS refuses to run. Redirect, never pipe - a
+      # closed pipe hands the still-writing binary an EPIPE that is an unwrap
+      # inside clap_complete, and that assertion once killed the release it gated.
       - name: Launch smoke
         shell: pwsh
         run: |
@@ -261,12 +202,12 @@ jobs:
       # Completions come from the just-built native binary, the same way the
       # Linux tarballs get theirs. Today's gnu zip ships none at all.
       #
-      # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes
-      # no BOM, while Windows PowerShell 5.1's does - and a BOM at the top of
-      # pond.bash or _pond breaks sourcing on the shells that read them. Piping
-      # into Set-Content is safe here (it consumes the whole stream); the
-      # EPIPE trap is only in matchers like `Select-String -Quiet` that stop
-      # early, which is why the smoke step above matches on the file instead.
+      # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes no
+      # BOM, while Windows PowerShell 5.1's does - and a BOM atop pond.bash or
+      # _pond breaks sourcing. Piping into Set-Content is safe (it consumes the
+      # whole stream); the EPIPE trap is only in matchers like
+      # `Select-String -Quiet` that stop early, which is why the smoke step above
+      # matches on the file instead.
       - name: Package release zip
         shell: pwsh
         run: |
@@ -287,6 +228,7 @@ jobs:
           path: dist/pond-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
           retention-days: 1
+
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -371,7 +313,7 @@ jobs:
 
       # Two artifacts, not one: the macOS jobs only need the 38MB darwin
       # tarball, while publish needs all three cross-compiled tarballs plus
-      # checksums (the Windows zip reaches it separately, from windows-verify).
+      # checksums (the Windows zip reaches it separately, from windows-dist).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-darwin
@@ -459,7 +401,7 @@ jobs:
   # HERE (after build AND macos-verify), so crates.io can't ship without
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
-    needs: [dist-build, macos-verify, windows-verify]
+    needs: [dist-build, macos-verify, windows-verify, windows-dist]
     # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
     # the /ci-cache PVC (release-plz runs `cargo publish` here).
     runs-on: pond-ci
@@ -477,7 +419,7 @@ jobs:
       - uses: ./.github/actions/bootstrap
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
-      # The msvc zip is built natively by windows-verify, not by the moon dist
+      # The msvc zip is built natively by windows-dist, not by the moon dist
       # task, so it arrives as its own artifact.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-windows, path: dist }

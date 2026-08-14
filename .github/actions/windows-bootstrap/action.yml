@@ -1,0 +1,89 @@
+name: Windows build prerequisites
+description: >
+  Everything the two Windows jobs need after checkout: protoc, NASM, the pinned
+  Rust toolchain, and the kache S3 build cache. Shared so windows-verify and
+  windows-dist cannot drift apart - a protoc version skew between them would
+  produce two differently-built binaries from one commit.
+
+  Deliberately NOT including checkout: a local composite action can only be
+  resolved once the repository is already checked out, and `git config --system
+  core.longpaths true` has to run before checkout anyway (pond's longest
+  tracked path is 456 chars and git refuses it otherwise). Both callers do
+  those two steps inline.
+inputs:
+  kache-access-key-id:
+    description: S3 access key for the kache remote.
+    required: true
+  kache-secret-access-key:
+    description: S3 secret key for the kache remote.
+    required: true
+  manifest-key:
+    description: >
+      Scopes kache's warm-prefetch manifest. MUST differ per build variant:
+      every build sharing the bucket otherwise writes the same triple-keyed
+      default and they clobber each other, silently dropping prefetch to zero.
+    required: true
+runs:
+  using: composite
+  steps:
+    # The windows-2025 image ships neither protoc nor NASM. protoc: direct zip,
+    # matching lance's own windows-build job (no third-party action). NASM: for
+    # aws-lc-sys, and an installed NASM always wins over its prebuilt-nasm
+    # feature.
+    - name: Install protoc
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
+        $v = '35.1'
+        Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
+        Expand-Archive protoc.zip -DestinationPath C:\protoc
+        "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Install NASM
+      shell: pwsh
+      run: choco install nasm -y --no-progress
+
+    # rustup honors rust-toolchain.toml; the host triple IS the build target,
+    # so no extra rust-std is downloaded.
+    - name: Materialize the pinned toolchain
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        rustup toolchain install --no-self-update
+        rustup show active-toolchain
+        cargo --version
+
+    # kache on S3, deliberately NOT GitHub's cache: GitHub caps a repository at
+    # 10 GB (raisable only as a paid metered SKU) and scopes entries per branch
+    # so siblings cannot share. This graph does not fit that, and Windows work
+    # happens on feature branches. kache is content-addressed in the same
+    # Hetzner bucket the dist build uses - no ceiling, no GitHub storage
+    # billing, keys portable across branches and runners.
+    #
+    # Pinned to main, NOT the v1 tag: v1 predates Windows support and fails
+    # outright with "Unsupported platform: win32-x64".
+    #
+    # Accepted limitation: kache is a RUSTC_WRAPPER, so it caches rustc units
+    # but not build-script EXECUTION - aws-lc-sys under cmake + NASM, plus ring,
+    # blake3 and zstd-sys, recompile their native halves every run.
+    #
+    # Its post step is `success() || failure()`, so a red run still saves, which
+    # matters because Windows iteration means a test failing after a long compile.
+    - uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main @ 2026-06-19
+      with:
+        s3-bucket: ttq
+        s3-endpoint: https://nbg1.your-objectstorage.com
+        s3-region: nbg1
+        # Same prefix as the dist build's raw-kache usage. Content-addressed and
+        # triple-keyed, so sharing can only add hits, never cross-contaminate.
+        s3-prefix: kache/pond
+        s3-access-key-id: ${{ inputs.kache-access-key-id }}
+        s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
+        github-cache: false
+        manifest-key: ${{ inputs.manifest-key }}
+        # The hosted runner's disk is far smaller than kache's 50GiB default,
+        # and an evicted local entry costs a remote fetch, not a rebuild.
+        max-size: 20GiB
+        # Would require `pull-requests: write`, which this workflow deliberately
+        # does not grant. The job summary carries the same report.
+        pr-comment: false
