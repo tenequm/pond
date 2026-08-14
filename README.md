@@ -99,6 +99,11 @@ Building from source instead (`cargo install pond-db`) needs two tools on
 Windows, and NASM (`winget install NASM.NASM`) for `aws-lc-sys`. Embeddings run
 on the CPU backend.
 
+Cloning this repository on Windows additionally needs `git config --global
+core.longpaths true` first - some test fixtures nest encoded project slugs deep
+enough to pass 260 characters, and git refuses to create them otherwise. This
+affects a clone only; `cargo install pond-db` does not package the fixtures.
+
 Running the Linux binary under WSL works when both the agent session files and
 the pond store live on the ext4 side. Do not point either across `/mnt/c`:
 throughput collapses and Windows-side writes are missed.

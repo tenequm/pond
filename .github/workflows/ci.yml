@@ -129,6 +129,18 @@ jobs:
       # compiles third-party build scripts on a hosted runner.
       BAZEL_REMOTE_AUTH: ""
     steps:
+      # MUST precede checkout. pond's longest tracked path is 456 characters -
+      # a claude-desktop fixture that nests an encoded project slug inside a
+      # session directory - and Git for Windows refuses to create it
+      # ("Filename too long", exit 128) regardless of the LongPathsEnabled
+      # registry key, because git only opts into `\\?\` paths when
+      # core.longpaths is set. --system, not --global: actions/checkout
+      # relocates HOME while it edits global config, so a --global setting is
+      # not reliably in scope by the time it checks the ref out.
+      - name: Allow long paths in git
+        shell: pwsh
+        run: git config --system core.longpaths true
+
       # fetch-depth 1 is enough: no moon here, and POND_BUILD_COMMIT needs only HEAD.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
