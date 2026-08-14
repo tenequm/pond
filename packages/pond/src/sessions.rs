@@ -2164,14 +2164,13 @@ impl Store {
     /// and only sound under the build lock - the holder is the sole builder, so
     /// any temp present is a crashed-build orphan, not a live write.
     fn sweep_orphan_temps(cache_dir: &Path, store_key: &str) {
-        let prefix = format!("rowmetamap-{store_key}-");
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with(&prefix) && name.contains(".tmp-") {
+            if crate::rowmap::is_orphan_temp(name, store_key) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

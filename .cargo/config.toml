@@ -1,0 +1,12 @@
+# Not all Windows systems ship the VC runtime redistributable, and a dynamically
+# linked binary dies with "VCRUNTIME140.dll was not found" on a clean machine.
+# Static CRT makes pond.exe self-contained. Same choice lancedb makes.
+#
+# Two traps this config carries:
+#   1. Windows builds MUST pass `--target x86_64-pc-windows-msvc` explicitly.
+#      Without --target, cargo applies target rustflags to host artifacts too,
+#      so build scripts and proc-macros get +crt-static and fail to load.
+#   2. Setting RUSTFLAGS in the environment silently REPLACES this whole list.
+#      Never set RUSTFLAGS in the windows-verify job.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]

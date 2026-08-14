@@ -17,16 +17,21 @@ nix profile add github:tenequm/pond#pond
 ```
 
 ```sh [cargo-binstall (prebuilt, Windows-friendly)]
-# Downloads the prebuilt binary (no protoc required).
+# Downloads the prebuilt binary. On Windows this is the x86_64-pc-windows-msvc
+# zip, statically linked against the VC runtime - nothing else to install.
 cargo binstall pond-db
 ```
 
 ```sh [Cargo (build from source)]
-# Requires protoc on PATH on Windows (winget install Google.Protobuf).
-# macOS and Linux vendor protoc automatically.
+# On Windows this needs protoc (winget install Google.Protobuf) and NASM
+# (winget install NASM.NASM) on PATH. macOS and Linux vendor protoc themselves.
 cargo install pond-db
 ```
 
 ::::
+
+On Windows, the release zip also carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
+
+Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
 
 Next: [Quickstart](/get-started/quickstart).

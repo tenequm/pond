@@ -14,6 +14,7 @@ env:
 fileGroups:
   sources:
     - 'src/**/*'
+    - 'build.rs'
     - 'SKILL.md'
     - 'Cargo.toml'
     - '/Cargo.toml'
@@ -30,6 +31,11 @@ tasks:
   lint:
     command: 'cargo clippy --locked -- -D warnings'
     inputs: ['@group(sources)', '@group(tests)']
+  # Mirrored by hand in ci.yml's windows-verify job (tests) as
+  # `cargo test --locked --target x86_64-pc-windows-msvc`. That job cannot run
+  # this task: moon's fingerprint carries no OS, so it would hit the hash the
+  # Linux runner already cached and report "cached" without compiling anything
+  # on Windows. Change the command here, change it there.
   test:
     command: 'cargo test --locked'
     inputs: ['@group(sources)', '@group(tests)']

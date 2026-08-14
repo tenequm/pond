@@ -14,6 +14,7 @@ env:
 fileGroups:
   sources:
     - 'packages/pond/src/**/*'
+    - 'packages/pond/build.rs'
     - 'packages/pond/SKILL.md'
     - 'packages/pond/Cargo.toml'
     - 'Cargo.toml'
@@ -40,6 +41,12 @@ tasks:
       cache: false
       outputStyle: stream
 
+  # The dist compile below is mirrored by hand in ci.yml's windows-dist job
+  # as `cargo build --locked --profile dist --target x86_64-pc-windows-msvc`,
+  # which is where the Windows artifact now comes from. Same reason as the
+  # `test` task in packages/pond/moon.yml: moon's fingerprint carries no OS, so
+  # that job must not run a shared moon task. Keep the two in lockstep.
+  #
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
   # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
   # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
@@ -53,7 +60,7 @@ tasks:
 
       # `profile = "minimal"` + targets-in-toml does not reliably fetch
       # rust-std for non-host targets.
-      rustup target add aarch64-apple-darwin x86_64-pc-windows-gnu \
+      rustup target add aarch64-apple-darwin \
                         aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 
       # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
@@ -67,15 +74,17 @@ tasks:
       trap 'kache sync --push || true' EXIT
 
       # Cargo unifies features across all targets in one invocation, leaking
-      # cfg-gated deps across platforms. macOS and Windows each build alone:
-      # macOS pulls candle's macOS-only `metal`, and the two linux targets
-      # enable xet-data's `cfg(not(windows))` sha2 `asm` feature, which drags
-      # sha2-asm (a Windows compile_error!) into the Windows build.
+      # cfg-gated deps across platforms, so macOS builds alone: it pulls
+      # candle's macOS-only `metal`, which the linux pair must not see.
+      #
+      # Windows is not here at all - the msvc zip is built natively by the
+      # windows-dist job in ci.yml and handed to publish-release as its own
+      # artifact. Cross-compiling Windows was dropped with the gnu target: it
+      # never worked at runtime and no CI job ever executed it.
       cargo zigbuild --locked --profile dist --target aarch64-apple-darwin
       cargo zigbuild --locked --profile dist \
         --target aarch64-unknown-linux-gnu \
         --target x86_64-unknown-linux-gnu
-      cargo zigbuild --locked --profile dist --target x86_64-pc-windows-gnu
 
       mkdir -p target/dist
       cp "$TD/aarch64-apple-darwin/dist/pond" target/dist/pond-aarch64-apple-darwin
@@ -101,7 +110,6 @@ tasks:
       fi
       cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu
       cp "$TD/x86_64-unknown-linux-gnu/dist/pond" target/dist/pond-x86_64-unknown-linux-gnu
-      cp "$TD/x86_64-pc-windows-gnu/dist/pond.exe" target/dist/pond-x86_64-pc-windows-gnu.exe
       ls -lh target/dist/
 
       # Completion scripts are target-independent, so one native run of the
@@ -124,15 +132,16 @@ tasks:
         install -m755 "target/dist/pond-$t" pond
         tar -cJf "dist/pond-$t.tar.xz" pond completions
       done
-      install -m755 target/dist/pond-x86_64-pc-windows-gnu.exe pond.exe
-      zip -j "dist/pond-x86_64-pc-windows-gnu.zip" pond.exe
-      rm -f pond pond.exe
+      rm -f pond
       rm -rf completions
+      # Covers only what this task produced. publish-release regenerates it
+      # over the merged dist/ once the natively-built Windows zip lands, so
+      # this copy never reaches a release.
       ( cd dist && sha256sum pond-* > checksums.txt )
       ls -lh dist/
     # No @group(tests): tests and benches are not linked into the shipped
     # binary, so a test-only change cannot alter dist/ and should not pay a
-    # four-target cross-compile.
+    # three-target cross-compile.
     #
     # Caveat worth knowing before narrowing these further: the script bakes
     # `git rev-parse HEAD` into the binary via POND_BUILD_COMMIT, and no
@@ -148,7 +157,6 @@ tasks:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'
       - 'dist/pond-aarch64-unknown-linux-gnu.tar.xz'
-      - 'dist/pond-x86_64-pc-windows-gnu.zip'
       - 'dist/checksums.txt'
     options:
       cache: true

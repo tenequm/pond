@@ -661,6 +661,18 @@ impl ChainPaths {
 /// Discover the chain under `cache_dir` for `store_key`: the highest-version
 /// base (`-v{V}`) plus every delta (`-d{V}`) above it, ascending. `None` if no
 /// base exists yet.
+/// Does `file_name` name an abandoned build temp for `store_key`?
+///
+/// One definition, two enforcement points: `Store::sweep_orphan_temps` reclaims
+/// by it, and the rowmap purge probe asserts that a rebuild which could not
+/// rename leaves behind something it matches. Held here, beside the
+/// `with_extension("tmp-{pid}-{nonce}")` in `build`, because that is what makes
+/// the shape true - duplicating the predicate let the sweep change while the
+/// probe kept passing on a rule that no longer held.
+pub fn is_orphan_temp(file_name: &str, store_key: &str) -> bool {
+    file_name.starts_with(&format!("rowmetamap-{store_key}-")) && file_name.contains(".tmp-")
+}
+
 pub fn discover_chain(cache_dir: &Path, store_key: &str) -> Option<ChainPaths> {
     let prefix = format!("rowmetamap-{store_key}-");
     let mut bases: Vec<(u64, PathBuf)> = Vec::new();

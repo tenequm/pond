@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger, added for the Windows jobs: windows-dist is release-gated,
+  # so dispatch is the only way to exercise the shipped-artifact path before it
+  # reaches main. Side effect accepted: build-and-test and flake-check carry no
+  # event condition, so they run on dispatch too. release-prep and everything
+  # downstream stay push-gated.
+  workflow_dispatch:
 
 # Default read-only; publish-release elevates to contents:write for its own
 # `gh release upload`. The release PR and publishes use the GH_RELEASE_TOKEN
@@ -77,6 +83,157 @@ jobs:
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
 
+  # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
+  # (20.7 test + 23.8 dist). Split, they start together on separate hosted
+  # runners - separate machines, separate disks, nothing shared - so Windows
+  # contributes the longer of the two to a release, not the sum.
+  #
+  # Plain cargo in both, NOT moon, and the reason is load-bearing: moon's task
+  # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
+  # architecture (crates/task-hasher/src/task_fingerprint.rs). `moon run
+  # pond:test` here would compute the hash the Linux runner already stored for
+  # this commit, report "cached", and go green without compiling a single line
+  # on Windows - exactly the failure these jobs exist to prevent. They mirror
+  # packages/pond/moon.yml `test` and the dist leg of the root moon.yml
+  # `build-dist`; keep them in lockstep by hand.
+  #
+  # The two carry DIFFERENT kache manifest-keys. Sharing one would make each
+  # overwrite the other's warm-prefetch manifest, silently dropping both to a
+  # near-cold fetch.
+
+  # The gate: the full suite, natively. Runs on ordinary PRs too - at 20.7 min
+  # warm there is no reason to defer a Windows regression to release time (the
+  # plan deferred it only because a run was estimated at 50-75 min, before kache).
+  # Skipped for fork PRs: they get no secrets, so kache has no S3 credentials.
+  windows-verify:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: windows-2025
+    # No `needs:` - starts at t=0 alongside the Linux jobs and windows-dist.
+    # 180 is measured headroom: this leg was 76 min on a fully cold cache.
+    timeout-minutes: 180
+    # Cancellable, like build-and-test: a newer push supersedes it. That makes
+    # this the one `needs:` of publish-release that can be cancelled - the
+    # sibling windows-dist is explicitly not, being an artifact producer. It is
+    # safe because release-plz cuts the tag INSIDE publish-release, so a
+    # cancelled run leaves is_release still true and the superseding push simply
+    # re-runs the whole release path. The same exposure build-and-test already
+    # carries. Do not "fix" this to false without that reasoning changing.
+    concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
+    # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
+    # REPLACES the +crt-static rustflags from .cargo/config.toml.
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      # MUST precede checkout, and cannot live in the composite action (a local
+      # action only resolves once the repo is checked out). pond's longest
+      # tracked path is 456 characters - a claude-desktop fixture nesting an
+      # encoded project slug inside a session dir - and Git for Windows refuses
+      # it ("Filename too long", exit 128) regardless of the LongPathsEnabled
+      # registry key, because git only opts into `\\?\` paths when
+      # core.longpaths is set. --system, not --global: actions/checkout
+      # relocates HOME while it edits global config.
+      - name: Allow long paths in git
+        shell: pwsh
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/windows-bootstrap
+        with:
+          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          manifest-key: windows-verify
+
+      # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
+      # anywhere upstream, so this is the first place they ever run on Windows.
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+  # The shipped msvc zip. Release-gated rather than per-PR: it produces an
+  # artifact nobody consumes outside a release, and it is the only thing in the
+  # pipeline that ever executes a Windows binary.
+  windows-dist:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+    runs-on: windows-2025
+    timeout-minutes: 180
+    # Not cancellable, same rule as dist-build: this produces a release artifact
+    # publish-release needs. Cancelling it mid-release cancels the publish with
+    # it, and after release-plz cuts the tag the is_release gate is false
+    # forever - an interrupted publish cannot auto-recover.
+    concurrency: { group: "ci-windows-dist-${{ github.ref }}", cancel-in-progress: false }
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      - name: Allow long paths in git
+        shell: pwsh
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/windows-bootstrap
+        with:
+          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          manifest-key: windows-dist
+
+      # --profile dist, not --release: `release` is pond's no-LTO iteration
+      # profile, and every shipped binary is built with `dist`. Without
+      # POND_BUILD_COMMIT the Windows binary would be the only artifact missing
+      # the commit stamp.
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
+          cargo build --locked --profile dist --target x86_64-pc-windows-msvc
+
+      # Mirrors macos-verify's launch smoke, and for the same reason: no channel
+      # should ship a binary the OS refuses to run. Redirect, never pipe - a
+      # closed pipe hands the still-writing binary an EPIPE that is an unwrap
+      # inside clap_complete, and that assertion once killed the release it gated.
+      - name: Launch smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
+          & $exe --version
+          & $exe --help | Out-Null
+          & $exe completions powershell | Set-Content -Encoding utf8 completions.ps1
+          if (-not (Select-String -Path completions.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
+
+      # Completions come from the just-built native binary, the same way the
+      # Linux tarballs get theirs - generated here rather than shipped empty.
+      #
+      # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes no
+      # BOM, while Windows PowerShell 5.1's does - and a BOM atop pond.bash or
+      # _pond breaks sourcing. Piping into Set-Content is safe (it consumes the
+      # whole stream); the EPIPE trap is only in matchers like
+      # `Select-String -Quiet` that stop early, which is why the smoke step above
+      # matches on the file instead.
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
+          New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
+          Copy-Item $exe stage\pond.exe
+          & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
+          & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
+          & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
+          & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path stage\pond.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-windows
+          path: dist/pond-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+          retention-days: 1
+
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
   # whose tag already exists". (dry-run can't report this: in dry-run release-plz
@@ -115,14 +272,14 @@ jobs:
           fi
 
   # Build + Developer ID sign. Split from publish-release so notarization and
-  # the macOS checks can gate the publish without re-running the 4-target build.
+  # the macOS checks can gate the publish without re-running the 3-target build.
   dist-build:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
     # ARC runner pod: zig/zigbuild/SDK/rcodesign come from the pond-runner
     # image, incremental cache on /ci-cache - no docker, no buildkit.
     runs-on: pond-ci
-    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    # A fully cold 3-target dist build measured 56m; warm runs are minutes.
     timeout-minutes: 90
     concurrency: { group: "pond-dist-${{ github.ref }}", cancel-in-progress: false }
     outputs:
@@ -159,7 +316,8 @@ jobs:
         run: echo "v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[]|select(.name=="pond-db").version')" >> "$GITHUB_OUTPUT"
 
       # Two artifacts, not one: the macOS jobs only need the 38MB darwin
-      # tarball, while publish needs all four plus checksums.
+      # tarball, while publish needs all three cross-compiled tarballs plus
+      # checksums (the Windows zip reaches it separately, from windows-dist).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-darwin
@@ -247,7 +405,7 @@ jobs:
   # HERE (after build AND macos-verify), so crates.io can't ship without
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
-    needs: [dist-build, macos-verify]
+    needs: [dist-build, macos-verify, windows-verify, windows-dist]
     # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
     # the /ci-cache PVC (release-plz runs `cargo publish` here).
     runs-on: pond-ci
@@ -265,6 +423,22 @@ jobs:
       - uses: ./.github/actions/bootstrap
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
+      # The msvc zip is built natively by windows-dist, not by the moon dist
+      # task, so it arrives as its own artifact.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: dist-windows, path: dist }
+
+      # checksums.txt is produced INSIDE the cached moon dist task, so it
+      # structurally cannot cover an artifact built on another runner.
+      # Regenerate over the merged dist/ before anything reads it - the
+      # `gh release upload` below globs dist/pond-* and would otherwise ship a
+      # checksums file with no line for the Windows zip.
+      - name: Merge the Windows zip into checksums
+        run: |
+          set -euo pipefail
+          test -f dist/pond-x86_64-pc-windows-msvc.zip
+          ( cd dist && sha256sum pond-* > checksums.txt )
+          cat dist/checksums.txt
 
       - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         id: release-plz
