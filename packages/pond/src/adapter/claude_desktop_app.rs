@@ -99,23 +99,17 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
     }
 }
 
-/// Every place the Cowork store can live, in probe order: the macOS
-/// `~/Library/Application Support/Claude` layout, then plain `%APPDATA%\Claude`,
-/// then the MSIX-virtualized layouts. All are built on every platform rather
-/// than behind `cfg!`, because that is what lets a test drive the Windows
-/// branches from a `TempDir` home. The cost of the ones that cannot match is
-/// two `PathBuf` joins and the single failing `read_dir` in
-/// [`msix_cowork_roots`], on a path that runs once per command.
+/// Every place the Cowork store can live, in probe order. Built on every
+/// platform rather than behind `cfg!`, so a test can drive the Windows branches
+/// from a `TempDir` home.
 ///
-/// `%APPDATA%` leads on Windows because that is what a real install uses:
-/// verified against Claude 1.30096.1 on Windows 11, which ships as a per-user
-/// Squirrel install under `%LOCALAPPDATA%\AnthropicClaude` with NO MSIX package
-/// registered, so Electron's `userData` is not virtualized at all. See
-/// [`msix_cowork_roots`] for why the virtualized path is still probed.
+/// `%APPDATA%` leads because that is what a real install uses: verified against
+/// Claude 1.30096.1 on Windows 11, a per-user Squirrel install under
+/// `%LOCALAPPDATA%\AnthropicClaude` with NO MSIX package registered, so
+/// Electron's `userData` is never virtualized.
 ///
-/// `%LOCALAPPDATA%` / `%APPDATA%` are derived from home rather than read, so a
-/// redirected AppData is unsupported - the same known gap opencode's probe has
-/// with `XDG_DATA_HOME`.
+/// AppData is derived from home rather than read, so a redirected AppData is
+/// unsupported - the same gap opencode's probe has with `XDG_DATA_HOME`.
 fn cowork_roots(home: &Path) -> Vec<PathBuf> {
     let app_data = home.join("AppData");
     let mut roots = vec![
@@ -134,30 +128,30 @@ fn cowork_roots(home: &Path) -> Vec<PathBuf> {
 
 /// The Store/MSIX channel, where Electron's `userData` is silently virtualized
 /// under `%LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude`
-/// (anthropics/claude-code #25579, #26073). The package-family hash is
-/// install-channel-dependent, so the directory is matched by name and the
-/// results sorted for a deterministic pick across channels.
+/// (anthropics/claude-code #25579, #26073).
 ///
-/// Kept as a secondary probe, not the primary: the mainline installer is not
-/// MSIX (see [`cowork_roots`]), and this layout has never been verified against
-/// a real packaged install - so if the virtualized child layout differs it
-/// probes nothing rather than probing wrong.
+/// A secondary probe, not the primary: the mainline installer is not MSIX (see
+/// [`cowork_roots`]), and this layout is unverified against a real packaged
+/// install - so a differing child layout probes nothing rather than wrong.
 fn msix_cowork_roots(packages: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(packages) else {
         return Vec::new();
     };
-    let mut roots: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|entry| {
-            entry
+    msix_roots_from(entries.flatten().map(|entry| entry.path()))
+}
+
+/// Split from [`msix_cowork_roots`] so both rules are testable: `read_dir`
+/// order is filesystem-defined, so a directory fixture can never prove the sort
+/// that makes the pick deterministic across channels.
+fn msix_roots_from(families: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = families
+        .filter(|family| {
+            family
                 .file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .contains("claude")
+                .is_some_and(|name| name.to_string_lossy().to_lowercase().contains("claude"))
         })
-        .map(|entry| {
-            entry
-                .path()
+        .map(|family| {
+            family
                 .join("LocalCache")
                 .join("Roaming")
                 .join("Claude")
@@ -1176,12 +1170,9 @@ mod tests {
         )
     }
 
-    /// The Store/MSIX channel - a secondary probe, not what the mainline
-    /// installer produces (see [`cowork_roots`]) - hides the store under a
-    /// package-family directory whose name is install-channel-dependent, so it
-    /// has to be matched by name. Two Claude channels present must resolve
-    /// deterministically, and a foreign package must never be a candidate even
-    /// when it carries the same inner layout.
+    /// The MSIX store hides under a package-family directory whose name is
+    /// install-channel-dependent, so it is matched by name. The decoy sorts
+    /// BEFORE both Claude families, so dropping the filter returns it.
     #[test]
     fn probe_default_finds_the_msix_virtualized_store() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -1199,11 +1190,6 @@ mod tests {
                 .join("Claude")
                 .join(SESSIONS_SUBDIR);
             std::fs::create_dir_all(&root)?;
-            // The foreign package sorts BEFORE both Claude families, so a probe
-            // that dropped the name filter would return it - that is what makes
-            // the filter load-bearing here rather than incidentally satisfied.
-            // Between the two real channels the sort, not the walk order,
-            // decides.
             if family.starts_with("Anthropic") {
                 expected = Some(root);
             }
@@ -1218,6 +1204,35 @@ mod tests {
             "probe must pick the Claude package family: got {got:?}, expected {expected:?}",
         );
         Ok(())
+    }
+
+    /// The half a directory fixture cannot prove: `read_dir` order is
+    /// filesystem-defined, so only feeding deliberately unsorted names shows
+    /// the sort is what makes the pick deterministic across channels.
+    #[test]
+    fn msix_roots_are_filtered_by_name_and_sorted() {
+        let families = [
+            "ZZClaudeBeta_9zzzzzzzzzzzz",
+            "AAUnrelated_1a2b3c",
+            "AnthropicClaude_j0mn41abcdefg",
+        ]
+        .iter()
+        .map(|family| Path::new("Packages").join(family));
+
+        let roots = msix_roots_from(families);
+        let names: Vec<_> = roots
+            .iter()
+            .filter_map(|root| root.iter().nth(1).and_then(|name| name.to_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AnthropicClaude_j0mn41abcdefg",
+                "ZZClaudeBeta_9zzzzzzzzzzzz"
+            ],
+            "the foreign family must be dropped and the rest sorted",
+        );
+        assert!(roots.iter().all(|root| root.ends_with(SESSIONS_SUBDIR)));
     }
 
     /// The non-MSIX install keeps Electron's plain `%APPDATA%\Claude` layout.

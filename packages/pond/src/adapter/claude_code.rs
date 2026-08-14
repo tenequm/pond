@@ -212,9 +212,9 @@ fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathB
 /// `:` a Windows `cwd` carries, keeping the slug a legal path segment
 /// ([`crate::adapter::validate_path_id`]).
 ///
-/// Confirmed against real corpora on both platform families: 181 posix project
-/// directories, and a native Windows 11 capture in which a `C:\Users\<user>\
-/// <project>` cwd is stored as `C--Users-<user>-<project>`.
+/// Confirmed against real corpora: 178 of 181 posix project directories match
+/// exactly (the 3 misses are not path-derived), plus a native Windows 11
+/// capture whose drive-letter `cwd` is stored as `C--Users-<user>-<project>`.
 fn encode_project(project: &str) -> String {
     let mut encoded = String::with_capacity(project.len());
     for c in project.chars() {
@@ -231,20 +231,15 @@ fn encode_project(project: &str) -> String {
     encoded
 }
 
-/// Best-effort inverse of [`encode_project`], for the one path that needs it:
-/// a transcript in which no row carries `cwd`. The encoding is lossy - `/`,
-/// `.`, `_`, and a space are all `-` by the time we see the slug - so this
-/// recovers only the separators and the Windows drive/UNC prefix.
-///
-/// Two shapes come back wrong rather than merely coarse, both because the slug
-/// alone cannot say which platform wrote it: a project whose own name contains
-/// `--`, and an absolute posix path whose first component starts with a
-/// non-alphanumeric (`/_work/1/s` -> `--work-1-s`, the shape a self-hosted CI
-/// workdir has), which is indistinguishable from a UNC share and decodes as
-/// one. Neither earns a `cfg!(windows)` branch: the module stays
-/// platform-agnostic so a posix test can drive the Windows shapes, and every
-/// transcript any real corpus has produced carries `cwd` - which is why this is
-/// the fallback and not the rule.
+/// Best-effort inverse of [`encode_project`], for the one path that needs it: a
+/// transcript in which no row carries `cwd`. Lossy - `/`, `.`, `_` and a space
+/// are all `-` by the time we see the slug - so it recovers separators and the
+/// Windows drive/UNC prefix only. Two shapes decode wrong, because the slug
+/// cannot say which platform wrote it: a project name containing `--`, and an
+/// absolute posix path whose first component starts with a non-alphanumeric
+/// (`/_work/1/s` -> `--work-1-s`, indistinguishable from a UNC share). Neither
+/// earns a `cfg!(windows)` branch - every real transcript carries `cwd`, which
+/// is why this is the fallback.
 fn decode_project(slug: &str) -> String {
     if let Some(rest) = slug.strip_prefix("--") {
         return format!(r"\\{}", rest.replace('-', r"\"));
@@ -695,7 +690,8 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
                 AdapterError::schema(
                     NAME,
                     path_display.clone(),
-                    "no `cwd` field in any row and source path is not UTF-8",
+                    "no `cwd` field in any row, and the project directory is not \
+                     readable from the source path",
                 )
             })?;
             extract_self_str(&Value::String(decoded)).ok_or_else(|| {
@@ -1360,6 +1356,13 @@ mod tests {
         "/tests/fixtures/adapter/claude_code/projects"
     );
 
+    /// The native Windows 11 capture, in its own root so the posix corpus
+    /// counts above stay untouched.
+    const WINDOWS_FIXTURE_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/claude_code/windows-projects"
+    );
+
     #[test]
     fn probe_default_finds_claude_projects_under_home() -> anyhow::Result<()> {
         crate::adapter::test_support::assert_probe_default(
@@ -1386,22 +1389,15 @@ mod tests {
             encode_project("/Users/user/my project.v2"),
             "-Users-user-my-project-v2"
         );
-        // The drive-letter shape a native Windows 11 `~/.claude/projects`
-        // capture confirmed: this is what Claude Code itself wrote for a
-        // `C:\Users\...` cwd, not a model of it.
         assert_eq!(
             encode_project(r"C:\Users\user\claude-code"),
             "C--Users-user-claude-code"
         );
         assert_eq!(encode_project(r"\\host\share\pond"), "--host-share-pond");
-        // Astral characters cost two dashes because the JS regex counts UTF-16
-        // units.
+        // Astral characters cost two dashes: the JS regex counts UTF-16 units.
         assert_eq!(encode_project("/a/\u{1F600}"), "-a---");
-        // The committed Windows fixture's own pair
-        // (`tests/fixtures/adapter/claude_code/windows-projects/`): this cwd and
-        // this directory name are what Claude Code 2.1.232 wrote for itself, so
-        // the encoder is pinned to captured ground truth rather than to a model
-        // of it. The restore-side half is asserted in the integration suite.
+        // The committed capture's own pair, so the rule is pinned to ground
+        // truth rather than to a model of it.
         assert_eq!(
             encode_project(r"C:\dev\pond fixture_demo.v2"),
             "C--dev-pond-fixture-demo-v2"
@@ -1418,10 +1414,7 @@ mod tests {
             "/Users/user/Projects/pond"
         );
         assert_eq!(decode_project("C--Users-user-pond"), r"C:\Users\user\pond");
-        // The lossiness, stated outright: a `-` the project name itself
-        // carried is gone by the time the slug is written, so it comes back as
-        // a separator. This is why `cwd` is the mainline and this is only the
-        // fallback.
+        // A `-` the project name carried comes back as a separator.
         assert_eq!(
             decode_project(&encode_project(r"C:\Users\user\claude-code")),
             r"C:\Users\user\claude\code"
@@ -1429,10 +1422,8 @@ mod tests {
         assert_eq!(decode_project("--host-share-pond"), r"\\host\share\pond");
         // A drive root has nothing after the prefix.
         assert_eq!(decode_project("C--"), r"C:\");
-        // Wrong, not merely coarse, and asserted so it stays a known behavior:
-        // an absolute posix path whose first component starts with a
-        // non-alphanumeric encodes to the same `--` prefix a UNC share does,
-        // and the slug carries nothing that could tell them apart.
+        // Wrong, not just coarse - asserted so it stays a known behavior: a
+        // posix root starting non-alphanumeric is indistinguishable from UNC.
         assert_eq!(decode_project(&encode_project("/_work/1/s")), r"\\work\1\s");
     }
 
@@ -1559,6 +1550,21 @@ mod tests {
             &ClaudeCodeFactory,
             &adapter,
             std::path::Path::new(FIXTURE_ROOT),
+        )
+        .await
+    }
+
+    /// The same round trip over the Windows capture, which the integration
+    /// suite can only check by path prefix (the helper is `pub(crate)`). This
+    /// is what covers the two transcripts it never serializes, and the file
+    /// contents rather than just the slug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_restore_is_value_equal_to_the_windows_capture() -> anyhow::Result<()> {
+        let adapter = ClaudeCodeAdapter::new(WINDOWS_FIXTURE_ROOT);
+        crate::adapter::test_support::assert_native_restore(
+            &ClaudeCodeFactory,
+            &adapter,
+            std::path::Path::new(WINDOWS_FIXTURE_ROOT),
         )
         .await
     }
