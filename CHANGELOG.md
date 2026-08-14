@@ -2,14 +2,36 @@
 
 ## [0.14.10](https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10) - 2026-08-14
 
+Windows is a supported platform. This release ships the first Windows binary pond has ever natively built and tested - an `x86_64-pc-windows-msvc` zip produced and smoke-tested on a real Windows runner, replacing the cross-compiled `windows-gnu` artifact that no CI had ever executed - alongside adapters that find sessions where Windows actually puts them and unattended sync through Task Scheduler.
+
+The port opened as a community contribution from [@BadAd84](https://github.com/BadAd84) in [#147](https://github.com/tenequm/pond/pull/147). It landed the runtime core, arrived with an end-to-end verification across 331 real sessions, and caught a main-thread stack overflow that an independent clean-room design of the same work missed entirely. Everything else here builds on that foundation.
+
 ### <!-- 1 -->🎉 New Features
 - **windows:** PATHEXT resolution, network-path gate, and platform fixes ([#155](https://github.com/tenequm/pond/pull/155)) ([95e8ce4](https://github.com/tenequm/pond/commit/95e8ce4d88a1e9f210811ce8546e9b95503d3ce1))
+  - `claude` installed from npm is a `claude.cmd` shim, which `CreateProcess` never finds because it only appends `.exe`. PATH resolution is now `PATHEXT`-aware, and `pond init` spawns the resolved path through `%COMSPEC% /C`.
+  - UNC paths are refused at `StorageUrl::parse` with a message naming the alternatives, instead of failing deep inside Lance after `object_store` has silently dropped the host.
+  - `~\pond` in config now expands like `~/pond`. lance expands both and shellexpand only the latter, so the two disagreed and one of them created a literal `~` directory.
+  - `validate_path_id` rejects Windows device names, trailing dots and spaces, and `:` on every platform - archives are portable, and each of these fails silently on Windows rather than loudly.
+  - cliclack floor raised to 0.5.6, where Ctrl-C finally cancels a wizard prompt on Windows.
 - **ci:** native Windows msvc gate and artifact ([#152](https://github.com/tenequm/pond/pull/152)) ([ee37a63](https://github.com/tenequm/pond/commit/ee37a63887adcd1a95fc4531e3389bafd025c98c))
+  - `windows-verify` runs the full test suite on a `windows-2025` runner for every pull request; `windows-dist` builds the shipped msvc zip with `+crt-static` and a Windows application manifest. The never-executed `windows-gnu` artifact is dropped, and a release cannot be cut without both jobs green.
+  - Also fixes a real sync-lock bug: `flock` belongs to the open file description, so a subprocess spawned while a `SyncLockGuard` was alive inherited a duplicate and held the lock past drop, making a later acquire report `Busy` with no holder.
 - **config:** accept multiple source paths per adapter entry ([#149](https://github.com/tenequm/pond/pull/149)) ([caf6994](https://github.com/tenequm/pond/commit/caf6994d4d88842a876fcd496cb53111bd1ef9a8))
-- Windows support ([#147](https://github.com/tenequm/pond/pull/147)) ([ed59091](https://github.com/tenequm/pond/commit/ed5909185136a13dee3cb20f70f831636da66b10))
+  - `[adapters.<name>].path` now takes a single directory or an array; an array fans out into one single-path pass per directory, so every configured location rides the same sync while the adapters and the seam stay untouched. A malformed array fails before any store write and `pond status` names it.
+  - Also fixes `pond adapters discover` overwriting customized entries, `enable` leaving a pathless entry that failed every later sync, and openclaw reconciliation across several roots.
+- Windows support ([#147](https://github.com/tenequm/pond/pull/147)) ([ed59091](https://github.com/tenequm/pond/commit/ed5909185136a13dee3cb20f70f831636da66b10)) - contributed by [@BadAd84](https://github.com/BadAd84)
+  - Native directory layout: data, cache, and state under `%LOCALAPPDATA%\pond`, config at `%APPDATA%\pond\config.toml`, with explicit `XDG_*` overrides still honored on every platform.
+  - A dedicated 16 MiB runtime thread, fixing a main-thread stack overflow that made the previously published Windows binary unusable - it could not run `--version`.
+  - `raw_arg` for `cmd /C` secret commands (MSVCRT escaping is not how cmd parses), a sibling lock-holder file, and `protoc` vendoring scoped to non-MSVC targets so the existing release build kept working.
+  - A Task Scheduler backend for `pond schedule`, since verified end to end on Windows 11: registration, cadence round-trip, a tick that runs and logs, and a clean stop.
 
 ### <!-- 2 -->🐛 Bug Fixes
-- **adapter:** correct project-slug encoding for Windows and posix ([a218ef3](https://github.com/tenequm/pond/commit/a218ef33cb337b2ec8c41bb9b23b02fb76231559))
+- **adapter:** correct project-slug encoding for Windows and posix ([#156](https://github.com/tenequm/pond/pull/156)) ([a218ef3](https://github.com/tenequm/pond/commit/a218ef33cb337b2ec8c41bb9b23b02fb76231559))
+  - Claude Code project slugs are now encoded by its actual rule - every non-alphanumeric character becomes one dash per UTF-16 code unit - so Windows drive letters, backslashes, and non-BMP characters round-trip instead of silently mismatching.
+  - A `cwd`-less subagent transcript derives its project by decoding the project directory rather than reading its own parent directory, which named the subagent folder instead of the project.
+  - Claude Desktop probes `%APPDATA%` before the MSIX package family, the order a real Windows install actually uses; the pi adapter keeps the second separator of a UNC prefix.
+  - oh-my-pi task subagents now link to the session that spawned them, read from the parent transcript's own header rather than parsed out of a directory name - correct at any nesting depth, where name-parsing fabricated a parent id for nested agents and dropped the link for underscore-free names. Subagent sessions stay out of default search results, as designed.
+  - All four adapters, plus the scheduler, verified against real captures on Windows 11 hardware; the Windows fixtures are committed.
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10
 
