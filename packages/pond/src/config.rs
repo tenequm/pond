@@ -474,27 +474,47 @@ impl Default for EmbeddingsConfig {
 }
 
 /// The platform-local default storage path, used when neither
-/// `--storage-path` / `POND_STORAGE_PATH` nor `[storage].path` is set:
-/// `$XDG_DATA_HOME/pond`, then `$HOME/.local/share/pond`, then `.pond`.
-/// `xdg_data_home` is honored only if absolute, per the XDG base-directory
-/// spec.
+/// `--storage-path` / `POND_STORAGE_PATH` nor `[storage].path` is set.
+///
+/// Precedence on all platforms: explicit `$XDG_DATA_HOME/pond` when set and
+/// absolute, then the platform-native fallback, then `$HOME/.local/share/pond`,
+/// then `.pond`. On Windows the native fallback is `%LOCALAPPDATA%\pond\data`.
 pub fn default_storage_path(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<Url> {
-    if let Some(xdg) = xdg_data_home.filter(|path| path.is_absolute()) {
+    // Honor an explicit XDG_DATA_HOME override on every platform - consistent
+    // with state_root(), which always honors XDG_STATE_HOME when set.
+    if let Some(xdg) = xdg_data_home.filter(|p| p.is_absolute()) {
         return url_for_path(xdg.join("pond"));
+    }
+    // Windows native fallback: %LOCALAPPDATA%\pond\data.
+    // Not the root %LOCALAPPDATA%\pond (the cache lives in \cache and state
+    // in \state); each role has its own subdirectory under one pond root.
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return url_for_path(local_app_data.join("pond").join("data"));
     }
     if let Some(home) = home {
         return url_for_path(home.join(".local").join("share").join("pond"));
     }
-    // No HOME and no usable XDG var - stay usable rather than panic.
     url_for_path(PathBuf::from(".pond"))
 }
 
-/// Cache dir for rebuildable artifacts (the search row meta map): the XDG-cache
-/// analog of [`default_storage_path`]. Separate root because the contents are
-/// regenerated from the store, not durable data.
+/// Cache dir for rebuildable artifacts (the search row meta map).
+///
+/// Precedence: explicit `$XDG_CACHE_HOME/pond`, then `%LOCALAPPDATA%\pond\cache`
+/// on Windows, then `$HOME/.cache/pond`, then `.pond-cache`.
 pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-    if let Some(xdg) = xdg_cache_home.filter(|path| path.is_absolute()) {
+    if let Some(xdg) = xdg_cache_home.filter(|p| p.is_absolute()) {
         return xdg.join("pond");
+    }
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return local_app_data.join("pond").join("cache");
     }
     if let Some(home) = home {
         return home.join(".cache").join("pond");
@@ -503,12 +523,22 @@ pub fn default_cache_path(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>
 }
 
 /// Local default path for `config.toml`. URI-backed data dirs always land
-/// here because the config file has to be local (it names the bucket and
-/// any creds). XDG hierarchy: `$XDG_CONFIG_HOME/pond/config.toml`, then
-/// `$HOME/.config/pond/config.toml`, then `.pond.toml` in cwd.
+/// here because the config file has to be local (it names the bucket and creds).
+///
+/// Precedence: explicit `$XDG_CONFIG_HOME/pond/config.toml`, then
+/// `%APPDATA%\pond\config.toml` on Windows (Roaming profile - config is
+/// small and benefits from profile sync; data/cache/state are not Roaming),
+/// then `$HOME/.config/pond/config.toml`, then `.pond.toml` in cwd.
 pub fn default_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-    if let Some(xdg) = xdg_config_home.filter(|path| path.is_absolute()) {
+    if let Some(xdg) = xdg_config_home.filter(|p| p.is_absolute()) {
         return xdg.join("pond").join("config.toml");
+    }
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return app_data.join("pond").join("config.toml");
     }
     if let Some(home) = home {
         return home.join(".config").join("pond").join("config.toml");
@@ -832,12 +862,26 @@ pub fn contract_home_under(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// [`contract_home_under`] against the process `HOME`. Returns the input
+/// The user's home directory, resolved per-OS from the process environment.
+/// Windows reads `USERPROFILE` (the native home; `HOME`, when present at all,
+/// is a POSIX-style path set by git-bash/msys/Cygwin and points somewhere a
+/// native binary must not follow). Unix reads `HOME`. Empty values are treated
+/// as unset. Every home-relative default path and the adapter auto-discovery
+/// probes resolve through this, so pond finds `~/.claude`, `~/.omp`, and
+/// friends on Windows the same way it does on Unix.
+pub fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// [`contract_home_under`] against the process home. Returns the input
 /// rendered for humans; machine surfaces (JSON output, the wire) keep
 /// absolute paths.
 pub fn contract_home(path: &Path) -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => contract_home_under(path, Path::new(&home)),
+    match home_dir() {
+        Some(home) => contract_home_under(path, &home),
         None => path.to_path_buf(),
     }
 }
@@ -865,12 +909,13 @@ impl EmbeddingsConfig {
     }
 }
 
-/// Write `config.toml` with owner-only perms (0600). The file can carry a
+/// Write `config.toml` with owner-only perms on Unix (0600). The file can carry a
 /// plaintext `secret_access_key` (inline `[creds.*]`), so it must never be
 /// group/world-readable - matching the AWS CLI's 0600 on its credentials file.
-/// Unix only; Windows is out of v1 scope. Order is truncate -> chmod -> write,
-/// so the secret is only ever written once perms are already 0600, even when
-/// repairing a pre-existing 0644 file.
+/// On Unix, order is truncate -> chmod -> write so the secret is only written
+/// once perms are already 0600, even when repairing a pre-existing 0644 file.
+/// On Windows, the file is written with default ACLs (user-scoped under
+/// `%APPDATA%\pond`); explicit ACL hardening is not applied.
 pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -905,14 +950,24 @@ mod tests {
 
     use super::*;
     use serde_json::Value;
+    // Only the unix-gated 0600-permissions test uses TempDir here.
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[test]
     fn local_path_resolves_both_local_schemes() {
-        let plain = Url::parse("file:///tmp/pond-store").unwrap();
-        assert_eq!(local_path(&plain), Some(PathBuf::from("/tmp/pond-store")));
-        let uring = Url::parse("file+uring:///tmp/pond-store").unwrap();
-        assert_eq!(local_path(&uring), Some(PathBuf::from("/tmp/pond-store")));
+        // file and file+uring resolve to the same local path; remote -> None.
+        // Built from a platform-absolute path so the round-trip is exercised on
+        // Windows drive paths too, not just POSIX ones.
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\tmp\\pond-store")
+        } else {
+            PathBuf::from("/tmp/pond-store")
+        };
+        let plain = url_for_path(&path).unwrap();
+        assert_eq!(local_path(&plain), Some(path.clone()));
+        let uring = Url::parse(&plain.as_str().replacen("file:", "file+uring:", 1)).unwrap();
+        assert_eq!(local_path(&uring), Some(path));
         assert_eq!(local_path(&Url::parse("s3://bucket/prefix").unwrap()), None);
     }
 
@@ -990,35 +1045,44 @@ mod tests {
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn default_storage_path_follows_xdg_then_home() {
-        // An absolute XDG_DATA_HOME wins.
-        let resolved =
-            default_storage_path(Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home")))
-                .unwrap();
+        let xdg = PathBuf::from("/xdg");
+        let home = PathBuf::from("/home");
+        let resolved = default_storage_path(Some(xdg.clone()), Some(home.clone())).unwrap();
         assert!(is_local(&resolved));
-        assert_eq!(local_path(&resolved).unwrap(), PathBuf::from("/xdg/pond"));
+        assert_eq!(local_path(&resolved).unwrap(), xdg.join("pond"));
 
         // A relative XDG_DATA_HOME is ignored per the XDG spec; HOME is the fallback.
-        let resolved = default_storage_path(
-            Some(PathBuf::from("relative")),
-            Some(PathBuf::from("/home")),
-        )
-        .unwrap();
+        let resolved =
+            default_storage_path(Some(PathBuf::from("relative")), Some(home.clone())).unwrap();
         assert_eq!(
             local_path(&resolved).unwrap(),
-            PathBuf::from("/home/.local/share/pond"),
+            home.join(".local").join("share").join("pond"),
         );
 
         // No XDG and no HOME - stays usable: returns the cwd-anchored `.pond`.
-        // The result is absolute (Lance's URL conversion requires it), so we
-        // just check that the URL ends with the relative path's components.
         let resolved = default_storage_path(None, None).unwrap();
         assert!(is_local(&resolved));
         assert!(
             local_path(&resolved).unwrap().ends_with(".pond"),
             "fallback path should end with .pond: {resolved}",
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_storage_path_windows_native() {
+        // On Windows the function uses %LOCALAPPDATA% (native Windows data dir)
+        // regardless of the XDG/home parameters.
+        let resolved = default_storage_path(None, None).unwrap();
+        assert!(is_local(&resolved));
+        let path = local_path(&resolved).unwrap();
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .expect("LOCALAPPDATA must be set in Windows test environment");
+        assert_eq!(path, local_app_data.join("pond").join("data"));
     }
 
     #[test]

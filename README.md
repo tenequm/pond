@@ -60,7 +60,7 @@ The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over thr
 
 ## Install
 
-Linux and macOS are supported; Windows is not in v1 scope.
+Linux, macOS, and Windows are supported.
 
 **Package Managers (macOS and Linux):**
 
@@ -85,6 +85,13 @@ cargo install --path packages/pond --features cuda
 ```
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
+
+On Windows, the Homebrew/Nix packages do not apply. The easiest install is
+`cargo binstall pond-db` (downloads the prebuilt windows-gnu binary, no `protoc`
+needed). Alternatively `cargo install pond-db` builds from source - this requires
+`protoc` on `PATH` (`winget install Google.Protobuf`) because `protobuf-src` does
+not link with MSVC; the published binary uses windows-gnu and vendors protoc
+automatically. Embeddings run on the CPU backend.
 
 ## Usage
 
@@ -141,7 +148,7 @@ pond optimize --only index
 
 ### Scheduled sync
 
-Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux):
+Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux, Task Scheduler on Windows):
 
 ```sh
 pond schedule start                # every 5m by default (--every 15m|1h|6h|1d)

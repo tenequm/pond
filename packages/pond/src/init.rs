@@ -436,7 +436,7 @@ fn display_path(path: &Path) -> String {
 fn platform_default_storage() -> String {
     config::default_storage_path(
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        config::home_dir(),
     )
     .ok()
     .and_then(|url| config::local_path(&url))
@@ -912,9 +912,9 @@ const SKILL_DISPLAY_PATH: &str = "~/.claude/skills/pond/SKILL.md";
 
 /// Sync the bundled skill into Claude Code's user skills dir.
 fn skill_section(prompts: bool, auto: bool, consented: bool) -> Result<()> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = config::home_dir() else {
         cliclack::log::info(format!(
-            "skill: HOME not set - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
+            "skill: no home dir (HOME/USERPROFILE unset) - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
         ))?;
         return Ok(());
     };

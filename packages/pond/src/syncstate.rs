@@ -6,33 +6,63 @@
 //! CLI-surface state.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The resolved `XDG_STATE_HOME` root. Also the value scheduler
-/// registrations pin into the job environment, so scheduled and manual syncs
-/// agree on one state dir even when the variable is set only in shell rc.
+/// The XDG state root pinned into scheduler job environments so the scheduled
+/// sync resolves the same state dir as a manual run. `XDG_STATE_HOME` wins on
+/// all platforms when set and absolute; otherwise the platform-native fallback
+/// applies.
 pub(crate) fn state_root() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .filter(|p| p.is_absolute())
+    {
+        return xdg;
+    }
+    // Windows native: %LOCALAPPDATA%\pond\state.
+    // pond_state_dir() is state_root() itself on Windows (no extra \pond level;
+    // there are no sibling app state dirs here).
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return local_app_data.join("pond").join("state");
+    }
+    // Unix: $HOME/.local/state
+    crate::config::home_dir()
+        .map(|home| home.join(".local").join("state"))
         .unwrap_or_else(|| PathBuf::from(".pond-state"))
 }
 
-/// `$XDG_STATE_HOME/pond` (default `~/.local/state/pond`): the scheduler log,
-/// the sync lock, and the last-sync record. State, not data or cache, per the
-/// XDG base-dir spec - operational state that survives cache wipes and never
-/// needs backup.
+/// The directory where the scheduler log, sync lock, and last-sync record live.
+///
+/// On all platforms, `XDG_STATE_HOME/pond` when `XDG_STATE_HOME` is set - except
+/// on Windows, where the per-app `\pond` suffix is omitted because `state_root()`
+/// already points to a pond-specific dir (`%LOCALAPPDATA%\pond\state`). This also
+/// keeps the scheduler-pinning contract: the wrapper sets
+/// `XDG_STATE_HOME=state_root()`, and the scheduled job calls `pond_state_dir()`
+/// which on Windows returns `state_root()` = the same value, with no double suffix.
+///
+/// On Unix: `$HOME/.local/state/pond` (one app under the shared XDG state home).
 pub(crate) fn pond_state_dir() -> PathBuf {
+    // On Windows: state_root() is already pond's state dir (no \pond suffix),
+    // whether XDG_STATE_HOME is set by the user or by the scheduler wrapper.
+    #[cfg(windows)]
+    {
+        state_root()
+    }
+    // Unix: add \pond so other apps can coexist under the shared XDG state home.
+    #[cfg(not(windows))]
     state_root().join("pond")
 }
 
-/// Who holds the sync lock, written into the lock file on acquire so a
+/// Who holds the sync lock. Written into a sibling `.holder.json` file (not the
+/// lock file itself, which is whole-file-locked on Windows) on acquire so a
 /// blocked sibling can name what it is waiting for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SyncLockHolder {
@@ -50,8 +80,17 @@ pub(crate) enum SyncLockState {
 /// Held for the whole sync run. The OS drops the flock when the file closes,
 /// so a killed sync can never leave a stale lock. The lock file is never
 /// unlinked - unlink while a sibling holds the path open hands out two locks.
+/// `SyncLockGuard::drop` removes the sibling `.holder.json` best-effort.
 pub(crate) struct SyncLockGuard {
     _file: File,
+    holder_path: PathBuf,
+}
+
+impl Drop for SyncLockGuard {
+    fn drop(&mut self) {
+        // Best-effort: the file may already be absent (concurrent stop, etc.).
+        let _ = std::fs::remove_file(&self.holder_path);
+    }
 }
 
 pub(crate) fn try_acquire_sync_lock(store_key: &str) -> Result<SyncLockState> {
@@ -61,7 +100,12 @@ pub(crate) fn try_acquire_sync_lock(store_key: &str) -> Result<SyncLockState> {
 fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(format!("sync-{store_key}.lock"));
-    let mut file = File::options()
+    // Holder info lives in a sibling file, not the lock file itself: Windows
+    // takes a mandatory whole-file lock, so a blocked sibling cannot read
+    // bytes out of the locked file to name the holder. A plain unlocked file
+    // is readable on every platform.
+    let holder_path = dir.join(format!("sync-{store_key}.holder.json"));
+    let file = File::options()
         .read(true)
         .write(true)
         .create(true)
@@ -74,15 +118,22 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 pid: std::process::id(),
                 started_at: Utc::now(),
             };
-            // Best-effort holder info; the lock itself is the flock, not the bytes.
-            let _ = file.set_len(0);
-            let _ = file.seek(SeekFrom::Start(0));
-            let _ = serde_json::to_vec(&holder).map(|bytes| file.write_all(&bytes));
-            let _ = file.flush();
-            Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
+            // Use temp + rename so a concurrent reader never sees a partial
+            // write (same pattern as write_last_sync_in). Best-effort: the
+            // lock itself is the flock, not the holder bytes.
+            if let Ok(bytes) = serde_json::to_vec(&holder) {
+                let tmp = holder_path.with_extension("json.tmp");
+                if std::fs::write(&tmp, &bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &holder_path);
+                }
+            }
+            Ok(SyncLockState::Acquired(SyncLockGuard {
+                _file: file,
+                holder_path,
+            }))
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let holder = std::fs::read_to_string(&path)
+            let holder = std::fs::read_to_string(&holder_path)
                 .ok()
                 .and_then(|text| serde_json::from_str(&text).ok());
             Ok(SyncLockState::Busy(holder))
@@ -97,7 +148,10 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 path = %path.display(),
                 "sync lock unsupported on this filesystem; proceeding without single-flight"
             );
-            Ok(SyncLockState::Acquired(SyncLockGuard { _file: file }))
+            Ok(SyncLockState::Acquired(SyncLockGuard {
+                _file: file,
+                holder_path,
+            }))
         }
     }
 }

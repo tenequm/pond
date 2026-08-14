@@ -133,7 +133,9 @@ fn render_files(files: &[pond::adapter::RestoredFile]) -> String {
     let mut out = String::new();
     for file in files {
         out.push_str("### ");
-        out.push_str(&file.relative_path.display().to_string());
+        // Normalize to `/` so the golden is one file across platforms; the
+        // PathBuf itself keeps OS separators for the on-disk write above.
+        out.push_str(&file.relative_path.display().to_string().replace('\\', "/"));
         out.push('\n');
         out.push_str(std::str::from_utf8(&file.bytes).unwrap_or("<non-utf8>"));
         if !out.ends_with('\n') {

@@ -134,7 +134,7 @@ use url::Url;
 fn default_local_storage() -> anyhow::Result<StorageUrl> {
     let url = pond::config::default_storage_path(
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        pond::config::home_dir(),
     )?;
     StorageUrl::parse(url.as_str())
 }
@@ -144,7 +144,7 @@ fn default_local_storage() -> anyhow::Result<StorageUrl> {
 fn default_cache_dir() -> PathBuf {
     pond::config::default_cache_path(
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        pond::config::home_dir(),
     )
 }
 
@@ -1097,8 +1097,37 @@ fn try_raise_fd_limit(_target: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Entry point. The async body below (`run`) is an enormous state machine (the
+/// whole CLI). On Windows the main thread's default stack is 1 MiB, and both
+/// constructing that future and polling it overflow it before any code runs
+/// (Linux/macOS default to 8 MiB and never hit this). `#[tokio::main]` would
+/// run it on the main thread, and even `Box::pin` still materializes the future
+/// as a stack temporary first. So we run the runtime and the future on a
+/// dedicated thread with a generous stack, which behaves identically on every
+/// platform.
+fn main() -> anyhow::Result<()> {
+    const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
+    let worker = std::thread::Builder::new()
+        .name("pond-main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(MAIN_STACK_SIZE)
+                .max_blocking_threads(64)
+                .build()?;
+            runtime.block_on(run())
+        })?;
+    // A panic inside the worker has already been rendered by the human-panic
+    // hook installed in `run`; propagate it as a non-zero exit rather than a
+    // second, uglier panic message from the main thread.
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => std::process::exit(101),
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     #[allow(unsafe_code)]
     unsafe {
@@ -2086,7 +2115,7 @@ fn config_path(explicit: Option<PathBuf>) -> PathBuf {
     }
     pond::config::default_config_path(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        pond::config::home_dir(),
     )
 }
 

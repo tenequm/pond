@@ -608,9 +608,22 @@ fn run_secret_command(set: &str, field: &str, command: &str) -> Result<String> {
     {
         return Ok(hit.clone());
     }
+    // On Windows, pass the command string verbatim with `raw_arg` so cmd.exe
+    // receives it without MSVCRT-style re-quoting (`arg` would quote/escape the
+    // string, and cmd does not parse that escaping scheme). `COMSPEC` is the
+    // canonical way to locate cmd.exe; `sh -c` handles all other platforms.
+    #[cfg(windows)]
+    let output = {
+        use std::os::windows::process::CommandExt as _;
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd".into());
+        std::process::Command::new(shell)
+            .raw_arg(format!("/C {command}"))
+            .output()
+            .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?
+    };
+    #[cfg(not(windows))]
     let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+        .args(["-c", command])
         .output()
         .with_context(|| format!("[creds.{set}] {field}_command failed to spawn: {command}"))?;
     if !output.status.success() {
@@ -4720,6 +4733,32 @@ mod tests {
     }
 
     #[test]
+    fn secret_command_with_space_round_trips() {
+        // The command has spaces; with the old Windows `arg(command)` code
+        // cmd.exe would receive the whole string MSVCRT-quoted and misparse it.
+        // With `raw_arg(format!("/C {command}"))` it receives the raw form.
+        // Both Unix (sh -c) and Windows (cmd /C) should produce the word "hello".
+        let result = run_secret_command("test", "field", "echo hello").unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn secret_command_with_space_and_quote_round_trips() {
+        // The reviewer explicitly required a case with BOTH a space AND a quote.
+        // Old Windows `arg(command)` would MSVCRT-escape the quotes, making
+        // cmd.exe see a backslash-mangled string. With `raw_arg` it is literal.
+        let result = run_secret_command("test2", "q", r#"echo "hello world""#).unwrap();
+        // cmd /C echo "hello world" preserves the outer quotes in its output;
+        // sh -c 'echo "hello world"' strips them (shell quoting, not echoed).
+        #[cfg(windows)]
+        assert_eq!(
+            result, r#""hello world""#,
+            "cmd echo must preserve outer quotes"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(result, "hello world", "sh must strip outer quotes");
+    }
+    #[test]
     fn prune_keeps_live_uuid_dirs_and_drops_dead_ones() {
         let temp = TempDir::new().unwrap();
         let indices = temp.path().join("bkt/messages.lance/_indices");
@@ -4766,8 +4805,13 @@ mod tests {
     fn storage_url_translation_table() {
         // file (Lance's `uri_to_url` appends the trailing slash; `child_uri`
         // trims it downstream)
-        let local = StorageUrl::parse("/srv/pond").unwrap();
-        assert_eq!(local.lance_url().as_str(), "file:///srv/pond/");
+        let (local_input, local_expected) = if cfg!(windows) {
+            ("C:\\srv\\pond", "file:///C:/srv/pond/")
+        } else {
+            ("/srv/pond", "file:///srv/pond/")
+        };
+        let local = StorageUrl::parse(local_input).unwrap();
+        assert_eq!(local.lance_url().as_str(), local_expected);
         assert!(local.is_local());
         assert!(local.scheme_options.is_empty());
         // s3 passthrough
@@ -5049,7 +5093,14 @@ mod tests {
             CredsSet {
                 access_key_id_file: Some(key_path),
                 // Two trailing newlines: exactly one is stripped.
-                secret_access_key_command: Some("printf 'from-command\\n\\n'".to_owned()),
+                secret_access_key_command: Some(
+                    if cfg!(windows) {
+                        "echo from-command&echo."
+                    } else {
+                        "printf 'from-command\\n\\n'"
+                    }
+                    .to_owned(),
+                ),
                 ..CredsSet::default()
             },
         );
@@ -5061,7 +5112,11 @@ mod tests {
         );
         assert_eq!(
             opts(&resolved, "secret_access_key").as_deref(),
-            Some("from-command\n"),
+            Some(if cfg!(windows) {
+                "from-command\r\n"
+            } else {
+                "from-command\n"
+            }),
         );
 
         // A failing command surfaces its text and exit status.

@@ -109,6 +109,9 @@ impl Sandbox {
             .arg("--storage-path")
             .arg(self.store_path())
             .env("HOME", self.temp.path().join("home"))
+            .env("USERPROFILE", self.temp.path().join("home"))
+            .env("APPDATA", self.temp.path().join("config"))
+            .env("LOCALAPPDATA", self.temp.path().join("data"))
             .env("XDG_DATA_HOME", self.temp.path().join("data"))
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("XDG_CACHE_HOME", self.temp.path().join("cache"))
@@ -250,9 +253,10 @@ async fn native_resume_writes_a_pi_session_file_for_the_whole_lineage() {
             "{path} escaped --out-dir {}",
             out_dir.display(),
         );
-        // The pi adapter's own layout, so pi's session list finds it.
+        // The pi adapter's own layout, so pi's session list finds it. Compare
+        // on `/`-normalized text: the on-disk path uses OS separators.
         assert!(
-            path.contains("/sessions/--"),
+            path.replace('\\', "/").contains("/sessions/--"),
             "{path} is not in pi's layout"
         );
         let head: Value = serde_json::from_str(
