@@ -13,7 +13,7 @@ pond <command> --help   # full flags for any command
 - `pond adapters list|discover|enable|disable` - manage which adapters sync ingests
 - `pond storage check|use` - probe a destination; switch the active store
 - `pond creds add|list|delete` - manage URL-scoped credential sets
-- `pond schedule start|stop|status|logs` - manage the automatic sync schedule
+- `pond schedule start|stop|status|logs` - manage the automatic sync schedule (launchd on macOS, systemd user timers or a fenced crontab block on Linux, Task Scheduler on Windows)
 - `pond config show|path|schema` - inspect resolved configuration
 
 ## Data

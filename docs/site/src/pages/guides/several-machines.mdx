@@ -10,6 +10,8 @@ Concurrent writers are safe: Lance serializes commits through the object store's
 
 Within one machine, sync is single-flight: a second `pond sync` against the same store waits for the first (naming the holder), and the scheduled run passes `--no-wait` so ticks skip cleanly instead of queueing. `pond status --hosts` shows which machines feed the store - sessions and latest activity per ingest host.
 
+The machines need not share an OS: macOS, Linux, and Windows hosts can all feed one store, and each schedules its own syncs through its native scheduler.
+
 ## Mixed versions
 
 A release that changes the store schema (0.13.0 added materialized tool columns) migrates the store in place the first time the new binary opens it - a one-time backfill with a stderr notice - after which older binaries fail at open with a schema-mismatch error. When several machines share one bucket, upgrade pond on all of them together; a machine left on an older version stops syncing until it upgrades.
