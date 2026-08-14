@@ -222,6 +222,13 @@ jobs:
 
       # Completions come from the just-built native binary, the same way the
       # Linux tarballs get theirs. Today's gnu zip ships none at all.
+      #
+      # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes
+      # no BOM, while Windows PowerShell 5.1's does - and a BOM at the top of
+      # pond.bash or _pond breaks sourcing on the shells that read them. Piping
+      # into Set-Content is safe here (it consumes the whole stream); the
+      # EPIPE trap is only in matchers like `Select-String -Quiet` that stop
+      # early, which is why the smoke step above matches on the file instead.
       - name: Package release zip
         shell: pwsh
         run: |
