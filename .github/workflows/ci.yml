@@ -165,11 +165,17 @@ jobs:
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
   # pipeline that ever executes a Windows binary.
+  # `!cancelled()` is load-bearing: release-prep only runs on a main push, and a
+  # skipped `needs` skips its dependents, so a bare `needs:` would stop this ever
+  # running on the release PR.
   windows-dist:
+    needs: [release-prep]
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+      !cancelled() && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')) ||
+        needs.release-prep.outputs.is_release == 'true'
+      )
     runs-on: windows-2025
     timeout-minutes: 180
     # Not cancellable, same rule as dist-build: this produces a release artifact
