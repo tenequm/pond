@@ -13,7 +13,7 @@
 
 Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
 
-Your agent history is already on your disk: thousands of sessions of decisions, fixes, and dead ends, scattered across tools that cannot search them. Pond ingests them automatically and losslessly into storage you own - a local folder or your own S3 bucket - and makes the whole corpus searchable, SQL-queryable, and available to your agents over MCP, so "how did we fix this before?" is a query, not an archaeology dig. Sessions are no longer locked to the tool that created them: pond restores any session into any supported client, and you continue working there.
+Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
 ```sh
 brew install tenequm/tap/pond
