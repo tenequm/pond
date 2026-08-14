@@ -101,7 +101,8 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
 
 /// Every place the Cowork store can live, in probe order. Built on every
 /// platform rather than behind `cfg!`, so a test can drive the Windows branches
-/// from a `TempDir` home.
+/// from a `TempDir` home; the MSIX `read_dir` runs eagerly, costing one failing
+/// syscall per command where the directory is absent.
 ///
 /// `%APPDATA%` leads because that is what a real install uses: verified against
 /// Claude 1.30096.1 on Windows 11, a per-user Squirrel install under
@@ -109,7 +110,7 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
 /// Electron's `userData` is never virtualized.
 ///
 /// AppData is derived from home rather than read, so a redirected AppData is
-/// unsupported - the same gap opencode's probe has with `XDG_DATA_HOME`.
+/// unsupported.
 fn cowork_roots(home: &Path) -> Vec<PathBuf> {
     let app_data = home.join("AppData");
     let mut roots = vec![
@@ -128,11 +129,8 @@ fn cowork_roots(home: &Path) -> Vec<PathBuf> {
 
 /// The Store/MSIX channel, where Electron's `userData` is silently virtualized
 /// under `%LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude`
-/// (anthropics/claude-code #25579, #26073).
-///
-/// A secondary probe, not the primary: the mainline installer is not MSIX (see
-/// [`cowork_roots`]), and this layout is unverified against a real packaged
-/// install - so a differing child layout probes nothing rather than wrong.
+/// (anthropics/claude-code #25579, #26073). Unverified against a real packaged
+/// install, so a differing child layout probes nothing rather than wrong.
 fn msix_cowork_roots(packages: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(packages) else {
         return Vec::new();
@@ -140,9 +138,7 @@ fn msix_cowork_roots(packages: &Path) -> Vec<PathBuf> {
     msix_roots_from(entries.flatten().map(|entry| entry.path()))
 }
 
-/// Split from [`msix_cowork_roots`] so both rules are testable: `read_dir`
-/// order is filesystem-defined, so a directory fixture can never prove the sort
-/// that makes the pick deterministic across channels.
+/// Split out so the name filter and the sort are provable without a directory.
 fn msix_roots_from(families: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = families
         .filter(|family| {
@@ -1233,6 +1229,43 @@ mod tests {
             "the foreign family must be dropped and the rest sorted",
         );
         assert!(roots.iter().all(|root| root.ends_with(SESSIONS_SUBDIR)));
+    }
+
+    /// Probe ORDER, which the single-root tests cannot see: with both layouts
+    /// present `%APPDATA%` has to win, because that is the one a real install
+    /// writes. The plan inverted this order deliberately.
+    #[test]
+    fn probe_default_prefers_roaming_over_a_present_msix_family() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let roaming = temp
+            .path()
+            .join("AppData")
+            .join("Roaming")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&roaming)?;
+        std::fs::create_dir_all(
+            temp.path()
+                .join("AppData")
+                .join("Local")
+                .join("Packages")
+                .join("AnthropicClaude_j0mn41abcdefg")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR),
+        )?;
+
+        let probe = ClaudeDesktopAppFactory.probe_default(&Env::with_home(temp.path()));
+        let got = probe
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        anyhow::ensure!(
+            got == roaming.to_str(),
+            "the real-install layout must win over the Store channel: got {got:?}",
+        );
+        Ok(())
     }
 
     /// The non-MSIX install keeps Electron's plain `%APPDATA%\Claude` layout.

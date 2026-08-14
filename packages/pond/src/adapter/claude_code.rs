@@ -206,15 +206,10 @@ fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathB
 }
 
 /// Claude Code's own project-slug rule, read off its bundle
-/// (`A.replace(/[^a-zA-Z0-9]/g, "-")`) rather than inferred: every
-/// non-alphanumeric character becomes `-`. Restoring to the wrong directory is
-/// silent, so this has to match exactly - which also neutralizes the `\` and
-/// `:` a Windows `cwd` carries, keeping the slug a legal path segment
-/// ([`crate::adapter::validate_path_id`]).
-///
-/// Confirmed against real corpora: 178 of 181 posix project directories match
-/// exactly (the 3 misses are not path-derived), plus a native Windows 11
-/// capture whose drive-letter `cwd` is stored as `C--Users-<user>-<project>`.
+/// (`A.replace(/[^a-zA-Z0-9]/g, "-")`) rather than inferred. Restoring to the
+/// wrong directory is silent, so it has to match exactly. Confirmed against 178
+/// of 181 posix project directories (the 3 misses are not path-derived) and a
+/// native Windows 11 capture.
 fn encode_project(project: &str) -> String {
     let mut encoded = String::with_capacity(project.len());
     for c in project.chars() {
@@ -232,14 +227,10 @@ fn encode_project(project: &str) -> String {
 }
 
 /// Best-effort inverse of [`encode_project`], for the one path that needs it: a
-/// transcript in which no row carries `cwd`. Lossy - `/`, `.`, `_` and a space
-/// are all `-` by the time we see the slug - so it recovers separators and the
-/// Windows drive/UNC prefix only. Two shapes decode wrong, because the slug
-/// cannot say which platform wrote it: a project name containing `--`, and an
-/// absolute posix path whose first component starts with a non-alphanumeric
-/// (`/_work/1/s` -> `--work-1-s`, indistinguishable from a UNC share). Neither
-/// earns a `cfg!(windows)` branch - every real transcript carries `cwd`, which
-/// is why this is the fallback.
+/// transcript in which no row carries `cwd`. Lossy, so it recovers separators
+/// and the Windows drive/UNC prefix only, and two shapes decode outright wrong
+/// (pinned in the tests). No `cfg!(windows)` branch: every real transcript
+/// carries `cwd`, which is why this is the fallback.
 fn decode_project(slug: &str) -> String {
     if let Some(rest) = slug.strip_prefix("--") {
         return format!(r"\\{}", rest.replace('-', r"\"));
@@ -1394,7 +1385,6 @@ mod tests {
             "C--Users-user-claude-code"
         );
         assert_eq!(encode_project(r"\\host\share\pond"), "--host-share-pond");
-        // Astral characters cost two dashes: the JS regex counts UTF-16 units.
         assert_eq!(encode_project("/a/\u{1F600}"), "-a---");
         // The committed capture's own pair, so the rule is pinned to ground
         // truth rather than to a model of it.

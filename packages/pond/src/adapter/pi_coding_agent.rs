@@ -280,9 +280,8 @@ fn reconstructed_relative_path(session: &crate::sessions::SessionWithMessages) -
 
 /// pi's `sessionDirectoryName` (`jsonl/repo.ts`): strip the leading separator,
 /// map `/`, `\` and `:` to `-`, and wrap in `--`. Reproduced exactly so a
-/// resumed session is discoverable by pi rather than merely well-formed - which
-/// means stripping exactly ONE separator, as pi's un-`g`-flagged `/^[/\\]/`
-/// does, so a UNC `\\host\share` keeps its second backslash.
+/// resumed session is discoverable by pi rather than merely well-formed,
+/// including the single-separator strip (`/^[/\\]/`, no `g`).
 fn encode_project(project: &str) -> String {
     let body: String = project
         .strip_prefix(['/', '\\'])
