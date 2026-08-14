@@ -200,7 +200,13 @@ jobs:
       # Its post step is `post-if: success() || failure()`, so a red run still
       # saves - which matters, because the expected way to iterate here is a
       # platform-specific test failing after an hour of compiling.
-      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+      # Pinned to main, NOT the v1 tag, and that is deliberate: v1 (Jun 2026)
+      # predates Windows support and fails this job outright with "Unsupported
+      # platform: win32-x64". main maps win32-x64 -> x86_64-pc-windows-msvc and
+      # is also where the max-size / pr-comment inputs exist. Still immutable -
+      # it is a SHA, not a moving ref. Move back to a tag once one ships with
+      # Windows in it.
+      - uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main @ 2026-06-19
         with:
           s3-bucket: ttq
           s3-endpoint: https://nbg1.your-objectstorage.com
