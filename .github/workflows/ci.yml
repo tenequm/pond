@@ -88,14 +88,14 @@ jobs:
   # runners - separate machines, separate disks, nothing shared - so Windows
   # contributes the longer of the two to a release, not the sum.
   #
-  # Plain cargo in both, NOT moon, and the reason is load-bearing: moon's task
+  # windows-verify runs moon's `pond:test-msvc`, never `pond:test`: the task
   # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
-  # architecture (crates/task-hasher/src/task_fingerprint.rs). `moon run
-  # pond:test` here would compute the hash the Linux runner already stored for
-  # this commit, report "cached", and go green without compiling a single line
-  # on Windows - exactly the failure these jobs exist to prevent. They mirror
-  # packages/pond/moon.yml `test` and the dist leg of the root moon.yml
-  # `build-dist`; keep them in lockstep by hand.
+  # architecture (crates/task-hasher/src/task_fingerprint.rs), so sharing one
+  # task would hit the hash the Linux runner already stored and go green without
+  # compiling a line here. The differing command is what keeps them apart, and
+  # the remote cache is what lets a prose-only commit skip the leg entirely.
+  # windows-dist stays plain cargo, mirroring the dist leg of the root moon.yml
+  # `build-dist`; keep those two in lockstep by hand.
   #
   # The two carry DIFFERENT kache manifest-keys. Sharing one would make each
   # overwrite the other's warm-prefetch manifest, silently dropping both to a
@@ -125,8 +125,22 @@ jobs:
     concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
+    #
+    # BAZEL_REMOTE_AUTH is NOT blanked here, unlike the sibling jobs: moon only
+    # skips a task on a cache hit, and a hosted runner starts with an empty local
+    # cache every run, so without the remote there is nothing to hit.
     env:
-      BAZEL_REMOTE_AUTH: ""
+      # kache defaults its store to %LOCALAPPDATA% on C:, which on this image is
+      # a slow ~29 GB network-attached disk; D: is ~147 GB of fast local storage
+      # and already holds target/ (actions/runner-images#12416). Same volume as
+      # the build tree is also the precondition for any future hardlink restore.
+      KACHE_CACHE_DIR: D:\kache
+      # Prefetch stops at 2GiB of blobs or 300s of scheduling by default, and
+      # this graph is far past both - lance alone is 287 MB of ~790 crates. The
+      # crates the caps drop are the expensive ones, which is why lance and the
+      # datafusion set flip between hit and miss with an unchanged Cargo.lock.
+      KACHE_PREFETCH_MAX_BYTES: "0"
+      KACHE_PREFETCH_DEADLINE_SECS: "0"
     steps:
       # MUST precede checkout, and cannot live in the composite action (a local
       # action only resolves once the repo is checked out). pond's longest
@@ -139,26 +153,49 @@ jobs:
       - name: Allow long paths in git
         shell: pwsh
         run: git config --system core.longpaths true
+      # Full history for the same reason build-and-test needs it: moon's vcs
+      # layer resolves vcs.defaultBranch, which a shallow PR checkout lacks.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
 
+      # Pinned to the version .github/actions/bootstrap installs on Linux: the
+      # two share a remote cache, and moon refuses a cache written by another
+      # version. Located by search rather than by guessing the archive layout.
+      - name: Install moon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = '2.4.6'
+          Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
+          Expand-Archive moon.zip -DestinationPath C:\moon
+          $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       - name: Test
-        run: cargo test --locked --target x86_64-pc-windows-msvc
+        run: moon run pond:test-msvc
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
   # pipeline that ever executes a Windows binary.
+  # `!cancelled()` is load-bearing: release-prep only runs on a main push, and a
+  # skipped `needs` skips its dependents, so a bare `needs:` would stop this ever
+  # running on the release PR.
   windows-dist:
+    needs: [release-prep]
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+      !cancelled() && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')) ||
+        needs.release-prep.outputs.is_release == 'true'
+      )
     runs-on: windows-2025
     timeout-minutes: 180
     # Not cancellable, same rule as dist-build: this produces a release artifact
