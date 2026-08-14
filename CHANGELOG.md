@@ -32,6 +32,7 @@ The port opened as a community contribution from [@BadAd84](https://github.com/B
   - Claude Desktop probes `%APPDATA%` before the MSIX package family, the order a real Windows install actually uses; the pi adapter keeps the second separator of a UNC prefix.
   - oh-my-pi task subagents now link to the session that spawned them, read from the parent transcript's own header rather than parsed out of a directory name - correct at any nesting depth, where name-parsing fabricated a parent id for nested agents and dropped the link for underscore-free names. Subagent sessions stay out of default search results, as designed.
   - All four adapters, plus the scheduler, verified against real captures on Windows 11 hardware; the Windows fixtures are committed.
+  - Note for existing stores: `project` is an immutable field, so a stored session whose project now derives differently is refused on re-ingest with `immutable_project` and reported as a partial sync rather than rewritten. Nothing already stored is lost or changed, and only a fresh store picks up the corrected value.
 
 **Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10
 
