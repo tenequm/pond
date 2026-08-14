@@ -90,7 +90,7 @@ On Windows, the Homebrew/Nix packages do not apply. The easiest install is `carg
 
 Building from source instead (`cargo install pond-db`) needs two tools on `PATH` that the prebuilt binary spares you: `protoc` (`winget install Google.Protobuf`), because `protobuf-src` cannot vendor it on Windows, and NASM (`winget install NASM.NASM`) for `aws-lc-sys`. Embeddings run on the CPU backend.
 
-Cloning this repository on Windows additionally needs `git config --global core.longpaths true` first - some test fixtures nest encoded project slugs deep enough to pass 260 characters, and git refuses to create them otherwise. This affects a clone only; `cargo install pond-db` does not package the fixtures.
+Cloning this repository on Windows additionally needs `git config --global core.longpaths true` first - some test fixtures nest encoded project slugs deep enough to pass 260 characters, and git refuses to create them otherwise. This affects a clone only; `cargo install pond-db` does not package the fixtures. Build and test from the clone with an explicit `--target x86_64-pc-windows-msvc`: without it, cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
 
 Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
 

@@ -49,15 +49,14 @@ fn entries(count: u64, marker: &str) -> Vec<RowMetaEntry> {
         .collect()
 }
 
-/// Leftover build temps must match what `sweep_orphan_temps` looks for:
-/// the store prefix plus a `.tmp-` infix.
+/// Leftover build temps, matched with the very predicate `sweep_orphan_temps`
+/// reclaims by - not a copy of it, so the two cannot drift apart.
 fn orphan_temps(cache_dir: &Path) -> Vec<String> {
-    let prefix = format!("rowmetamap-{STORE_KEY}-");
     std::fs::read_dir(cache_dir)
         .expect("read cache dir")
         .flatten()
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .filter(|name| name.starts_with(&prefix) && name.contains(".tmp-"))
+        .filter(|name| pond::rowmap::is_orphan_temp(name, STORE_KEY))
         .collect()
 }
 
@@ -122,8 +121,17 @@ fn purge_then_same_version_rebuild_under_a_live_mapping_leaves_a_readable_segmen
         );
     }
 
+    // Closing stdin releases the child's mapping and ends its run. Assert how it
+    // ended rather than discarding it: a child that panicked *after* writing the
+    // ready marker would otherwise leave this test asserting against a segment
+    // nobody was holding, which is the one way it could pass vacuously.
     drop(child.stdin.take());
-    child.wait()?;
+    let child_status = child.wait()?;
+    assert!(
+        child_status.success(),
+        "child holding the mapping exited abnormally ({child_status}) - \
+         the cycle above may not have run against a live mapping",
+    );
     Ok(())
 }
 

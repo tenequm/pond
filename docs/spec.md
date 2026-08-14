@@ -109,15 +109,7 @@ These are stable positions. pond will not:
 
 ### 2.4 Platform
 
-Linux, macOS, and Windows (x64). The published Windows binary is a native
-`x86_64-pc-windows-msvc` build, statically linked against the VC runtime and
-verified by a Windows CI job that runs the full test suite on every release.
-`protobuf-src` cannot vendor protoc on Windows, so a system `protoc` (and NASM,
-for `aws-lc-sys`) is needed only when building from source there. The scheduler
-backs onto Task Scheduler in place of launchd/systemd.
-`local-store-durability` (Section 3.3) relies on `local-store-self-heal` on
-Windows instead of the Unix fsync wrapper (dir-fsync semantics differ).
-Embeddings run on the CPU backend (Metal is macOS-only, CUDA is Linux opt-in).
+Linux, macOS, and Windows (x64). The published Windows binary is a native `x86_64-pc-windows-msvc` build, statically linked against the VC runtime and verified by native Windows CI that runs the full test suite on every pull request and release. `protobuf-src` cannot vendor protoc on Windows, so a system `protoc` (and NASM, for `aws-lc-sys`) is needed only when building from source there. The scheduler backs onto Task Scheduler in place of launchd/systemd. `local-store-durability` (Section 3.3) relies on `local-store-self-heal` on Windows instead of the Unix fsync wrapper (dir-fsync semantics differ). Embeddings run on the CPU backend (Metal is macOS-only, CUDA is Linux opt-in).
 
 ---
 

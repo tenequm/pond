@@ -115,8 +115,13 @@ jobs:
     # No `needs:` - starts at t=0 alongside the Linux jobs and windows-dist.
     # 180 is measured headroom: this leg was 76 min on a fully cold cache.
     timeout-minutes: 180
-    # Cancellable, like build-and-test: a newer push supersedes it. Only the
-    # artifact producers below are protected from cancellation.
+    # Cancellable, like build-and-test: a newer push supersedes it. That makes
+    # this the one `needs:` of publish-release that can be cancelled - the
+    # sibling windows-dist is explicitly not, being an artifact producer. It is
+    # safe because release-plz cuts the tag INSIDE publish-release, so a
+    # cancelled run leaves is_release still true and the superseding push simply
+    # re-runs the whole release path. The same exposure build-and-test already
+    # carries. Do not "fix" this to false without that reasoning changing.
     concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
@@ -200,7 +205,7 @@ jobs:
           if (-not (Select-String -Path completions.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
 
       # Completions come from the just-built native binary, the same way the
-      # Linux tarballs get theirs. Today's gnu zip ships none at all.
+      # Linux tarballs get theirs - generated here rather than shipped empty.
       #
       # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes no
       # BOM, while Windows PowerShell 5.1's does - and a BOM atop pond.bash or
@@ -228,7 +233,6 @@ jobs:
           path: dist/pond-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
           retention-days: 1
-
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
