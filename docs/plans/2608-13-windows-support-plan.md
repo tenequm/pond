@@ -120,7 +120,7 @@ New `windows-verify` job in `ci.yml`, runner `windows-2025` (note: `windows-late
     (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
   ```
 
-  To make the release gate binding, mark `windows-verify` as a required status check in branch protection: on ordinary PRs the `if:` skips it, and GitHub treats a skipped required check as satisfied, so only release PRs actually wait on it. `windows-verify` takes **no `needs:`** - it starts at t=0 in parallel with the Linux jobs rather than serializing the release path behind them. `timeout-minutes: 120` (the test compile and the `dist` compile are two independent dep-graph builds on a slow hosted runner), a `concurrency` group with `cancel-in-progress`, and `env: BAZEL_REMOTE_AUTH: ""` (same rule as `flake-check`/`macos-verify`: hosted runners compiling third-party build scripts get no cache credentials).
+  To make the release gate binding, mark `windows-verify` as a required status check in branch protection: on ordinary PRs the `if:` skips it, and GitHub treats a skipped required check as satisfied, so only release PRs actually wait on it. `windows-verify` takes **no `needs:`** - it starts at t=0 in parallel with the Linux jobs rather than serializing the release path behind them. `timeout-minutes: 180` (measured: the cold run took 138.6 min - 76.4 test + 61.0 dist - on the free 4-vCPU runner), a `concurrency` group with **`cancel-in-progress: false`** (this job produces a release artifact, same rule as `dist-build`; cancelling it mid-release cancels the publish with it), and `env: BAZEL_REMOTE_AUTH: ""` (same rule as `flake-check`/`macos-verify`: hosted runners compiling third-party build scripts get no cache credentials).
 - **Steps** (full copy-pasteable fragment in Appendix A; the load-bearing details): checkout (depth 1 - no moon here, `POND_BUILD_COMMIT` needs only HEAD); protoc direct-download + `$GITHUB_PATH`; `choco install nasm -y`; `rustup toolchain install --no-self-update` (honors `rust-toolchain.toml` 1.95.0; the host triple IS the build target so no extra rust-std); `kunobi-ninja/kache-action` (S3, see above); `cargo test --locked --target x86_64-pc-windows-msvc` (**full** suite - DataFusion/axum/rmcp get their first Windows run ever here); then `POND_BUILD_COMMIT=$(git rev-parse --short HEAD)` and **`cargo build --locked --profile dist --target x86_64-pc-windows-msvc`** - `--profile dist`, NOT `--release`: `release` is pond's no-LTO iteration profile (`Cargo.toml:23-29`), every shipped binary uses `dist`, and without `POND_BUILD_COMMIT` the Windows binary loses the commit stamp every other artifact carries (`moon.yml:51` -> `main.rs:223`); launch-smoke mirroring `macos-verify` (`--version`, `--help`, `completions powershell` - redirect to a file, never pipe: a closed pipe trips clap_complete); package the zip (exe + all four completion scripts) with `Compress-Archive`; upload as `dist-windows` artifact (`if-no-files-found: error`, `retention-days: 1`).
 - **`publish-release` wiring:** `needs: [dist-build, macos-verify, windows-verify]`; a second `download-artifact` for `dist-windows` into `dist/`; then - **before** the release-plz step - regenerate checksums: `checksums.txt` is produced *inside the cached moon task* (`moon.yml:131`, declared output `:152`) and structurally cannot contain the Windows hash, so the job asserts the zip exists and re-runs `( cd dist && sha256sum pond-* > checksums.txt )` over the merged dist. The `gh release upload "v$V" dist/pond-* dist/checksums.txt` glob (`ci.yml:282`) then picks the zip up unchanged; the nix/Homebrew `sha()` helpers read only `pond-<target>.tar.xz` and are unaffected.
 - **The two de-risking probes**, placed per the repo's test rules:
@@ -279,8 +279,8 @@ Reference implementation from the moon-wiring verification pass. Line references
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
     runs-on: windows-2025
-    timeout-minutes: 120
-    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: true }
+    timeout-minutes: 180
+    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: false }
     env:
       # Same rule as flake-check/macos-verify: no moon runs here, and this job
       # compiles third-party build scripts on a hosted runner.
@@ -318,7 +318,9 @@ Reference implementation from the moon-wiring verification pass. Line references
           rustup show active-toolchain
           cargo --version
 
-      - uses: kunobi-ninja/kache-action@<pin-sha>   # v1 (S3 backend; see 3.2)
+      # NOT the v1 tag: it predates Windows support and fails the job with
+      # "Unsupported platform: win32-x64". Pin main (or a later tag that has it).
+      - uses: kunobi-ninja/kache-action@<pin-sha>   # main; S3 backend, see 3.2
         with:
           s3-bucket: ttq
 

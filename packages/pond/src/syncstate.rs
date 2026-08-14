@@ -98,9 +98,17 @@ impl Drop for SyncLockGuard {
         // skips) because of an unrelated child process. `unlock` clears the
         // description's lock outright, however many descriptors still reference
         // it. Best-effort: an unlock failure leaves the old close-time behavior.
-        let _ = self.file.unlock();
+        //
+        // Order matters: remove the holder BEFORE unlocking. While we still
+        // hold the lock nobody else can have written one, so the file we delete
+        // is provably ours. Unlocking first opens a window where a successor
+        // acquires, writes its own holder, and we delete it - leaving the next
+        // blocked process reporting `Busy(None)` about a live holder it can no
+        // longer name.
+        //
         // Best-effort: the file may already be absent (concurrent stop, etc.).
         let _ = std::fs::remove_file(&self.holder_path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -285,14 +293,26 @@ mod lock_release_regression {
     #[test]
     fn lock_frees_on_drop_even_while_subprocesses_are_spawning() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Counted, not assumed. A spawn that never succeeds turns this test
+        // green without ever opening the fork/exec window it exists to probe -
+        // which is exactly what a hardcoded /usr/bin/true would do on NixOS or
+        // a minimal container, where that path does not exist. `/bin/sh` is
+        // present on every unix, and the count is asserted below.
+        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = {
             let stop = std::sync::Arc::clone(&stop);
+            let spawned = std::sync::Arc::clone(&spawned);
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = std::process::Command::new("/usr/bin/true")
+                    if std::process::Command::new("/bin/sh")
+                        .args(["-c", ":"])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .status();
+                        .status()
+                        .is_ok()
+                    {
+                        spawned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             })
         };
@@ -323,5 +343,9 @@ mod lock_release_regression {
         if let Err(message) = result {
             panic!("{message}");
         }
+        assert!(
+            spawned.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no subprocess ever spawned - this test proved nothing",
+        );
     }
 }

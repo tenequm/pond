@@ -30,13 +30,8 @@ cargo install pond-db
 
 ::::
 
-On Windows, the release zip also carries completion scripts for PowerShell,
-bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your
-`$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of
-`RemoteSigned` or looser.
+On Windows, the release zip also carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
 
-Running the Linux binary under WSL works when both the agent session files and
-the pond store live on the ext4 side. Do not point either across `/mnt/c`:
-throughput collapses and Windows-side writes are missed.
+Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
 
 Next: [Quickstart](/get-started/quickstart).
