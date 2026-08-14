@@ -9,6 +9,18 @@ use pond::{
 };
 use tempfile::TempDir;
 
+/// Real native-Windows capture; see the fixture-gate test below.
+const WINDOWS_FIXTURES: &str = "tests/fixtures/adapter/claude_code/windows-projects";
+
+/// The directory name Claude Code chose for the capture's `cwd`.
+const WINDOWS_SLUG: &str = "C--dev-pond-fixture-demo-v2";
+
+/// The capture's plain session, its two-subagent parent, and that parent's
+/// first child.
+const WINDOWS_PLAIN_SESSION: &str = "68f6e765-7552-44c4-8cf9-d88aba05bdb0";
+const WINDOWS_PARENT_SESSION: &str = "95602a8e-b311-49b6-a95c-69c12cd105f8";
+const WINDOWS_CHILD_SUFFIX: &str = "agent-a44fd74de879ec6e2";
+
 /// The adapter ingests the whole fixture corpus without dropping anything, and
 /// every session it produced carries retrievable conversational content.
 /// Asserts adapter output at the Store layer - `pond_get_session`/
@@ -245,5 +257,140 @@ fn write_claude_parent_workflow_child(root: &Path) -> anyhow::Result<()> {
         wf.join("agent-xyz789.meta.json"),
         r#"{"agentType":"general-purpose","description":"workflow fixture child"}"#,
     )?;
+    Ok(())
+}
+
+/// The Windows fixture gate (plan 2608-13 section 3.5). Captured on native
+/// Windows 11 from a `cwd` of `C:\dev\pond fixture_demo.v2`, one path carrying a
+/// drive colon, backslashes, a space, an underscore and a dot - so a single
+/// capture pins every character class the slug rule collapses.
+///
+/// Both routes to the slug are asserted, because the restore has two: the
+/// captured `source.project_dir` hint, which it prefers, and `encode_project`
+/// from the `cwd`, which it falls back to. Asserting only the first would pass
+/// with a broken encoder.
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_capture_ingests_its_native_cwd_and_restores_to_the_same_slug() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(WINDOWS_FIXTURES);
+
+    let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+    assert_eq!(summary.dropped_events, 0);
+    assert_eq!(summary.dropped_sessions, 0);
+    assert_eq!(summary.skipped_files, 0);
+
+    // The backslash-bearing `cwd` survives ingest verbatim - it is a value, not
+    // a path pond walks.
+    for id in store.session_ids().await? {
+        let session = store.get_session(&id).await?.expect("ingested");
+        assert_eq!(
+            &*session.session.project, r"C:\dev\pond fixture_demo.v2",
+            "session {id} lost its Windows cwd",
+        );
+    }
+
+    // Round trip: the slug pond writes back is the slug Claude Code wrote.
+    let parent = store
+        .get_session(WINDOWS_PARENT_SESSION)
+        .await?
+        .expect("subagent parent ingested");
+    let files = ClaudeCodeFactory.serialize(&parent, RestoreFidelity::Native)?;
+    assert!(
+        files
+            .iter()
+            .all(|f| f.relative_path.starts_with(WINDOWS_SLUG)),
+        "restore must target the captured slug, got {:?}",
+        files.iter().map(|f| &f.relative_path).collect::<Vec<_>>(),
+    );
+
+    // That rode the placement hint, which the restore prefers. Strip it and the
+    // same slug has to come back out of `encode_project`, derived from the
+    // Windows `cwd` alone - the half the capture exists to pin.
+    let mut derived = parent;
+    let source = derived
+        .session
+        .options
+        .get_mut("source")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("ingest records options.source");
+    assert!(
+        source.remove("project_dir").is_some(),
+        "the hint must be there to strip, or the fallback below proves nothing",
+    );
+    let derived_files = ClaudeCodeFactory.serialize(&derived, RestoreFidelity::Native)?;
+    assert!(
+        derived_files
+            .iter()
+            .all(|f| f.relative_path.starts_with(WINDOWS_SLUG)),
+        "encode_project must derive the captured slug from the Windows cwd, got {:?}",
+        derived_files
+            .iter()
+            .map(|f| &f.relative_path)
+            .collect::<Vec<_>>(),
+    );
+
+    // The subagent layout is the same on Windows as on posix.
+    let child = store
+        .get_session(&format!("{WINDOWS_PARENT_SESSION}/{WINDOWS_CHILD_SUFFIX}"))
+        .await?
+        .expect("subagent ingested");
+    let child_files = ClaudeCodeFactory.serialize(&child, RestoreFidelity::Native)?;
+    assert!(
+        child_files.iter().any(|f| f
+            .relative_path
+            .ends_with(format!("subagents/{WINDOWS_CHILD_SUFFIX}.jsonl"))),
+        "subagent restore path drifted: {:?}",
+        child_files
+            .iter()
+            .map(|f| &f.relative_path)
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// The other half of the gate: the slug-decode fallback, which only fires when
+/// no row in a transcript carries `cwd`. Derived from the same real capture by
+/// stripping that one field, because no natural corpus contains a `cwd`-less
+/// transcript. The recovered path is deliberately lossy - the encoding turned
+/// the space, underscore and dot into the same `-` a separator became, so they
+/// all come back as separators. Recovering the `C:\` prefix is the part that
+/// matters; before this, the slug decoded to `C//dev/pond/fixture/demo/v2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_capture_without_cwd_falls_back_to_decoding_the_slug() -> anyhow::Result<()> {
+    let source = TempDir::new()?;
+    let project = source.path().join(WINDOWS_SLUG);
+    std::fs::create_dir_all(&project)?;
+    let captured = Path::new(WINDOWS_FIXTURES)
+        .join(WINDOWS_SLUG)
+        .join(format!("{WINDOWS_PLAIN_SESSION}.jsonl"));
+    let stripped: String = std::fs::read_to_string(&captured)?
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).expect("fixture is json");
+            if let Some(object) = row.as_object_mut() {
+                object.remove("cwd");
+            }
+            format!("{row}\n")
+        })
+        .collect();
+    std::fs::write(
+        project.join(format!("{WINDOWS_PLAIN_SESSION}.jsonl")),
+        stripped,
+    )?;
+
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path()).await?;
+    let adapter = ClaudeCodeAdapter::new(source.path());
+    ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    let session = store
+        .get_session(WINDOWS_PLAIN_SESSION)
+        .await?
+        .expect("ingested");
+    assert_eq!(&*session.session.project, r"C:\dev\pond\fixture\demo\v2");
+
     Ok(())
 }

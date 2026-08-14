@@ -72,6 +72,9 @@ impl AdapterFactory for OpencodeFactory {
         Ok(Box::new(OpencodeAdapter::new(config_path(NAME, config)?)))
     }
 
+    /// Windows needs no separate branch: opencode resolves its data dir through
+    /// `xdg-basedir`, which has zero Windows special-casing. The standing gap is
+    /// that pond ignores `XDG_DATA_HOME` here, on any platform.
     fn probe_default(&self, env: &Env) -> Option<Value> {
         // The configured root is the opencode DATA DIR (it holds both the
         // `opencode*.db` files and the legacy `storage/` tree). Only offer it
@@ -1752,6 +1755,8 @@ fn encode(value: &Value, location: &str) -> Result<Vec<u8>, AdapterError> {
     })
 }
 
+/// Lands in a JSON field, never a path segment - so unlike its claude-code and
+/// pi namesakes this one needs no Windows treatment.
 fn encode_project(project: &str) -> String {
     project
         .chars()

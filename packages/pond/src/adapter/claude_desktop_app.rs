@@ -1,10 +1,12 @@
 //! Claude Desktop app adapter - Cowork / agent-mode sessions only.
 //!
 //! Source path:
-//! `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<workspace>/local_<uuid>/audit.jsonl`
-//! with a sibling `local_<uuid>.json` metadata file. Each `audit.jsonl` is one
-//! session (one JSON object per line); the metadata carries `sessionId`,
-//! `createdAt`, the project folder, and UI fields.
+//! `<store>/<acct>/<workspace>/local_<uuid>/audit.jsonl`, with a sibling
+//! `local_<uuid>.json` metadata file. `<store>` is
+//! `~/Library/Application Support/Claude/local-agent-mode-sessions` on macOS,
+//! or one of the Windows layouts [`cowork_roots`] enumerates. Each
+//! `audit.jsonl` is one session (one JSON object per line); the metadata
+//! carries `sessionId`, `createdAt`, the project folder, and UI fields.
 //!
 //! Scope is deliberately narrow (spec.md#adapters, locked product split):
 //! - It NEVER reads `~/.claude/projects` or the `claude-code-sessions/`
@@ -63,11 +65,11 @@ const NAME: &str = "claude-desktop-app";
 /// `blocking_send` when the consumer lags.
 const CHANNEL_CAP: usize = 256;
 
-/// The session-store subpath under `~/Library/Application Support/Claude`.
+/// The session-store subpath under every platform's Claude data directory.
 const SESSIONS_SUBDIR: &str = "local-agent-mode-sessions";
 
-/// Stateless factory: opens [`ClaudeDesktopAppAdapter`] instances and probes for
-/// the Cowork store under `~/Library/Application Support/Claude`.
+/// Stateless factory: opens [`ClaudeDesktopAppAdapter`] instances and probes
+/// the Cowork store at each layout [`cowork_roots`] knows.
 pub struct ClaudeDesktopAppFactory;
 
 impl AdapterFactory for ClaudeDesktopAppFactory {
@@ -82,8 +84,10 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
-        let path = cowork_root(&env.home);
-        path.exists().then(|| json!({ "path": path }))
+        cowork_roots(&env.home)
+            .into_iter()
+            .find(|path| path.exists())
+            .map(|path| json!({ "path": path }))
     }
 
     fn serialize(
@@ -95,12 +99,63 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
     }
 }
 
-/// `~/Library/Application Support/Claude/local-agent-mode-sessions`.
-fn cowork_root(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("Claude")
-        .join(SESSIONS_SUBDIR)
+/// Every place the Cowork store can live, in probe order. Built on every
+/// platform rather than behind `cfg!`, so a test can drive the Windows branches
+/// from a `TempDir` home; the MSIX `read_dir` runs eagerly, costing one failing
+/// syscall per command where the directory is absent.
+///
+/// `%APPDATA%` leads because that is what a real install uses: verified against
+/// Claude 1.30096.1 on Windows 11, a per-user Squirrel install under
+/// `%LOCALAPPDATA%\AnthropicClaude` with NO MSIX package registered, so
+/// Electron's `userData` is never virtualized.
+///
+/// AppData is derived from home rather than read, so a redirected AppData is
+/// unsupported.
+fn cowork_roots(home: &Path) -> Vec<PathBuf> {
+    let app_data = home.join("AppData");
+    let mut roots = vec![
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR),
+        app_data
+            .join("Roaming")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR),
+    ];
+    roots.extend(msix_cowork_roots(&app_data.join("Local").join("Packages")));
+    roots
+}
+
+/// The Store/MSIX channel, where Electron's `userData` is silently virtualized
+/// under `%LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude`
+/// (anthropics/claude-code #25579, #26073). Unverified against a real packaged
+/// install, so a differing child layout probes nothing rather than wrong.
+fn msix_cowork_roots(packages: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(packages) else {
+        return Vec::new();
+    };
+    msix_roots_from(entries.flatten().map(|entry| entry.path()))
+}
+
+/// Split out so the name filter and the sort are provable without a directory.
+fn msix_roots_from(families: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = families
+        .filter(|family| {
+            family
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().to_lowercase().contains("claude"))
+        })
+        .map(|family| {
+            family
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR)
+        })
+        .collect();
+    roots.sort();
+    roots
 }
 
 /// Configured Cowork reader, rooted at a `local-agent-mode-sessions/` directory.
@@ -1108,6 +1163,117 @@ mod tests {
                 "Claude",
                 "local-agent-mode-sessions",
             ],
+        )
+    }
+
+    /// The MSIX store hides under a package-family directory whose name is
+    /// install-channel-dependent, so it is matched by name. The decoy sorts
+    /// BEFORE both Claude families, so dropping the filter returns it.
+    #[test]
+    fn probe_default_finds_the_msix_virtualized_store() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let packages = temp.path().join("AppData").join("Local").join("Packages");
+        let mut expected = None;
+        for family in [
+            "AAUnrelated_1a2b3c",
+            "ZZClaudeBeta_9zzzzzzzzzzzz",
+            "AnthropicClaude_j0mn41abcdefg",
+        ] {
+            let root = packages
+                .join(family)
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR);
+            std::fs::create_dir_all(&root)?;
+            if family.starts_with("Anthropic") {
+                expected = Some(root);
+            }
+        }
+        let probe = ClaudeDesktopAppFactory.probe_default(&Env::with_home(temp.path()));
+        let got = probe
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        anyhow::ensure!(
+            got == expected.as_deref().and_then(Path::to_str),
+            "probe must pick the Claude package family: got {got:?}, expected {expected:?}",
+        );
+        Ok(())
+    }
+
+    /// The half a directory fixture cannot prove: `read_dir` order is
+    /// filesystem-defined, so only feeding deliberately unsorted names shows
+    /// the sort is what makes the pick deterministic across channels.
+    #[test]
+    fn msix_roots_are_filtered_by_name_and_sorted() {
+        let families = [
+            "ZZClaudeBeta_9zzzzzzzzzzzz",
+            "AAUnrelated_1a2b3c",
+            "AnthropicClaude_j0mn41abcdefg",
+        ]
+        .iter()
+        .map(|family| Path::new("Packages").join(family));
+
+        let roots = msix_roots_from(families);
+        let names: Vec<_> = roots
+            .iter()
+            .filter_map(|root| root.iter().nth(1).and_then(|name| name.to_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AnthropicClaude_j0mn41abcdefg",
+                "ZZClaudeBeta_9zzzzzzzzzzzz"
+            ],
+            "the foreign family must be dropped and the rest sorted",
+        );
+        assert!(roots.iter().all(|root| root.ends_with(SESSIONS_SUBDIR)));
+    }
+
+    /// Probe ORDER, which the single-root tests cannot see: with both layouts
+    /// present `%APPDATA%` has to win, because that is the one a real install
+    /// writes. The plan inverted this order deliberately.
+    #[test]
+    fn probe_default_prefers_roaming_over_a_present_msix_family() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let roaming = temp
+            .path()
+            .join("AppData")
+            .join("Roaming")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&roaming)?;
+        std::fs::create_dir_all(
+            temp.path()
+                .join("AppData")
+                .join("Local")
+                .join("Packages")
+                .join("AnthropicClaude_j0mn41abcdefg")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR),
+        )?;
+
+        let probe = ClaudeDesktopAppFactory.probe_default(&Env::with_home(temp.path()));
+        let got = probe
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        anyhow::ensure!(
+            got == roaming.to_str(),
+            "the real-install layout must win over the Store channel: got {got:?}",
+        );
+        Ok(())
+    }
+
+    /// The non-MSIX install keeps Electron's plain `%APPDATA%\Claude` layout.
+    #[test]
+    fn probe_default_finds_the_roaming_appdata_store() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &ClaudeDesktopAppFactory,
+            &["AppData", "Roaming", "Claude", "local-agent-mode-sessions"],
         )
     }
 

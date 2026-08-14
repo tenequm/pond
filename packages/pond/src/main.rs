@@ -749,8 +749,8 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// Manage the automatic sync schedule.
     ///
     /// Registers `pond sync -q --no-wait` with the OS scheduler: launchd on macOS,
-    /// systemd user timers (or a crontab fence) on Linux. `pond init` offers
-    /// the same setup interactively.
+    /// systemd user timers (or a crontab fence) on Linux, Task Scheduler on
+    /// Windows. `pond init` offers the same setup interactively.
     #[command(after_long_help = "Examples:
   pond schedule start              every 5 minutes (the default)
   pond schedule start --every 15m

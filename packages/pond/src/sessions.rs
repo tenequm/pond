@@ -4372,7 +4372,10 @@ impl std::fmt::Display for IngestError {
                 attempted,
             } => write!(
                 formatter,
-                "session {session_id} {field} is immutable: stored {stored:?}, attempted {attempted:?}",
+                "session {session_id} {field} is immutable: stored {stored:?}, attempted \
+                 {attempted:?} - if the attempted value is the correct one, the stored row \
+                 predates a change in how the adapter derives it and only a fresh store \
+                 picks it up",
             ),
         }
     }
