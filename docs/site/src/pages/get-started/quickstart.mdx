@@ -25,6 +25,8 @@ pond sync  # import, embed, index - every enabled adapter
 
 `sync` only ingests already-enabled adapters; it never enables on its own. Manage the set with `pond adapters list|discover|enable|disable`.
 
+Discovery is per-platform: adapters are found under `~/` on macOS and Linux, and under `%APPDATA%` / `%LOCALAPPDATA%` on Windows. Nothing to configure either way - `pond init` and `pond adapters discover` look in the right place for the OS they run on.
+
 ## Ask your agent
 
 It searches your history through pond:
