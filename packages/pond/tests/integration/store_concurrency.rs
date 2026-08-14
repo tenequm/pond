@@ -1,6 +1,15 @@
 //! Multi-writer Store concurrency on a shared local-FS data dir (spec.md#substrate):
 //! Lance's local commit lock plus pond's retry layer must serialize
 //! concurrent writers without surfacing a spurious `Conflict`.
+//!
+//! The real `TempDir` here is deliberate and must not be "fixed" to
+//! `shared-memory://` under the CLAUDE.md two-Store rule. Lance picks its
+//! commit handler by scheme and platform: a `file://` store on Windows routes
+//! to `RenameCommitHandler` (hard-link plus delete, NTFS-only), while
+//! `shared-memory://` and every remote scheme keep `ConditionalPutCommitHandler`
+//! on all platforms. Only a local-FS dir exercises the Windows commit path, so
+//! swapping the backend here would silently stop testing it - and this is the
+//! job the windows-verify gate leans on to prove OCC works there at all.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
