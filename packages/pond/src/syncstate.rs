@@ -77,17 +77,28 @@ pub(crate) enum SyncLockState {
     Busy(Option<SyncLockHolder>),
 }
 
-/// Held for the whole sync run. The OS drops the flock when the file closes,
-/// so a killed sync can never leave a stale lock. The lock file is never
-/// unlinked - unlink while a sibling holds the path open hands out two locks.
-/// `SyncLockGuard::drop` removes the sibling `.holder.json` best-effort.
+/// Held for the whole sync run. `Drop` unlocks explicitly, and the OS drops the
+/// flock again when the file closes, so a killed sync can never leave a stale
+/// lock. The lock file is never unlinked - unlink while a sibling holds the path
+/// open hands out two locks. `SyncLockGuard::drop` also removes the sibling
+/// `.holder.json` best-effort.
 pub(crate) struct SyncLockGuard {
-    _file: File,
+    file: File,
     holder_path: PathBuf,
 }
 
 impl Drop for SyncLockGuard {
     fn drop(&mut self) {
+        // Release explicitly instead of relying on close. `flock` belongs to the
+        // open file *description*, not the descriptor: any subprocess spawned
+        // while this guard was alive inherited a duplicate, so dropping our
+        // `File` leaves the lock held until that child execs or exits. The
+        // window is small but real - it makes a later acquire report `Busy` with
+        // no holder, so a sync refuses to start (or, under `--no-wait`, silently
+        // skips) because of an unrelated child process. `unlock` clears the
+        // description's lock outright, however many descriptors still reference
+        // it. Best-effort: an unlock failure leaves the old close-time behavior.
+        let _ = self.file.unlock();
         // Best-effort: the file may already be absent (concurrent stop, etc.).
         let _ = std::fs::remove_file(&self.holder_path);
     }
@@ -127,10 +138,7 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                     let _ = std::fs::rename(&tmp, &holder_path);
                 }
             }
-            Ok(SyncLockState::Acquired(SyncLockGuard {
-                _file: file,
-                holder_path,
-            }))
+            Ok(SyncLockState::Acquired(SyncLockGuard { file, holder_path }))
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             let holder = std::fs::read_to_string(&holder_path)
@@ -148,10 +156,7 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 path = %path.display(),
                 "sync lock unsupported on this filesystem; proceeding without single-flight"
             );
-            Ok(SyncLockState::Acquired(SyncLockGuard {
-                _file: file,
-                holder_path,
-            }))
+            Ok(SyncLockState::Acquired(SyncLockGuard { file, holder_path }))
         }
     }
 }
@@ -259,5 +264,64 @@ mod tests {
         assert_eq!(read.sessions_inserted, 3);
         assert_eq!(read.outcome, SyncOutcome::Error);
         assert_eq!(read.error.as_deref(), Some("boom"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_release_regression {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+
+    /// Guards the fix in `SyncLockGuard::drop`. `flock` belongs to the open file
+    /// description, so a subprocess spawned while the guard is alive inherits a
+    /// duplicate descriptor and keeps the lock alive past the guard - unless the
+    /// guard unlocks explicitly. Without the `unlock()` call this reproduces
+    /// within a handful of rounds; the loop is generous only so a slow or busy
+    /// machine cannot pass it by luck.
+    ///
+    /// unix-only: the mechanism is `flock` plus fd inheritance across fork.
+    /// Windows locks are mandatory byte-range locks with different handle
+    /// inheritance, so the same shape proves nothing there.
+    #[test]
+    fn lock_frees_on_drop_even_while_subprocesses_are_spawning() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::process::Command::new("/usr/bin/true")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            })
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut result = Ok(());
+        for round in 0..2_000 {
+            let guard = match try_acquire_sync_lock_in(dir.path(), "k").unwrap() {
+                SyncLockState::Acquired(guard) => guard,
+                SyncLockState::Busy(_) => {
+                    result = Err(format!("round {round}: fresh lock reported busy"));
+                    break;
+                }
+            };
+            drop(guard);
+            if let SyncLockState::Busy(holder) = try_acquire_sync_lock_in(dir.path(), "k").unwrap()
+            {
+                result = Err(format!(
+                    "round {round}: lock still held after drop (holder={holder:?}) - \
+                     an inherited descriptor is keeping the flock alive"
+                ));
+                break;
+            }
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        spawner.join().unwrap();
+        if let Err(message) = result {
+            panic!("{message}");
+        }
     }
 }
