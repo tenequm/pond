@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger, added for windows-verify: that job is skipped on ordinary
+  # PRs, so dispatch is the only way to exercise a Windows change before it
+  # reaches main. Side effect accepted: build-and-test and flake-check carry no
+  # event condition, so they run on dispatch too. release-prep and everything
+  # downstream stay push-gated.
+  workflow_dispatch:
 
 # Default read-only; publish-release elevates to contents:write for its own
 # `gh release upload`. The release PR and publishes use the GH_RELEASE_TOKEN
@@ -77,6 +83,149 @@ jobs:
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
 
+  # Native Windows gate, and the source of the shipped msvc zip - nothing else
+  # in the pipeline ever executes a Windows binary.
+  #
+  # Plain cargo, NOT moon, and the reason is load-bearing: moon's task
+  # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
+  # architecture (crates/task-hasher/src/task_fingerprint.rs). `moon run
+  # pond:test` here would compute the hash the Linux runner already stored for
+  # this commit, report "cached", and go green without compiling a single line
+  # on Windows - exactly the failure this job exists to prevent. The commands
+  # below mirror packages/pond/moon.yml `test` and the dist leg of the root
+  # moon.yml `build-dist`; keep them in lockstep by hand.
+  windows-verify:
+    # Skipped on ordinary PRs, so as a required status check it only actually
+    # gates release PRs (GitHub treats a skipped required check as satisfied).
+    # release-plz's branch prefix is its default `release-plz-`; pond's
+    # .github/release-plz.toml does not override it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
+    runs-on: windows-2025
+    # No `needs:` - this starts at t=0 alongside the Linux jobs instead of
+    # serializing the release path behind them. Two full dep-graph compiles
+    # (test profile, then dist) on a 4-vCPU hosted runner need the headroom.
+    timeout-minutes: 120
+    concurrency: { group: "ci-windows-${{ github.ref }}", cancel-in-progress: true }
+    # Two variables are deliberately absent here.
+    #
+    # CARGO_TARGET_DIR: a short absolute target dir would dodge MSVC's MAX_PATH
+    # link limit, but Swatinem/rust-cache ignores CARGO_TARGET_DIR entirely and
+    # derives its cache path as path.join(workspaceRoot, target) - for an
+    # absolute target that yields the nonexistent `.\C:\t`, so every run would
+    # silently cache nothing and rebuild from cold. Lance's own Windows CI
+    # builds the same aws-lc-sys from an even deeper path
+    # (D:\a\lance\lance\rust\target\...) with the default dir, so the limit is
+    # not actually binding here. If a link ever fails with LNK1104 / os error
+    # 206, the fix is a short target dir plus a hand-rolled actions/cache over
+    # it - not re-adding this variable.
+    #
+    # RUSTFLAGS: setting it anywhere in this job silently REPLACES the
+    # +crt-static rustflags from .cargo/config.toml.
+    env:
+      # Same rule as flake-check/macos-verify: no moon runs here, and this job
+      # compiles third-party build scripts on a hosted runner.
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      # fetch-depth 1 is enough: no moon here, and POND_BUILD_COMMIT needs only HEAD.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The windows-2025 image ships neither protoc nor NASM. protoc: direct
+      # zip, matching lance's own windows-build job (dependency-free, no third
+      # party action). NASM: required by aws-lc-sys, and an installed NASM
+      # always wins over its `prebuilt-nasm` feature.
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
+          $v = '35.1'
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath C:\protoc
+          "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install NASM
+        shell: pwsh
+        run: choco install nasm -y --no-progress
+
+      # rustup honors rust-toolchain.toml; the host triple IS the build target,
+      # so no extra rust-std is downloaded.
+      - name: Materialize the pinned toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
+
+      # Load-bearing, not incidental: a cold run here is two full compiles of a
+      # lance + datafusion + candle dep graph on 4 vCPUs. Saving on dispatch as
+      # well as main is what makes iterating on a Windows branch viable - a
+      # dispatch run saves a branch-scoped cache the next dispatch restores,
+      # while main's cache stays readable from every branch. Release PRs restore
+      # only; they should not spend upload time.
+      #
+      # Evaluated and rejected as alternatives: sccache and kache. Both are
+      # rustc wrappers, so neither caches build-script EXECUTION - and this
+      # graph's slowest native work (aws-lc-sys under cmake + NASM) happens
+      # exactly there, which rust-cache does restore as part of target/.
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+
+      # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
+      # anywhere upstream, so this is the first place they ever run on Windows.
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      # --profile dist, not --release: `release` is pond's no-LTO iteration
+      # profile, and every shipped binary is built with `dist`. Without
+      # POND_BUILD_COMMIT the Windows binary would be the only artifact missing
+      # the commit stamp.
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
+          cargo build --locked --profile dist --target x86_64-pc-windows-msvc
+
+      # Mirrors macos-verify's launch smoke. Redirect, never pipe: a closed pipe
+      # hands the still-writing binary an EPIPE that is an unwrap inside
+      # clap_complete, and that assertion once killed the release it gated.
+      - name: Launch smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
+          & $exe --version
+          & $exe --help | Out-Null
+          & $exe completions powershell | Set-Content -Encoding utf8 completions.ps1
+          if (-not (Select-String -Path completions.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
+
+      # Completions come from the just-built native binary, the same way the
+      # Linux tarballs get theirs. Today's gnu zip ships none at all.
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
+          New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
+          Copy-Item $exe stage\pond.exe
+          & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
+          & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
+          & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
+          & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path stage\pond.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-windows
+          path: dist/pond-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+          retention-days: 1
+
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
   # whose tag already exists". (dry-run can't report this: in dry-run release-plz
@@ -115,14 +264,14 @@ jobs:
           fi
 
   # Build + Developer ID sign. Split from publish-release so notarization and
-  # the macOS checks can gate the publish without re-running the 4-target build.
+  # the macOS checks can gate the publish without re-running the 3-target build.
   dist-build:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
     # ARC runner pod: zig/zigbuild/SDK/rcodesign come from the pond-runner
     # image, incremental cache on /ci-cache - no docker, no buildkit.
     runs-on: pond-ci
-    # A fully cold 4-target dist build measured 56m; warm runs are minutes.
+    # A fully cold 3-target dist build measured 56m; warm runs are minutes.
     timeout-minutes: 90
     concurrency: { group: "pond-dist-${{ github.ref }}", cancel-in-progress: false }
     outputs:
@@ -247,7 +396,7 @@ jobs:
   # HERE (after build AND macos-verify), so crates.io can't ship without
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
-    needs: [dist-build, macos-verify]
+    needs: [dist-build, macos-verify, windows-verify]
     # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
     # the /ci-cache PVC (release-plz runs `cargo publish` here).
     runs-on: pond-ci
@@ -265,6 +414,22 @@ jobs:
       - uses: ./.github/actions/bootstrap
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
+      # The msvc zip is built natively by windows-verify, not by the moon dist
+      # task, so it arrives as its own artifact.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: dist-windows, path: dist }
+
+      # checksums.txt is produced INSIDE the cached moon dist task, so it
+      # structurally cannot cover an artifact built on another runner.
+      # Regenerate over the merged dist/ before anything reads it - the
+      # `gh release upload` below globs dist/pond-* and would otherwise ship a
+      # checksums file with no line for the Windows zip.
+      - name: Merge the Windows zip into checksums
+        run: |
+          set -euo pipefail
+          test -f dist/pond-x86_64-pc-windows-msvc.zip
+          ( cd dist && sha256sum pond-* > checksums.txt )
+          cat dist/checksums.txt
 
       - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         id: release-plz

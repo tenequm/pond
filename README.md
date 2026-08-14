@@ -87,11 +87,21 @@ cargo install --path packages/pond --features cuda
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
 
 On Windows, the Homebrew/Nix packages do not apply. The easiest install is
-`cargo binstall pond-db` (downloads the prebuilt windows-gnu binary, no `protoc`
-needed). Alternatively `cargo install pond-db` builds from source - this requires
-`protoc` on `PATH` (`winget install Google.Protobuf`) because `protobuf-src` does
-not link with MSVC; the published binary uses windows-gnu and vendors protoc
-automatically. Embeddings run on the CPU backend.
+`cargo binstall pond-db`, which downloads the prebuilt
+`x86_64-pc-windows-msvc` binary - statically linked against the VC runtime, so
+it needs nothing installed. The same zip is attached to every
+[release](https://github.com/tenequm/pond/releases) and carries completion
+scripts for PowerShell, bash, zsh, and fish.
+
+Building from source instead (`cargo install pond-db`) needs two tools on
+`PATH` that the prebuilt binary spares you: `protoc`
+(`winget install Google.Protobuf`), because `protobuf-src` cannot vendor it on
+Windows, and NASM (`winget install NASM.NASM`) for `aws-lc-sys`. Embeddings run
+on the CPU backend.
+
+Running the Linux binary under WSL works when both the agent session files and
+the pond store live on the ext4 side. Do not point either across `/mnt/c`:
+throughput collapses and Windows-side writes are missed.
 
 ## Usage
 
