@@ -6679,7 +6679,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "pond-db"
-version = "0.14.9"
+version = "0.14.10"
 dependencies = [
  "anstyle",
  "anyhow",

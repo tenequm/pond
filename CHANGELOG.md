@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.10](https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10) - 2026-08-14
+
+### <!-- 1 -->🎉 New Features
+- **windows:** PATHEXT resolution, network-path gate, and platform fixes ([#155](https://github.com/tenequm/pond/pull/155)) ([95e8ce4](https://github.com/tenequm/pond/commit/95e8ce4d88a1e9f210811ce8546e9b95503d3ce1))
+- **ci:** native Windows msvc gate and artifact ([#152](https://github.com/tenequm/pond/pull/152)) ([ee37a63](https://github.com/tenequm/pond/commit/ee37a63887adcd1a95fc4531e3389bafd025c98c))
+- **config:** accept multiple source paths per adapter entry ([#149](https://github.com/tenequm/pond/pull/149)) ([caf6994](https://github.com/tenequm/pond/commit/caf6994d4d88842a876fcd496cb53111bd1ef9a8))
+- Windows support ([#147](https://github.com/tenequm/pond/pull/147)) ([ed59091](https://github.com/tenequm/pond/commit/ed5909185136a13dee3cb20f70f831636da66b10))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **adapter:** correct project-slug encoding for Windows and posix ([a218ef3](https://github.com/tenequm/pond/commit/a218ef33cb337b2ec8c41bb9b23b02fb76231559))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10
+
 ## [0.14.9](https://github.com/tenequm/pond/compare/v0.14.8...v0.14.9) - 2026-08-12
 
 ### <!-- 1 -->🎉 New Features
