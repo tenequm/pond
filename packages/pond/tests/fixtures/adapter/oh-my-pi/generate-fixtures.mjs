@@ -48,6 +48,13 @@ const CWD = "/Users/user/Projects/omp-demo";
 const BUCKET = "-Projects-omp-demo";
 const SESSION_ID = "0a1b2c3d4e5f6071";
 const FORK_ID = "1b2c3d4e5f607182";
+// A `task` subagent and its own child. omp keeps them in an artifacts directory
+// named after the parent's file and nests the same way at any depth
+// (`export/html/index.ts::collectSubSessions`). The agent id deliberately keeps an
+// underscore - omp sanitizes to [A-Za-z0-9_-] - because that is what makes the
+// parent id unreadable from the directory name alone.
+const SUBAGENT_ID = "2c3d4e5f60718293";
+const NESTED_ID = "3d4e5f60718293a4";
 
 const line = (value) => `${JSON.stringify(value)}\n`;
 
@@ -206,6 +213,41 @@ writeFileSync(
       timestamp: "2026-08-12T09:00:03.000Z",
       message: { role: "user", content: [{ type: "text", text: "legacy file, no slot" }] },
     }),
+);
+
+const artifacts = join(bucket, `2026-08-12T10-00-00-000Z_${SESSION_ID}`);
+mkdirSync(join(artifacts, "code_review"), { recursive: true });
+writeFileSync(
+  join(artifacts, "code_review.jsonl"),
+  sessionFile({
+    id: SUBAGENT_ID,
+    title: "code review",
+    entries: [
+      {
+        type: "message",
+        id: "dddd0001",
+        parentId: null,
+        timestamp: "2026-08-12T10:01:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "review the diff" }] },
+      },
+    ],
+  }),
+);
+writeFileSync(
+  join(artifacts, "code_review", "Bob.jsonl"),
+  sessionFile({
+    id: NESTED_ID,
+    title: "nested worker",
+    entries: [
+      {
+        type: "message",
+        id: "eeee0001",
+        parentId: null,
+        timestamp: "2026-08-12T10:02:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "check the tests" }] },
+      },
+    ],
+  }),
 );
 
 console.log(`wrote fixtures under ${bucket}`);

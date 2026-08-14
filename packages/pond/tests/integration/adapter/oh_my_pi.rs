@@ -22,8 +22,9 @@ const FIXTURE_ROOT: &str = concat!(
     "/tests/fixtures/adapter/oh-my-pi/sessions"
 );
 
-// 2 slot-fronted sessions + 1 legacy slot-less file.
-const FIXTURE_SESSIONS: usize = 3;
+// 2 slot-fronted sessions + 1 legacy slot-less file, plus the artifacts
+// directory omp 17.3.4 writes: a `task` subagent and its own nested child.
+const FIXTURE_SESSIONS: usize = 5;
 const SLOT_FRONTED_SESSION: &str = "0a1b2c3d4e5f6071";
 
 async fn ingest(root: &Path) -> anyhow::Result<(Store, TempDir)> {
