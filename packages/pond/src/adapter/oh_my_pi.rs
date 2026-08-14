@@ -108,6 +108,9 @@ impl AdapterFactory for OhMyPiFactory {
         Ok(Box::new(OhMyPiAdapter::new(config_path(NAME, config)?)))
     }
 
+    /// Home-relative on every platform, and field-verified there: PR #147 synced
+    /// 331 omp sessions end-to-end on Windows 11, so the `/`-based scope
+    /// encoding in the session ids is portable in practice, not just in theory.
     fn probe_default(&self, env: &Env) -> Option<Value> {
         let path = env.home.join(".omp").join("agent").join("sessions");
         path.exists().then(|| json!({ "path": path }))

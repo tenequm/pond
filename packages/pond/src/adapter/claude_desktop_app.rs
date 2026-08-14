@@ -1,7 +1,9 @@
 //! Claude Desktop app adapter - Cowork / agent-mode sessions only.
 //!
 //! Source path:
-//! `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<workspace>/local_<uuid>/audit.jsonl`
+//! `<store>/<acct>/<workspace>/local_<uuid>/audit.jsonl`, where `<store>` is
+//! `~/Library/Application Support/Claude/local-agent-mode-sessions` on macOS
+//! and one of the Windows layouts [`cowork_roots`] enumerates,
 //! with a sibling `local_<uuid>.json` metadata file. Each `audit.jsonl` is one
 //! session (one JSON object per line); the metadata carries `sessionId`,
 //! `createdAt`, the project folder, and UI fields.
@@ -63,11 +65,11 @@ const NAME: &str = "claude-desktop-app";
 /// `blocking_send` when the consumer lags.
 const CHANNEL_CAP: usize = 256;
 
-/// The session-store subpath under `~/Library/Application Support/Claude`.
+/// The session-store subpath under every platform's Claude data directory.
 const SESSIONS_SUBDIR: &str = "local-agent-mode-sessions";
 
-/// Stateless factory: opens [`ClaudeDesktopAppAdapter`] instances and probes for
-/// the Cowork store under `~/Library/Application Support/Claude`.
+/// Stateless factory: opens [`ClaudeDesktopAppAdapter`] instances and probes
+/// the Cowork store at each layout [`cowork_roots`] knows.
 pub struct ClaudeDesktopAppFactory;
 
 impl AdapterFactory for ClaudeDesktopAppFactory {
@@ -82,8 +84,10 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
     }
 
     fn probe_default(&self, env: &Env) -> Option<Value> {
-        let path = cowork_root(&env.home);
-        path.exists().then(|| json!({ "path": path }))
+        cowork_roots(&env.home)
+            .into_iter()
+            .find(|path| path.exists())
+            .map(|path| json!({ "path": path }))
     }
 
     fn serialize(
@@ -95,12 +99,71 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
     }
 }
 
-/// `~/Library/Application Support/Claude/local-agent-mode-sessions`.
-fn cowork_root(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("Claude")
-        .join(SESSIONS_SUBDIR)
+/// Every place the Cowork store can live, in probe order: the macOS
+/// `~/Library/Application Support/Claude` layout, then plain `%APPDATA%\Claude`,
+/// then the MSIX-virtualized layout. All are checked on every platform - a miss
+/// is one `exists()` call, and staying platform-agnostic is what lets a test
+/// drive the Windows branches from a `TempDir` home.
+///
+/// `%APPDATA%` leads on Windows because that is what a real install uses:
+/// verified against Claude 1.30096.1 on Windows 11, which ships as a per-user
+/// Squirrel install under `%LOCALAPPDATA%\AnthropicClaude` with NO MSIX package
+/// registered, so Electron's `userData` is not virtualized at all. See
+/// [`msix_cowork_roots`] for why the virtualized path is still probed.
+///
+/// `%LOCALAPPDATA%` / `%APPDATA%` are derived from home rather than read, so a
+/// redirected AppData is unsupported - the same known gap opencode's probe has
+/// with `XDG_DATA_HOME`.
+fn cowork_roots(home: &Path) -> Vec<PathBuf> {
+    let app_data = home.join("AppData");
+    let mut roots = vec![
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR),
+        app_data
+            .join("Roaming")
+            .join("Claude")
+            .join(SESSIONS_SUBDIR),
+    ];
+    roots.extend(msix_cowork_roots(&app_data.join("Local").join("Packages")));
+    roots
+}
+
+/// The Store/MSIX channel, where Electron's `userData` is silently virtualized
+/// under `%LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude`
+/// (anthropics/claude-code #25579, #26073). The package-family hash is
+/// install-channel-dependent, so the directory is matched by name and the
+/// results sorted for a deterministic pick across channels.
+///
+/// Kept as a secondary probe, not the primary: the mainline installer is not
+/// MSIX (see [`cowork_roots`]), and this layout has never been verified against
+/// a real packaged install - so if the virtualized child layout differs it
+/// probes nothing rather than probing wrong.
+fn msix_cowork_roots(packages: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(packages) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("claude")
+        })
+        .map(|entry| {
+            entry
+                .path()
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR)
+        })
+        .collect();
+    roots.sort();
+    roots
 }
 
 /// Configured Cowork reader, rooted at a `local-agent-mode-sessions/` directory.
@@ -1108,6 +1171,54 @@ mod tests {
                 "Claude",
                 "local-agent-mode-sessions",
             ],
+        )
+    }
+
+    /// The Windows store is MSIX-virtualized under a package-family directory
+    /// whose name is install-channel-dependent, so the probe has to match it by
+    /// name. Two channels present must resolve deterministically.
+    #[test]
+    fn probe_default_finds_the_msix_virtualized_store() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let packages = temp.path().join("AppData").join("Local").join("Packages");
+        let mut expected = None;
+        for family in [
+            "ZZUnrelated_1a2b3c",
+            "ZZClaudeBeta_9zzzzzzzzzzzz",
+            "AnthropicClaude_j0mn41abcdefg",
+        ] {
+            let root = packages
+                .join(family)
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join(SESSIONS_SUBDIR);
+            std::fs::create_dir_all(&root)?;
+            // Two Claude channels are present, so the sort - not the walk order
+            // - has to decide; the unrelated package must not be a candidate at
+            // all, even though it has the same inner layout.
+            if family.starts_with("Anthropic") {
+                expected = Some(root);
+            }
+        }
+        let probe = ClaudeDesktopAppFactory.probe_default(&Env::with_home(temp.path()));
+        let got = probe
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        anyhow::ensure!(
+            got == expected.as_deref().and_then(Path::to_str),
+            "probe must pick the Claude package family: got {got:?}, expected {expected:?}",
+        );
+        Ok(())
+    }
+
+    /// The non-MSIX install keeps Electron's plain `%APPDATA%\Claude` layout.
+    #[test]
+    fn probe_default_finds_the_roaming_appdata_store() -> anyhow::Result<()> {
+        crate::adapter::test_support::assert_probe_default(
+            &ClaudeDesktopAppFactory,
+            &["AppData", "Roaming", "Claude", "local-agent-mode-sessions"],
         )
     }
 

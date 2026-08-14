@@ -205,8 +205,47 @@ fn claude_relative_path(session: &crate::sessions::SessionWithMessages) -> PathB
     PathBuf::from(encoded_project).join(format!("{}.jsonl", session.session.id))
 }
 
+/// Claude Code's own project-slug rule, read off its bundle
+/// (`A.replace(/[^a-zA-Z0-9]/g, "-")`) rather than inferred: every
+/// non-alphanumeric character becomes `-`. Restoring to the wrong directory is
+/// silent, so this has to match exactly - which also neutralizes the `\` and
+/// `:` a Windows `cwd` carries, keeping the slug a legal path segment
+/// ([`crate::adapter::validate_path_id`]).
+///
+/// Confirmed against real corpora on both platform families: 181 posix project
+/// directories, and a native Windows 11 capture in which a `C:\Users\<user>\
+/// <project>` cwd is stored as `C--Users-<user>-<project>`.
 fn encode_project(project: &str) -> String {
-    project.replace(['/', '.'], "-")
+    let mut encoded = String::with_capacity(project.len());
+    for c in project.chars() {
+        if c.is_ascii_alphanumeric() {
+            encoded.push(c);
+        } else {
+            // One dash per UTF-16 unit: the JS regex counts code units, so an
+            // astral character collapses to two dashes, not one.
+            for _ in 0..c.len_utf16() {
+                encoded.push('-');
+            }
+        }
+    }
+    encoded
+}
+
+/// Best-effort inverse of [`encode_project`], for the one path that needs it:
+/// a transcript in which no row carries `cwd`. The encoding is lossy - `/`,
+/// `.`, `_`, and a space are all `-` by the time we see the slug - so this
+/// recovers only the separators and the Windows drive/UNC prefix, and a
+/// project whose own name contains `--` can decode to a path that was never
+/// real.
+fn decode_project(slug: &str) -> String {
+    if let Some(rest) = slug.strip_prefix("--") {
+        return format!(r"\\{}", rest.replace('-', r"\"));
+    }
+    let bytes = slug.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b'-' && bytes[2] == b'-' {
+        return format!(r"{}:\{}", &slug[..1], slug[3..].replace('-', r"\"));
+    }
+    slug.replace('-', "/")
 }
 
 /// Shared claude-JSONL row mapping: replay dedup, `tool_use_id -> name`
@@ -645,7 +684,7 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-                .map(|s| s.replace('-', "/"))
+                .map(decode_project)
                 .ok_or_else(|| {
                     AdapterError::schema(
                         NAME,
@@ -1321,6 +1360,65 @@ mod tests {
             &ClaudeCodeFactory,
             &[".claude", "projects"],
         )
+    }
+
+    /// Claude Code collapses every non-alphanumeric character, so the slug a
+    /// restore writes into has to as well - `_` and a space included, which
+    /// the older `['/', '.']` rule left intact and mis-restored. The Windows
+    /// forms are what make the slug a legal path segment at all.
+    #[test]
+    fn encode_project_collapses_every_non_alphanumeric() {
+        assert_eq!(
+            encode_project("/Users/user/Projects/pond"),
+            "-Users-user-Projects-pond"
+        );
+        assert_eq!(
+            encode_project("/private/tmp/clean_test_empty"),
+            "-private-tmp-clean-test-empty"
+        );
+        assert_eq!(
+            encode_project("/Users/user/my project.v2"),
+            "-Users-user-my-project-v2"
+        );
+        // The drive-letter shape a native Windows 11 `~/.claude/projects`
+        // capture confirmed: this is what Claude Code itself wrote for a
+        // `C:\Users\...` cwd, not a model of it.
+        assert_eq!(
+            encode_project(r"C:\Users\user\claude-code"),
+            "C--Users-user-claude-code"
+        );
+        assert_eq!(encode_project(r"\\host\share\pond"), "--host-share-pond");
+        // Astral characters cost two dashes because the JS regex counts UTF-16
+        // units.
+        assert_eq!(encode_project("/a/\u{1F600}"), "-a---");
+    }
+
+    /// The fallback decode fires only when no row carries `cwd`. It cannot
+    /// undo the collapse, but it must recover the separators and the Windows
+    /// drive/UNC prefix instead of emitting `C//Users/user`.
+    #[test]
+    fn decode_project_recovers_separators_and_windows_prefixes() {
+        assert_eq!(
+            decode_project("-Users-user-Projects-pond"),
+            "/Users/user/Projects/pond"
+        );
+        assert_eq!(decode_project("C--Users-user-pond"), r"C:\Users\user\pond");
+        // The lossiness, stated outright: a `-` the project name itself
+        // carried is gone by the time the slug is written, so it comes back as
+        // a separator. This is why `cwd` is the mainline and this is only the
+        // fallback.
+        assert_eq!(
+            decode_project(&encode_project(r"C:\Users\user\claude-code")),
+            r"C:\Users\user\claude\code"
+        );
+        assert_eq!(decode_project("--host-share-pond"), r"\\host\share\pond");
+        // A drive root has nothing after the prefix.
+        assert_eq!(decode_project("C--"), r"C:\");
+        // Path separators survive a round trip; everything else is lossy by
+        // construction, which is why `cwd` is the mainline.
+        for path in ["/Users/user/pond", r"C:\Users\user\pond", r"\\host\share"] {
+            assert_eq!(decode_project(&encode_project(path)), path);
+        }
     }
 
     /// `source_record_hash` must dedupe noise-field replays (whitespace,

@@ -72,6 +72,11 @@ impl AdapterFactory for OpencodeFactory {
         Ok(Box::new(OpencodeAdapter::new(config_path(NAME, config)?)))
     }
 
+    /// Windows needs no separate branch: opencode resolves its data dir through
+    /// `xdg-basedir`, which has zero Windows special-casing, so the CLI uses
+    /// `~/.local/share/opencode` verbatim there too. (opencode's own docs claim
+    /// `%APPDATA%` - that is their Electron shell, not the CLI store.) The
+    /// standing gap is that pond ignores `XDG_DATA_HOME` here, on any platform.
     fn probe_default(&self, env: &Env) -> Option<Value> {
         // The configured root is the opencode DATA DIR (it holds both the
         // `opencode*.db` files and the legacy `storage/` tree). Only offer it
@@ -1752,6 +1757,10 @@ fn encode(value: &Value, location: &str) -> Result<Vec<u8>, AdapterError> {
     })
 }
 
+/// A stand-in for the `projectID` hash a non-opencode session has no way to
+/// carry. It lands in a JSON field, never in a path segment, and it already
+/// collapses everything non-alphanumeric - so unlike its claude-code and pi
+/// namesakes it needs no Windows treatment.
 fn encode_project(project: &str) -> String {
     project
         .chars()

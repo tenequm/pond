@@ -280,10 +280,13 @@ fn reconstructed_relative_path(session: &crate::sessions::SessionWithMessages) -
 
 /// pi's `sessionDirectoryName` (`jsonl/repo.ts`): strip the leading separator,
 /// map `/`, `\` and `:` to `-`, and wrap in `--`. Reproduced exactly so a
-/// resumed session is discoverable by pi rather than merely well-formed.
+/// resumed session is discoverable by pi rather than merely well-formed - which
+/// means stripping exactly ONE separator, as pi's un-`g`-flagged `/^[/\\]/`
+/// does, so a UNC `\\host\share` keeps its second backslash.
 fn encode_project(project: &str) -> String {
     let body: String = project
-        .trim_start_matches(['/', '\\'])
+        .strip_prefix(['/', '\\'])
+        .unwrap_or(project)
         .chars()
         .map(|c| {
             if matches!(c, '/' | '\\' | ':') {
@@ -1652,6 +1655,20 @@ mod tests {
             &PiCodingAgentFactory,
             &[".pi", "agent", "sessions"],
         )
+    }
+
+    /// Byte-for-byte against pi's `sessionDirectoryName`. The UNC case is the
+    /// one that bites: pi strips ONE leading separator, so `\\host\share` keeps
+    /// a backslash that becomes a third dash.
+    #[test]
+    fn encode_project_matches_pi_session_directory_name() {
+        assert_eq!(encode_project("/Users/user/pond"), "--Users-user-pond--");
+        // The drive's `:` and `\` are two separate characters, so two dashes.
+        assert_eq!(
+            encode_project(r"C:\Users\user\pond"),
+            "--C--Users-user-pond--"
+        );
+        assert_eq!(encode_project(r"\\host\share\pond"), "---host-share-pond--");
     }
 
     /// Codec round-trip (spec.md#adapter-native-restore-lossless): every stored
