@@ -12,6 +12,10 @@ use tempfile::TempDir;
 /// Real native-Windows capture; see the fixture-gate test below.
 const WINDOWS_FIXTURES: &str = "tests/fixtures/adapter/claude_code/windows-projects";
 
+/// The directory name Claude Code 2.1.232 itself chose for the capture's `cwd`.
+/// Ground truth on both sides of the round trip, so it is named once.
+const WINDOWS_SLUG: &str = "C--dev-pond-fixture-demo-v2";
+
 /// The adapter ingests the whole fixture corpus without dropping anything, and
 /// every session it produced carries retrievable conversational content.
 /// Asserts adapter output at the Store layer - `pond_get_session`/
@@ -256,8 +260,13 @@ fn write_claude_parent_workflow_child(root: &Path) -> anyhow::Result<()> {
 /// `C:\dev\pond fixture_demo.v2` - one path deliberately carrying a drive
 /// colon, backslashes, a space, an underscore and a dot, so a single capture
 /// pins every character class the slug rule collapses. Claude Code stored it
-/// under `C--dev-pond-fixture-demo-v2`, which is what `encode_project` must
-/// reproduce for a restore to land where Claude Code will look for it.
+/// under [`WINDOWS_SLUG`], which is what a restore must reproduce to land where
+/// Claude Code will look for it.
+///
+/// Both ways of reaching that slug are asserted, because the restore has two:
+/// the captured `source.project_dir` placement hint, which it prefers, and
+/// `encode_project` derived from the `cwd`, which it falls back to. Asserting
+/// only the first would pass with a broken encoder.
 ///
 /// The only edit to the capture: the `%LOCALAPPDATA%\Temp` Task output paths
 /// had their user component replaced with `user`. Nothing the assertions below
@@ -293,9 +302,35 @@ async fn windows_capture_ingests_its_native_cwd_and_restores_to_the_same_slug() 
     assert!(
         files
             .iter()
-            .all(|f| f.relative_path.starts_with("C--dev-pond-fixture-demo-v2")),
+            .all(|f| f.relative_path.starts_with(WINDOWS_SLUG)),
         "restore must target the captured slug, got {:?}",
         files.iter().map(|f| &f.relative_path).collect::<Vec<_>>(),
+    );
+
+    // That rode the placement hint, which the restore prefers. Strip it and the
+    // same slug has to come back out of `encode_project`, derived from the
+    // Windows `cwd` alone - the half the capture exists to pin.
+    let mut derived = parent;
+    let source = derived
+        .session
+        .options
+        .get_mut("source")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("ingest records options.source");
+    assert!(
+        source.remove("project_dir").is_some(),
+        "the hint must be there to strip, or the fallback below proves nothing",
+    );
+    let derived_files = ClaudeCodeFactory.serialize(&derived, RestoreFidelity::Native)?;
+    assert!(
+        derived_files
+            .iter()
+            .all(|f| f.relative_path.starts_with(WINDOWS_SLUG)),
+        "encode_project must derive the captured slug from the Windows cwd, got {:?}",
+        derived_files
+            .iter()
+            .map(|f| &f.relative_path)
+            .collect::<Vec<_>>(),
     );
 
     // The subagent layout is the same on Windows as on posix.
@@ -328,10 +363,10 @@ async fn windows_capture_ingests_its_native_cwd_and_restores_to_the_same_slug() 
 #[tokio::test(flavor = "multi_thread")]
 async fn windows_capture_without_cwd_falls_back_to_decoding_the_slug() -> anyhow::Result<()> {
     let source = TempDir::new()?;
-    let project = source.path().join("C--dev-pond-fixture-demo-v2");
+    let project = source.path().join(WINDOWS_SLUG);
     std::fs::create_dir_all(&project)?;
     let captured = Path::new(WINDOWS_FIXTURES)
-        .join("C--dev-pond-fixture-demo-v2")
+        .join(WINDOWS_SLUG)
         .join("68f6e765-7552-44c4-8cf9-d88aba05bdb0.jsonl");
     let stripped: String = std::fs::read_to_string(&captured)?
         .lines()

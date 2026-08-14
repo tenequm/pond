@@ -234,9 +234,17 @@ fn encode_project(project: &str) -> String {
 /// Best-effort inverse of [`encode_project`], for the one path that needs it:
 /// a transcript in which no row carries `cwd`. The encoding is lossy - `/`,
 /// `.`, `_`, and a space are all `-` by the time we see the slug - so this
-/// recovers only the separators and the Windows drive/UNC prefix, and a
-/// project whose own name contains `--` can decode to a path that was never
-/// real.
+/// recovers only the separators and the Windows drive/UNC prefix.
+///
+/// Two shapes come back wrong rather than merely coarse, both because the slug
+/// alone cannot say which platform wrote it: a project whose own name contains
+/// `--`, and an absolute posix path whose first component starts with a
+/// non-alphanumeric (`/_work/1/s` -> `--work-1-s`, the shape a self-hosted CI
+/// workdir has), which is indistinguishable from a UNC share and decodes as
+/// one. Neither earns a `cfg!(windows)` branch: the module stays
+/// platform-agnostic so a posix test can drive the Windows shapes, and every
+/// transcript any real corpus has produced carries `cwd` - which is why this is
+/// the fallback and not the rule.
 fn decode_project(slug: &str) -> String {
     if let Some(rest) = slug.strip_prefix("--") {
         return format!(r"\\{}", rest.replace('-', r"\"));
@@ -680,18 +688,16 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
     let project = match project {
         Some(value) => value,
         None => {
-            let decoded = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(decode_project)
-                .ok_or_else(|| {
-                    AdapterError::schema(
-                        NAME,
-                        path_display.clone(),
-                        "no `cwd` field in any row and source path is not UTF-8",
-                    )
-                })?;
+            // `project_dir`, not `path.parent()`: for a subagent transcript the
+            // parent directory is `subagents/`, and only `source_project_dir`
+            // climbs past it to the directory whose name IS the slug.
+            let decoded = project_dir.as_deref().map(decode_project).ok_or_else(|| {
+                AdapterError::schema(
+                    NAME,
+                    path_display.clone(),
+                    "no `cwd` field in any row and source path is not UTF-8",
+                )
+            })?;
             extract_self_str(&Value::String(decoded)).ok_or_else(|| {
                 AdapterError::schema(
                     NAME,
@@ -1391,6 +1397,15 @@ mod tests {
         // Astral characters cost two dashes because the JS regex counts UTF-16
         // units.
         assert_eq!(encode_project("/a/\u{1F600}"), "-a---");
+        // The committed Windows fixture's own pair
+        // (`tests/fixtures/adapter/claude_code/windows-projects/`): this cwd and
+        // this directory name are what Claude Code 2.1.232 wrote for itself, so
+        // the encoder is pinned to captured ground truth rather than to a model
+        // of it. The restore-side half is asserted in the integration suite.
+        assert_eq!(
+            encode_project(r"C:\dev\pond fixture_demo.v2"),
+            "C--dev-pond-fixture-demo-v2"
+        );
     }
 
     /// The fallback decode fires only when no row carries `cwd`. It cannot
@@ -1414,11 +1429,80 @@ mod tests {
         assert_eq!(decode_project("--host-share-pond"), r"\\host\share\pond");
         // A drive root has nothing after the prefix.
         assert_eq!(decode_project("C--"), r"C:\");
-        // Path separators survive a round trip; everything else is lossy by
-        // construction, which is why `cwd` is the mainline.
-        for path in ["/Users/user/pond", r"C:\Users\user\pond", r"\\host\share"] {
-            assert_eq!(decode_project(&encode_project(path)), path);
-        }
+        // Wrong, not merely coarse, and asserted so it stays a known behavior:
+        // an absolute posix path whose first component starts with a
+        // non-alphanumeric encodes to the same `--` prefix a UNC share does,
+        // and the slug carries nothing that could tell them apart.
+        assert_eq!(decode_project(&encode_project("/_work/1/s")), r"\\work\1\s");
+    }
+
+    /// The `cwd`-less fallback must decode the PROJECT directory, not whatever
+    /// directory the transcript happens to sit in. For a subagent that is
+    /// `subagents/`, two levels below the project, so the fallback has to climb
+    /// through `source_project_dir` exactly as the placement hint does -
+    /// otherwise a subagent's project reads as the literal string `subagents`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cwd_less_subagent_decodes_the_project_dir_not_its_own_parent() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        let parent_uuid = "22222222-2222-2222-2222-222222222222";
+        let agent_hash = "beefcafe1234";
+        std::fs::create_dir_all(project_dir.join(parent_uuid).join("subagents"))?;
+
+        // No `cwd` on any row of either file - the only shape that reaches
+        // `decode_project` at all.
+        let parent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-parent-1",
+            "sessionId": parent_uuid,
+            "timestamp": "2026-05-16T00:00:00.000Z",
+            "version": "2.1.121",
+            "message": {"role": "user", "content": "hi parent"},
+        });
+        std::fs::write(
+            project_dir.join(format!("{parent_uuid}.jsonl")),
+            format!("{parent_row}\n"),
+        )?;
+        let subagent_row = serde_json::json!({
+            "type": "user",
+            "uuid": "u-sub-1",
+            "sessionId": parent_uuid,
+            "isSidechain": true,
+            "agentId": agent_hash,
+            "timestamp": "2026-05-16T00:01:00.000Z",
+            "version": "2.1.121",
+            "message": {"role": "user", "content": "subagent prompt"},
+        });
+        std::fs::write(
+            project_dir
+                .join(parent_uuid)
+                .join("subagents")
+                .join(format!("agent-{agent_hash}.jsonl")),
+            format!("{subagent_row}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        // Coarse by construction - the real cwd was `/tmp/pond-test` - but it is
+        // the project directory, and parent and child have to agree on it.
+        let decoded = "/tmp/pond/test";
+        let parent = store
+            .get_session(parent_uuid)
+            .await?
+            .expect("parent session ingests");
+        assert_eq!(&*parent.session.project, decoded);
+        let child = store
+            .get_session(&format!("{parent_uuid}/agent-{agent_hash}"))
+            .await?
+            .expect("subagent session ingests");
+        assert_eq!(
+            &*child.session.project, decoded,
+            "a subagent must not take `subagents/` as its project",
+        );
+        Ok(())
     }
 
     /// `source_record_hash` must dedupe noise-field replays (whitespace,

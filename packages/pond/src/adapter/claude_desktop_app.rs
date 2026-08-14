@@ -1,12 +1,12 @@
 //! Claude Desktop app adapter - Cowork / agent-mode sessions only.
 //!
 //! Source path:
-//! `<store>/<acct>/<workspace>/local_<uuid>/audit.jsonl`, where `<store>` is
-//! `~/Library/Application Support/Claude/local-agent-mode-sessions` on macOS
-//! and one of the Windows layouts [`cowork_roots`] enumerates,
-//! with a sibling `local_<uuid>.json` metadata file. Each `audit.jsonl` is one
-//! session (one JSON object per line); the metadata carries `sessionId`,
-//! `createdAt`, the project folder, and UI fields.
+//! `<store>/<acct>/<workspace>/local_<uuid>/audit.jsonl`, with a sibling
+//! `local_<uuid>.json` metadata file. `<store>` is
+//! `~/Library/Application Support/Claude/local-agent-mode-sessions` on macOS,
+//! or one of the Windows layouts [`cowork_roots`] enumerates. Each
+//! `audit.jsonl` is one session (one JSON object per line); the metadata
+//! carries `sessionId`, `createdAt`, the project folder, and UI fields.
 //!
 //! Scope is deliberately narrow (spec.md#adapters, locked product split):
 //! - It NEVER reads `~/.claude/projects` or the `claude-code-sessions/`
@@ -101,9 +101,11 @@ impl AdapterFactory for ClaudeDesktopAppFactory {
 
 /// Every place the Cowork store can live, in probe order: the macOS
 /// `~/Library/Application Support/Claude` layout, then plain `%APPDATA%\Claude`,
-/// then the MSIX-virtualized layout. All are checked on every platform - a miss
-/// is one `exists()` call, and staying platform-agnostic is what lets a test
-/// drive the Windows branches from a `TempDir` home.
+/// then the MSIX-virtualized layouts. All are built on every platform rather
+/// than behind `cfg!`, because that is what lets a test drive the Windows
+/// branches from a `TempDir` home. The cost of the ones that cannot match is
+/// two `PathBuf` joins and the single failing `read_dir` in
+/// [`msix_cowork_roots`], on a path that runs once per command.
 ///
 /// `%APPDATA%` leads on Windows because that is what a real install uses:
 /// verified against Claude 1.30096.1 on Windows 11, which ships as a per-user
@@ -1174,16 +1176,19 @@ mod tests {
         )
     }
 
-    /// The Windows store is MSIX-virtualized under a package-family directory
-    /// whose name is install-channel-dependent, so the probe has to match it by
-    /// name. Two channels present must resolve deterministically.
+    /// The Store/MSIX channel - a secondary probe, not what the mainline
+    /// installer produces (see [`cowork_roots`]) - hides the store under a
+    /// package-family directory whose name is install-channel-dependent, so it
+    /// has to be matched by name. Two Claude channels present must resolve
+    /// deterministically, and a foreign package must never be a candidate even
+    /// when it carries the same inner layout.
     #[test]
     fn probe_default_finds_the_msix_virtualized_store() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let packages = temp.path().join("AppData").join("Local").join("Packages");
         let mut expected = None;
         for family in [
-            "ZZUnrelated_1a2b3c",
+            "AAUnrelated_1a2b3c",
             "ZZClaudeBeta_9zzzzzzzzzzzz",
             "AnthropicClaude_j0mn41abcdefg",
         ] {
@@ -1194,9 +1199,11 @@ mod tests {
                 .join("Claude")
                 .join(SESSIONS_SUBDIR);
             std::fs::create_dir_all(&root)?;
-            // Two Claude channels are present, so the sort - not the walk order
-            // - has to decide; the unrelated package must not be a candidate at
-            // all, even though it has the same inner layout.
+            // The foreign package sorts BEFORE both Claude families, so a probe
+            // that dropped the name filter would return it - that is what makes
+            // the filter load-bearing here rather than incidentally satisfied.
+            // Between the two real channels the sort, not the walk order,
+            // decides.
             if family.starts_with("Anthropic") {
                 expected = Some(root);
             }
