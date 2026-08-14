@@ -46,8 +46,8 @@ pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
 pub use discovery::{
-    Candidate, apply_to_doc, discover, persist_accept, probe_unconfigured, prompt_and_persist,
-    set_adapter_enabled,
+    Candidate, apply_to_doc, discover, persist_accept, probe_pathless, probe_unconfigured,
+    prompt_and_persist, set_adapter_enabled,
 };
 pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,

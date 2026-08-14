@@ -292,7 +292,7 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
     .await?;
     detail(&mut phases, format!("map_present={}", oracle.0.is_some()));
 
-    let resolved: Vec<(String, Value)> = config
+    let resolved = config
         .resolve_adapters(args.adapter.as_deref())
         .context("resolve_adapters")?;
     if resolved.is_empty() {
@@ -300,7 +300,8 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
     }
 
     let mut combined = IngestSummary::default();
-    for (name, cfg) in resolved {
+    for entry in resolved {
+        let (name, cfg) = (entry.name, entry.config);
         let factory =
             adapter::by_name(&name).ok_or_else(|| anyhow::anyhow!("unknown adapter {name:?}"))?;
         let adapter_obj = factory.open(cfg)?;

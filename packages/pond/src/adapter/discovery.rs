@@ -28,12 +28,32 @@ pub struct Candidate {
 pub fn probe_unconfigured(
     configured: &std::collections::BTreeMap<String, Value>,
 ) -> Vec<Candidate> {
+    probe_filtered(configured, |_| false)
+}
+
+/// Probe every factory whose entry does not already name a source `path`.
+/// Backs `pond adapters discover`: an entry carrying a path may have been
+/// customized (a hand-written dir, or a multi-path array), and persisting a
+/// re-probed pick would overwrite it with the single default - but a decline
+/// stub (`enabled = false`, no `path`, written by `pond init`) carries
+/// nothing to lose and MUST stay re-offerable, or declining an adapter would
+/// dead-end the only route back to it.
+pub fn probe_pathless(configured: &std::collections::BTreeMap<String, Value>) -> Vec<Candidate> {
+    probe_filtered(configured, |blob| blob.get("path").is_none())
+}
+
+/// Shared probe: a factory with no entry is always a candidate; one with an
+/// entry is re-offered only when `reoffer` says its blob has nothing to lose.
+fn probe_filtered(
+    configured: &std::collections::BTreeMap<String, Value>,
+    reoffer: impl Fn(&Value) -> bool,
+) -> Vec<Candidate> {
     let Some(env) = Env::from_env() else {
         return Vec::new();
     };
     super::registry()
         .iter()
-        .filter(|factory| !configured.contains_key(factory.name()))
+        .filter(|factory| configured.get(factory.name()).is_none_or(&reoffer))
         .filter_map(|factory| {
             factory.probe_default(&env).map(|config| Candidate {
                 name: factory.name().to_owned(),
@@ -329,6 +349,67 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// `probe_pathless` is what keeps `pond adapters discover` from
+    /// dead-ending a declined adapter: the decline stub `pond init` writes
+    /// carries no `path`, so it must stay re-offerable, while an entry that
+    /// already names its source (scalar or array) must never be re-probed.
+    #[test]
+    fn probe_pathless_reoffers_stubs_but_never_a_configured_path() {
+        let configured = |blob: Value| {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("claude-code".to_owned(), blob);
+            map
+        };
+        let offers = |map: &std::collections::BTreeMap<String, Value>| {
+            probe_pathless(map).iter().any(|c| c.name == "claude-code")
+        };
+
+        // A configured path (scalar or array) is never re-offered.
+        assert!(!offers(&configured(
+            json!({ "enabled": true, "path": "/srv/cc" })
+        )));
+        assert!(!offers(&configured(
+            json!({ "enabled": true, "path": ["/srv/a", "/srv/b"] })
+        )));
+        // Disabled but still naming its source: `pond adapters enable` is the
+        // route back, not a re-probe that would overwrite the path.
+        assert!(!offers(&configured(
+            json!({ "enabled": false, "path": "/srv/cc" })
+        )));
+
+        // The decline stub carries nothing to lose, so it stays offerable -
+        // and `probe_unconfigured` (sync's post-import prompt) still skips it,
+        // because that surface must not re-ask about a declined adapter.
+        let stub = configured(json!({ "enabled": false }));
+        assert!(
+            !probe_unconfigured(&stub)
+                .iter()
+                .any(|c| c.name == "claude-code"),
+        );
+        // The probe itself only yields a candidate when the source exists on
+        // this machine, so assert the filter, not the environment.
+        assert!(
+            registry_names_reaching_probe(&stub).contains(&"claude-code"),
+            "a pathless stub must reach probe_default",
+        );
+    }
+
+    /// Names `probe_pathless`'s filter lets through to `probe_default`,
+    /// independent of whether the machine actually has those sources.
+    fn registry_names_reaching_probe(
+        configured: &std::collections::BTreeMap<String, Value>,
+    ) -> Vec<&'static str> {
+        super::super::registry()
+            .iter()
+            .map(|factory| factory.name())
+            .filter(|name| {
+                configured
+                    .get(*name)
+                    .is_none_or(|blob| blob.get("path").is_none())
+            })
+            .collect()
+    }
 
     #[test]
     fn prompt_and_persist_errors_on_non_tty_stdin() {

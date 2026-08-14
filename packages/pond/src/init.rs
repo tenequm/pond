@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use pond::adapter::{self, Candidate};
 use pond::config::{self, Config, CredsSet};
 use pond::substrate::StorageUrl;
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 use crate::schedule::{self, ScheduleEvery};
 
@@ -740,11 +740,25 @@ fn adapter_rows(doc: &DocumentMut, force: bool) -> Vec<AdapterRow> {
                     .and_then(|table| table.get("enabled"))
                     .and_then(Item::as_bool)
                     .unwrap_or(false);
+                let contract =
+                    |path: &str| config::contract_home(Path::new(path)).display().to_string();
+                // A multi-path entry must show its own dirs: falling through
+                // to the probed default would display a directory that is not
+                // in the config at all.
                 let hint = item
                     .as_table_like()
                     .and_then(|table| table.get("path"))
-                    .and_then(Item::as_str)
-                    .map(|path| config::contract_home(Path::new(path)).display().to_string())
+                    .and_then(|path| match path {
+                        Item::Value(Value::Array(paths)) => Some(
+                            paths
+                                .iter()
+                                .filter_map(|element| element.as_str())
+                                .map(contract)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                        other => other.as_str().map(contract),
+                    })
                     .or_else(|| candidate.map(|c| c.hint.clone()))
                     .unwrap_or_default();
                 rows.push(AdapterRow {
