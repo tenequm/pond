@@ -192,9 +192,17 @@ jobs:
       # rustc wrappers, so neither caches build-script EXECUTION - and this
       # graph's slowest native work (aws-lc-sys under cmake + NASM) happens
       # exactly there, which rust-cache does restore as part of target/.
+      # cache-on-failure matters more here than anywhere else in the pipeline.
+      # The action's post step is `post-if: success() || CACHE_ON_FAILURE`, so
+      # by default a red run saves nothing - and the expected way to iterate on
+      # Windows is exactly a red run, where a platform-specific test fails after
+      # an hour of compiling. Without this, every such iteration pays the full
+      # cold build again. (A cancelled or timed-out job still saves nothing;
+      # only the timeout above protects against that.)
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          cache-on-failure: true
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
