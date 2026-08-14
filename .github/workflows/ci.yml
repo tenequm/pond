@@ -105,9 +105,14 @@ jobs:
       (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-'))
     runs-on: windows-2025
     # No `needs:` - this starts at t=0 alongside the Linux jobs instead of
-    # serializing the release path behind them. Two full dep-graph compiles
-    # (test profile, then dist) on a 4-vCPU hosted runner need the headroom.
-    timeout-minutes: 120
+    # serializing the release path behind them.
+    #
+    # 180, not 120, and the number is measured: the first cold run spent 76
+    # minutes on the test leg alone, leaving a thin-LTO codegen-units=1 `dist`
+    # compile to finish inside the remaining 44. Overrunning is worse than it
+    # looks - a killed job never runs rust-cache's save step, so the next run
+    # starts cold too and the overrun repeats. Warm runs land far under this.
+    timeout-minutes: 180
     # Not cancellable, same rule as dist-build: this job produces a release
     # artifact that publish-release needs. Cancelling it mid-release would
     # cancel publish-release with it, and after release-plz cuts the tag the
