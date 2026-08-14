@@ -13,12 +13,26 @@
 
 Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
 
+Your agent history is already on your disk: thousands of sessions of decisions, fixes, and dead ends, scattered across tools that cannot search them. Pond ingests them automatically and losslessly into storage you own - a local folder or your own S3 bucket - and makes the whole corpus searchable, SQL-queryable, and available to your agents over MCP, so "how did we fix this before?" is a query, not an archaeology dig. Sessions are no longer locked to the tool that created them: pond restores any session into any supported client, and you continue working there.
+
+```sh
+brew install tenequm/tap/pond
+```
+
+Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)."*
+
 <p align="center">
   <img src="docs/site/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
 </p>
 <p align="center"><sub>A live 12k-session corpus, then a three-month-old fix found and verified against the current code (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
 
-Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/site/assets/tokens-chart-dark.svg">
+    <img src="docs/site/assets/tokens-chart-light.svg" alt="Bar chart: tokens into context for one recall answer. pond_search returns a complete ranked answer in 1.5-3k tokens; grep plus reading one matching transcript costs 90-255k tokens, chosen from 23-3,270 unranked matching files" width="920">
+  </picture>
+</p>
+<p align="center"><sub>Five real recall questions, one corpus, one machine - method, raw numbers, and a rerunnable script in <a href="docs/benchmarks/recall-context-cost.md">docs/benchmarks</a></sub></p>
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
 
