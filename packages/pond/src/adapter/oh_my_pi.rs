@@ -34,13 +34,15 @@
 //! - omp externalizes images to `~/.omp/agent/blobs/<sha256>` and stores
 //!   `blob:sha256:<hash>` refs inline. pond ingests the ref, not the bytes - the
 //!   transcript stays faithful to the file, and search never wanted the pixels.
-//! - The header's `parentSession` is carried verbatim in `options.source` but
-//!   NOT mapped to `parent_session_id`. omp writes either a session id or a
+//! - The header's `parentSession` FIELD is carried verbatim in `options.source`
+//!   but NOT mapped to `parent_session_id`. omp writes either a session id or a
 //!   session path there depending on the flow and its own docs call it metadata,
 //!   not a typed key, so resolving it is a lineage feature for pi and omp
 //!   together (`docs/plans/2608-06-pi-pond-plugin-and-v4-adapters-implementation-plan.md`
 //!   section 9 item 2), not a guess this adapter makes per row
-//!   (spec.md#model-no-synthesis).
+//!   (spec.md#model-no-synthesis). A `task` subagent is the separate,
+//!   unambiguous case: it carries no parent field at all and its parent is read
+//!   off the directory layout instead - see [`link_subagent`].
 //!
 //! Ingest-only by design: see [`OhMyPiFactory::serialize`].
 //!
@@ -285,6 +287,7 @@ impl JsonlTree for OhMyPiAdapter {
         let placement = SourcePlacement::from_path(path);
         let mut session = v3_session_from_row(NAME, &head.value, &at_head, &placement)?;
         fold_title_slot(&mut session, rows.first(), &at_head)?;
+        link_subagent(&mut session, path);
         Ok(session)
     }
 
@@ -304,6 +307,43 @@ impl JsonlTree for OhMyPiAdapter {
         }
         v3_events_from_row(&session.id, row.line, &row.value, session.created_at)
     }
+}
+
+/// A `task` subagent writes beside its parent, into a directory named after the
+/// parent's own session file: `<bucket>/<parent>.jsonl` next to
+/// `<bucket>/<parent>/<AgentName>.jsonl` (verified against omp 17.3.4 on
+/// Windows 11). The child header is a plain v3 session with its own id and NO
+/// parent field, so the path is the only link - derived, never synthesized, the
+/// same rule claude-code's `subagents/` layout follows
+/// (spec.md#model-no-synthesis).
+///
+/// The sibling file is what separates a parent-session directory from a scope
+/// bucket: a bucket never has a `<bucket>.jsonl` next to it, while a parent
+/// directory always does, because it is named after that very file.
+///
+/// `source_agent` becomes the fixed `oh-my-pi/subagent`, not the agent's name:
+/// it is a harness identity that filters match on, and a per-invocation name
+/// would make the taxonomy unbounded. The name is already in
+/// `options.source.file_name`. The `/` is also what keeps these out of default
+/// search, which is the point - before this they ranked as top-level sessions.
+fn link_subagent(session: &mut Session, path: &Path) {
+    let Some(dir) = path.parent() else { return };
+    let Some(dir_name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(sibling) = dir.parent().map(|up| up.join(format!("{dir_name}.jsonl"))) else {
+        return;
+    };
+    if !sibling.is_file() {
+        return;
+    }
+    // omp names a session file `<ISO-timestamp>_<id>`; the timestamp carries no
+    // `_`, so the first one splits the parent's id off cleanly.
+    let Some((_, parent_id)) = dir_name.split_once('_') else {
+        return;
+    };
+    session.parent_session_id = Some(parent_id.to_owned());
+    session.source_agent = format!("{NAME}/subagent");
 }
 
 /// omp's fixed-width first-line title slot (`session-title-slot.ts`): `type`
@@ -409,6 +449,73 @@ mod tests {
         Path::new(FIXTURES)
             .join(BUCKET)
             .join(format!("2026-08-12T10-00-00-000Z_{MAIN}.jsonl"))
+    }
+
+    /// omp 17.3.4's `task` layout, captured on Windows 11: the subagent sits in
+    /// a directory named after the parent's own session file and carries no
+    /// parent field. Both halves matter - the child links back and drops out of
+    /// default search, while the parent beside it stays top-level.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_subagent_links_to_the_parent_named_by_its_directory() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let bucket = corpus.path().join("--C--dev-omp-test--");
+        let parent_id = "01a000f8-ab2d-7000-903b-514cf631bc40";
+        let child_id = "01a000f8-c2be-7000-85a6-eae2c18027a0";
+        let stem = format!("2026-08-14T15-51-31-885Z_{parent_id}");
+        std::fs::create_dir_all(bucket.join(&stem))?;
+
+        let transcript = |id: &str, ts: &str, text: &str| {
+            format!(
+                concat!(
+                    r#"{{"type":"title","v":1,"title":"","updatedAt":"{ts}"}}"#,
+                    "\n",
+                    r#"{{"type":"session","version":3,"id":"{id}","timestamp":"{ts}","cwd":"C:\\dev\\omp-test"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"m-{id}","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#,
+                    "\n",
+                ),
+                id = id,
+                ts = ts,
+                text = text,
+            )
+        };
+        std::fs::write(
+            bucket.join(format!("{stem}.jsonl")),
+            transcript(parent_id, "2026-08-14T15:51:31.885Z", "parent turn"),
+        )?;
+        std::fs::write(
+            bucket.join(&stem).join("WriteAlpha.jsonl"),
+            transcript(child_id, "2026-08-14T15:51:37.918Z", "subagent turn"),
+        )?;
+
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_adapter(
+            &store,
+            &OhMyPiAdapter::new(corpus.path()),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+
+        let child = store
+            .get_session(child_id)
+            .await?
+            .expect("the subagent transcript ingests");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(parent_id),
+            "the parent is named by the directory and nowhere else",
+        );
+        assert_eq!(child.session.source_agent, format!("{NAME}/subagent"));
+
+        let parent = store
+            .get_session(parent_id)
+            .await?
+            .expect("the parent transcript ingests");
+        assert_eq!(parent.session.parent_session_id, None);
+        assert_eq!(parent.session.source_agent, NAME);
+        Ok(())
     }
 
     async fn ingest_fixtures(temp: &TempDir) -> anyhow::Result<Store> {
