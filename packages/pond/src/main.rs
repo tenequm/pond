@@ -391,6 +391,19 @@ struct StoreArgs {
         value_name = "PATH"
     )]
     config: Option<PathBuf>,
+    /// Directory holding pond's per-host state: the sync lock, the last-sync
+    /// record, and the scheduler log. Must be absolute.
+    ///
+    /// The argument form of `XDG_STATE_HOME`, and the reason it exists: a
+    /// Windows Task Scheduler `Exec` action carries no environment block, so
+    /// the scheduled job is pinned to its registration-time state dir here
+    /// where launchd and systemd pin an env var.
+    ///
+    /// Hidden from help on every platform: it is machinery the scheduler bakes
+    /// into a task, not a flag anyone types, and a `cfg`-conditional hide would
+    /// make `--help` - and the snapshot suite that pins it - diverge per OS.
+    #[arg(long = "state-dir", global = true, hide = true, value_name = "PATH")]
+    state_dir: Option<PathBuf>,
 }
 
 // Parsed once, matched once, immediately destructured - the size spread
@@ -1213,7 +1226,16 @@ async fn run() -> anyhow::Result<()> {
     let StoreArgs {
         storage_path,
         config,
+        state_dir,
     } = cli.store;
+    // Before any state path resolves. Relative would resolve against the
+    // scheduler's working directory, which is not ours to assume.
+    if let Some(dir) = state_dir {
+        if !dir.is_absolute() {
+            bail!("--state-dir must be absolute, got {}", dir.display());
+        }
+        syncstate::set_state_dir_override(dir);
+    }
 
     match cli.command {
         Command::Init(args) => init::run(args, storage_path, config).await?,

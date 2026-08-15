@@ -7,16 +7,30 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The XDG state root pinned into scheduler job environments so the scheduled
-/// sync resolves the same state dir as a manual run. `XDG_STATE_HOME` wins on
-/// all platforms when set and absolute; otherwise the platform-native fallback
-/// applies.
+/// Set once from the global `--state-dir` flag, before anything resolves a
+/// state path. It is the argument form of `XDG_STATE_HOME`, and exists because
+/// a Task Scheduler `Exec` action carries no environment block: the Windows
+/// scheduler bakes the registration-time state dir into the task's arguments
+/// where launchd and systemd pin an env var instead.
+static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn set_state_dir_override(dir: PathBuf) {
+    let _ = STATE_DIR_OVERRIDE.set(dir);
+}
+
+/// The XDG state root pinned into scheduler jobs so the scheduled sync resolves
+/// the same state dir as a manual run. `--state-dir` wins, then `XDG_STATE_HOME`
+/// when set and absolute; otherwise the platform-native fallback applies.
 pub(crate) fn state_root() -> PathBuf {
+    if let Some(pinned) = STATE_DIR_OVERRIDE.get() {
+        return pinned.clone();
+    }
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -44,9 +58,10 @@ pub(crate) fn state_root() -> PathBuf {
 /// On all platforms, `XDG_STATE_HOME/pond` when `XDG_STATE_HOME` is set - except
 /// on Windows, where the per-app `\pond` suffix is omitted because `state_root()`
 /// already points to a pond-specific dir (`%LOCALAPPDATA%\pond\state`). This also
-/// keeps the scheduler-pinning contract: the wrapper sets
-/// `XDG_STATE_HOME=state_root()`, and the scheduled job calls `pond_state_dir()`
-/// which on Windows returns `state_root()` = the same value, with no double suffix.
+/// keeps the scheduler-pinning contract: the task bakes `--state-dir
+/// <state_root()>` into its arguments, and the scheduled job calls
+/// `pond_state_dir()` which on Windows returns `state_root()` = the same value,
+/// with no double suffix.
 ///
 /// On Unix: `$HOME/.local/state/pond` (one app under the shared XDG state home).
 pub(crate) fn pond_state_dir() -> PathBuf {

@@ -4,10 +4,9 @@
 //! context, trips TCC folder-access denials, and silently drops jobs that
 //! span sleep). Linux prefers systemd user timers (`Persistent=true` catches
 //! up after downtime) and falls back to a fenced crontab block. Windows uses
-//! Task Scheduler: a generated `.cmd` wrapper keeps every path out of
-//! schtasks quoting, and the task XML provides the settings that align it
-//! with the launchd/systemd posture (battery-friendly, catch-up after missed
-//! runs, windowless launch).
+//! Task Scheduler: the task Execs `pondw.exe`, pond's windowless launcher,
+//! and the task XML provides the settings that align it with the
+//! launchd/systemd posture (battery-friendly, catch-up after missed runs).
 //!
 //! The scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an
 //! unattended run can never auto-enable freshly-detected adapters, and
@@ -929,16 +928,21 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    //! Windows Task Scheduler backend. The scheduled action chain:
+    //! Windows Task Scheduler backend. The task's `Exec` action is `pondw.exe`,
+    //! pond's windowless launcher, and nothing else:
     //!
-    //! 1. `.cmd` wrapper (`<pond_state_dir>/pond-sync.cmd`): pins `XDG_STATE_HOME`,
-    //!    runs `pond sync -q --no-wait`, appends output to the sync log.
-    //! 2. `.vbs` shim (`<pond_state_dir>/pond-sync.vbs`): launches the `.cmd` via
-    //!    `WScript.Shell.Run(..., 0, False)` - the `0` WindowStyle suppresses the
-    //!    console window that `cmd.exe` would otherwise pop on every tick.
-    //!    `<Hidden>` in the task XML only hides the task in Task Scheduler UI; the
-    //!    shim is what prevents a visible terminal from flashing every 5 minutes.
-    //! 3. Task created via `/XML` with a `<Settings>` block: battery-friendly,
+    //! 1. `pondw.exe` is linked into the `windows` subsystem, so no console
+    //!    flashes on a tick, and it waits on `pond.exe` and returns its exit
+    //!    code, so Task Scheduler's `Last Result` is the sync's own status.
+    //!    `<Hidden>` in the task XML is unrelated - it only hides the task in
+    //!    the Task Scheduler UI listing.
+    //! 2. Its `--log` argument is what gives the run somewhere to write: an
+    //!    `Exec` action has no output redirection of its own, the way a launchd
+    //!    plist has `StandardOutPath`.
+    //! 3. `--state-dir` pins the resolved state dir into the arguments. An
+    //!    `Exec` action carries no environment block either, so the env-var
+    //!    pinning the launchd and systemd backends use has no analog here.
+    //! 4. Task created via `/XML` with a `<Settings>` block: battery-friendly,
     //!    `StartWhenAvailable` (catch-up after downtime, systemd `Persistent=true`).
 
     use std::path::PathBuf;
@@ -951,16 +955,23 @@ mod windows {
 
     const TASK_NAME: &str = "pond-sync";
 
-    /// Probe existence + cadence in a single `schtasks /Query /XML ONE` call.
-    pub(super) fn probe() -> Result<State> {
+    /// The registered task's XML, or `None` when no such task exists.
+    fn query_xml() -> Result<Option<String>> {
         let output = Command::new("schtasks")
             .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
             .output()
             .context("failed to run schtasks /Query")?;
-        if !output.status.success() {
+        Ok(output
+            .status
+            .success()
+            .then(|| decode_console(&output.stdout)))
+    }
+
+    /// Probe existence + cadence in a single `schtasks /Query /XML ONE` call.
+    pub(super) fn probe() -> Result<State> {
+        let Some(xml) = query_xml()? else {
             return Ok(Inactive);
-        }
-        let xml = decode_console(&output.stdout);
+        };
         Ok(Active {
             backend: "task-scheduler",
             every: parse_interval_from_xml(&xml),
@@ -971,67 +982,61 @@ mod windows {
     /// `pond schedule start` and the `pond init` schedule section.
     pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
         let bin = pond_bin();
+        let launcher = pondw_bin(&bin)?;
         let log = super::log_path();
-        // state_root is what we pin into XDG_STATE_HOME; pond_state_dir is
-        // the subdirectory where the wrapper, shim, log, and lock files live.
+        // state_root is what we pin into --state-dir; pond_state_dir is the
+        // directory where the log, lock, and last-sync record live.
         let state_root = crate::syncstate::state_root();
         let pond_state = crate::syncstate::pond_state_dir();
         std::fs::create_dir_all(&pond_state)
             .with_context(|| format!("failed to create {}", pond_state.display()))?;
 
-        // Gate on % in the state dir: the .vbs path goes into the XML <Arguments>
-        // element, where Task Scheduler expands %VAR% at runtime with NO escape
-        // syntax. Mirror the unix gate that blocks % in cron/plist templates.
-        let state_str = state_root.display().to_string();
-        if state_str.contains('%') {
-            bail!(
-                "state dir {state_str:?} contains '%' which Task Scheduler expands \
-                 in the task XML arguments with no escape syntax; it resolves from \
-                 XDG_STATE_HOME, falling back to %USERPROFILE%\\.local\\state - set \
-                 XDG_STATE_HOME to a path without '%' and re-run `pond schedule start`"
-            );
+        // Gate on % in every path that lands in the XML: Task Scheduler expands
+        // %VAR% inside <Command> and <Arguments> at runtime with NO escape
+        // syntax. Mirrors the unix gate that blocks % in cron/plist templates.
+        for path in [&launcher, &bin, &log, &state_root] {
+            let text = path.display().to_string();
+            if text.contains('%') {
+                bail!(
+                    "{text:?} contains '%' which Task Scheduler expands in the task \
+                     XML with no escape syntax; the state dir resolves from \
+                     --state-dir or XDG_STATE_HOME, falling back to \
+                     %LOCALAPPDATA%\\pond\\state - move pond or its state dir to a \
+                     path without '%' and re-run `pond schedule start`"
+                );
+            }
         }
 
-        // The `.cmd` wrapper runs under cmd.exe so `>>` redirection works.
-        // `%` is expansion-active in batch even inside double-quoted `set`
-        // values, so escape it as `%%` in all three embedded paths.
-        let escape_batch = |s: &str| s.replace('%', "%%");
-        let wrapper = pond_state.join("pond-sync.cmd");
-        let wrapper_body = format!(
-            "@echo off\r\n\
-             set \"XDG_STATE_HOME={state}\"\r\n\
-             \"{bin}\" sync -q --no-wait >> \"{log}\" 2>&1\r\n",
-            state = escape_batch(&state_str),
-            bin = escape_batch(&bin.display().to_string()),
-            log = escape_batch(&log.display().to_string()),
-        );
+        let arguments = task_arguments(&log, &bin, &state_root);
 
-        // The `.vbs` shim invokes the `.cmd` with WindowStyle=0 (hidden), so
-        // cmd.exe does not pop a visible console window on every tick.
-        // `<Hidden>true</Hidden>` in the task XML only hides the task in the
-        // Task Scheduler UI; the shim is what prevents the console flash.
-        let vbs = pond_state.join("pond-sync.vbs");
-        let vbs_body = format!(
-            "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\"\", 0, False\r\n",
-            wrapper.display(),
-        );
-
-        // Already-scheduled no-op: both artifact bodies unchanged and task
-        // exists at the same cadence means registration is not needed.
-        let unchanged = std::fs::read_to_string(&wrapper)
-            .map(|existing| existing == wrapper_body)
-            .unwrap_or(false)
-            && std::fs::read_to_string(&vbs)
-                .map(|existing| existing == vbs_body)
-                .unwrap_or(false);
-        if unchanged
-            && let Ok(Active {
-                every: registered, ..
-            }) = probe()
-            && registered == Some(every)
+        // Already-scheduled no-op: same action, same cadence. Compared on the
+        // decoded element text, not the escaped form we wrote, because Task
+        // Scheduler re-serializes the XML it stores and need not escape a quote
+        // in element content. A mismatch only costs an idempotent re-register.
+        let launcher_str = launcher.display().to_string();
+        if let Some(xml) = query_xml()?
+            && between(&xml, "<Command>", "</Command>")
+                .map(xml_unescape)
+                .as_deref()
+                == Some(launcher_str.as_str())
+            && between(&xml, "<Arguments>", "</Arguments>")
+                .map(xml_unescape)
+                .as_deref()
+                == Some(arguments.as_str())
+            && parse_interval_from_xml(&xml) == Some(every)
         {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
+        }
+
+        // The pin is registration-time: a later shell-only override splits the
+        // lock and last-sync record between the scheduled and manual syncs, and
+        // the task will not follow it.
+        if std::env::var_os("XDG_STATE_HOME").is_some() {
+            pond::output::line(&format!(
+                "note: XDG_STATE_HOME is set; the task is pinned to {} and will not follow later changes",
+                state_root.display()
+            ))?;
         }
 
         // Write the XML task definition to a temp file; schtasks /Create /XML
@@ -1040,10 +1045,10 @@ mod windows {
         // schtasks reads a BOM-less file through the ANSI code page, so a
         // UTF-8 write would mojibake any non-ASCII state path (e.g. a
         // non-ASCII Windows username) into a task action pointing at a
-        // nonexistent shim - registration "succeeds" and every tick silently
-        // does nothing. UTF-16LE+BOM matches the declaration in `task_xml`
-        // and the encoding Task Scheduler's own XML export produces.
-        let xml = task_xml(&vbs, every);
+        // nonexistent launcher - registration "succeeds" and every tick
+        // silently does nothing. UTF-16LE+BOM matches the declaration in
+        // `task_xml` and the encoding Task Scheduler's own XML export produces.
+        let xml = task_xml(&launcher, &arguments, every);
         let tmp_xml = pond_state.join("pond-sync-task.xml.tmp");
         std::fs::write(&tmp_xml, utf16le_bom(&xml))
             .with_context(|| format!("failed to write {}", tmp_xml.display()))?;
@@ -1063,13 +1068,6 @@ mod windows {
             );
         }
 
-        // Write both artifacts AFTER /Create succeeds: a failed /Create must not
-        // leave a wrapper or shim that points at a non-existent task.
-        std::fs::write(&wrapper, &wrapper_body)
-            .with_context(|| format!("failed to write {}", wrapper.display()))?;
-        std::fs::write(&vbs, &vbs_body)
-            .with_context(|| format!("failed to write {}", vbs.display()))?;
-
         pond::output::line(&super::render_state(&super::State::Active {
             backend: "task-scheduler",
             every: Some(every),
@@ -1088,7 +1086,7 @@ mod windows {
             .output()
             .context("failed to run schtasks /Delete")?;
         if output.status.success() {
-            // Leave the wrapper + log in place; the log stays readable via
+            // Leave the log in place; it stays readable via
             // `pond schedule logs`.
             pond::output::line("schedule removed")?;
             return Ok(());
@@ -1108,13 +1106,32 @@ mod windows {
         Ok(())
     }
 
+    /// The `<Arguments>` line the task runs: the launcher's own `--log`, then
+    /// the pond command line it executes.
+    ///
+    /// `--state-dir` is the argument form of the `XDG_STATE_HOME` the launchd
+    /// and systemd backends pin in the job environment - an `Exec` action has
+    /// no environment block, so the value is pinned here instead.
+    fn task_arguments(
+        log: &std::path::Path,
+        bin: &std::path::Path,
+        state_root: &std::path::Path,
+    ) -> String {
+        format!(
+            "--log \"{log}\" -- \"{bin}\" sync -q --no-wait --state-dir \"{state}\"",
+            log = log.display(),
+            bin = bin.display(),
+            state = state_root.display(),
+        )
+    }
+
     /// Generate Task Scheduler XML for the pond-sync task.
     ///
-    /// The `<Action>` runs `wscript.exe //B //NoLogo <vbs>` rather than the `.cmd`
-    /// wrapper directly: WScript.Shell.Run with WindowStyle=0 suppresses the
-    /// console window that `cmd.exe` would otherwise show on every tick. The `.vbs`
-    /// shim calls the `.cmd` with Run(..., 0, False).
-    fn task_xml(vbs: &std::path::Path, every: ScheduleEvery) -> String {
+    /// The `<Action>` runs `pondw.exe`, pond's windowless launcher: a
+    /// console-subsystem binary in an interactive `Exec` action flashes a
+    /// window on every tick, and a fire-and-forget shim would report its own
+    /// exit code instead of the sync's.
+    fn task_xml(launcher: &std::path::Path, arguments: &str, every: ScheduleEvery) -> String {
         let trigger = match every {
             ScheduleEvery::D1 => "    <CalendarTrigger>\n\
                  \x20\x20\x20\x20  <StartBoundary>2000-01-01T03:00:00</StartBoundary>\n\
@@ -1144,9 +1161,10 @@ mod windows {
                 )
             }
         };
-        // Task Scheduler expands %VAR% in <Arguments> at runtime; the % gate in
-        // start() ensures the vbs path is free of '%' before we reach here.
-        let vbs_str = xml_escape(&vbs.display().to_string());
+        // Task Scheduler expands %VAR% in <Command> and <Arguments> at runtime;
+        // the % gate in start() clears every embedded path before we get here.
+        let launcher_str = xml_escape(&launcher.display().to_string());
+        let arguments = xml_escape(arguments);
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
              <Task version=\"1.2\" \
@@ -1168,8 +1186,8 @@ mod windows {
              \x20\x20</Settings>\n\
              \x20\x20<Actions Context=\"Author\">\n\
              \x20\x20  <Exec>\n\
-             \x20\x20    <Command>wscript.exe</Command>\n\
-             \x20\x20    <Arguments>//B //NoLogo &quot;{vbs_str}&quot;</Arguments>\n\
+             \x20\x20    <Command>{launcher_str}</Command>\n\
+             \x20\x20    <Arguments>{arguments}</Arguments>\n\
              \x20\x20  </Exec>\n\
              \x20\x20</Actions>\n\
              </Task>\n"
@@ -1182,6 +1200,16 @@ mod windows {
             .replace('<', "&lt;")
             .replace('>', "&gt;")
             .replace('"', "&quot;")
+    }
+
+    /// Inverse of `xml_escape`, for reading values back out of the XML Task
+    /// Scheduler returns. `&amp;` unescapes last so `&amp;quot;` survives as a
+    /// literal `&quot;` rather than collapsing into a quote.
+    fn xml_unescape(s: &str) -> String {
+        s.replace("&quot;", "\"")
+            .replace("&gt;", ">")
+            .replace("&lt;", "<")
+            .replace("&amp;", "&")
     }
 
     /// Recover the registered cadence from a `schtasks /Query /XML ONE` body.
@@ -1219,12 +1247,29 @@ mod windows {
         Some(&rest[..end])
     }
 
-    /// The binary path baked into the wrapper. Prefer `pond.exe` on PATH (a
+    /// The binary path baked into the task. Prefer `pond.exe` on PATH (a
     /// stable install location that survives upgrades); fall back to this exe.
     fn pond_bin() -> PathBuf {
         crate::find_on_path("pond.exe")
             .or_else(|| crate::find_on_path("pond"))
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
+    }
+
+    /// The launcher that runs alongside `pond.exe`. Both ship in the same zip
+    /// and every install channel unpacks them together, so a missing one means
+    /// a hand-assembled install - name that rather than registering a task
+    /// whose action does not exist.
+    fn pondw_bin(bin: &std::path::Path) -> Result<PathBuf> {
+        let launcher = bin.with_file_name("pondw.exe");
+        if !launcher.is_file() {
+            bail!(
+                "{} not found: it ships beside pond.exe in the release zip and runs \
+                 the scheduled sync without a console window - reinstall pond \
+                 (winget install tenequm.pond) and re-run `pond schedule start`",
+                launcher.display()
+            );
+        }
+        Ok(launcher)
     }
 
     /// Decode process output that may be UTF-16 (schtasks `/XML` and some
@@ -1264,9 +1309,20 @@ mod windows {
         #![allow(clippy::expect_used, clippy::unwrap_used)]
         use super::*;
 
+        /// The action shape `start()` builds, for tests that need one.
+        fn fixture() -> (std::path::PathBuf, String) {
+            let launcher = std::path::PathBuf::from("C:\\Program Files\\pond\\pondw.exe");
+            let arguments = task_arguments(
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state\\sync.log"),
+                std::path::Path::new("C:\\Program Files\\pond\\pond.exe"),
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state"),
+            );
+            (launcher, arguments)
+        }
+
         #[test]
         fn all_cadences_round_trip_through_task_xml() {
-            let vbs = std::path::Path::new("C:\\pond\\pond-sync.vbs");
+            let (launcher, arguments) = fixture();
             for every in [
                 ScheduleEvery::M5,
                 ScheduleEvery::M15,
@@ -1274,7 +1330,7 @@ mod windows {
                 ScheduleEvery::H6,
                 ScheduleEvery::D1,
             ] {
-                let xml = task_xml(vbs, every);
+                let xml = task_xml(&launcher, &arguments, every);
                 let parsed = parse_interval_from_xml(&xml);
                 assert_eq!(parsed, Some(every), "cadence {every:?} did not round-trip");
             }
@@ -1303,7 +1359,7 @@ mod windows {
         fn utf16le_bom_leads_with_bom_and_round_trips_non_ascii() {
             // The task XML file MUST carry a UTF-16LE BOM: schtasks reads a
             // BOM-less file as ANSI, mojibaking non-ASCII state paths.
-            let text = "C:\\Users\\p\u{f6}nd \u{e9}tat\\pond-sync.vbs";
+            let text = "C:\\Users\\p\u{f6}nd \u{e9}tat\\pondw.exe";
             let bytes = utf16le_bom(text);
             assert_eq!(&bytes[..2], &[0xFF, 0xFE], "BOM must lead the file");
             assert_eq!(bytes.len(), 2 + text.encode_utf16().count() * 2);
@@ -1313,13 +1369,12 @@ mod windows {
         }
 
         #[test]
-        fn task_xml_uses_wscript_and_contains_expected_settings() {
-            let vbs = std::path::Path::new("C:\\pond\\pond-sync.vbs");
-            let xml = task_xml(vbs, ScheduleEvery::M5);
-            // wscript.exe action - no console window on each tick
-            assert!(xml.contains("<Command>wscript.exe</Command>"));
-            assert!(xml.contains("//B //NoLogo"));
-            assert!(xml.contains("pond-sync.vbs"));
+        fn task_xml_execs_the_launcher_and_contains_expected_settings() {
+            let (launcher, arguments) = fixture();
+            let xml = task_xml(&launcher, &arguments, ScheduleEvery::M5);
+            // The launcher IS the action: no wscript, no .cmd, no .vbs.
+            assert!(xml.contains("<Command>C:\\Program Files\\pond\\pondw.exe</Command>"));
+            assert!(!xml.contains("wscript"));
             // battery + catch-up settings
             assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
             assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
@@ -1328,20 +1383,46 @@ mod windows {
         }
 
         #[test]
-        fn vbs_body_has_windowstyle_zero_and_quotes_wrapper() {
-            // The .vbs shim must pass WindowStyle=0 (hidden) and wrap the
-            // wrapper path in VBScript double-quotes so spaces survive.
-            let wrapper = std::path::Path::new("C:\\Users\\Adam\\pond sync\\pond-sync.cmd");
-            let wrapper_str = wrapper.display().to_string();
-            // Simulate what start() builds for the vbs_body.
-            let vbs_body = format!(
-                "CreateObject(\"WScript.Shell\").Run \"\"\"{wrapper_str}\"\"\", 0, False\r\n",
-            );
-            assert!(vbs_body.contains(", 0, False"), "must pass WindowStyle=0");
+        fn task_arguments_pin_the_state_dir_and_quote_spaced_paths() {
+            let (_, arguments) = fixture();
+            // The pin an Exec action's missing environment block forces.
             assert!(
-                vbs_body.contains(&format!("\"\"\"{wrapper_str}\"\"\"")),
-                "path must be triple-double-quoted (VBS literal-quote idiom)"
+                arguments.contains("--state-dir \"C:\\Users\\Adam\\AppData\\Local\\pond\\state\""),
+                "{arguments}"
             );
+            assert!(arguments.contains("sync -q --no-wait"), "{arguments}");
+            // Every path is quoted: `C:\Program Files\...` splits otherwise.
+            assert!(
+                arguments.contains("-- \"C:\\Program Files\\pond\\pond.exe\""),
+                "{arguments}"
+            );
+            assert!(arguments.starts_with("--log \"C:\\"), "{arguments}");
+        }
+
+        #[test]
+        fn action_survives_the_xml_escape_round_trip() {
+            // start()'s already-scheduled no-op compares the DECODED element
+            // text, because Task Scheduler re-serializes what it stores and
+            // need not escape a quote in element content. Both directions of
+            // that comparison have to agree with the escaper.
+            let (launcher, arguments) = fixture();
+            let xml = task_xml(&launcher, &arguments, ScheduleEvery::M5);
+            assert_eq!(
+                between(&xml, "<Arguments>", "</Arguments>").map(xml_unescape),
+                Some(arguments)
+            );
+            assert_eq!(
+                between(&xml, "<Command>", "</Command>").map(xml_unescape),
+                Some(launcher.display().to_string())
+            );
+        }
+
+        #[test]
+        fn xml_unescape_leaves_an_escaped_entity_literal() {
+            // &amp; unescapes last, so a literal "&quot;" in a path does not
+            // collapse into a quote and desync the no-op comparison.
+            assert_eq!(xml_unescape(&xml_escape("a&quot;b")), "a&quot;b");
+            assert_eq!(xml_unescape(&xml_escape("a\"<b>&c")), "a\"<b>&c");
         }
     }
 }

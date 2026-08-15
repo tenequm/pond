@@ -47,6 +47,12 @@ name = "pond"
 name = "pond"
 path = "src/main.rs"
 
+# Windows-only in practice: the windowless launcher the scheduled task runs.
+# Declared rather than left to autodiscovery so the target is visible here.
+[[bin]]
+name = "pondw"
+path = "src/bin/pondw.rs"
+
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
