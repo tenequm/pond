@@ -3901,17 +3901,26 @@ pub mod durability {
         }
     }
 
-    /// fsync the file the write just published plus its parent directory: the
-    /// file `sync_all` makes the bytes durable, the dir `sync_all` makes the
-    /// name (the freshly linked/renamed entry) durable. Fsync failures are hard
-    /// errors - a silently no-op durability layer is worse than none - but a
-    /// vanished parent dir (concurrent cleanup) is tolerated.
+    /// fsync the file the write just published plus, on unix, its parent
+    /// directory: the file `sync_all` makes the bytes durable, the dir
+    /// `sync_all` makes the name (the freshly linked/renamed entry) durable.
+    /// Fsync failures are hard errors - a silently no-op durability layer is
+    /// worse than none - but a vanished parent dir (concurrent cleanup) is
+    /// tolerated.
+    ///
+    /// Windows has no directory fsync to make: `FlushFileBuffers` on a
+    /// directory handle fails, and object_store, RocksDB, and SQLite all skip
+    /// it for that reason. The file flush alone is the NTFS-validated recipe
+    /// (WireGuard, Subversion) against the metadata-only journal's "name
+    /// durable, bytes lost" window, and the residual crash window between the
+    /// publish and this flush stays covered by `local-store-self-heal`.
     fn sync_file_and_parent(location: &ObjPath) -> OsResult<()> {
         let local = lance_io::local::to_local_path(location);
         let path = FsPath::new(&local);
         let file = File::open(path).map_err(|e| durability_error("open for fsync", path, e))?;
         file.sync_all()
             .map_err(|e| durability_error("fsync", path, e))?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             // Unix permits fsync on an O_RDONLY directory fd.
             match File::open(parent) {
@@ -4156,7 +4165,7 @@ fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet
 }
 
 /// The object-store wrapper applied to every dataset open: the fsync-on-write
-/// durability wrapper (local stores, unix), the `_indices/*` disk cache (remote
+/// durability wrapper (local stores), the `_indices/*` disk cache (remote
 /// stores only, when a cache dir is supplied), and the diagnostic io-trace
 /// wrapper. `None` when none is active. The durability and index-cache wrappers
 /// are backend-exclusive (local vs remote), so they never coexist.
@@ -4167,8 +4176,9 @@ fn store_wrapper(
     let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
     // Innermost, wrapping the real store directly: fsync must act on the final
     // on-disk file the moment the inner write publishes its name, before any
-    // diagnostic wrapper's post-processing.
-    #[cfg(unix)]
+    // diagnostic wrapper's post-processing. Not unix-only: Windows flushes the
+    // published file too, and only skips the directory half, which does not
+    // exist there (see `durability::sync_file_and_parent`).
     if config::is_local(location) {
         wrappers.push(Arc::new(durability::FsyncOnWrite));
     }
@@ -4794,6 +4804,17 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    /// The durability wrapper is attached per backend, not per platform: it was
+    /// `cfg(unix)` while Windows had no flush-on-publish, and re-gating it that
+    /// way would silently un-enforce `windows-store-durability`.
+    #[test]
+    fn local_stores_get_a_write_wrapper_and_remote_ones_do_not() {
+        let local = Url::from_directory_path(TempDir::new().unwrap().path()).unwrap();
+        assert!(store_wrapper(&local, None).is_some());
+        let remote = Url::parse("s3://bucket/prefix").unwrap();
+        assert!(store_wrapper(&remote, None).is_none());
+    }
 
     /// Built as layers, not a bare io error: the matcher has to see through
     /// object_store's box, Lance's box, and the anyhow context.
