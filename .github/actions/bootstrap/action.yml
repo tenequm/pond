@@ -13,7 +13,7 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        MOON_VERSION=2.4.6
+        MOON_VERSION=2.5.1
         PROTOC_VERSION=35.1
         KACHE_VERSION=0.9.0
         UV_VERSION=0.11.33

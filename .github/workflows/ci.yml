@@ -214,15 +214,11 @@ jobs:
       - name: Build release zip
         run: moon run repo:build-dist-msvc
         env:
-          # moon queues remote-cache uploads as background tasks and aborts any
-          # still running 60s after the task ends (BACKGROUND_FLUSH_TIMEOUT, a
-          # hard-coded const in cache-storage/src/storage.rs, unchanged through
-          # v2.5.1). This artifact is ~76 MB from a hosted runner to Hetzner and
-          # never finishes in time, so it was re-uploaded and re-aborted every
-          # run and the task could never cache. `is_daemon_env()` switches that
-          # same code path to await the upload inline; its only other effect is
-          # disabling an in-process memo of identical child commands, and this
-          # job runs one cargo build once.
+          # moon aborts remote-cache uploads still queued 60s after a task ends
+          # (BACKGROUND_FLUSH_TIMEOUT, a hard-coded const), which this ~76 MB
+          # artifact never beat - so the task never cached. This takes the inline
+          # branch added in v2.5.0, awaiting the upload instead; keep the moon
+          # pin at or above that.
           MOON_DAEMON_RUNNING: "1"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

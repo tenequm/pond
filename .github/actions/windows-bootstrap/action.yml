@@ -55,7 +55,7 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $v = '2.4.6'
+        $v = '2.5.1'
         Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
         Expand-Archive moon.zip -DestinationPath C:\moon
         $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
