@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.11](https://github.com/tenequm/pond/compare/v0.14.10...v0.14.11) - 2026-08-17
+
+### <!-- 1 -->🎉 New Features
+- **windows:** flush published writes on local stores ([2ac28df](https://github.com/tenequm/pond/commit/2ac28df5d87582b548df7dd5ad5906d1c6c4c7bf))
+- **windows:** Exec pondw.exe from the scheduled task ([55043fe](https://github.com/tenequm/pond/commit/55043fea28dac6ebc20bfc89e54651f63c0bf147))
+- **windows:** publish to winget and Scoop ([5c07c55](https://github.com/tenequm/pond/commit/5c07c55a3c3975fae9c72c95c8a0e5dce0ecc820))
+
+### <!-- 5 -->📚 Documentation
+- **readme:** above-the-fold rework with recall-context-cost chart ([#158](https://github.com/tenequm/pond/pull/158)) ([895a8d8](https://github.com/tenequm/pond/commit/895a8d87fe985095fcaac0f19e89fb49435ce334))
+
+### <!-- 6 -->🧹 Chores
+- **windows:** cache the Windows suite through moon and fix kache prefetch ([0ed4a0c](https://github.com/tenequm/pond/commit/0ed4a0c008c2c43c25ae019913081d59e0c718a9))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.10...v0.14.11
+
 ## [0.14.10](https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10) - 2026-08-14
 
 Windows is a supported platform. This release ships the first Windows binary pond has ever natively built and tested - an `x86_64-pc-windows-msvc` zip produced and smoke-tested on a real Windows runner, replacing the cross-compiled `windows-gnu` artifact that no CI had ever executed - alongside adapters that find sessions where Windows actually puts them and unattended sync through Task Scheduler.
