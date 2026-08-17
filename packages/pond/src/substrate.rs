@@ -3911,7 +3911,7 @@ pub mod durability {
         // `FlushFileBuffers` fails with ERROR_ACCESS_DENIED on a read-only
         // handle, where unix happily fsyncs an O_RDONLY fd.
         #[cfg(windows)]
-        let opened = std::fs::OpenOptions::new().write(true).open(path);
+        let opened = File::options().write(true).open(path);
         #[cfg(not(windows))]
         let opened = File::open(path);
         let file = opened.map_err(|e| durability_error("open for fsync", path, e))?;
@@ -4066,8 +4066,8 @@ pub mod durability {
         use super::*;
         use object_store::ObjectStoreExt;
 
-        // A prefix-less local store, so an object_store `Path` is the absolute
-        // FS path (leading `/` stripped) - exactly what `to_local_path` inverts.
+        // A prefix-less local store, so the paths `obj_path` builds round-trip
+        // through `to_local_path`.
         fn wrapped() -> Arc<dyn ObjectStore> {
             let inner: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
             FsyncOnWrite.wrap("test", inner)
