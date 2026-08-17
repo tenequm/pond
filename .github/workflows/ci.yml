@@ -296,13 +296,14 @@ jobs:
       # otherwise derives it from the ref name).
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: stable }
-      # When GitHub's GraphQL API is down, the action's cargo-binstall cannot
-      # discover the prebuilt release-plz asset and degrades to a source build,
-      # which then fails against rust-toolchain.toml's pin. It cuts no tag, so
-      # is_release stays true and re-running the job recovers the release.
+      # When GitHub's GraphQL API is degraded, the action's cargo-binstall cannot
+      # discover the prebuilt release-plz asset and degrades to a source build.
+      # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml, so that build uses stable
+      # rather than pond's pin, which is too old for release-plz's dep tree.
       - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         with: { command: release-pr, config: .github/release-plz.toml }   # keep the release PR current; never publishes
         env:
+          RUSTUP_TOOLCHAIN: stable
           # PAT (not GITHUB_TOKEN) so the opened release PR triggers build-and-test.
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -487,10 +488,18 @@ jobs:
           ( cd dist && sha256sum pond-* > checksums.txt )
           cat dist/checksums.txt
 
+      # Same binstall exposure as release-prep (see the comment there). The Linux
+      # bootstrap installs rustup with --default-toolchain none and materializes
+      # only the pin, so stable has to be added explicitly - rustup 1.28+ no
+      # longer auto-installs the toolchain RUSTUP_TOOLCHAIN names.
+      - name: Add stable for the release-plz install fallback
+        run: rustup toolchain install stable --no-self-update --profile minimal
+
       - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
         env:
+          RUSTUP_TOOLCHAIN: stable
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
