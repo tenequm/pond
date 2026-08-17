@@ -41,6 +41,7 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 ## Source of truth
 
 - `docs/spec.md` is the spec (sections 1-10: overview, scope, storage substrate, canonical model, session datasets, adapters, protocol, search and embeddings, deferred, references). Read the relevant section before changing behavior.
+- `docs/benchmarks/results.md` is the measurement log behind the performance rules below - raw bench output with the host it was taken on. Read it before benchmarking, so a new number has something to be compared against, and append the run to it afterwards.
 
 ## Search scope is intentional - do not "fix" it
 
