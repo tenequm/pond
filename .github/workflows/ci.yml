@@ -676,6 +676,10 @@ jobs:
         with:
           identifier: tenequm.pond
           version: ${{ needs.dist-build.outputs.v }}
+          # Unlimited (the default) would accumulate every pond patch release in
+          # winget-pkgs. Trades away `winget install --version` for versions
+          # older than the last 5.
+          max-versions-to-keep: 5
           # Defaults to github.ref_name, which is `main` here.
           release-tag: v${{ needs.dist-build.outputs.v }}
           # The default regex matches exe/msi/msix/appx only; pond ships a
