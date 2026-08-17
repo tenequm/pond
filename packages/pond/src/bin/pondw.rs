@@ -23,7 +23,9 @@ fn main() {
     // The parent has no console, so a console-subsystem child would allocate
     // and show one of its own.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Distinct so Task Scheduler's Last Result tells the two apart.
     const USAGE: i32 = 2;
+    const SPAWN_FAILED: i32 = 3;
 
     let mut args = std::env::args_os().skip(1);
     let (Some(flag), Some(log_path), Some(sep), Some(program)) =
@@ -35,24 +37,24 @@ fn main() {
         std::process::exit(USAGE);
     }
 
-    let Ok(mut log) = std::fs::OpenOptions::new()
+    // An unwritable log must not stop the sync: losing diagnostics is worse
+    // than losing the run it was diagnosing. The child still gets its exit code
+    // back to Task Scheduler either way.
+    let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-    else {
-        // No console and no log: the exit code is the whole diagnostic.
-        std::process::exit(USAGE);
-    };
-    let (Ok(out), Ok(err)) = (log.try_clone(), log.try_clone()) else {
-        let _ = writeln!(log, "pondw: cannot duplicate the log handle");
-        std::process::exit(1);
+        .ok();
+    let (out, err) = match log.as_ref().map(|f| (f.try_clone(), f.try_clone())) {
+        Some((Ok(out), Ok(err))) => (Stdio::from(out), Stdio::from(err)),
+        _ => (Stdio::null(), Stdio::null()),
     };
 
     match Command::new(&program)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stdout(out)
+        .stderr(err)
         .creation_flags(CREATE_NO_WINDOW)
         .status()
     {
@@ -60,12 +62,14 @@ fn main() {
         // rather than the success a bare `unwrap_or(0)` would invent.
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => {
-            let _ = writeln!(
-                log,
-                "pondw: failed to run {}: {error}",
-                program.to_string_lossy()
-            );
-            std::process::exit(1);
+            if let Some(log) = log.as_mut() {
+                let _ = writeln!(
+                    log,
+                    "pondw: failed to run {}: {error}",
+                    program.to_string_lossy()
+                );
+            }
+            std::process::exit(SPAWN_FAILED);
         }
     }
 }

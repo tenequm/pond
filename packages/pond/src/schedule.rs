@@ -984,20 +984,34 @@ mod windows {
         // Gate on % in every path that lands in the XML: Task Scheduler expands
         // %VAR% inside <Command> and <Arguments> at runtime with NO escape
         // syntax. Mirrors the unix gate that blocks % in cron/plist templates.
-        for path in [&launcher, &bin, &log, &state_root] {
+        for (what, path) in [
+            ("launcher", &launcher),
+            ("pond binary", &bin),
+            ("sync log", &log),
+            ("state dir", &state_root),
+        ] {
             let text = path.display().to_string();
             if text.contains('%') {
                 bail!(
-                    "{text:?} contains '%' which Task Scheduler expands in the task \
-                     XML with no escape syntax; the state dir resolves from \
-                     --state-dir or XDG_STATE_HOME, falling back to \
-                     %LOCALAPPDATA%\\pond\\state - move pond or its state dir to a \
-                     path without '%' and re-run `pond schedule start`"
+                    "the {what} path {text:?} contains '%', which Task Scheduler \
+                     expands in the task XML with no escape syntax; move it to a path \
+                     without '%' (the state dir resolves from --state-dir or \
+                     XDG_STATE_HOME) and re-run `pond schedule start`"
                 );
             }
         }
 
         let arguments = task_arguments(&log, &bin, &state_root);
+
+        // The pin is registration-time: a later shell-only override splits the
+        // lock and last-sync record between the scheduled and manual syncs, and
+        // the task will not follow it.
+        if std::env::var_os("XDG_STATE_HOME").is_some() {
+            pond::output::line(&format!(
+                "note: XDG_STATE_HOME is set; the task is pinned to {} and will not follow later changes",
+                state_root.display()
+            ))?;
+        }
 
         // Already-scheduled no-op: same action, same cadence. Compared on the
         // decoded element text, not the escaped form we wrote, because Task
@@ -1017,16 +1031,6 @@ mod windows {
         {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
-        }
-
-        // The pin is registration-time: a later shell-only override splits the
-        // lock and last-sync record between the scheduled and manual syncs, and
-        // the task will not follow it.
-        if std::env::var_os("XDG_STATE_HOME").is_some() {
-            pond::output::line(&format!(
-                "note: XDG_STATE_HOME is set; the task is pinned to {} and will not follow later changes",
-                state_root.display()
-            ))?;
         }
 
         // Write the XML task definition to a temp file; schtasks /Create /XML
@@ -1096,6 +1100,17 @@ mod windows {
         Ok(())
     }
 
+    /// Quote a path for the task's command line. Trailing backslashes are
+    /// doubled: `CommandLineToArgvW` reads `\"` as an escaped quote, so
+    /// `"C:\dir\"` would swallow the closing quote and run on to end of line -
+    /// a state dir set to `C:\dir\` would otherwise register a task that fails
+    /// or writes somewhere else on every tick.
+    fn quote_arg(path: &std::path::Path) -> String {
+        let text = path.display().to_string();
+        let trailing = text.len() - text.trim_end_matches('\\').len();
+        format!("\"{text}{}\"", "\\".repeat(trailing))
+    }
+
     /// The `<Arguments>` line: the launcher's own `--log`, then the pond
     /// command line it runs.
     fn task_arguments(
@@ -1104,10 +1119,10 @@ mod windows {
         state_root: &std::path::Path,
     ) -> String {
         format!(
-            "--log \"{log}\" -- \"{bin}\" sync -q --no-wait --state-dir \"{state}\"",
-            log = log.display(),
-            bin = bin.display(),
-            state = state_root.display(),
+            "--log {log} -- {bin} sync -q --no-wait --state-dir {state}",
+            log = quote_arg(log),
+            bin = quote_arg(bin),
+            state = quote_arg(state_root),
         )
     }
 
@@ -1369,6 +1384,19 @@ mod windows {
             assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
             assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
             assert!(xml.contains("<Hidden>true</Hidden>"));
+        }
+
+        #[test]
+        fn a_trailing_separator_does_not_escape_the_closing_quote() {
+            // `--state-dir "C:\dir\"` would swallow the quote and run on.
+            let args = task_arguments(
+                std::path::Path::new("C:\\s\\sync.log"),
+                std::path::Path::new("C:\\bin\\pond.exe"),
+                std::path::Path::new("C:\\my state\\"),
+            );
+            assert!(args.ends_with("--state-dir \"C:\\my state\\\\\""), "{args}");
+            // Every quote still pairs off.
+            assert_eq!(args.matches('"').count() % 2, 0, "{args}");
         }
 
         #[test]

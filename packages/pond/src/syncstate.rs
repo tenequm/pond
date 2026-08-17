@@ -65,13 +65,10 @@ pub(crate) fn state_root() -> PathBuf {
 ///
 /// On Unix: `$HOME/.local/state/pond` (one app under the shared XDG state home).
 pub(crate) fn pond_state_dir() -> PathBuf {
-    // On Windows: state_root() is already pond's state dir (no \pond suffix),
-    // whether XDG_STATE_HOME is set by the user or by the scheduler wrapper.
     #[cfg(windows)]
     {
         state_root()
     }
-    // Unix: add \pond so other apps can coexist under the shared XDG state home.
     #[cfg(not(windows))]
     state_root().join("pond")
 }

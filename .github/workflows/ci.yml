@@ -225,7 +225,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
-          cargo build --locked --profile dist --target x86_64-pc-windows-msvc
+          cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
 
       # Mirrors macos-verify's launch smoke, and for the same reason: no channel
       # should ship a binary the OS refuses to run. Redirect, never pipe - a
@@ -257,8 +257,8 @@ jobs:
           $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
           New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
           Copy-Item $exe stage\pond.exe
-          # The windowless launcher the scheduled task Execs. `pond schedule
-          # start` refuses to register without it, so it is not optional cargo.
+          # The windowless launcher the scheduled task Execs; `pond schedule
+          # start` refuses to register without it.
           Copy-Item target\x86_64-pc-windows-msvc\dist\pondw.exe stage\pondw.exe
           & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
           & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
