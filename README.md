@@ -97,7 +97,7 @@ scoop install pond
 cargo binstall pond-db
 ```
 
-All three land the same prebuilt `x86_64-pc-windows-msvc` binary, statically linked against the VC runtime and carrying completions for PowerShell, bash, zsh, and fish; building from source there additionally needs `protoc` and NASM on `PATH`. The [Windows notes](https://pond.locker/get-started/install#windows) cover Defender, long paths, WSL, and building from a clone.
+See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
 
 ## Usage
 
