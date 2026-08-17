@@ -3872,13 +3872,13 @@ pub mod index_cache {
 /// `LocalFileSystem` publishes a name (hard_link/rename) without syncing the
 /// bytes, so a hard host stop can persist the name over page-cache-only bytes -
 /// a zero-byte manifest that permanently poisons the table. This wrapper fsyncs
-/// the written file and its parent directory after the inner write returns, so
-/// every artifact is durable before Lance proceeds to the next step. Unix only:
-/// Windows commits route through a different handler with different dir-fsync
-/// semantics and rely on self-heal instead.
-#[cfg(unix)]
+/// the written file - and on unix its parent directory - after the inner write
+/// returns, so every artifact is durable before Lance proceeds to the next
+/// step. Windows keeps the file half only (spec.md#windows-store-durability):
+/// there is no directory fsync to make there.
 pub mod durability {
     use std::fs::File;
+    #[cfg(unix)]
     use std::io::ErrorKind;
     use std::ops::Range;
     use std::path::Path as FsPath;
@@ -4076,9 +4076,11 @@ pub mod durability {
             FsyncOnWrite.wrap("test", inner)
         }
 
+        // `from_absolute_path` rather than trimming a leading `/` by hand: a
+        // Windows absolute path has a drive letter and backslashes instead, and
+        // this is the constructor whose inverse `to_local_path` is.
         fn obj_path(root: &FsPath, name: &str) -> ObjPath {
-            // object_store `Path` is the absolute FS path minus the leading `/`.
-            ObjPath::from(root.join(name).to_string_lossy().trim_start_matches('/'))
+            ObjPath::from_absolute_path(root.join(name)).unwrap()
         }
 
         #[tokio::test]
