@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.14.11](https://github.com/tenequm/pond/compare/v0.14.10...v0.14.11) - 2026-08-17
+
+Finishes the Windows port 0.14.10 opened. Local-store durability now behaves the same on NTFS as it does on APFS and ext4, the background sync task no longer flashes a console window or hides its own failures, and pond installs from Scoop today.
+
+**Upgrading on Windows:** run `pond schedule start` once. An existing scheduled task keeps its old `.cmd` + `.vbs` action chain until it is re-registered - nothing breaks if you skip this, but the console flash and the swallowed exit code stay.
+
+### <!-- 1 -->🎉 New Features
+- **windows:** flush published writes on local stores ([2ac28df](https://github.com/tenequm/pond/commit/2ac28df5d87582b548df7dd5ad5906d1c6c4c7bf))
+  - The local-store durability wrapper was attached behind a `cfg(unix)` gate, so a Windows local store had none of it. NTFS journals metadata but not file data, and a local store commits by hard-link-and-rename, so a hard host stop could persist a manifest's *name* while dropping its *bytes*. The wrapper is now attached per backend (local vs remote) rather than per platform, and a unit test pins it there - a re-added `cfg(unix)` would silently un-enforce the rule, which is how the gap survived this long.
+  - `sync_file_and_parent` skips only the directory half on Windows: `FlushFileBuffers` on a directory handle fails, and object_store, RocksDB, and SQLite all skip it for the same reason. The published file's bytes still go through `File::sync_all`. Ordering is unchanged, and the residual window no directory fsync can close on Windows stays covered by `local-store-self-heal`.
+  - Measured free: under 1 ms per commit at every batch size, 0.8 ms (3.4%) at the largest, A/B'd on a real Windows box against the same build without the wrapper (`docs/benchmarks/results.md`).
+- **windows:** Exec pondw.exe from the scheduled task ([55043fe](https://github.com/tenequm/pond/commit/55043fea28dac6ebc20bfc89e54651f63c0bf147))
+  - The Task Scheduler action was a `.cmd` launching a `.vbs` to hide the console window, and the chain swallowed the sync's exit code - a failing sync reported success in Task Scheduler. It is now a single `pondw.exe`, a windowless launcher that propagates the real exit code.
+  - Adds a global `--state-dir`, the argument form of `XDG_STATE_HOME`, because an Exec action carries no environment block. Gated behind a `windows-launcher` feature so unix `cargo binstall` is unaffected.
+- **windows:** publish to winget and Scoop ([5c07c55](https://github.com/tenequm/pond/commit/5c07c55a3c3975fae9c72c95c8a0e5dce0ecc820))
+  - Scoop is live: `scoop bucket add tenequm https://github.com/tenequm/scoop-bucket` then `scoop install pond`. The winget manifest is generated and submitted by CI, but `winget install` does not resolve until microsoft/winget-pkgs accepts the first submission - use Scoop until then. PowerShell completions and the Windows install docs ship here too.
+
+### <!-- 5 -->📚 Documentation
+- **readme:** above-the-fold rework with recall-context-cost chart ([#158](https://github.com/tenequm/pond/pull/158)) ([895a8d8](https://github.com/tenequm/pond/commit/895a8d87fe985095fcaac0f19e89fb49435ce334))
+
+### <!-- 6 -->🧹 Chores
+- **windows:** cache the Windows suite through moon and fix kache prefetch ([0ed4a0c](https://github.com/tenequm/pond/commit/0ed4a0c008c2c43c25ae019913081d59e0c718a9))
+  - `windows-verify` swung between 17m54s and 51m02s on an unchanged dependency tree, with `lance` and the datafusion set flipping between hit and miss run to run. kache's 2 GiB prefetch cap sits far below a ~790-crate graph where `lance` alone is 287 MB, so what it dropped was biased toward the largest artifacts; the cap and deadline are now unlimited. The cache store also moves off the network-attached `C:` onto `D:`, the fast local volume that already holds `target/`.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.10...v0.14.11
+
 ## [0.14.10](https://github.com/tenequm/pond/compare/v0.14.9...v0.14.10) - 2026-08-14
 
 Windows is a supported platform. This release ships the first Windows binary pond has ever natively built and tested - an `x86_64-pc-windows-msvc` zip produced and smoke-tested on a real Windows runner, replacing the cross-compiled `windows-gnu` artifact that no CI had ever executed - alongside adapters that find sessions where Windows actually puts them and unattended sync through Task Scheduler.
