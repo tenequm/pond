@@ -1,7 +1,7 @@
 name: Windows build prerequisites
 description: >
-  Everything the two Windows jobs need after checkout: protoc, the pinned Rust
-  toolchain, and the kache S3 build cache. Shared so windows-verify and
+  Everything the two Windows jobs need after checkout: protoc, moon, the pinned
+  Rust toolchain, and the kache S3 build cache. Shared so windows-verify and
   windows-dist cannot drift apart - a protoc version skew between them would
   produce two differently-built binaries from one commit.
 
@@ -47,6 +47,19 @@ runs:
       shell: pwsh
       run: |
         "AWS_LC_SYS_PREBUILT_NASM=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    # Pinned to the version .github/actions/bootstrap installs on Linux: the two
+    # share a remote cache, and moon refuses a cache written by another version.
+    # Located by search rather than by guessing the archive layout.
+    - name: Install moon
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $v = '2.4.6'
+        Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
+        Expand-Archive moon.zip -DestinationPath C:\moon
+        $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
+        $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     # rustup honors rust-toolchain.toml; the host triple IS the build target,
     # so no extra rust-std is downloaded.
