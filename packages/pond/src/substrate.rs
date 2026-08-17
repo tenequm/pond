@@ -3874,8 +3874,7 @@ pub mod index_cache {
 /// a zero-byte manifest that permanently poisons the table. This wrapper fsyncs
 /// the written file - and on unix its parent directory - after the inner write
 /// returns, so every artifact is durable before Lance proceeds to the next
-/// step. Windows keeps the file half only (spec.md#windows-store-durability):
-/// there is no directory fsync to make there.
+/// step.
 pub mod durability {
     use std::fs::File;
     #[cfg(unix)]
@@ -3902,24 +3901,15 @@ pub mod durability {
     }
 
     /// fsync the file the write just published plus, on unix, its parent
-    /// directory: the file `sync_all` makes the bytes durable, the dir
-    /// `sync_all` makes the name (the freshly linked/renamed entry) durable.
-    /// Fsync failures are hard errors - a silently no-op durability layer is
-    /// worse than none - but a vanished parent dir (concurrent cleanup) is
-    /// tolerated.
-    ///
-    /// Windows has no directory fsync to make: `FlushFileBuffers` on a
-    /// directory handle fails, and object_store, RocksDB, and SQLite all skip
-    /// it for that reason. The file flush alone is the NTFS-validated recipe
-    /// (WireGuard, Subversion) against the metadata-only journal's "name
-    /// durable, bytes lost" window, and the residual crash window between the
-    /// publish and this flush stays covered by `local-store-self-heal`.
+    /// directory - the file `sync_all` makes the bytes durable, the dir
+    /// `sync_all` the name (spec.md#local-store-durability). Fsync failures are
+    /// hard errors - a silently no-op durability layer is worse than none - but
+    /// a vanished parent dir (concurrent cleanup) is tolerated.
     fn sync_file_and_parent(location: &ObjPath) -> OsResult<()> {
         let local = lance_io::local::to_local_path(location);
         let path = FsPath::new(&local);
-        // Windows needs GENERIC_WRITE to flush: `FlushFileBuffers` fails with
-        // ERROR_ACCESS_DENIED on a read-only handle, where unix happily fsyncs
-        // an O_RDONLY fd. Opening for write does not modify the file.
+        // `FlushFileBuffers` fails with ERROR_ACCESS_DENIED on a read-only
+        // handle, where unix happily fsyncs an O_RDONLY fd.
         #[cfg(windows)]
         let opened = std::fs::OpenOptions::new().write(true).open(path);
         #[cfg(not(windows))]
@@ -4185,9 +4175,7 @@ fn store_wrapper(
     let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
     // Innermost, wrapping the real store directly: fsync must act on the final
     // on-disk file the moment the inner write publishes its name, before any
-    // diagnostic wrapper's post-processing. Not unix-only: Windows flushes the
-    // published file too, and only skips the directory half, which does not
-    // exist there (see `durability::sync_file_and_parent`).
+    // diagnostic wrapper's post-processing.
     if config::is_local(location) {
         wrappers.push(Arc::new(durability::FsyncOnWrite));
     }
@@ -4814,9 +4802,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// The durability wrapper is attached per backend, not per platform: it was
-    /// `cfg(unix)` while Windows had no flush-on-publish, and re-gating it that
-    /// way would silently un-enforce `windows-store-durability`.
+    /// Per backend, not per platform: a re-added `cfg(unix)` here would
+    /// silently un-enforce `local-store-durability` on Windows.
     #[test]
     fn local_stores_get_a_write_wrapper_and_remote_ones_do_not() {
         let local = Url::from_directory_path(TempDir::new().unwrap().path()).unwrap();
