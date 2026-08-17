@@ -100,13 +100,18 @@ cargo install --path packages/pond --features cuda
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
 
-On Windows, the Homebrew/Nix packages do not apply. The easiest install is `cargo binstall pond-db`, which downloads the prebuilt `x86_64-pc-windows-msvc` binary - statically linked against the VC runtime, so it needs nothing installed. The same zip is attached to every [release](https://github.com/tenequm/pond/releases) and carries completion scripts for PowerShell, bash, zsh, and fish.
+On Windows, the Homebrew/Nix packages do not apply:
 
-Building from source instead (`cargo install pond-db`) needs two tools on `PATH` that the prebuilt binary spares you: `protoc` (`winget install Google.Protobuf`), because `protobuf-src` cannot vendor it on Windows, and NASM (`winget install NASM.NASM`) for `aws-lc-sys`. Embeddings run on the CPU backend.
+```powershell
+winget install tenequm.pond
 
-Cloning this repository on Windows additionally needs `git config --global core.longpaths true` first - some test fixtures nest encoded project slugs deep enough to pass 260 characters, and git refuses to create them otherwise. This affects a clone only; `cargo install pond-db` does not package the fixtures. Build and test from the clone with an explicit `--target x86_64-pc-windows-msvc`: without it, cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
+scoop install pond
 
-Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
+cargo binstall pond-db
+```
+
+The winget manifest is in review at [winget-pkgs](https://github.com/microsoft/winget-pkgs), so `winget install` does not resolve yet - use Scoop until it merges. See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
 
 ## Usage
 

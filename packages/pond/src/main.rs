@@ -850,8 +850,10 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
   bash:  pond completions bash > ~/.local/share/bash-completion/completions/pond
   zsh:   pond completions zsh > \"${fpath[1]}/_pond\"
   fish:  pond completions fish > ~/.config/fish/completions/pond.fish
+  pwsh:  pond completions powershell > _pond.ps1, then dot-source it from $PROFILE
+         (needs an execution policy of RemoteSigned or looser)
 
-Homebrew and nix packages ship these pre-installed.")]
+Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     #[command(display_order = 18)]
     Completions {
         #[arg(value_enum)]

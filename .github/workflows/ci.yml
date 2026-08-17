@@ -454,6 +454,8 @@ jobs:
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
     env:
       V: ${{ needs.dist-build.outputs.v }}
+    outputs:
+      released: ${{ steps.release-plz.outputs.releases_created }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
@@ -650,3 +652,30 @@ jobs:
           git -C "$nix" add pkgs/pond/default.nix
           git -C "$nix" diff --quiet --staged || git -C "$nix" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
           git -C "$nix" push
+
+  # Not `on: release`: release-plz publishes the release, and publish-release
+  # uploads the binaries to it several steps later, so a release-triggered run
+  # would hand winget-releaser an empty installer list. Its own job rather than
+  # a step in publish-release so an upstream hiccup cannot red-flag a release
+  # that already published; "Re-run failed jobs" retries just this.
+  winget-publish:
+    needs: [dist-build, publish-release]
+    if: ${{ needs.publish-release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Same rule as flake-check/macos-verify: the workflow-level env hands this
+    # secret to every job, and the action below binstalls and runs komac.
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: tenequm.pond
+          version: ${{ needs.dist-build.outputs.v }}
+          # Defaults to github.ref_name, which is `main` here.
+          release-tag: v${{ needs.dist-build.outputs.v }}
+          # The default regex matches exe/msi/msix/appx only; pond ships a
+          # portable zip, so without this the manifest gets no installer URL.
+          installers-regex: '\.zip$'
+          # Classic PAT: winget-releaser rejects fine-grained tokens.
+          token: ${{ secrets.WINGET_PAT }}
