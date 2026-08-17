@@ -1,5 +1,5 @@
 ---
-description: Install pond on macOS, Linux, or Windows via Homebrew, Nix, cargo-binstall (prebuilt binary), or Cargo (build from source).
+description: Install pond on macOS, Linux, or Windows via Homebrew, Nix, winget, Scoop, cargo-binstall (prebuilt binary), or Cargo (build from source).
 ---
 
 # Install
@@ -16,7 +16,16 @@ brew install tenequm/tap/pond
 nix profile add github:tenequm/pond#pond
 ```
 
-```sh [cargo-binstall (prebuilt, Windows-friendly)]
+```powershell [winget (Windows)]
+winget install tenequm.pond
+```
+
+```powershell [Scoop (Windows)]
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
+scoop install pond
+```
+
+```sh [cargo-binstall (prebuilt)]
 # Downloads the prebuilt binary. On Windows this is the x86_64-pc-windows-msvc
 # zip, statically linked against the VC runtime - nothing else to install.
 cargo binstall pond-db
@@ -30,7 +39,27 @@ cargo install pond-db
 
 ::::
 
-On Windows, the release zip also carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
+## Windows
+
+:::warning
+The winget manifest is in review at [winget-pkgs](https://github.com/microsoft/winget-pkgs), so `winget install tenequm.pond` does not resolve yet. Use Scoop until it merges.
+:::
+
+winget is the primary channel once live. pond is published there as a portable zip, so the install puts `pond` on `PATH`, registers an Add/Remove Programs entry, and `winget uninstall tenequm.pond` reverses it - no MSI and no installer to click through. Scoop is the same binary through a different manager; the bucket updates itself from each GitHub release. Both ultimately fetch `pond-x86_64-pc-windows-msvc.zip`, which is attached to every [release](https://github.com/tenequm/pond/releases) and can also be unpacked by hand.
+
+The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
+
+Building from source instead needs two tools the prebuilt binary spares you: `protoc`, because `protobuf-src` cannot vendor it on Windows, and NASM, for `aws-lc-sys`. Embeddings run on the CPU backend.
+
+### Defender and where the store lives
+
+A pond store is many small files, and Defender's real-time scanning charges per file touched - excluding pond's directory (`%LOCALAPPDATA%\pond` by default, holding the store, cache, and state) is worth it if sync or search feels slow. Keep the store on an NTFS volume: local stores commit through a hard-link-and-rename dance that NTFS documents and pond has verified there, while ReFS volumes - including Dev Drive - are unverified for that path. A UNC path is rejected outright at the store URL, because the layers underneath silently drop the host component and the store would open somewhere else; a mapped network drive has the same fault but cannot be told apart from a local drive, so pond cannot reject it for you - point the store at a local drive or a remote scheme (`s3://`, `gs://`, `az://`).
+
+### Long paths
+
+The Windows binary ships a manifest declaring long-path awareness, which only takes effect on machines where the `LongPathsEnabled` policy is also set. Nothing in pond's own path handling depends on it - it is insurance for the bundled C libraries and for tools pond spawns. Cloning this repository is the one case that genuinely needs it, and needs it in git rather than in pond: `git config --global core.longpaths true` - some test fixtures nest encoded project slugs past 260 characters. Build and test from a clone with an explicit `--target x86_64-pc-windows-msvc`; without it cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
+
+### WSL
 
 Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
 

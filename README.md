@@ -13,12 +13,26 @@
 
 Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool, any machine - searchable in one place.
 
+Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
+
+```sh
+brew install tenequm/tap/pond
+```
+
+Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)."*
+
 <p align="center">
   <img src="docs/site/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
 </p>
 <p align="center"><sub>A live 12k-session corpus, then a three-month-old fix found and verified against the current code (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
 
-Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/site/assets/tokens-chart-dark.svg">
+    <img src="docs/site/assets/tokens-chart-light.svg" alt="Bar chart: tokens into context for one recall answer. pond_search returns a complete ranked answer in 1.5-3k tokens; grep plus reading one matching transcript costs 90-255k tokens, chosen from 23-3,270 unranked matching files" width="920">
+  </picture>
+</p>
+<p align="center"><sub>Five real recall questions, one corpus, one machine - method, raw numbers, and a rerunnable script in <a href="docs/benchmarks/recall-context-cost.md">docs/benchmarks</a></sub></p>
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
 
@@ -86,13 +100,18 @@ cargo install --path packages/pond --features cuda
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
 
-On Windows, the Homebrew/Nix packages do not apply. The easiest install is `cargo binstall pond-db`, which downloads the prebuilt `x86_64-pc-windows-msvc` binary - statically linked against the VC runtime, so it needs nothing installed. The same zip is attached to every [release](https://github.com/tenequm/pond/releases) and carries completion scripts for PowerShell, bash, zsh, and fish.
+On Windows, the Homebrew/Nix packages do not apply:
 
-Building from source instead (`cargo install pond-db`) needs two tools on `PATH` that the prebuilt binary spares you: `protoc` (`winget install Google.Protobuf`), because `protobuf-src` cannot vendor it on Windows, and NASM (`winget install NASM.NASM`) for `aws-lc-sys`. Embeddings run on the CPU backend.
+```powershell
+winget install tenequm.pond
 
-Cloning this repository on Windows additionally needs `git config --global core.longpaths true` first - some test fixtures nest encoded project slugs deep enough to pass 260 characters, and git refuses to create them otherwise. This affects a clone only; `cargo install pond-db` does not package the fixtures. Build and test from the clone with an explicit `--target x86_64-pc-windows-msvc`: without it, cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
+scoop install pond
 
-Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
+cargo binstall pond-db
+```
+
+The winget manifest is in review at [winget-pkgs](https://github.com/microsoft/winget-pkgs), so `winget install` does not resolve yet - use Scoop until it merges. See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
 
 ## Usage
 
