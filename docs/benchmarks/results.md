@@ -6,7 +6,7 @@ Entries are newest first within each bench. Output is pasted verbatim: the bench
 
 Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-latency law, the sync change-detection oracle, the `count_rows` inequality trap). This file is the underlying measurements, including runs whose only conclusion was "no change".
 
-`write_bench` was named `copy_bench` before v0.12; recovered entries predating the rename say so. Older runs not yet transcribed here can be recovered from pond itself - the bench output is a tool body, so it is reachable through `pond_sql` on `parts.variant_data`, not through `pond_search`.
+`write_bench` was named `copy_bench` until v0.11.1 (`ad9134f`, 2026-07-01); recovered entries predating the rename say so. Older runs not yet transcribed here can be recovered from pond itself - the bench output is a tool body, so it is reachable through `pond_sql` on `parts.variant_data`, not through `pond_search`.
 
 ## Environments
 
@@ -14,7 +14,7 @@ Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-
 - **win-5700x3d** - AMD Ryzen 7 5700X3D (8C/16T), 16 GB, Windows 11 Pro 10.0.26200, NTFS on NVMe SSD.
 - **s3-nbg1** - Hetzner object storage at `nbg1.your-objectstorage.com`, driven from mac-m1max.
 
-No Linux entry exists yet: no pond bench has ever been run on Linux (checked against the full session history on 2026-08-17).
+No Linux entry exists yet: on 2026-08-17 every recorded session mentioning a benchmark was searched for bench output carrying a Linux path or target triple, and none exists. CI does not run benches, so a Linux number would have to be produced deliberately.
 
 ## write_bench --append-sweep
 
