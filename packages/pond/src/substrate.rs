@@ -3893,10 +3893,42 @@ pub mod durability {
         UploadPart,
     };
 
-    fn durability_error(op: &str, path: &FsPath, source: std::io::Error) -> object_store::Error {
+    /// Keeps the `io::Error` reachable as a source. `is_transient_sharing_violation`
+    /// classifies by downcasting to it, and on Windows the flush opens the file
+    /// for write - the operation that raises ERROR_SHARING_VIOLATION when a
+    /// scanner or sibling reader holds the object we just published. Formatting
+    /// it into a string here would make that contention unretryable.
+    #[derive(Debug, thiserror::Error)]
+    #[error("{op} {path}")]
+    struct FsyncFailed {
+        op: &'static str,
+        path: String,
+        source: std::io::Error,
+    }
+
+    fn durability_error(
+        op: &'static str,
+        path: &FsPath,
+        source: std::io::Error,
+    ) -> object_store::Error {
         object_store::Error::Generic {
             store: "fsync-durability",
-            source: format!("{op} {}: {source}", path.display()).into(),
+            source: Box::new(FsyncFailed {
+                op,
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Flattens a flush failure so the retry classifier cannot see the
+    /// `io::Error` through it. Only for a flush that runs AFTER the write is
+    /// already published: retrying there re-attempts a version that landed,
+    /// which OCC rebases into re-appending rows already committed.
+    fn terminal(error: object_store::Error) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "fsync-durability",
+            source: format!("{error}").into(),
         }
     }
 
@@ -4029,7 +4061,9 @@ pub mod durability {
             opts: RenameOptions,
         ) -> OsResult<()> {
             self.inner.rename_opts(from, to, opts).await?;
-            sync_file_and_parent(to)?;
+            // The rename already published the name, so a retry here would
+            // re-attempt a landed version.
+            sync_file_and_parent(to).map_err(terminal)?;
             Ok(())
         }
     }
@@ -4078,6 +4112,28 @@ pub mod durability {
         // this is the constructor whose inverse `to_local_path` is.
         fn obj_path(root: &FsPath, name: &str) -> ObjPath {
             ObjPath::from_absolute_path(root.join(name)).unwrap()
+        }
+
+        // The bug this pins: a stringified source made the contention
+        // unclassifiable, so a retryable flush failure failed the write.
+        #[test]
+        fn a_contended_flush_is_retryable_unless_the_write_already_published() {
+            let sharing_violation = || std::io::Error::from_raw_os_error(32);
+            let classify = |error: object_store::Error| {
+                crate::substrate::is_transient_sharing_violation(&anyhow::Error::from(
+                    lance::Error::from(error),
+                ))
+            };
+            assert!(classify(durability_error(
+                "open for fsync",
+                FsPath::new("/store/data.lance"),
+                sharing_violation(),
+            )));
+            assert!(!classify(terminal(durability_error(
+                "open for fsync",
+                FsPath::new("/store/data.lance"),
+                sharing_violation(),
+            ))));
         }
 
         #[tokio::test]
@@ -4802,16 +4858,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Per backend, not per platform: a re-added `cfg(unix)` here would
-    /// silently un-enforce `local-store-durability` on Windows.
-    #[test]
-    fn local_stores_get_a_write_wrapper_and_remote_ones_do_not() {
-        let local = Url::from_directory_path(TempDir::new().unwrap().path()).unwrap();
-        assert!(store_wrapper(&local, None).is_some());
-        let remote = Url::parse("s3://bucket/prefix").unwrap();
-        assert!(store_wrapper(&remote, None).is_none());
-    }
-
     /// Built as layers, not a bare io error: the matcher has to see through
     /// object_store's box, Lance's box, and the anyhow context.
     #[test]
@@ -4886,11 +4932,12 @@ mod tests {
         assert!(!indices.join("dead").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn store_wrapper_present_for_local_absent_for_remote() {
         // Local file:// stores get the fsync durability wrapper (no index cache
-        // dir, io-trace unarmed); remote stores get nothing here.
+        // dir, io-trace unarmed); remote stores get nothing here. Not
+        // cfg(unix): the wrapper attaches per backend, and a re-added gate
+        // would silently un-enforce `local-store-durability` on Windows.
         let local = Url::parse("file:///tmp/pond-wrapper-test").unwrap();
         assert!(store_wrapper(&local, None).is_some());
         for remote in ["memory:///pond-wrapper-test", "s3://bucket/prefix"] {
