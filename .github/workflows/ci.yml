@@ -654,7 +654,12 @@ jobs:
           git -C "$nix" push
 
   # Opens the winget-pkgs PR for the version publish-release just shipped -
-  # after it, so the zip the manifest points at already exists on the release.
+  # gated on it, so the zip the manifest points at already exists on the
+  # release. This is why it is not `on: release`: release-plz publishes the
+  # release, and publish-release uploads the binaries to it several steps
+  # later, so a release-triggered run would hand winget-releaser an empty
+  # installer list. A failed submission is retried with "Re-run failed jobs".
+  #
   # WINGET_ENABLED is the on-switch: winget-releaser hard-fails unless at least
   # one version of tenequm.pond is already in winget-pkgs, so it stays unset
   # until the first (necessarily manual, interactive `komac new`) submission is
@@ -662,7 +667,23 @@ jobs:
   winget-publish:
     needs: [dist-build, publish-release]
     if: ${{ vars.WINGET_ENABLED == 'true' && needs.publish-release.outputs.released == 'true' }}
-    uses: ./.github/workflows/winget-publish.yml
-    with:
-      version: ${{ needs.dist-build.outputs.v }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Komac under the hood; there is no separate Komac action. fork-user
+      # defaults to the repository owner, whose winget-pkgs fork the PR
+      # branches off.
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: tenequm.pond
+          version: ${{ needs.dist-build.outputs.v }}
+          # The action defaults release-tag to github.ref_name, which is `main`
+          # here.
+          release-tag: v${{ needs.dist-build.outputs.v }}
+          # Load-bearing: the default regex matches exe/msi/msix/appx only, and
+          # pond ships a portable zip - without this line the action finds no
+          # installer and publishes a manifest with no URL.
+          installers-regex: '\.zip$'
+          # Classic PAT with public_repo. winget-releaser rejects fine-grained
+          # tokens.
+          token: ${{ secrets.WINGET_PAT }}
