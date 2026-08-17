@@ -1,27 +1,15 @@
-//! `pondw.exe` - the windowless launcher the Windows scheduled task runs.
+//! `pondw.exe --log <file> -- <program> [args...]` - the windowless launcher
+//! the Windows scheduled task Execs, and pond's own plumbing rather than a
+//! general-purpose runner.
 //!
-//! Task Scheduler executes its `Exec` action in the user's interactive session,
-//! so a console-subsystem binary flashes a window on every tick. This one is
-//! linked into the `windows` subsystem and has no console at all. It waits on
-//! the child and exits with the child's code, so the task's `Last Result` is
-//! pond's own status - a fire-and-forget shim reports its own success and hides
-//! a failing sync.
+//! Task Scheduler runs its action in the interactive session, so a
+//! console-subsystem binary flashes a window every tick; this one is in the
+//! `windows` subsystem. It waits and exits with the child's code, so the task's
+//! `Last Result` is the sync's own. `--log` exists because an Exec action has
+//! no `StandardOutPath` equivalent.
 //!
-//! The task bakes exactly one shape:
-//!
-//! ```text
-//! pondw.exe --log <file> -- <program> [args...]
-//! ```
-//!
-//! Everything after `--` runs verbatim with stdout and stderr appended to
-//! `<file>`, which is how `pond schedule logs` has anything to read: a
-//! Task Scheduler action has no output redirection of its own, the way a
-//! launchd plist has `StandardOutPath`. Not a general-purpose runner - it is
-//! pond's own plumbing and takes no other form.
-//!
-//! Non-Windows builds compile to an empty `main`: this is a `src/bin` target,
-//! which cargo discovers on every platform, and it ships only in the Windows
-//! zip.
+//! Non-Windows builds compile to an empty `main`: cargo discovers `src/bin` on
+//! every platform, and this ships only in the Windows zip.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 

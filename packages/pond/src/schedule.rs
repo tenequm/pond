@@ -928,22 +928,12 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    //! Windows Task Scheduler backend. The task's `Exec` action is `pondw.exe`,
-    //! pond's windowless launcher, and nothing else:
-    //!
-    //! 1. `pondw.exe` is linked into the `windows` subsystem, so no console
-    //!    flashes on a tick, and it waits on `pond.exe` and returns its exit
-    //!    code, so Task Scheduler's `Last Result` is the sync's own status.
-    //!    `<Hidden>` in the task XML is unrelated - it only hides the task in
-    //!    the Task Scheduler UI listing.
-    //! 2. Its `--log` argument is what gives the run somewhere to write: an
-    //!    `Exec` action has no output redirection of its own, the way a launchd
-    //!    plist has `StandardOutPath`.
-    //! 3. `--state-dir` pins the resolved state dir into the arguments. An
-    //!    `Exec` action carries no environment block either, so the env-var
-    //!    pinning the launchd and systemd backends use has no analog here.
-    //! 4. Task created via `/XML` with a `<Settings>` block: battery-friendly,
-    //!    `StartWhenAvailable` (catch-up after downtime, systemd `Persistent=true`).
+    //! Windows Task Scheduler backend. The action is `pondw.exe` (see its own
+    //! module doc), carrying the log path and the pinned state dir as arguments
+    //! because an `Exec` action has neither an environment block nor a
+    //! `StandardOutPath`. The task XML supplies the launchd/systemd-equivalent
+    //! posture: battery-friendly, `StartWhenAvailable` for catch-up after
+    //! downtime.
 
     use std::path::PathBuf;
     use std::process::Command;
@@ -1106,12 +1096,8 @@ mod windows {
         Ok(())
     }
 
-    /// The `<Arguments>` line the task runs: the launcher's own `--log`, then
-    /// the pond command line it executes.
-    ///
-    /// `--state-dir` is the argument form of the `XDG_STATE_HOME` the launchd
-    /// and systemd backends pin in the job environment - an `Exec` action has
-    /// no environment block, so the value is pinned here instead.
+    /// The `<Arguments>` line: the launcher's own `--log`, then the pond
+    /// command line it runs.
     fn task_arguments(
         log: &std::path::Path,
         bin: &std::path::Path,
@@ -1255,21 +1241,24 @@ mod windows {
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
     }
 
-    /// The launcher that runs alongside `pond.exe`. Both ship in the same zip
-    /// and every install channel unpacks them together, so a missing one means
-    /// a hand-assembled install - name that rather than registering a task
-    /// whose action does not exist.
+    /// The launcher shipped beside `pond.exe`. `bin` comes from PATH, which
+    /// under winget is a symlink in its Links dir with no pondw.exe next to it,
+    /// so the running binary's own directory is the fallback.
     fn pondw_bin(bin: &std::path::Path) -> Result<PathBuf> {
-        let launcher = bin.with_file_name("pondw.exe");
-        if !launcher.is_file() {
-            bail!(
-                "{} not found: it ships beside pond.exe in the release zip and runs \
-                 the scheduled sync without a console window - reinstall pond \
-                 (winget install tenequm.pond) and re-run `pond schedule start`",
-                launcher.display()
-            );
-        }
-        Ok(launcher)
+        [
+            Some(bin.with_file_name("pondw.exe")),
+            std::env::current_exe()
+                .ok()
+                .map(|exe| exe.with_file_name("pondw.exe")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file())
+        .context(
+            "pondw.exe not found beside pond.exe: it ships in the release zip and runs \
+             the scheduled sync without a console window - reinstall pond and re-run \
+             `pond schedule start`",
+        )
     }
 
     /// Decode process output that may be UTF-16 (schtasks `/XML` and some
