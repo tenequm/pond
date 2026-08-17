@@ -225,6 +225,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
+          # --features windows-launcher is what builds pondw.exe. Dropping it
+          # fails the packaging step below on the missing file - fix the flag,
+          # not that copy: a zip without pondw.exe makes `pond schedule start`
+          # refuse to register, and the gate is what keeps unix binstall working
+          # (packages/pond/Cargo.toml).
           cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
 
       # Mirrors macos-verify's launch smoke, and for the same reason: no channel
