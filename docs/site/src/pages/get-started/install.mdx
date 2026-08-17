@@ -53,7 +53,7 @@ A pond store is many small files, and Defender's real-time scanning charges per 
 
 ### Long paths
 
-The Windows binary ships a manifest declaring long-path awareness, which only takes effect on machines where the `LongPathsEnabled` policy is also set. Nothing in pond's own path handling depends on it - it is insurance for the bundled C libraries and for tools pond spawns. Cloning this repository is the one case that genuinely needs it, and needs it in git rather than in pond: `git config --global core.longpaths true`.
+The Windows binary ships a manifest declaring long-path awareness, which only takes effect on machines where the `LongPathsEnabled` policy is also set. Nothing in pond's own path handling depends on it - it is insurance for the bundled C libraries and for tools pond spawns. Cloning this repository is the one case that genuinely needs it, and needs it in git rather than in pond: `git config --global core.longpaths true` - some test fixtures nest encoded project slugs past 260 characters. Build and test from a clone with an explicit `--target x86_64-pc-windows-msvc`; without it cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
 
 ### WSL
 
