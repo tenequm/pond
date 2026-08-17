@@ -127,21 +127,9 @@ jobs:
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
     #
-    # BAZEL_REMOTE_AUTH is NOT blanked here, unlike the sibling jobs: moon only
-    # skips a task on a cache hit, and a hosted runner starts with an empty local
-    # cache every run, so without the remote there is nothing to hit.
-    env:
-      # kache defaults its store to %LOCALAPPDATA% on C:, which on this image is
-      # a slow ~29 GB network-attached disk; D: is ~147 GB of fast local storage
-      # and already holds target/ (actions/runner-images#12416). Same volume as
-      # the build tree is also the precondition for any future hardlink restore.
-      KACHE_CACHE_DIR: D:\kache
-      # Prefetch stops at 2GiB of blobs or 300s of scheduling by default, and
-      # this graph is far past both - lance alone is 287 MB of ~790 crates. The
-      # crates the caps drop are the expensive ones, which is why lance and the
-      # datafusion set flip between hit and miss with an unchanged Cargo.lock.
-      KACHE_PREFETCH_MAX_BYTES: "0"
-      KACHE_PREFETCH_DEADLINE_SECS: "0"
+    # BAZEL_REMOTE_AUTH is NOT blanked here, unlike flake-check: moon only skips
+    # a task on a cache hit, and a hosted runner starts with an empty local cache
+    # every run, so without the remote there is nothing to hit.
     steps:
       # MUST precede checkout, and cannot live in the composite action (a local
       # action only resolves once the repo is checked out). pond's longest
