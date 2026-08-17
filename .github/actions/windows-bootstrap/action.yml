@@ -1,7 +1,7 @@
 name: Windows build prerequisites
 description: >
-  Everything the two Windows jobs need after checkout: protoc, NASM, the pinned
-  Rust toolchain, and the kache S3 build cache. Shared so windows-verify and
+  Everything the two Windows jobs need after checkout: protoc, the pinned Rust
+  toolchain, and the kache S3 build cache. Shared so windows-verify and
   windows-dist cannot drift apart - a protoc version skew between them would
   produce two differently-built binaries from one commit.
 
@@ -27,9 +27,7 @@ runs:
   using: composite
   steps:
     # The windows-2025 image ships neither protoc nor NASM. protoc: direct zip,
-    # matching lance's own windows-build job (no third-party action). NASM: for
-    # aws-lc-sys, and an installed NASM always wins over its prebuilt-nasm
-    # feature.
+    # matching lance's own windows-build job (no third-party action).
     - name: Install protoc
       shell: pwsh
       run: |
@@ -39,9 +37,16 @@ runs:
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
         Expand-Archive protoc.zip -DestinationPath C:\protoc
         "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-    - name: Install NASM
+    # NASM is aws-lc-sys's only extra Windows x86-64 prerequisite, and it ships
+    # CI-verified prebuilt objects for exactly that case, so opting in drops a
+    # release-critical dependency on community.chocolatey.org - which rate-limits
+    # GitHub Actions IPs and reports the refusal as "package was not found".
+    # Only forgoes assembly size reduction under opt-level s/z, which neither the
+    # release nor the dist profile uses.
+    - name: Use aws-lc-sys prebuilt NASM objects
       shell: pwsh
-      run: choco install nasm -y --no-progress
+      run: |
+        "AWS_LC_SYS_PREBUILT_NASM=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     # rustup honors rust-toolchain.toml; the host triple IS the build target,
     # so no extra rust-std is downloaded.
@@ -64,7 +69,7 @@ runs:
     # outright with "Unsupported platform: win32-x64".
     #
     # Accepted limitation: kache is a RUSTC_WRAPPER, so it caches rustc units
-    # but not build-script EXECUTION - aws-lc-sys under cmake + NASM, plus ring,
+    # but not build-script EXECUTION - aws-lc-sys under cmake, plus ring,
     # blake3 and zstd-sys, recompile their native halves every run.
     #
     # Its post step is `success() || failure()`, so a red run still saves, which
