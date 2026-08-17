@@ -972,6 +972,13 @@ mod windows {
     /// `pond schedule start` and the `pond init` schedule section.
     pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
         let bin = pond_bin();
+        if !bin.is_file() {
+            bail!(
+                "could not resolve the pond binary to register ({}); run \
+                 `pond schedule start` from an installed pond",
+                bin.display()
+            );
+        }
         let launcher = pondw_bin(&bin)?;
         let log = super::log_path();
         // state_root is what we pin into --state-dir; pond_state_dir is the
@@ -1060,6 +1067,13 @@ mod windows {
                 "schtasks /Create failed: {}",
                 decode_console(&output.stderr).trim()
             );
+        }
+
+        // The pre-pondw action chain, when this is an upgrade. Removed only
+        // once the new task exists: a failed /Create must leave the old one
+        // working.
+        for stale in ["pond-sync.cmd", "pond-sync.vbs"] {
+            let _ = std::fs::remove_file(pond_state.join(stale));
         }
 
         pond::output::line(&super::render_state(&super::State::Active {
