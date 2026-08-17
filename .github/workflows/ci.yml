@@ -225,7 +225,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
-          cargo build --locked --profile dist --target x86_64-pc-windows-msvc
+          # --features windows-launcher builds pondw.exe (gated in Cargo.toml).
+          cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
 
       # Mirrors macos-verify's launch smoke, and for the same reason: no channel
       # should ship a binary the OS refuses to run. Redirect, never pipe - a
@@ -257,12 +258,15 @@ jobs:
           $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
           New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
           Copy-Item $exe stage\pond.exe
+          # The windowless launcher the scheduled task Execs; `pond schedule
+          # start` refuses to register without it.
+          Copy-Item target\x86_64-pc-windows-msvc\dist\pondw.exe stage\pondw.exe
           & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
           & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
           & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
           & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path stage\pond.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
+          Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -391,6 +391,12 @@ struct StoreArgs {
         value_name = "PATH"
     )]
     config: Option<PathBuf>,
+    /// Directory holding pond's per-host state: the sync lock, the last-sync
+    /// record, and the scheduler log. Must be absolute. The argument form of
+    /// `XDG_STATE_HOME`; hidden because the scheduler bakes it into a task
+    /// rather than anyone typing it.
+    #[arg(long = "state-dir", global = true, hide = true, value_name = "PATH")]
+    state_dir: Option<PathBuf>,
 }
 
 // Parsed once, matched once, immediately destructured - the size spread
@@ -1215,7 +1221,16 @@ async fn run() -> anyhow::Result<()> {
     let StoreArgs {
         storage_path,
         config,
+        state_dir,
     } = cli.store;
+    // Before any state path resolves. Relative would resolve against the
+    // scheduler's working directory, which is not ours to assume.
+    if let Some(dir) = state_dir {
+        if !dir.is_absolute() {
+            bail!("--state-dir must be absolute, got {}", dir.display());
+        }
+        syncstate::set_state_dir_override(dir);
+    }
 
     match cli.command {
         Command::Init(args) => init::run(args, storage_path, config).await?,

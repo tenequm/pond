@@ -39,7 +39,9 @@ tasks:
   # the Linux runner already cached and report "cached" without compiling
   # anything on Windows. The differing command is what keeps the two apart.
   test-msvc:
-    command: 'cargo test --locked --target x86_64-pc-windows-msvc'
+    # windows-launcher so pondw.exe is compiled here on every PR; the job that
+    # builds it for the zip is release-gated, too late to learn it is broken.
+    command: 'cargo test --locked --target x86_64-pc-windows-msvc --features windows-launcher'
     inputs: ['@group(sources)', '@group(tests)']
   # Cheap packaging gate: `cargo package --list` must contain every file the
   # code embeds via include_str!/include_bytes! (a full verify build is skipped

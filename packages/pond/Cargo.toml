@@ -47,6 +47,15 @@ name = "pond"
 name = "pond"
 path = "src/main.rs"
 
+# The windowless launcher the Windows scheduled task runs. Behind a feature so
+# it is not built, installed, or demanded on platforms that cannot use it:
+# cargo has no target-conditional [[bin]], and an unconditional one makes
+# `cargo binstall` require pondw in the unix archives, which do not carry it.
+[[bin]]
+name = "pondw"
+path = "src/bin/pondw.rs"
+required-features = ["windows-launcher"]
+
 [dependencies]
 anstyle = "1"
 anyhow = "1.0.102"
@@ -192,6 +201,9 @@ candle-transformers = { version = "0.10", features = ["metal"] }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Gates the pondw bin (see [[bin]] above). The Windows dist build enables it;
+# nothing else should.
+windows-launcher = []
 # Diagnostic only: enables lance-io per-request IO recording so the
 # serve_mem_bench `--io-trace` mode can attribute exact S3 GET counts/paths
 # per query. Never enabled for release builds; `read_iops`/`read_bytes` are
