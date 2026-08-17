@@ -3872,13 +3872,12 @@ pub mod index_cache {
 /// `LocalFileSystem` publishes a name (hard_link/rename) without syncing the
 /// bytes, so a hard host stop can persist the name over page-cache-only bytes -
 /// a zero-byte manifest that permanently poisons the table. This wrapper fsyncs
-/// the written file and its parent directory after the inner write returns, so
-/// every artifact is durable before Lance proceeds to the next step. Unix only:
-/// Windows commits route through a different handler with different dir-fsync
-/// semantics and rely on self-heal instead.
-#[cfg(unix)]
+/// the written file - and on unix its parent directory - after the inner write
+/// returns, so every artifact is durable before Lance proceeds to the next
+/// step.
 pub mod durability {
     use std::fs::File;
+    #[cfg(unix)]
     use std::io::ErrorKind;
     use std::ops::Range;
     use std::path::Path as FsPath;
@@ -3894,24 +3893,63 @@ pub mod durability {
         UploadPart,
     };
 
-    fn durability_error(op: &str, path: &FsPath, source: std::io::Error) -> object_store::Error {
+    /// Keeps the `io::Error` reachable as a source. `is_transient_sharing_violation`
+    /// classifies by downcasting to it, and on Windows the flush opens the file
+    /// for write - the operation that raises ERROR_SHARING_VIOLATION when a
+    /// scanner or sibling reader holds the object we just published. Formatting
+    /// it into a string here would make that contention unretryable.
+    #[derive(Debug, thiserror::Error)]
+    #[error("{op} {path}")]
+    struct FsyncFailed {
+        op: &'static str,
+        path: String,
+        source: std::io::Error,
+    }
+
+    fn durability_error(
+        op: &'static str,
+        path: &FsPath,
+        source: std::io::Error,
+    ) -> object_store::Error {
         object_store::Error::Generic {
             store: "fsync-durability",
-            source: format!("{op} {}: {source}", path.display()).into(),
+            source: Box::new(FsyncFailed {
+                op,
+                path: path.display().to_string(),
+                source,
+            }),
         }
     }
 
-    /// fsync the file the write just published plus its parent directory: the
-    /// file `sync_all` makes the bytes durable, the dir `sync_all` makes the
-    /// name (the freshly linked/renamed entry) durable. Fsync failures are hard
-    /// errors - a silently no-op durability layer is worse than none - but a
-    /// vanished parent dir (concurrent cleanup) is tolerated.
+    /// Flattens a flush failure so the retry classifier cannot see the
+    /// `io::Error` through it. Only for a flush that runs AFTER the write is
+    /// already published: retrying there re-attempts a version that landed,
+    /// which OCC rebases into re-appending rows already committed.
+    fn terminal(error: object_store::Error) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "fsync-durability",
+            source: format!("{error}").into(),
+        }
+    }
+
+    /// fsync the file the write just published plus, on unix, its parent
+    /// directory - the file `sync_all` makes the bytes durable, the dir
+    /// `sync_all` the name (spec.md#local-store-durability). Fsync failures are
+    /// hard errors - a silently no-op durability layer is worse than none - but
+    /// a vanished parent dir (concurrent cleanup) is tolerated.
     fn sync_file_and_parent(location: &ObjPath) -> OsResult<()> {
         let local = lance_io::local::to_local_path(location);
         let path = FsPath::new(&local);
-        let file = File::open(path).map_err(|e| durability_error("open for fsync", path, e))?;
+        // `FlushFileBuffers` fails with ERROR_ACCESS_DENIED on a read-only
+        // handle, where unix happily fsyncs an O_RDONLY fd.
+        #[cfg(windows)]
+        let opened = File::options().write(true).open(path);
+        #[cfg(not(windows))]
+        let opened = File::open(path);
+        let file = opened.map_err(|e| durability_error("open for fsync", path, e))?;
         file.sync_all()
             .map_err(|e| durability_error("fsync", path, e))?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             // Unix permits fsync on an O_RDONLY directory fd.
             match File::open(parent) {
@@ -4023,7 +4061,9 @@ pub mod durability {
             opts: RenameOptions,
         ) -> OsResult<()> {
             self.inner.rename_opts(from, to, opts).await?;
-            sync_file_and_parent(to)?;
+            // The rename already published the name, so a retry here would
+            // re-attempt a landed version.
+            sync_file_and_parent(to).map_err(terminal)?;
             Ok(())
         }
     }
@@ -4060,16 +4100,40 @@ pub mod durability {
         use super::*;
         use object_store::ObjectStoreExt;
 
-        // A prefix-less local store, so an object_store `Path` is the absolute
-        // FS path (leading `/` stripped) - exactly what `to_local_path` inverts.
+        // A prefix-less local store, so the paths `obj_path` builds round-trip
+        // through `to_local_path`.
         fn wrapped() -> Arc<dyn ObjectStore> {
             let inner: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
             FsyncOnWrite.wrap("test", inner)
         }
 
+        // `from_absolute_path` rather than trimming a leading `/` by hand: a
+        // Windows absolute path has a drive letter and backslashes instead, and
+        // this is the constructor whose inverse `to_local_path` is.
         fn obj_path(root: &FsPath, name: &str) -> ObjPath {
-            // object_store `Path` is the absolute FS path minus the leading `/`.
-            ObjPath::from(root.join(name).to_string_lossy().trim_start_matches('/'))
+            ObjPath::from_absolute_path(root.join(name)).unwrap()
+        }
+
+        // The bug this pins: a stringified source made the contention
+        // unclassifiable, so a retryable flush failure failed the write.
+        #[test]
+        fn a_contended_flush_is_retryable_unless_the_write_already_published() {
+            let sharing_violation = || std::io::Error::from_raw_os_error(32);
+            let classify = |error: object_store::Error| {
+                crate::substrate::is_transient_sharing_violation(&anyhow::Error::from(
+                    lance::Error::from(error),
+                ))
+            };
+            assert!(classify(durability_error(
+                "open for fsync",
+                FsPath::new("/store/data.lance"),
+                sharing_violation(),
+            )));
+            assert!(!classify(terminal(durability_error(
+                "open for fsync",
+                FsPath::new("/store/data.lance"),
+                sharing_violation(),
+            ))));
         }
 
         #[tokio::test]
@@ -4156,7 +4220,7 @@ fn prune_stale_uuid_dirs(dir: &std::path::Path, keep: &std::collections::HashSet
 }
 
 /// The object-store wrapper applied to every dataset open: the fsync-on-write
-/// durability wrapper (local stores, unix), the `_indices/*` disk cache (remote
+/// durability wrapper (local stores), the `_indices/*` disk cache (remote
 /// stores only, when a cache dir is supplied), and the diagnostic io-trace
 /// wrapper. `None` when none is active. The durability and index-cache wrappers
 /// are backend-exclusive (local vs remote), so they never coexist.
@@ -4168,7 +4232,6 @@ fn store_wrapper(
     // Innermost, wrapping the real store directly: fsync must act on the final
     // on-disk file the moment the inner write publishes its name, before any
     // diagnostic wrapper's post-processing.
-    #[cfg(unix)]
     if config::is_local(location) {
         wrappers.push(Arc::new(durability::FsyncOnWrite));
     }
@@ -4869,11 +4932,12 @@ mod tests {
         assert!(!indices.join("dead").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn store_wrapper_present_for_local_absent_for_remote() {
         // Local file:// stores get the fsync durability wrapper (no index cache
-        // dir, io-trace unarmed); remote stores get nothing here.
+        // dir, io-trace unarmed); remote stores get nothing here. Not
+        // cfg(unix): the wrapper attaches per backend, and a re-added gate
+        // would silently un-enforce `local-store-durability` on Windows.
         let local = Url::parse("file:///tmp/pond-wrapper-test").unwrap();
         assert!(store_wrapper(&local, None).is_some());
         for remote in ["memory:///pond-wrapper-test", "s3://bucket/prefix"] {

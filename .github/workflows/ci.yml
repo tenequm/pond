@@ -180,7 +180,7 @@ jobs:
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       - name: Test
-        run: moon run pond:test-msvc
+        run: moon run pond:lint-msvc pond:test-msvc
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
