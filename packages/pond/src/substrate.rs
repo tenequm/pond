@@ -3917,7 +3917,14 @@ pub mod durability {
     fn sync_file_and_parent(location: &ObjPath) -> OsResult<()> {
         let local = lance_io::local::to_local_path(location);
         let path = FsPath::new(&local);
-        let file = File::open(path).map_err(|e| durability_error("open for fsync", path, e))?;
+        // Windows needs GENERIC_WRITE to flush: `FlushFileBuffers` fails with
+        // ERROR_ACCESS_DENIED on a read-only handle, where unix happily fsyncs
+        // an O_RDONLY fd. Opening for write does not modify the file.
+        #[cfg(windows)]
+        let opened = std::fs::OpenOptions::new().write(true).open(path);
+        #[cfg(not(windows))]
+        let opened = File::open(path);
+        let file = opened.map_err(|e| durability_error("open for fsync", path, e))?;
         file.sync_all()
             .map_err(|e| durability_error("fsync", path, e))?;
         #[cfg(unix)]
