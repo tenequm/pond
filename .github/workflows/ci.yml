@@ -663,6 +663,10 @@ jobs:
     if: ${{ needs.publish-release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Same rule as flake-check/macos-verify: the workflow-level env hands this
+    # secret to every job, and the action below binstalls and runs komac.
+    env:
+      BAZEL_REMOTE_AUTH: ""
     steps:
       - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:

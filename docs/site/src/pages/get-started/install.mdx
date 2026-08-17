@@ -49,7 +49,7 @@ Building from source instead needs two tools the prebuilt binary spares you: `pr
 
 ### Defender and where the store lives
 
-A pond store is many small files, and Defender's real-time scanning charges per file touched - excluding the store directory (`%LOCALAPPDATA%\pond` by default) is worth it if sync or search feels slow. Keep the store on an NTFS volume: local stores commit through a hard-link-and-rename dance that NTFS documents and pond has verified there, while ReFS volumes - including Dev Drive - are unverified for that path. Network locations are rejected outright: a UNC path or a mapped network drive fails at the store URL with an error naming the limitation, because the layers underneath silently drop the host component.
+A pond store is many small files, and Defender's real-time scanning charges per file touched - excluding pond's directory (`%LOCALAPPDATA%\pond` by default, holding the store, cache, and state) is worth it if sync or search feels slow. Keep the store on an NTFS volume: local stores commit through a hard-link-and-rename dance that NTFS documents and pond has verified there, while ReFS volumes - including Dev Drive - are unverified for that path. A UNC path is rejected outright at the store URL, because the layers underneath silently drop the host component and the store would open somewhere else; a mapped network drive has the same fault but cannot be told apart from a local drive, so pond cannot reject it for you - point the store at a local drive or a remote scheme (`s3://`, `gs://`, `az://`).
 
 ### Long paths
 

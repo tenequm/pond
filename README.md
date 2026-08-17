@@ -89,9 +89,12 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 On Windows, the Homebrew/Nix packages do not apply:
 
 ```powershell
-winget install tenequm.pond                                            # winget
-scoop bucket add tenequm https://github.com/tenequm/scoop-bucket; scoop install pond
-cargo binstall pond-db                                                 # prebuilt zip, no manager
+winget install tenequm.pond
+
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
+scoop install pond
+
+cargo binstall pond-db
 ```
 
 All three land the same prebuilt `x86_64-pc-windows-msvc` binary, statically linked against the VC runtime, so nothing else needs installing. The zip is attached to every [release](https://github.com/tenequm/pond/releases) and carries completion scripts for PowerShell, bash, zsh, and fish.
