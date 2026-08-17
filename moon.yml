@@ -41,11 +41,10 @@ tasks:
       cache: false
       outputStyle: stream
 
-  # The dist compile below is mirrored by hand in ci.yml's windows-dist job
-  # as `cargo build --locked --profile dist --target x86_64-pc-windows-msvc`,
-  # which is where the Windows artifact now comes from. Same reason as the
-  # `test` task in packages/pond/moon.yml: moon's fingerprint carries no OS, so
-  # that job must not run a shared moon task. Keep the two in lockstep.
+  # The Windows leg lives in `build-dist-msvc` below, built natively rather than
+  # cross-compiled. It is a separate task for the same reason `test-msvc` is
+  # separate from `test`: moon's fingerprint carries no OS, so a shared task
+  # would hit the hash this one already cached and ship nothing.
   #
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
   # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
@@ -161,3 +160,53 @@ tasks:
     options:
       cache: true
       outputStyle: stream
+
+  # The shipped msvc zip, built natively on a Windows runner. A moon task rather
+  # than inline job steps so it gets the same task-level remote cache every other
+  # build leg has - as raw `cargo build` it could never be skipped, and paid a
+  # full thin-LTO link on every release even when nothing had changed.
+  #
+  # Completions come from the just-built binary, the same way the Linux tarballs
+  # get theirs. `Out-Null` and `Set-Content` both consume the whole stream, so
+  # neither trips the EPIPE that a short-circuiting matcher like
+  # `Select-String -Quiet` hands the still-writing binary - which is why the
+  # emptiness check reads the file back instead of piping into it.
+  #
+  # Same POND_BUILD_COMMIT caveat as build-dist: no content hash represents HEAD,
+  # and what keeps a hit from shipping a stale commit string is that a release
+  # commit always bumps the version in packages/pond/Cargo.toml, which IS an input.
+  build-dist-msvc:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
+      # --features windows-launcher builds pondw.exe (gated in Cargo.toml).
+      cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
+
+      $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
+      & $exe --version
+      & $exe --help | Out-Null
+
+      # rm first: moon can hydrate a previously cached dist/ into the tree.
+      Remove-Item -Recurse -Force stage -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
+      Copy-Item $exe stage\pond.exe
+      # The windowless launcher the scheduled task Execs; `pond schedule start`
+      # refuses to register without it.
+      Copy-Item target\x86_64-pc-windows-msvc\dist\pondw.exe stage\pondw.exe
+      & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
+      & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
+      & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
+      & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
+      if (-not (Select-String -Path stage\completions\_pond.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
+
+      New-Item -ItemType Directory -Force -Path dist | Out-Null
+      Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
+      Remove-Item -Recurse -Force stage
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'dist/pond-x86_64-pc-windows-msvc.zip'
+    options:
+      cache: true
+      outputStyle: stream
+      windowsShell: 'pwsh'

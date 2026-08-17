@@ -94,8 +94,9 @@ jobs:
   # task would hit the hash the Linux runner already stored and go green without
   # compiling a line here. The differing command is what keeps them apart, and
   # the remote cache is what lets a prose-only commit skip the leg entirely.
-  # windows-dist stays plain cargo, mirroring the dist leg of the root moon.yml
-  # `build-dist`; keep those two in lockstep by hand.
+  # windows-dist runs `repo:build-dist-msvc` for the same two reasons: its own
+  # task so the OS-less fingerprint cannot collide with `repo:build-dist`, and a
+  # moon task so it is cacheable at all.
   #
   # The two carry DIFFERENT kache manifest-keys. Sharing one would make each
   # overwrite the other's warm-prefetch manifest, silently dropping both to a
@@ -126,21 +127,9 @@ jobs:
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
     #
-    # BAZEL_REMOTE_AUTH is NOT blanked here, unlike the sibling jobs: moon only
-    # skips a task on a cache hit, and a hosted runner starts with an empty local
-    # cache every run, so without the remote there is nothing to hit.
-    env:
-      # kache defaults its store to %LOCALAPPDATA% on C:, which on this image is
-      # a slow ~29 GB network-attached disk; D: is ~147 GB of fast local storage
-      # and already holds target/ (actions/runner-images#12416). Same volume as
-      # the build tree is also the precondition for any future hardlink restore.
-      KACHE_CACHE_DIR: D:\kache
-      # Prefetch stops at 2GiB of blobs or 300s of scheduling by default, and
-      # this graph is far past both - lance alone is 287 MB of ~790 crates. The
-      # crates the caps drop are the expensive ones, which is why lance and the
-      # datafusion set flip between hit and miss with an unchanged Cargo.lock.
-      KACHE_PREFETCH_MAX_BYTES: "0"
-      KACHE_PREFETCH_DEADLINE_SECS: "0"
+    # BAZEL_REMOTE_AUTH is NOT blanked here, unlike flake-check: moon only skips
+    # a task on a cache hit, and a hosted runner starts with an empty local cache
+    # every run, so without the remote there is nothing to hit.
     steps:
       # MUST precede checkout, and cannot live in the composite action (a local
       # action only resolves once the repo is checked out). pond's longest
@@ -164,19 +153,6 @@ jobs:
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
 
-      # Pinned to the version .github/actions/bootstrap installs on Linux: the
-      # two share a remote cache, and moon refuses a cache written by another
-      # version. Located by search rather than by guessing the archive layout.
-      - name: Install moon
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $v = '2.4.6'
-          Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
-          Expand-Archive moon.zip -DestinationPath C:\moon
-          $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
-          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       - name: Test
@@ -186,14 +162,15 @@ jobs:
   # artifact nobody consumes outside a release, and it is the only thing in the
   # pipeline that ever executes a Windows binary.
   # `!cancelled()` is load-bearing: release-prep only runs on a main push, and a
-  # skipped `needs` skips its dependents, so a bare `needs:` would stop this ever
-  # running on the release PR.
+  # skipped `needs` skips its dependents, so a bare `needs:` would stop the
+  # workflow_dispatch escape hatch ever running.
+  # Deliberately NOT pre-flighted on the release PR: a failure here cuts no tag,
+  # so is_release stays true and `gh run rerun --failed` recovers it.
   windows-dist:
     needs: [release-prep]
     if: >-
       !cancelled() && (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')) ||
         needs.release-prep.outputs.is_release == 'true'
       )
     runs-on: windows-2025
@@ -203,70 +180,34 @@ jobs:
     # it, and after release-plz cuts the tag the is_release gate is false
     # forever - an interrupted publish cannot auto-recover.
     concurrency: { group: "ci-windows-dist-${{ github.ref }}", cancel-in-progress: false }
-    env:
-      BAZEL_REMOTE_AUTH: ""
     steps:
       - name: Allow long paths in git
         shell: pwsh
         run: git config --system core.longpaths true
+      # Full history, like the sibling Windows job: moon's vcs layer resolves
+      # vcs.defaultBranch, which a shallow checkout lacks.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
 
-      # --profile dist, not --release: `release` is pond's no-LTO iteration
-      # profile, and every shipped binary is built with `dist`. Without
-      # POND_BUILD_COMMIT the Windows binary would be the only artifact missing
-      # the commit stamp.
-      - name: Build release binary
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
-          # --features windows-launcher builds pondw.exe (gated in Cargo.toml).
-          cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
-
-      # Mirrors macos-verify's launch smoke, and for the same reason: no channel
-      # should ship a binary the OS refuses to run. Redirect, never pipe - a
-      # closed pipe hands the still-writing binary an EPIPE that is an unwrap
-      # inside clap_complete, and that assertion once killed the release it gated.
-      - name: Launch smoke
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
-          & $exe --version
-          & $exe --help | Out-Null
-          & $exe completions powershell | Set-Content -Encoding utf8 completions.ps1
-          if (-not (Select-String -Path completions.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
-
-      # Completions come from the just-built native binary, the same way the
-      # Linux tarballs get theirs - generated here rather than shipped empty.
-      #
-      # `shell: pwsh` is load-bearing twice over: PowerShell 7's `utf8` writes no
-      # BOM, while Windows PowerShell 5.1's does - and a BOM atop pond.bash or
-      # _pond breaks sourcing. Piping into Set-Content is safe (it consumes the
-      # whole stream); the EPIPE trap is only in matchers like
-      # `Select-String -Quiet` that stop early, which is why the smoke step above
-      # matches on the file instead.
-      - name: Package release zip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
-          New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
-          Copy-Item $exe stage\pond.exe
-          # The windowless launcher the scheduled task Execs; `pond schedule
-          # start` refuses to register without it.
-          Copy-Item target\x86_64-pc-windows-msvc\dist\pondw.exe stage\pondw.exe
-          & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
-          & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
-          & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
-          & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
+      # Build + smoke + package, as a moon task so the leg gets the same
+      # task-level remote cache every other build has. `--profile dist`, not
+      # `--release`: `release` is pond's no-LTO iteration profile, and every
+      # shipped binary is built with `dist`.
+      - name: Build release zip
+        run: moon run repo:build-dist-msvc
+        env:
+          # moon aborts remote-cache uploads still queued 60s after a task ends
+          # (BACKGROUND_FLUSH_TIMEOUT, a hard-coded const), which this ~76 MB
+          # artifact never beat - so the task never cached. This takes the inline
+          # branch added in v2.5.0, awaiting the upload instead; keep the moon
+          # pin at or above that.
+          MOON_DAEMON_RUNNING: "1"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
