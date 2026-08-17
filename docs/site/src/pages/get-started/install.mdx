@@ -41,7 +41,11 @@ cargo install pond-db
 
 ## Windows
 
-winget is the primary channel. pond is published there as a portable zip, so the install puts `pond` on `PATH`, registers an Add/Remove Programs entry, and `winget uninstall tenequm.pond` reverses it - no MSI and no installer to click through. Scoop is the same binary through a different manager; the bucket updates itself from each GitHub release. Both ultimately fetch `pond-x86_64-pc-windows-msvc.zip`, which is attached to every [release](https://github.com/tenequm/pond/releases) and can also be unpacked by hand.
+:::warning
+The winget manifest is in review at [winget-pkgs](https://github.com/microsoft/winget-pkgs), so `winget install tenequm.pond` does not resolve yet. Use Scoop until it merges.
+:::
+
+winget is the primary channel once live. pond is published there as a portable zip, so the install puts `pond` on `PATH`, registers an Add/Remove Programs entry, and `winget uninstall tenequm.pond` reverses it - no MSI and no installer to click through. Scoop is the same binary through a different manager; the bucket updates itself from each GitHub release. Both ultimately fetch `pond-x86_64-pc-windows-msvc.zip`, which is attached to every [release](https://github.com/tenequm/pond/releases) and can also be unpacked by hand.
 
 The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
 
