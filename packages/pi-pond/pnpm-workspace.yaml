@@ -1,7 +1,0 @@
-allowBuilds:
-  '@google/genai': set this to true or false
-  esbuild: set this to true or false
-  protobufjs: set this to true or false
-minimumReleaseAgeExclude:
-  - '@rollup/rollup-linux-s390x-gnu@4.62.5'
-  - '@rollup/rollup-openbsd-x64@4.62.5'
