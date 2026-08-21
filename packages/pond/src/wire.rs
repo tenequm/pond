@@ -593,10 +593,10 @@ pub struct SearchRequest {
     #[serde(default)]
     pub namespace: Option<String>,
     pub query: String,
-    /// Retrieval arm (spec.md#search). `vector` (default) matches on meaning;
-    /// `fts` matches exact whole words via BM25. The agent picks per query -
-    /// there is no server-side fusion. If `vector` is asked of a store with no
-    /// embeddings, the server falls back to `fts`.
+    /// Retrieval arm (spec.md#search). `fts` (default) matches exact whole
+    /// words via BM25; `vector` matches on meaning and is available only when
+    /// the serving instance has `[embeddings].enabled = true` - otherwise it is
+    /// refused. The agent picks per query; there is no server-side fusion.
     #[serde(default)]
     pub mode: SearchModeWire,
     /// Result ordering. `relevance` (default) ranks by match strength (vector:
@@ -611,14 +611,15 @@ pub struct SearchRequest {
     pub limit: usize,
 }
 
-/// Wire-level retrieval arm (spec.md#search). The agent chooses per query:
-/// `vector` for concepts/meaning (default), `fts` for known exact words
-/// (BM25). The old server-side hybrid fusion is gone - one arm per request.
+/// Wire-level retrieval arm (spec.md#search). `fts` (default) matches exact
+/// whole words via BM25; `vector` matches on meaning and is available only when
+/// the serving instance has `[embeddings].enabled = true` - otherwise it is
+/// refused. The agent picks per query; there is no server-side fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchModeWire {
-    Fts,
     #[default]
+    Fts,
     Vector,
 }
 
