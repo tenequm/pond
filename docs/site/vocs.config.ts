@@ -76,6 +76,7 @@ export default defineConfig({
   ],
   sidebar: [
     { text: 'Why pond?', link: '/why' },
+    { text: 'How pond compares', link: '/compare' },
     {
       text: 'Get started',
       items: [

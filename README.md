@@ -79,7 +79,7 @@ Three kinds of tool get called "memory". Side by side:
 
 Pick session search for fast local recall. Pick a memory layer when the agent should carry distilled facts, not the record. Pick pond when you want the sessions themselves, in storage you own, from every machine you run.
 
-Every cell is a claim about a specific version of someone else's project. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
+Full comparison, with receipts per tool: [pond.locker/compare](https://pond.locker/compare). Every cell is a claim about a specific version of someone else's project. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
 
 ## Background
 
