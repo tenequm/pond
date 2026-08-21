@@ -781,10 +781,6 @@ Examples (4 patterns the agent should recognize):
                     source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
-                    // min_score is intentionally not on the MCP surface; scores
-                    // are response-relative, so a server-side threshold is a
-                    // footgun for agent callers. CLI / HTTP still exposes it.
-                    min_score: 0.0,
                 },
                 limit: params.limit.unwrap_or(10),
             };

@@ -1090,7 +1090,6 @@ mod search_handler {
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
-        pub min_score: f64,
         /// Drop subagent hits (session id contains `/`) from the arm results in
         /// memory - the spec.md#search retrieval default. See `plan_search` for
         /// when it is on.
@@ -1199,19 +1198,6 @@ mod search_handler {
         plan.mode = resolve_effective_mode(store, plan.mode).await?;
         stage!("resolve_mode");
 
-        // `min_score` gates raw cosine, so it is meaningful only for `vector`.
-        // BM25 is unbounded and not comparable across queries; reject a
-        // non-zero floor on `fts` rather than silently ignore it.
-        if matches!(plan.mode, SearchMode::Fts) && plan.min_score > 0.0 {
-            return Err(map_error(crate::Error::validation_field(
-                "min_score is not supported in fts mode (BM25 scores are unbounded \
-                 and not comparable across queries); use vector mode or drop min_score",
-                "min_score",
-                Some(serde_json::json!(plan.min_score)),
-                Some("0 in fts mode".to_owned()),
-            )));
-        }
-
         // The scope count (spec.md#search-absence-honesty: how many searchable
         // messages the filters left in scope, so "no relevant hits" is
         // distinguishable from "my filters excluded everything") overlaps
@@ -1230,7 +1216,7 @@ mod search_handler {
                 }
                 // Vector arm (default): embed `plan.query` and run kNN. The
                 // hit score is raw cosine similarity (`1 - distance`), which
-                // `min_score` gates and the recency boost later tweaks.
+                // the recency boost later tweaks.
                 SearchMode::Vector => {
                     let backend = load_embedder(embedder).await?;
                     let vector = embed_query(backend.as_ref(), &plan.query)?;
@@ -1264,7 +1250,7 @@ mod search_handler {
         // per-session cap: the surviving candidates are already bounded by the
         // arm pool, and the byte budget bounds the rendered output.
         let (mut selected, mut total_sessions, mut matched_total) =
-            select_top_hits(candidates, plan.min_score, plan.limit);
+            select_top_hits(candidates, plan.limit);
         if selected.is_empty() {
             return Ok(empty_response(searchable_in_scope));
         }
@@ -1346,8 +1332,7 @@ mod search_handler {
         // Final ordering score (spec.md#search). `relevance` ranks vector hits
         // by cosine plus a gentle recency tiebreaker and fts hits by BM25;
         // `recency` ranks both strictly newest-first (the timestamp itself is
-        // the key). The boost is post-gate (the min_score cosine gate already
-        // ran in select_top_hits), so it only reorders comparably-relevant hits.
+        // the key). The boost only reorders comparably-relevant hits.
         let now = clock.now();
         let mut scored = Vec::with_capacity(selected.len());
         for candidate in selected {
@@ -1464,7 +1449,6 @@ mod search_handler {
             )));
         }
         let limit = request.limit.min(LIMIT_CAP);
-        let min_score = filters.min_score;
         let filter = build_scope_filter(&filters)?;
         let exclude_subagents = default_excludes_subagents(&filters);
         // Retriever candidate pool: wider than `limit` so grouping and the
@@ -1486,7 +1470,6 @@ mod search_handler {
             pool,
             vector_pool,
             limit,
-            min_score,
             exclude_subagents,
         })
     }
@@ -1667,9 +1650,9 @@ mod search_handler {
             .collect()
     }
 
-    // Cosine similarity (`1 - distance`): raw, bounded [0, 1], so `min_score`
-    // gates it directly and the value is stable across pool sizes (unlike the
-    // old rank-norm `1 - idx/n`, which shifted whenever `limit` changed).
+    // Cosine similarity (`1 - distance`): raw, bounded [0, 1], so the value is
+    // stable across pool sizes (unlike the old rank-norm `1 - idx/n`, which
+    // shifted whenever `limit` changed).
     fn normalize_vector(hits: Vec<SearchHit>) -> Vec<Candidate> {
         hits.into_iter()
             .map(|hit| Candidate {
@@ -1704,23 +1687,16 @@ mod search_handler {
     /// belonging to the top-`limit` session roots (no per-session cap: the arm
     /// pool already bounds the count, and the byte budget bounds the rendered
     /// output). Hydration and rendering then touch those rows instead of the
-    /// full arm pool (~150). The min_score gate runs here on raw `base_score`
-    /// (cosine for vector). Returns the selected candidates, the total
-    /// distinct-session-root count (for `has_more`), and the count of
-    /// candidates above `min_score` (for `matched_total`).
+    /// full arm pool (~150). Returns the selected candidates, the total
+    /// distinct-session-root count (for `has_more`), and the candidate count
+    /// (for `matched_total`). There is no score floor: absence honesty comes
+    /// from `searchable_in_scope`, not from dropping low-scoring hits (present
+    /// and absent content overlap in the cosine band; see
+    /// docs/researches/embeddings.md).
     fn select_top_hits(
         mut candidates: Vec<Candidate>,
-        min_score: f64,
         limit: usize,
     ) -> (Vec<Candidate>, usize, usize) {
-        // `min_score` gates raw cosine only when set above 0. The default 0 is
-        // "no gate" - the absence honesty comes from `searchable_in_scope`, not
-        // from dropping low-cosine hits (present and absent content overlap in
-        // the cosine band; see docs/researches/embeddings.md). A literal `>= 0`
-        // filter would also drop legitimately weak (near-orthogonal) hits.
-        if min_score > 0.0 {
-            candidates.retain(|candidate| candidate.base_score >= min_score);
-        }
         let matched_total = candidates.len();
         candidates.sort_by(|left, right| {
             right
@@ -2172,7 +2148,6 @@ mod tests {
             source_agent: None,
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
-            min_score: 0.0,
         };
         let sql = build_scope_filter(&filters).unwrap().to_lance();
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
@@ -2281,7 +2256,6 @@ mod tests {
     fn plan_search_shapes_request_for_each_planning_input() {
         let mut request = search_request("  vector memory  ");
         request.limit = 500;
-        request.filters.min_score = 0.42;
         // Default request mode is vector.
         let plan = plan_search(request).unwrap();
         assert_eq!(plan.mode, SearchMode::Vector);
@@ -2292,7 +2266,6 @@ mod tests {
         assert!(plan.exclude_subagents);
         assert_eq!(plan.pool, 1500);
         assert_eq!(plan.vector_pool, 3000);
-        assert_eq!(plan.min_score, 0.42);
 
         // Case 2: an explicit fts mode + a tiny limit floors the pools so the
         // arm doesn't starve (50 floor -> 75 after the over-fetch).

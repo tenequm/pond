@@ -555,12 +555,6 @@ enum Command {
         /// ISO date (YYYY-MM-DD) upper bound, inclusive.
         #[arg(long)]
         to_date: Option<String>,
-        /// Score floor on raw cosine (vector mode only); hits below it are
-        /// dropped. Rejected in fts mode (BM25 is unbounded). Not an absence
-        /// signal - present and absent content score in overlapping bands, so
-        /// leave at 0 unless trimming an over-long tail.
-        #[arg(long, default_value_t = 0.0)]
-        min_score: f64,
         /// Print Lance query plans instead of search results.
         #[arg(long)]
         explain: bool,
@@ -1570,7 +1564,6 @@ async fn run() -> anyhow::Result<()> {
             session_id,
             from_date,
             to_date,
-            min_score,
             explain,
             format,
         } => {
@@ -1589,7 +1582,6 @@ async fn run() -> anyhow::Result<()> {
                     source_agent: None,
                     from_date,
                     to_date,
-                    min_score,
                 },
                 limit,
             };

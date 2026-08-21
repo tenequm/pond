@@ -47,11 +47,6 @@ Options:
       --to-date <TO_DATE>
           ISO date (YYYY-MM-DD) upper bound, inclusive
 
-      --min-score <MIN_SCORE>
-          Score floor on raw cosine (vector mode only); hits below it are dropped. Rejected in fts mode (BM25 is unbounded). Not an absence signal - present and absent content score in overlapping bands, so leave at 0 unless trimming an over-long tail
-          
-          [default: 0]
-
       --explain
           Print Lance query plans instead of search results
 
