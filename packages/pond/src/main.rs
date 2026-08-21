@@ -4189,7 +4189,12 @@ async fn run_sync_pipeline(
         // FTS + vector fold is batched too (DEFAULT_SYNC_INDEX_FOLD_ROWS):
         // each fold is an S3 round-trip storm, and the deferred tail stays
         // searchable because the retrievers flat-scan it.
-        guard_embedding_model_unchanged(store).await?;
+        // A disabled instance never writes vectors, so a model swap cannot
+        // create a second embedding space from here; the guard would only
+        // bail its sync with re-embed advice it cannot act on.
+        if pond::embed::embeddings_enabled() {
+            guard_embedding_model_unchanged(store).await?;
+        }
         let policy = configured_maintenance_policy(loaded, None)?
             .with_cleanup_interval(pond::substrate::DEFAULT_SYNC_CLEANUP_INTERVAL)
             .with_scalar_fold_row_threshold(pond::substrate::DEFAULT_SYNC_SCALAR_FOLD_ROWS)
@@ -4723,13 +4728,15 @@ async fn run_import_stage(
         &rowmap_oracle
     };
     // Set expectations up front on the one run that is genuinely long: a first
-    // sync reads and embeds the full history. `--verify` (also an empty
-    // oracle) already announced itself above.
+    // sync reads (and, with embedding enabled, embeds) the full history.
+    // `--verify` (also an empty oracle) already announced itself above.
     if !verify && oracle.is_empty() {
-        output_err(&pond::output::paint(
-            "plan: first sync from this host - every source is read and embedded in full, which can take a while on a large history. Ctrl-C is safe: the next sync resumes where this one stopped.",
-            pond::output::yellow(),
-        ))?;
+        let notice = if pond::embed::embeddings_enabled() {
+            "plan: first sync from this host - every source is read and embedded in full, which can take a while on a large history. Ctrl-C is safe: the next sync resumes where this one stopped."
+        } else {
+            "plan: first sync from this host - every source is read in full, which can take a while on a large history. Ctrl-C is safe: the next sync resumes where this one stopped."
+        };
+        output_err(&pond::output::paint(notice, pond::output::yellow()))?;
     }
     // One MultiProgress owns every adapter's bar as a single continuously
     // redrawn block: on a terminal resize it desyncs for at most one tick and

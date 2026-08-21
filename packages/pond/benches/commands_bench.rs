@@ -207,7 +207,8 @@ async fn run_status(url: &str, config: &Config, verbose: bool) -> Result<RunRepo
     // that so the bench's "total" lines up with what a user actually waits
     // for; the per-call ms below are observed serial times for breakdown.
     let parallel_start = Instant::now();
-    let (_sizes, row_counts, names, index_status, embedding) = if verbose {
+    let semantic_probes = verbose && config.embeddings.enabled;
+    let (_sizes, row_counts, names, index_status, embedding) = if semantic_probes {
         let r = tokio::try_join!(
             store.table_sizes(),
             store.row_counts(),
@@ -251,16 +252,18 @@ async fn run_status(url: &str, config: &Config, verbose: bool) -> Result<RunRepo
             elapsed: searchable_start.elapsed(),
             detail: String::new(),
         });
-        let stale_start = Instant::now();
-        let _ = store
-            .stale_embedding_count()
-            .await
-            .context("stale_embedding_count")?;
-        phases.push(Phase {
-            label: "stale_embedding_count".to_owned(),
-            elapsed: stale_start.elapsed(),
-            detail: String::new(),
-        });
+        if semantic_probes {
+            let stale_start = Instant::now();
+            let _ = store
+                .stale_embedding_count()
+                .await
+                .context("stale_embedding_count")?;
+            phases.push(Phase {
+                label: "stale_embedding_count".to_owned(),
+                elapsed: stale_start.elapsed(),
+                detail: String::new(),
+            });
+        }
     }
     Ok(RunReport {
         op: if verbose {
