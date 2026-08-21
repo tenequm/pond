@@ -43,7 +43,7 @@ Install, run guided setup, and ingest your local sessions:
 ```sh
 brew install tenequm/tap/pond
 pond init   # guided setup: storage, adapters, MCP + agent skill, optional schedule
-pond sync   # ingest, embed, update indexes - every enabled adapter
+pond sync   # ingest and index - every enabled adapter
 ```
 
 `pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code (by hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: save `pond skill` output to `~/.claude/skills/pond/SKILL.md`). Then ask your agent - real prompts from daily use:
@@ -85,9 +85,9 @@ Full comparison, with receipts per tool: [pond.locker/compare](https://pond.lock
 
 Every agentic CLI ships its own session format and its own search surface. Switching tools means losing history. Replaying a Claude Code session in another provider's tooling means re-translating the wire shape by hand. Hosted multi-tenant deployments rebuild the same storage layer from scratch.
 
-Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, search (vector or BM25 full-text, one arm per query), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
+Pond is the storage and retrieval layer that sits underneath. Every adapter is a bidirectional codec between a client format and one canonical schema, so any session can be restored by any adapter - it need not return to the client that produced it. Storage, search (BM25 full-text by default, with optional semantic search, one arm per query), and provider-agnostic replay all sit on a single Lance-on-object-storage foundation.
 
-The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over three Lance datasets, `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration.
+The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over three Lance datasets, opt-in `intfloat/multilingual-e5-small` embeddings at FP16 weights (Metal on macOS, CUDA opt-in, CPU fallback), and local-FS / S3 / GCS / Azure backends through Lance's `object_store` integration.
 
 ## Install
 
@@ -140,7 +140,7 @@ Set up storage, adapters, MCP registration, and an optional sync schedule in one
 pond init
 ```
 
-Then import sessions from local adapters, embed them, update indexes, and search:
+Then import sessions from local adapters, update indexes, and search:
 
 ```sh
 pond sync
@@ -176,10 +176,10 @@ pond sql "SELECT project, count(*) FROM messages GROUP BY project ORDER BY 2 DES
 
 ### Maintenance
 
-Run maintenance on demand (sync already embeds inline and folds indexes every run):
+Run maintenance on demand (sync folds indexes on every run):
 
 ```sh
-pond optimize --only embed
+pond optimize --only embed   # only when [embeddings].enabled = true
 pond optimize --only index
 ```
 
@@ -195,7 +195,7 @@ pond schedule logs
 
 ### Status and introspection
 
-`pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
+`pond status` prints a per-table storage table, then `indexes` (text readiness, plus the semantic half only when embeddings are enabled), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
 
 ### Remote storage
 
@@ -223,6 +223,15 @@ enabled = false                    # kept in config, skipped on `pond sync`
 path = "~/.codex/sessions"
 ```
 
+Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true` (literal `true`/`false`), then run `pond optimize --only embed` once to fill the backlog:
+
+```toml
+[embeddings]
+enabled = true
+```
+
+Full detail, including what it costs and how mixed fleets behave, is in the [configuration reference](https://pond.locker/reference/configuration).
+
 ### Verbosity
 
 Root-level `-v` / `-vv` / `-vvv` raise the tracing level (info / debug / trace); `-q` / `-qq` lower it. The default surfaces warnings only. `RUST_LOG` overrides the CLI flag when set; `POND_LOG` is no longer honored.
@@ -235,8 +244,8 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Canonical Session / Message / Part interlingua.** Owned in pond, in the shape of Effect v4's `Prompt`-side Part union. This schema is pond's product; everything else is machinery around it.
 - **Three Lance datasets** (`sessions`, `messages`, `parts`). `messages` carries the nullable embedding (`vector` + `embedding_model`) alongside denormalized filter columns (`source_agent` / `project` / `role` / `timestamp`) for single-stage filter pushdown.
 - **No-synthesis adapter seam.** Adapters parse source records through extractor helpers that make "invent a value" a compile error - `model-no-synthesis`, `model-schema-honesty`, and `adapter-provenance-required` are structural, not review rules.
-- **Index lifecycle decoupled from writes.** Writes commit data (embeddings included, computed inline at ingest) without folding the search indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
-- **Single-arm retrieval.** Each query runs one retriever - `vector` (cosine, with a gentle recency tiebreaker) or `fts` (BM25) - chosen per query; no server-side fusion. The vector arm falls back to full-text when the store has no embeddings, and `--sort-by recency` returns newest-first. Results group to one summary per session, keyed on `session_root`.
+- **Index lifecycle decoupled from writes.** Writes commit data (including embeddings, computed inline at ingest when embeddings are enabled) without folding the search indexes. `pond sync` runs index maintenance by default, and `pond optimize --only index` runs it on demand; Lance merges index results with a flat scan over unindexed fragments, so reads stay correct.
+- **Single-arm retrieval.** Each query runs one retriever - `fts` (BM25, the default) or `vector` (cosine, with a gentle recency tiebreaker, offered only when embeddings are enabled) - chosen per query; no server-side fusion. `--sort-by recency` returns newest-first. Results group to one summary per session, keyed on `session_root`.
 - **Language-neutral full-text.** Word-level `simple` tokenizer with English stemming (ascii-folding on); tokens the stemmer does not recognize pass through unchanged and stay exact-matchable, so pond indexes sessions in any language alike.
 - **Two transports, one handler set.** HTTP+JSON (axum) and MCP (rmcp) both dispatch into the same handlers. Wire ops: `pond_search`, `pond_get_session`, `pond_get_message`, `pond_ingest`. MCP additionally exposes the read-only `pond_sql` tool and the `schema://pond`, `schema://pond-sql`, and `stats://pond` resources.
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.

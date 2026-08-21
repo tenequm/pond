@@ -7,7 +7,7 @@ What it demonstrates: a headless pi worker's sessions land in a central store wi
 ## Prerequisites
 
 - Docker with Compose v2.
-- Outbound HTTPS. The sidecar embeds every message as it ingests and there is no switch to turn that off, so it downloads the ~500 MB embedding model from HuggingFace on first use - see "What embedding costs here".
+- Outbound HTTPS, for the object store. Nothing else phones home: semantic search is off by default, so no embedding model is downloaded - see "Turning on semantic search".
 - A provider API key for pi, only for the `worker-pi` half. `ANTHROPIC_API_KEY` is the default path; any provider pi supports works if you adjust `worker-pi`'s environment. The pond half (sidecar, store, read side) needs no key - see "Without an API key".
 
 ## Run
@@ -43,28 +43,32 @@ curl -s localhost:9797/v1/search \
   -d '{"protocol_version":1,"query":"write-ahead log","limit":5}' | jq
 ```
 
-That is the vector arm (the default), and it works on a fresh store because the sidecar embedded inline as it synced. `"mode":"fts"` switches to exact whole words (BM25):
+That is the full-text arm (BM25), the default, and it works on a fresh store with no model anywhere in the picture. `"mode":"vector"` is refused until semantic search is turned on (below).
 
-```
-curl -s localhost:9797/v1/search \
-  -H 'content-type: application/json' \
-  -d '{"protocol_version":1,"query":"write-ahead","mode":"fts","limit":5}' | jq
-```
+## Turning on semantic search
 
-## What embedding costs here
+Embeddings are opt-in and off here, which is why no service in `docker-compose.yml` sets them. Turning them on for the sidecar is one env var plus one volume:
 
-pond has no ingest-time embedding switch - not an env var, not a config key. `[embeddings]` carries only `model` and `dim`, and the sidecar's inline embed is unconditional, so **every worker pod in this shape holds the embedding model**. Concretely:
-
-- First embeddable row triggers a ~500 MB download into `$HOME/.cache/huggingface`, which is the container layer, not the shared volume - a replaced pod downloads it again.
-- A pod that cannot reach HuggingFace does not degrade to full-text-only; the model-load error propagates out of the write and the sync writes nothing.
-
-The consequence for the fleet doc's "Split the embedding work off the workers": that split is not available today. The central pass still exists and is still worth scheduling, but on this topology it finds an empty backlog and exits immediately:
-
-```
-docker compose run --rm read-side optimize --only embed
+```yaml
+  worker-pond:
+    environment:
+      POND_EMBEDDINGS_ENABLED: "true"
+    volumes:
+      - pi-sessions:/pi/.pi
+      - hf-cache:/pi/.cache/huggingface   # add `hf-cache:` to the top-level `volumes:` too
 ```
 
-It earns its keep for sessions that arrive unembedded by another route (`pond copy`) and for the model-swap re-embed (`--force-embed`).
+The cache volume is not optional in a fleet: the model lands in `$HOME/.cache/huggingface`, which is the container layer and not the shared sessions volume, so without it every replaced pod re-downloads 466 MiB. Budget the memory too - a pond process sits around 100 MiB with embeddings off and 500-900 MiB once any vector work has run - and expect the first sync to be CPU-bound, since a Linux container has neither Metal nor CUDA.
+
+The value must be the literal `true` or `false`; `1` fails config load.
+
+The read side needs nothing set to *read* vectors, but it does need the flag to *make* them - which is how the fleet doc's "Split the embedding work off the workers" is done here. Leave `worker-pond` at the default (off) and run the central pass on an enabled read side:
+
+```
+docker compose run --rm -e POND_EMBEDDINGS_ENABLED=true read-side optimize --only embed
+```
+
+That embeds everything the workers ingested without vectors, and it is the same pass that earns its keep for sessions arriving by another route (`pond copy`) and for the model-swap re-embed (`--force-embed`). Until it has run, `"mode":"vector"` is refused; afterwards it answers from the same store.
 
 ## See the fleet view
 
