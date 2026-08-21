@@ -125,8 +125,10 @@ pub(crate) async fn run(
             if !WIZARD_PROMPTS_ACTIVE.load(Ordering::SeqCst) {
                 if let Ok(mut pending) = PENDING_SCHEDULE.lock()
                     && let Some((every, config_file)) = pending.take()
+                    && let Err(error) = schedule::start(every, config_file)
                 {
-                    let _ = schedule::start(every, Some(config_file));
+                    let _ =
+                        pond::output::line_err(&format!("schedule registration failed: {error:#}"));
                 }
                 std::process::exit(130);
             }
@@ -303,6 +305,14 @@ pub(crate) async fn run(
     }
     if let Some(every) = schedule_choice {
         plan.push_str(&format!("\nschedule   pond sync every {}", every.label()));
+        // A schedule pins the config path into the OS unit; a path the
+        // templates cannot embed must fail here, before the config write and
+        // the first sync - not inside registration after both already ran.
+        schedule::reject_unembeddable(
+            "config file",
+            &config_file,
+            "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml",
+        )?;
     }
     plan.push_str(&format!("\nconfig     {}", display_path(&config_file)));
     cliclack::note("Plan", plan)?;
@@ -403,7 +413,7 @@ pub(crate) async fn run(
     let registration = match PENDING_SCHEDULE.lock() {
         Ok(mut pending) => pending
             .take()
-            .map(|(every, config_file)| schedule::start(every, Some(config_file))),
+            .map(|(every, config_file)| schedule::start(every, config_file)),
         Err(_) => None,
     };
     if let Some(outcome) = registration {

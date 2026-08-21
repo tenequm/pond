@@ -1280,8 +1280,8 @@ async fn run() -> anyhow::Result<()> {
                 };
                 // The searchable count is an FTS fact, not an embedding one:
                 // with embedding disabled `-v` reads it from the FTS index's
-                // num_docs (index-resident, no data scan) instead of the
-                // skipped embedding probe.
+                // num_docs (index-resident; a fresh pre-index store falls back
+                // to a count scan) instead of the skipped embedding probe.
                 let searchable_fut = async {
                     if verbose && !pond::embed::embeddings_enabled() {
                         store
@@ -4077,9 +4077,10 @@ async fn run_sync_stages(
     // has no query path, so this is its own resident embedder. The flush HUD
     // connects that inline embedding back to the live adapter bar. With
     // embedding disabled none of it is wired, so ingest writes null vectors.
-    let store = if pond::embed::embeddings_enabled() {
+    let mut store = store;
+    if pond::embed::embeddings_enabled() {
         let embedder = Arc::new(LazyEmbedder::candle());
-        let store = store
+        store = store
             .with_embedder(embedder.clone())
             .with_ingest_embed_progress(pond::sessions::IngestEmbedProgress(Arc::new({
                 let hud = flush_hud.clone();
@@ -4112,10 +4113,7 @@ async fn run_sync_stages(
                 ))?;
             }
         }
-        store
-    } else {
-        store
-    };
+    }
 
     run_sync_pipeline(
         &store,
@@ -5928,6 +5926,7 @@ fn status_json(
         "corpus": {
             "sessions": totals.sessions,
             "messages": totals.messages,
+            "searchable_messages": checks.searchable,
             "parts": totals.parts,
         },
         "indexes": indexes,

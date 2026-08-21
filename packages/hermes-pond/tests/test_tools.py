@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from hermes_pond.tools import (
     RESPONSE_MAX_BYTES,
@@ -135,4 +136,7 @@ def test_mode_description_is_version_neutral():
     description = SEARCH_SCHEMA["description"]
     assert '"fts"' in description
     assert '"vector"' in description
+    # No arm may be marked as the default: catches '"fts" (default...' and
+    # 'default,' alike, while allowing the closing "pond's default." sentence.
+    assert not re.search(r'"(fts|vector)"\s*\(\s*default', description)
     assert "default," not in description

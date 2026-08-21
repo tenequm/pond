@@ -2702,10 +2702,12 @@ impl Store {
     /// signal that lets the `vector` arm run instead of degrading to `fts`.
     /// The IVF index exists only once embeddings cross the activation
     /// threshold, so its presence proves embeddings exist via a resident
-    /// manifest read - NOT an `IsNotNull("vector")` scan, which Lance cannot
-    /// answer from stats and so reads the whole ~GB vector column from the
-    /// store on every query. Below the threshold (no index yet) fall back to
-    /// the prior `IsNotNull("vector")` `LIMIT 1` probe.
+    /// manifest read. Below the threshold (no index yet) fall back to a
+    /// `LIMIT 1` probe on `embedding_model`, the narrow co-set sibling of
+    /// `vector` (spec.md#session-embed-from-canonical): same answer, but on
+    /// an all-null store (enabled, nothing embedded yet - the routine state
+    /// right after opting in) the probe never early-stops, and `vector`
+    /// would be a whole ~GB column read per query.
     pub async fn has_embeddings(&self) -> Result<bool> {
         if self
             .handle
@@ -2714,7 +2716,7 @@ impl Store {
         {
             return Ok(true);
         }
-        let scope = Predicate::IsNotNull("vector");
+        let scope = Predicate::IsNotNull("embedding_model");
         let mut scanner = self
             .handle
             .scan(
@@ -4822,7 +4824,6 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
         column: "search_text",
         trigger: IndexTrigger::OnAnyRows,
         params: IndexParamsKind::InvertedFtsWord,
-        presence_column: None,
     });
     for (column, kind, name) in MESSAGE_SCALAR_INDICES {
         messages.push(IndexIntent {
@@ -4830,7 +4831,6 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
-            presence_column: None,
         });
     }
     if include_vector {
@@ -4849,7 +4849,6 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
                 num_bits: IVF_SQ_NUM_BITS,
                 max_iters: IVF_SQ_MAX_ITERS,
             },
-            presence_column: Some("embedding_model"),
         });
     }
     let parts = PARTS_SCALAR_INDICES
@@ -4859,7 +4858,6 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
-            presence_column: None,
         })
         .collect();
     let sessions = SESSIONS_SCALAR_INDICES
@@ -4869,7 +4867,6 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
-            presence_column: None,
         })
         .collect();
     IndexIntents {

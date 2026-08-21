@@ -239,20 +239,43 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
     Ok(())
 }
 
-/// The config file pinned into a registration: the same resolution every other
-/// command applies (`--config-file`, else `POND_CONFIG_FILE`, else the XDG
-/// default), so the scheduled sync reads the file a manual `pond sync` reads.
-/// The env read is explicit because `pond init` reaches `start` without clap's
-/// parsed value.
+/// The config file pinned into a registration. clap already resolved
+/// `--config-file` and `POND_CONFIG_FILE` into `explicit` on every caller
+/// path, so only the XDG default remains to apply. Absolutized against the
+/// invoking shell's cwd: the pinned path is re-read from the scheduler's
+/// working directory, which is not ours to assume - a relative pin would
+/// silently miss there and the scheduled sync would run on built-in defaults.
 fn config_file(explicit: Option<PathBuf>) -> PathBuf {
-    crate::config_path(explicit.or_else(|| std::env::var_os("POND_CONFIG_FILE").map(PathBuf::from)))
+    let path = crate::config_path(explicit);
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// Registration entry point for `pond init`, which calls it after the config
 /// write with the config path it resolved (a `--config-file` passed to init
 /// must pin into the unit, and clap's parsed value is invisible from here).
-pub(crate) fn start(every: ScheduleEvery, explicit: Option<PathBuf>) -> Result<()> {
-    platform_start(every, &config_file(explicit))
+pub(crate) fn start(every: ScheduleEvery, explicit: PathBuf) -> Result<()> {
+    platform_start(every, &config_file(Some(explicit)))
+}
+
+/// Paths are embedded verbatim in plist XML, a systemd quoted `Environment=`
+/// value, a crontab line (where % means newline), and Task Scheduler XML
+/// (where %VAR% runtime-expands with no escape syntax) - none of which the
+/// templates escape. Reject the exotic characters up front instead of writing
+/// a silently broken registration. `sources` names where the path resolved
+/// from: the bad character may come from a fallback (`$HOME`), where "unset
+/// the env var" would be a dead-end instruction. Also called by `pond init`
+/// as soon as the schedule is chosen, so a doomed registration fails before
+/// the config write and first sync, not after them.
+pub(crate) fn reject_unembeddable(what: &str, path: &Path, sources: &str) -> Result<()> {
+    let text = path.display().to_string();
+    if text.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
+        anyhow::bail!(
+            "{what} {text:?} contains a character (< > & \" % or a newline) that cannot be \
+             embedded in a scheduler registration; it resolves from {sources} - use a \
+             simpler absolute path and re-run `pond schedule start`"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -358,12 +381,12 @@ mod unix {
         // read a different config would run with different adapters and a
         // different [embeddings].enabled than a manual one.
         let state = crate::syncstate::state_root();
-        reject_unembeddable(
+        super::reject_unembeddable(
             "state dir",
             &state,
             "XDG_STATE_HOME, falling back to $HOME/.local/state",
         )?;
-        reject_unembeddable(
+        super::reject_unembeddable(
             "config file",
             config_file,
             "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml",
@@ -383,24 +406,6 @@ mod unix {
             }
             other => bail!("pond schedule is not supported on {other} yet"),
         }
-    }
-
-    /// Paths are embedded verbatim in plist XML, a systemd quoted
-    /// `Environment=` value, and a crontab line (where % means newline) - none
-    /// of which these templates escape. Reject the exotic characters up front
-    /// instead of writing a silently broken registration. `sources` names where
-    /// the path resolved from: the bad character may come from a fallback
-    /// (`$HOME`), where "unset the env var" would be a dead-end instruction.
-    fn reject_unembeddable(what: &str, path: &Path, sources: &str) -> Result<()> {
-        let text = path.display().to_string();
-        if text.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
-            bail!(
-                "{what} {text:?} contains a character (< > & \" % or a newline) that cannot be \
-                 embedded in a scheduler registration; it resolves from {sources} - use a \
-                 simpler absolute path and re-run `pond schedule start`"
-            );
-        }
-        Ok(())
     }
 
     pub(super) fn stop() -> Result<()> {
@@ -1012,28 +1017,6 @@ mod unix {
             // without it.
             assert!(entry.find("POND_CONFIG_FILE=") < entry.find(BIN), "{entry}");
         }
-
-        #[test]
-        fn unembeddable_paths_are_rejected_before_registration() {
-            for bad in [
-                "/home/user/a\"b/config.toml",
-                "/home/user/100%/config.toml",
-                "/home/user/a<b>/config.toml",
-                "/home/user/a&b/config.toml",
-                "/home/user/a\nb/config.toml",
-            ] {
-                let error = reject_unembeddable("config file", Path::new(bad), "POND_CONFIG_FILE")
-                    .err()
-                    .map(|error| error.to_string())
-                    .unwrap_or_default();
-                assert!(error.contains("config file"), "accepted {bad}");
-                assert!(error.contains("POND_CONFIG_FILE"), "{error}");
-            }
-            assert!(
-                reject_unembeddable("config file", Path::new(CONFIG), "POND_CONFIG_FILE").is_ok()
-            );
-            assert!(reject_unembeddable("state dir", Path::new(STATE), "XDG_STATE_HOME").is_ok());
-        }
     }
 }
 
@@ -1085,7 +1068,7 @@ mod windows {
 
     /// Register (or replace, via `/F`) the Task Scheduler job. Shared by
     /// `pond schedule start` and the `pond init` schedule section.
-    pub(crate) fn start(every: ScheduleEvery, config_file: &std::path::Path) -> Result<()> {
+    pub(super) fn start(every: ScheduleEvery, config_file: &std::path::Path) -> Result<()> {
         let bin = pond_bin();
         if !bin.is_file() {
             bail!(
@@ -1103,25 +1086,35 @@ mod windows {
         std::fs::create_dir_all(&pond_state)
             .with_context(|| format!("failed to create {}", pond_state.display()))?;
 
-        // Gate on % in every path that lands in the XML: Task Scheduler expands
-        // %VAR% inside <Command> and <Arguments> at runtime with NO escape
-        // syntax. Mirrors the unix gate that blocks % in cron/plist templates.
-        for (what, path) in [
-            ("launcher", launcher.as_path()),
-            ("pond binary", bin.as_path()),
-            ("sync log", log.as_path()),
-            ("state dir", state_root.as_path()),
-            ("config file", config_file),
+        // Gate every path that lands in the XML: Task Scheduler expands %VAR%
+        // inside <Command> and <Arguments> at runtime with NO escape syntax.
+        // The shared gate's wider character set costs nothing here, and each
+        // entry names its own source so the error points at the actual knob.
+        for (what, path, sources) in [
+            (
+                "launcher",
+                launcher.as_path(),
+                "the installed pond binary's directory",
+            ),
+            ("pond binary", bin.as_path(), "the installed pond location"),
+            (
+                "sync log",
+                log.as_path(),
+                "the state dir (--state-dir or XDG_STATE_HOME)",
+            ),
+            (
+                "state dir",
+                state_root.as_path(),
+                "--state-dir or XDG_STATE_HOME",
+            ),
+            (
+                "config file",
+                config_file,
+                "--config-file or POND_CONFIG_FILE, falling back to \
+                 $XDG_CONFIG_HOME/pond/config.toml",
+            ),
         ] {
-            let text = path.display().to_string();
-            if text.contains('%') {
-                bail!(
-                    "the {what} path {text:?} contains '%', which Task Scheduler \
-                     expands in the task XML with no escape syntax; move it to a path \
-                     without '%' (the state dir resolves from --state-dir or \
-                     XDG_STATE_HOME) and re-run `pond schedule start`"
-                );
-            }
+            super::reject_unembeddable(what, path, sources)?;
         }
 
         let arguments = task_arguments(&log, &bin, &state_root, config_file);
@@ -1605,5 +1598,39 @@ mod tests {
             assert_eq!(ScheduleEvery::from_secs(every.secs()), Some(every));
         }
         assert_eq!(ScheduleEvery::from_secs(123), None);
+    }
+
+    #[test]
+    fn unembeddable_paths_are_rejected_before_registration() {
+        for bad in [
+            "/home/user/a\"b/config.toml",
+            "/home/user/100%/config.toml",
+            "/home/user/a<b>/config.toml",
+            "/home/user/a&b/config.toml",
+            "/home/user/a\nb/config.toml",
+        ] {
+            let error = reject_unembeddable("config file", Path::new(bad), "POND_CONFIG_FILE")
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(error.contains("config file"), "accepted {bad}");
+            assert!(error.contains("POND_CONFIG_FILE"), "{error}");
+        }
+        assert!(
+            reject_unembeddable(
+                "config file",
+                Path::new("/home/user/.config/pond/config.toml"),
+                "POND_CONFIG_FILE"
+            )
+            .is_ok()
+        );
+    }
+
+    /// The pinned path is re-read from the scheduler's working directory, so
+    /// a relative `--config-file` must leave the registration absolute.
+    #[test]
+    fn config_pin_is_absolutized() {
+        let pinned = config_file(Some(PathBuf::from("relative/config.toml")));
+        assert!(pinned.is_absolute(), "{}", pinned.display());
     }
 }

@@ -287,7 +287,7 @@ one message.";
     /// `schema://pond` for the serving instance. With embedding off the doc
     /// must not offer the vector arm
     /// (spec.md#protocol-self-describing-capabilities): the same
-    /// self-description rule `annotate_search_mode`
+    /// self-description rule `annotate_search_mode_with`
     /// enforces on `tools/list`. Each rewrite is asserted so the doc and the
     /// rewrite cannot drift apart silently.
     fn schema_doc_for(enabled: bool) -> String {
@@ -1177,27 +1177,31 @@ Examples (4 patterns the agent should recognize):
                     let map_err = |error: anyhow::Error| {
                         ErrorData::internal_error(format!("stats unavailable: {error}"), None)
                     };
-                    let (sessions, messages, parts) = store.row_counts().await.map_err(&map_err)?;
-                    // Both are data-page scans over `messages` reporting
-                    // embedding state, so an instance with embedding off skips
-                    // the calls outright and nulls the embeddings keys. The
-                    // searchable count is an FTS fact, not an embedding one:
-                    // when disabled it comes from the FTS index's num_docs
-                    // (index-resident, no data scan) so the corpus block stays
-                    // complete on the default posture.
-                    let (embedding, searchable) = if crate::embed::embeddings_enabled() {
-                        let progress = store.embedding_progress().await.map_err(&map_err)?;
-                        let stale = store.stale_embedding_count().await.map_err(&map_err)?;
-                        let searchable = progress.total;
-                        (Some((progress, stale)), searchable)
-                    } else {
-                        let searchable = store
-                            .searchable_in_scope(&crate::substrate::Predicate::And(Vec::new()))
-                            .await
-                            .map_err(&map_err)?;
-                        (None, searchable)
+                    // Both embedding probes are data-page scans over `messages`,
+                    // so an instance with embedding off skips the calls outright
+                    // and nulls the embeddings keys. The searchable count is an
+                    // FTS fact, not an embedding one: when disabled it comes
+                    // from the FTS index's num_docs (index-resident; a fresh
+                    // pre-index store falls back to a count scan) so the corpus
+                    // block stays complete on the default posture.
+                    let embedding_fut = async {
+                        if crate::embed::embeddings_enabled() {
+                            let (progress, stale) = tokio::try_join!(
+                                store.embedding_progress(),
+                                store.stale_embedding_count(),
+                            )?;
+                            let searchable = progress.total;
+                            anyhow::Ok((Some((progress, stale)), searchable))
+                        } else {
+                            let searchable = store
+                                .searchable_in_scope(&crate::substrate::Predicate::And(Vec::new()))
+                                .await?;
+                            anyhow::Ok((None, searchable))
+                        }
                     };
-                    let indices = store.index_status().await.map_err(&map_err)?;
+                    let ((sessions, messages, parts), (embedding, searchable), indices) =
+                        tokio::try_join!(store.row_counts(), embedding_fut, store.index_status())
+                            .map_err(map_err)?;
 
                     let embedded_percent = embedding.as_ref().map(|(progress, _)| {
                         if progress.total == 0 {
@@ -1265,7 +1269,7 @@ Examples (4 patterns the agent should recognize):
                 meta: None,
             };
             annotate_tool_limits(&mut result);
-            annotate_search_mode(&mut result);
+            annotate_search_mode_with(&mut result, crate::embed::embeddings_enabled());
             Ok(result)
         }
     }
@@ -1303,10 +1307,6 @@ Examples (4 patterns the agent should recognize):
     /// description and the `mode` property description at list time. The wire
     /// contract is untouched - the refusal in `resolve_effective_mode` handles
     /// an explicit attempt.
-    fn annotate_search_mode(result: &mut ListToolsResult) {
-        annotate_search_mode_with(result, crate::embed::embeddings_enabled());
-    }
-
     fn annotate_search_mode_with(result: &mut ListToolsResult, embeddings_enabled: bool) {
         if embeddings_enabled {
             return;
@@ -1644,6 +1644,20 @@ Examples (4 patterns the agent should recognize):
                 "an enabled instance advertises both arms"
             );
             assert!(mode_description(tool).contains("vector"));
+        }
+
+        /// The rewrite needles live in prose, so a reworded `SCHEMA_DOC` would
+        /// make every `String::replace` silently no-op (the `debug_assert`s in
+        /// `schema_doc_for` never run in release) - this is the drift guard.
+        #[test]
+        fn schema_doc_hides_the_vector_arm_when_embeddings_are_disabled() {
+            let disabled = schema_doc_for(false);
+            assert_ne!(disabled, SCHEMA_DOC, "no rewrite landed");
+            assert!(
+                !disabled.contains("vector"),
+                "schema doc must not offer an arm this instance refuses: {disabled}"
+            );
+            assert_eq!(schema_doc_for(true), SCHEMA_DOC);
         }
     }
 }

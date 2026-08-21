@@ -222,6 +222,9 @@ describe("mode description is version-neutral", () => {
     const description = factories.search(mainCtx())!.description;
     expect(description).toContain('"fts"');
     expect(description).toContain('"vector"');
+    // No arm may be marked as the default: catches '"fts" (default...' and
+    // 'default,' alike, while allowing the closing "pond's default." sentence.
+    expect(description).not.toMatch(/"(fts|vector)"\s*\(\s*default/);
     expect(description).not.toContain("default,");
   });
 });

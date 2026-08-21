@@ -60,7 +60,7 @@ Embeddings are opt-in and off here, which is why no service in `docker-compose.y
 
 The cache volume is not optional in a fleet: the model lands in `$HOME/.cache/huggingface`, which is the container layer and not the shared sessions volume, so without it every replaced pod re-downloads 466 MiB. Budget the memory too - a pond process sits around 100 MiB with embeddings off and 500-900 MiB once any vector work has run - and expect the first sync to be CPU-bound, since a Linux container has neither Metal nor CUDA.
 
-The value must be the literal `true` or `false`; `1` fails config load.
+The value is boolean-ish: `true`/`false`, and also `1`/`0`, `yes`/`no`.
 
 The refusal is per process, not per store: any pond that should answer `"mode":"vector"` needs the flag, existing vectors or not, and it loads the model to embed the query - so give the serving `read-side` the same `POND_EMBEDDINGS_ENABLED: "true"` plus the `hf-cache` volume when you turn this on. The workers still need nothing - which is how the fleet doc's "Split the embedding work off the workers" is done here. Leave `worker-pond` at the default (off) and run the central pass on an enabled read side:
 
