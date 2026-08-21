@@ -1677,7 +1677,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Config { command } => {
             run_config_command(command, storage_path, config).await?;
         }
-        Command::Schedule { command } => schedule::run(command)?,
+        Command::Schedule { command } => schedule::run(command, config)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }

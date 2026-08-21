@@ -18,7 +18,7 @@
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 use pond::output::{dim, line, line_err, paint};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ScheduleEvery {
@@ -168,9 +168,9 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
     }
 }
 
-pub(crate) fn run(command: ScheduleCmd) -> Result<()> {
+pub(crate) fn run(command: ScheduleCmd, config: Option<PathBuf>) -> Result<()> {
     match command {
-        ScheduleCmd::Start { every } => platform_start(every),
+        ScheduleCmd::Start { every } => platform_start(every, &config_file(config)),
         ScheduleCmd::Stop => platform_stop(),
         ScheduleCmd::Status => {
             let state = platform_probe()?;
@@ -239,14 +239,19 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
     Ok(())
 }
 
-// Re-export `start` for `pond init`, which calls `schedule::start` directly.
-#[cfg(unix)]
-pub(crate) use unix::start;
-#[cfg(windows)]
-pub(crate) use windows::start;
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn start(_every: ScheduleEvery) -> Result<()> {
-    anyhow::bail!("pond schedule is not supported on this platform yet")
+/// The config file pinned into a registration: the same resolution every other
+/// command applies (`--config-file`, else `POND_CONFIG_FILE`, else the XDG
+/// default), so the scheduled sync reads the file a manual `pond sync` reads.
+/// The env read is explicit because `pond init` reaches `start` without clap's
+/// parsed value.
+fn config_file(explicit: Option<PathBuf>) -> PathBuf {
+    crate::config_path(explicit.or_else(|| std::env::var_os("POND_CONFIG_FILE").map(PathBuf::from)))
+}
+
+/// Registration entry point for `pond init`, which calls it after the config
+/// write.
+pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
+    platform_start(every, &config_file(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -266,16 +271,18 @@ fn platform_probe() -> Result<State> {
     Ok(Inactive)
 }
 
+// Task Scheduler's Exec action carries no environment block, so the Windows
+// backend pins its paths as `pondw` arguments instead of env vars.
 #[cfg(windows)]
-fn platform_start(every: ScheduleEvery) -> Result<()> {
+fn platform_start(every: ScheduleEvery, _config_file: &Path) -> Result<()> {
     windows::start(every)
 }
 #[cfg(unix)]
-fn platform_start(every: ScheduleEvery) -> Result<()> {
-    unix::start(every)
+fn platform_start(every: ScheduleEvery, config_file: &Path) -> Result<()> {
+    unix::start(every, config_file)
 }
 #[cfg(not(any(unix, windows)))]
-fn platform_start(_every: ScheduleEvery) -> Result<()> {
+fn platform_start(_every: ScheduleEvery, _config_file: &Path) -> Result<()> {
     anyhow::bail!("pond schedule is not supported on this platform yet")
 }
 
@@ -334,7 +341,7 @@ mod unix {
 
     /// Register the schedule. Shared by `pond schedule start` and the
     /// `pond init` schedule section (which calls it after the config write).
-    pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
+    pub(super) fn start(every: ScheduleEvery, config_file: &Path) -> Result<()> {
         let bin = pond_bin();
         let log = super::log_path();
         if let Some(parent) = log.parent() {
@@ -345,39 +352,54 @@ mod unix {
         // XDG_STATE_HOME would put the scheduled sync's flock and last-sync
         // record in a different state dir than manual syncs - splitting the
         // single-flight lock. Pin the registration-time resolution into the
-        // job's environment (same precedent as the baked-in log path).
+        // job's environment (same precedent as the baked-in log path). The
+        // config file is pinned for the same reason: a scheduled sync that
+        // read a different config would run with different adapters and a
+        // different [embeddings].enabled than a manual one.
         let state = crate::syncstate::state_root();
-        // The path is embedded verbatim in plist XML, a systemd quoted
-        // Environment= value, and a crontab line (where % means newline) -
-        // none of which this template escapes. Reject the exotic characters
-        // up front instead of writing a silently broken registration.
-        let state_str = state.display().to_string();
-        if state_str.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
-            // Name the resolved path AND its sources: the bad character may
-            // come from $HOME (the fallback), where "unset XDG_STATE_HOME"
-            // would be a dead-end instruction.
-            bail!(
-                "state dir {state_str:?} contains a character (< > & \" % or a newline) that \
-                 cannot be embedded in a scheduler registration; it resolves from \
-                 XDG_STATE_HOME, falling back to $HOME/.local/state - set XDG_STATE_HOME \
-                 to a simpler absolute path and re-run `pond schedule start`"
-            );
-        }
+        reject_unembeddable(
+            "state dir",
+            &state,
+            "XDG_STATE_HOME, falling back to $HOME/.local/state",
+        )?;
+        reject_unembeddable(
+            "config file",
+            config_file,
+            "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml",
+        )?;
         match std::env::consts::OS {
-            "macos" => start_launchd(&bin, every, &log, &state),
+            "macos" => start_launchd(&bin, every, &log, &state, config_file),
             "linux" => {
                 if systemd_user_available() {
                     // Switching schedulers must not leave the other one
                     // firing: a systemd start strips any cron fence.
                     remove_cron_fence()?;
-                    start_systemd(&bin, every, &state)
+                    start_systemd(&bin, every, &state, config_file)
                 } else {
                     stop_systemd()?;
-                    start_cron(&bin, every, &log, &state)
+                    start_cron(&bin, every, &log, &state, config_file)
                 }
             }
             other => bail!("pond schedule is not supported on {other} yet"),
         }
+    }
+
+    /// Paths are embedded verbatim in plist XML, a systemd quoted
+    /// `Environment=` value, and a crontab line (where % means newline) - none
+    /// of which these templates escape. Reject the exotic characters up front
+    /// instead of writing a silently broken registration. `sources` names where
+    /// the path resolved from: the bad character may come from a fallback
+    /// (`$HOME`), where "unset the env var" would be a dead-end instruction.
+    fn reject_unembeddable(what: &str, path: &Path, sources: &str) -> Result<()> {
+        let text = path.display().to_string();
+        if text.contains(['<', '>', '&', '"', '%', '\n', '\r']) {
+            bail!(
+                "{what} {text:?} contains a character (< > & \" % or a newline) that cannot be \
+                 embedded in a scheduler registration; it resolves from {sources} - use a \
+                 simpler absolute path and re-run `pond schedule start`"
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn stop() -> Result<()> {
@@ -429,7 +451,13 @@ mod unix {
             .join(format!("{LAUNCHD_LABEL}.plist")))
     }
 
-    fn plist_body(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> String {
+    fn plist_body(
+        bin: &Path,
+        every: ScheduleEvery,
+        log: &Path,
+        state: &Path,
+        config_file: &Path,
+    ) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -449,6 +477,8 @@ mod unix {
 	<dict>
 		<key>XDG_STATE_HOME</key>
 		<string>{state}</string>
+		<key>POND_CONFIG_FILE</key>
+		<string>{config_file}</string>
 	</dict>
 	<key>StartInterval</key>
 	<integer>{secs}</integer>
@@ -465,6 +495,7 @@ mod unix {
             secs = every.secs(),
             log = log.display(),
             state = state.display(),
+            config_file = config_file.display(),
         )
     }
 
@@ -478,9 +509,15 @@ mod unix {
             .unwrap_or(false)
     }
 
-    fn start_launchd(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> Result<()> {
+    fn start_launchd(
+        bin: &Path,
+        every: ScheduleEvery,
+        log: &Path,
+        state: &Path,
+        config_file: &Path,
+    ) -> Result<()> {
         let plist = plist_path()?;
-        let body = plist_body(bin, every, log, state);
+        let body = plist_body(bin, every, log, state, config_file);
         let uid = current_uid()?;
         let unchanged = std::fs::read_to_string(&plist)
             .map(|existing| existing == body)
@@ -606,7 +643,7 @@ mod unix {
             .join("systemd/user")
     }
 
-    fn systemd_service_body(bin: &Path, state: &Path) -> String {
+    fn systemd_service_body(bin: &Path, state: &Path, config_file: &Path) -> String {
         format!(
             "# created and maintained by pond; edits may be replaced\n\
              [Unit]\n\
@@ -614,8 +651,10 @@ mod unix {
              [Service]\n\
              Type=oneshot\n\
              Environment=\"XDG_STATE_HOME={}\"\n\
+             Environment=\"POND_CONFIG_FILE={}\"\n\
              ExecStart={} sync -q --no-wait\n",
             state.display(),
+            config_file.display(),
             bin.display(),
         )
     }
@@ -636,13 +675,18 @@ mod unix {
         )
     }
 
-    fn start_systemd(bin: &Path, every: ScheduleEvery, state: &Path) -> Result<()> {
+    fn start_systemd(
+        bin: &Path,
+        every: ScheduleEvery,
+        state: &Path,
+        config_file: &Path,
+    ) -> Result<()> {
         let dir = systemd_unit_dir();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         let service_path = dir.join("pond-sync.service");
         let timer_path = dir.join("pond-sync.timer");
-        let service = systemd_service_body(bin, state);
+        let service = systemd_service_body(bin, state, config_file);
         let timer = systemd_timer_body(every);
         let unchanged = std::fs::read_to_string(&service_path)
             .map(|existing| existing == service)
@@ -740,10 +784,12 @@ mod unix {
         log: &Path,
         minute: u32,
         state: &Path,
+        config_file: &Path,
     ) -> String {
         let command = format!(
-            "XDG_STATE_HOME=\"{}\" {} sync -q --no-wait >> {} 2>&1",
+            "XDG_STATE_HOME=\"{}\" POND_CONFIG_FILE=\"{}\" {} sync -q --no-wait >> {} 2>&1",
             state.display(),
+            config_file.display(),
             bin.display(),
             log.display()
         );
@@ -854,22 +900,29 @@ mod unix {
         Ok(fence_entry_in(&read_crontab()?))
     }
 
-    fn start_cron(bin: &Path, every: ScheduleEvery, log: &Path, state: &Path) -> Result<()> {
+    fn start_cron(
+        bin: &Path,
+        every: ScheduleEvery,
+        log: &Path,
+        state: &Path,
+        config_file: &Path,
+    ) -> Result<()> {
         let existing = read_crontab()?;
         // The command-shape check keeps this a real idempotence test: a fence
         // entry written by an older pond (`sync -q` without `--no-wait`, or
-        // without the pinned state dir) must re-register, not be kept as
-        // "already scheduled".
+        // without the pinned state dir or config file) must re-register, not be
+        // kept as "already scheduled".
         if let Some(entry) = fence_entry_in(&existing)
             && cron_entry_interval(&entry) == Some(every)
             && entry.contains(&bin.display().to_string())
             && entry.contains("--no-wait")
             && entry.contains("XDG_STATE_HOME=")
+            && entry.contains("POND_CONFIG_FILE=")
         {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
-        let entry = cron_entry(bin, every, log, fastrand::u32(0..60), state);
+        let entry = cron_entry(bin, every, log, fastrand::u32(0..60), state, config_file);
         let mut body = strip_cron_fence(&existing);
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
@@ -901,11 +954,17 @@ mod unix {
     mod tests {
         use super::*;
 
+        const BIN: &str = "/usr/local/bin/pond";
+        const LOG: &str = "/tmp/sync.log";
+        const STATE: &str = "/home/user/.local/state";
+        const CONFIG: &str = "/home/user/.config/pond/config.toml";
+
         #[test]
         fn cron_entries_reverse_map_to_their_cadence() {
-            let bin = Path::new("/usr/local/bin/pond");
-            let log = Path::new("/tmp/sync.log");
-            let state = Path::new("/home/user/.local/state");
+            let bin = Path::new(BIN);
+            let log = Path::new(LOG);
+            let state = Path::new(STATE);
+            let config_file = Path::new(CONFIG);
             for every in [
                 ScheduleEvery::M5,
                 ScheduleEvery::M15,
@@ -914,10 +973,65 @@ mod unix {
                 ScheduleEvery::D1,
             ] {
                 for minute in [0, 7, 59] {
-                    let entry = cron_entry(bin, every, log, minute, state);
+                    let entry = cron_entry(bin, every, log, minute, state, config_file);
                     assert_eq!(cron_entry_interval(&entry), Some(every), "entry: {entry}");
                 }
             }
+        }
+
+        /// A scheduled sync must read the config a manual one reads: without
+        /// the pin, a shell-set POND_CONFIG_FILE (or XDG_CONFIG_HOME) makes the
+        /// two diverge - different adapters, different [embeddings].enabled.
+        #[test]
+        fn every_template_pins_the_config_file() {
+            let (bin, log, state, config_file) = (
+                Path::new(BIN),
+                Path::new(LOG),
+                Path::new(STATE),
+                Path::new(CONFIG),
+            );
+            let plist = plist_body(bin, ScheduleEvery::M5, log, state, config_file);
+            assert!(
+                plist.contains(&format!(
+                    "<key>POND_CONFIG_FILE</key>\n\t\t<string>{CONFIG}</string>"
+                )),
+                "{plist}"
+            );
+            let service = systemd_service_body(bin, state, config_file);
+            assert!(
+                service.contains(&format!("Environment=\"POND_CONFIG_FILE={CONFIG}\"\n")),
+                "{service}"
+            );
+            let entry = cron_entry(bin, ScheduleEvery::M5, log, 7, state, config_file);
+            assert!(
+                entry.contains(&format!("POND_CONFIG_FILE=\"{CONFIG}\"")),
+                "{entry}"
+            );
+            // The pinned env has to precede the binary, or cron runs the sync
+            // without it.
+            assert!(entry.find("POND_CONFIG_FILE=") < entry.find(BIN), "{entry}");
+        }
+
+        #[test]
+        fn unembeddable_paths_are_rejected_before_registration() {
+            for bad in [
+                "/home/user/a\"b/config.toml",
+                "/home/user/100%/config.toml",
+                "/home/user/a<b>/config.toml",
+                "/home/user/a&b/config.toml",
+                "/home/user/a\nb/config.toml",
+            ] {
+                let error = reject_unembeddable("config file", Path::new(bad), "POND_CONFIG_FILE")
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default();
+                assert!(error.contains("config file"), "accepted {bad}");
+                assert!(error.contains("POND_CONFIG_FILE"), "{error}");
+            }
+            assert!(
+                reject_unembeddable("config file", Path::new(CONFIG), "POND_CONFIG_FILE").is_ok()
+            );
+            assert!(reject_unembeddable("state dir", Path::new(STATE), "XDG_STATE_HOME").is_ok());
         }
     }
 }
