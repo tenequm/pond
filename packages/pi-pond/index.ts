@@ -55,6 +55,7 @@ export default function piPond(pi: ExtensionAPI): void {
   const controller = new PondController(
     config,
     {
+      info: (message) => console.error(`[pond] ${message}`),
       warn: (message) => console.error(`[pond] ${message}`),
       error: (message) => console.error(`[pond] ${message}`),
     },

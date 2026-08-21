@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from hermes_pond.config import PondPluginConfig
+from hermes_pond.mcp_client import McpError
 from hermes_pond.service import PondController, resolve_pond_binary
 
 STUB = Path(__file__).resolve().parent / "stub_pond_bin.py"
@@ -85,3 +86,49 @@ def test_binary_missing_returns_typed_error(hermes_home):
     # Not connected yet -> the starting/unavailable message; the install hint is
     # in the logs. A second attempt is gated by backoff.
     assert "pond is not connected" in text
+
+
+class _RaisingClient:
+    """A connected client whose every call raises - the two failure shapes the
+    supervisor has to tell apart."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def call_tool(self, name, args, timeout):
+        raise self._exc
+
+    def alive(self):
+        return True
+
+    def close(self):
+        pass
+
+
+def _controller_with_client(exc):
+    controller = PondController(_managed_config())
+    controller._client = _RaisingClient(exc)
+    dropped = []
+    controller._drop = lambda reason: dropped.append(reason)
+    return controller, dropped
+
+
+def test_app_error_is_relayed_without_respawning_the_child():
+    # pond rejected the request, not the connection: dropping here would cost a
+    # cold pond serve start on every refused call.
+    controller, dropped = _controller_with_client(
+        McpError("mode=vector is off", code=-32010, data={"retryable": False})
+    )
+    assert controller.call_tool("pond_search", {"query": "a"}) == (
+        False,
+        "pond: mode=vector is off",
+    )
+    assert dropped == []
+
+
+def test_transport_fault_still_drops_the_connection():
+    controller, dropped = _controller_with_client(McpError("pond stdio closed (child exited)"))
+    ok, text = controller.call_tool("pond_search", {"query": "a"})
+    assert ok is False
+    assert "pond call failed" in text
+    assert len(dropped) == 1
