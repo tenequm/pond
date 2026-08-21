@@ -3294,21 +3294,28 @@ async fn optimize_table_indices(
             );
             continue;
         }
-        // FTS-only guard: folding a tail with zero non-null values writes an
-        // empty delta segment, which Lance 7.0.0 reads back with the wrong
-        // posting-tail codec (`Default` = VarintDelta vs the metadata-absent
-        // default Fixed32), deterministically failing every later merge. The
-        // probe is bounded: it reads only the tail fragments the fold itself
-        // would read, stops at the first non-null value, and runs only after
-        // the fold threshold already passed.
-        if matches!(intent.params, IndexParamsKind::InvertedFtsWord)
-            && !column_has_values(dataset, intent.column, &unindexed).await?
+        // Content-index guard: folding a tail with zero non-null values writes
+        // an empty delta segment. For FTS, Lance 7.0.0 reads that segment back
+        // with the wrong posting-tail codec (`Default` = VarintDelta vs the
+        // metadata-absent default Fixed32), deterministically failing every
+        // later merge. For IVF_SQ the segment is readable but always wins
+        // `select_segment_for_single_rebalance`, so each later no-op fold
+        // writes and discards a full rebuild into a fresh `_indices/<uuid>/`
+        // dir - which is exactly what an enabled instance would do to the
+        // all-null fragments a disabled peer wrote. The probe is bounded: it
+        // reads only the tail fragments the fold itself would read, stops at
+        // the first non-null value, and runs only after the fold threshold
+        // already passed.
+        if matches!(
+            intent.params,
+            IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. }
+        ) && !column_has_values(dataset, intent.column, &unindexed).await?
         {
             tracing::debug!(
                 target: "pond::perf",
                 index = intent.name,
                 tail_rows,
-                "skipping FTS fold (tail has no indexable values)",
+                "skipping content index fold (tail has no indexable values)",
             );
             continue;
         }

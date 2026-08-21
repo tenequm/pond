@@ -1894,7 +1894,9 @@ impl Store {
     /// is logged, not fatal.
     pub async fn prewarm(&self, cache_dir: &Path) -> Result<()> {
         let messages = self.dataset(Table::Messages).await?;
-        if let Err(error) = messages.prewarm_index(MESSAGES_VECTOR_INDEX).await {
+        if crate::embed::embeddings_enabled()
+            && let Err(error) = messages.prewarm_index(MESSAGES_VECTOR_INDEX).await
+        {
             tracing::debug!(%error, "vector index prewarm skipped");
         }
         // Best-effort: on failure `rowmap` stays empty and the arms fall back to
@@ -3079,19 +3081,6 @@ impl Store {
             .await
     }
 
-    /// Rows added or rewritten in `messages` since the IVF_SQ vector index
-    /// was last folded; a missing index reports the whole table. Manifest-only,
-    /// and an upper bound on the embed backlog (a row folds only after it
-    /// embeds, so no unembedded row is ever folded): zero proves nothing is
-    /// unembedded, but non-zero can be all-embedded rows the index has not
-    /// absorbed yet - confirm with [`embed_backlog_count`](Self::embed_backlog_count)
-    /// before acting on it.
-    pub async fn unindexed_vector_backlog(&self) -> Result<usize> {
-        self.handle
-            .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
-            .await
-    }
-
     /// Embedding coverage: how many `messages` rows carry a vector and how
     /// many are still eligible. Drives the `pond status` embeddings line and
     /// the `pond optimize` progress bar's known total.
@@ -3208,7 +3197,7 @@ impl Store {
         &self,
         vector_threshold: usize,
     ) -> Result<OptimizeOutcome> {
-        let intents = pond_index_intents_with_vector_threshold(vector_threshold);
+        let intents = pond_index_intents_with_vector_threshold(vector_threshold, true);
         let policy = MaintenancePolicy::always_compact();
         let mut tables = Vec::with_capacity(3);
         for (table, intents) in intents.all() {
@@ -3217,6 +3206,29 @@ impl Store {
                 .optimize_table(table, intents, None, &policy)
                 .await;
             tables.push(outcome);
+        }
+        Ok(OptimizeOutcome { tables })
+    }
+
+    /// Index-fold-only sibling of [`Self::optimize_indices_with_vector_threshold`]
+    /// (no compaction), so a test can observe what the fold alone did.
+    #[cfg(test)]
+    async fn build_indices_only_with_vector_threshold(
+        &self,
+        vector_threshold: usize,
+    ) -> Result<OptimizeOutcome> {
+        let policy = pond_index_intents_with_vector_threshold(vector_threshold, true);
+        let mut tables = Vec::with_capacity(3);
+        for (table, intents) in policy.all() {
+            let indices = self
+                .handle
+                .optimize_table_indices_only(table, intents, None)
+                .await;
+            tables.push(TableOptimizeOutcome {
+                table,
+                indices,
+                compaction: PhaseOutcome::NotAttempted,
+            });
         }
         Ok(OptimizeOutcome { tables })
     }
@@ -4784,13 +4796,26 @@ const IVF_SQ_MAX_ITERS: usize = 15;
 /// Pond's production IndexIntents: the per-table intent set
 /// `Store::open_with_options` registers with the substrate.
 pub fn pond_index_intents() -> IndexIntents {
-    pond_index_intents_with_vector_threshold(VECTOR_INDEX_ACTIVATION_ROWS)
+    pond_index_intents_with_vector_threshold(
+        VECTOR_INDEX_ACTIVATION_ROWS,
+        crate::embed::embeddings_enabled(),
+    )
 }
 
 /// Same as [`pond_index_intents`] but with an overridable IVF_SQ activation
-/// threshold. Used by tests that need to exercise the activation boundary
-/// without writing 100k vectors.
-pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) -> IndexIntents {
+/// threshold and an explicit vector-intent switch. Used by tests that need to
+/// exercise the activation boundary without writing 100k vectors, and
+/// order-independently of the process-wide embedding flag.
+///
+/// `include_vector = false` drops the IVF_SQ intent entirely, which is what
+/// keeps fold, rebuild, cleanup, status, and copy-verify away from the vector
+/// index on an instance with embedding off (spec.md#search). An index already
+/// on disk is left untouched - Lance recalculates its fragment bitmap at
+/// commit whether or not an intent names it.
+pub(crate) fn pond_index_intents_with_vector_threshold(
+    vector_threshold: usize,
+    include_vector: bool,
+) -> IndexIntents {
     let mut messages = Vec::with_capacity(MESSAGE_SCALAR_INDICES.len() + 2);
     messages.push(IndexIntent {
         name: MESSAGES_FTS_INDEX,
@@ -4806,18 +4831,20 @@ pub(crate) fn pond_index_intents_with_vector_threshold(vector_threshold: usize) 
             params: IndexParamsKind::Scalar(kind.clone()),
         });
     }
-    messages.push(IndexIntent {
-        name: MESSAGES_VECTOR_INDEX,
-        column: "vector",
-        trigger: IndexTrigger::OnNonNullCount {
+    if include_vector {
+        messages.push(IndexIntent {
+            name: MESSAGES_VECTOR_INDEX,
             column: "vector",
-            threshold: vector_threshold,
-        },
-        params: IndexParamsKind::IvfSqCosine {
-            num_bits: IVF_SQ_NUM_BITS,
-            max_iters: IVF_SQ_MAX_ITERS,
-        },
-    });
+            trigger: IndexTrigger::OnNonNullCount {
+                column: "vector",
+                threshold: vector_threshold,
+            },
+            params: IndexParamsKind::IvfSqCosine {
+                num_bits: IVF_SQ_NUM_BITS,
+                max_iters: IVF_SQ_MAX_ITERS,
+            },
+        });
+    }
     let parts = PARTS_SCALAR_INDICES
         .iter()
         .map(|(column, kind, name)| IndexIntent {
@@ -7836,6 +7863,130 @@ mod tests {
         Ok(())
     }
 
+    /// spec.md#lance-index-maintenance / plan 10.2: an all-null `vector` tail
+    /// must not be folded into IVF_SQ. The empty delta segment it would write
+    /// always wins `select_segment_for_single_rebalance`, so every later no-op
+    /// fold rebuilds the whole index into a fresh `_indices/<uuid>/` and throws
+    /// it away - the exact shape an enabled instance sees when a peer with
+    /// embedding off appends unembedded rows.
+    /// Decision 5: with embedding off the IVF intent is absent from the intent
+    /// set, so fold, rebuild, cleanup, status, and copy-verify all stop naming
+    /// the vector index in one place. Everything else is unchanged.
+    #[test]
+    fn vector_intent_is_absent_when_it_is_not_included() {
+        let with = pond_index_intents_with_vector_threshold(256, true);
+        let without = pond_index_intents_with_vector_threshold(256, false);
+        assert!(
+            with.messages
+                .iter()
+                .any(|intent| intent.name == MESSAGES_VECTOR_INDEX)
+        );
+        assert!(
+            !without
+                .messages
+                .iter()
+                .any(|intent| intent.name == MESSAGES_VECTOR_INDEX)
+        );
+        assert_eq!(without.messages.len() + 1, with.messages.len());
+        assert_eq!(without.sessions.len(), with.sessions.len());
+        assert_eq!(without.parts.len(), with.parts.len());
+    }
+
+    #[tokio::test]
+    async fn all_null_vector_tail_is_not_folded_into_ivf() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
+        store.write_embeddings(&embedded(&keys[..256])).await?;
+        store
+            .build_indices_only_with_vector_threshold(256)
+            .await?
+            .into_result()?;
+        let vector_tail = || async {
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_VECTOR_INDEX)
+                .await
+        };
+        assert_eq!(
+            vector_tail().await?,
+            0,
+            "the fold must cover the whole base"
+        );
+
+        // Two commits of unembedded-but-searchable rows: the disabled-peer tail.
+        let mut tail_keys = Vec::new();
+        for batch in 0..2 {
+            let key = MessageKey {
+                session_id: format!("session-null-{batch}"),
+                message_id: format!("null-msg-{batch}"),
+            };
+            ingest_events(
+                &store,
+                vec![
+                    IngestEvent::Session(Session {
+                        id: key.session_id.clone(),
+                        parent_session_id: None,
+                        parent_message_id: None,
+                        source_agent: "claude-code".to_owned(),
+                        created_at: Utc::now(),
+                        project: Extracted::from_test_value("/proj/null".to_owned()),
+                        options: ProviderOptions::new(),
+                    }),
+                    IngestEvent::Message(Message::User {
+                        id: key.message_id.clone(),
+                        session_id: key.session_id.clone(),
+                        timestamp: Utc::now(),
+                        options: ProviderOptions::new(),
+                    }),
+                    IngestEvent::Part(Part {
+                        session_id: key.session_id.clone(),
+                        id: format!("{}-part", key.message_id),
+                        message_id: key.message_id.clone(),
+                        ordinal: 0,
+                        provenance: crate::wire::Provenance::Conversational,
+                        options: ProviderOptions::new(),
+                        kind: PartKind::Text {
+                            text: Some(Extracted::from_test_value("null tail body".to_owned())),
+                        },
+                    }),
+                ],
+            )
+            .await?;
+            tail_keys.push(key);
+        }
+        let before = vector_tail().await?;
+        assert!(before > 0, "the unembedded rows must form a vector tail");
+
+        store
+            .build_indices_only_with_vector_threshold(256)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            vector_tail().await?,
+            before,
+            "an all-null vector tail must be skipped, not folded",
+        );
+
+        // One embedded row in the tail and the same fold appends.
+        store
+            .write_embeddings(&[EmbeddedMessage {
+                session_id: tail_keys[0].session_id.clone(),
+                id: tail_keys[0].message_id.clone(),
+                vector: synthetic_vector(4242),
+            }])
+            .await?;
+        store
+            .build_indices_only_with_vector_threshold(256)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            vector_tail().await?,
+            0,
+            "a tail holding an embedded row must fold",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn model_swap_force_re_embeds_only_stale_rows_and_rebuilds_ivf_pq() -> anyhow::Result<()>
     {
@@ -8344,22 +8495,6 @@ mod tests {
         assert_eq!(store.embed_backlog_count().await?, 6);
 
         store.write_embeddings(&embedded(&keys[4..])).await?;
-        assert_eq!(store.embed_backlog_count().await?, 0);
-        Ok(())
-    }
-
-    // The post-copy shape: every row embedded, none folded into IVF_SQ yet
-    // (here: no index at all, which reports the whole table). The lag must
-    // over-state - never under-state - so the embed gate can trust lag == 0
-    // as "nothing unembedded" and must confirm lag > 0 with the exact count.
-    #[tokio::test]
-    async fn unindexed_vector_backlog_over_states_when_embedded_rows_are_unfolded()
-    -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let (store, keys) = store_with_messages(&temp, 10).await?;
-        store.write_embeddings(&embedded(&keys)).await?;
-
-        assert_eq!(store.unindexed_vector_backlog().await?, 10);
         assert_eq!(store.embed_backlog_count().await?, 0);
         Ok(())
     }
