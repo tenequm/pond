@@ -1047,7 +1047,7 @@ pub use get_handler::{pond_get_message, pond_get_session};
 
 mod search_handler {
     //! The `pond_search` handler: single-arm retrieval at message granularity -
-    //! `vector` (kNN, default) or `fts` (BM25), chosen per query, no fusion -
+    //! `fts` (BM25, default) or `vector` (kNN), chosen per query, no fusion -
     //! with filter pushdown and session-grouped responses (spec.md#search).
 
     use crate::{
@@ -1066,9 +1066,9 @@ mod search_handler {
     use super::{map_error, map_storage};
 
     /// Internal retrieval arm. The caller picks per query via the wire `mode`
-    /// field (`pond search --mode`): `Vector` (default) on meaning, `Fts` on
-    /// exact whole words. There is no hybrid fusion - one arm per request. A
-    /// `Vector` request degrades to `Fts` when the store has no embeddings.
+    /// field (`pond search --mode`): `Fts` (default) on exact whole words,
+    /// `Vector` on meaning. There is no hybrid fusion - one arm per request.
+    /// `resolve_effective_mode` governs when `Vector` is available.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Fts,
@@ -1119,7 +1119,7 @@ mod search_handler {
     const RECENCY_BOOST_SCALE_DAYS: f64 = 30.0;
 
     /// Run a single-arm search. The caller picks the arm via the wire `mode`
-    /// field; `vector` degrades to `fts` only when the store has no embeddings.
+    /// field; `resolve_effective_mode` governs when `vector` is available.
     /// The embedder is `LazyEmbedder`-loaded on the first vector call, so
     /// fts-only corpora never pay the model load. The response has no top-level
     /// mode field; retriever attribution stays in `explain_search_plan`.
@@ -1145,7 +1145,8 @@ mod search_handler {
         search: &crate::config::SearchConfig,
     ) -> Result<String, ErrorEnvelope> {
         let mut plan = plan_search(request)?;
-        plan.mode = resolve_effective_mode(store, plan.mode).await?;
+        plan.mode =
+            resolve_effective_mode(store, plan.mode, crate::embed::embeddings_enabled()).await?;
         let mut out = String::new();
         match plan.mode {
             SearchMode::Fts => {
@@ -1193,9 +1194,10 @@ mod search_handler {
         }
         let mut plan = plan_search(request)?;
 
-        // A `vector` request degrades to `fts` when the store has no
-        // embeddings (nothing to match against); `fts` stays `fts`.
-        plan.mode = resolve_effective_mode(store, plan.mode).await?;
+        // A `vector` request is refused when embedding is off on this instance,
+        // and degrades to `fts` when it is on but nothing is embedded yet.
+        plan.mode =
+            resolve_effective_mode(store, plan.mode, crate::embed::embeddings_enabled()).await?;
         stage!("resolve_mode");
 
         // The scope count (spec.md#search-absence-honesty: how many searchable
@@ -1214,7 +1216,7 @@ mod search_handler {
                     retain_non_subagents(&mut hits, plan.exclude_subagents);
                     Ok(normalize_fts(hits))
                 }
-                // Vector arm (default): embed `plan.query` and run kNN. The
+                // Vector arm: embed `plan.query` and run kNN. The
                 // hit score is raw cosine similarity (`1 - distance`), which
                 // the recency boost later tweaks.
                 SearchMode::Vector => {
@@ -1395,15 +1397,29 @@ mod search_handler {
         set [embeddings].enabled = true in pond's config (or POND_EMBEDDINGS_ENABLED=true), \
         run `pond optimize --only embed`, then retry with mode=\"vector\" - or use mode=\"fts\"";
 
-    /// Pick the effective retrieval arm. `fts` always stays `fts`. `vector`
-    /// degrades to `fts` when the store has no embeddings - there is nothing to
-    /// match against (`has_embeddings()` is the only gate).
+    /// Pick the effective arm. `fts` stays `fts`. `vector` is refused when
+    /// embedding is disabled on this instance - checked before any store probe,
+    /// because `has_embeddings()` on a never-embedded store is a full column
+    /// read. With embedding enabled, `vector` degrades to `fts` until a row is
+    /// embedded.
     async fn resolve_effective_mode(
         store: &Store,
         requested: SearchMode,
+        embeddings_enabled: bool,
     ) -> Result<SearchMode, ErrorEnvelope> {
         if matches!(requested, SearchMode::Fts) {
             return Ok(SearchMode::Fts);
+        }
+        if !embeddings_enabled {
+            return Err(crate::wire::error(
+                crate::wire::ErrorCode::ValidationFailed,
+                SEMANTIC_DISABLED_MESSAGE,
+                serde_json::json!({
+                    "field": "mode",
+                    "config_key": "embeddings.enabled",
+                    "retryable": false,
+                }),
+            ));
         }
         let has = store.has_embeddings().await.map_err(map_storage)?;
         Ok(if has {
@@ -2030,6 +2046,33 @@ mod search_handler {
             retain_non_subagents(&mut kept, false);
             assert_eq!(kept.len(), 3);
         }
+
+        /// The refusal is decided from the argument, never the process-wide
+        /// flag, and lands before any store probe - so it is testable without
+        /// seeding the `OnceLock` and costs no column read on a cold store.
+        #[tokio::test]
+        async fn vector_refused_when_embeddings_disabled() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Store::open_local(temp.path()).await.unwrap();
+
+            let error = resolve_effective_mode(&store, SearchMode::Vector, false)
+                .await
+                .expect_err("mode=vector must be refused when embedding is off")
+                .error;
+            assert_eq!(error.code, crate::wire::ErrorCode::ValidationFailed);
+            assert_eq!(error.message, SEMANTIC_DISABLED_MESSAGE);
+            assert_eq!(error.details["field"], "mode");
+            assert_eq!(error.details["config_key"], "embeddings.enabled");
+            assert_eq!(error.details["retryable"], serde_json::json!(false));
+
+            assert_eq!(
+                resolve_effective_mode(&store, SearchMode::Fts, false)
+                    .await
+                    .unwrap(),
+                SearchMode::Fts,
+                "fts is unaffected by the switch",
+            );
+        }
     }
 }
 
@@ -2051,7 +2094,7 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
-            mode: crate::wire::SearchModeWire::Vector,
+            mode: crate::wire::SearchModeWire::default(),
             sort_by: crate::wire::SortBy::Relevance,
             filters: SearchFilters::default(),
             limit: 20,
@@ -2262,9 +2305,9 @@ mod tests {
     fn plan_search_shapes_request_for_each_planning_input() {
         let mut request = search_request("  vector memory  ");
         request.limit = 500;
-        // Default request mode is vector.
+        // Default request mode is fts.
         let plan = plan_search(request).unwrap();
-        assert_eq!(plan.mode, SearchMode::Vector);
+        assert_eq!(plan.mode, SearchMode::Fts);
         assert_eq!(plan.query, "vector memory");
         assert_eq!(plan.limit, 200);
         // Default filters exclude subagents, so the pools over-fetch by half

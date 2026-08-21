@@ -54,6 +54,8 @@ fn fake_vector(text: &str) -> Vec<f32> {
 /// Ingest the claude-code fixtures, index, embed - exactly the corpus
 /// `pond serve` would expose - and wrap it in an `AppState` + router.
 async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
+    // The vector arm is refused unless this instance opted in.
+    pond::embed::init_enabled(true);
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     ingest_adapter(
@@ -109,11 +111,15 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
         .find(|id| !id.contains('/'))
         .expect("the fixture corpus has at least one session");
 
-    // POST /v1/search round-trips to a success envelope.
+    // POST /v1/search round-trips to a success envelope on the vector arm.
     let (status, headers, body) = post(
         &app,
         "/v1/search",
-        &json!({ "protocol_version": PROTOCOL_VERSION, "query": "error handling" }),
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "query": "error handling",
+            "mode": "vector",
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -126,6 +132,33 @@ async fn search_and_get_round_trip() -> anyhow::Result<()> {
     assert!(
         matches!(envelope, SearchEnvelope::Success(_)),
         "search should succeed over the fixture corpus",
+    );
+
+    // An absent `mode` takes the fts arm. The JSON envelope carries no mode
+    // field, so the arms are told apart by behavior: BM25 needs real token
+    // overlap and finds nothing for a token no message holds, while kNN always
+    // returns the nearest rows.
+    let gibberish = json!({ "protocol_version": PROTOCOL_VERSION, "query": "zqxjvwkhbrmp" });
+    let (status, _headers, body) = post(&app, "/v1/search", &gibberish).await;
+    assert_eq!(status, StatusCode::OK);
+    let SearchEnvelope::Success(default_arm) = serde_json::from_value(body)? else {
+        panic!("expected a successful search");
+    };
+    assert_eq!(
+        default_arm.matched_total, 0,
+        "the default arm is fts: an unseen token matches nothing",
+    );
+
+    let mut as_vector = gibberish;
+    as_vector["mode"] = json!("vector");
+    let (status, _headers, body) = post(&app, "/v1/search", &as_vector).await;
+    assert_eq!(status, StatusCode::OK);
+    let SearchEnvelope::Success(vector_arm) = serde_json::from_value(body)? else {
+        panic!("expected a successful search");
+    };
+    assert!(
+        vector_arm.matched_total > 0,
+        "the vector arm returns the nearest rows for any query",
     );
 
     // POST /v1/get-session round-trips a full session by id.

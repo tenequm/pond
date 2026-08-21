@@ -70,6 +70,8 @@ impl ClientHandler for TestClient {}
 /// text part. Built via the `pond_ingest` handler directly - the claude-code
 /// fixtures carry no reasoning parts, and placeholder rendering needs one.
 async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
+    // The vector arm is refused unless this instance opted in.
+    pond::embed::init_enabled(true);
     let store = Store::open_local(temp.path()).await?;
 
     let session = Session {
@@ -207,10 +209,15 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     assert_eq!(meta_chars("pond_get_message"), Some(200_000));
 
     // pond_search runs over the MCP transport and returns a success envelope.
+    // An explicit mode="vector" takes the kNN arm ("nearest message").
     let result = client
         .call_tool(
-            CallToolRequestParams::new("pond_search")
-                .with_arguments(json!({ "query": "answer" }).as_object().unwrap().clone()),
+            CallToolRequestParams::new("pond_search").with_arguments(
+                json!({ "query": "answer", "mode": "vector" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         )
         .await?;
     let search = tool_text(&result);
@@ -220,6 +227,22 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
              session."
         ),
         "search transcript header states the totals: {search}"
+    );
+
+    // No mode -> the fts arm ("matching message"), the default on every surface.
+    let default_arm = client
+        .call_tool(
+            CallToolRequestParams::new("pond_search")
+                .with_arguments(json!({ "query": "answer" }).as_object().unwrap().clone()),
+        )
+        .await?;
+    let default_arm = tool_text(&default_arm);
+    assert!(
+        default_arm.starts_with(
+            "pond_search: 1 matching message (1 searchable in scope), showing 1 hit from 1 \
+             session."
+        ),
+        "an absent mode takes the fts arm: {default_arm}"
     );
     assert!(
         search.contains(SESSION_ID),
