@@ -163,8 +163,12 @@ def drive_wizard(name, argv, script, env, *, target="sandbox", expect=0, deadlin
     record(name, target, ok, code if code is not None else -1, secs, note)
 
 
-def seed_sandbox(base: Path, real_config: Path, storage_path: str, legacy=False) -> dict:
-    """A fresh HOME/XDG sandbox with a config.toml carrying the real creds block."""
+def seed_sandbox(base: Path, real_config: Path, storage_path: str, legacy=False,
+                 embeddings_enabled: bool = False) -> dict:
+    """A fresh HOME/XDG sandbox with a config.toml carrying the real creds block.
+
+    `embeddings_enabled` is written out explicitly (pond's own default is false)
+    so a case never depends on what the operator's config happens to say."""
     home = base
     for sub in ("config/pond", "data", "state"):
         (home / sub).mkdir(parents=True, exist_ok=True)
@@ -173,6 +177,7 @@ def seed_sandbox(base: Path, real_config: Path, storage_path: str, legacy=False)
     cfg = (home / "config/pond/config.toml")
     cfg.write_text(
         f"[storage]\npath = \"{storage_path}\"\n\n"
+        f"[embeddings]\nenabled = {str(embeddings_enabled).lower()}\n\n"
         f"[{table}.claude-code]\nenabled = false\npath = \"{home}/empty-claude\"\n\n"
         f"{creds_block}\n"
     )
@@ -257,10 +262,34 @@ def main() -> int:
         env=sched_env, expect=1)
     run("adapters list", [B, "adapters", "list", "--config-file", CFG], "real")
 
-    # search: cold (pays index prewarm) then warm, both modes
-    run("search vector (cold)", [B, "search", "memory leak", *read], "real", anchor=None, timeout=900)
-    run("search vector (warm)", [B, "search", "auth refactor", *read], "real", timeout=600)
-    run("search fts", [B, "search", "--mode", "fts", "timeout", *read], "real", timeout=600)
+    # search: cold (pays index prewarm) then warm. fts is the default arm, so the
+    # unqualified runs must say "matching" (BM25 wording), never "nearest".
+    run("search default fts (cold)", [B, "search", "memory leak", *read], "real", anchor=None, timeout=900)
+    run("search default fts (warm)", [B, "search", "auth refactor", *read], "real",
+        anchor="matching message", timeout=600)
+    run("search fts explicit", [B, "search", "--mode", "fts", "timeout", *read], "real",
+        anchor="matching message", timeout=600)
+
+    # embeddings opt-in: same corpus, two sandbox configs. The operator's config
+    # is not usable here - its [embeddings].enabled state is unknown from inside
+    # the harness, and both arms need a known one.
+    emb_off = seed_sandbox(workdir / "emb-off", Path(CFG), URL)
+    emb_on = seed_sandbox(workdir / "emb-on", Path(CFG), URL, embeddings_enabled=True)
+    run("search vector (embeddings off)", [B, "search", "--mode", "vector", "memory leak"],
+        "sandbox", env=emb_off, expect=1,
+        anchor="semantic search is off on this pond instance", timeout=600)
+    run("search vector (embeddings on)", [B, "search", "--mode", "vector", "memory leak"],
+        "sandbox", env=emb_on, anchor="nearest message", timeout=900)
+    # Disabled says nothing about the semantic half anywhere; anchor on the
+    # "indexes   text ..." prefix (ready / N pending / not built all qualify) and
+    # assert the absence separately, since `run` can only anchor on presence.
+    off = run("status -v (embeddings off)", [B, "status", "-v"], "sandbox", env=emb_off,
+              anchor="indexes   text", timeout=900)
+    no_semantic = bool(off) and "semantic" not in off.lower()
+    record("status -v omits semantic", "sandbox", no_semantic, 0, 0.0,
+           "" if no_semantic else f"got: {_tail(off.encode() if off else None)}")
+    run("status -v (embeddings on)", [B, "status", "-v"], "sandbox", env=emb_on,
+        anchor="semantic", timeout=900)
 
     # discover a real session/message id via sql, then time get
     sid = _first_value(run("sql sample session", [B, "sql",
@@ -352,8 +381,15 @@ def main() -> int:
         # against the copy-dest the copy test just populated (real data, not a
         # trivial no-op against an empty store).
         opt_target = COPY_DEST if args.skip_sync else SYNC
+        opt_dest = "scratch:copy-dest" if args.skip_sync else "scratch:sync"
         run("optimize", [B, "optimize", "--storage-path", opt_target, "--config-file", CFG],
-            "scratch:copy-dest" if args.skip_sync else "scratch:sync", timeout=3600)
+            opt_dest, timeout=3600)
+        # The embed stage only exists on an opted-in instance, so it runs under
+        # the enabled sandbox. A copy-dest target is a no-op (copied rows keep
+        # their vectors); a sync-seeded one embeds whatever backlog it grew.
+        run("optimize --only embed (embeddings on)",
+            [B, "optimize", "--only", "embed", "--storage-path", opt_target],
+            opt_dest, env=emb_on, timeout=3600)
 
     print_matrix()
     return 0 if all(r.ok for r in RESULTS) else 1
