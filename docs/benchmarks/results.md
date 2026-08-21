@@ -112,3 +112,93 @@ Full real corpus, local source to a clean S3 destination - the measurement behin
 ```
 
 13.8 min against 75.7 min, 5.47x slower, and merge left 2,685 objects against 62. Append is bandwidth-bound under one commit per table; merge is commit-latency-bound at one commit per chunk.
+
+## release A/B: CLI reads and full first import (embeddings opt-in)
+
+One-off release verification for PR #168 (`feat/164-embeddings-opt-in`): old = v0.14.11 release binary built from main, new = branch `ba3e352`. Real full corpus against the production store; not a cargo bench - hyperfine over the CLI for reads, `time pond sync` into fresh scratch prefixes for the import. The absolute ~2 min search figures are the pre-existing one-shot CLI cold start (index open + first-query warmup over S3), not a branch effect; long-lived `mcp`/`serve` does not pay it per query.
+
+### 2026-08-21 - s3-nbg1, old 0.14.11 vs new ba3e352, read matrix
+
+Store `s3+https://nbg1.your-objectstorage.com/pondarium/pond` (~14.3k sessions / 2.87M messages at run time). `hyperfine -w 1 -r 3` per cell. `new-disabled` = default config, `new-enabled` = `POND_EMBEDDINGS_ENABLED=1`.
+
+```
+== status (default verbosity) ==
+Benchmark 1: old
+  Time (mean ± σ):      6.330 s ±  0.984 s    [User: 1.474 s, System: 1.620 s]
+  Range (min … max):    5.317 s …  7.282 s    3 runs
+
+Benchmark 2: new-disabled
+  Time (mean ± σ):      5.373 s ±  0.294 s    [User: 1.462 s, System: 1.671 s]
+  Range (min … max):    5.034 s …  5.552 s    3 runs
+
+Summary
+  new-disabled ran
+    1.18 ± 0.19 times faster than old
+== status -v ==
+Benchmark 1: old
+  Time (mean ± σ):     79.115 s ± 21.896 s    [User: 7.398 s, System: 5.012 s]
+  Range (min … max):   63.175 s … 104.081 s    3 runs
+
+Benchmark 2: new-disabled
+  Time (mean ± σ):     21.563 s ±  5.805 s    [User: 1.708 s, System: 1.870 s]
+  Range (min … max):   15.901 s … 27.502 s    3 runs
+
+Benchmark 3: new-enabled
+  Time (mean ± σ):     72.139 s ± 30.303 s    [User: 6.099 s, System: 4.233 s]
+  Range (min … max):   51.654 s … 106.949 s    3 runs
+
+Summary
+  new-disabled ran
+    3.35 ± 1.67 times faster than new-enabled
+    3.67 ± 1.42 times faster than old
+== search fts ==
+Benchmark 1: old
+  Time (mean ± σ):     112.384 s ±  3.177 s    [User: 8.323 s, System: 4.460 s]
+  Range (min … max):   109.358 s … 115.692 s    3 runs
+
+Benchmark 2: new-disabled
+  Time (mean ± σ):     117.016 s ± 18.010 s    [User: 8.064 s, System: 4.409 s]
+  Range (min … max):   100.323 s … 136.103 s    3 runs
+
+Summary
+  old ran
+    1.04 ± 0.16 times faster than new-disabled
+== search default mode (upgrade experience: omitted --mode) ==
+Benchmark 1: old-default
+  Time (mean ± σ):     122.856 s ± 14.638 s    [User: 8.396 s, System: 4.615 s]
+  Range (min … max):   113.779 s … 139.743 s    3 runs
+
+Benchmark 2: new-default
+  Time (mean ± σ):     111.895 s ±  9.605 s    [User: 7.773 s, System: 4.345 s]
+  Range (min … max):   105.965 s … 122.977 s    3 runs
+
+Summary
+  new-default ran
+    1.10 ± 0.16 times faster than old-default
+```
+
+`status` 1.18x, `status -v` 3.67x with embeddings disabled (it no longer pays the embedding-coverage scan) and parity when enabled, `search --mode fts` parity (1.04 +/- 0.16), omitted-mode search 1.10x from the default flip vector -> fts. No regression in any cell.
+
+### 2026-08-21 - s3-nbg1, old 0.14.11 vs new ba3e352, full first import to fresh scratch prefix
+
+Same local adapter corpus as source, each leg into its own clean prefix (`pond-perf-new` / `pond-perf-old`, deleted after the run). Row counts differ slightly between legs because the source corpus is live and grew ~100 messages between the 18:08Z and 18:48Z starts.
+
+```
+== full first import: local adapter corpus -> fresh S3 scratch prefix ==
+-- NEW branch, default disabled (18:08:58Z) --
+stored    12,054 sessions, 2,328,304 messages
+done - sync complete in 00:39:22
+
+real	39m22.957s
+user	5m36.334s
+sys	1m4.735s
+-- OLD 0.14.11, always embeds (18:48:21Z) --
+stored    12,055 sessions, 2,328,401 messages
+done - sync complete in 01:53:55
+
+real	113m56.185s
+user	9m21.515s
+sys	2m42.220s
+```
+
+39m22s against 113m56s: first import is 2.89x faster with embeddings off (the new default). The gap is the inline embedding cost the old binary always paid; a new-enabled leg would land near the old number.
