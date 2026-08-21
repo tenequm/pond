@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -37,6 +38,10 @@ CALL_TIMEOUT_S = 120.0
 SQL_CALL_TIMEOUT_MARGIN_S = 30.0
 RESTART_BASE_DELAY_S = 0.5
 RESTART_MAX_DELAY_S = 30.0
+# pond's own JSON-RPC application error codes (spec 7.4): validation_failed,
+# not_found, and their siblings, i.e. -32010 through -32016.
+POND_APP_ERROR_CODES = range(-32016, -32009)
+VERSION_PROBE_TIMEOUT_S = 5.0
 
 INSTALL_HINT = (
     "install pond, then restart hermes: `brew install tenequm/tap/pond`, "
@@ -77,6 +82,20 @@ def resolve_pond_binary(binary_path: str | None) -> str:
     raise McpError(f"pond binary not found on PATH. {INSTALL_HINT}")
 
 
+def is_pond_app_error(exc: McpError) -> bool:
+    """Did pond reject the REQUEST, rather than the connection failing?
+
+    An app error is the caller's problem and the warm child is still healthy, so
+    tearing it down would respawn `pond serve` on every such call. A transport
+    fault carries neither a pond code nor a `retryable` marker and must drop.
+    """
+    code = exc.error.code
+    if isinstance(code, int) and code in POND_APP_ERROR_CODES:
+        return True
+    data = exc.error.data
+    return isinstance(data, dict) and data.get("retryable") is False
+
+
 def _call_timeout(name: str, args: dict) -> float:
     """Transport deadline for one tool call. pond_sql carries its own server-side
     timeout, so the transport must wait at least that long plus a transfer margin;
@@ -111,6 +130,7 @@ class PondController:
         self._attempt = 0
         self._next_retry_at = 0.0
         self._stopped = False
+        self._version_logged = False
 
     # -- logging -----------------------------------------------------------
     def _info(self, msg: str) -> None:
@@ -141,6 +161,8 @@ class PondController:
             try:
                 return client.call_tool(name, args, timeout=_call_timeout(name, args))
             except McpError as exc:
+                if is_pond_app_error(exc):
+                    return False, f"pond: {exc.error.message}"
                 self._drop(f"tool call failed: {exc}")
                 return False, f"pond call failed: {exc}"
 
@@ -194,8 +216,28 @@ class PondController:
             self._error(f"failed to start: {exc}")
         self._schedule_retry()
 
+    def _log_version(self, pond_bin: str) -> None:
+        """Record which pond this session is actually talking to, once. The tool
+        text is version-neutral, so the log is the only place the binary's
+        behaviour (default search arm, embeddings) can be traced back to."""
+        if self._version_logged:
+            return
+        self._version_logged = True
+        try:
+            probe = subprocess.run(
+                [pond_bin, "--version"],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=VERSION_PROBE_TIMEOUT_S,
+            )
+            self._info(f"{pond_bin}: {(probe.stdout or probe.stderr).strip()}")
+        except Exception as exc:
+            self._warn(f"could not read `{pond_bin} --version`: {exc}")
+
     def _dial_stdio(self) -> StdioTransport:
         pond_bin = resolve_pond_binary(self._config.binary_path)
+        self._log_version(pond_bin)
         args = [
             "serve",
             "--transport",

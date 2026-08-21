@@ -67,9 +67,10 @@ SEARCH_SCHEMA = {
         "(cross-harness: Claude Code, OpenClaw, hermes, and every other ingested "
         "source; survives resets and disk-budget pruning). Not the live conversation "
         "- for the current session use session_search. Returns pond's rendered "
-        'transcript grouped by session, best first. mode: "vector" (default, '
-        'meaning) or "fts" (exact words). Pass a hit\'s session_id to '
-        "pond_get_session or its message_id to pond_get_message."
+        'transcript grouped by session, best first. Pick mode: "fts" (exact '
+        'whole words, BM25) or "vector" (meaning; only where that pond instance '
+        "has embeddings enabled). Omit mode to use pond's default. Pass a hit's "
+        "session_id to pond_get_session or its message_id to pond_get_message."
     ),
     "parameters": {
         "type": "object",

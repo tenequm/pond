@@ -7,7 +7,10 @@ import { PondController, type PondLogger, pondServeArgs } from "../src/service.t
 
 function collectingLogger(): { logger: PondLogger; errors: string[] } {
   const errors: string[] = [];
-  return { errors, logger: { warn: () => {}, error: (message) => errors.push(message) } };
+  return {
+    errors,
+    logger: { info: () => {}, warn: () => {}, error: (message) => errors.push(message) },
+  };
 }
 
 // `dial` and `scheduleRestart` are private to the class, not to the runtime -

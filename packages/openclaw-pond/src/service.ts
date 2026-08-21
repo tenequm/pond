@@ -5,6 +5,7 @@
 // callTool seam the tools use. The plugin never touches an existing pond
 // config; on a completely unconfigured pond, `--bootstrap openclaw` enables
 // that one adapter (equivalent to a minimal `pond init`).
+import { execFile } from "node:child_process";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { PondPluginConfig } from "./config.js";
@@ -27,6 +28,7 @@ const RESTART_MAX_DELAY_MS = 30_000;
 // (OpenClaw's house pattern probes local children with a 10s deadline); the
 // SDK default of 60s would let a hung child stall gateway startup.
 const DIAL_TIMEOUT_MS = 10_000;
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
 
 // The MCP SDK's stdio transport passes the child a fixed safelist (HOME, PATH,
 // USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
@@ -111,11 +113,31 @@ export function resolvePondBinary(binaryPath: string | undefined): string {
   throw new Error(`pond binary not found on PATH. ${INSTALL_HINT}`);
 }
 
+// Which pond this gateway is actually talking to. The tool descriptions are
+// version-neutral by design, so this line is the only place a behaviour
+// difference (default search arm, embeddings) traces back to a binary.
+// Fire-and-forget: the dial never waits on it and never fails because of it.
+function logPondVersion(pondBin: string, logger: PondLogger): void {
+  execFile(
+    pondBin,
+    ["--version"],
+    { timeout: VERSION_PROBE_TIMEOUT_MS },
+    (error, stdout, stderr) => {
+      if (error) {
+        logger.warn(`could not read \`${pondBin} --version\`: ${error.message}`);
+        return;
+      }
+      logger.info(`${pondBin}: ${(stdout || stderr).trim()}`);
+    },
+  );
+}
+
 export class PondController {
   private client = new PondMcpClient();
   private stopped = true;
   private attempt = 0;
   private restartTimer: ReturnType<typeof setTimeout> | undefined;
+  private versionLogged = false;
 
   constructor(
     private readonly config: PondPluginConfig,
@@ -189,6 +211,10 @@ export class PondController {
     // interactive work. `nice` execs pond in place - the child pid IS pond, so
     // the stop() ladder signals the right process. Skipped on Windows.
     const pondBin = resolvePondBinary(this.config.binaryPath);
+    if (!this.versionLogged) {
+      this.versionLogged = true;
+      logPondVersion(pondBin, this.logger);
+    }
     const posix = process.platform !== "win32";
     const command = posix ? "nice" : pondBin;
     const prefix = posix ? ["-n", "19", pondBin] : [];

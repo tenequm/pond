@@ -20,7 +20,7 @@ or `cargo install pond`. Nothing else is required - `pond init` is only for buil
 
 ## What you get
 
-**Four tools, available to the model.** `pond_search`, `pond_get_session`, `pond_get_message`, `pond_sql`. They return pond's own rendered transcripts unmodified, so the "read this next" hints pond writes reach the model intact. They default to the whole archive: cross-agent recall is the point.
+**Four tools, available to the model.** `pond_search`, `pond_get_session`, `pond_get_message`, `pond_sql`. They return pond's own rendered transcripts unmodified, so the "read this next" hints pond writes reach the model intact. They default to the whole archive: cross-agent recall is the point. On `pond_search`, pick mode: "fts" (exact whole words, BM25) or "vector" (meaning; only where that pond instance has embeddings enabled). Omit mode to use pond's default.
 
 **Capture.** The managed pond runs a periodic sync (every 5 minutes by default) that tails pi's session files. Nothing is pushed; pond reads what pi already writes.
 

@@ -12,9 +12,9 @@ restore. This plugin is deliberately **tools only** - no memory slot, no
 auto-recall, no `before_prompt_build` hook, no CLI namespace. It adds four
 tools:
 
-- `pond_search` - search over a readable local archive of past sessions:
-  exact words and BM25 full-text, with semantic (vector) search as the
-  accelerator on top.
+- `pond_search` - search over a readable local archive of past sessions. Pick
+  mode: "fts" (exact whole words, BM25) or "vector" (meaning; only where that
+  pond instance has embeddings enabled). Omit mode to use pond's default.
 - `pond_get_session` - read a whole session as a transcript.
 - `pond_get_message` - expand one message with its full tool bodies.
 - `pond_sql` - read-only SQL analytics over the corpus.

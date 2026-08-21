@@ -141,3 +141,16 @@ describe("pond tools", () => {
     expect(pond.calls[0]?.args).toEqual({ id: "m1", context_before: 0, context_after: 5 });
   });
 });
+
+// The description must read correctly against ANY pond binary: the default arm
+// is the running instance's business, so naming one here would go stale on the
+// first upgrade that flips it.
+describe("mode description is version-neutral", () => {
+  it("names both arms and no default", async () => {
+    const { byName } = await tools();
+    const description = byName.get(POND_TOOL_NAMES.search)?.description ?? "";
+    expect(description).toContain('"fts"');
+    expect(description).toContain('"vector"');
+    expect(description).not.toContain("default,");
+  });
+});
