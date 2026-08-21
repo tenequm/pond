@@ -158,12 +158,12 @@ fn part_for(session: &Session, msg: &Message, idx: usize) -> Part {
     }
 }
 
-fn search_request(query: &str, mode: Option<SearchModeWire>) -> SearchRequest {
+fn search_request(query: &str, mode: SearchModeWire) -> SearchRequest {
     SearchRequest {
         protocol_version: PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),
         query: query.to_owned(),
-        mode: mode.unwrap_or_default(),
+        mode,
         sort_by: pond::wire::SortBy::Relevance,
         filters: SearchFilters::default(),
         limit: 10,
@@ -241,7 +241,7 @@ async fn run_bench(label: String, store: &Store, args: &Args, open_ms: u128) -> 
             match pond_search(
                 store,
                 &embedder,
-                search_request(query, Some(SearchModeWire::Fts)),
+                search_request(query, SearchModeWire::Fts),
                 &cfg,
             )
             .await
@@ -257,7 +257,7 @@ async fn run_bench(label: String, store: &Store, args: &Args, open_ms: u128) -> 
             match pond_search(
                 store,
                 &embedder,
-                search_request(query, Some(SearchModeWire::Vector)),
+                search_request(query, SearchModeWire::Vector),
                 &cfg,
             )
             .await
@@ -363,6 +363,11 @@ fn print_table(rows: &[BenchRow], args: &Args) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // The vector arm is the point of this bench and runs on a fake backend, so
+    // it must not depend on the operator's `[embeddings].enabled`. First call
+    // wins, so seed before `Config::load` installs the config value.
+    pond::embed::init_enabled(true);
 
     let config_path = config::default_config_path(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),

@@ -202,6 +202,12 @@ struct Row {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Both arms are measured on a fake backend, so the vector arm must not
+    // depend on the operator's `[embeddings].enabled`. First call wins, so
+    // seed before `Config::load` installs the config value.
+    pond::embed::init_enabled(true);
+
     let config_path = config::default_config_path(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),

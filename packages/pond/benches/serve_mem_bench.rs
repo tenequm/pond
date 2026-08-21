@@ -5,9 +5,9 @@
 
 //! Read-path bench for `pond mcp` / `pond serve`. Opens an existing
 //! `~/.local/share/pond/` corpus and measures *pond's own* steady-state read
-//! path: the resident meta cache we build, the two retrieval arms (vector
-//! default, fts), and `pond_get_message` hydration - with the cache loaded, the
-//! way the server actually serves.
+//! path: the resident meta cache we build, the two retrieval arms (fts, the
+//! default; vector, the opt-in), and `pond_get_message` hydration - with the
+//! cache loaded, the way the server actually serves.
 //!
 //! It reports total memory at every phase and breaks it into parts - store
 //! open, resident meta cache, Lance caches, candle E5 model - so you can see
@@ -21,16 +21,22 @@
 //!   - build_rowmap  : `ensure_rowmap` builds + mmaps the resident meta cache
 //!   - fts_steady    : N fts-arm queries (no embedder) - pond's core read path
 //!   - vector_first  : first vector query (the cold E5 model-load spike)
-//!   - vector_steady : N vector-arm queries (default arm; needs the embedder)
+//!   - vector_steady : N vector-arm queries (opt-in arm; needs the embedder)
 //!   - get_steady    : N `pond_get_message` hydration calls on prior hits
 //!   - sql_steady    : N `pond_sql` calls (the analytic tool)
 //!   - idle/drained  : resting footprint; drained drops the model (cache stays)
+//!
+//! The vector phases run only when `[embeddings].enabled` is on (the bench
+//! reads the same config `pond serve` does); otherwise they are skipped rather
+//! than downgraded to fts, so no fts timing is ever reported under a vector
+//! label.
 //!
 //! Run:
 //!   cargo bench --bench serve_mem_bench
 //!   cargo bench --bench serve_mem_bench -- --queries 50 --skip-idle
 //!   cargo bench --bench serve_mem_bench -- --attribute   # per-arm latency
 //!   cargo bench --bench serve_mem_bench -- --io-trace    # S3 GETs per arm
+//!   cargo bench --bench serve_mem_bench -- --no-embedder # never-loaded floor
 
 use std::{
     path::{Path, PathBuf},
@@ -108,8 +114,8 @@ struct Args {
     /// instead of `--data-dir` - this is how we measure real S3 read cost.
     #[arg(long)]
     storage_path: Option<String>,
-    /// Config file for creds (default `~/.config/pond/config.toml`). Only used
-    /// with `--storage-path`.
+    /// Config file (default `~/.config/pond/config.toml`). Supplies creds for
+    /// `--storage-path` and the `[embeddings].enabled` the vector phases gate on.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Override the Lance index cache cap (MiB). Default: remote 1024, local 256.
@@ -159,6 +165,12 @@ struct Args {
     /// Runs after the cache build and exits before the normal phases.
     #[arg(long)]
     io_trace: bool,
+    /// Force `[embeddings].enabled = false` for this process: the vector phases
+    /// are skipped and the candle model is never loaded, so the idle floor is
+    /// the one a disabled instance actually rests at (never-loaded, not
+    /// loaded-then-dropped).
+    #[arg(long)]
+    no_embedder: bool,
     /// Skip the idle drain phase.
     #[arg(long)]
     skip_idle: bool,
@@ -791,6 +803,15 @@ fn find_phase<'a>(phases: &'a [PhaseStats], name: &str) -> Option<&'a PhaseStats
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // The vector arm only exists when the process is embedding-enabled, so seed
+    // the flag the way `pond serve` does - from the bench's own config - before
+    // anything reads it. `--no-embedder` pins it off first (first call wins).
+    if args.no_embedder {
+        pond::embed::init_enabled(false);
+    }
+    load_bench_config(&args)?;
+    let vector_enabled = pond::embed::embeddings_enabled();
+
     let target = resolve_open_target(&args)?;
     if let OpenTarget::Local(dir) = &target
         && !dir.join("sessions.lance").exists()
@@ -819,6 +840,16 @@ async fn main() -> Result<()> {
     println!(
         "queries          {} per phase, warmup={}, limit={}",
         args.queries, args.warmup, args.limit,
+    );
+    println!(
+        "embeddings       {}",
+        if vector_enabled {
+            "enabled (vector phases run)"
+        } else if args.no_embedder {
+            "disabled by --no-embedder (never-loaded idle floor)"
+        } else {
+            "disabled by config (vector phases skipped)"
+        },
     );
     println!();
 
@@ -913,19 +944,25 @@ async fn main() -> Result<()> {
     // Exits before the normal phases.
     if args.attribute {
         let empty = Predicate::And(Vec::new());
-        let backend = embedder.get().await?;
+        let backend = if vector_enabled {
+            Some(embedder.get().await?)
+        } else {
+            None
+        };
         // Warm each path once so steady-state cache state matches the phases.
         store.searchable_in_scope(&empty).await?;
         store.fts_search(QUERIES[0], 100, &empty).await?;
-        let warm_vec = backend.embed(&[QUERIES[0].to_string()])?;
-        store
-            .vector_search(
-                warm_vec.first().context("no warm vec")?,
-                100,
-                &empty,
-                Some(&cfg),
-            )
-            .await?;
+        if let Some(backend) = &backend {
+            let warm_vec = backend.embed(&[QUERIES[0].to_string()])?;
+            store
+                .vector_search(
+                    warm_vec.first().context("no warm vec")?,
+                    100,
+                    &empty,
+                    Some(&cfg),
+                )
+                .await?;
+        }
 
         let mut scope_ms = Vec::new();
         let mut fts_ms = Vec::new();
@@ -939,20 +976,28 @@ async fn main() -> Result<()> {
             store.fts_search(q, 100, &empty).await?;
             fts_ms.push(t.elapsed().as_millis());
 
-            let v = backend.embed(&[(*q).to_string()])?;
-            let t = Instant::now();
-            store
-                .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
-                .await?;
-            vec_ms.push(t.elapsed().as_millis());
+            if let Some(backend) = &backend {
+                let v = backend.embed(&[(*q).to_string()])?;
+                let t = Instant::now();
+                store
+                    .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                    .await?;
+                vec_ms.push(t.elapsed().as_millis());
+            }
         }
         println!("\n=== attribution (isolated arm latency, ms) ===");
+        if !vector_enabled {
+            println!("vector arm skipped: embeddings disabled");
+        }
         println!("{:<22}{:>8}{:>8}", "component", "p50", "p95");
         for (name, v) in [
             ("searchable_in_scope", &scope_ms),
             ("fts_search", &fts_ms),
             ("vector_search", &vec_ms),
         ] {
+            if v.is_empty() {
+                continue;
+            }
             println!(
                 "{name:<22}{:>8}{:>8}",
                 percentile(v, 0.5),
@@ -969,15 +1014,29 @@ async fn main() -> Result<()> {
     if args.io_trace {
         use pond::substrate::io_trace;
         let empty = Predicate::And(Vec::new());
-        let backend = embedder.get().await?;
+        let backend = if vector_enabled {
+            Some(embedder.get().await?)
+        } else {
+            None
+        };
+        // The full-request component must issue the mode a real client would
+        // get: sending `vector` to a disabled instance traces a refusal, not a
+        // search.
+        let full_mode = if vector_enabled {
+            SearchModeWire::Vector
+        } else {
+            SearchModeWire::Fts
+        };
         // Warm every path so we measure a warm server's steady-state IO, not the
         // one-time cold index/metadata load.
         store.searchable_in_scope(&empty).await?;
         store.fts_search(QUERIES[0], 100, &empty).await?;
-        let wv = backend.embed(&[QUERIES[0].to_string()])?;
-        store
-            .vector_search(wv.first().context("no warm vec")?, 100, &empty, Some(&cfg))
-            .await?;
+        if let Some(backend) = &backend {
+            let wv = backend.embed(&[QUERIES[0].to_string()])?;
+            store
+                .vector_search(wv.first().context("no warm vec")?, 100, &empty, Some(&cfg))
+                .await?;
+        }
         let warm_hits = store.fts_search(QUERIES[0], 1, &empty).await?;
         let get_id = warm_hits.first().map(|hit| hit.key.message_id.clone());
         if let Some(id) = &get_id {
@@ -986,7 +1045,7 @@ async fn main() -> Result<()> {
         let _ = pond_search(
             &store,
             &embedder,
-            search_request(QUERIES[0], SearchModeWire::Vector, args.limit),
+            search_request(QUERIES[0], full_mode, args.limit),
             &cfg,
         )
         .await;
@@ -1030,13 +1089,15 @@ async fn main() -> Result<()> {
         for q in &queries {
             meas!(0, store.searchable_in_scope(&empty).await?);
             meas!(1, store.fts_search(q, 100, &empty).await?);
-            let v = backend.embed(&[(*q).to_string()])?;
-            meas!(
-                2,
-                store
-                    .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
-                    .await?
-            );
+            if let Some(backend) = &backend {
+                let v = backend.embed(&[(*q).to_string()])?;
+                meas!(
+                    2,
+                    store
+                        .vector_search(v.first().context("no vec")?, 100, &empty, Some(&cfg))
+                        .await?
+                );
+            }
             if let Some(id) = &get_id {
                 meas!(3, {
                     let _ = pond_get_message(&store, get_request(id.clone())).await;
@@ -1048,7 +1109,7 @@ async fn main() -> Result<()> {
                 let _ = pond_search(
                     &store,
                     &embedder,
-                    search_request(q, SearchModeWire::Vector, args.limit),
+                    search_request(q, full_mode, args.limit),
                     &cfg,
                 )
                 .await;
@@ -1056,6 +1117,9 @@ async fn main() -> Result<()> {
         }
 
         println!("\n=== S3 IO per warm query (component isolated) ===");
+        if !vector_enabled {
+            println!("vector arm skipped: embeddings disabled (pond_search traced in fts mode)");
+        }
         println!(
             "{:<16}{:>10}{:>10}{:>13}{:>13}",
             "component", "iops_p50", "iops_p95", "bytes_p50", "bytes_p95"
@@ -1084,8 +1148,13 @@ async fn main() -> Result<()> {
                 - percentile(&iops[2], p) as i128
         };
         if !iops[4].is_empty() {
+            let derived = if vector_enabled {
+                "(derived: pond_search - scope - fts - vector)"
+            } else {
+                "(derived: pond_search - scope - fts)"
+            };
             println!(
-                "{:<16}{:>10}{:>10}    (derived: pond_search - scope - fts - vector)",
+                "{:<16}{:>10}{:>10}    {derived}",
                 "  hydration",
                 hydration(0.5),
                 hydration(0.95),
@@ -1142,48 +1211,53 @@ async fn main() -> Result<()> {
     .await
     .map(|s| phases.push(s))?;
 
-    // ---- Phase: vector_first (the cold E5 model-load spike) ----
-    sampler.mark_phase_start();
-    let rss_start_kb = sampler.current_kb();
-    let pf_start_kb = sampler.current_pf_kb();
-    let request = search_request(QUERIES[0], SearchModeWire::Vector, args.limit);
-    let t = Instant::now();
-    let envelope = pond_search(&store, &embedder, request, &cfg).await;
-    let first_ms = t.elapsed().as_millis();
-    if let SearchEnvelope::Error(error) = envelope {
-        anyhow::bail!("vector_first failed: {error:?}");
-    }
-    thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
-    phases.push(PhaseStats {
-        name: "vector_first",
-        queries: 1,
-        elapsed_ms: vec![first_ms],
-        rss_start_kb,
-        rss_end_kb: sampler.current_kb(),
-        rss_phase_peak_kb: sampler.phase_peak_kb(),
-        rss_global_peak_kb: sampler.peak_kb(),
-        pf_start_kb,
-        pf_end_kb: sampler.current_pf_kb(),
-        pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
-        pf_global_peak_kb: sampler.peak_pf_kb(),
-        notes: format!("first_call_ms={first_ms} (includes E5 model load + vector index)"),
-    });
+    // ---- Phases: vector_first (the cold E5 model-load spike) + vector_steady ----
+    // Skipped, never downgraded to fts: a disabled instance refuses `vector`,
+    // and reporting an fts timing under a vector label would fake the arm.
+    if vector_enabled {
+        sampler.mark_phase_start();
+        let rss_start_kb = sampler.current_kb();
+        let pf_start_kb = sampler.current_pf_kb();
+        let request = search_request(QUERIES[0], SearchModeWire::Vector, args.limit);
+        let t = Instant::now();
+        let envelope = pond_search(&store, &embedder, request, &cfg).await;
+        let first_ms = t.elapsed().as_millis();
+        if let SearchEnvelope::Error(error) = envelope {
+            anyhow::bail!("vector_first failed: {error:?}");
+        }
+        thread::sleep(Duration::from_millis(args.rss_interval_ms * 2));
+        phases.push(PhaseStats {
+            name: "vector_first",
+            queries: 1,
+            elapsed_ms: vec![first_ms],
+            rss_start_kb,
+            rss_end_kb: sampler.current_kb(),
+            rss_phase_peak_kb: sampler.phase_peak_kb(),
+            rss_global_peak_kb: sampler.peak_kb(),
+            pf_start_kb,
+            pf_end_kb: sampler.current_pf_kb(),
+            pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
+            pf_global_peak_kb: sampler.peak_pf_kb(),
+            notes: format!("first_call_ms={first_ms} (includes E5 model load + vector index)"),
+        });
 
-    // ---- Phase: vector_steady (the default arm) ----
-    run_search_phase(SearchPhase {
-        name: "vector_steady",
-        store: &store,
-        embedder: &embedder,
-        cfg: &cfg,
-        sampler: &sampler,
-        mode: SearchModeWire::Vector,
-        queries: &queries,
-        limit: args.limit,
-        record_hits: true,
-        hit_sink: &hit_sink,
-    })
-    .await
-    .map(|s| phases.push(s))?;
+        run_search_phase(SearchPhase {
+            name: "vector_steady",
+            store: &store,
+            embedder: &embedder,
+            cfg: &cfg,
+            sampler: &sampler,
+            mode: SearchModeWire::Vector,
+            queries: &queries,
+            limit: args.limit,
+            record_hits: true,
+            hit_sink: &hit_sink,
+        })
+        .await
+        .map(|s| phases.push(s))?;
+    } else {
+        println!("vector phases skipped: embeddings disabled");
+    }
 
     // ---- Phase: get_steady (pond_get_message hydration on prior hits) ----
     let ids: Vec<String> = {
@@ -1220,8 +1294,13 @@ async fn main() -> Result<()> {
             pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
             pf_global_peak_kb: sampler.peak_pf_kb(),
             notes: format!(
-                "slept {}s with no requests (model resident)",
-                args.idle_seconds
+                "slept {}s with no requests ({})",
+                args.idle_seconds,
+                if vector_enabled {
+                    "model resident"
+                } else {
+                    "model never loaded"
+                },
             ),
         });
 
@@ -1249,7 +1328,11 @@ async fn main() -> Result<()> {
             pf_end_kb: sampler.current_pf_kb(),
             pf_phase_peak_kb: sampler.phase_peak_pf_kb(),
             pf_global_peak_kb: sampler.peak_pf_kb(),
-            notes: "embedder dropped; cache stays resident (pond resting floor)".to_owned(),
+            notes: if vector_enabled {
+                "embedder dropped; cache stays resident (pond resting floor)".to_owned()
+            } else {
+                "model never loaded; cache stays resident (pond resting floor)".to_owned()
+            },
         });
     }
 
@@ -1299,7 +1382,14 @@ async fn main() -> Result<()> {
             mib(d.rss_end_kb),
         );
     }
-    if let (Some(i), Some(d)) = (idle_model, idle_drained) {
+    // With embeddings off the model never loaded, so `idle` and `idle_drained`
+    // are the same measurement - a delta here would read ~0 and pass for "the
+    // model is free". Say n/a instead.
+    if !vector_enabled {
+        println!(
+            "  + candle E5 model (serving)  PF     n/a   RSS     n/a          (embeddings disabled; never loaded)"
+        );
+    } else if let (Some(i), Some(d)) = (idle_model, idle_drained) {
         println!(
             "  + candle E5 model (serving)  PF {:>+7.1}   RSS {:>+7.1} MiB   (lazy; vector arm only)",
             mib(i.pf_end_kb) - mib(d.pf_end_kb),
@@ -1318,6 +1408,9 @@ async fn main() -> Result<()> {
                 if ok { "PASS" } else { "FAIL" },
                 args.idle_target_mib as f64 - floor,
             );
+            if !vector_enabled {
+                println!("               (embeddings disabled: this floor never held the model)");
+            }
             ok
         }
         None => {
@@ -1362,6 +1455,7 @@ async fn main() -> Result<()> {
         "peak_rss_mib": peak_rss,
         "idle_target_mib": args.idle_target_mib,
         "peak_target_mib": args.peak_target_mib,
+        "embeddings_enabled": vector_enabled,
         "pass": pass,
         "phases": json_phases,
     });
