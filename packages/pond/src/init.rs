@@ -257,15 +257,26 @@ pub(crate) async fn run(
     }
     adapter::apply_to_doc(&mut doc, &fresh_accepts, &fresh_declines)?;
 
-    // ---- schedule (opt-in: --yes alone never schedules) --------------------
+    // ---- schedule (creating one is opt-in: --yes alone never schedules) ----
+    // An ACTIVE registration is repair territory instead: re-registering
+    // rewrites the unit with the current template (the config-file pin,
+    // absolutized paths), which is how re-running init after an upgrade heals
+    // a stale unit - so the prompt defaults to yes with the current cadence
+    // preselected. Interactive only: a --yes run may be sandboxed (e2e drives
+    // one), and a sandboxed repair would repoint the user's real unit at the
+    // sandbox config.
+    let active_schedule = schedule::status_snapshot();
     let schedule_choice: Option<ScheduleEvery> = match args.schedule {
         Some(every) => Some(every),
         None if prompts => {
-            let wanted = wiz(
-                cliclack::confirm("Run pond sync automatically on a schedule?")
-                    .initial_value(false)
-                    .interact(),
-            )?;
+            let prompt = if active_schedule.active {
+                "Sync schedule found - re-register it? (refreshes the unit after an upgrade; No leaves it unchanged)"
+            } else {
+                "Run pond sync automatically on a schedule?"
+            };
+            let wanted = wiz(cliclack::confirm(prompt)
+                .initial_value(active_schedule.active)
+                .interact())?;
             if wanted {
                 // cliclack renders hints only on the focused item, so the
                 // recommendation rides in the label to stay visible.
@@ -275,7 +286,7 @@ pub(crate) async fn run(
                     .item(ScheduleEvery::H1, "every hour", "")
                     .item(ScheduleEvery::H6, "every 6 hours", "")
                     .item(ScheduleEvery::D1, "daily", "")
-                    .initial_value(ScheduleEvery::M5)
+                    .initial_value(active_schedule.every.unwrap_or(ScheduleEvery::M5))
                     .interact())?)
             } else {
                 None
