@@ -1389,6 +1389,12 @@ mod search_handler {
         ts.timestamp() as f64
     }
 
+    /// Literal text of the `mode=vector` refusal. One constant: the MCP tool, the
+    /// REST route, the CLI, and `optimize --only embed` all print this exact line.
+    pub const SEMANTIC_DISABLED_MESSAGE: &str = "semantic search is off on this pond instance: \
+        set [embeddings].enabled = true in pond's config (or POND_EMBEDDINGS_ENABLED=true), \
+        run `pond optimize --only embed`, then retry with mode=\"vector\" - or use mode=\"fts\"";
+
     /// Pick the effective retrieval arm. `fts` always stays `fts`. `vector`
     /// degrades to `fts` when the store has no embeddings - there is nothing to
     /// match against (`has_embeddings()` is the only gate).
@@ -2028,8 +2034,8 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    SearchMode, SearchPlan, build_scope_filter, default_excludes_subagents, explain_search_plan,
-    hit_payload, plan_search, pond_search,
+    SEMANTIC_DISABLED_MESSAGE, SearchMode, SearchPlan, build_scope_filter,
+    default_excludes_subagents, explain_search_plan, hit_payload, plan_search, pond_search,
 };
 
 #[cfg(test)]

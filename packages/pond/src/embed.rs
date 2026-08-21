@@ -353,6 +353,30 @@ pub fn init_model_id(id: String) {
     MODEL_ID_RUNTIME.get_or_init(|| id);
 }
 
+/// Process-wide opt-in switch, seeded once at startup from
+/// `[embeddings].enabled` via [`init_enabled`]. Uninitialized -> `false`, so a
+/// process that never loaded config (tests, ad-hoc tooling) behaves like a
+/// fresh install. Tests that need the vector arm call `init_enabled(true)`.
+static ENABLED_RUNTIME: OnceLock<bool> = OnceLock::new();
+
+pub fn embeddings_enabled() -> bool {
+    ENABLED_RUNTIME.get().copied().unwrap_or(false)
+}
+
+pub fn init_enabled(enabled: bool) {
+    ENABLED_RUNTIME.get_or_init(|| enabled);
+}
+
+/// Debug-only seeding-order tripwire: a verb that reads the flag before
+/// `EmbeddingsConfig::install_runtime` ran would silently behave as disabled on
+/// an enabled instance, so fail the test run instead.
+pub fn assert_runtime_installed() {
+    debug_assert!(
+        ENABLED_RUNTIME.get().is_some(),
+        "embeddings flag read before install_runtime"
+    );
+}
+
 /// Messages per model-inference + write batch. e5 truncates at 512 tokens, so
 /// a 32-row batch's padded attention transient stays bounded.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
