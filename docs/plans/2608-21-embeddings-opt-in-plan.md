@@ -287,7 +287,7 @@ Why: a JSON-RPC error makes hermes-pond tear down and respawn the `pond serve` c
 
 **CLI** `pond search`: `main.rs` ~512 and ~533-536 `--mode` help: `fts` default, `vector` needs `[embeddings].enabled`. The refusal already surfaces through the existing error printing; verify `pond search --mode vector x` prints `SEMANTIC_DISABLED_MESSAGE` and exits non-zero.
 
-**Delete `min_score`** (decision 14) as its own commit on the branch (`refactor(search): drop min_score - unused, vector-only`; no `!` - the PR squashes into the one `feat!:` commit, which carries the breaking marker), BEFORE the default flip so the diff is reviewable on its own. After the squash the re-add target is this list, not a commit:
+**Delete `min_score`** (decision 14) as its own commit on the branch (`feat!(search): drop min_score - unused, vector-only`), BEFORE the default flip so the diff is reviewable on its own. After the squash the re-add target is this list, not a commit:
 - `wire.rs` ~660 `SearchRequest.min_score: f64` - remove the field and its doc.
 - `handlers.rs` ~1205-1212 the "BM25 is unbounded ... reject a non-zero floor on fts" block - remove; `SearchPlan.min_score` and every read of it (`rg -n min_score packages/pond/src` - 28 hits at the time of writing, across `wire.rs`, `handlers.rs`, `main.rs`, `render.rs`, `transport.rs`) - remove the vector-arm filter that applies it and the plan field.
 - `main.rs` ~558-563 the `--min-score` clap arg and its two pass-throughs (~1573, ~1592).
