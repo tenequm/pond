@@ -64,6 +64,23 @@ Sessions are picked up automatically from **Claude Code**, the **Claude desktop 
 
 No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories.
 
+Three kinds of tool get called "memory". Side by side:
+
+| | **pond** | **Session search** (ctx, deja-vu, cass) | **Memory layers** (Mem0, Letta) |
+|---|---|---|---|
+| History from before install | yes | yes | no |
+| What is kept | the whole session | a search index ¹ | extracted facts |
+| Where it lives | local dir or S3 bucket | local index | the tool's database |
+| After the harness deletes the file | still there | gone at next refresh ¹ | only the extract |
+| Several machines | one shared bucket | pulled into one machine ² | shared server or cloud |
+| Agent access | CLI, MCP, HTTP, SQL | CLI, MCP ³ | HTTP, SDK, MCP |
+
+¹ cass also mirrors the raw files, so they outlive the source. ² deja-vu copies records between machines over ssh; cass pulls other hosts' session files over ssh/rsync into its local index; ctx is single-machine. ³ cass has no MCP server.
+
+Pick session search for fast local recall. Pick a memory layer when the agent should carry distilled facts, not the record. Pick pond when you want the sessions themselves, in storage you own, from every machine you run.
+
+Every cell is a claim about a specific version of someone else's project. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
+
 ## Background
 
 Every agentic CLI ships its own session format and its own search surface. Switching tools means losing history. Replaying a Claude Code session in another provider's tooling means re-translating the wire shape by hand. Hosted multi-tenant deployments rebuild the same storage layer from scratch.
