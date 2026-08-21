@@ -249,9 +249,10 @@ fn config_file(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 /// Registration entry point for `pond init`, which calls it after the config
-/// write.
-pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
-    platform_start(every, &config_file(None))
+/// write with the config path it resolved (a `--config-file` passed to init
+/// must pin into the unit, and clap's parsed value is invisible from here).
+pub(crate) fn start(every: ScheduleEvery, explicit: Option<PathBuf>) -> Result<()> {
+    platform_start(every, &config_file(explicit))
 }
 
 // ---------------------------------------------------------------------------

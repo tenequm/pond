@@ -1278,6 +1278,20 @@ async fn run() -> anyhow::Result<()> {
                         Ok(None)
                     }
                 };
+                // The searchable count is an FTS fact, not an embedding one:
+                // with embedding disabled `-v` reads it from the FTS index's
+                // num_docs (index-resident, no data scan) instead of the
+                // skipped embedding probe.
+                let searchable_fut = async {
+                    if verbose && !pond::embed::embeddings_enabled() {
+                        store
+                            .searchable_in_scope(&pond::substrate::Predicate::And(Vec::new()))
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
                 let hosts_fut = async {
                     if hosts {
                         store.ingest_host_activity().await.map(Some)
@@ -1291,6 +1305,7 @@ async fn run() -> anyhow::Result<()> {
                     names,
                     index_status,
                     embedding,
+                    searchable_only,
                     host_activity,
                 ) = tokio::try_join!(
                     store.table_sizes(),
@@ -1298,6 +1313,7 @@ async fn run() -> anyhow::Result<()> {
                     store.adapter_names(include_subagents),
                     store.index_status_indexable(),
                     embedding_fut,
+                    searchable_fut,
                     hosts_fut,
                 )?;
                 let totals = RowTotals {
@@ -1309,6 +1325,10 @@ async fn run() -> anyhow::Result<()> {
                     totals: &totals,
                     adapter_count: names.len(),
                     index_status: &index_status,
+                    searchable: embedding
+                        .as_ref()
+                        .map(|e| e.total as u64)
+                        .or(searchable_only.map(|n| n as u64)),
                     embedding,
                 };
                 // One scheduler probe (a launchctl/systemctl spawn) serves
@@ -3571,12 +3591,22 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
             dest_duplicates,
         })
     };
+    // The embedding probe is two data-page count_rows scans (~7 s each on a
+    // remote store) and its result is read only on the enabled path - do not
+    // pay it when disabled.
+    let embedding_probe = async {
+        if pond::embed::embeddings_enabled() {
+            to.embedding_progress().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    };
     let (sessions, messages, parts, dest_index_status, dest_embedding) = tokio::try_join!(
         verify_table(Table::Sessions),
         verify_table(Table::Messages),
         verify_table(Table::Parts),
         to.index_status(),
-        to.embedding_progress(),
+        embedding_probe,
     )?;
     let tables = vec![sessions, messages, parts];
     let fts_present = dest_index_status
@@ -3589,9 +3619,9 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
         fts_present,
         // With embedding disabled there is no IVF intent, so a missing index is
         // the expected steady state - not a "run pond optimize" nag.
-        vector_present_or_below_activation: !pond::embed::embeddings_enabled()
-            || vector_present
-            || dest_embedding.embedded < VECTOR_INDEX_ACTIVATION_ROWS,
+        vector_present_or_below_activation: vector_present
+            || dest_embedding
+                .is_none_or(|progress| progress.embedded < VECTOR_INDEX_ACTIVATION_ROWS),
     };
     Ok(StorageVerify {
         tables,
@@ -6039,6 +6069,9 @@ struct StatusChecks<'a> {
     totals: &'a RowTotals,
     adapter_count: usize,
     index_status: &'a [IndexStatus],
+    /// Non-null `search_text` count, present only under `-v`: from the
+    /// embedding probe when enabled, from FTS `num_docs` when disabled.
+    searchable: Option<u64>,
     embedding: Option<EmbeddingProgress>,
 }
 
@@ -6055,10 +6088,10 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         pond::embed::embeddings_enabled(),
     );
     output(&render_indexes_line(&health))?;
-    // Default: `stored` shows the manifest row count (cheap); under `-v` the
-    // embedding probe ran, so swap in the searchable subset and report it.
-    let messages_label = match &checks.embedding {
-        Some(e) => format!("{} searchable messages", format_thousands(e.total as u64)),
+    // Default: `stored` shows the manifest row count (cheap); under `-v` a
+    // searchable count was read, so swap in the searchable subset.
+    let messages_label = match checks.searchable {
+        Some(n) => format!("{} searchable messages", format_thousands(n)),
         None => format!("{} messages", format_thousands(checks.totals.messages)),
     };
     output(&format!(
@@ -6081,7 +6114,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         paint("agents", dim()),
         checks.adapter_count,
     ))?;
-    if checks.embedding.is_none() {
+    if checks.searchable.is_none() {
         let hint = if pond::embed::embeddings_enabled() {
             "(use -v for searchable message count + embedding backlog)"
         } else {

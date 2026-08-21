@@ -74,7 +74,9 @@ static WIZARD_PROMPTS_ACTIVE: AtomicBool = AtomicBool::new(true);
 /// stopped" - that is only true if the interrupt path still installs the
 /// schedule. `take()` keeps registration single-shot between the handler and
 /// the normal path.
-static PENDING_SCHEDULE: Mutex<Option<ScheduleEvery>> = Mutex::new(None);
+/// `(every, config_file)`: the registration pins the config path init
+/// resolved, so a `--config-file` init writes to is the one the unit reads.
+static PENDING_SCHEDULE: Mutex<Option<(ScheduleEvery, PathBuf)>> = Mutex::new(None);
 
 /// Unwrap a prompt result. Esc and Ctrl-C surface from cliclack as
 /// `Interrupted` (the wizard-scoped ctrlc handler in [`run`] is what keeps
@@ -122,9 +124,9 @@ pub(crate) async fn run(
         let _ = ctrlc::set_handler(|| {
             if !WIZARD_PROMPTS_ACTIVE.load(Ordering::SeqCst) {
                 if let Ok(mut pending) = PENDING_SCHEDULE.lock()
-                    && let Some(every) = pending.take()
+                    && let Some((every, config_file)) = pending.take()
                 {
-                    let _ = schedule::start(every);
+                    let _ = schedule::start(every, Some(config_file));
                 }
                 std::process::exit(130);
             }
@@ -377,7 +379,7 @@ pub(crate) async fn run(
     // Park the schedule for the Ctrl-C handler BEFORE the sync re-arms it, so
     // no window exists where an interrupt exits without registering.
     if let Ok(mut pending) = PENDING_SCHEDULE.lock() {
-        *pending = schedule_choice;
+        *pending = schedule_choice.map(|every| (every, config_file.clone()));
     }
     let first_sync = if run_first_sync {
         WIZARD_PROMPTS_ACTIVE.store(false, Ordering::SeqCst);
@@ -399,7 +401,9 @@ pub(crate) async fn run(
     // blocks on this mutex, so an interrupt landing mid-registration waits
     // for it to finish instead of exiting between the take and the start.
     let registration = match PENDING_SCHEDULE.lock() {
-        Ok(mut pending) => pending.take().map(schedule::start),
+        Ok(mut pending) => pending
+            .take()
+            .map(|(every, config_file)| schedule::start(every, Some(config_file))),
         Err(_) => None,
     };
     if let Some(outcome) = registration {

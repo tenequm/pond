@@ -62,13 +62,13 @@ The cache volume is not optional in a fleet: the model lands in `$HOME/.cache/hu
 
 The value must be the literal `true` or `false`; `1` fails config load.
 
-The read side needs nothing set to *read* vectors, but it does need the flag to *make* them - which is how the fleet doc's "Split the embedding work off the workers" is done here. Leave `worker-pond` at the default (off) and run the central pass on an enabled read side:
+The refusal is per process, not per store: any pond that should answer `"mode":"vector"` needs the flag, existing vectors or not, and it loads the model to embed the query - so give the serving `read-side` the same `POND_EMBEDDINGS_ENABLED: "true"` plus the `hf-cache` volume when you turn this on. The workers still need nothing - which is how the fleet doc's "Split the embedding work off the workers" is done here. Leave `worker-pond` at the default (off) and run the central pass on an enabled read side:
 
 ```
 docker compose run --rm -e POND_EMBEDDINGS_ENABLED=true read-side optimize --only embed
 ```
 
-That embeds everything the workers ingested without vectors, and it is the same pass that earns its keep for sessions arriving by another route (`pond copy`) and for the model-swap re-embed (`--force-embed`). Until it has run, `"mode":"vector"` is refused; afterwards it answers from the same store.
+That embeds everything the workers ingested without vectors, and it is the same pass that earns its keep for sessions arriving by another route (`pond copy`) and for the model-swap re-embed (`--force-embed`). Until it has run, `"mode":"vector"` finds nothing to rank; afterwards an enabled read side answers from the same store (a read side without the flag keeps refusing the mode regardless of what the store holds).
 
 ## See the fleet view
 

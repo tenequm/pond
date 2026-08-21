@@ -1154,6 +1154,11 @@ pub struct IndexIntent {
     /// How the params are built at create time. Some intents have static
     /// params (FTS, scalars); IVF_SQ needs the row count to size partitions.
     pub params: IndexParamsKind,
+    /// Narrow co-set column to probe for the all-null fold guard instead of
+    /// `column`. A wide indexed column (vectors) makes the probe a data-page
+    /// storm exactly when it matters (an all-null tail never early-stops);
+    /// a co-set sibling answers the same question at a fraction of the read.
+    pub presence_column: Option<&'static str>,
 }
 
 /// When an [`IndexIntent`] should exist on disk.
@@ -3309,7 +3314,12 @@ async fn optimize_table_indices(
         if matches!(
             intent.params,
             IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. }
-        ) && !column_has_values(dataset, intent.column, &unindexed).await?
+        ) && !column_has_values(
+            dataset,
+            intent.presence_column.unwrap_or(intent.column),
+            &unindexed,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "pond::perf",
@@ -3544,7 +3554,12 @@ async fn index_status(
                 IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. }
             )
         {
-            unindexed_rows = column_value_count(dataset, intent.column, &unindexed).await?;
+            unindexed_rows = column_value_count(
+                dataset,
+                intent.presence_column.unwrap_or(intent.column),
+                &unindexed,
+            )
+            .await?;
         }
         statuses.push(IndexStatus {
             table,

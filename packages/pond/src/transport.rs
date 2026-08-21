@@ -284,6 +284,45 @@ conversational siblings each side, both default 3, like grep -B/-A). A \
 session id is rejected with a hint naming pond_get_session - it cannot pick \
 one message.";
 
+    /// `schema://pond` for the serving instance. With embedding off the doc
+    /// must not offer the vector arm
+    /// (spec.md#protocol-self-describing-capabilities): the same
+    /// self-description rule `annotate_search_mode`
+    /// enforces on `tools/list`. Each rewrite is asserted so the doc and the
+    /// rewrite cannot drift apart silently.
+    fn schema_doc_for(enabled: bool) -> String {
+        if enabled {
+            return SCHEMA_DOC.to_owned();
+        }
+        let rewrites = [
+            (
+                "mode (fts default - matches exact whole \
+words, BM25 | vector - matches on meaning)",
+                "mode (fts, the only arm on this instance - matches exact whole words, BM25)",
+            ),
+            (
+                "(raw cosine for vector, normalized BM25 for fts). vector relevance \
+ordering adds a gentle recency tiebreaker;",
+                "(normalized BM25);",
+            ),
+            (
+                "pond's embedder (multilingual-e5-small) is trained \
+for cross-lingual retrieval, so a vector query in language A can match indexed \
+text in language B. fts",
+                "fts",
+            ),
+        ];
+        let mut doc = SCHEMA_DOC.to_owned();
+        for (from, to) in rewrites {
+            debug_assert!(
+                doc.contains(from),
+                "schema doc drifted from rewrite: {from}"
+            );
+            doc = doc.replace(from, to);
+        }
+        doc
+    }
+
     /// Static documentation served as the `schema://pond-sql` resource: the
     /// table/column schema, dialect, function set, output modes, pagination
     /// pattern, drilling pattern, and worked examples for `pond_sql`.
@@ -1100,7 +1139,7 @@ Examples (4 patterns the agent should recognize):
         ) -> Result<ReadResourceResult, ErrorData> {
             match request.uri.as_str() {
                 "schema://pond" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    SCHEMA_DOC,
+                    schema_doc_for(crate::embed::embeddings_enabled()),
                     request.uri,
                 )])),
                 "schema://pond-sql" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -1139,16 +1178,24 @@ Examples (4 patterns the agent should recognize):
                         ErrorData::internal_error(format!("stats unavailable: {error}"), None)
                     };
                     let (sessions, messages, parts) = store.row_counts().await.map_err(&map_err)?;
-                    // Both are data-page scans over `messages` and both report
-                    // only embedding state, so an instance with embedding off
-                    // skips the calls outright and nulls the keys.
-                    let embedding = if crate::embed::embeddings_enabled() {
-                        Some((
-                            store.embedding_progress().await.map_err(&map_err)?,
-                            store.stale_embedding_count().await.map_err(&map_err)?,
-                        ))
+                    // Both are data-page scans over `messages` reporting
+                    // embedding state, so an instance with embedding off skips
+                    // the calls outright and nulls the embeddings keys. The
+                    // searchable count is an FTS fact, not an embedding one:
+                    // when disabled it comes from the FTS index's num_docs
+                    // (index-resident, no data scan) so the corpus block stays
+                    // complete on the default posture.
+                    let (embedding, searchable) = if crate::embed::embeddings_enabled() {
+                        let progress = store.embedding_progress().await.map_err(&map_err)?;
+                        let stale = store.stale_embedding_count().await.map_err(&map_err)?;
+                        let searchable = progress.total;
+                        (Some((progress, stale)), searchable)
                     } else {
-                        None
+                        let searchable = store
+                            .searchable_in_scope(&crate::substrate::Predicate::And(Vec::new()))
+                            .await
+                            .map_err(&map_err)?;
+                        (None, searchable)
                     };
                     let indices = store.index_status().await.map_err(&map_err)?;
 
@@ -1182,7 +1229,7 @@ Examples (4 patterns the agent should recognize):
                         "corpus": {
                             "sessions": sessions,
                             "messages": messages,
-                            "searchable_messages": embedding.as_ref().map(|(p, _)| p.total),
+                            "searchable_messages": searchable,
                             "parts": parts,
                         },
                         "embeddings": {
@@ -1248,7 +1295,7 @@ Examples (4 patterns the agent should recognize):
             .details
             .get("config_key")
             .and_then(serde_json::Value::as_str)
-            == Some("embeddings.enabled")
+            == Some(crate::handlers::SEMANTIC_DISABLED_CONFIG_KEY)
     }
 
     /// With embedding off, the `pond_search` surface must not invite a vector

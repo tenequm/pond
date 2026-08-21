@@ -4822,6 +4822,7 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
         column: "search_text",
         trigger: IndexTrigger::OnAnyRows,
         params: IndexParamsKind::InvertedFtsWord,
+        presence_column: None,
     });
     for (column, kind, name) in MESSAGE_SCALAR_INDICES {
         messages.push(IndexIntent {
@@ -4829,20 +4830,26 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
+            presence_column: None,
         });
     }
     if include_vector {
         messages.push(IndexIntent {
             name: MESSAGES_VECTOR_INDEX,
             column: "vector",
+            // Probes count `embedding_model`, the narrow co-set sibling of
+            // `vector` (spec.md#session-embed-from-canonical): same answer,
+            // none of the wide-column data-page reads (CLAUDE.md "count_rows
+            // predicates").
             trigger: IndexTrigger::OnNonNullCount {
-                column: "vector",
+                column: "embedding_model",
                 threshold: vector_threshold,
             },
             params: IndexParamsKind::IvfSqCosine {
                 num_bits: IVF_SQ_NUM_BITS,
                 max_iters: IVF_SQ_MAX_ITERS,
             },
+            presence_column: Some("embedding_model"),
         });
     }
     let parts = PARTS_SCALAR_INDICES
@@ -4852,6 +4859,7 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
+            presence_column: None,
         })
         .collect();
     let sessions = SESSIONS_SCALAR_INDICES
@@ -4861,6 +4869,7 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column,
             trigger: IndexTrigger::OnAnyRows,
             params: IndexParamsKind::Scalar(kind.clone()),
+            presence_column: None,
         })
         .collect();
     IndexIntents {

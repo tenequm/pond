@@ -1393,6 +1393,12 @@ mod search_handler {
 
     /// Literal text of the `mode=vector` refusal. One constant: the MCP tool, the
     /// REST route, the CLI, and `optimize --only embed` all print this exact line.
+    /// `details.config_key` value the refusal carries. Load-bearing beyond
+    /// documentation: the MCP transport dispatches on this exact key/value to
+    /// deliver the refusal as an in-turn tool error instead of a JSON-RPC
+    /// error (which would make hermes-pond respawn `pond serve` per call).
+    pub const SEMANTIC_DISABLED_CONFIG_KEY: &str = "embeddings.enabled";
+
     pub const SEMANTIC_DISABLED_MESSAGE: &str = "semantic search is off on this pond instance: \
         set [embeddings].enabled = true in pond's config (or POND_EMBEDDINGS_ENABLED=true), \
         run `pond optimize --only embed`, then retry with mode=\"vector\" - or use mode=\"fts\"";
@@ -1416,7 +1422,7 @@ mod search_handler {
                 SEMANTIC_DISABLED_MESSAGE,
                 serde_json::json!({
                     "field": "mode",
-                    "config_key": "embeddings.enabled",
+                    "config_key": SEMANTIC_DISABLED_CONFIG_KEY,
                     "retryable": false,
                 }),
             ));
@@ -2077,8 +2083,9 @@ mod search_handler {
 }
 
 pub use search_handler::{
-    SEMANTIC_DISABLED_MESSAGE, SearchMode, SearchPlan, build_scope_filter,
-    default_excludes_subagents, explain_search_plan, hit_payload, plan_search, pond_search,
+    SEMANTIC_DISABLED_CONFIG_KEY, SEMANTIC_DISABLED_MESSAGE, SearchMode, SearchPlan,
+    build_scope_filter, default_excludes_subagents, explain_search_plan, hit_payload, plan_search,
+    pond_search,
 };
 
 #[cfg(test)]

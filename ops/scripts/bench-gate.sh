@@ -23,12 +23,13 @@ PROBE_MID="${PROBE_MID:-419caaa5-13d7-448a-807c-5fb5105112a7}"
 BASELINE="ops/bench-gate-baseline.jsonl"
 TMP="$(mktemp -d)"
 
-# The gate owns its config - the operator's storage + creds, embeddings forced
-# on - so the vector probe measures vector search whatever the machine has
-# [embeddings].enabled set to.
-export POND_CONFIG_FILE="$TMP/config.toml"
-awk '/^\[embeddings\]/{skip=1;next} /^\[/{skip=0} !skip' "$OPERATOR_CONFIG" > "$POND_CONFIG_FILE"
-printf '\n[embeddings]\nenabled = true\n' >> "$POND_CONFIG_FILE"
+# Force embeddings on through the env mirror: Config::load layers
+# POND_EMBEDDINGS_ENABLED over the operator's file in every consumer (the CLI
+# probes and the cargo benches alike), so the vector probe measures vector
+# search whatever the machine has [embeddings].enabled set to - while the
+# operator's model/dim (a different embedding space if overridden) stay
+# exactly what the store was embedded with.
+export POND_EMBEDDINGS_ENABLED=true
 
 echo "=== bench gate: $STORE_URL ==="
 cargo build --release
