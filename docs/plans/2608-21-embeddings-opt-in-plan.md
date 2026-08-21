@@ -471,6 +471,9 @@ Version-neutral wording (decision 16) - one string, used by all three:
 - 8.7 (~763): replace the whole paragraph: "Embedding is opt-in by configuration (`[embeddings].enabled`, default off). With it off, no pond process loads a model, ingest writes no vectors, index maintenance ignores the vector index, and a `vector` request is refused. With it on, ingest embeds inline, `pond optimize --only embed` fills any backlog, and the `vector` arm is available on request; `fts` is the default arm either way. Instances sharing one store may differ: rows ingested by an instance with embedding off are embedded when an enabled instance next runs `pond optimize --only embed`."
 - 8.8 (~767): add "The vector index is maintained only by instances with embedding enabled; an instance with it off leaves an existing vector index untouched."
 - 3.7 (~212, ~219): "FTS + vector fold at the sync tail" -> "FTS (and, when embedding is enabled, vector) fold".
+- 7.8 `schedule`: add "the installed unit pins the state directory and the config file it was registered with, so a scheduled run sees the same configuration as a manual one".
+- 7 (protocol, where the MCP surface / `instructions` are described - `rg -n "instructions" docs/spec.md`): add a rule `protocol-self-describing-capabilities`: "The server's instructions and tool descriptions MUST state only the capabilities the serving instance offers, and every statement about default behaviour MUST come from the running binary, never from an installed file (skill, plugin text). Why: fleets upgrade one host at a time; a file that names a default goes stale the moment the binary's default changes, and a description that offers an arm the instance refuses costs a wasted turn per agent per attempt."
+- 8.3: delete "plus a minimum score".
 - Contents line ~19 and 1.1 line ~31: only if they name the vector default.
 
 ### 5.10 Scheduler units
