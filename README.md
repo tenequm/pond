@@ -225,6 +225,32 @@ The full contract is in [`docs/spec.md`](docs/spec.md). Key choices:
 - **Opaque-string multi-tenancy.** Each tenant is a `namespace` string the integrator supplies; pond does not authenticate, authorize, or model identity. The object store's IAM is the storage boundary.
 - **Encryption is operational.** Bucket SSE plus filesystem encryption; pond holds no keys and adds no application-level crypto.
 
+## Roadmap
+
+pond ships in small steps. This table lists the steps in order. Done steps stay in the table. The [roadmap board](https://github.com/users/tenequm/projects/1) holds the same items with their issues. React or comment on an issue to influence the order.
+
+| # | Step | Status |
+|---|------|--------|
+| 1 | Lossless ingest from Claude Code and Codex into Lance, local or S3 | ✅ [v0.5](https://github.com/tenequm/pond/releases/tag/v0.5.0) |
+| 2 | Single-arm search: BM25 or vector, one arm per query | ✅ [v0.10](https://github.com/tenequm/pond/releases/tag/v0.10.0) |
+| 3 | Remote sync in under a minute; warm search in under a second | ✅ [v0.11](https://github.com/tenequm/pond/releases/tag/v0.11.0)-[v0.12](https://github.com/tenequm/pond/releases/tag/v0.12.0) |
+| 4 | Tool-call columns and read-only SQL over the corpus | ✅ [v0.13](https://github.com/tenequm/pond/releases/tag/v0.13.0) |
+| 5 | Crash-safe local stores that self-heal on open | ✅ [v0.14.0](https://github.com/tenequm/pond/releases/tag/v0.14.0) |
+| 6 | Eleven harnesses, `pond resume` into any client, MCP registry, Windows | ✅ [v0.14.11](https://github.com/tenequm/pond/releases/tag/v0.14.11) |
+| 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ⏭ Next |
+| 8 | Lance 10: count pushdown, date-filter zonemaps, faster index commits. [#145](https://github.com/tenequm/pond/issues/145) | ⏭ Next |
+| 9 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
+| 10 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
+| 11 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | ⏳ Later |
+| 12 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
+| | A capture daemon. pond reads what your harness already writes. | ❌ Not planned |
+| | A hosted service that owns your bucket. Your storage stays yours. | ❌ Not planned |
+| | Summaries or pruning of stored sessions. pond keeps the sessions. | ❌ Not planned |
+
+Step 7 is based on data. Over 63 days, agents ran 1,126 searches against this archive. BM25 found the answer 61% of the time. Vector found it 37% of the time. Read [the measurement](docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md).
+
+This is a direction, not a contract. The order changes when the data changes.
+
 ## References
 
 The upstream schemas that shaped pond's canonical model are documented in [`docs/references/`](docs/references/) (source URLs + why each matters; the vendored code itself is not redistributed). Real session captures live under `packages/pond/tests/fixtures/adapter/`.
@@ -246,7 +272,7 @@ Issues and pull requests are welcome. The most useful contributions right now:
 - Pointers to additional reference schemas or session samples worth documenting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
 
-For larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](.github/SECURITY.md).
+For something bigger, the [roadmap](#roadmap) is the list. Comment on the issue before you start, so we agree on the scope. For other larger changes, open an issue first to discuss the direction. For security issues, see [SECURITY.md](.github/SECURITY.md).
 
 Questions or feedback? Start a [GitHub Discussion](https://github.com/tenequm/pond/discussions), or DM me on [Telegram](https://t.me/tenequm) or [X](https://x.com/opwizardx) - I answer personally.
 
