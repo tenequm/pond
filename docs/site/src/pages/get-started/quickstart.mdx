@@ -1,5 +1,5 @@
 ---
-description: Get started with pond - pond init sets up storage, adapters, and MCP registration; pond sync ingests and embeds your Claude Code, Codex, and OpenCode sessions; then ask any agent about your past work.
+description: Get started with pond - pond init sets up storage, adapters, and MCP registration; pond sync ingests and indexes your Claude Code, Codex, and OpenCode sessions; then ask any agent about your past work.
 ---
 
 # Quickstart
@@ -20,7 +20,7 @@ pond init -y --every 5m  # non-interactive: enable every discovered adapter, syn
 ## Ingest
 
 ```sh
-pond sync  # import, embed, index - every enabled adapter
+pond sync  # import and index - every enabled adapter
 ```
 
 `sync` only ingests already-enabled adapters; it never enables on its own. Manage the set with `pond adapters list|discover|enable|disable`.

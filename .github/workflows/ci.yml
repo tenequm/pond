@@ -508,7 +508,7 @@ jobs:
             '';
 
             meta = {
-              description = "Lossless storage and hybrid search for sessions from any AI agent client";
+              description = "Lossless storage, full-text search, and optional semantic search for sessions from any AI agent client";
               homepage = "https://pond.locker/";
               changelog = "https://github.com/tenequm/pond/releases/tag/v\${version}";
               license = lib.licenses.asl20;
@@ -550,7 +550,7 @@ jobs:
           # frozen_string_literal: true
 
           class Pond < Formula
-            desc "Lossless storage and hybrid search for sessions from any AI agent client"
+            desc "Lossless storage, full-text search, and optional semantic search for sessions from any AI agent client"
             homepage "https://pond.locker/"
             license "Apache-2.0"
 

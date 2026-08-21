@@ -1,5 +1,5 @@
 ---
-description: pond's MCP tools - pond_search (vector or full-text search over agent sessions), pond_get_session (a whole session by id), pond_get_message (one message with full tool bodies), and pond_sql (read-only SQL over sessions, messages, and parts).
+description: pond's MCP tools - pond_search (full-text search over agent sessions, semantic when enabled), pond_get_session (a whole session by id), pond_get_message (one message with full tool bodies), and pond_sql (read-only SQL over sessions, messages, and parts).
 ---
 
 # MCP tools
@@ -10,12 +10,12 @@ Three tools cover almost every request: `pond_search` finds, `pond_get_session` 
 
 ## pond_search
 
-Find relevant messages across all stored sessions - semantic or keyword. Returns a readable transcript of ranked hits grouped by session, best session first.
+Find relevant messages across all stored sessions. Returns a readable transcript of ranked hits grouped by session, best session first.
 
 | Parameter | Meaning |
 |---|---|
-| `query` | what to search for - keep it semantic (concepts, not project names) |
-| `mode` | `vector` (default, matches on meaning) or `fts` (exact whole words, BM25) |
+| `query` | what to search for - distinctive words from the work you are looking for |
+| `mode` | `fts` (default, exact whole words, BM25) or `vector` (matches on meaning) - the `vector` arm is refused unless [semantic search is enabled](/reference/configuration#embeddings) |
 | `sort_by` | `relevance` (default) or `recency` |
 | `project` | only sessions whose project path contains this substring |
 | `session_id` | search within one session |
@@ -56,4 +56,4 @@ Read-only is enforced in two layers (statement allowlist plus a read-only sessio
 
 - `schema://pond` - search-field documentation and response format
 - `schema://pond-sql` - the SQL surface's table schemas
-- `stats://pond` - corpus and embedding statistics
+- `stats://pond` - corpus and index statistics
