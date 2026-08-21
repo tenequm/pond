@@ -274,8 +274,8 @@ fn platform_probe() -> Result<State> {
 // Task Scheduler's Exec action carries no environment block, so the Windows
 // backend pins its paths as `pondw` arguments instead of env vars.
 #[cfg(windows)]
-fn platform_start(every: ScheduleEvery, _config_file: &Path) -> Result<()> {
-    windows::start(every)
+fn platform_start(every: ScheduleEvery, config_file: &Path) -> Result<()> {
+    windows::start(every, config_file)
 }
 #[cfg(unix)]
 fn platform_start(every: ScheduleEvery, config_file: &Path) -> Result<()> {
@@ -1084,7 +1084,7 @@ mod windows {
 
     /// Register (or replace, via `/F`) the Task Scheduler job. Shared by
     /// `pond schedule start` and the `pond init` schedule section.
-    pub(crate) fn start(every: ScheduleEvery) -> Result<()> {
+    pub(crate) fn start(every: ScheduleEvery, config_file: &std::path::Path) -> Result<()> {
         let bin = pond_bin();
         if !bin.is_file() {
             bail!(
@@ -1106,10 +1106,11 @@ mod windows {
         // %VAR% inside <Command> and <Arguments> at runtime with NO escape
         // syntax. Mirrors the unix gate that blocks % in cron/plist templates.
         for (what, path) in [
-            ("launcher", &launcher),
-            ("pond binary", &bin),
-            ("sync log", &log),
-            ("state dir", &state_root),
+            ("launcher", launcher.as_path()),
+            ("pond binary", bin.as_path()),
+            ("sync log", log.as_path()),
+            ("state dir", state_root.as_path()),
+            ("config file", config_file),
         ] {
             let text = path.display().to_string();
             if text.contains('%') {
@@ -1122,7 +1123,7 @@ mod windows {
             }
         }
 
-        let arguments = task_arguments(&log, &bin, &state_root);
+        let arguments = task_arguments(&log, &bin, &state_root, config_file);
 
         // The pin is registration-time: a later shell-only override splits the
         // lock and last-sync record between the scheduled and manual syncs, and
@@ -1245,12 +1246,14 @@ mod windows {
         log: &std::path::Path,
         bin: &std::path::Path,
         state_root: &std::path::Path,
+        config_file: &std::path::Path,
     ) -> String {
         format!(
-            "--log {log} -- {bin} sync -q --no-wait --state-dir {state}",
+            "--log {log} -- {bin} sync -q --no-wait --state-dir {state} --config-file {config}",
             log = quote_arg(log),
             bin = quote_arg(bin),
             state = quote_arg(state_root),
+            config = quote_arg(config_file),
         )
     }
 
@@ -1448,6 +1451,7 @@ mod windows {
                 std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state\\sync.log"),
                 std::path::Path::new("C:\\Program Files\\pond\\pond.exe"),
                 std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state"),
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Roaming\\pond\\config.toml"),
             );
             (launcher, arguments)
         }
@@ -1521,8 +1525,9 @@ mod windows {
                 std::path::Path::new("C:\\s\\sync.log"),
                 std::path::Path::new("C:\\bin\\pond.exe"),
                 std::path::Path::new("C:\\my state\\"),
+                std::path::Path::new("C:\\c\\config.toml"),
             );
-            assert!(args.ends_with("--state-dir \"C:\\my state\\\\\""), "{args}");
+            assert!(args.contains("--state-dir \"C:\\my state\\\\\""), "{args}");
             // Every quote still pairs off.
             assert_eq!(args.matches('"').count() % 2, 0, "{args}");
         }
@@ -1536,6 +1541,12 @@ mod windows {
                 "{arguments}"
             );
             assert!(arguments.contains("sync -q --no-wait"), "{arguments}");
+            assert!(
+                arguments.contains(
+                    "--config-file \"C:\\Users\\Adam\\AppData\\Roaming\\pond\\config.toml\""
+                ),
+                "{arguments}"
+            );
             // Every path is quoted: `C:\Program Files\...` splits otherwise.
             assert!(
                 arguments.contains("-- \"C:\\Program Files\\pond\\pond.exe\""),
