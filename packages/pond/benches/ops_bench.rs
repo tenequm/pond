@@ -105,7 +105,11 @@ async fn main() -> Result<()> {
     timed("row_counts", store.row_counts()).await?;
     timed("table_sizes", store.table_sizes()).await?;
     timed("index_status", store.index_status()).await?;
-    timed("embedding_progress", store.embedding_progress()).await?;
+    if config.embeddings.enabled {
+        timed("embedding_progress", store.embedding_progress()).await?;
+    } else {
+        println!("  {:<40} {:>9}", "embedding_progress", "skipped");
+    }
     timed("adapter_names(false)", store.adapter_names(false)).await?;
 
     // pond sync: the change-detection oracle built before any progress prints.
@@ -125,8 +129,12 @@ async fn main() -> Result<()> {
     // pond optimize: the read side that decides what work is owed. The embed +
     // index commits that follow are the work itself, timed by the command.
     println!("\n[optimize] backlog probes (read-only)");
-    timed("stale_embedding_count", store.stale_embedding_count()).await?;
-    timed("embedding_progress", store.embedding_progress()).await?;
+    if config.embeddings.enabled {
+        timed("stale_embedding_count", store.stale_embedding_count()).await?;
+        timed("embedding_progress", store.embedding_progress()).await?;
+    } else {
+        println!("  embed backlog probes skipped: embeddings disabled");
+    }
 
     // pond copy: the delta plan compares per-session message counts across two
     // stores. Self-to-self yields an empty plan but times the detection scan -

@@ -346,18 +346,27 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
 
     let any_new_rows = combined.inserted > 0;
     if !args.no_optimize && any_new_rows {
-        timed("embed", &mut phases, async {
-            let progress = store.embedding_progress().await?;
-            let backlog = progress.total.saturating_sub(progress.embedded);
-            if backlog == 0 {
-                return Ok::<usize, anyhow::Error>(0);
-            }
-            let embedder = pond::embed::CandleEmbedder::load().context("CandleEmbedder::load")?;
-            let worker = pond::embed::EmbedWorker::new(&store, &embedder);
-            let s = worker.run().await.context("EmbedWorker::run")?;
-            Ok(s.messages)
-        })
-        .await?;
+        if config.embeddings.enabled {
+            timed("embed", &mut phases, async {
+                let progress = store.embedding_progress().await?;
+                let backlog = progress.total.saturating_sub(progress.embedded);
+                if backlog == 0 {
+                    return Ok::<usize, anyhow::Error>(0);
+                }
+                let embedder =
+                    pond::embed::CandleEmbedder::load().context("CandleEmbedder::load")?;
+                let worker = pond::embed::EmbedWorker::new(&store, &embedder);
+                let s = worker.run().await.context("EmbedWorker::run")?;
+                Ok(s.messages)
+            })
+            .await?;
+        } else {
+            phases.push(Phase {
+                label: "embed".to_owned(),
+                elapsed: Duration::ZERO,
+                detail: "skipped ([embeddings].enabled = false)".to_owned(),
+            });
+        }
         let policy = MaintenancePolicy {
             compaction_fragment_cap: 0,
             cleanup_older_than: chrono::Duration::days(1),
