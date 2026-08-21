@@ -1,0 +1,70 @@
+---
+title: How pond compares
+description: pond next to session-search tools (ctx, deja-vu, cass), memory layers (Mem0, Letta, claude-mem) and proxy recorders (Tapes, virtual-context). What each kind does well, where pond differs, and when to pick which.
+---
+
+# How pond compares [Three kinds of tool get called "memory". They do different jobs.]
+
+Every tool on this page reads or records AI agent sessions and hands something back to an agent. They differ in what they keep, where they keep it, and what happens to it when the harness that wrote the file moves on. Each section grants the other kind its job first, then says where pond differs and when to pick which.
+
+Every claim here is about a specific version of someone else's project, checked against its source on the date in brackets. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
+
+## Side by side
+
+| | **pond** | **Session search** (ctx, deja-vu, cass) | **Memory layers** (Mem0, Letta) |
+|---|---|---|---|
+| History from before install | yes | yes | no |
+| What is kept | the whole session | a search index ¹ | extracted facts |
+| Where it lives | local dir or S3 bucket | local index | the tool's database |
+| After the harness deletes the file | still there | gone at next refresh ¹ | only the extract |
+| Several machines | one shared bucket | pulled into one machine ² | shared server or cloud |
+| Agent access | CLI, MCP, HTTP, SQL | CLI, MCP ³ | HTTP, SDK, MCP |
+
+¹ cass also mirrors the raw files, so they outlive the source. ² deja-vu copies records between machines over ssh; cass pulls other hosts' session files over ssh/rsync into its local index; ctx is single-machine. ³ cass has no MCP server.
+
+## Session search tools
+
+[ctx](https://github.com/ctxrs/ctx), [deja-vu](https://github.com/vshulcz/deja-vu) and [cass](https://github.com/Dicklesworthstone/coding_agent_session_search) do one thing well: they index the session files your harnesses already wrote to disk and give you fast recall over them, with no setup beyond the install. All three know your history from before you installed them. ctx and deja-vu expose it over MCP; deja-vu also injects recall at session start and before tool calls, and ships as one plugin bundle for six harnesses. If you want recall on one machine today, any of them works.
+
+pond keeps the sessions rather than indexing them. The difference shows up in three places.
+
+**When the harness deletes the file.** Claude Code removes session files after 30 days by default. ctx's storage documentation says a deleted source "remains available for search" only until the next refresh publishes a new index generation, and automatic refresh is on by default (ctx 1.0.2, `docs/storage.md`, 2026-08-21). deja-vu rebuilds its index without records whose source file is gone; its own test deletes a source file and asserts the session no longer appears (`internal/index/index_test.go`, 2026-08-21). cass is the exception: it keeps a content-addressed mirror of the raw session bytes and scores a hit whose source is gone as "archive-only" rather than dropping it. pond's spec makes survival a requirement: once a session is stored, re-ingest is never the recovery path, because a rotated source cannot supply its rows again.
+
+**Where the copy lives.** All three keep a local index on the machine that ran the harness. deja-vu's roadmap lists cloud sync as not planned; ctx's README says nothing leaves the machine; cass's only mention of S3 in source is a cache-eviction policy. pond writes to a local directory or to a bucket you own (S3, GCS, Azure, any S3-compatible store), and [every machine you run can sync into the same bucket](/guides/several-machines). ctx's own README states the consequence of a single-machine index: if the session is not on your machine, for example because a teammate's agent produced the code, ctx cannot prove the attribution. deja-vu can copy records between machines over ssh, and cass can pull other hosts' files over ssh/rsync into its local index; both gather copies onto one box rather than writing to one place.
+
+**What an agent can ask.** ctx and deja-vu answer over MCP; cass is CLI-only (its `--robot` JSON mode, no MCP server as of 2026-08-21). pond answers over MCP and HTTP, and also runs [read-only SQL](/reference/cli#query) over sessions, messages and parts, including tool-call and tool-result bodies, so "which commands failed most often last month" is a query rather than a script.
+
+Where they beat pond: deja-vu redacts credentials at index time and re-applies it on share and sync; pond redacts nothing today (outbound redaction is [roadmap #167](https://github.com/tenequm/pond/issues/167)). deja-vu publishes a retrieval benchmark anyone can rerun in minutes; pond has published a [usage-trace study of its two search arms](https://github.com/tenequm/pond/tree/main/docs/researches/2608-21-semantic-vs-fts-usage-eval), not a benchmark. cass's search is hybrid by default; pond's is one arm per query, BM25 or vector.
+
+Pick session search when you want fast local recall on one machine and the index following the source is acceptable. Pick pond when the sessions themselves are the thing to keep, in storage you own, from every machine you run. The two are not exclusive: an index can always be rebuilt from an archive.
+
+## Memory layers
+
+[Mem0](https://github.com/mem0ai/mem0), [Letta](https://github.com/letta-ai/letta-code) and [claude-mem](https://github.com/thedotmack/claude-mem) give an agent something to carry between sessions: preferences, facts, decisions, observations. That is a different job from keeping the record. Mem0 stores what an LLM extracts from the messages you pass to `add()`, with a library, a self-hosted server and a hosted platform. Letta's agent writes its own memory blocks, kept in Letta Cloud by default. claude-mem compresses sessions into observations and injects them back. If you want an agent that remembers you prefer vim keybindings, these are built for it.
+
+None of them keeps the session. Mem0 and Letta start when the agent starts saving; claude-mem reads existing transcript files but keeps the compressed observations, not the transcript. What the extractor decided to drop is not recoverable from any of them.
+
+pond sits underneath this kind of tool. It keeps every message, tool call, tool result and reasoning block of every session, from every client, and a memory layer can be rebuilt from that record at any time with whatever extraction rules you prefer that month. The reverse is not possible. The custody question also differs: Letta archived its open-source memory server on 2026-08-15 and moved development to a harness whose conversations live in its cloud by default; a record in your own bucket is not subject to that kind of decision.
+
+Pick a memory layer when the agent should carry distilled facts and preferences. Pick pond when you want the record those facts came from. Running both is the natural setup: the archive is the source, the memory layer is a view over it.
+
+## Proxy recorders
+
+[Tapes](https://tapes.dev) and [virtual-context](https://github.com/virtual-context/virtual-context) sit between the client and the model provider and record the wire traffic. This needs no per-client adapter: anything that can point `ANTHROPIC_BASE_URL` at the proxy is covered, and what they capture includes tool calls and results in full. For production agents you operate, and for clients whose on-disk format nobody has written an adapter for, this is the simpler capture model.
+
+The trade is coverage and custody. A proxy records only the traffic that passed through it, so nothing from before you installed it ever enters the store, and clients without a configurable endpoint (the Claude.ai web app, for one) are invisible to it. A proxy sits in the hot path of every request, which is infrastructure to keep alive. Tapes requires Postgres with pg_duckdb and pgvector. What they restore is their own captured traffic back into a live context; neither rederives a session into another client's native format.
+
+pond reads the files the harness already wrote, so it covers everything from before install, needs no process in the request path, and runs as one binary against a directory or a bucket.
+
+Pick a proxy recorder when you operate production agents and want wire-level capture with zero adapters. Pick pond for the sessions your coding agents already wrote to disk, including the months before you installed anything.
+
+## "Saving everything is junk"
+
+Some tools argue the opposite of pond's premise: that most of a transcript is noise and a good memory filters at capture time. The filter is a fine idea. Running it at capture time is the problem, because the decision of what mattered is only knowable later, and a filter that ran at capture time cannot be undone. Storage is cheap. Keep the record and run whatever filter you like over it, as often as the rules change.
+
+## Next
+
+- [Why pond?](/why) - the premise in full
+- [Several machines, one bucket](/guides/several-machines)
+- [Remote storage](/guides/remote-storage) - S3, R2, B2, GCS
+- [MCP tools](/reference/mcp-tools) - what an agent can ask
