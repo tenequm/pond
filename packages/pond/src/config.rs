@@ -240,6 +240,16 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # backlog. Measured: off keeps a pond process ~100 MiB; on costs ~500-900 MiB
 # once any vector work ran, a 466 MiB one-time download, and CPU-bound first
 # syncs on hosts without Metal/CUDA.
+#
+# `model` selects the HuggingFace XLM-RoBERTa model; `dim` declares its output
+# width and is baked into the messages.vector schema on table creation - it must
+# equal the model's hidden_size. Common pairings:
+#   model = \"intfloat/multilingual-e5-small\"   dim = 384   (default)
+#   model = \"intfloat/multilingual-e5-base\"    dim = 768
+#   model = \"intfloat/multilingual-e5-large\"   dim = 1024
+#
+# A different-dim model needs a fresh data dir; pond enforces this at the
+# schema boundary.
 # enabled = false
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384

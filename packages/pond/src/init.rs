@@ -341,7 +341,7 @@ pub(crate) async fn run(
     let run_first_sync = prompts
         && !picked.is_empty()
         && wiz(cliclack::confirm(
-            "Run the first sync now? (recommended - it reads and embeds your full history)",
+            "Run the first sync now? (recommended - it reads your full history)",
         )
         .initial_value(true)
         .interact())?;

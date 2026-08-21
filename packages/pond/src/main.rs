@@ -509,10 +509,10 @@ enum Command {
     },
     /// Search stored messages.
     ///
-    /// `--mode vector` (default) matches on meaning; `--mode fts` matches exact
-    /// whole words (BM25). Keep the query about concepts; scope with
-    /// `--project`, `--from-date`, and friends instead of putting names in
-    /// the query.
+    /// `--mode fts` (default) matches exact whole words (BM25); `--mode vector`
+    /// matches on meaning and needs `[embeddings].enabled`. Put the distinctive
+    /// words you expect in the conversation in the query; scope with
+    /// `--project`, `--from-date`, and friends instead.
     #[command(after_long_help = "Examples:
   pond search \"lance compaction tuning\"
   pond search \"auth retry\" --project pond --limit 5
@@ -520,8 +520,8 @@ enum Command {
   pond search \"migration plan\" --from-date 2026-05-01 --format json")]
     #[command(display_order = 10)]
     Search {
-        /// Free-text query. Semantic concepts work best; project names belong
-        /// in `--project`.
+        /// Free-text query: the distinctive words you expect in the
+        /// conversation. Project names belong in `--project`.
         query: String,
         /// Tenant namespace. The personal pond has exactly one; leave at the
         /// default.
@@ -530,9 +530,9 @@ enum Command {
         /// Max sessions to return.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Retrieval arm: `vector` (default - matches on meaning) or `fts`
-        /// (exact whole words, BM25). Falls back to `fts` when the store has no
-        /// embeddings.
+        /// Retrieval arm: `fts` (default - exact whole words, BM25) or
+        /// `vector` (matches on meaning). `vector` is available only when this
+        /// instance has `[embeddings].enabled = true`; otherwise it is refused.
         #[arg(long, value_enum)]
         mode: Option<CliSearchMode>,
         /// Result order: `relevance` (default) or `recency` (newest first).
@@ -1272,7 +1272,7 @@ async fn run() -> anyhow::Result<()> {
                 // embedding probe (which DOES scan messages) only runs under
                 // `-v`. Skipping it drops a cold-S3 status from ~43s to ~3s.
                 let embedding_fut = async {
-                    if verbose {
+                    if verbose && pond::embed::embeddings_enabled() {
                         store.embedding_progress().await.map(Some)
                     } else {
                         Ok(None)
@@ -1398,6 +1398,12 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
+            // `--force-embed` asks for embedding work by name, so it refuses
+            // rather than silently doing nothing; a plain `pond optimize` just
+            // skips the embed stage.
+            if force_embed && !pond::embed::embeddings_enabled() {
+                bail!("{}", pond::handlers::SEMANTIC_DISABLED_MESSAGE);
+            }
             let (_, store) = open_store(storage_path, &loaded, true, false).await?;
             if let Some(name) = drop_index {
                 store
@@ -1492,14 +1498,18 @@ async fn run() -> anyhow::Result<()> {
             }
             // One resident embedder shared by the query arm (AppState) and the
             // inline embed-at-ingest path (the store), so the model loads once.
+            // Constructing it loads nothing; with embedding disabled it is
+            // never attached, so no path can reach a model.
             let embedder = Arc::new(LazyEmbedder::candle());
-            embedder.spawn_idle_reaper();
-            let store = Arc::new(
-                open_store(storage_path.clone(), &config, true, true)
-                    .await?
-                    .1
-                    .with_embedder(embedder.clone()),
-            );
+            let opened = open_store(storage_path.clone(), &config, true, true)
+                .await?
+                .1;
+            let store = Arc::new(if pond::embed::embeddings_enabled() {
+                embedder.spawn_idle_reaper();
+                opened.with_embedder(embedder.clone())
+            } else {
+                opened
+            });
             let state = AppState {
                 store,
                 embedder,
@@ -1539,13 +1549,13 @@ async fn run() -> anyhow::Result<()> {
             // and the one instance is shared by the query arm and the store's
             // inline embed-at-ingest path.
             let embedder = Arc::new(LazyEmbedder::candle());
-            embedder.spawn_idle_reaper();
-            let store = Arc::new(
-                open_store(storage_path, &config, true, true)
-                    .await?
-                    .1
-                    .with_embedder(embedder.clone()),
-            );
+            let opened = open_store(storage_path, &config, true, true).await?.1;
+            let store = Arc::new(if pond::embed::embeddings_enabled() {
+                embedder.spawn_idle_reaper();
+                opened.with_embedder(embedder.clone())
+            } else {
+                opened
+            });
             spawn_prewarm(store.clone());
             transport::mcp::serve_stdio(AppState {
                 store,
@@ -2633,7 +2643,7 @@ async fn run_store_to_store_copy(
     output(&stage_line(
         indexes_started.elapsed(),
         "indexes",
-        "text + semantic rebuilt on destination",
+        index_rebuild_recap(),
     ))?;
 
     // `pond copy` always closes with the id-set + duplicate proof. On success
@@ -2744,7 +2754,7 @@ async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> 
     output(&stage_line(
         indexes_started.elapsed(),
         "indexes",
-        "text + semantic rebuilt on destination",
+        index_rebuild_recap(),
     ))?;
     output(&format!(
         "{} restore complete in {}",
@@ -3577,7 +3587,10 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
         .any(|status| status.intent_name == MESSAGES_VECTOR_INDEX && status.exists);
     let dest_indexes = IndexCoverage {
         fts_present,
-        vector_present_or_below_activation: vector_present
+        // With embedding disabled there is no IVF intent, so a missing index is
+        // the expected steady state - not a "run pond optimize" nag.
+        vector_present_or_below_activation: !pond::embed::embeddings_enabled()
+            || vector_present
             || dest_embedding.embedded < VECTOR_INDEX_ACTIVATION_ROWS,
     };
     Ok(StorageVerify {
@@ -3703,6 +3716,12 @@ impl OptimizeStages {
         }
         if !(stages.embed || stages.index) {
             bail!("no optimize stages selected");
+        }
+        // Embed alone is an explicit request for embedding work; refuse it
+        // instead of returning a silent no-op. A full optimize keeps running
+        // and folds the text index.
+        if stages.embed && !stages.index && !pond::embed::embeddings_enabled() {
+            bail!("{}", pond::handlers::SEMANTIC_DISABLED_MESSAGE);
         }
         Ok(stages)
     }
@@ -4022,45 +4041,51 @@ async fn run_sync_stages(
 ) -> anyhow::Result<()> {
     let open_started = std::time::Instant::now();
     let (_, store) = open_store(storage_path, loaded, true, false).await?;
+    tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
+    let flush_hud = Arc::new(FlushHud::default());
     // sync ingests through `upsert_session_batch`, which embeds inline; it
     // has no query path, so this is its own resident embedder. The flush HUD
-    // connects that inline embedding back to the live adapter bar.
-    let embedder = Arc::new(LazyEmbedder::candle());
-    let flush_hud = Arc::new(FlushHud::default());
-    let store = store
-        .with_embedder(embedder.clone())
-        .with_ingest_embed_progress(pond::sessions::IngestEmbedProgress(Arc::new({
-            let hud = flush_hud.clone();
-            move |done, total| hud.embed_tick(done, total)
-        })));
-    tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
+    // connects that inline embedding back to the live adapter bar. With
+    // embedding disabled none of it is wired, so ingest writes null vectors.
+    let store = if pond::embed::embeddings_enabled() {
+        let embedder = Arc::new(LazyEmbedder::candle());
+        let store = store
+            .with_embedder(embedder.clone())
+            .with_ingest_embed_progress(pond::sessions::IngestEmbedProgress(Arc::new({
+                let hud = flush_hud.clone();
+                move |done, total| hud.embed_tick(done, total)
+            })));
 
-    // Load the model before the import bars own the terminal: a first run
-    // downloads ~500 MB of weights (embed.rs prints a one-time notice - the
-    // ureq-only hf-hub build renders no progress bar), which would otherwise
-    // fire mid-import underneath active progress bars. Best-effort: a
-    // caught-up sync embeds nothing, so an offline host must not fail here -
-    // when new rows do need embedding, the flush surfaces the real error.
-    let model_started = std::time::Instant::now();
-    match embedder.get().await {
-        Ok(_) => {
-            if !json && model_started.elapsed() > Duration::from_secs(1) {
-                output(&stage_line(
-                    model_started.elapsed(),
-                    "model",
-                    "embedding model ready",
+        // Load the model before the import bars own the terminal: a first run
+        // downloads ~500 MB of weights (embed.rs prints a one-time notice - the
+        // ureq-only hf-hub build renders no progress bar), which would otherwise
+        // fire mid-import underneath active progress bars. Best-effort: a
+        // caught-up sync embeds nothing, so an offline host must not fail here -
+        // when new rows do need embedding, the flush surfaces the real error.
+        let model_started = std::time::Instant::now();
+        match embedder.get().await {
+            Ok(_) => {
+                if !json && model_started.elapsed() > Duration::from_secs(1) {
+                    output(&stage_line(
+                        model_started.elapsed(),
+                        "model",
+                        "embedding model ready",
+                    ))?;
+                }
+            }
+            Err(error) => {
+                output_err(&pond::output::paint(
+                    &format!(
+                        "model: embedding model unavailable ({error:#}); continuing - the sync fails only if new sessions need embedding"
+                    ),
+                    pond::output::yellow(),
                 ))?;
             }
         }
-        Err(error) => {
-            output_err(&pond::output::paint(
-                &format!(
-                    "model: embedding model unavailable ({error:#}); continuing - the sync fails only if new sessions need embedding"
-                ),
-                pond::output::yellow(),
-            ))?;
-        }
-    }
+        store
+    } else {
+        store
+    };
 
     run_sync_pipeline(
         &store,
@@ -4147,16 +4172,14 @@ async fn run_sync_pipeline(
         if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
             tracing::warn!(%error, "post-import rowmap refresh skipped");
         }
-        // Sync embeds inline at ingest (the `with_embedder` above), so
-        // every new searchable row already carries its vector and a flush
-        // that fails to embed aborts without writing - sync can never
-        // leave a searchable row un-embedded. The finalize *embed worker*
-        // would therefore only full-scan `messages` over S3 to discover
-        // there is nothing to embed (measured 20-81s of pure waste on the
-        // remote store), so sync skips it and keeps only the cheap
-        // LIMIT-1 model-swap guard. A genuine pre-inline / wire-ingest
-        // backlog is healed by `pond optimize` (which keeps the full
-        // embed pass). Cleanup is amortized: a 5-min cron sync shouldn't
+        // On an instance with embedding enabled, sync embeds inline, so
+        // every row IT ingested carries its vector; rows ingested by a
+        // disabled peer are healed by `pond optimize --only embed` on an
+        // enabled instance. The finalize embed worker therefore does not
+        // run in sync - it would only full-scan `messages` over S3 to
+        // discover there is nothing for it to do (measured 20-81s of pure
+        // waste on the remote store); sync keeps only the cheap LIMIT-1
+        // model-swap guard. Cleanup is amortized: a 5-min cron sync shouldn't
         // pay the per-table version-log walk (~9s on S3) every run, so it
         // cleans once every DEFAULT_SYNC_CLEANUP_INTERVAL commits instead
         // (`pond optimize` still cleans every run). The scalar-index fold
@@ -4767,6 +4790,7 @@ async fn guard_embedding_model_unchanged(store: &Store) -> anyhow::Result<()> {
 }
 
 async fn run_embed_stage(store: &Store, force: bool) -> anyhow::Result<EmbedSummary> {
+    pond::embed::assert_runtime_installed();
     run_embed_stage_with_limit(store, force, None, "--force-embed").await
 }
 
@@ -4776,6 +4800,13 @@ async fn run_embed_stage_with_limit(
     limit: Option<usize>,
     force_hint: &'static str,
 ) -> anyhow::Result<EmbedSummary> {
+    // Embedding off: no model load, no store read - this is the seam `optimize`,
+    // `copy`, and archive restore share, and on a store synced with embedding
+    // off every row is backlog, so an ungated pass would embed the corpus.
+    if !pond::embed::embeddings_enabled() {
+        return Ok(EmbedSummary::default());
+    }
+
     // Model-swap detection via a LIMIT-1 read of any embedded row's model id,
     // not the full-column `stale_embedding_count` scan that ran every sync (the
     // single-active-model invariant makes one row representative).
@@ -4796,21 +4827,12 @@ async fn run_embed_stage_with_limit(
         store.drop_vector_index().await?;
     }
 
-    // Two-step backlog gate. `unindexed_vector_backlog` is a manifest-only
-    // upper bound on the embed backlog: zero proves nothing is unembedded, so
-    // the frequent idle sync skips without a data-page read. Non-zero is NOT
-    // proof of work - after a copy (rows arrive embedded, index unfolded) or
-    // between deferred sync folds the lag counts fully-embedded rows; a fresh
-    // S3 copy once read 104,994 "unindexed" against 0 actually-unembedded and
-    // drew a whole-corpus bar that looked hung. So confirm with the exact
-    // eligible count (search_text present, embedding_model null, narrow
-    // model-id column) before loading the embedder and sizing a bar. A forced
-    // re-embed redoes every row, so it counts the live eligible set directly.
-    let backlog = if !swapped && store.unindexed_vector_backlog().await? == 0 {
-        0
-    } else {
-        store.embed_backlog_count().await?
-    };
+    // The manifest-only `unindexed_vector_backlog` cannot be trusted as a zero
+    // proof any more: an enabled peer folds a disabled peer's all-null fragments
+    // into IVF, which marks them indexed while every row is still unembedded.
+    // `embed_backlog_count` is the narrow co-set count (embedding_model IS NULL
+    // AND search_text IS NOT NULL) - ~7 s on S3, paid only here, never in sync.
+    let backlog = store.embed_backlog_count().await?;
     let bar_total = match limit {
         Some(cap) => backlog.min(cap),
         None => backlog,
@@ -4993,6 +5015,7 @@ async fn render_sync_summary(store: &Store) -> anyhow::Result<()> {
         &index_status,
         None,
         pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
+        pond::embed::embeddings_enabled(),
     );
 
     output("")?;
@@ -6022,6 +6045,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         checks.index_status,
         checks.embedding.as_ref(),
         pond::substrate::DEFAULT_SYNC_INDEX_FOLD_ROWS as u64,
+        pond::embed::embeddings_enabled(),
     );
     output(&render_indexes_line(&health))?;
     // Default: `stored` shows the manifest row count (cheap); under `-v` the
@@ -6051,10 +6075,12 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         checks.adapter_count,
     ))?;
     if checks.embedding.is_none() {
-        output_err(&paint(
-            "(use -v for searchable message count + embedding backlog)",
-            dim(),
-        ))?;
+        let hint = if pond::embed::embeddings_enabled() {
+            "(use -v for searchable message count + embedding backlog)"
+        } else {
+            "(use -v for searchable message count)"
+        };
+        output_err(&paint(hint, dim()))?;
     }
     Ok(())
 }
@@ -6334,16 +6360,21 @@ enum IndexHealthState {
 #[derive(Debug, Clone)]
 struct IndexHealth {
     text: IndexHealthState,
-    semantic: IndexHealthState,
+    /// `None` when this instance has embedding disabled: the semantic half is
+    /// then absent from every rendered line, not reported as missing.
+    semantic: Option<IndexHealthState>,
 }
 
 /// `Ready` means the substrate's lag guard is intentionally batching; queries
 /// fall through to the brute-force scan over a small remainder. `Pending(N)`
 /// means the trailing fragment count crossed the threshold and a fold is owed.
+/// `embeddings_enabled` is an argument, not a read of the process flag, so the
+/// unit tests below cover both postures regardless of install order.
 fn classify_index_health(
     statuses: &[IndexStatus],
     embedding: Option<&EmbeddingProgress>,
     fold_threshold: u64,
+    embeddings_enabled: bool,
 ) -> IndexHealth {
     use IndexHealthState::*;
 
@@ -6385,22 +6416,38 @@ fn classify_index_health(
     {
         semantic = Pending(progress.backlog as u64);
     }
-    IndexHealth { text, semantic }
+    IndexHealth {
+        text,
+        semantic: embeddings_enabled.then_some(semantic),
+    }
+}
+
+/// The `copy` / archive-restore `indexes` recap: name only the indexes this
+/// instance actually rebuilt.
+fn index_rebuild_recap() -> &'static str {
+    if pond::embed::embeddings_enabled() {
+        "text + semantic rebuilt on destination"
+    } else {
+        "text rebuilt on destination"
+    }
 }
 
 fn render_indexes_line(health: &IndexHealth) -> String {
     use IndexHealthState::*;
     use pond::output::{dim, paint, yellow};
 
-    let body = match (&health.text, &health.semantic) {
-        (Ready, Ready) => "text + semantic ready".to_owned(),
-        _ => {
+    let body = match (&health.text, health.semantic.as_ref()) {
+        (Ready, None) => "text ready".to_owned(),
+        (Pending(n), None) => format!("text {} pending", format_thousands(*n)),
+        (NotBuilt, None) => "text not built".to_owned(),
+        (Ready, Some(Ready)) => "text + semantic ready".to_owned(),
+        (_, Some(semantic)) => {
             let text_part = match &health.text {
                 Ready => "text ready".to_owned(),
                 Pending(n) => format!("text {} pending", format_thousands(*n)),
                 NotBuilt => "text not built".to_owned(),
             };
-            let semantic_part = match &health.semantic {
+            let semantic_part = match semantic {
                 Ready => "semantic ready".to_owned(),
                 Pending(n) => format!("semantic {} pending", format_thousands(*n)),
                 // The ANN index only builds past an activation row-count, but
@@ -6412,7 +6459,8 @@ fn render_indexes_line(health: &IndexHealth) -> String {
             format!("{text_part} . {semantic_part}")
         }
     };
-    let any_pending = matches!(health.text, Pending(_)) || matches!(health.semantic, Pending(_));
+    let any_pending =
+        matches!(health.text, Pending(_)) || matches!(health.semantic, Some(Pending(_)));
     let label = if any_pending {
         paint("indexes", yellow())
     } else {
@@ -6562,6 +6610,83 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    fn index_status(name: &str, exists: bool, unindexed_rows: usize) -> IndexStatus {
+        IndexStatus {
+            table: pond::substrate::Table::Messages,
+            intent_name: name.to_owned(),
+            fragments_covered: 0,
+            unindexed_fragments: usize::from(unindexed_rows > 0),
+            unindexed_rows,
+            exists,
+        }
+    }
+
+    /// With embedding off the indexes line must say nothing about semantic
+    /// search - not even "ready" (decision 7). `embeddings_enabled` is an
+    /// argument so both postures are covered from one test process.
+    #[test]
+    fn index_health_omits_the_semantic_half_when_embeddings_are_disabled() {
+        let both = [
+            index_status(MESSAGES_FTS_INDEX, true, 0),
+            index_status(MESSAGES_VECTOR_INDEX, true, 0),
+        ];
+        let disabled = classify_index_health(&both, None, 0, false);
+        assert!(disabled.semantic.is_none());
+        assert!(render_indexes_line(&disabled).ends_with("text ready"));
+
+        let enabled = classify_index_health(&both, None, 0, true);
+        assert!(enabled.semantic.is_some());
+        assert!(render_indexes_line(&enabled).ends_with("text + semantic ready"));
+    }
+
+    #[test]
+    fn disabled_indexes_line_renders_text_only_for_every_text_state() {
+        let pending = [index_status(MESSAGES_FTS_INDEX, true, 1234)];
+        let health = classify_index_health(&pending, None, 0, false);
+        assert!(render_indexes_line(&health).ends_with("text 1,234 pending"));
+
+        let missing = [index_status(MESSAGES_FTS_INDEX, false, 0)];
+        let health = classify_index_health(&missing, None, 0, false);
+        assert!(render_indexes_line(&health).ends_with("text not built"));
+    }
+
+    /// The embedding backlog override must not resurrect the semantic half
+    /// on a disabled instance (`status -v` skips the probe, but the override
+    /// is the second door into the same field).
+    #[test]
+    fn embedding_backlog_override_stays_none_when_disabled() {
+        let statuses = [
+            index_status(MESSAGES_FTS_INDEX, true, 0),
+            index_status(MESSAGES_VECTOR_INDEX, true, 0),
+        ];
+        let progress = EmbeddingProgress {
+            embedded: 10,
+            total: 20,
+            backlog: 10,
+            model: "test-model",
+        };
+        let health = classify_index_health(&statuses, Some(&progress), 0, false);
+        assert!(health.semantic.is_none());
+        assert!(!render_indexes_line(&health).contains("semantic"));
+    }
+
+    /// The process flag is uninitialized in unit tests, i.e. disabled - so an
+    /// explicit `--only embed` must refuse rather than silently no-op, while a
+    /// full optimize still resolves (it just skips the embed stage).
+    #[test]
+    fn optimize_refuses_an_explicit_embed_stage_when_embeddings_are_disabled() {
+        assert!(!pond::embed::embeddings_enabled());
+        let refused = OptimizeStages::resolve(Some(OptimizeStage::Embed), &[]).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("semantic search is off on this pond instance"),
+        );
+        assert!(OptimizeStages::resolve(None, &[OptimizeStage::Index]).is_err());
+        let full = OptimizeStages::resolve(None, &[]).unwrap();
+        assert!(full.embed && full.index);
+    }
 
     #[test]
     fn find_in_dirs_resolves_a_bare_name_per_platform() -> anyhow::Result<()> {
