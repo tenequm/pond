@@ -22,10 +22,15 @@ Read first: `CLAUDE.md` (repo rules - minimalism, test placement, release-plz), 
 | 8 | When enabled, behaviour is today's: inline embed at ingest, backlog via `pond optimize --only embed`, model-swap guard (`--force-embed`), IVF activation at 100k, degrade-to-fts until the first row is embedded - with ONE fix: the embed stage decides "is there a backlog" from `embed_backlog_count()` alone, never from the manifest fast-path `unindexed_vector_backlog()` (section 3.2 explains why that path now lies). |
 | 9 | Mixed fleet (one machine enabled, one disabled, same remote store) is supported and documented: the disabled machine's rows stay un-embedded until the enabled machine runs `pond optimize --only embed`. `sync` does not grow a backlog probe. |
 | 10 | `POND_EMBEDDINGS_ENABLED=true|false` works as an env mirror (containers and CI have no config file). Value must be the literal `true`/`false` - figment stringifies `1`, which fails the bool field. |
-| 11 | Scheduled-sync units pin the config path the same way they already pin `XDG_STATE_HOME`, so a scheduled sync sees the same `enabled` as a manual one. |
+| 11 | Scheduled-sync units pin the config path (`POND_CONFIG_FILE`) the same way they already pin `XDG_STATE_HOME`, so a scheduled sync sees the same `enabled` as a manual one. Units installed by an older pond lack the line until `pond schedule install` is re-run; the changelog says so. |
 | 12 | No compatibility shim, no auto-enable for stores that already hold vectors (repo rule: pre-release). A config containing `enabled` fails to load on an older binary (`deny_unknown_fields`) - accepted; the CHANGELOG says so. |
 | 13 | Ships as ONE `feat!:` commit with a real diff (squash subject keeps the `!`) so release-plz cuts `0.15.0`. The three plugins' text changes ride in the same PR. |
-| 14 | The `--min-score` flag and `min_score` param keep rejecting fts mode; after the flip a caller passing `min_score` without an explicit `mode` gets that error. Documented in the CHANGELOG upgrade note; help text corrected. |
+| 14 | **Delete `--min-score` / `min_score`** (CLI flag, HTTP wire field, the fts-rejection block). Receipt: 0 of 1,126 real `pond_search` calls in the 63-day corpus passed it; it was never on the MCP surface; spec 8.3 itself says scores carry no absence signal. Removal is its own commit inside the PR so a future re-add is a targeted revert; spec section 9 keeps a one-line deferred entry. |
+| 15 | The MCP tool description is **conditional on the running instance**: with embedding off, the `mode` parameter doc names `fts` only and meaning-based search is not mentioned anywhere in the tool surface; the JSON-schema enum stays `["fts","vector"]`; the refusal (decision 3) remains the safety net for an explicit attempt. |
+| 16 | Plugin tool descriptions become **version-neutral**: they describe both modes without naming a default ("omit `mode` to use pond's default"), so the same text is correct against any pond binary. (Fetching the description from the server at registration is not possible: hermes starts pond lazily on the first call, after tools are registered.) Plugins stay manually published; each logs the resolved `pond --version` once at dial time. |
+| 17 | Server `instructions` replace "keep queries semantic (concepts, not project names)" with distinctive-words guidance only. **No zero-hit retry prose**: agents already retried 74% of misses in the corpus (171 same-mode, 53 mode switch, 76 pond_sql of 403 NOT_FOUND); more prose would add searches, not recall. |
+| 18 | `SKILL.md` (installed to `~/.claude/skills/pond/`, refreshed only by `pond init`) carries **stable routing only**. Every behaviour fact - default arm, which arms exist, the semantic opt-in hint - lives in the server `instructions`, which always come from the running binary. Rollout order then does not matter by construction: store format unchanged, pond MCP self-describing, plugins version-neutral, skill version-neutral. |
+| 19 | Discoverability of semantic search when off: the commented `[embeddings]` block `pond init` writes, the docs-site configuration page, and one clause in the server instructions ("semantic search is an opt-in; see `[embeddings]`"). Nothing in `pond init` output, nothing in `status`. |
 
 Spec 8.7 already says "Embedding is opt-in by configuration"; the code never had the switch. This change closes a spec-vs-code gap, then tightens 8.1/8.7 wording.
 
@@ -62,8 +67,11 @@ Both call `finalize_indexes` -> `run_embed_stage`. On a store synced with embedd
 ### 3.7 Plugins describe the old contract
 `hermes-pond/tools.py:70`, `pi-pond/src/tools.ts:75`, `openclaw-pond/src/tools.ts:146` (NOT `schemas.ts:23`, which is only the enum and stays valid).
 
-### 3.8 `--min-score` without `mode` hard-errors after the flip
-`handlers.rs` ~1205 rejects `min_score > 0` in fts mode. Decision 14.
+### 3.8 `--min-score` without `mode` would hard-error after the flip
+`handlers.rs` ~1205 rejects `min_score > 0` in fts mode, so a CLI/HTTP caller passing it without an explicit `mode` would start failing. Decision 14 deletes the parameter instead (zero real uses).
+
+### 3.8b Installed skill goes stale
+`init.rs::skill_sync` is the only refresh path for `~/.claude/skills/pond/SKILL.md` and cannot tell "older pond's copy" from "user edit", so it asks. Today's SKILL.md line ~16 hardcodes `mode=vector default`. Decision 18 moves behaviour facts out of the file.
 
 ### 3.9 Accepted / left alone
 - Rollback: no store or schema change; only a config carrying `enabled` breaks an older binary. `pond init` writes the `[embeddings]` block commented out (`DEFAULT_CONFIG_TOML`), keep it that way.
@@ -79,11 +87,12 @@ Do the steps in order; each ends with a command that must pass before the next.
 
 | Step | Scope | Gate command |
 |---|---|---|
+| 0 | Delete `min_score` (5.2, own commit) | `cargo test && cargo insta accept` (help_search snapshot) |
 | 1 | Config field + runtime flag (5.1) | `cargo build && cargo test --lib config::` |
 | 2 | Write path: no embedder when disabled (5.3); intents + prewarm (5.4); embed stage (5.5) | `cargo test --lib sessions::tests::` - the inline-embed unit test (`sessions.rs` ~6111-6148, "inline embed rides the birth append") MUST stay green; it does only if the gate lives at the `main.rs` attach sites, not inside `Store` |
 | 3 | Default arm + refusal (5.2) | `cargo test --test integration -- transport_mcp:: transport_http:: search::` then `cargo insta accept` after reading the 6 snapshot diffs |
 | 4 | Output gating (5.6) | `cargo test` |
-| 5 | Descriptions, skill, plugins, docs, spec (5.7, 5.8, 5.9) | plugin tests: `pnpm -C packages/openclaw-pond test`, `pnpm -C packages/pi-pond test`, `cd packages/hermes-pond && python -m pytest` |
+| 5 | Conditional description + instructions, skill to routing-only, plugins neutral, docs, spec (5.7, 5.8, 5.9) | plugin tests: `pnpm -C packages/openclaw-pond test`, `pnpm -C packages/pi-pond test`, `cd packages/hermes-pond && python -m pytest` |
 | 6 | Scheduler units (5.10), harness + benches (5.11) | `cargo clippy --all-targets -- -D warnings` (CI runs tests WITHOUT `--all-targets`; benches only compile under `lint-msvc`, skipped on fork PRs - this local run is the only bench gate) |
 | 7 | Acceptance matrix (section 8) against a copy of a real store | all rows pass |
 | 8 | CHANGELOG enrichment happens on the release PR, not here (section 9) | - |
@@ -276,7 +285,15 @@ SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
 
 Why: a JSON-RPC error makes hermes-pond tear down and respawn the `pond serve` child on every call (3.5), and Claude Code renders a tool error in-turn so the model simply retries with `mode="fts"`. REST `POST /v1/search` keeps mapping `ValidationFailed` to HTTP 400 (`transport.rs` ~117-121) - correct for a client-fixable request.
 
-**CLI** `pond search`: `main.rs` ~512 and ~533-536 `--mode` help: `fts` default, `vector` needs `[embeddings].enabled`. `--min-score` help (~558-562) add: "Requires mode=vector, which is no longer the default - pass --mode vector explicitly." The refusal already surfaces through the existing error printing; verify `pond search --mode vector x` prints `SEMANTIC_DISABLED_MESSAGE` and exits non-zero.
+**CLI** `pond search`: `main.rs` ~512 and ~533-536 `--mode` help: `fts` default, `vector` needs `[embeddings].enabled`. The refusal already surfaces through the existing error printing; verify `pond search --mode vector x` prints `SEMANTIC_DISABLED_MESSAGE` and exits non-zero.
+
+**Delete `min_score`** (decision 14) as its own commit on the branch (`refactor(search): drop min_score - unused, vector-only`; no `!` - the PR squashes into the one `feat!:` commit, which carries the breaking marker), BEFORE the default flip so the diff is reviewable on its own. After the squash the re-add target is this list, not a commit:
+- `wire.rs` ~660 `SearchRequest.min_score: f64` - remove the field and its doc.
+- `handlers.rs` ~1205-1212 the "BM25 is unbounded ... reject a non-zero floor on fts" block - remove; `SearchPlan.min_score` and every read of it (`rg -n min_score packages/pond/src` - 28 hits at the time of writing, across `wire.rs`, `handlers.rs`, `main.rs`, `render.rs`, `transport.rs`) - remove the vector-arm filter that applies it and the plan field.
+- `main.rs` ~558-563 the `--min-score` clap arg and its two pass-throughs (~1573, ~1592).
+- `transport.rs` ~784-787 the MCP comment "min_score is intentionally not on the MCP surface" and the `min_score: 0.0` literal; the REST `POST /v1/search` body loses the field (serde will reject an unknown field only if the struct is `deny_unknown_fields` - check; if it is, an old client sending `min_score: 0` gets a 400, which is acceptable and goes in the changelog).
+- `docs/spec.md` 8.3 "plus a minimum score" - delete the phrase; add to section 9 (deferred): "Score floor (`min_score`): removed in 0.15 after zero observed use; re-add behind the vector arm only if a measured need appears."
+- Snapshot `help_search.snap` changes again; `cargo insta accept`.
 
 **Test helper** `handlers.rs` ~2067 hardcodes `mode: SearchModeWire::Vector` in `search_request()`; change to `SearchModeWire::default()` and fix the assertion at ~2287 (`assert_eq!(plan.mode, SearchMode::Vector)` becomes `Fts`). Add a unit test `vector_refused_when_embeddings_disabled` calling `resolve_effective_mode(&store, SearchMode::Vector, false)` and asserting `error.code == ValidationFailed` and `details.config_key == "embeddings.enabled"`.
 
@@ -387,22 +404,58 @@ The `-v` backlog override (~6390-6395) that flips `semantic` to `Pending(backlog
 
 ### 5.7 Server instructions, tool descriptions, skill
 
-`transport.rs`:
-- Server `instructions` block (~1032-1064, the `get_info` text): it says "keep queries semantic (concepts, not project names)". With BM25 the default that advice degrades results. Replace with: "phrase queries with the distinctive words you expect in the conversation (error strings, symbol names, product names); use mode=\"vector\" for paraphrase-style recall when this instance has embeddings enabled". Keep it as short as the current sentence; instructions are the always-loaded routing surface (CLAUDE.md "MCP tool routing is deliberate").
-- `query` param doc (~569-573) carries the same "semantic - concepts, not project names" phrase: same fix.
-- `mode` param doc (~576-579) and the tool description (~743-746): `"fts" (default) exact words, BM25; "vector" meaning - needs [embeddings].enabled on the serving instance`.
-- Other mentions (~234-235, ~252, ~257-258, ~316-319): read each, apply the same wording. Do not lengthen descriptions.
+**Conditional tool description (decision 15).** The `#[tool(description = "...")]` attribute on `pond_search` (`transport.rs` ~740) and the `McpSearchParams` doc comments (~566-582) are static (rmcp macros). The hook is the already-overridden `list_tools` (~1185): it builds `ListToolsResult { tools: self.tool_router.list_all(), .. }` then calls `annotate_tool_limits(&mut result)`. Add a sibling `annotate_search_mode(&mut result)` called right after it:
 
-`packages/pond/SKILL.md` line ~16: current `(`mode=vector` default; `mode=fts` for exact whole words)` -> `(`mode=fts` default: exact words; `mode=vector` for meaning, only where embeddings are enabled)`. This file is `include_str!`-embedded and installed by `pond init`; keep it in the crate (not in Cargo `exclude`).
+```rust
+/// With embedding off, the `pond_search` surface must not invite a vector
+/// query: the static attribute text names both arms, so rewrite the tool
+/// description and the `mode` property description at list time. The enum
+/// stays ["fts","vector"] - the wire contract is stable; the refusal in
+/// `resolve_effective_mode` handles an explicit attempt.
+fn annotate_search_mode(result: &mut ListToolsResult) {
+    if crate::embed::embeddings_enabled() {
+        return;
+    }
+    for tool in result.tools.iter_mut().filter(|t| t.name == "pond_search") {
+        tool.description = Some(SEARCH_DESCRIPTION_FTS_ONLY.into());
+        if let Some(props) = tool.input_schema.get_mut("properties").and_then(|p| p.as_object_mut())
+            && let Some(mode) = props.get_mut("mode").and_then(|m| m.as_object_mut())
+        {
+            mode.insert("description".into(), serde_json::Value::String(MODE_DOC_FTS_ONLY.into()));
+        }
+    }
+}
+```
+
+(`input_schema` is an `Arc<JsonObject>` in rmcp - use `Arc::make_mut` if the field is not directly mutable; check the rmcp version in `Cargo.lock` and its `Tool` struct before writing this.) Write the enabled text into the attribute and `MODE_DOC` constants so the two variants live side by side:
+
+- Attribute (enabled) tool description: today's text with `mode="vector" (default) matches meaning; mode="fts" matches exact whole words (BM25)` -> `mode="fts" (default) matches exact whole words (BM25); mode="vector" matches meaning`, and "keep the query semantic (concepts, not project names)" -> "put the distinctive words you expect in the conversation in the query (error strings, symbol names, product names); project names go in the project filter".
+- `SEARCH_DESCRIPTION_FTS_ONLY`: the same text with the whole `mode=` sentence removed.
+- `McpSearchParams.mode` doc (enabled): `"fts" (default): exact whole words via BM25. "vector": matches on meaning; available because this instance has embeddings enabled.`
+- `MODE_DOC_FTS_ONLY`: `"fts" (default and only arm on this instance): exact whole words via BM25.`
+- `McpSearchParams.query` doc (~569): `What to search for: the distinctive words you expect in the conversation (error strings, symbol names, product names). Project names go in the project filter, not the query.`
+
+Unit test: call `list_tools` with the flag false (construct `PondMcp` directly in `transport.rs::tests`, pass the flag through a small `annotate_search_mode_with(result, enabled: bool)` so the test does not depend on the global) and assert the `mode` description does not contain "vector"; with true, assert it does.
+
+**Server `instructions`** (`get_info`, ~1032-1064) - decision 17. Current clause: `keep queries semantic (concepts, not project names)`. Replace with: `phrase queries with the distinctive words you expect in the conversation (error strings, symbol names, product names) - project names go in the project filter`. Add one clause only when embedding is off (decision 19): `semantic (meaning-based) search is an opt-in on this instance - [embeddings].enabled in pond's config`. Do NOT add anything about retrying on zero hits. `get_info` runs per connection, so the conditional is a plain `if` on `embeddings_enabled()`; keep the block as short as today's (instructions are charged to every request - CLAUDE.md "MCP tool routing is deliberate").
+
+Other `transport.rs` mentions (~234-235, ~252, ~257-258, ~316-319): read each; where it states the default arm or "keep queries semantic", apply the same wording; do not lengthen.
+
+**`packages/pond/SKILL.md`** (decision 18) - routing only. Current line ~16: ``-> `pond_search` (`mode=vector` default; `mode=fts` for exact whole words).`` -> ``-> `pond_search` (the tool description on the running pond lists the available modes).``. Grep the file for `vector`, `semantic`, `embedding`, `fts` and remove every behaviour statement; keep "which tool for which intent" lines. The file stays `include_str!`-embedded and installed by `pond init`; keep it out of Cargo `exclude`. After this change a stale installed copy is still correct, so `skill_sync` needs no change.
 
 ### 5.8 Plugins (same PR)
 
-- `packages/openclaw-pond/src/tools.ts` ~146: `"vector" (default, meaning) or "fts" (exact words, BM25)` -> `"fts" (default, exact words, BM25) or "vector" (meaning; only when pond has embeddings enabled)`.
-- `packages/pi-pond/src/tools.ts` ~75: same.
-- `packages/hermes-pond/tools.py` ~70: same.
-- `packages/hermes-pond/service.py` ~142-145: today every `McpError` calls `self._drop(...)`. The refusal no longer arrives as `McpError` (5.2), but add the guard anyway so any future non-retryable app error does not respawn the child: if `exc.error.code` is in the pond app range (`-32010..-32016`) or `exc.error.data.get("retryable") is False`, return `(False, f"pond: {exc.error.message}")` WITHOUT `_drop`. Keep `_drop` for transport faults.
-- Each plugin: one test asserting the `mode` description string contains `"fts" (default`. Each plugin's README: flip the default wording.
-- All three resolve `pond` from `PATH` with no version gate, and nothing in CI publishes them. Minimum: log the resolved `pond --version` once at dial time in each plugin (openclaw `resolvePondBinary`, pi `service.ts` ~136, hermes equivalent) so a binary/plugin skew is visible in logs.
+Version-neutral wording (decision 16) - one string, used by all three:
+
+`Pick mode: "fts" (exact whole words, BM25) or "vector" (meaning; only where that pond instance has embeddings enabled). Omit mode to use pond's default.`
+
+- `packages/openclaw-pond/src/tools.ts` ~146 (`SEARCH_DESCRIPTION`): replace `Pick \`mode\`: "vector" (default, meaning) or "fts" (exact words, BM25).` with the string above. `schemas.ts:23` (the TypeBox enum) is already correct - leave it.
+- `packages/pi-pond/src/tools.ts` ~75-76: same replacement.
+- `packages/hermes-pond/tools.py` ~70-71: same replacement; the enum at ~78 stays.
+- `packages/hermes-pond/service.py` ~142-145: today every `McpError` calls `self._drop(...)`. The refusal no longer arrives as `McpError` (5.2), but add the guard so no future non-retryable app error respawns the child: if `exc.error.code` is in pond's app range (`-32010..-32016`) or `exc.error.data.get("retryable") is False`, return `(False, f"pond: {exc.error.message}")` WITHOUT `_drop`. Keep `_drop` for transport faults. Unit test with a fake `McpError(-32010, retryable=False)`: `_drop` not called.
+- Version visibility: openclaw `resolvePondBinary` (`src/service.ts` ~94-111), pi `src/service.ts` ~136-152, hermes `service.py` `_ensure_connected`: after resolving the binary, run `pond --version` once and log it at info level. No version gate.
+- Tests: one per plugin asserting the `mode` description does not contain the word "default," (i.e. names no default) and contains both `"fts"` and `"vector"`. READMEs: same neutral sentence.
+- Publishing is manual and out of band (npm for openclaw-pond / pi-pond, the hermes package per its own README), right after the `chore: release v0.15.0` PR merges. Nothing in CI publishes them; do not add that here.
 
 ### 5.9 Docs and spec
 
@@ -422,7 +475,7 @@ The `-v` backlog override (~6390-6395) that flips `semantic` to `Pending(backlog
 
 ### 5.10 Scheduler units
 
-`packages/pond/src/schedule.rs`: the three templates (`plist_body`, `systemd_service_body`, `cron_entry`) set `XDG_STATE_HOME` from the registration-time value with a char-rejection guard (~353-364). Add the config path the same way: resolve the active config file at registration (the same path `config_path(config)` yields in `main.rs`) and emit `POND_CONFIG_FILE=<path>` in each template; extend the char guard to it. Unit args stay `sync -q --no-wait`. Add the path to the existing template unit tests. This way a scheduled sync honours the same `enabled` the user set for manual syncs (3.6).
+`packages/pond/src/schedule.rs`: the three templates (`plist_body`, `systemd_service_body`, `cron_entry`) set `XDG_STATE_HOME` from the registration-time value with a char-rejection guard (~353-364). Add the config path the same way: resolve the active config file at registration (the same path `config_path(config)` yields in `main.rs`) and emit `POND_CONFIG_FILE=<path>` in each template; extend the char guard to it. Unit args stay `sync -q --no-wait`. Add the path to the existing template unit tests. This way a scheduled sync honours the same `enabled` the user set for manual syncs (3.6). Units written by an older pond lack the line; the changelog tells users to re-run `pond schedule install`.
 
 ### 5.11 Tests, benches, harness
 
@@ -430,7 +483,7 @@ Rust:
 - `tests/integration/transport_mcp.rs` ~213-221: the request `json!({"query":"answer"})` expects "pond_search: 1 nearest message ...". This is the one hard break. Keep it as the vector test by adding `"mode":"vector"` (the fixture enables embeddings), and add a sibling test without `mode` expecting "1 matching message". The disabled-path refusal is covered by the `handlers.rs` unit test with the explicit `false` argument (5.2) plus a unit test on the MCP match-arm predicate (`details.config_key == "embeddings.enabled"`); do not add a test binary for it (CLAUDE.md forbids loose test binaries).
 - `tests/integration/transport_http.rs` ~116: add `"mode":"vector"` so the vector arm stays covered; add a no-mode sibling asserting BM25 wording.
 - `src/snapshots/pond__tests__help_{search,sync,optimize,status,root,serve}.snap`: regenerate with `cargo insta accept` after reading every diff (`cargo insta review` to inspect).
-- A CLI regression test for decision 14: `pond search --min-score 0.2 foo` (no `--mode`) exits non-zero with the existing min_score message.
+- After the `min_score` removal commit: `pond search --min-score 0.2 foo` must fail with clap's "unexpected argument" (the flag no longer exists) - assert in the CLI help snapshot, no extra test needed.
 
 Benches (compile-check with `cargo clippy --all-targets`):
 - `benches/serve_mem_bench.rs` ~1145-1183 `vector_first` / `vector_steady` send explicit `SearchModeWire::Vector`; with the refusal they `bail!`. Gate: when `!embeddings_enabled()` skip both phases, print `vector phases skipped: embeddings disabled`, and mark the "candle E5 model (serving)" delta as `n/a` so the `idle_target_mib` gate (~1319-1339) cannot pass against an FTS query labelled vector. Add a `--no-embedder` flag that measures a never-loaded idle floor (see section 8, case A, for why).
@@ -459,10 +512,13 @@ Benches (compile-check with `cargo clippy --all-targets`):
 - Do not delete sync's model preload; gate it.
 - Do not add any backlog/staleness probe to `sync`, `status` (non-verbose), `mcp`/`serve` startup, or the search path.
 - Do not auto-enable when vectors exist, write config files, or add a compatibility shim for older binaries.
-- Do not extend the FTS all-null fold guard to IVF as a substitute for removing the intent.
+- Do not extend the FTS all-null fold guard to IVF as a *substitute* for removing the intent on disabled instances. (It IS extended on the enabled path - section 10.2 - those are different problems.)
 - Do not fatten MCP tool descriptions; routing lives in the server instructions.
 - Do not rename `MESSAGES_VECTOR_INDEX` ("messages_vector_ivfpq" is a stable on-disk identifier).
 - Do not open a release PR or pick a version; release-plz does both.
+- Do not put the default arm, the list of arms, or the opt-in hint into `SKILL.md`, plugin descriptions, or any file on disk - only the running binary states behaviour.
+- Do not add "retry with other words" / "zero hits is not absence" prose to instructions or descriptions; the scope count in every response is the only absence cue.
+- Do not fetch tool descriptions from the server inside plugins at registration time; hermes starts pond lazily, so the text must be static and version-neutral.
 
 ---
 
@@ -479,12 +535,36 @@ All against `cargo build --release` (`target/release/pond`). C, D, E need a copy
 | E mixed fleet | machine 1 enabled, machine 2 disabled, same store; each syncs its own sources; machine 1 runs `optimize --only embed` | no new OCC conflicts; after machine 1's optimize, machine 2's rows are embedded and vector-searchable from machine 1 |
 | F scheduled sync | `pond schedule install` with `enabled = true` in a non-default `XDG_CONFIG_HOME` | the written unit carries `POND_CONFIG_FILE=<that path>`; the scheduled run embeds (check `indexes text + semantic ready` in its log) |
 | G bench gate | `ops/scripts/bench-gate.sh` before and after on the same store | rows for both; valid JSON; `search_mode` stamped |
-| H min_score | `pond search --min-score 0.2 foo` | the existing min_score/fts error, exit != 0 |
+| H min_score removed | `pond search --min-score 0.2 foo`; `curl -X POST .../v1/search -d '{"query":"x","min_score":0.2}'` | clap "unexpected argument"; HTTP 400 unknown field (or ignored, if the struct is not `deny_unknown_fields` - record which) |
+| I fts-only surface | `pond mcp` on a disabled instance, `tools/list` | `pond_search` description and `mode` doc contain no "vector"; enum still `["fts","vector"]`; `get_info` instructions contain the opt-in clause |
+| J skill is version-neutral | `rg -n "vector|semantic|embedding|default" packages/pond/SKILL.md` | only routing lines; no behaviour statements |
 
 ---
 
 ## 9. Release
 
 - One squash-merged PR; subject `feat!(search): fts is the default arm; embeddings opt-in via [embeddings].enabled` with a real diff -> release-plz opens `chore: release v0.15.0`.
-- On the release PR branch, enrich `CHANGELOG.md` under `🛠 Breaking Changes` with a bolded `**Upgrading:**` preamble (precedent: `CHANGELOG.md:7`): "Embeddings are off by default. `mode=vector` is refused until `[embeddings].enabled = true` (or `POND_EMBEDDINGS_ENABLED=true`); existing vectors and the vector index are kept and resume on the next `pond optimize --only embed` from an enabled instance. Default search mode is `fts`; `--min-score` now needs an explicit `--mode vector`. A config file containing `enabled` does not load on pond < 0.15. Update openclaw-pond / pi-pond / hermes-pond alongside the binary." Then the grouped bullets with the measured numbers from the eval.
+- On the release PR branch, enrich `CHANGELOG.md` under `🛠 Breaking Changes` with a bolded `**Upgrading:**` preamble (precedent: `CHANGELOG.md:7`): "Embeddings are off by default. `mode=vector` is refused until `[embeddings].enabled = true` (or `POND_EMBEDDINGS_ENABLED=true`); existing vectors and the vector index are kept and resume on the next `pond optimize --only embed` from an enabled instance. Default search mode is `fts`. `--min-score` / `min_score` is removed (unused). `pond schedule install` must be re-run once so scheduled syncs pin the config file. A config file containing `enabled` does not load on pond < 0.15. Update openclaw-pond / pi-pond / hermes-pond alongside the binary." Then the grouped bullets with the measured numbers from the eval.
 - After release: add "implemented in v0.15.0" to section 6 of `docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md` and move roadmap row 7 to done in `README.md`.
+
+---
+
+## 10. Enabled-path regression guard
+
+Decision 8 says "enabled = today's behaviour". These are the ways this change can break the enabled path by itself; each has a check.
+
+### 10.1 `OnceLock` seeding order
+`embeddings_enabled()` is `false` until `EmbeddingsConfig::install_runtime` runs. A verb that opens the store or builds intents before `Config::load(..)` + `install_runtime()` behaves as disabled on an enabled instance - no embed, vector refused, IVF intent absent - silently. Audit every `Command::*` arm in `main.rs`: `rg -n "install_runtime" packages/pond/src` and confirm it is called once, before `open_store`, on `sync`, `serve`, `mcp`, `search`, `optimize`, `copy`, `status`, `resume`, `schedule`, and the archive import path. If `install_runtime` is called from one shared place (check `open_store` / `Config::load`), verify that place is on every path; if any arm loads config lazily or not at all (e.g. a verb that takes `--storage-path` without a config), it must still call `install_runtime` on the loaded-or-default config. Add a debug assertion helper `embed::assert_runtime_installed()` called at the top of `pond_index_intents()` and `run_embed_stage` in debug builds (`debug_assert!(ENABLED_RUNTIME.get().is_some(), "embeddings flag read before install_runtime")`) so a missed path fails tests instead of silently flipping behaviour.
+
+### 10.2 Enabled peer folding a disabled peer's all-null fragments
+Lance 8 folds an all-null tail into IVF_SQ without corruption, but the resulting empty delta segment always wins `select_segment_for_single_rebalance`, so every later no-op fold writes a full rebuild into a fresh `_indices/<uuid>/` dir and discards it - growing orphan dirs on the store and wasted work on the enabled machine. Guard on the enabled path: in `optimize_table_indices` (`substrate.rs` ~3304) extend the existing all-null probe from `matches!(intent.params, IndexParamsKind::InvertedFtsWord)` to `matches!(intent.params, IndexParamsKind::InvertedFtsWord | IndexParamsKind::IvfSqCosine { .. })`. The probe is already bounded (reads only the tail fragments, stops at the first non-null) and already runs after the fold threshold passed. This keeps the `sessions.rs` ~3084 invariant ("a row folds only after it embeds") literally true for fragments that hold no embedded row at all; fragments that mix embedded and null rows still fold (the null rows are excluded from index data, and when they are later embedded via `merge_update` they move to new fragments and fold then). Unit test: a tail of two fragments with all-null `vector` -> no IVF append; add one embedded row -> append happens.
+
+### 10.3 Enabled-path test coverage
+Every integration fixture that exercises vector search must call `init_enabled(true)`; a fixture that forgets passes green on fts. Guard: in `tests/integration/search.rs` assert once that the vector fixture actually took the vector arm (`pond search --explain` / the `explain_search_plan` helper already used in `handlers.rs::tests` - assert `plan.mode == SearchMode::Vector` for the default-vector request after `init_enabled(true)`). The snapshot-free way: one integration test `vector_arm_is_live_when_enabled` that fails if the effective mode degraded.
+
+### 10.4 `embed_backlog_count` as the only gate
+`run_embed_stage` now always runs `embed_backlog_count()` when enabled - a `count_rows` with the `IsNotNull` guard (CLAUDE.md "count_rows predicates": ~7 s on S3, never the unguarded `Ne`). Verify the implementation of `embed_backlog_count` (`sessions.rs` ~3128) still uses the narrow `embedding_model` column and the guard; do not rewrite it. It runs only in `optimize` / `copy` / archive restore - confirm `sync` never reaches `run_embed_stage` (today it does not; keep it that way).
+
+### 10.5 Acceptance B widened
+Case B must cover, on an enabled instance: `sync` (inline embed), `optimize --only embed` (backlog), `copy --to <dir>` (finalize embeds, recap says "text + semantic"), `serve --with-sync` (model loads once, shared), CLI `search --mode vector`, MCP `mode=vector`, and `status` showing `text + semantic ready`. Any of these behaving as disabled is a 10.1 bug.
+
