@@ -41,7 +41,7 @@ dim = 384
 
 With `enabled = false` no pond process downloads or loads a model, new messages are stored without vectors, index maintenance ignores the vector index, and a `vector` request is refused with a message naming this switch. With `enabled = true` messages embed inline at ingest, and `pond optimize --only embed` fills the backlog of anything ingested while it was off.
 
-`POND_EMBEDDINGS_ENABLED=true|false` is the env mirror, which is how containers and CI turn it on without a config file. The value must be the literal `true` or `false`; `1` and `0` fail to load.
+`POND_EMBEDDINGS_ENABLED=true|false` is the env mirror, which is how containers and CI turn it on without a config file. `true`/`false` (also `1`/`0`, `yes`/`no`); any other string fails config loading.
 
 What it costs: with embeddings off a pond process sits around 100 MiB; once any vector work has run it costs roughly 500-900 MiB, plus a one-time 466 MiB model download into `$HOME/.cache/huggingface` and CPU-bound first syncs on hosts without Metal or CUDA.
 

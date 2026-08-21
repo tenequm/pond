@@ -223,7 +223,7 @@ enabled = false                    # kept in config, skipped on `pond sync`
 path = "~/.codex/sessions"
 ```
 
-Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true` (literal `true`/`false`), then run `pond optimize --only embed` once to fill the backlog:
+Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true`, then run `pond optimize --only embed` once to fill the backlog:
 
 ```toml
 [embeddings]
