@@ -585,3 +585,7 @@ Found while executing the plan; the code above these claims won:
 - `min_score` lived on `SearchFilters`, not `SearchRequest` (5.2); removing it also removed the orphaned `is_zero_f64` helper. `render.rs` had no `min_score`.
 - `SearchRequest` is not `deny_unknown_fields`: an old client's HTTP `min_score` is silently ignored (200), not rejected - acceptance H records "ignored".
 - There is no open-time intent registration (5.4 cited `sessions.rs` ~3308 - that is `index_status_with`); `Store::open` never builds intents. `unindexed_vector_backlog` lost its last caller after 5.5 and was deleted.
+
+## 12. Status (2026-08-22)
+
+Release-verification perf A/B on the real S3 corpus is DONE and logged in `docs/benchmarks/results.md` ("release A/B: CLI reads and full first import (embeddings opt-in)", s3-nbg1, v0.14.11 vs `ba3e352`): status 1.18x, `status -v` 3.67x disabled / parity enabled, `search --mode fts` parity, omitted-mode 1.10x, full first import 39m22s vs 113m56s (2.89x). Branch HEAD `0d9e9ba` also carries the init schedule-repair prompt and the npm trusted-publishing CI job (openclaw-pond 0.2.0, pi-pond 0.3.0). Remaining: CI green, merge with a real-diff `feat!:` squash subject, release-plz PR enrichment per section 9.

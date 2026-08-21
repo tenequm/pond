@@ -1284,10 +1284,7 @@ async fn run() -> anyhow::Result<()> {
                 // to a count scan) instead of the skipped embedding probe.
                 let searchable_fut = async {
                     if verbose && !pond::embed::embeddings_enabled() {
-                        store
-                            .searchable_in_scope(&pond::substrate::Predicate::And(Vec::new()))
-                            .await
-                            .map(Some)
+                        store.searchable_message_count().await.map(Some)
                     } else {
                         Ok(None)
                     }
@@ -1460,7 +1457,11 @@ async fn run() -> anyhow::Result<()> {
                     output(&stage_line(
                         started.elapsed(),
                         "indexes",
-                        "embed + fold complete",
+                        if pond::embed::embeddings_enabled() {
+                            "embed + fold complete"
+                        } else {
+                            "fold complete"
+                        },
                     ))?;
                     Some(outcome)
                 } else {
@@ -2166,6 +2167,9 @@ async fn open_store(
     spinner: bool,
     index_cache: bool,
 ) -> anyhow::Result<(ResolvedStorage, Store)> {
+    // Every store the CLI opens reads the embeddings flag (index intents,
+    // search arm), so a config built without `Config::load` trips here.
+    pond::embed::assert_runtime_installed();
     let storage = resolve_storage_location(explicit, loaded)?;
     let resolved = storage.resolve(&loaded.creds)?;
     warn_unmatched_sets(&[&resolved], loaded)?;

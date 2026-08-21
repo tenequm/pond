@@ -319,10 +319,17 @@ pub(crate) async fn run(
         // A schedule pins the config path into the OS unit; a path the
         // templates cannot embed must fail here, before the config write and
         // the first sync - not inside registration after both already ran.
+        // Gate the same absolutized path registration pins (a relative input
+        // picks up cwd components), and the state dir registration also pins.
         schedule::reject_unembeddable(
             "config file",
-            &config_file,
-            "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml",
+            &schedule::config_file(Some(config_file.clone())),
+            schedule::CONFIG_FILE_SOURCES,
+        )?;
+        schedule::reject_unembeddable(
+            "state dir",
+            &crate::syncstate::state_root(),
+            schedule::STATE_DIR_SOURCES,
         )?;
     }
     plan.push_str(&format!("\nconfig     {}", display_path(&config_file)));

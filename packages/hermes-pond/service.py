@@ -219,10 +219,17 @@ class PondController:
     def _log_version(self, pond_bin: str) -> None:
         """Record which pond this session is actually talking to, once. The tool
         text is version-neutral, so the log is the only place the binary's
-        behaviour (default search arm, embeddings) can be traced back to."""
+        behaviour (default search arm, embeddings) can be traced back to.
+        Fire-and-forget: the dial never waits on it and never fails because of
+        it (matches the openclaw-pond / pi-pond probes)."""
         if self._version_logged:
             return
         self._version_logged = True
+        threading.Thread(
+            target=self._probe_version, args=(pond_bin,), daemon=True
+        ).start()
+
+    def _probe_version(self, pond_bin: str) -> None:
         try:
             probe = subprocess.run(
                 [pond_bin, "--version"],

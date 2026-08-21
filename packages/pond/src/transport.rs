@@ -1193,9 +1193,7 @@ Examples (4 patterns the agent should recognize):
                             let searchable = progress.total;
                             anyhow::Ok((Some((progress, stale)), searchable))
                         } else {
-                            let searchable = store
-                                .searchable_in_scope(&crate::substrate::Predicate::And(Vec::new()))
-                                .await?;
+                            let searchable = store.searchable_message_count().await?;
                             anyhow::Ok((None, searchable))
                         }
                     };

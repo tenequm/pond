@@ -124,57 +124,57 @@ Store `s3+https://nbg1.your-objectstorage.com/pondarium/pond` (~14.3k sessions /
 ```
 == status (default verbosity) ==
 Benchmark 1: old
-  Time (mean ± σ):      6.330 s ±  0.984 s    [User: 1.474 s, System: 1.620 s]
-  Range (min … max):    5.317 s …  7.282 s    3 runs
+  Time (mean +/- sigma):      6.330 s +/-  0.984 s    [User: 1.474 s, System: 1.620 s]
+  Range (min ... max):    5.317 s ...  7.282 s    3 runs
 
 Benchmark 2: new-disabled
-  Time (mean ± σ):      5.373 s ±  0.294 s    [User: 1.462 s, System: 1.671 s]
-  Range (min … max):    5.034 s …  5.552 s    3 runs
+  Time (mean +/- sigma):      5.373 s +/-  0.294 s    [User: 1.462 s, System: 1.671 s]
+  Range (min ... max):    5.034 s ...  5.552 s    3 runs
 
 Summary
   new-disabled ran
-    1.18 ± 0.19 times faster than old
+    1.18 +/- 0.19 times faster than old
 == status -v ==
 Benchmark 1: old
-  Time (mean ± σ):     79.115 s ± 21.896 s    [User: 7.398 s, System: 5.012 s]
-  Range (min … max):   63.175 s … 104.081 s    3 runs
+  Time (mean +/- sigma):     79.115 s +/- 21.896 s    [User: 7.398 s, System: 5.012 s]
+  Range (min ... max):   63.175 s ... 104.081 s    3 runs
 
 Benchmark 2: new-disabled
-  Time (mean ± σ):     21.563 s ±  5.805 s    [User: 1.708 s, System: 1.870 s]
-  Range (min … max):   15.901 s … 27.502 s    3 runs
+  Time (mean +/- sigma):     21.563 s +/-  5.805 s    [User: 1.708 s, System: 1.870 s]
+  Range (min ... max):   15.901 s ... 27.502 s    3 runs
 
 Benchmark 3: new-enabled
-  Time (mean ± σ):     72.139 s ± 30.303 s    [User: 6.099 s, System: 4.233 s]
-  Range (min … max):   51.654 s … 106.949 s    3 runs
+  Time (mean +/- sigma):     72.139 s +/- 30.303 s    [User: 6.099 s, System: 4.233 s]
+  Range (min ... max):   51.654 s ... 106.949 s    3 runs
 
 Summary
   new-disabled ran
-    3.35 ± 1.67 times faster than new-enabled
-    3.67 ± 1.42 times faster than old
+    3.35 +/- 1.67 times faster than new-enabled
+    3.67 +/- 1.42 times faster than old
 == search fts ==
 Benchmark 1: old
-  Time (mean ± σ):     112.384 s ±  3.177 s    [User: 8.323 s, System: 4.460 s]
-  Range (min … max):   109.358 s … 115.692 s    3 runs
+  Time (mean +/- sigma):     112.384 s +/-  3.177 s    [User: 8.323 s, System: 4.460 s]
+  Range (min ... max):   109.358 s ... 115.692 s    3 runs
 
 Benchmark 2: new-disabled
-  Time (mean ± σ):     117.016 s ± 18.010 s    [User: 8.064 s, System: 4.409 s]
-  Range (min … max):   100.323 s … 136.103 s    3 runs
+  Time (mean +/- sigma):     117.016 s +/- 18.010 s    [User: 8.064 s, System: 4.409 s]
+  Range (min ... max):   100.323 s ... 136.103 s    3 runs
 
 Summary
   old ran
-    1.04 ± 0.16 times faster than new-disabled
+    1.04 +/- 0.16 times faster than new-disabled
 == search default mode (upgrade experience: omitted --mode) ==
 Benchmark 1: old-default
-  Time (mean ± σ):     122.856 s ± 14.638 s    [User: 8.396 s, System: 4.615 s]
-  Range (min … max):   113.779 s … 139.743 s    3 runs
+  Time (mean +/- sigma):     122.856 s +/- 14.638 s    [User: 8.396 s, System: 4.615 s]
+  Range (min ... max):   113.779 s ... 139.743 s    3 runs
 
 Benchmark 2: new-default
-  Time (mean ± σ):     111.895 s ±  9.605 s    [User: 7.773 s, System: 4.345 s]
-  Range (min … max):   105.965 s … 122.977 s    3 runs
+  Time (mean +/- sigma):     111.895 s +/-  9.605 s    [User: 7.773 s, System: 4.345 s]
+  Range (min ... max):   105.965 s ... 122.977 s    3 runs
 
 Summary
   new-default ran
-    1.10 ± 0.16 times faster than old-default
+    1.10 +/- 0.16 times faster than old-default
 ```
 
 `status` 1.18x, `status -v` 3.67x with embeddings disabled (it no longer pays the embedding-coverage scan) and parity when enabled, `search --mode fts` parity (1.04 +/- 0.16), omitted-mode search 1.10x from the default flip vector -> fts. No regression in any cell.

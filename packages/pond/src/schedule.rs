@@ -245,10 +245,14 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
 /// invoking shell's cwd: the pinned path is re-read from the scheduler's
 /// working directory, which is not ours to assume - a relative pin would
 /// silently miss there and the scheduled sync would run on built-in defaults.
-fn config_file(explicit: Option<PathBuf>) -> PathBuf {
+pub(crate) fn config_file(explicit: Option<PathBuf>) -> PathBuf {
     let path = crate::config_path(explicit);
     std::path::absolute(&path).unwrap_or(path)
 }
+
+pub(crate) const CONFIG_FILE_SOURCES: &str =
+    "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml";
+pub(crate) const STATE_DIR_SOURCES: &str = "XDG_STATE_HOME, falling back to $HOME/.local/state";
 
 /// Registration entry point for `pond init`, which calls it after the config
 /// write with the config path it resolved (a `--config-file` passed to init
@@ -381,16 +385,8 @@ mod unix {
         // read a different config would run with different adapters and a
         // different [embeddings].enabled than a manual one.
         let state = crate::syncstate::state_root();
-        super::reject_unembeddable(
-            "state dir",
-            &state,
-            "XDG_STATE_HOME, falling back to $HOME/.local/state",
-        )?;
-        super::reject_unembeddable(
-            "config file",
-            config_file,
-            "--config-file or POND_CONFIG_FILE, falling back to $XDG_CONFIG_HOME/pond/config.toml",
-        )?;
+        super::reject_unembeddable("state dir", &state, super::STATE_DIR_SOURCES)?;
+        super::reject_unembeddable("config file", config_file, super::CONFIG_FILE_SOURCES)?;
         match std::env::consts::OS {
             "macos" => start_launchd(&bin, every, &log, &state, config_file),
             "linux" => {
@@ -1107,12 +1103,7 @@ mod windows {
                 state_root.as_path(),
                 "--state-dir or XDG_STATE_HOME",
             ),
-            (
-                "config file",
-                config_file,
-                "--config-file or POND_CONFIG_FILE, falling back to \
-                 $XDG_CONFIG_HOME/pond/config.toml",
-            ),
+            ("config file", config_file, super::CONFIG_FILE_SOURCES),
         ] {
             super::reject_unembeddable(what, path, sources)?;
         }

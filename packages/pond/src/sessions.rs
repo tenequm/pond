@@ -2658,6 +2658,13 @@ impl Store {
     /// hits" only means something relative to how many messages were
     /// searchable at all, and 0 tells the caller their filters excluded
     /// everything before retrieval even started.
+    /// Corpus-wide searchable total - the count `pond status -v` and
+    /// `stats://pond` report when embedding progress is skipped, so both
+    /// surfaces share one definition of the disabled-path source.
+    pub async fn searchable_message_count(&self) -> Result<usize> {
+        self.searchable_in_scope(&Predicate::And(Vec::new())).await
+    }
+
     pub async fn searchable_in_scope(&self, filter: &Predicate) -> Result<usize> {
         // Unfiltered: the FTS index already counts non-null search_text rows
         // (`num_docs`), and fast_search only searches those indexed docs - so
@@ -3219,9 +3226,9 @@ impl Store {
         &self,
         vector_threshold: usize,
     ) -> Result<OptimizeOutcome> {
-        let policy = pond_index_intents_with_vector_threshold(vector_threshold, true);
+        let intents = pond_index_intents_with_vector_threshold(vector_threshold, true);
         let mut tables = Vec::with_capacity(3);
-        for (table, intents) in policy.all() {
+        for (table, intents) in intents.all() {
             let indices = self
                 .handle
                 .optimize_table_indices_only(table, intents, None)
