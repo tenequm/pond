@@ -573,3 +573,15 @@ Every integration fixture that exercises vector search must call `init_enabled(t
 ### 10.5 Acceptance B widened
 Case B must cover, on an enabled instance: `sync` (inline embed), `optimize --only embed` (backlog), `copy --to <dir>` (finalize embeds, recap says "text + semantic"), `serve --with-sync` (model loads once, shared), CLI `search --mode vector`, MCP `mode=vector`, and `status` showing `text + semantic ready`. Any of these behaving as disabled is a 10.1 bug.
 
+
+---
+
+## 11. Implementation corrections (2026-08-21, PR #168)
+
+Found while executing the plan; the code above these claims won:
+
+- Decision 10 overstated the env mirror's strictness: `Config::load` uses figment `extract_lossy`, so `POND_EMBEDDINGS_ENABLED` accepts boolean-ish strings (`1`/`0`/`yes`/`TRUE`), and only non-boolean-ish values fail to load. Pinned by `config.rs` test `env_mirror_maps_embeddings_enabled_true_and_1_and_rejects_non_boolean_strings`.
+- There is no `pond schedule install`; the subcommand is `pond schedule start` (sections 3.6, 5.10, 9 and the changelog text should read `start`).
+- `min_score` lived on `SearchFilters`, not `SearchRequest` (5.2); removing it also removed the orphaned `is_zero_f64` helper. `render.rs` had no `min_score`.
+- `SearchRequest` is not `deny_unknown_fields`: an old client's HTTP `min_score` is silently ignored (200), not rejected - acceptance H records "ignored".
+- There is no open-time intent registration (5.4 cited `sessions.rs` ~3308 - that is `index_status_with`); `Store::open` never builds intents. `unindexed_vector_backlog` lost its last caller after 5.5 and was deleted.
