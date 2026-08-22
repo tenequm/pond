@@ -5841,6 +5841,7 @@ fn status_json_empty(
 ) -> anyhow::Result<String> {
     let doc = serde_json::json!({
         "pond_version": VERSION.as_str(),
+        "embeddings_enabled": pond::embed::embeddings_enabled(),
         "storage": {
             "url": resolved.display(),
             "binding": resolved.binding.describe(),
@@ -5917,6 +5918,7 @@ fn status_json(
     });
     let doc = serde_json::json!({
         "pond_version": VERSION.as_str(),
+        "embeddings_enabled": pond::embed::embeddings_enabled(),
         "storage": {
             "url": resolved.display(),
             "binding": resolved.binding.describe(),
@@ -6712,6 +6714,21 @@ mod tests {
         let health = classify_index_health(&statuses, Some(&progress), 0, false);
         assert!(health.semantic.is_none());
         assert!(!render_indexes_line(&health).contains("semantic"));
+    }
+
+    /// The status JSON names the embeddings posture so a consumer can tell
+    /// which search arm an omitted `mode` resolves to without reading config.
+    /// The unit-test process never loads config, so the flag reads as the
+    /// disabled default.
+    #[test]
+    fn status_json_reports_embeddings_enabled() {
+        let resolved = StorageUrl::parse("/tmp/pond-test-status-json")
+            .unwrap()
+            .resolve(&std::collections::BTreeMap::new())
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&status_json_empty(&resolved, None).unwrap()).unwrap();
+        assert_eq!(doc["embeddings_enabled"], serde_json::json!(false));
     }
 
     /// The process flag is uninitialized in unit tests, i.e. disabled - so an
