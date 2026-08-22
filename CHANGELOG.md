@@ -2,11 +2,21 @@
 
 ## [0.15.0](https://github.com/tenequm/pond/compare/v0.14.11...v0.15.0) - 2026-08-22
 
+Embeddings are opt-in. Full-text search (BM25) is now the default arm everywhere, and a fresh install no longer downloads a 466 MB embedding model or embeds anything at sync - first import of an 11k-session corpus dropped from 113m56s to 39m22s (2.89x) in the release A/B against a real S3 store. A 63-day usage-trace evaluation (1,126 real searches, `docs/researches/`) found fts matches or beats vector quality on this workload, which is why the default flipped rather than just the cost.
+
+**Upgrading:** if you used semantic search and want to keep it, set `[embeddings].enabled = true` in config (or `POND_EMBEDDINGS_ENABLED=1`; boolean-ish `1/0/yes/no/true/false` all parse). Without it, searches run fts - degraded for meaning-style queries, never broken, and your existing embeddings and semantic index stay untouched on the store for the moment you opt back in. Then re-run `pond init` - it now detects your existing sync schedule and offers to re-register it, refreshing the unit after the upgrade (or run `pond schedule start`).
+
 ### <!-- 0 -->🛠 Breaking Changes
-- **status:** [**breaking**] report embeddings_enabled in status --format json ([afbdd8e](https://github.com/tenequm/pond/commit/afbdd8eb50eb7c05ee77d2bc22a69288db2b4034))
+- **search:** fts is the default arm; embeddings opt-in via `[embeddings].enabled` ([a5b2779](https://github.com/tenequm/pond/commit/a5b277937de6cb3f3ea70a9b5c0d051b9c4c15c9))
+  - An omitted `mode` now resolves to `fts` on every surface: CLI (`pond search`), MCP (`pond_search`), HTTP wire, and the openclaw/pi/hermes plugins. `mode=vector` on a disabled instance returns a typed refusal naming `embeddings.enabled` (`retryable: false`) instead of failing obscurely; the HTTP `min_score` parameter of an old client is silently ignored, not rejected.
+  - Disabled instances skip the model download, the embed stage, and the vector index intent entirely; the MCP tool surface describes itself fts-only so agents are never routed to a refusal. Enabled instances behave exactly as before - the release A/B measured parity on every enabled-path read.
+  - Reads got cheaper on the new default: `pond status -v` 79.1s -> 21.6s (3.67x) on the real 2.87M-message S3 store (embedding scans replaced by index-resident reads), `status` 1.18x, `search --mode fts` at parity (1.04 +/- 0.16). Baselines in `docs/benchmarks/results.md`.
+- **status:** report embeddings_enabled in status --format json ([afbdd8e](https://github.com/tenequm/pond/commit/afbdd8eb50eb7c05ee77d2bc22a69288db2b4034))
+  - Additive field so a consumer can tell which arm an omitted `mode` resolves to without reading config. (This commit also carries the release's breaking marker: the squash subject above used the malformed `feat!(scope):` form the conventional-commit parser ignores.)
 
 ### <!-- 1 -->🎉 New Features
-- feat!(search): fts is the default arm; embeddings opt-in via [embeddings].enabled ([a5b2779](https://github.com/tenequm/pond/commit/a5b277937de6cb3f3ea70a9b5c0d051b9c4c15c9))
+- **init:** schedule repair - re-running `pond init` detects an active sync schedule and offers to re-register it, rewriting the unit with the current template (config-file pin, absolutized paths). The prompt defaults to yes with the current cadence preselected; declining leaves the unit byte-identical. Interactive only, so sandboxed `--yes` runs can never repoint a real unit. ([a5b2779](https://github.com/tenequm/pond/commit/a5b277937de6cb3f3ea70a9b5c0d051b9c4c15c9))
+- **plugins:** openclaw-pond 0.2.0 and pi-pond 0.3.0 ship the version-neutral fts-default tool descriptions and now auto-publish to npm via trusted publishing (OIDC, no tokens) on each release. ([a5b2779](https://github.com/tenequm/pond/commit/a5b277937de6cb3f3ea70a9b5c0d051b9c4c15c9))
 
 ### <!-- 5 -->📚 Documentation
 - **site:** add /compare page; link it from the README FAQ table ([e91fcec](https://github.com/tenequm/pond/commit/e91fcec25b9635f4ecb2d1eb0678b8564f6fdf7e))
