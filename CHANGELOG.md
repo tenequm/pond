@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.15.0](https://github.com/tenequm/pond/compare/v0.14.11...v0.15.0) - 2026-08-22
+
+### <!-- 0 -->🛠 Breaking Changes
+- **status:** [**breaking**] report embeddings_enabled in status --format json ([afbdd8e](https://github.com/tenequm/pond/commit/afbdd8eb50eb7c05ee77d2bc22a69288db2b4034))
+
+### <!-- 1 -->🎉 New Features
+- feat!(search): fts is the default arm; embeddings opt-in via [embeddings].enabled ([a5b2779](https://github.com/tenequm/pond/commit/a5b277937de6cb3f3ea70a9b5c0d051b9c4c15c9))
+
+### <!-- 5 -->📚 Documentation
+- **site:** add /compare page; link it from the README FAQ table ([e91fcec](https://github.com/tenequm/pond/commit/e91fcec25b9635f4ecb2d1eb0678b8564f6fdf7e))
+- **readme:** add side-by-side table under the memory-tool FAQ ([e52a49d](https://github.com/tenequm/pond/commit/e52a49db8ead128f1de1aac7f5cfede2d2bacdab))
+- **readme:** add the roadmap - shipped steps, what is next in order, and what is not planned ([d47ec3c](https://github.com/tenequm/pond/commit/d47ec3c2767309e4834485ba4342ddc046c76df4))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.14.11...v0.15.0
+
 ## [0.14.11](https://github.com/tenequm/pond/compare/v0.14.10...v0.14.11) - 2026-08-17
 
 Finishes the Windows port 0.14.10 opened. Local-store durability now behaves the same on NTFS as it does on APFS and ext4, the background sync task no longer flashes a console window or hides its own failures, and pond installs from Scoop today.
