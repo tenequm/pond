@@ -212,3 +212,19 @@ describe("subagent denial", () => {
     }
   });
 });
+
+// The description must read correctly against ANY pond binary: the default arm
+// is the running instance's business, so naming one here would go stale on the
+// first upgrade that flips it.
+describe("mode description is version-neutral", () => {
+  it("names both arms and no default", async () => {
+    const { factories } = await harness();
+    const description = factories.search(mainCtx())!.description;
+    expect(description).toContain('"fts"');
+    expect(description).toContain('"vector"');
+    // No arm may be marked as the default: catches '"fts" (default...' and
+    // 'default,' alike, while allowing the closing "pond's default." sentence.
+    expect(description).not.toMatch(/"(fts|vector)"\s*\(\s*default/);
+    expect(description).not.toContain("default,");
+  });
+});

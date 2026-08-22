@@ -193,6 +193,8 @@ pub mod mcp {
     //! Mounted on stdio (via `pond mcp`) and on the `/mcp` HTTP route (via
     //! `pond serve`).
 
+    use std::sync::Arc;
+
     use anyhow::Context;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rmcp::{
@@ -231,8 +233,9 @@ pub mod mcp {
     /// Static documentation served as the `schema://pond` resource. Detail
     /// agents load on demand; the per-tool descriptions below stay tight.
     const SCHEMA_DOC: &str = "\
-pond_search params: query (semantic - concepts, not project names), mode \
-(vector default - matches on meaning | fts - matches exact whole words, BM25), \
+pond_search params: query (the distinctive words you expect in the \
+conversation, not project names), mode (fts default - matches exact whole \
+words, BM25 | vector - matches on meaning), \
 sort_by (relevance default | recency), limit (returned sessions; default 10, \
 max 200 - also the want-more knob, there is no pagination), project (path \
 substring), session_id (exact session match - search within one session), \
@@ -280,6 +283,45 @@ full part bodies, reasoning included, plus context_before / context_after \
 conversational siblings each side, both default 3, like grep -B/-A). A \
 session id is rejected with a hint naming pond_get_session - it cannot pick \
 one message.";
+
+    /// `schema://pond` for the serving instance. With embedding off the doc
+    /// must not offer the vector arm
+    /// (spec.md#protocol-self-describing-capabilities): the same
+    /// self-description rule `annotate_search_mode_with`
+    /// enforces on `tools/list`. Each rewrite is asserted so the doc and the
+    /// rewrite cannot drift apart silently.
+    fn schema_doc_for(enabled: bool) -> String {
+        if enabled {
+            return SCHEMA_DOC.to_owned();
+        }
+        let rewrites = [
+            (
+                "mode (fts default - matches exact whole \
+words, BM25 | vector - matches on meaning)",
+                "mode (fts, the only arm on this instance - matches exact whole words, BM25)",
+            ),
+            (
+                "(raw cosine for vector, normalized BM25 for fts). vector relevance \
+ordering adds a gentle recency tiebreaker;",
+                "(normalized BM25);",
+            ),
+            (
+                "pond's embedder (multilingual-e5-small) is trained \
+for cross-lingual retrieval, so a vector query in language A can match indexed \
+text in language B. fts",
+                "fts",
+            ),
+        ];
+        let mut doc = SCHEMA_DOC.to_owned();
+        for (from, to) in rewrites {
+            debug_assert!(
+                doc.contains(from),
+                "schema doc drifted from rewrite: {from}"
+            );
+            doc = doc.replace(from, to);
+        }
+        doc
+    }
 
     /// Static documentation served as the `schema://pond-sql` resource: the
     /// table/column schema, dialect, function set, output modes, pagination
@@ -569,14 +611,12 @@ Examples (4 patterns the agent should recognize):
     /// `pond_search` MCP tool parameters.
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct McpSearchParams {
-        /// What to search for: concepts and keywords. Keep it semantic - do
-        /// not put project names in the query, use the `project` filter
-        /// instead.
+        /// What to search for: the distinctive words you expect in the
+        /// conversation (error strings, symbol names, product names). Project
+        /// names go in the project filter, not the query.
         query: String,
-        /// Retrieval arm: "vector" (default - matches on meaning) or "fts"
-        /// (matches exact whole words via BM25). Use vector for concepts/
-        /// paraphrases, fts when you know the literal words. Falls back to fts
-        /// when the store has no embeddings.
+        /// "fts" (default): exact whole words via BM25. "vector": matches on
+        /// meaning; available because this instance has embeddings enabled.
         #[serde(default)]
         mode: Option<String>,
         /// Result order: "relevance" (default - best match first) or "recency"
@@ -703,12 +743,12 @@ Examples (4 patterns the agent should recognize):
         }
     }
 
-    /// Parse the `mode` param; unknown / absent defaults to vector. Returns
-    /// `None` for an explicit unknown value so the caller can reject it.
+    /// Parse the `mode` param; absent defaults to fts. Returns `None` for an
+    /// explicit unknown value so the caller can reject it.
     fn parse_search_mode(value: Option<&str>) -> Option<SearchModeWire> {
         match value {
-            None | Some("vector") => Some(SearchModeWire::Vector),
-            Some("fts") => Some(SearchModeWire::Fts),
+            None | Some("fts") => Some(SearchModeWire::Fts),
+            Some("vector") => Some(SearchModeWire::Vector),
             Some(_) => None,
         }
     }
@@ -740,11 +780,12 @@ Examples (4 patterns the agent should recognize):
         #[tool(
             description = "Find relevant messages in past sessions - the entry point for \
                            recall: \"have we worked on X\", \"what did we decide about Y\", \
-                           \"find the session where...\". mode=\"vector\" (default) matches \
-                           meaning; mode=\"fts\" matches exact whole words (BM25). Scope with \
-                           project / session_id / source_agent / from_date / to_date; keep the \
-                           query semantic \
-                           (concepts, not project names). Returns scored hits grouped by \
+                           \"find the session where...\". mode=\"fts\" (default) matches exact \
+                           whole words (BM25); mode=\"vector\" matches meaning. Scope with \
+                           project / session_id / source_agent / from_date / to_date; put the \
+                           distinctive words you expect in the conversation in the query \
+                           (error strings, symbol names, product names); project names go in \
+                           the project filter. Returns scored hits grouped by \
                            session, best session first; pass a hit's session_id to \
                            pond_get_session or its message_id to pond_get_message to read \
                            it. Searches conversational text only (tool \
@@ -781,10 +822,6 @@ Examples (4 patterns the agent should recognize):
                     source_agent: params.source_agent,
                     from_date: params.from_date,
                     to_date: params.to_date,
-                    // min_score is intentionally not on the MCP surface; scores
-                    // are response-relative, so a server-side threshold is a
-                    // footgun for agent callers. CLI / HTTP still exposes it.
-                    min_score: 0.0,
                 },
                 limit: params.limit.unwrap_or(10),
             };
@@ -803,6 +840,13 @@ Examples (4 patterns the agent should recognize):
                         crate::render::Surface::Mcp,
                     )))
                 }
+                // The `mode=vector` refusal is the caller's to fix in-turn (retry
+                // with fts), so it rides back as a tool error, not a JSON-RPC
+                // one: a JSON-RPC error makes plugin hosts tear down and respawn
+                // the pond child on every call.
+                SearchEnvelope::Error(envelope) if is_semantic_disabled(&envelope) => Ok(
+                    CallToolResult::error(vec![Content::text(envelope.error.message.clone())]),
+                ),
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
         }
@@ -1029,7 +1073,7 @@ Examples (4 patterns the agent should recognize):
             // schema:// resources. Wording is deliberate: "analyze / review /
             // summarize a session" must bind to pond_get_session, and
             // pond_sql must never read as the general "analyze" tool.
-            .with_instructions(
+            .with_instructions(format!(
                 "pond recalls past agent sessions (Claude Code and others) - prior work, \
                  decisions, and context across sessions, not the live conversation. Three \
                  tools cover almost every request: pond_search finds relevant messages, \
@@ -1048,8 +1092,10 @@ Examples (4 patterns the agent should recognize):
                  group-by, joins), exact strings or identifiers inside tool bodies, \
                  bulk export (parquet/ndjson) - read resource \
                  schema://pond-sql before writing SQL. Scope with filters (project, \
-                 session_id, source_agent, from_date / to_date), keep queries semantic \
-                 (concepts, not project names). source_agent is exact-or-subpath: a root \
+                 session_id, source_agent, from_date / to_date), and phrase queries with \
+                 the distinctive words you expect in the conversation (error strings, \
+                 symbol names, product names) - project names go in the project filter. \
+                 source_agent is exact-or-subpath: a root \
                  value (\"openclaw\", \"claude-code\") returns that harness's main \
                  sessions; subagents are stored as their own sessions and excluded by \
                  default - name a subpath (\"claude-code/general-purpose\") to search \
@@ -1060,8 +1106,14 @@ Examples (4 patterns the agent should recognize):
                  exact strings with pond_sql WHERE contains_tokens(search_text, '...') \
                  before concluding something never happened. Deeper reference: resources \
                  schema://pond (search/get params + response format), schema://pond-sql \
-                 (SQL columns, functions, worked examples), stats://pond (corpus stats).",
-            )
+                 (SQL columns, functions, worked examples), stats://pond (corpus stats).{}",
+                if crate::embed::embeddings_enabled() {
+                    ""
+                } else {
+                    " Semantic (meaning-based) search is an opt-in on this instance - \
+                     [embeddings].enabled in pond's config."
+                },
+            ))
         }
 
         async fn list_resources(
@@ -1087,7 +1139,7 @@ Examples (4 patterns the agent should recognize):
         ) -> Result<ReadResourceResult, ErrorData> {
             match request.uri.as_str() {
                 "schema://pond" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    SCHEMA_DOC,
+                    schema_doc_for(crate::embed::embeddings_enabled()),
                     request.uri,
                 )])),
                 "schema://pond-sql" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -1125,18 +1177,39 @@ Examples (4 patterns the agent should recognize):
                     let map_err = |error: anyhow::Error| {
                         ErrorData::internal_error(format!("stats unavailable: {error}"), None)
                     };
-                    let (sessions, messages, parts) = store.row_counts().await.map_err(&map_err)?;
-                    let embedding = store.embedding_progress().await.map_err(&map_err)?;
-                    let stale = store.stale_embedding_count().await.map_err(&map_err)?;
-                    let indices = store.index_status().await.map_err(&map_err)?;
-
-                    let embedded_percent = if embedding.total == 0 {
-                        0.0
-                    } else {
-                        #[allow(clippy::cast_precision_loss)]
-                        let pct = (embedding.embedded as f64 / embedding.total as f64) * 100.0;
-                        (pct * 10.0).round() / 10.0
+                    // Both embedding probes are data-page scans over `messages`,
+                    // so an instance with embedding off skips the calls outright
+                    // and nulls the embeddings keys. The searchable count is an
+                    // FTS fact, not an embedding one: when disabled it comes
+                    // from the FTS index's num_docs (index-resident; a fresh
+                    // pre-index store falls back to a count scan) so the corpus
+                    // block stays complete on the default posture.
+                    let embedding_fut = async {
+                        if crate::embed::embeddings_enabled() {
+                            let (progress, stale) = tokio::try_join!(
+                                store.embedding_progress(),
+                                store.stale_embedding_count(),
+                            )?;
+                            let searchable = progress.total;
+                            anyhow::Ok((Some((progress, stale)), searchable))
+                        } else {
+                            let searchable = store.searchable_message_count().await?;
+                            anyhow::Ok((None, searchable))
+                        }
                     };
+                    let ((sessions, messages, parts), (embedding, searchable), indices) =
+                        tokio::try_join!(store.row_counts(), embedding_fut, store.index_status())
+                            .map_err(map_err)?;
+
+                    let embedded_percent = embedding.as_ref().map(|(progress, _)| {
+                        if progress.total == 0 {
+                            0.0
+                        } else {
+                            #[allow(clippy::cast_precision_loss)]
+                            let pct = (progress.embedded as f64 / progress.total as f64) * 100.0;
+                            (pct * 10.0).round() / 10.0
+                        }
+                    });
                     let index_rows = indices
                         .iter()
                         .map(|status| {
@@ -1158,15 +1231,15 @@ Examples (4 patterns the agent should recognize):
                         "corpus": {
                             "sessions": sessions,
                             "messages": messages,
-                            "searchable_messages": embedding.total,
+                            "searchable_messages": searchable,
                             "parts": parts,
                         },
                         "embeddings": {
-                            "model": embedding.model,
-                            "embedded": embedding.embedded,
-                            "searchable_total": embedding.total,
+                            "model": embedding.as_ref().map(|(p, _)| p.model),
+                            "embedded": embedding.as_ref().map(|(p, _)| p.embedded),
+                            "searchable_total": embedding.as_ref().map(|(p, _)| p.total),
                             "embedded_percent": embedded_percent,
-                            "stale_under_other_model": stale,
+                            "stale_under_other_model": embedding.as_ref().map(|(_, s)| *s),
                         },
                         "indices": index_rows,
                     });
@@ -1194,7 +1267,65 @@ Examples (4 patterns the agent should recognize):
                 meta: None,
             };
             annotate_tool_limits(&mut result);
+            annotate_search_mode_with(&mut result, crate::embed::embeddings_enabled());
             Ok(result)
+        }
+    }
+
+    /// `pond_search` description with the whole `mode=` sentence removed - what
+    /// an instance with embedding off advertises.
+    const SEARCH_DESCRIPTION_FTS_ONLY: &str = "Find relevant messages in past sessions - the \
+        entry point for recall: \"have we worked on X\", \"what did we decide about Y\", \"find \
+        the session where...\". Scope with project / session_id / source_agent / from_date / \
+        to_date; put the distinctive words you expect in the conversation in the query (error \
+        strings, symbol names, product names); project names go in the project filter. Returns \
+        scored hits grouped by session, best session first; pass a hit's session_id to \
+        pond_get_session or its message_id to pond_get_message to read it. Searches \
+        conversational text only (tool calls/results and reasoning are excluded by design - a \
+        gap there is expected, not a failure) and excludes subagent sessions; reach both via \
+        pond_sql. Response format details: resource schema://pond.";
+
+    /// `mode` property description on an instance with embedding off.
+    const MODE_DOC_FTS_ONLY: &str =
+        "\"fts\" (default and only arm on this instance): exact whole words via BM25.";
+
+    /// True for the `mode=vector` refusal (`resolve_effective_mode`), the one
+    /// search error the caller can fix in-turn.
+    fn is_semantic_disabled(envelope: &ErrorEnvelope) -> bool {
+        envelope
+            .error
+            .details
+            .get("config_key")
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::handlers::SEMANTIC_DISABLED_CONFIG_KEY)
+    }
+
+    /// With embedding off, the `pond_search` surface must not invite a vector
+    /// query: the static attribute text names both arms, so rewrite the tool
+    /// description and the `mode` property description at list time. The wire
+    /// contract is untouched - the refusal in `resolve_effective_mode` handles
+    /// an explicit attempt.
+    fn annotate_search_mode_with(result: &mut ListToolsResult, embeddings_enabled: bool) {
+        if embeddings_enabled {
+            return;
+        }
+        for tool in result
+            .tools
+            .iter_mut()
+            .filter(|tool| tool.name == "pond_search")
+        {
+            tool.description = Some(SEARCH_DESCRIPTION_FTS_ONLY.into());
+            if let Some(mode) = Arc::make_mut(&mut tool.input_schema)
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("mode"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                mode.insert(
+                    "description".to_owned(),
+                    serde_json::Value::String(MODE_DOC_FTS_ONLY.to_owned()),
+                );
+            }
         }
     }
 
@@ -1419,6 +1550,112 @@ Examples (4 patterns the agent should recognize):
             assert_eq!(value("pond_search"), Some(80_000));
             assert_eq!(value("pond_get_session"), Some(200_000));
             assert_eq!(value("pond_get_message"), Some(200_000));
+        }
+
+        #[test]
+        fn parse_search_mode_defaults_to_fts() {
+            assert_eq!(parse_search_mode(None), Some(SearchModeWire::Fts));
+            assert_eq!(parse_search_mode(Some("fts")), Some(SearchModeWire::Fts));
+            assert_eq!(
+                parse_search_mode(Some("vector")),
+                Some(SearchModeWire::Vector)
+            );
+            assert_eq!(parse_search_mode(Some("hybrid")), None);
+        }
+
+        /// Only the refusal takes the in-turn tool-error branch; every other
+        /// validation failure stays a JSON-RPC error.
+        #[test]
+        fn semantic_disabled_predicate_matches_only_the_refusal() {
+            let envelope = |details: serde_json::Value| ErrorEnvelope {
+                error: ErrorBody {
+                    code: ErrorCode::ValidationFailed,
+                    message: "boom".to_owned(),
+                    details,
+                },
+            };
+            assert!(is_semantic_disabled(&envelope(serde_json::json!({
+                "field": "mode",
+                "config_key": "embeddings.enabled",
+                "retryable": false,
+            }))));
+            assert!(!is_semantic_disabled(&envelope(
+                serde_json::json!({ "field": "query" })
+            )));
+            assert!(!is_semantic_disabled(&envelope(serde_json::json!({
+                "config_key": "search.nprobes"
+            }))));
+        }
+
+        fn listed_tools() -> ListToolsResult {
+            ListToolsResult {
+                tools: PondMcp::tool_router().list_all(),
+                next_cursor: None,
+                meta: None,
+            }
+        }
+
+        fn search_tool(result: &ListToolsResult) -> &Tool {
+            result
+                .tools
+                .iter()
+                .find(|tool| tool.name == "pond_search")
+                .expect("pond_search is registered")
+        }
+
+        fn mode_description(tool: &Tool) -> &str {
+            tool.input_schema["properties"]["mode"]["description"]
+                .as_str()
+                .expect("the mode property carries a description")
+        }
+
+        #[test]
+        fn search_surface_hides_the_vector_arm_when_embeddings_are_disabled() {
+            let mut disabled = listed_tools();
+            annotate_search_mode_with(&mut disabled, false);
+            let tool = search_tool(&disabled);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                !description.contains("vector"),
+                "tool description must not offer an arm this instance refuses: {description}"
+            );
+            let mode = mode_description(tool);
+            assert!(
+                !mode.contains("vector"),
+                "mode description must not offer the vector arm: {mode}"
+            );
+            // Only prose is rewritten - the wire contract still accepts both
+            // arms, and the refusal is what answers an explicit attempt.
+            assert_eq!(
+                tool.input_schema["properties"]["mode"]["type"],
+                serde_json::json!(["string", "null"]),
+            );
+
+            let mut enabled = listed_tools();
+            annotate_search_mode_with(&mut enabled, true);
+            let tool = search_tool(&enabled);
+            assert!(
+                tool.description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("vector"),
+                "an enabled instance advertises both arms"
+            );
+            assert!(mode_description(tool).contains("vector"));
+        }
+
+        /// The rewrite needles live in prose, so a reworded `SCHEMA_DOC` would
+        /// make every `String::replace` silently no-op (the `debug_assert`s in
+        /// `schema_doc_for` never run in release) - this is the drift guard.
+        #[test]
+        fn schema_doc_hides_the_vector_arm_when_embeddings_are_disabled() {
+            let disabled = schema_doc_for(false);
+            assert_ne!(disabled, SCHEMA_DOC, "no rewrite landed");
+            assert!(
+                !disabled.contains("vector"),
+                "schema doc must not offer an arm this instance refuses: {disabled}"
+            );
+            assert_eq!(schema_doc_for(true), SCHEMA_DOC);
         }
     }
 }

@@ -593,10 +593,10 @@ pub struct SearchRequest {
     #[serde(default)]
     pub namespace: Option<String>,
     pub query: String,
-    /// Retrieval arm (spec.md#search). `vector` (default) matches on meaning;
-    /// `fts` matches exact whole words via BM25. The agent picks per query -
-    /// there is no server-side fusion. If `vector` is asked of a store with no
-    /// embeddings, the server falls back to `fts`.
+    /// Retrieval arm (spec.md#search). `fts` (default) matches exact whole
+    /// words via BM25; `vector` matches on meaning and is available only when
+    /// the serving instance has `[embeddings].enabled = true` - otherwise it is
+    /// refused. The agent picks per query; there is no server-side fusion.
     #[serde(default)]
     pub mode: SearchModeWire,
     /// Result ordering. `relevance` (default) ranks by match strength (vector:
@@ -611,14 +611,15 @@ pub struct SearchRequest {
     pub limit: usize,
 }
 
-/// Wire-level retrieval arm (spec.md#search). The agent chooses per query:
-/// `vector` for concepts/meaning (default), `fts` for known exact words
-/// (BM25). The old server-side hybrid fusion is gone - one arm per request.
+/// Wire-level retrieval arm (spec.md#search). `fts` (default) matches exact
+/// whole words via BM25; `vector` matches on meaning and is available only when
+/// the serving instance has `[embeddings].enabled = true` - otherwise it is
+/// refused. The agent picks per query; there is no server-side fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchModeWire {
-    Fts,
     #[default]
+    Fts,
     Vector,
 }
 
@@ -649,19 +650,6 @@ pub struct SearchFilters {
     pub from_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
-    /// Raw-cosine score floor for `vector` mode; hits below it are dropped.
-    /// Not an absence signal: present and absent content score in overlapping
-    /// bands (see `docs/researches/embeddings.md`), so the default stays 0 and
-    /// the response's `searchable_in_scope` carries the honesty instead.
-    /// Disallowed in `fts` mode (BM25 is unbounded and not comparable across
-    /// queries) - the handler rejects a non-zero value there.
-    // Skip the default 0.0 so an unfiltered request stays compact.
-    #[serde(default, skip_serializing_if = "is_zero_f64")]
-    pub min_score: f64,
-}
-
-fn is_zero_f64(value: &f64) -> bool {
-    *value == 0.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

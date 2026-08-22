@@ -12,8 +12,9 @@ something that sounds prior, search pond.
 
 ## Which tool
 
-- Find past work by meaning ("what did we decide", "have we hit this before")
-  -> `pond_search` (`mode=vector` default; `mode=fts` for exact whole words).
+- Find past work ("what did we decide", "have we hit this before")
+  -> `pond_search` (the tool description on the running pond lists the
+  available modes).
 - Read, analyze, review, or summarize a session -> `pond_get_session(id)` -
   one call, full readable transcript (a message id also works: it resolves to
   its parent session, page anchored at that message).

@@ -207,7 +207,8 @@ async fn run_status(url: &str, config: &Config, verbose: bool) -> Result<RunRepo
     // that so the bench's "total" lines up with what a user actually waits
     // for; the per-call ms below are observed serial times for breakdown.
     let parallel_start = Instant::now();
-    let (_sizes, row_counts, names, index_status, embedding) = if verbose {
+    let semantic_probes = verbose && config.embeddings.enabled;
+    let (_sizes, row_counts, names, index_status, embedding) = if semantic_probes {
         let r = tokio::try_join!(
             store.table_sizes(),
             store.row_counts(),
@@ -251,16 +252,18 @@ async fn run_status(url: &str, config: &Config, verbose: bool) -> Result<RunRepo
             elapsed: searchable_start.elapsed(),
             detail: String::new(),
         });
-        let stale_start = Instant::now();
-        let _ = store
-            .stale_embedding_count()
-            .await
-            .context("stale_embedding_count")?;
-        phases.push(Phase {
-            label: "stale_embedding_count".to_owned(),
-            elapsed: stale_start.elapsed(),
-            detail: String::new(),
-        });
+        if semantic_probes {
+            let stale_start = Instant::now();
+            let _ = store
+                .stale_embedding_count()
+                .await
+                .context("stale_embedding_count")?;
+            phases.push(Phase {
+                label: "stale_embedding_count".to_owned(),
+                elapsed: stale_start.elapsed(),
+                detail: String::new(),
+            });
+        }
     }
     Ok(RunReport {
         op: if verbose {
@@ -346,18 +349,27 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
 
     let any_new_rows = combined.inserted > 0;
     if !args.no_optimize && any_new_rows {
-        timed("embed", &mut phases, async {
-            let progress = store.embedding_progress().await?;
-            let backlog = progress.total.saturating_sub(progress.embedded);
-            if backlog == 0 {
-                return Ok::<usize, anyhow::Error>(0);
-            }
-            let embedder = pond::embed::CandleEmbedder::load().context("CandleEmbedder::load")?;
-            let worker = pond::embed::EmbedWorker::new(&store, &embedder);
-            let s = worker.run().await.context("EmbedWorker::run")?;
-            Ok(s.messages)
-        })
-        .await?;
+        if config.embeddings.enabled {
+            timed("embed", &mut phases, async {
+                let progress = store.embedding_progress().await?;
+                let backlog = progress.total.saturating_sub(progress.embedded);
+                if backlog == 0 {
+                    return Ok::<usize, anyhow::Error>(0);
+                }
+                let embedder =
+                    pond::embed::CandleEmbedder::load().context("CandleEmbedder::load")?;
+                let worker = pond::embed::EmbedWorker::new(&store, &embedder);
+                let s = worker.run().await.context("EmbedWorker::run")?;
+                Ok(s.messages)
+            })
+            .await?;
+        } else {
+            phases.push(Phase {
+                label: "embed".to_owned(),
+                elapsed: Duration::ZERO,
+                detail: "skipped ([embeddings].enabled = false)".to_owned(),
+            });
+        }
         let policy = MaintenancePolicy {
             compaction_fragment_cap: 0,
             cleanup_older_than: chrono::Duration::days(1),

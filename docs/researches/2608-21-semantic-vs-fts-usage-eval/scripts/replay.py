@@ -14,9 +14,10 @@ for i,c in enumerate(sample):
     for k,fl in (('project','--project'),('from_date','--from-date'),('to_date','--to-date'),('source_agent',None),('session_id','--session-id')):
         if p.get(k) and fl: args+=[fl,str(p[k])]
     def run(mode):
-        t=time.time(); r=subprocess.run(args+['--mode',mode,p['query']],capture_output=True,text=True,timeout=120); dt=time.time()-t
-        try: return [s['session_id'] for s in json.loads(r.stdout)['sessions']],dt
-        except Exception: return [],dt
+        # check=True: a refused or failing search must abort the replay, not
+        # score as "zero hits in 0.2s" and quietly measure nothing.
+        t=time.time(); r=subprocess.run(args+['--mode',mode,p['query']],capture_output=True,text=True,timeout=120,check=True); dt=time.time()-t
+        return [s['session_id'] for s in json.loads(r.stdout)['sessions']],dt
     fts,tf=run('fts'); vec,tv=run('vector')
     out.append(dict(call_id=c['call_id'],query=p['query'],orig_top=orig[:3],fts_top=fts,vec_top=vec,tf=tf,tv=tv,
         fts_has_top1=orig[0] in fts, fts_has_any3=any(o in fts for o in orig[:3]), vec_has_top1=orig[0] in vec))

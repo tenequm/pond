@@ -14,8 +14,9 @@ plugin is deliberately **tools only** - no memory-provider slot, no ambient
 recall, no prompt injection, no `session_search` override. It adds four tools
 under the `pond` toolset:
 
-- `pond_search` - search a durable archive of past sessions (exact-word BM25
-  full-text, with semantic vector search on top).
+- `pond_search` - search a durable archive of past sessions. Pick mode: "fts"
+  (exact whole words, BM25) or "vector" (meaning; only where that pond instance
+  has embeddings enabled). Omit mode to use pond's default.
 - `pond_get_session` - read a whole past session as a transcript.
 - `pond_get_message` - expand one message with its full tool bodies.
 - `pond_sql` - read-only SQL analytics over the corpus.

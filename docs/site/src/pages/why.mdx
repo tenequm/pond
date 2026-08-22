@@ -16,7 +16,7 @@ Your agent history is already on your disk: thousands of sessions full of decisi
 ```sh
 brew install tenequm/tap/pond
 pond init   # guided setup: storage, adapters, MCP registration, optional schedule
-pond sync   # ingest, embed, update indexes
+pond sync   # ingest and update indexes
 ```
 
 Then ask your agent - real prompts from daily use:
@@ -58,7 +58,7 @@ Every adapter is bidirectional, so any stored session can be restored into any o
 
 ## Local by default, nothing phones home
 
-Everything runs on your machine: ingest, search, SQL, and the embedding model (Metal on macOS, CPU elsewhere - no embedding API, no keys). pond sends no telemetry. Its only network traffic is the storage you explicitly configure and a one-time embedding-model download, cached locally. Your sessions live in a local directory unless you point pond at your own bucket - and then they go there and nowhere else.
+Everything runs on your machine: ingest, search, SQL, and, if you turn on semantic search, the embedding model (Metal on macOS, CPU elsewhere - no embedding API, no keys). pond sends no telemetry. Its only network traffic is the storage you explicitly configure, plus the one-time embedding-model download if you enabled semantic search, cached locally. Your sessions live in a local directory unless you point pond at your own bucket - and then they go there and nowhere else.
 
 ## The problem
 

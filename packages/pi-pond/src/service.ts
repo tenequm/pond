@@ -12,6 +12,7 @@
 // That is why there is no subagent detection and no env sniffing here: every
 // session gets the same extension behaving the same way, and pond's own
 // per-host sync flock plus `--no-wait` make overlapping loops safe.
+import { execFile } from "node:child_process";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { PondConfig } from "./config.ts";
@@ -23,6 +24,7 @@ import {
 } from "./mcp.ts";
 
 export type PondLogger = {
+  info: (message: string) => void;
   warn: (message: string) => void;
   error: (message: string) => void;
 };
@@ -40,6 +42,7 @@ const RESTART_MAX_DELAY_MS = 30_000;
 // Local-sidecar deadline for the initialize handshake and the tool-list probe;
 // the SDK default of 60s would let a hung child stall the first tool call.
 const DIAL_TIMEOUT_MS = 10_000;
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
 
 // The MCP SDK's stdio transport passes the child a fixed safelist (HOME, PATH,
 // USER, ...) when no env is given, silently dropping XDG_* and POND_* - a store
@@ -171,12 +174,34 @@ export function pondBinaryPath(
   }
 }
 
+/**
+ * Which pond this session is actually talking to. The tool descriptions are
+ * version-neutral by design, so this line is the only place a behaviour
+ * difference (default search arm, embeddings) traces back to a binary.
+ * Fire-and-forget: the dial never waits on it and never fails because of it.
+ */
+function logPondVersion(pondBin: string, logger: PondLogger): void {
+  execFile(
+    pondBin,
+    ["--version"],
+    { timeout: VERSION_PROBE_TIMEOUT_MS },
+    (error, stdout, stderr) => {
+      if (error) {
+        logger.warn(`could not read \`${pondBin} --version\`: ${error.message}`);
+        return;
+      }
+      logger.info(`${pondBin}: ${(stdout || stderr).trim()}`);
+    },
+  );
+}
+
 export class PondController {
   private client = new PondMcpClient();
   private stopped = false;
   private attempt = 0;
   private restartTimer: ReturnType<typeof setTimeout> | undefined;
   private starting: Promise<void> | undefined;
+  private versionLogged = false;
 
   constructor(
     private readonly config: PondConfig,
@@ -274,6 +299,10 @@ export class PondController {
     // interactive work. `nice` execs pond in place - the child pid IS pond, so
     // the stop() ladder signals the right process. Skipped on Windows.
     const pondBin = resolvePondBinary(this.config.binaryPath);
+    if (!this.versionLogged) {
+      this.versionLogged = true;
+      logPondVersion(pondBin, this.logger);
+    }
     const posix = process.platform !== "win32";
     const command = posix ? "nice" : pondBin;
     const prefix = posix ? ["-n", "19", pondBin] : [];

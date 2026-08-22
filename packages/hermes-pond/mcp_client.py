@@ -21,11 +21,27 @@ import subprocess
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class JsonRpcError:
+    """The `error` member of a JSON-RPC response. `code` / `data` are None for a
+    transport failure, which is what lets the supervisor tell a server-side app
+    error (the caller's problem) from a dead child (the connection's problem)."""
+
+    message: str
+    code: int | None = None
+    data: object | None = None
 
 
 class McpError(Exception):
     """A JSON-RPC error envelope or a transport failure."""
+
+    def __init__(self, message: str, code: int | None = None, data: object | None = None):
+        super().__init__(message)
+        self.error = JsonRpcError(message=message, code=code, data=data)
 
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -304,7 +320,12 @@ class PondMcpClient:
             message["params"] = params
         resp = self._t.roundtrip(message, timeout)
         if isinstance(resp.get("error"), dict):
-            raise McpError(str(resp["error"].get("message") or resp["error"]))
+            envelope = resp["error"]
+            raise McpError(
+                str(envelope.get("message") or envelope),
+                code=envelope.get("code"),
+                data=envelope.get("data"),
+            )
         return resp.get("result") or {}
 
     def initialize(self, timeout: float) -> None:

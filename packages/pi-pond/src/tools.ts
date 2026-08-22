@@ -72,8 +72,9 @@ async function relay(
 
 const SEARCH_DESCRIPTION =
   "Find relevant messages in the durable pond archive of past agent sessions - every harness on " +
-  'every machine, not just pi. Returns pond\'s rendered transcript: results grouped by session, best first. Pick `mode`: "vector" ' +
-  '(default, meaning) or "fts" (exact words, BM25). Pass a hit\'s session_id to pond_get_session or ' +
+  "every machine, not just pi. Returns pond's rendered transcript: results grouped by session, best first. " +
+  'Pick mode: "fts" (exact whole words, BM25) or "vector" (meaning; only where that pond instance has ' +
+  "embeddings enabled). Omit mode to use pond's default. Pass a hit's session_id to pond_get_session or " +
   "its message_id to pond_get_message.";
 
 const GET_SESSION_DESCRIPTION =

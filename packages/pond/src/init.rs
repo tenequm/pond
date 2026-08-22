@@ -74,7 +74,9 @@ static WIZARD_PROMPTS_ACTIVE: AtomicBool = AtomicBool::new(true);
 /// stopped" - that is only true if the interrupt path still installs the
 /// schedule. `take()` keeps registration single-shot between the handler and
 /// the normal path.
-static PENDING_SCHEDULE: Mutex<Option<ScheduleEvery>> = Mutex::new(None);
+/// `(every, config_file)`: the registration pins the config path init
+/// resolved, so a `--config-file` init writes to is the one the unit reads.
+static PENDING_SCHEDULE: Mutex<Option<(ScheduleEvery, PathBuf)>> = Mutex::new(None);
 
 /// Unwrap a prompt result. Esc and Ctrl-C surface from cliclack as
 /// `Interrupted` (the wizard-scoped ctrlc handler in [`run`] is what keeps
@@ -122,9 +124,11 @@ pub(crate) async fn run(
         let _ = ctrlc::set_handler(|| {
             if !WIZARD_PROMPTS_ACTIVE.load(Ordering::SeqCst) {
                 if let Ok(mut pending) = PENDING_SCHEDULE.lock()
-                    && let Some(every) = pending.take()
+                    && let Some((every, config_file)) = pending.take()
+                    && let Err(error) = schedule::start(every, config_file)
                 {
-                    let _ = schedule::start(every);
+                    let _ =
+                        pond::output::line_err(&format!("schedule registration failed: {error:#}"));
                 }
                 std::process::exit(130);
             }
@@ -253,15 +257,26 @@ pub(crate) async fn run(
     }
     adapter::apply_to_doc(&mut doc, &fresh_accepts, &fresh_declines)?;
 
-    // ---- schedule (opt-in: --yes alone never schedules) --------------------
+    // ---- schedule (creating one is opt-in: --yes alone never schedules) ----
+    // An ACTIVE registration is repair territory instead: re-registering
+    // rewrites the unit with the current template (the config-file pin,
+    // absolutized paths), which is how re-running init after an upgrade heals
+    // a stale unit - so the prompt defaults to yes with the current cadence
+    // preselected. Interactive only: a --yes run may be sandboxed (e2e drives
+    // one), and a sandboxed repair would repoint the user's real unit at the
+    // sandbox config.
+    let active_schedule = schedule::status_snapshot();
     let schedule_choice: Option<ScheduleEvery> = match args.schedule {
         Some(every) => Some(every),
         None if prompts => {
-            let wanted = wiz(
-                cliclack::confirm("Run pond sync automatically on a schedule?")
-                    .initial_value(false)
-                    .interact(),
-            )?;
+            let prompt = if active_schedule.active {
+                "Sync schedule found - re-register it? (refreshes the unit after an upgrade; No leaves it unchanged)"
+            } else {
+                "Run pond sync automatically on a schedule?"
+            };
+            let wanted = wiz(cliclack::confirm(prompt)
+                .initial_value(active_schedule.active)
+                .interact())?;
             if wanted {
                 // cliclack renders hints only on the focused item, so the
                 // recommendation rides in the label to stay visible.
@@ -271,7 +286,7 @@ pub(crate) async fn run(
                     .item(ScheduleEvery::H1, "every hour", "")
                     .item(ScheduleEvery::H6, "every 6 hours", "")
                     .item(ScheduleEvery::D1, "daily", "")
-                    .initial_value(ScheduleEvery::M5)
+                    .initial_value(active_schedule.every.unwrap_or(ScheduleEvery::M5))
                     .interact())?)
             } else {
                 None
@@ -301,6 +316,21 @@ pub(crate) async fn run(
     }
     if let Some(every) = schedule_choice {
         plan.push_str(&format!("\nschedule   pond sync every {}", every.label()));
+        // A schedule pins the config path into the OS unit; a path the
+        // templates cannot embed must fail here, before the config write and
+        // the first sync - not inside registration after both already ran.
+        // Gate the same absolutized path registration pins (a relative input
+        // picks up cwd components), and the state dir registration also pins.
+        schedule::reject_unembeddable(
+            "config file",
+            &schedule::config_file(Some(config_file.clone())),
+            schedule::CONFIG_FILE_SOURCES,
+        )?;
+        schedule::reject_unembeddable(
+            "state dir",
+            &crate::syncstate::state_root(),
+            schedule::STATE_DIR_SOURCES,
+        )?;
     }
     plan.push_str(&format!("\nconfig     {}", display_path(&config_file)));
     cliclack::note("Plan", plan)?;
@@ -341,7 +371,7 @@ pub(crate) async fn run(
     let run_first_sync = prompts
         && !picked.is_empty()
         && wiz(cliclack::confirm(
-            "Run the first sync now? (recommended - it reads and embeds your full history)",
+            "Run the first sync now? (recommended - it reads your full history)",
         )
         .initial_value(true)
         .interact())?;
@@ -377,7 +407,7 @@ pub(crate) async fn run(
     // Park the schedule for the Ctrl-C handler BEFORE the sync re-arms it, so
     // no window exists where an interrupt exits without registering.
     if let Ok(mut pending) = PENDING_SCHEDULE.lock() {
-        *pending = schedule_choice;
+        *pending = schedule_choice.map(|every| (every, config_file.clone()));
     }
     let first_sync = if run_first_sync {
         WIZARD_PROMPTS_ACTIVE.store(false, Ordering::SeqCst);
@@ -399,7 +429,9 @@ pub(crate) async fn run(
     // blocks on this mutex, so an interrupt landing mid-registration waits
     // for it to finish instead of exiting between the take and the start.
     let registration = match PENDING_SCHEDULE.lock() {
-        Ok(mut pending) => pending.take().map(schedule::start),
+        Ok(mut pending) => pending
+            .take()
+            .map(|(every, config_file)| schedule::start(every, config_file)),
         Err(_) => None,
     };
     if let Some(outcome) = registration {

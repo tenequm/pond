@@ -1047,7 +1047,7 @@ pub use get_handler::{pond_get_message, pond_get_session};
 
 mod search_handler {
     //! The `pond_search` handler: single-arm retrieval at message granularity -
-    //! `vector` (kNN, default) or `fts` (BM25), chosen per query, no fusion -
+    //! `fts` (BM25, default) or `vector` (kNN), chosen per query, no fusion -
     //! with filter pushdown and session-grouped responses (spec.md#search).
 
     use crate::{
@@ -1066,9 +1066,9 @@ mod search_handler {
     use super::{map_error, map_storage};
 
     /// Internal retrieval arm. The caller picks per query via the wire `mode`
-    /// field (`pond search --mode`): `Vector` (default) on meaning, `Fts` on
-    /// exact whole words. There is no hybrid fusion - one arm per request. A
-    /// `Vector` request degrades to `Fts` when the store has no embeddings.
+    /// field (`pond search --mode`): `Fts` (default) on exact whole words,
+    /// `Vector` on meaning. There is no hybrid fusion - one arm per request.
+    /// `resolve_effective_mode` governs when `Vector` is available.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SearchMode {
         Fts,
@@ -1090,7 +1090,6 @@ mod search_handler {
         pub pool: usize,
         pub vector_pool: usize,
         pub limit: usize,
-        pub min_score: f64,
         /// Drop subagent hits (session id contains `/`) from the arm results in
         /// memory - the spec.md#search retrieval default. See `plan_search` for
         /// when it is on.
@@ -1120,7 +1119,7 @@ mod search_handler {
     const RECENCY_BOOST_SCALE_DAYS: f64 = 30.0;
 
     /// Run a single-arm search. The caller picks the arm via the wire `mode`
-    /// field; `vector` degrades to `fts` only when the store has no embeddings.
+    /// field; `resolve_effective_mode` governs when `vector` is available.
     /// The embedder is `LazyEmbedder`-loaded on the first vector call, so
     /// fts-only corpora never pay the model load. The response has no top-level
     /// mode field; retriever attribution stays in `explain_search_plan`.
@@ -1146,7 +1145,8 @@ mod search_handler {
         search: &crate::config::SearchConfig,
     ) -> Result<String, ErrorEnvelope> {
         let mut plan = plan_search(request)?;
-        plan.mode = resolve_effective_mode(store, plan.mode).await?;
+        plan.mode =
+            resolve_effective_mode(store, plan.mode, crate::embed::embeddings_enabled()).await?;
         let mut out = String::new();
         match plan.mode {
             SearchMode::Fts => {
@@ -1194,23 +1194,11 @@ mod search_handler {
         }
         let mut plan = plan_search(request)?;
 
-        // A `vector` request degrades to `fts` when the store has no
-        // embeddings (nothing to match against); `fts` stays `fts`.
-        plan.mode = resolve_effective_mode(store, plan.mode).await?;
+        // A `vector` request is refused when embedding is off on this instance,
+        // and degrades to `fts` when it is on but nothing is embedded yet.
+        plan.mode =
+            resolve_effective_mode(store, plan.mode, crate::embed::embeddings_enabled()).await?;
         stage!("resolve_mode");
-
-        // `min_score` gates raw cosine, so it is meaningful only for `vector`.
-        // BM25 is unbounded and not comparable across queries; reject a
-        // non-zero floor on `fts` rather than silently ignore it.
-        if matches!(plan.mode, SearchMode::Fts) && plan.min_score > 0.0 {
-            return Err(map_error(crate::Error::validation_field(
-                "min_score is not supported in fts mode (BM25 scores are unbounded \
-                 and not comparable across queries); use vector mode or drop min_score",
-                "min_score",
-                Some(serde_json::json!(plan.min_score)),
-                Some("0 in fts mode".to_owned()),
-            )));
-        }
 
         // The scope count (spec.md#search-absence-honesty: how many searchable
         // messages the filters left in scope, so "no relevant hits" is
@@ -1228,9 +1216,9 @@ mod search_handler {
                     retain_non_subagents(&mut hits, plan.exclude_subagents);
                     Ok(normalize_fts(hits))
                 }
-                // Vector arm (default): embed `plan.query` and run kNN. The
+                // Vector arm: embed `plan.query` and run kNN. The
                 // hit score is raw cosine similarity (`1 - distance`), which
-                // `min_score` gates and the recency boost later tweaks.
+                // the recency boost later tweaks.
                 SearchMode::Vector => {
                     let backend = load_embedder(embedder).await?;
                     let vector = embed_query(backend.as_ref(), &plan.query)?;
@@ -1264,7 +1252,7 @@ mod search_handler {
         // per-session cap: the surviving candidates are already bounded by the
         // arm pool, and the byte budget bounds the rendered output.
         let (mut selected, mut total_sessions, mut matched_total) =
-            select_top_hits(candidates, plan.min_score, plan.limit);
+            select_top_hits(candidates, plan.limit);
         if selected.is_empty() {
             return Ok(empty_response(searchable_in_scope));
         }
@@ -1346,8 +1334,7 @@ mod search_handler {
         // Final ordering score (spec.md#search). `relevance` ranks vector hits
         // by cosine plus a gentle recency tiebreaker and fts hits by BM25;
         // `recency` ranks both strictly newest-first (the timestamp itself is
-        // the key). The boost is post-gate (the min_score cosine gate already
-        // ran in select_top_hits), so it only reorders comparably-relevant hits.
+        // the key). The boost only reorders comparably-relevant hits.
         let now = clock.now();
         let mut scored = Vec::with_capacity(selected.len());
         for candidate in selected {
@@ -1404,15 +1391,41 @@ mod search_handler {
         ts.timestamp() as f64
     }
 
-    /// Pick the effective retrieval arm. `fts` always stays `fts`. `vector`
-    /// degrades to `fts` when the store has no embeddings - there is nothing to
-    /// match against (`has_embeddings()` is the only gate).
+    /// `details.config_key` value the refusal carries. Load-bearing beyond
+    /// documentation: the MCP transport dispatches on this exact key/value to
+    /// deliver the refusal as an in-turn tool error instead of a JSON-RPC
+    /// error (which would make hermes-pond respawn `pond serve` per call).
+    pub const SEMANTIC_DISABLED_CONFIG_KEY: &str = "embeddings.enabled";
+
+    /// Literal text of the `mode=vector` refusal. One constant: the MCP tool, the
+    /// REST route, the CLI, and `optimize --only embed` all print this exact line.
+    pub const SEMANTIC_DISABLED_MESSAGE: &str = "semantic search is off on this pond instance: \
+        set [embeddings].enabled = true in pond's config (or POND_EMBEDDINGS_ENABLED=true), \
+        run `pond optimize --only embed`, then retry with mode=\"vector\" - or use mode=\"fts\"";
+
+    /// Pick the effective arm. `fts` stays `fts`. `vector` is refused when
+    /// embedding is disabled on this instance - checked before any store probe,
+    /// because `has_embeddings()` on a never-embedded store is a full column
+    /// read. With embedding enabled, `vector` degrades to `fts` until a row is
+    /// embedded.
     async fn resolve_effective_mode(
         store: &Store,
         requested: SearchMode,
+        embeddings_enabled: bool,
     ) -> Result<SearchMode, ErrorEnvelope> {
         if matches!(requested, SearchMode::Fts) {
             return Ok(SearchMode::Fts);
+        }
+        if !embeddings_enabled {
+            return Err(crate::wire::error(
+                crate::wire::ErrorCode::ValidationFailed,
+                SEMANTIC_DISABLED_MESSAGE,
+                serde_json::json!({
+                    "field": "mode",
+                    "config_key": SEMANTIC_DISABLED_CONFIG_KEY,
+                    "retryable": false,
+                }),
+            ));
         }
         let has = store.has_embeddings().await.map_err(map_storage)?;
         Ok(if has {
@@ -1464,7 +1477,6 @@ mod search_handler {
             )));
         }
         let limit = request.limit.min(LIMIT_CAP);
-        let min_score = filters.min_score;
         let filter = build_scope_filter(&filters)?;
         let exclude_subagents = default_excludes_subagents(&filters);
         // Retriever candidate pool: wider than `limit` so grouping and the
@@ -1486,7 +1498,6 @@ mod search_handler {
             pool,
             vector_pool,
             limit,
-            min_score,
             exclude_subagents,
         })
     }
@@ -1667,9 +1678,9 @@ mod search_handler {
             .collect()
     }
 
-    // Cosine similarity (`1 - distance`): raw, bounded [0, 1], so `min_score`
-    // gates it directly and the value is stable across pool sizes (unlike the
-    // old rank-norm `1 - idx/n`, which shifted whenever `limit` changed).
+    // Cosine similarity (`1 - distance`): raw, bounded [0, 1], so the value is
+    // stable across pool sizes (unlike the old rank-norm `1 - idx/n`, which
+    // shifted whenever `limit` changed).
     fn normalize_vector(hits: Vec<SearchHit>) -> Vec<Candidate> {
         hits.into_iter()
             .map(|hit| Candidate {
@@ -1704,23 +1715,16 @@ mod search_handler {
     /// belonging to the top-`limit` session roots (no per-session cap: the arm
     /// pool already bounds the count, and the byte budget bounds the rendered
     /// output). Hydration and rendering then touch those rows instead of the
-    /// full arm pool (~150). The min_score gate runs here on raw `base_score`
-    /// (cosine for vector). Returns the selected candidates, the total
-    /// distinct-session-root count (for `has_more`), and the count of
-    /// candidates above `min_score` (for `matched_total`).
+    /// full arm pool (~150). Returns the selected candidates, the total
+    /// distinct-session-root count (for `has_more`), and the candidate count
+    /// (for `matched_total`). There is no score floor: absence honesty comes
+    /// from `searchable_in_scope`, not from dropping low-scoring hits (present
+    /// and absent content overlap in the cosine band; see
+    /// docs/researches/embeddings.md).
     fn select_top_hits(
         mut candidates: Vec<Candidate>,
-        min_score: f64,
         limit: usize,
     ) -> (Vec<Candidate>, usize, usize) {
-        // `min_score` gates raw cosine only when set above 0. The default 0 is
-        // "no gate" - the absence honesty comes from `searchable_in_scope`, not
-        // from dropping low-cosine hits (present and absent content overlap in
-        // the cosine band; see docs/researches/embeddings.md). A literal `>= 0`
-        // filter would also drop legitimately weak (near-orthogonal) hits.
-        if min_score > 0.0 {
-            candidates.retain(|candidate| candidate.base_score >= min_score);
-        }
         let matched_total = candidates.len();
         candidates.sort_by(|left, right| {
             right
@@ -2048,12 +2052,40 @@ mod search_handler {
             retain_non_subagents(&mut kept, false);
             assert_eq!(kept.len(), 3);
         }
+
+        /// The refusal is decided from the argument, never the process-wide
+        /// flag, and lands before any store probe - so it is testable without
+        /// seeding the `OnceLock` and costs no column read on a cold store.
+        #[tokio::test]
+        async fn vector_refused_when_embeddings_disabled() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Store::open_local(temp.path()).await.unwrap();
+
+            let error = resolve_effective_mode(&store, SearchMode::Vector, false)
+                .await
+                .expect_err("mode=vector must be refused when embedding is off")
+                .error;
+            assert_eq!(error.code, crate::wire::ErrorCode::ValidationFailed);
+            assert_eq!(error.message, SEMANTIC_DISABLED_MESSAGE);
+            assert_eq!(error.details["field"], "mode");
+            assert_eq!(error.details["config_key"], "embeddings.enabled");
+            assert_eq!(error.details["retryable"], serde_json::json!(false));
+
+            assert_eq!(
+                resolve_effective_mode(&store, SearchMode::Fts, false)
+                    .await
+                    .unwrap(),
+                SearchMode::Fts,
+                "fts is unaffected by the switch",
+            );
+        }
     }
 }
 
 pub use search_handler::{
-    SearchMode, SearchPlan, build_scope_filter, default_excludes_subagents, explain_search_plan,
-    hit_payload, plan_search, pond_search,
+    SEMANTIC_DISABLED_CONFIG_KEY, SEMANTIC_DISABLED_MESSAGE, SearchMode, SearchPlan,
+    build_scope_filter, default_excludes_subagents, explain_search_plan, hit_payload, plan_search,
+    pond_search,
 };
 
 #[cfg(test)]
@@ -2069,7 +2101,7 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION,
             namespace: Some("local".to_owned()),
             query: query.to_owned(),
-            mode: crate::wire::SearchModeWire::Vector,
+            mode: crate::wire::SearchModeWire::default(),
             sort_by: crate::wire::SortBy::Relevance,
             filters: SearchFilters::default(),
             limit: 20,
@@ -2172,7 +2204,6 @@ mod tests {
             source_agent: None,
             from_date: Some("2026-01-01".to_owned()),
             to_date: Some("2026-05-01".to_owned()),
-            min_score: 0.0,
         };
         let sql = build_scope_filter(&filters).unwrap().to_lance();
         assert!(sql.contains("project LIKE '%/Users/me/pond%'"));
@@ -2281,10 +2312,9 @@ mod tests {
     fn plan_search_shapes_request_for_each_planning_input() {
         let mut request = search_request("  vector memory  ");
         request.limit = 500;
-        request.filters.min_score = 0.42;
-        // Default request mode is vector.
+        // Default request mode is fts.
         let plan = plan_search(request).unwrap();
-        assert_eq!(plan.mode, SearchMode::Vector);
+        assert_eq!(plan.mode, SearchMode::Fts);
         assert_eq!(plan.query, "vector memory");
         assert_eq!(plan.limit, 200);
         // Default filters exclude subagents, so the pools over-fetch by half
@@ -2292,7 +2322,6 @@ mod tests {
         assert!(plan.exclude_subagents);
         assert_eq!(plan.pool, 1500);
         assert_eq!(plan.vector_pool, 3000);
-        assert_eq!(plan.min_score, 0.42);
 
         // Case 2: an explicit fts mode + a tiny limit floors the pools so the
         // arm doesn't starve (50 floor -> 75 after the over-fetch).

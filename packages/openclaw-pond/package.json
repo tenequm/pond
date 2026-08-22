@@ -1,9 +1,14 @@
 {
   "name": "openclaw-pond",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Projects pond's read-only recall tools (pond_search, pond_get_session, pond_get_message, pond_sql) into OpenClaw agents and manages a local pond process.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tenequm/pond.git",
+    "directory": "packages/openclaw-pond"
+  },
   "files": [
     "index.ts",
     "src",

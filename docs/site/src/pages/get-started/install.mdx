@@ -49,7 +49,7 @@ winget is the primary channel once live. pond is published there as a portable z
 
 The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
 
-Building from source instead needs two tools the prebuilt binary spares you: `protoc`, because `protobuf-src` cannot vendor it on Windows, and NASM, for `aws-lc-sys`. Embeddings run on the CPU backend.
+Building from source instead needs two tools the prebuilt binary spares you: `protoc`, because `protobuf-src` cannot vendor it on Windows, and NASM, for `aws-lc-sys`. Embeddings, if you enable them, run on the CPU backend.
 
 ### Defender and where the store lives
 

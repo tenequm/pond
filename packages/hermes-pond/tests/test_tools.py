@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 
 from hermes_pond.tools import (
     RESPONSE_MAX_BYTES,
     SEARCH_MAX_LIMIT,
+    SEARCH_SCHEMA,
     make_handlers,
 )
 
@@ -125,3 +127,16 @@ def test_schemas_are_well_formed():
         assert params["type"] == "object"
         assert params["additionalProperties"] is False
         assert schema["description"]
+
+
+def test_mode_description_is_version_neutral():
+    # The description must read correctly against ANY pond binary: the default
+    # arm is the running instance's business, so naming one here would go stale
+    # on the first upgrade that flips it.
+    description = SEARCH_SCHEMA["description"]
+    assert '"fts"' in description
+    assert '"vector"' in description
+    # No arm may be marked as the default: catches '"fts" (default...' and
+    # 'default,' alike, while allowing the closing "pond's default." sentence.
+    assert not re.search(r'"(fts|vector)"\s*\(\s*default', description)
+    assert "default," not in description

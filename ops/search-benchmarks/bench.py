@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search-quality regression harness for pond's hybrid retrieval.
+"""Search-quality regression harness for pond retrieval.
 
 Drives `target/release/pond search --format json` end-to-end, scores the
 output against ground truth, and can replay captured arm fixtures through
@@ -29,15 +29,15 @@ arbitrary fusion variants without re-running pond. The research artifact
     python3 bench.py verify --queries queries-en.tsv
 
     # 2. capture results for one mode
-    python3 bench.py run --mode hybrid --queries queries-en.tsv --out results/hybrid-en
+    python3 bench.py run --mode vector --queries queries-en.tsv --out results/vector-en
 
     # 3. score against ground truth, emit per-query ranks CSV
-    python3 bench.py score --queries queries-en.tsv --results results/hybrid-en \\
-        --label hybrid-en --out /tmp/hybrid-en.csv
+    python3 bench.py score --queries queries-en.tsv --results results/vector-en \\
+        --label vector-en --out /tmp/vector-en.csv
 
     # 4. (optional) paired sign test across two runs / modes
-    python3 bench.py pair --csv-a /tmp/fts-en.csv --csv-b /tmp/hybrid-en.csv \\
-        --label-a fts --label-b hybrid
+    python3 bench.py pair --csv-a /tmp/fts-en.csv --csv-b /tmp/vector-en.csv \\
+        --label-a fts --label-b vector
 
     # 5. (research-only) replay arm fixtures through fusion variants
     python3 bench.py run --mode fts    --queries Q --out fixtures/fts    --limit 100
@@ -290,6 +290,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     backend = getattr(args, "backend", "pond")
     if backend == "pond":
         check_binary()
+        if args.mode == "vector":
+            # Embeddings are opt-in per process; without this a default pond
+            # refuses mode=vector and every query records as zero hits.
+            os.environ.setdefault("POND_EMBEDDINGS_ENABLED", "true")
         kb_client = None
     elif backend == "kb-mcp":
         kb_client = KbMcpClient()
@@ -774,7 +778,7 @@ def main() -> int:
 
     p_run = sub.add_parser("run", help="Run one retrieval mode against a query set")
     p_run.add_argument("--queries", required=True, help="TSV: id\\tlang\\tstratum\\tquery\\tground_truth")
-    p_run.add_argument("--mode", default="hybrid", choices=["fts", "vector", "hybrid"],
+    p_run.add_argument("--mode", default="fts", choices=["fts", "vector"],
                        help="pond retrieval mode (ignored for backend=kb-mcp)")
     p_run.add_argument("--backend", default="pond", choices=["pond", "kb-mcp"],
                        help="Search backend: pond CLI (default) or kb MCP server over stdio")

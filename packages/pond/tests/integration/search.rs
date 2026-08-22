@@ -11,6 +11,7 @@ use pond::{
     adapter::ClaudeCodeAdapter,
     config::SearchConfig,
     embed::{EmbedWorker, Embedder, LazyEmbedder},
+    handlers::explain_search_plan,
     handlers::ingest_adapter,
     handlers::pond_get_message,
     handlers::pond_get_session,
@@ -64,6 +65,10 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
 /// with the fake backend - the `pond_search` handler then runs end to end
 /// without model weights, exactly as `pond ingest` wires it (main.rs).
 async fn searchable_corpus(temp: &TempDir) -> anyhow::Result<(Store, LazyEmbedder)> {
+    // The vector arm is refused unless this instance opted in. First call wins
+    // for the whole test binary, and every fixture here opts in, so the flag is
+    // order-independent.
+    pond::embed::init_enabled(true);
     let store = Store::open_local(temp.path()).await?;
     let adapter = ClaudeCodeAdapter::new(FIXTURES);
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
@@ -223,10 +228,29 @@ async fn index_disk_cache_populates_from_a_fresh_reader() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// The default `vector` arm degrades to FTS-only when the store has no
-/// embeddings. Either way the corpus must yield scored, [0,1]-normalized hits.
+/// A fixture that forgets `init_enabled(true)` would still pass every vector
+/// test - on fts. This is the guard: with the opt-in taken and rows embedded,
+/// an explicit `mode=vector` must actually plan the vector arm.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_vector_default_degrades_to_fts_without_embeddings() -> anyhow::Result<()> {
+async fn vector_arm_is_live_when_enabled() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (store, embedder) = searchable_corpus(&temp).await?;
+    let phrase = corpus_phrase(&store).await?;
+
+    let plan = explain_search_plan(&store, &embedder, search_request(&phrase), &search_config())
+        .await
+        .map_err(|envelope| anyhow::anyhow!("{}", envelope.error.message))?;
+    assert!(
+        plan.starts_with("vector:"),
+        "mode=vector must not degrade to fts on an enabled, embedded store: {plan}"
+    );
+    Ok(())
+}
+
+/// The `vector` arm degrades to FTS-only when the store has no embeddings.
+/// Either way the corpus must yield scored, [0,1]-normalized hits.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_vector_degrades_to_fts_without_embeddings() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let (store, embedder) = searchable_corpus(&temp).await?;
     let phrase = corpus_phrase(&store).await?;

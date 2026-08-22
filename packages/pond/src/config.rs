@@ -233,22 +233,24 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # its sessions are their own harness and carry their own source_agent - and it
 # auto-discovers like the rest, so it needs no example of its own.
 
-# Embeddings. Search defaults to the vector arm (matching on meaning) when the
-# store has any vectors, falling back to FTS otherwise - the model loads lazily
-# on the first vector query, so there's no cost on FTS-only corpora. `model`
-# selects the HuggingFace XLM-RoBERTa model; `dim` declares its output width and
-# is baked into the messages.vector schema on table creation - it must equal the
-# model's hidden_size.
+# [embeddings]
+# Semantic (vector) search is opt-in. Off: no model is downloaded or loaded,
+# new messages get no vectors, and pond_search mode=\"vector\" is refused.
+# On: messages embed at ingest; run `pond optimize --only embed` to fill the
+# backlog. Measured: off keeps a pond process ~100 MiB; on costs ~500-900 MiB
+# once any vector work ran, a 466 MiB one-time download, and CPU-bound first
+# syncs on hosts without Metal/CUDA.
 #
-# Common pairings:
+# `model` selects the HuggingFace XLM-RoBERTa model; `dim` declares its output
+# width and is baked into the messages.vector schema on table creation - it must
+# equal the model's hidden_size. Common pairings:
 #   model = \"intfloat/multilingual-e5-small\"   dim = 384   (default)
 #   model = \"intfloat/multilingual-e5-base\"    dim = 768
 #   model = \"intfloat/multilingual-e5-large\"   dim = 1024
 #
 # A different-dim model needs a fresh data dir; pond enforces this at the
 # schema boundary.
-#
-# [embeddings]
+# enabled = false
 # model = \"intfloat/multilingual-e5-small\"
 # dim = 384
 
@@ -456,17 +458,16 @@ pub struct MaintenanceConfig {
     pub cleanup_older_than: Option<String>,
 }
 
-/// `[embeddings]`: model selector and vector dimension. There is no master
-/// switch - a `vector` search degrades to FTS when no vectors exist in the
-/// store (`has_embeddings()` is the only gate); the candle/Metal model is
-/// `LazyEmbedder`-loaded on the first query that
-/// actually needs it. `model` and `dim` are installed into the process at
-/// startup via `embed::init_model_id` / `sessions::init_embedding_dim`, so
-/// swapping models for a one-off experiment is a temporary config file - no
-/// CLI flag and no per-call-site plumbing.
+/// `[embeddings]`: the opt-in switch, model selector, and vector dimension.
+/// `enabled = false` (default) means no process loads a model, ingest writes
+/// null vectors, and `mode=vector` is refused. `model` and `dim` are installed
+/// into the process at startup via `install_runtime`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct EmbeddingsConfig {
+    /// Semantic (vector) search opt-in. Off by default: no model download, no
+    /// model load, no vectors written, and a `vector` request is refused.
+    pub enabled: bool,
     /// The embedding model id (spec.md#search): any XLM-RoBERTa model loadable
     /// by `candle-transformers`. Defaults to `intfloat/multilingual-e5-small`.
     pub model: String,
@@ -478,6 +479,7 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             model: crate::embed::DEFAULT_MODEL_ID.to_owned(),
             dim: crate::sessions::DEFAULT_EMBEDDING_DIM,
         }
@@ -747,10 +749,11 @@ impl Config {
 }
 
 /// The `POND_*` env mirror (spec.md#storage-env-mirror): `POND_STORAGE_PATH`
-/// -> `storage.path`, `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`.
-/// Filtered to exactly those two shapes - clap owns its own `POND_*` vars
-/// (`POND_CONFIG_FILE`, `POND_HOST`, ...) and an unfiltered prefix would turn each
-/// of them into an unknown-field error here.
+/// -> `storage.path`, `POND_EMBEDDINGS_ENABLED` -> `embeddings.enabled`,
+/// `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`. Filtered to exactly
+/// those three shapes - clap owns its own `POND_*` vars (`POND_CONFIG_FILE`,
+/// `POND_HOST`, ...) and an unfiltered prefix would turn each of them into an
+/// unknown-field error here.
 fn env_mirror() -> Env {
     // Keys reach these closures pre-lowercasing (`CREDS_...`), so compare on
     // an ascii-lowered copy; `str::starts_with` is case-sensitive.
@@ -760,7 +763,9 @@ fn env_mirror() -> Env {
             // `extra` has no env form (spec.md#storage-env-mirror): the env
             // grammar stays flat strings; structured options belong in the
             // file (or URL query params).
-            key == "storage_path" || (key.starts_with("creds_") && !key.ends_with("_extra"))
+            key == "storage_path"
+                || key == "embeddings_enabled"
+                || (key.starts_with("creds_") && !key.ends_with("_extra"))
         })
         .map(|key| {
             // Set names are lowercase alphanumeric (validate_creds), so the
@@ -1022,10 +1027,12 @@ impl EmbeddingsConfig {
         Ok(())
     }
 
-    /// Install model id + dim into the process. Idempotent: only the first
-    /// call sticks (matches `OnceLock` semantics in `embed::init_model_id` and
+    /// Install the opt-in switch + model id + dim into the process. Idempotent:
+    /// only the first call sticks (matches `OnceLock` semantics in
+    /// `embed::init_enabled` / `embed::init_model_id` and
     /// `sessions::init_embedding_dim`).
     pub fn install_runtime(&self) {
+        crate::embed::init_enabled(self.enabled);
         crate::embed::init_model_id(self.model.clone());
         crate::sessions::init_embedding_dim(self.dim);
     }
@@ -1121,6 +1128,7 @@ mod tests {
         let bad_model = EmbeddingsConfig {
             model: "   ".to_owned(),
             dim: 768,
+            ..Default::default()
         };
         assert!(bad_model.validate().is_err());
         // Non-multiple-of-8 dims are accepted now: IVF_SQ has no subspace
@@ -1128,12 +1136,14 @@ mod tests {
         let odd_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
+            ..Default::default()
         };
         assert!(odd_dim.validate().is_ok());
         // Zero is still rejected.
         let zero_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,
+            ..Default::default()
         };
         assert!(zero_dim.validate().is_err());
     }
@@ -1664,6 +1674,27 @@ region        = "file-region"
             assert_eq!(work.region.as_deref(), Some("file-region"));
             assert_eq!(work.scope.as_deref(), Some("s3://file-bucket/"));
             assert_eq!(config.creds["ci"].access_key_id.as_deref(), Some("ci-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn env_mirror_maps_embeddings_enabled_true_and_1_and_rejects_non_boolean_strings() {
+        figment::Jail::expect_with(|jail| {
+            let load = || Config::load("/nonexistent/pond-config-xyz.toml");
+            jail.set_env("POND_EMBEDDINGS_ENABLED", "true");
+            assert!(load().unwrap().embeddings.enabled);
+            jail.set_env("POND_EMBEDDINGS_ENABLED", "false");
+            assert!(!load().unwrap().embeddings.enabled);
+            // `extract_lossy` coerces boolean-ish env strings, so `1` / `yes`
+            // also enable - pinned here because the switch is the difference
+            // between a 466 MiB download and none.
+            jail.set_env("POND_EMBEDDINGS_ENABLED", "1");
+            assert!(load().unwrap().embeddings.enabled);
+            // Anything not boolean-ish fails the load rather than defaulting
+            // silently; the figment error names the key.
+            jail.set_env("POND_EMBEDDINGS_ENABLED", "garbage");
+            assert!(load().is_err());
             Ok(())
         });
     }
