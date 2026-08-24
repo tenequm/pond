@@ -20,9 +20,10 @@ fn conformance() -> Conformance<'static> {
         fixture_root: Path::new(FIXTURE_ROOT),
         // 5 conversations in the fixture export, minus the 0-message one.
         expected_sessions: 4,
+        resync_rereads: &[],
         // Per-session restore is a one-conversation export the adapter itself
         // re-reads, so the round trip closes entirely inside pond.
-        round_trip: RoundTrip::Reingest { downgraded: 0 },
+        round_trip: RoundTrip::Reingest { downgraded: &[] },
         config: path_config,
     }
 }

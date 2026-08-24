@@ -4,7 +4,6 @@
 //! through the title slot. Single-module mapping behavior (title-slot folding,
 //! carrier taxonomy, watermark math, the ingest-only restore refusal) stays in
 //! the `src/adapter/oh_my_pi.rs` unit tests.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
 
@@ -31,6 +30,7 @@ fn conformance() -> Conformance<'static> {
         factory: &OhMyPiFactory,
         fixture_root: Path::new(FIXTURE_ROOT),
         expected_sessions: FIXTURE_SESSIONS,
+        resync_rereads: &[],
         round_trip: RoundTrip::IngestOnly,
         config: path_config,
     }

@@ -1004,34 +1004,72 @@ mod tests {
         assert!(intruder.is_file(), "the unwind removed a foreign file");
     }
 
-    /// Adapters are structurally isolated from the store and query layer: no
+    /// Adapters are import-isolated from the store and query layer: no
     /// production line under `src/adapter/` names the store, the substrate,
-    /// the rowmap, the handlers, the SQL/transport/embedding modules, or the
-    /// Lance and Arrow crates beneath them. (The canonical model types -
-    /// `IngestEvent`, `SessionWithMessages` - are the seam's vocabulary and
-    /// stay allowed.) This isolation is why an adapter PR needs the standard
-    /// checks green and nothing else: code that cannot name the store cannot
-    /// regress store performance, so adapter changes skip the release bench
-    /// gate by construction. Every exemption is listed here with its reason.
+    /// the rowmap, the handlers, the Lance/Arrow/DataFusion crates beneath
+    /// them, or `Extracted::from_stored`, and every crate-root path an adapter
+    /// spells resolves to the seam's own vocabulary (`adapter`, `wire`,
+    /// `config`, and the three canonical model types from `sessions`).
+    ///
+    /// What this proves is mechanical and narrow: adapter code cannot reach the
+    /// store's write path, commit discipline, or query plans, so an adapter PR
+    /// is reviewed as parse and mapping behavior and the standard checks are
+    /// its whole bar. It does not prove performance isolation - an adapter
+    /// still decides the volume and shape of what it emits, and
+    /// `benches/ingest_bench.rs` drives claude-code end to end. Every
+    /// exemption is listed with its reason and its expected line count, so a
+    /// second use behind the same name is a visible change.
     #[test]
     fn adapters_never_touch_the_store_or_query_layer() {
-        const FORBIDDEN_IDENTS: [&str; 8] = [
+        // Matched as whole identifiers or as a `<token>_` prefix: the lance
+        // and arrow workspaces are hyphenated sub-crates (`lance_io`,
+        // `arrow_select`).
+        const FORBIDDEN_IDENTS: [&str; 10] = [
             "Store",
             "substrate",
             "rowmap",
             "handlers",
             "lance",
+            "lancedb",
             "arrow",
             "datafusion",
             "object_store",
+            "from_stored",
         ];
-        // Modules whose names are also ordinary identifiers (`sql` is a query
-        // string in every SQLite adapter), so only the crate path is forbidden.
-        const FORBIDDEN_PATHS: [&str; 3] = ["crate::sql", "crate::transport", "crate::embed"];
-        // openclaw's deletion reconciliation is a read-only detection pass over
-        // stored sessions (spec.md#session-append-only-exception): it names the
-        // store to ask what pond holds and never writes through it.
-        const EXEMPT: [(&str, &str); 1] = [("openclaw.rs", "Store")];
+        // The crate-root modules an adapter may name, and the only `sessions`
+        // items; `sql`, `transport`, `embed`, `store`, and every other module
+        // fail by omission, grouped imports included.
+        const ALLOWED_ROOTS: [&str; 4] = ["adapter", "wire", "config", "sessions"];
+        const ALLOWED_SESSIONS_ITEMS: [&str; 3] =
+            ["IngestEvent", "SessionWithMessages", "MessageWithParts"];
+        // (file, token, expected hits). openclaw's deletion reconciliation is a
+        // read-only detection pass over stored sessions
+        // (spec.md#session-append-only-exception): the import path, then the
+        // identifier on the import line and the `&Store` parameter; read-only
+        // is documented there, not checked here. `from_stored` is defined in
+        // extract.rs for the store side to call.
+        const EXEMPT: [(&str, &str, usize); 3] = [
+            ("openclaw.rs", "crate::sessions::Store", 1),
+            ("openclaw.rs", "Store", 2),
+            ("extract.rs", "from_stored", 1),
+        ];
+        // A column-0 line opening one of these below the test module is a
+        // production item the scan would otherwise never see.
+        const ITEM_KEYWORDS: [&str; 13] = [
+            "fn",
+            "pub",
+            "impl",
+            "use",
+            "const",
+            "static",
+            "struct",
+            "enum",
+            "trait",
+            "type",
+            "async",
+            "unsafe",
+            "macro_rules!",
+        ];
 
         fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).expect("adapter dir is readable") {
@@ -1043,20 +1081,116 @@ mod tests {
                 }
             }
         }
-        fn identifiers(line: &str) -> impl Iterator<Item = &str> {
-            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .filter(|ident| !ident.is_empty())
+        }
+        fn forbidden(ident: &str) -> Option<&'static str> {
+            FORBIDDEN_IDENTS.into_iter().find(|token| {
+                ident == *token
+                    || ident
+                        .strip_prefix(token)
+                        .is_some_and(|rest| rest.starts_with('_'))
+            })
         }
         // Test modules sit at the bottom of the file (repo convention) and
         // legitimately drive the store end to end: the scan stops at the
-        // `#[cfg(test)]` that introduces a `mod`, not at one gating one item.
+        // `#[cfg(test)]` that introduces a `mod` (attributes and doc lines in
+        // between allowed), not at one gating one item.
         fn opens_test_module(lines: &[&str], index: usize) -> bool {
             lines[index].trim_start().starts_with("#[cfg(test)]")
                 && lines[index + 1..]
                     .iter()
                     .map(|line| line.trim_start())
-                    .find(|line| !line.is_empty())
-                    .is_some_and(|line| line.split_whitespace().take(2).any(|word| word == "mod"))
+                    .find(|line| {
+                        !line.is_empty() && !line.starts_with("#[") && !line.starts_with("//")
+                    })
+                    .is_some_and(|line| line.split_whitespace().take(4).any(|word| word == "mod"))
+        }
+        /// The text between a `{` at `open` and its matching `}`, exclusive.
+        fn group_body(text: &str, open: usize) -> Option<&str> {
+            let mut depth = 0usize;
+            for (offset, c) in text[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&text[open + 1..open + offset]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        fn split_top_level(body: &str) -> Vec<&str> {
+            let mut entries = Vec::new();
+            let mut depth = 0usize;
+            let mut start = 0usize;
+            for (offset, c) in body.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        entries.push(body[start..offset].trim());
+                        start = offset + 1;
+                    }
+                    _ => {}
+                }
+            }
+            entries.push(body[start..].trim());
+            entries
+                .into_iter()
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        }
+        /// One crate-root path (`wire::Role::System`, `sessions::{A, B}`,
+        /// `sql::run`) against the allowlist; `Some` names the offending path.
+        fn check_root_path(entry: &str) -> Option<String> {
+            let head = entry.split('{').next().unwrap_or("").trim_end_matches("::");
+            let mut segments = head.split("::").map(str::trim).filter(|s| !s.is_empty());
+            let root = segments.next()?;
+            if !ALLOWED_ROOTS.contains(&root) {
+                return Some(format!("crate::{head}"));
+            }
+            if root != "sessions" {
+                return None;
+            }
+            let group_items = entry
+                .find('{')
+                .and_then(|open| group_body(entry, open))
+                .map(|body| identifiers(body).collect::<Vec<_>>())
+                .unwrap_or_default();
+            segments
+                .chain(group_items)
+                .find(|item| !ALLOWED_SESSIONS_ITEMS.contains(item))
+                .map(|item| format!("crate::sessions::{item}"))
+        }
+        /// Every crate-root path spelled inline on `line` (`crate::x::y`,
+        /// `crate::{a, b}`, `super::super::x` from a child module).
+        fn inline_root_paths<'a>(line: &'a str, root_prefixes: &[&str]) -> Vec<&'a str> {
+            let mut entries = Vec::new();
+            for prefix in root_prefixes {
+                for (start, _) in line.match_indices(prefix) {
+                    let rest = &line[start + prefix.len()..];
+                    let head_len = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                        .unwrap_or(rest.len());
+                    let entry_end = match rest[head_len..].starts_with('{') {
+                        true => group_body(rest, head_len)
+                            .map_or(rest.len(), |body| head_len + body.len() + 2),
+                        false => head_len,
+                    };
+                    entries.push(&rest[..entry_end]);
+                }
+            }
+            entries
+        }
+        fn is_item_line(line: &str) -> bool {
+            let first = line.split(|c: char| c.is_whitespace() || c == '(').next();
+            first.is_some_and(|word| ITEM_KEYWORDS.contains(&word))
+                && !line.split_whitespace().take(4).any(|word| word == "mod")
         }
 
         let adapter_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1064,38 +1198,117 @@ mod tests {
             .join("adapter");
         let mut files = Vec::new();
         rust_files(&adapter_dir, &mut files);
+        files.sort();
         let mut violations = Vec::new();
+        let mut exempt_hits: Vec<usize> = vec![0; EXEMPT.len()];
         for path in &files {
             let name = path
                 .strip_prefix(&adapter_dir)
                 .expect("collected under adapter_dir")
-                .display()
-                .to_string();
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            // `super::` is the crate root from mod.rs and the seam from a child.
+            let root_prefixes: &[&str] = match name.as_str() {
+                "mod.rs" => &["crate::", "super::"],
+                _ => &["crate::", "super::super::"],
+            };
             let text = std::fs::read_to_string(path).expect("adapter source is readable");
             let lines: Vec<&str> = text.lines().collect();
-            for (index, raw) in lines.iter().enumerate() {
-                if opens_test_module(&lines, index) {
-                    break;
+            let mut record = |line_no: usize, token: &str, line: &str| {
+                let exempt = EXEMPT
+                    .iter()
+                    .position(|(file, tok, _)| *file == name && *tok == token);
+                match exempt {
+                    Some(slot) => exempt_hits[slot] += 1,
+                    None => violations.push(format!("{name}:{line_no}: `{token}` in: {line}")),
                 }
+            };
+            // A multi-line `use crate::{ ... };` group: depth within it, and
+            // which crate-root module a nested multi-line group belongs to.
+            let mut group_depth = 0usize;
+            let mut nested_root: Option<String> = None;
+            let mut in_tests = false;
+            for (index, raw) in lines.iter().enumerate() {
+                let line_no = index + 1;
                 let line = raw.trim_start();
+                if in_tests {
+                    if raw.len() == line.len() && is_item_line(line) {
+                        record(line_no, "production item after the test module", line);
+                    }
+                    continue;
+                }
+                if opens_test_module(&lines, index) {
+                    in_tests = true;
+                    continue;
+                }
                 if line.starts_with("//") {
                     continue;
                 }
-                let hit = FORBIDDEN_PATHS
-                    .into_iter()
-                    .find(|token| line.contains(token))
-                    .or_else(|| identifiers(line).find(|ident| FORBIDDEN_IDENTS.contains(ident)));
-                if let Some(token) = hit
-                    && !EXEMPT.contains(&(name.as_str(), token))
-                {
-                    violations.push(format!("{name}:{}: {line}", index + 1));
+                for ident in identifiers(line) {
+                    if let Some(token) = forbidden(ident) {
+                        record(line_no, token, line);
+                    }
+                }
+                if group_depth > 0 {
+                    let entry = line.trim_end_matches(';').trim_end_matches(',');
+                    let opens = entry.matches('{').count();
+                    let closes = entry.matches('}').count();
+                    let is_path = entry.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+                    if group_depth == 1 && is_path {
+                        if let Some(bad) = check_root_path(entry) {
+                            record(line_no, &bad, line);
+                        }
+                        if opens > closes {
+                            nested_root = entry.split("::").next().map(str::to_owned);
+                        }
+                    } else if group_depth > 1
+                        && nested_root.as_deref() == Some("sessions")
+                        && let Some(item) =
+                            identifiers(entry).find(|item| !ALLOWED_SESSIONS_ITEMS.contains(item))
+                    {
+                        record(line_no, &format!("crate::sessions::{item}"), line);
+                    }
+                    group_depth = (group_depth + opens).saturating_sub(closes);
+                    continue;
+                }
+                for entry in inline_root_paths(line, root_prefixes) {
+                    if entry.starts_with('{') {
+                        match group_body(entry, 0) {
+                            Some(body) => {
+                                for sub in split_top_level(body) {
+                                    if let Some(bad) = check_root_path(sub) {
+                                        record(line_no, &bad, line);
+                                    }
+                                }
+                            }
+                            // `crate::{` opening a multi-line group.
+                            None => {
+                                group_depth = 1;
+                                nested_root = None;
+                            }
+                        }
+                    } else if let Some(bad) = check_root_path(entry) {
+                        record(line_no, &bad, line);
+                    }
                 }
             }
         }
+        for ((file, token, expected), actual) in EXEMPT.iter().zip(exempt_hits) {
+            if actual != *expected {
+                violations.push(format!(
+                    "{file}: `{token}` exempt for {expected} lines, found {actual} - a new use \
+                     needs its own reason, a removed one drops the exemption"
+                ));
+            }
+        }
+        violations.sort();
         assert!(
             violations.is_empty(),
-            "adapter code reached into the store/query layer, which breaks the \
-             isolation that lets adapter PRs skip benchmarks:\n{}",
+            "adapter code reached past the seam into the store/query layer:\n{}\n\
+             A legitimate read-only use goes into EXEMPT as (file, token, count) with its \
+             reason; production items belong above the test module.",
             violations.join("\n"),
         );
     }

@@ -35,10 +35,23 @@ fn conformance() -> Conformance<'static> {
         fixture_root: Path::new(FIXTURE_ROOT),
         // 4 v3 files + 2 v4 files + 2 SQLite sessions.
         expected_sessions: 8,
+        // Both end on a `lane` / `fact` mutation, which carries no timestamp,
+        // so their watermark is Opaque and the gate re-reads them rather than
+        // risk never ingesting the trailing mutation
+        // (spec.md#session-movement-complete; the unit test
+        // `v4_trailing_timestampless_mutation_forces_a_reread`).
+        resync_rereads: &["v4-main-session", "sqlite-main-session"],
         // Resume emits v3 for every origin, the only format a released pi
         // opens: the 4 v3-origin sessions replay natively; the 2 v4 and 2
         // SQLite sessions are reconstructed and honestly reported Foreign.
-        round_trip: RoundTrip::Reingest { downgraded: 4 },
+        round_trip: RoundTrip::Reingest {
+            downgraded: &[
+                "v4-main-session",
+                "v4-fork-session",
+                "sqlite-main-session",
+                "sqlite-child-session",
+            ],
+        },
         config: pi_config,
     }
 }

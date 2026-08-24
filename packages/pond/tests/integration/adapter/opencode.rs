@@ -40,11 +40,14 @@ fn conformance() -> Conformance<'static> {
         // 10 DB-resident sessions plus 4 legacy split-file-tree sessions; the
         // two source eras carry disjoint ids, so nothing is superseded.
         expected_sessions: 14,
+        resync_rereads: &[],
         // Native restore emits `opencode import` envelopes for an external
         // tool, not files this adapter re-reads.
         round_trip: RoundTrip::ExternalImport {
-            verified_by: "native_restore_is_value_equal_to_real_db_corpus (opt-in, below) and \
-                          the serialize unit tests in src/adapter/opencode.rs",
+            verified_by: "native_restore_conformance_against_db_fixture and \
+                          native_restore_emits_import_shape_from_tree in \
+                          src/adapter/opencode.rs (CI), plus the opt-in \
+                          native_restore_is_value_equal_to_real_db_corpus below",
         },
         config: path_config,
     }

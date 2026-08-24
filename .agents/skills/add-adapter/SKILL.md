@@ -12,7 +12,7 @@ The work splits into two phases. Phase A produces the spec doc and the fixture; 
 Ground rules that override any instinct to improvise:
 
 - docs/spec.md section 6 is the contract. The named rules cited below (`adapter-integrity-*`, `adapter-bounded-values`, `model-no-synthesis`, ...) are binding, and each states WHY it exists - read the rule before deviating.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` green is the whole bar for an adapter PR. No benchmarks: adapters are structurally isolated from the store and query layer (a guard test in `src/adapter/mod.rs` enforces it and lists its one read-only exemption with the reason), so an adapter cannot regress store performance.
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` green is the whole bar for an adapter PR. No benchmarks: adapters are import-isolated from the store and query layer (a guard test in `src/adapter/mod.rs` enforces it and lists its exemptions with reasons), so an adapter cannot reach the store's write path, commit discipline, or query plans; what it can still get wrong - parse cost, emitted volume, freshness reads - is what the conformance harness and review look at.
 - Third-party session-search parsers (franken_agent_detection, deja-vu, ctx, ...) may be read as corroborating references, never as the authority. Their bar is a search projection; pond's is a lossless round-trip codec.
 - Fixtures come from sandboxed self-capture only. Never vendor another repo's fixture, and never copy files from a real (non-sandboxed) agent home.
 
@@ -22,7 +22,7 @@ Output: `docs/adapters/<source_agent>.md` (named by the brand string, e.g. `grok
 
 ### 1. Read the writer, not the reader
 
-Clone the upstream agent to `~/pjv/<owner>/<repo>` and locate the code that WRITES the session files - serializers, transcript stores, migration code - not code that reads them back. The writer is the authority on what can appear in a file; readers routinely tolerate less than writers emit. Note the agent version or commit you read: it becomes the `Last verified` line of the spec doc.
+Clone the upstream agent locally and locate the code that WRITES the session files - serializers, transcript stores, migration code - not code that reads them back. The writer is the authority on what can appear in a file; readers routinely tolerate less than writers emit. Note the agent version or commit you read: it becomes the `Last verified` line of the spec doc.
 
 Verify every claimed shape empirically against a real capture (step 2). A field the source never actually emits does not get a mapping.
 
@@ -32,9 +32,9 @@ The conformance fixture is captured by running the target agent yourself under a
 
 Procedure:
 
-- Create a throwaway home and run the agent entirely inside it: `HOME=$(mktemp -d)` plus `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` under it (`USERPROFILE` on Windows). The agent must be installed and signed in beforehand; auth material that lands in the sandbox home must not end up in the fixture.
-- Script one or more sessions that exercise every shape the decision table needs: multi-turn text, a tool call with its result, a failed tool call, an unfinished/interrupted call, reasoning output if the agent supports it, a subagent/fork/spawn if the format records lineage, and an empty or aborted session. Add a CRLF variant of one file.
-- Copy the session files out preserving the agent's native directory layout, under `packages/pond/tests/fixtures/adapter/<name>/`. The fixture policy in `packages/pond/tests/fixtures/README.md` governs layout, which fields must stay verbatim, and the anonymization rules - verify against it, and add the new platform's section to it (layout, quirks, provenance: producer version/commit, capture date).
+- Create a throwaway home and run the agent entirely inside it: `HOME=$(mktemp -d)` plus `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` under it (`USERPROFILE` on Windows). A fresh home hides the sign-in state in your real one, so copy only the agent's credential file into the sandbox (the opencode capture note in `packages/pond/tests/fixtures/README.md` shows the shape) and delete it before you copy anything out; auth material never enters the fixture.
+- Script one or more sessions that exercise every shape the decision table needs: multi-turn text, a tool call with its result, a failed tool call, an unfinished/interrupted call, reasoning output if the agent supports it, a subagent/fork/spawn if the format records lineage, and an empty or aborted session. Encoding variants (CRLF, UTF-16) come from a capture on the platform that produces them, never from converting a copy - a converted file keeps the original's session id and collides with it.
+- Copy the session files out preserving the agent's native directory layout, under `packages/pond/tests/fixtures/adapter/<name>/`. The fixture policy in `packages/pond/tests/fixtures/README.md` governs layout, which fields must stay verbatim, and the anonymization rules - verify against it, run its "Verification" sweep (trufflehog, gitleaks, parse validation) before committing, and add the new platform's section to it (layout, quirks, provenance: producer version/commit, capture date).
 
 ### 3. Fill the decision table
 
@@ -51,8 +51,8 @@ Every row below is a required section of the spec doc. Every answer cites eviden
 | 7 | Lineage | How forks/spawns/subagents appear and map to `parent_session_id`. | `adapter-lineage-complete-restore` |
 | 8 | Deliberate non-capture | Sibling files and record kinds the adapter intentionally does not ingest, each with a reason. | `model-lossless-projection` (non-capture must be declared) |
 | 9 | Restore face | Native restore layout, or `restore_unsupported` with a reason naming the caller's alternative (oh-my-pi precedent). | `adapter-native-restore-lossless` |
-| 10 | Freshness oracle | How "has this session changed?" is answered cheaply; whether the source can rewrite/truncate in place (if it can, a tail peek is wrong). On an unchanged re-sync the gate must fire visibly (`SkipReason::Fresh`, counted as `skipped_fresh`) - the harness rejects an adapter that merely re-ingests idempotently. | `adapter-integrity-additive-sync` |
-| 11 | Windows | Where the agent writes on Windows, env overrides, encoding quirks (CRLF, UTF-16, path separators). | `windows-verify` CI runs the full test suite natively per PR |
+| 10 | Freshness oracle | How "has this session changed?" is answered cheaply; whether the source can rewrite/truncate in place (if it can, a tail peek is wrong). On an unchanged re-sync the gate must fire visibly (`SkipReason::Fresh`, counted as `skipped_fresh`) for every session except the ones the suite declares as `resync_rereads` with the reason (a source that gives a session no usable watermark) - the harness rejects an adapter that merely re-ingests idempotently. | `adapter-integrity-additive-sync` |
+| 11 | Windows | Where the agent writes on Windows, env overrides, encoding quirks (CRLF, UTF-16, path separators). | `windows-verify` CI runs the full test suite natively on same-repo branches; a fork PR gets it when a maintainer pushes the branch or on merge |
 
 Adapter-specific concerns beyond the table go into extra prose sections of the spec doc, not new universal rows.
 
@@ -102,7 +102,7 @@ Either implement `serialize` (native fidelity replays `raw_record`; foreign rebu
 Two layers, split by seam (single-module mapping behavior in unit tests; cross-module paths in the integration suite):
 
 - Unit tests inside the adapter file: mapping decisions from the spec doc's table (each row that involved a choice gets a test), `probe_default` via `test_support::assert_probe_default`, and - when the native layout is exactly the source file set - round-trip via `test_support::assert_native_restore`.
-- Integration suite `tests/integration/adapter/<name>.rs` using the shared conformance harness (`Conformance` in `tests/integration/adapter/mod.rs`): full-fixture ingest counts + searchable scope, re-sync-is-noop, and the round-trip mode the adapter declares (`Reingest { downgraded }` with the count of fixture sessions whose native restore is honestly served `Foreign`, `ExternalImport`, or `IngestOnly`). The adapter also declares its config face (`path_config` for the usual `{ "path": ... }` blob; a custom `fn(&Path) -> Value` for anything else) - the harness never grows adapter-specific branches. Keep adapter-specific assertions (lineage, taxonomy, project fallbacks) as extra tests in the same file.
+- Integration suite `tests/integration/adapter/<name>.rs` using the shared conformance harness (`Conformance` in `tests/integration/adapter/mod.rs`): full-fixture ingest counts + searchable scope (with a clean `IngestSummary`), re-sync-is-noop (every session skipped fresh except the declared `resync_rereads`), and the round-trip mode the adapter declares (`Reingest { downgraded }` naming the fixture sessions whose native restore is honestly served `Foreign` - at least one must replay natively - `ExternalImport { verified_by }` naming the CI test that owns value-equality, or `IngestOnly`, which also checks that `serialize` refuses). The adapter also declares its config face (`path_config` for the usual `{ "path": ... }` blob; a custom `fn(&Path) -> Value` for anything else) - the harness never grows adapter-specific branches. Keep adapter-specific assertions (lineage, taxonomy, project fallbacks) as extra tests in the same file.
 
 ### 6. Docs
 
@@ -112,4 +112,4 @@ Two layers, split by seam (single-module mapping behavior in unit tests; cross-m
 
 ### 7. Validate
 
-`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` - all green locally. CI additionally runs the identical test suite natively on Windows (`windows-verify`), which is what makes decision-table row 11 checked instead of aspirational. That is the whole bar; no benchmark run is part of an adapter PR.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` - all green locally (`--all-targets` matters: Linux CI lints only the library, the Windows leg lints the tests too). CI additionally runs the identical test suite natively on Windows (`windows-verify`) for same-repo branches, which is what makes decision-table row 11 checked instead of aspirational; a fork PR gets that leg when a maintainer pushes the branch or on merge. That is the whole bar; no benchmark run is part of an adapter PR.
