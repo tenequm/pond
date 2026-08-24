@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
@@ -25,6 +25,11 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::xlm_roberta::{Config, XLMRobertaModel};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
+// Not `std::time::Instant`: outside a paused runtime this IS the std clock,
+// but under `tokio::time::pause` the tests drive eviction by advancing time
+// instead of racing it - a 20 ms real threshold cannot survive a loaded CI
+// runner descheduling the task between two `get()` calls.
+use tokio::time::Instant;
 use tokio_stream::StreamExt;
 
 use crate::sessions::{EmbeddedMessage, PendingMessage, Store, embedding_dim};
@@ -700,10 +705,11 @@ mod tests {
         }
     }
 
-    /// `LazyEmbedder` keys eviction on `std::time::Instant`, which isn't
-    /// affected by `tokio::time::pause`. The test uses a tiny real
-    /// threshold so the suite runs in <100 ms.
-    #[tokio::test(flavor = "multi_thread")]
+    /// Eviction keys on `tokio::time::Instant`, so `start_paused` freezes the
+    /// clock and `advance` is the only thing that moves it. Never assert the
+    /// no-eviction case against a real threshold: it asserts that the runtime
+    /// scheduled two calls within N ms, which a loaded CI runner will break.
+    #[tokio::test(start_paused = true)]
     async fn lazy_embedder_evicts_after_idle_threshold() {
         let loads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&loads);
@@ -711,8 +717,8 @@ mod tests {
             counter.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(Arc::new(CountingEmbedder) as Arc<dyn Embedder>)
         });
-        let embedder =
-            LazyEmbedder::with_loader(loader).with_idle_threshold(Duration::from_millis(20));
+        let threshold = Duration::from_secs(60);
+        let embedder = LazyEmbedder::with_loader(loader).with_idle_threshold(threshold);
 
         embedder.get().await.unwrap();
         assert_eq!(
@@ -728,7 +734,18 @@ mod tests {
             "back-to-back get reuses the cached backend",
         );
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Just short of the threshold: still a reuse, and now that is a fact
+        // about the clock rather than about scheduling luck.
+        tokio::time::advance(threshold - Duration::from_secs(1)).await;
+        embedder.get().await.unwrap();
+        assert_eq!(
+            loads.load(AtomicOrdering::SeqCst),
+            1,
+            "a get inside the idle threshold reuses the cached backend",
+        );
+
+        // `get` refreshed `last_use`, so this crosses the threshold from there.
+        tokio::time::advance(threshold + Duration::from_secs(1)).await;
         embedder.get().await.unwrap();
         assert_eq!(
             loads.load(AtomicOrdering::SeqCst),
@@ -737,21 +754,25 @@ mod tests {
         );
     }
 
-    /// Same real-clock caveat as above: the reaper keys on
-    /// `std::time::Instant`, immune to `tokio::time::pause`.
-    #[tokio::test(flavor = "multi_thread")]
+    /// Same paused clock; the reaper's own `sleep` rides it, so advancing past
+    /// one tick plus the threshold is what makes it fire - no polling deadline.
+    #[tokio::test(start_paused = true)]
     async fn idle_reaper_evicts_without_an_intervening_get() {
         let loader: EmbedLoader = Arc::new(|| Ok(Arc::new(CountingEmbedder) as Arc<dyn Embedder>));
-        let embedder = Arc::new(
-            LazyEmbedder::with_loader(loader).with_idle_threshold(Duration::from_millis(20)),
-        );
+        let threshold = Duration::from_secs(60);
+        let embedder = Arc::new(LazyEmbedder::with_loader(loader).with_idle_threshold(threshold));
         embedder.spawn_idle_reaper();
         embedder.get().await.unwrap();
         assert!(embedder.state.lock().await.is_some());
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while embedder.state.lock().await.is_some() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Bounded by iterations, not by wall clock: each pass moves the virtual
+        // clock past another tick and yields so the reaper task can be polled.
+        for _ in 0..10 {
+            tokio::time::advance(threshold).await;
+            tokio::task::yield_now().await;
+            if embedder.state.lock().await.is_none() {
+                break;
+            }
         }
         assert!(
             embedder.state.lock().await.is_none(),
@@ -759,13 +780,13 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn lazy_embedder_from_loaded_never_evicts() {
         let preloaded = LazyEmbedder::from_loaded(Arc::new(CountingEmbedder));
         preloaded.get().await.unwrap();
-        // Wait past any reasonable threshold; the from_loaded path uses
+        // Past any reasonable threshold; the from_loaded path uses
         // Duration::MAX so the fake stays alive for the whole test.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
         preloaded.get().await.unwrap();
     }
 }

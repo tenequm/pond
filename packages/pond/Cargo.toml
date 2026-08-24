@@ -236,6 +236,10 @@ rmcp = { version = "1.7", features = ["client"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 insta = "1.47.2"
 tempfile = "3.25"
+# `test-util` for `#[tokio::test(start_paused = true)]` + `time::advance`: the
+# embedder's idle eviction keys on `tokio::time::Instant`, so its tests drive
+# the clock instead of sleeping against a real threshold. Test builds only.
+tokio = { version = "1.52", features = ["test-util"] }
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
 # 0.14, not 0.13: lance-io v8 pulls opendal 0.57, whose opendal-core needs the
