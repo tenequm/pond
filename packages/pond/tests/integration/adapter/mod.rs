@@ -15,7 +15,7 @@ use pond::{
     },
     handlers::ingest_adapter,
     sessions::{RowmapOracle, Store},
-    substrate::{Predicate, ScalarValue},
+    substrate::Predicate,
     wire::Message,
 };
 use tempfile::TempDir;
@@ -51,12 +51,24 @@ pub(crate) enum RoundTrip {
 /// assertions (taxonomy, lineage, project fallbacks) stay in the per-adapter
 /// files.
 pub(crate) struct Conformance<'a> {
-    pub factory: &'a dyn AdapterFactory,
-    pub fixture_root: &'a Path,
+    pub(crate) factory: &'a dyn AdapterFactory,
+    pub(crate) fixture_root: &'a Path,
     /// Sessions the store holds after a full-fixture ingest: importable
     /// sessions, not source files - empty sources don't count.
-    pub expected_sessions: usize,
-    pub round_trip: RoundTrip,
+    pub(crate) expected_sessions: usize,
+    pub(crate) round_trip: RoundTrip,
+}
+
+/// A fresh local store holding one full ingest of `adapter` (no freshness
+/// oracle, so every source is read). The `TempDir` is returned alongside
+/// because dropping it would pull the directory out from under the store.
+pub(crate) async fn ingest_into_temp_store(
+    adapter: &dyn Adapter,
+) -> anyhow::Result<(Store, TempDir)> {
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    ingest_adapter(&store, adapter, &NoopOracle, |_| {}).await?;
+    Ok((store, store_dir))
 }
 
 impl Conformance<'_> {
@@ -67,11 +79,7 @@ impl Conformance<'_> {
     }
 
     async fn ingest_fixture(&self) -> anyhow::Result<(Store, TempDir)> {
-        let store_dir = TempDir::new()?;
-        let store = Store::open_local(store_dir.path()).await?;
-        let adapter = self.open_at(self.fixture_root)?;
-        ingest_adapter(&store, adapter.as_ref(), &NoopOracle, |_| {}).await?;
-        Ok((store, store_dir))
+        ingest_into_temp_store(self.open_at(self.fixture_root)?.as_ref()).await
     }
 
     /// Full-corpus ingest through the Store: expected session count, every
@@ -106,11 +114,10 @@ impl Conformance<'_> {
             );
         }
 
+        // Exact-or-subpath, the same scope shape the handlers use, so an
+        // adapter whose fixture is entirely `brand/kind` sessions still counts.
         let searchable = store
-            .searchable_in_scope(&Predicate::Eq(
-                "source_agent",
-                ScalarValue::String(brand.to_owned()),
-            ))
+            .searchable_in_scope(&Predicate::Regex("source_agent", format!("^{brand}(/|$)")))
             .await?;
         anyhow::ensure!(
             searchable > 0,
@@ -217,6 +224,10 @@ impl Conformance<'_> {
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("{brand}: session {id} unreadable"))?;
                     let files = self.factory.serialize(&session, RestoreFidelity::Native)?;
+                    anyhow::ensure!(
+                        !files.is_empty(),
+                        "{brand}: native restore of {id} emitted nothing",
+                    );
                     for file in &files {
                         anyhow::ensure!(
                             file.actual_fidelity == RestoreFidelity::Native,
@@ -276,14 +287,12 @@ enum TargetRoot {
 
 async fn assert_foreign_pair(
     origin: impl Adapter,
-    target: &dyn pond::adapter::AdapterFactory,
+    target: &dyn AdapterFactory,
     snapshot_name: &str,
     target_root: TargetRoot,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    let store_dir = TempDir::new()?;
-    let store = Store::open_local(store_dir.path()).await?;
-    ingest_adapter(&store, &origin, &pond::adapter::NoopOracle, |_| {}).await?;
+    let (store, _store_dir) = ingest_into_temp_store(&origin).await?;
     // Pin the session explicitly: selecting by sort order would silently
     // swap which session the golden covers whenever a fixture is added.
     let session = store
@@ -298,15 +307,7 @@ async fn assert_foreign_pair(
         TargetRoot::Claude => Box::new(ClaudeCodeAdapter::new(target_dir.path())),
         TargetRoot::Codex => Box::new(CodexCliAdapter::new(target_dir.path().join("sessions"))),
     };
-    let verify_store_dir = TempDir::new()?;
-    let verify_store = Store::open_local(verify_store_dir.path()).await?;
-    ingest_adapter(
-        &verify_store,
-        target_adapter.as_ref(),
-        &pond::adapter::NoopOracle,
-        |_| {},
-    )
-    .await?;
+    let (verify_store, _verify_store_dir) = ingest_into_temp_store(target_adapter.as_ref()).await?;
 
     // Re-parse gate: the foreign output must re-ingest as a real session, not
     // silently collapse to an empty file. Foreign restore drops only System
@@ -337,9 +338,12 @@ async fn assert_foreign_pair(
     Ok(())
 }
 
+/// Write restored files under `root` through the production path gate
+/// (`restore_destinations`), so a `relative_path` the real writer would refuse
+/// fails the test instead of passing under a laxer join.
 fn write_restored(root: &Path, files: &[pond::adapter::RestoredFile]) -> anyhow::Result<()> {
-    for file in files {
-        let path = root.join(&file.relative_path);
+    let destinations = pond::adapter::restore_destinations(root, files)?;
+    for (path, file) in destinations.into_iter().zip(files) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

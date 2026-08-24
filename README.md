@@ -223,9 +223,18 @@ enabled = false                    # kept in config, skipped on `pond sync`
 path = "~/.codex/sessions"
 ```
 
+Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true`, then run `pond optimize --only embed` once to fill the backlog:
+
+```toml
+[embeddings]
+enabled = true
+```
+
+Full detail, including what it costs and how mixed fleets behave, is in the [configuration reference](https://pond.locker/reference/configuration).
+
 ### Supported harnesses
 
-One adapter per harness, in `pond adapters` discovery order. `Last verified` is when the adapter's mapping was last checked against a real capture of the source format; adapters are maintained best-effort, and format drift is safe by design (unknown record shapes still ingest losslessly, malformed input surfaces as a typed error naming the file). Adding a harness is routine work - see [Contributing](#contributing).
+One adapter per harness, in `pond adapters` discovery order; `Reads` is the path `pond init` discovers and writes to `[adapters.<name>].path`. `Last verified` is the most recent capture or refresh date of the adapter's committed fixture (`packages/pond/tests/fixtures/adapter/`), the corpus its mapping is tested against. Adapters are maintained best-effort, and format drift is safe by design: unknown record shapes still ingest losslessly, malformed input surfaces as a typed error naming the file. Adding a harness is routine work - see [Contributing](#contributing).
 
 | Adapter | Reads | Last verified |
 |---------|-------|---------------|
@@ -235,19 +244,10 @@ One adapter per harness, in `pond adapters` discovery order. `Last verified` is 
 | `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-05-13 |
 | `opencode` | opencode, `~/.local/share/opencode` (SQLite DB + legacy tree) | 2026-07-14 |
 | `openclaw` | openclaw, `~/.openclaw` | 2026-07-23 |
-| `nanoclaw` | nanoclaw, `~/nanoclaw/data/v2-sessions` | 2026-07-23 |
+| `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-07-23 |
 | `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |
 | `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
 | `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |
-
-Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true`, then run `pond optimize --only embed` once to fill the backlog:
-
-```toml
-[embeddings]
-enabled = true
-```
-
-Full detail, including what it costs and how mixed fleets behave, is in the [configuration reference](https://pond.locker/reference/configuration).
 
 ### Verbosity
 

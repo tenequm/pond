@@ -9,14 +9,12 @@
 use std::path::Path;
 
 use pond::{
-    adapter::{NoopOracle, OhMyPiAdapter, OhMyPiFactory},
-    handlers::ingest_adapter,
-    sessions::{RowmapOracle, Store},
+    adapter::{OhMyPiAdapter, OhMyPiFactory, SkipOracle},
+    sessions::RowmapOracle,
     substrate::{Predicate, ScalarValue},
 };
-use tempfile::TempDir;
 
-use super::{Conformance, RoundTrip};
+use super::{Conformance, RoundTrip, ingest_into_temp_store};
 
 const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -55,15 +53,7 @@ async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
 /// The brand is omp's own, never borrowed from the pi codec it shares.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_omp_row_brands_itself_as_pi() -> anyhow::Result<()> {
-    let store_dir = TempDir::new()?;
-    let store = Store::open_local(store_dir.path()).await?;
-    ingest_adapter(
-        &store,
-        &OhMyPiAdapter::new(FIXTURE_ROOT),
-        &NoopOracle,
-        |_| {},
-    )
-    .await?;
+    let (store, _store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(FIXTURE_ROOT)).await?;
 
     let as_pi = store
         .searchable_in_scope(&Predicate::Eq(
@@ -81,20 +71,12 @@ async fn no_omp_row_brands_itself_as_pi() -> anyhow::Result<()> {
 /// say WHY.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rowmap_keys_the_slot_fronted_session_by_its_header_id() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let store = Store::open_local(temp.path().join("store")).await?;
-    ingest_adapter(
-        &store,
-        &OhMyPiAdapter::new(FIXTURE_ROOT),
-        &NoopOracle,
-        |_| {},
-    )
-    .await?;
+    let (store, store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(FIXTURE_ROOT)).await?;
 
-    store.ensure_rowmap(&temp.path().join("cache")).await?;
+    store.ensure_rowmap(&store_dir.path().join("cache")).await?;
     let oracle = RowmapOracle(store.rowmap_snapshot());
     assert!(
-        pond::adapter::SkipOracle::session_max_ts(&oracle, SLOT_FRONTED_SESSION).is_some(),
+        oracle.session_max_ts(SLOT_FRONTED_SESSION).is_some(),
         "the slot-fronted session is keyed by its header id, not skipped as unreadable",
     );
     Ok(())

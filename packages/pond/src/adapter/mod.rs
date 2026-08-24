@@ -893,6 +893,8 @@ pub(crate) fn empty_options() -> ProviderOptions {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::path::{Path, PathBuf};
+
     use tempfile::TempDir;
 
     use super::{RestoreFidelity, RestoredFile, validate_path_id, write_restored_files};
@@ -958,54 +960,6 @@ mod tests {
         );
     }
 
-    /// Adapters are structurally isolated from the store and query layer: no
-    /// file in `src/adapter/` references the substrate, the store, the ingest
-    /// handlers, or the rowmap outside its `#[cfg(test)]` module. (The
-    /// canonical model types - `IngestEvent`, `SessionWithMessages` - are the
-    /// seam's vocabulary and stay allowed.) This isolation is why an adapter
-    /// PR needs `cargo test` green and nothing else: code that cannot name the
-    /// store cannot regress store performance, so adapter changes skip the
-    /// release bench gate by construction.
-    #[test]
-    fn adapters_never_touch_the_store_or_query_layer() {
-        let adapter_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("adapter");
-        let forbidden = ["substrate", "sessions::Store", "handlers::", "rowmap"];
-        let mut violations = Vec::new();
-        for entry in std::fs::read_dir(&adapter_dir).expect("src/adapter is readable") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let text = std::fs::read_to_string(&path).expect("adapter source is readable");
-            for (index, line) in text.lines().enumerate() {
-                let line = line.trim_start();
-                // Test modules sit at the bottom of the file (repo convention)
-                // and legitimately drive the store end to end - stop there.
-                if line.starts_with("#[cfg(test)]") {
-                    break;
-                }
-                if line.starts_with("//") {
-                    continue;
-                }
-                for token in forbidden {
-                    if line.contains(token) {
-                        violations.push(format!("{name}:{}: {line}", index + 1));
-                    }
-                }
-            }
-        }
-        assert!(
-            violations.is_empty(),
-            "adapter code reached into the store/query layer - qualified paths \
-             included, this breaks the isolation that lets adapter PRs skip \
-             benchmarks:\n{}",
-            violations.join("\n"),
-        );
-    }
-
     /// The unwind is scoped to this batch: a directory it did not create keeps
     /// standing, and everything already inside it stays.
     #[test]
@@ -1048,6 +1002,102 @@ mod tests {
             "the failed batch's own file survived",
         );
         assert!(intruder.is_file(), "the unwind removed a foreign file");
+    }
+
+    /// Adapters are structurally isolated from the store and query layer: no
+    /// production line under `src/adapter/` names the store, the substrate,
+    /// the rowmap, the handlers, the SQL/transport/embedding modules, or the
+    /// Lance and Arrow crates beneath them. (The canonical model types -
+    /// `IngestEvent`, `SessionWithMessages` - are the seam's vocabulary and
+    /// stay allowed.) This isolation is why an adapter PR needs the standard
+    /// checks green and nothing else: code that cannot name the store cannot
+    /// regress store performance, so adapter changes skip the release bench
+    /// gate by construction. Every exemption is listed here with its reason.
+    #[test]
+    fn adapters_never_touch_the_store_or_query_layer() {
+        const FORBIDDEN_IDENTS: [&str; 8] = [
+            "Store",
+            "substrate",
+            "rowmap",
+            "handlers",
+            "lance",
+            "arrow",
+            "datafusion",
+            "object_store",
+        ];
+        // Modules whose names are also ordinary identifiers (`sql` is a query
+        // string in every SQLite adapter), so only the crate path is forbidden.
+        const FORBIDDEN_PATHS: [&str; 3] = ["crate::sql", "crate::transport", "crate::embed"];
+        // openclaw's deletion reconciliation is a read-only detection pass over
+        // stored sessions (spec.md#session-append-only-exception): it names the
+        // store to ask what pond holds and never writes through it.
+        const EXEMPT: [(&str, &str); 1] = [("openclaw.rs", "Store")];
+
+        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("adapter dir is readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        fn identifiers(line: &str) -> impl Iterator<Item = &str> {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|ident| !ident.is_empty())
+        }
+        // Test modules sit at the bottom of the file (repo convention) and
+        // legitimately drive the store end to end: the scan stops at the
+        // `#[cfg(test)]` that introduces a `mod`, not at one gating one item.
+        fn opens_test_module(lines: &[&str], index: usize) -> bool {
+            lines[index].trim_start().starts_with("#[cfg(test)]")
+                && lines[index + 1..]
+                    .iter()
+                    .map(|line| line.trim_start())
+                    .find(|line| !line.is_empty())
+                    .is_some_and(|line| line.split_whitespace().take(2).any(|word| word == "mod"))
+        }
+
+        let adapter_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("adapter");
+        let mut files = Vec::new();
+        rust_files(&adapter_dir, &mut files);
+        let mut violations = Vec::new();
+        for path in &files {
+            let name = path
+                .strip_prefix(&adapter_dir)
+                .expect("collected under adapter_dir")
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(path).expect("adapter source is readable");
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, raw) in lines.iter().enumerate() {
+                if opens_test_module(&lines, index) {
+                    break;
+                }
+                let line = raw.trim_start();
+                if line.starts_with("//") {
+                    continue;
+                }
+                let hit = FORBIDDEN_PATHS
+                    .into_iter()
+                    .find(|token| line.contains(token))
+                    .or_else(|| identifiers(line).find(|ident| FORBIDDEN_IDENTS.contains(ident)));
+                if let Some(token) = hit
+                    && !EXEMPT.contains(&(name.as_str(), token))
+                {
+                    violations.push(format!("{name}:{}: {line}", index + 1));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "adapter code reached into the store/query layer, which breaks the \
+             isolation that lets adapter PRs skip benchmarks:\n{}",
+            violations.join("\n"),
+        );
     }
 }
 

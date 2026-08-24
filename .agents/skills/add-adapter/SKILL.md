@@ -5,20 +5,20 @@ description: Playbook for adding a new source-agent adapter to pond - spec the f
 
 # Adding a pond adapter
 
-An adapter is a bidirectional codec between one agent's native session format and pond's canonical schema (docs/spec.md section 6). The bar it must meet: lossless capture (every source field recoverable), no synthesized values, additive re-sync, and a restore face that is either lossless-native or an honest refusal. The registry cost is fixed and small: one file under `packages/pond/src/adapter/` plus one line in `registry()` (spec 6.7).
+An adapter is a bidirectional codec between one agent's native session format and pond's canonical schema (docs/spec.md section 6). The bar it must meet: lossless capture (every source field recoverable), no synthesized values, additive re-sync, and a restore face that is either lossless-native or an honest refusal. The registry cost is fixed and small: one file under `packages/pond/src/adapter/` plus its wiring in `src/adapter/mod.rs` - a module declaration, a re-export, and the `registry()` entry (spec 6.7).
 
 The work splits into two phases. Phase A produces the spec doc and the fixture; Phase B implements from them. Ship both in ONE self-contained PR: spec doc + fixture + adapter + tests + doc rows. Opening a draft PR after Phase A, so the decision table gets reviewed before implementation, is recommended but not required.
 
 Ground rules that override any instinct to improvise:
 
 - docs/spec.md section 6 is the contract. The named rules cited below (`adapter-integrity-*`, `adapter-bounded-values`, `model-no-synthesis`, ...) are binding, and each states WHY it exists - read the rule before deviating.
-- `cargo test` green is the whole bar for an adapter PR. No benchmarks: adapters are structurally isolated from the store and query layer (a guard test in `src/adapter/mod.rs` enforces it), so an adapter cannot regress store performance.
+- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` green is the whole bar for an adapter PR. No benchmarks: adapters are structurally isolated from the store and query layer (a guard test in `src/adapter/mod.rs` enforces it and lists its one read-only exemption with the reason), so an adapter cannot regress store performance.
 - Third-party session-search parsers (franken_agent_detection, deja-vu, ctx, ...) may be read as corroborating references, never as the authority. Their bar is a search projection; pond's is a lossless round-trip codec.
 - Fixtures come from sandboxed self-capture only. Never vendor another repo's fixture, and never copy files from a real (non-sandboxed) agent home.
 
 ## Phase A - spec the adapter
 
-Output: `docs/adapters/<source_agent>.md` (named by the brand string, e.g. `grok-build.md`) plus the committed fixture.
+Output: `docs/adapters/<source_agent>.md` (named by the brand string, e.g. `grok-build.md`; the directory is created with the first spec doc) plus the committed fixture.
 
 ### 1. Read the writer, not the reader
 
@@ -51,7 +51,7 @@ Every row below is a required section of the spec doc. Every answer cites eviden
 | 7 | Lineage | How forks/spawns/subagents appear and map to `parent_session_id`. | `adapter-lineage-complete-restore` |
 | 8 | Deliberate non-capture | Sibling files and record kinds the adapter intentionally does not ingest, each with a reason. | `model-lossless-projection` (non-capture must be declared) |
 | 9 | Restore face | Native restore layout, or `restore_unsupported` with a reason naming the caller's alternative (oh-my-pi precedent). | `adapter-native-restore-lossless` |
-| 10 | Freshness oracle | How "has this session changed?" is answered cheaply; whether the source can rewrite/truncate in place (if it can, a tail peek is wrong). | `adapter-integrity-additive-sync` |
+| 10 | Freshness oracle | How "has this session changed?" is answered cheaply; whether the source can rewrite/truncate in place (if it can, a tail peek is wrong). On an unchanged re-sync the gate must fire visibly (`SkipReason::Fresh`, counted as `skipped_fresh`) - the harness rejects an adapter that merely re-ingests idempotently. | `adapter-integrity-additive-sync` |
 | 11 | Windows | Where the agent writes on Windows, env overrides, encoding quirks (CRLF, UTF-16, path separators). | `windows-verify` CI runs the full test suite natively per PR |
 
 Adapter-specific concerns beyond the table go into extra prose sections of the spec doc, not new universal rows.

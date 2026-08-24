@@ -42,8 +42,9 @@ Constraints baked in:
 ```
 adapter/
   README.md                  this file
-  claude_app/                Claude Desktop (macOS), Cowork / local-agent-mode
+  claude_ai_export/          claude.ai data export (synthetic conversations.json)
   claude_code/               Claude Code CLI
+  claude_desktop_app/        Claude Desktop (macOS), Cowork / local-agent-mode
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
