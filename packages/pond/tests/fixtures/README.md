@@ -129,6 +129,13 @@ sample tree.
   CLI versions and includes `queue-operation` entries (the message-queue
   feature - these carry no uuid / parentUuid and must be skipped in the
   parentUuid chain).
+- `windows-projects/` is a separate root holding a real native-Windows capture
+  (added 2026-08-14): two sessions under `C--dev-pond-fixture-demo-v2`, the slug
+  Claude Code chose for a `cwd` of `C:\dev\pond fixture_demo.v2`, one of them
+  with two subagent sidecars. It pins the project-slug encoding for drive
+  colons, backslashes, spaces, underscores and dots; the Windows gate tests in
+  `tests/integration/adapter/claude_code.rs` are its only consumer, so the
+  `projects/` conformance census stays 13 sessions.
 
 ### claude_managed_agents (Anthropic API Managed Agents)
 
