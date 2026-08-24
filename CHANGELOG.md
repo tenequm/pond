@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.15.1](https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1) - 2026-08-24
+
+### <!-- 1 -->🎉 New Features
+- **adapter:** add grok-build ([#179](https://github.com/tenequm/pond/pull/179)) ([28bc262](https://github.com/tenequm/pond/commit/28bc26244bb06f61b9a9a63a3a9e73274fdc21df))
+- **adapter:** add letta-code ([#177](https://github.com/tenequm/pond/pull/177)) ([29aadc4](https://github.com/tenequm/pond/commit/29aadc4d1c3390c9796516ff341d253cad028c65))
+- make adapter addition routine - add-adapter skill, conformance harness, contributor flow ([#173](https://github.com/tenequm/pond/pull/173)) ([295c6cc](https://github.com/tenequm/pond/commit/295c6cc02bdc8a0094a647661691135d7abf1e24))
+
+### <!-- 5 -->📚 Documentation
+- **readme:** name grok-build in the auto-discovered harness list ([8c532da](https://github.com/tenequm/pond/commit/8c532da4497ca781a95ce277fe67a3a769c8f3a9))
+
+### <!-- 6 -->🧹 Chores
+- kache caching architecture (per-job k27 prefixes, bulk pull warm-up, kache 0.15.0) ([#176](https://github.com/tenequm/pond/pull/176)) ([dd51e9d](https://github.com/tenequm/pond/commit/dd51e9ddb2d3c12118800a3cbd287e66d69eb8fe))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1
+
 ## [0.15.0](https://github.com/tenequm/pond/compare/v0.14.11...v0.15.0) - 2026-08-22
 
 Embeddings are opt-in. Full-text search (BM25) is now the default arm everywhere, and a fresh install no longer downloads a 466 MB embedding model or embeds anything at sync - first import of an 11k-session corpus dropped from 113m56s to 39m22s (2.89x) in the release A/B against a real S3 store. A 63-day usage-trace evaluation (1,126 real searches, `docs/researches/`) found fts matches or beats vector quality on this workload, which is why the default flipped rather than just the cost.
