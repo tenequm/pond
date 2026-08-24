@@ -1,7 +1,8 @@
 //! letta-code adapter (github.com/letta-ai/letta-code, the `letta` CLI).
 //!
 //! Source: `~/.letta/transcripts/<agentId>/<conversationId>/transcript.jsonl`
-//! (`$LETTA_TRANSCRIPT_ROOT` overrides the root), the append-only client-side
+//! (letta relocates the root via `$LETTA_TRANSCRIPT_ROOT`; pond takes a
+//! relocated root as an explicit `path`), the append-only client-side
 //! transcript every letta-code producer writes on `end_turn`. One JSON row per
 //! line, two shapes: `{kind: user|assistant|reasoning|error, text}` and
 //! `{kind: tool_call, name?, argsText?, resultText?, resultOk?}`, each with a
@@ -51,7 +52,6 @@ const TRANSCRIPT_FILE: &str = "transcript.jsonl";
 /// Structurally never a session (`reflection-transcript.ts` writes only
 /// `payload-*.json` there), so the walk prunes it.
 const PAYLOADS_DIR: &str = "multi-reflection-payloads";
-const TRANSCRIPT_ROOT_ENV: &str = "LETTA_TRANSCRIPT_ROOT";
 /// Suffix that names a reconstructed transcript distinctly from the source
 /// file it was reconstructed away from
 /// (spec.md#adapter-restore-distinct-reconstruction).
@@ -61,7 +61,7 @@ const RECONSTRUCTED_SUFFIX: &str = "-reconstructed";
 const DERIVED_FROM_KEY: &str = "derived_from";
 
 /// Stateless factory: opens [`LettaCodeAdapter`] instances and probes for the
-/// transcript root under `~/.letta/transcripts` or `$LETTA_TRANSCRIPT_ROOT`.
+/// transcript root under `~/.letta/transcripts`.
 pub struct LettaCodeFactory;
 
 impl AdapterFactory for LettaCodeFactory {
@@ -73,15 +73,8 @@ impl AdapterFactory for LettaCodeFactory {
         Ok(Box::new(LettaCodeAdapter::new(config_path(NAME, config)?)))
     }
 
-    /// `$LETTA_TRANSCRIPT_ROOT` wins, exactly as it does for letta itself
-    /// (`transcript-paths.ts`), then `~/.letta/transcripts`.
     fn probe_default(&self, env: &Env) -> Option<Value> {
-        let root = std::env::var_os(TRANSCRIPT_ROOT_ENV)
-            .filter(|value| !value.is_empty())
-            .map_or_else(
-                || env.home.join(".letta").join("transcripts"),
-                PathBuf::from,
-            );
+        let root = env.home.join(".letta").join("transcripts");
         root.exists().then(|| json!({ "path": root }))
     }
 
@@ -696,9 +689,6 @@ mod tests {
 
     #[test]
     fn probe_default_finds_the_transcript_root_under_home() -> anyhow::Result<()> {
-        if std::env::var_os(TRANSCRIPT_ROOT_ENV).is_some() {
-            return Ok(()); // developer env overrides the probe.
-        }
         crate::adapter::test_support::assert_probe_default(
             &LettaCodeFactory,
             &[".letta", "transcripts"],

@@ -20,11 +20,15 @@ Ground rules that override any instinct to improvise:
 
 Output: `docs/adapters/<source_agent>.md` (named by the brand string, e.g. `grok-build.md`; the directory is created with the first spec doc) plus the committed fixture.
 
+Preflight, before anything else: the agent binary installed at the version the spec doc will cite, a provider key in the environment (or the credential file step 2 describes), and `tmux` when the TUI is the only writer. Discovering one of these missing on the day implementation starts is the most expensive kind of blocker.
+
 ### 1. Read the writer, not the reader
 
 Clone the upstream agent locally and locate the code that WRITES the session files - serializers, transcript stores, migration code - not code that reads them back. The writer is the authority on what can appear in a file; readers routinely tolerate less than writers emit. Note the agent version or commit you read: it becomes the `Last verified` line of the spec doc.
 
 Verify every claimed shape empirically against a real capture (step 2). A field the source never actually emits does not get a mapping.
+
+Trace each field's history on the writer file: `git log --follow -S'<field>' -- <writer file>` (`--follow` because renames stop `-S`; a shallow clone needs `git fetch --unshallow` first). Record it in the spec doc as a field-history section - the commit and date each row kind and field first appeared. That list decides which legacy shapes the current agent can no longer produce, which is exactly what the supplementary synthetic rows in step 2 must cover.
 
 ### 2. Capture the fixture (sandbox self-capture)
 
@@ -35,7 +39,7 @@ Procedure:
 - Create a throwaway home and run the agent entirely inside it: `HOME=$(mktemp -d)` plus `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` under it (`USERPROFILE` on Windows). Prefer a neutral base path (`/tmp/<name>-fixture`, not `$TMPDIR`, which embeds the username on macOS) because agents record their cwd and home into rows. A fresh home hides the sign-in state in your real one; if the agent takes its provider key from the environment (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, ...), use that and nothing touches disk. Otherwise copy only the agent's credential file into the sandbox (the opencode capture note in `packages/pond/tests/fixtures/README.md` shows the shape) and delete it before you copy anything out; auth material never enters the fixture.
 - Confirm which code path WRITES the session file before scripting (step 1): a headless / `-p` one-shot mode may skip the writer entirely, or write a reduced shape (letta-code's bidirectional stream drops tool rows; only its TUI writes them). When the TUI is the only complete writer, drive it under `tmux`: `tmux new-session -d -s cap -x 180 -y 45 "<agent> ..."`, then per prompt `tmux send-keys -t cap -l "<text>"`, `sleep 1`, `tmux send-keys -t cap C-m` - sending `Enter` in the same call as the text inserts a literal U+21B5 into the prompt instead of submitting - and read `tmux capture-pane -p -t cap` to wait for the turn. Rehearse once in a scratch home, then capture in a fresh one, so the committed fixture holds no retries.
 - Script one or more sessions that exercise every shape the decision table needs: multi-turn text, a tool call with its result, a failed tool call, an unfinished/interrupted call, reasoning output if the agent supports it, a subagent/fork/spawn if the format records lineage, and an empty or aborted session. Encoding variants (CRLF, UTF-16) come from a capture on the platform that produces them, never from converting a copy - a converted file keeps the original's session id and collides with it.
-- Copy the session files out preserving the agent's native directory layout, under `packages/pond/tests/fixtures/adapter/<name>/`. The fixture policy in `packages/pond/tests/fixtures/README.md` governs layout, which fields must stay verbatim, and the anonymization rules - verify against it, run its "Verification" sweep (trufflehog, gitleaks, parse validation) before committing, and add the new platform's section to it (layout, quirks, provenance: producer version/commit, capture date).
+- Copy the session files out preserving the agent's native directory layout, under `packages/pond/tests/fixtures/adapter/<name>/`. The fixture policy in `packages/pond/tests/fixtures/README.md` governs layout, which fields must stay verbatim, and the anonymization rules - verify against it, run its "Verification" sweep (trufflehog, gitleaks, parse validation) before committing, and add the new platform's section to it (layout, quirks, provenance: producer version/commit, capture date). Include a per-file row census in that section (`jq -r .kind transcript.jsonl | sort | uniq -c`, or the format's equivalent); every count a test asserts is derived from the census, never from memory - the letta counts drifted twice between capture and test.
 
 ### 3. Fill the decision table
 
@@ -64,6 +68,7 @@ Adapter-specific concerns beyond the table go into extra prose sections of the s
 - Title, then one line: `Last verified: <date>, against <agent> <version or commit>.`
 - Upstream pointers: the repo, the writer files read in step 1, any third-party references consulted (marked as non-authoritative).
 - The 11-row decision table, filled, with evidence per row.
+- Field history from step 1: the commit and date each row kind and field first appeared.
 - Extra format notes (envelope variants, migrations, legacy shapes) as prose.
 
 Scope split (spec 6.9): the spec doc owns format archaeology and the decision record - facts about the upstream, which do not rot when pond's code changes. The adapter code stays authoritative for extraction behavior. Maintenance is best-effort: drift is passively detected (unknown kinds still ingest losslessly; malformed input surfaces as typed errors), and the doc's `Last verified` line is updated when the adapter is next touched, not on a schedule.
@@ -76,7 +81,7 @@ Output: the adapter, wired and proven. Reference implementation: `packages/pond/
 
 `src/adapter/<name>.rs`, implementing `AdapterFactory` + `Adapter` (see `src/adapter/mod.rs` for the seam docs). Use the shared helpers instead of re-deriving them:
 
-- `jsonl.rs`: the `JsonlTree` driver for JSONL-tree sources; `parse_bounded` caps records (`adapter-bounded-values`) so no adapter reads unbounded input.
+- `jsonl.rs`: the `JsonlTree` driver for JSONL-tree sources; `parse_bounded` caps records (`adapter-bounded-values`) so no adapter reads unbounded input. Three verdict hooks keep input the adapter cannot ingest out of the parser: `unsupported_path(&Path)` answers from the path alone and is honored before the freshness peek and before the file is opened; `unsupported_reason(path, rows)` answers from parsed rows; a path-identity adapter (session id from the path, not the first line) returns `false` from `peeks_first_line()` so the peek never reads a byte.
 - `extract.rs`: the no-synthesis extractors (`extract_str`, `extract_bool`, `extract_value`, `extract_compact_repr`, ...). These make "invent a value" a compile error - a `Part` field is populated from an `Extracted<T>` or it stays `None`.
 - `mod.rs` shared plumbing: `config_path` / `expand_home` for the `{ "path": ... }` config blob, `part_id` / `part_ordinal`, `source_options` + `raw_record` for the native-restore capture, `compact_json`, `validate_path_id` for anything that becomes a filename.
 
@@ -92,11 +97,13 @@ Three lines in `src/adapter/mod.rs`: the `mod <name>;` declaration, the `pub use
 
 ### 3. Discovery
 
-`probe_default` checks the agent's canonical install path under `Env::home`, building paths with `.join()` components only (portable across separators; `Env::from_env` resolves `USERPROFILE`/`HOME`). Test it with `test_support::assert_probe_default(&Factory, &["path", "components"])`. An agent with no canonical path (a manual export, explicit creds) returns `None` - the claude-ai-export precedent - and the config is written explicitly instead. If another product squats the same directory, discovery must distinguish them before claiming the path.
+`probe_default` checks the agent's canonical install path under `Env::home`, building paths with `.join()` components only (portable across separators; `Env::from_env` resolves `USERPROFILE`/`HOME`). It reads only the injected `Env` - no `std::env` lookups inside an adapter (they cannot be injected, so their tests end up skipping on any box that sets the variable); an agent's relocation env var is the discovery layer's concern ([#148](https://github.com/tenequm/pond/issues/148)), and a relocated root is configured as an explicit `path`. Test it with `test_support::assert_probe_default(&Factory, &["path", "components"])`. An agent with no canonical path (a manual export, explicit creds) returns `None` - the claude-ai-export precedent - and the config is written explicitly instead. If another product squats the same directory, discovery must distinguish them before claiming the path.
 
 ### 4. Restore face
 
 Either implement `serialize` (native fidelity replays `raw_record`; foreign rebuilds an idiomatic best-effort form), or implement `restore_unsupported()` returning the reason string that names the caller's alternative. Never a runtime failure for a capability question.
+
+Two reconstruction rules review keeps catching: sort restored rows by `jsonl::source_line` first, then `by_timestamp_then_id` (claude-code, pi, desktop-app precedent), because sources stamp a whole turn with one timestamp; and `model-no-synthesis` binds the restore face too - a ToolCall without a `call_id` never folds a following result into itself.
 
 ### 5. Tests
 

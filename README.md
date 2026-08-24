@@ -248,7 +248,7 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 | `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |
 | `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
 | `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |
-| `letta-code` | letta-code, `~/.letta/transcripts` (`LETTA_TRANSCRIPT_ROOT` override) | 2026-08-24 |
+| `letta-code` | letta-code, `~/.letta/transcripts` (a root relocated via `LETTA_TRANSCRIPT_ROOT` is configured as an explicit `path`) | 2026-08-24 |
 
 ### Verbosity
 
