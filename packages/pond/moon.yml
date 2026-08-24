@@ -20,6 +20,12 @@ fileGroups:
     - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'
+    # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
+    # omits them lets a rustflags change be served from a cache entry built with
+    # the old ones - lint-msvc and test-msvc are exactly the tasks that carry
+    # them. kache's own keys already include the flags, so adding this costs one
+    # moon run and no cold cache.
+    - '/.cargo/config.toml'
   tests:
     - 'tests/**/*'
     - 'benches/**/*'

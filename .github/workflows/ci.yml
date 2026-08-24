@@ -10,6 +10,17 @@ on:
   # event condition, so they run on dispatch too. release-prep and everything
   # downstream stay push-gated.
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: >
+          Compile for real instead of replaying moon's remote cache. Required
+          for any run whose kache numbers will be read, and for prewarming a
+          fresh prefix: a CI-only diff changes none of the declared inputs of
+          lint-msvc / test-msvc / build-dist-msvc, so moon serves the hash main
+          already stored, cargo never runs, and the run yields no kache data
+          and no warm store.
+        type: boolean
+        default: false
 
 # Default read-only; publish-release elevates to contents:write for its own
 # `gh release upload`. The release PR and publishes use the GH_RELEASE_TOKEN
@@ -152,11 +163,67 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
+          s3-prefix: kache/pond/windows-verify/k27
+          # verify only, never windows-dist: a restored harness has unresolved
+          # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
+          # of link time here; not worth it on the leg whose output ships.
+          cache-executables: 'true'
+
+      # The round-one `kache pull dry run` step is gone, deliberately: it
+      # measured the lock-filtered enumeration (one sequential LIST per lock
+      # crate, 126.8 s measured against the shared prefix), and that number did
+      # its job - it sized round two in favor of `--pull --all` on a per-job
+      # prefix. The bootstrap's warm-up step now reports the same Plan: count
+      # and elapsed time from the pull that actually runs, so re-adding a
+      # lock-filtered dry run would buy nothing and cost ~2 min per run.
+
+      # moon replays the hash main already stored when a diff touches none of a
+      # task's declared inputs, which is every CI-only change - so a run whose
+      # kache numbers will be read has to defeat it deliberately.
+      #
+      # The value must be the literal `true`. MOON_FORCE is not a presence
+      # check: it is the clap env binding for `--force` (`moon run --help`:
+      # `[env: MOON_FORCE=]`), so moon parses it as the flag's value and rejects
+      # anything outside true/false with `error: invalid value '1' for
+      # '--force'`. Written only when asked, so the variable is simply absent on
+      # an ordinary run.
+      - name: Force a real compile
+        if: inputs.force_build
+        shell: pwsh
+        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       - name: Test
         run: moon run pond:lint-msvc pond:test-msvc
+
+      # Permanent diagnostics - this is how a cache regression shows up in the
+      # log instead of in stopwatch comparisons. The action's own summary is not
+      # enough: its "Prefetch: 0/N" line counts plan entries, not downloads
+      # (kunobi-ninja/kache#618), so it reads as a total miss on a run that hit
+      # 99.7%. `kache stats` carries the honest
+      # `Hit rate: X% (local/prefetch/remote/dup/miss)` split plus the `Remote:`
+      # and `Daemon:` lines that say which prefix actually served the run, and
+      # the daemon log is the only place a remote timeout is recorded.
+      #
+      # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
+      # `Get-Content -Wait` (src/service.rs), which follows the file forever and
+      # would hold the job to its 180 min timeout. Read the file instead - the
+      # auto-started daemon writes stderr next to its socket, and the socket
+      # defaults to <cache_dir>/daemon.sock.
+      #
+      # continue-on-error is load-bearing under pwsh: GitHub appends an
+      # `exit $LASTEXITCODE` check, so any non-zero kache exit would otherwise
+      # fail the step after the gate has already passed.
+      - name: kache diagnostics
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          kache stats
+          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
@@ -194,6 +261,15 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
+          s3-prefix: kache/pond/windows-dist/k27
+
+      # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
+      # prefix prewarms nothing if moon serves the stored hash, and the release
+      # then pays the cold build inline. Same `true`-not-`1` constraint too.
+      - name: Force a real compile
+        if: inputs.force_build
+        shell: pwsh
+        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       # Build + smoke + package, as a moon task so the leg gets the same
       # task-level remote cache every other build has. `--profile dist`, not
@@ -215,6 +291,20 @@ jobs:
           path: dist/pond-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
           retention-days: 1
+
+      # Same permanent diagnostics as windows-verify, and for the same reason:
+      # this leg runs rarely enough that a silent cache regression would first
+      # be noticed as a slow release. See the sibling job for why the daemon log
+      # is read as a file and why continue-on-error is load-bearing under pwsh.
+      - name: kache diagnostics
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          kache stats
+          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -272,6 +362,25 @@ jobs:
     outputs:
       v: ${{ steps.ver.outputs.v }}
       signed: ${{ steps.identity.outputs.signed }}
+    # Job-level, not step-level, so the bootstrap can see KACHE_S3_PREFIX and
+    # assert it against the prefix in .github/kache/linux-dist.toml before
+    # anything compiles. Bucket/endpoint/region stay here as well because the
+    # CLI reads them ahead of the file, so removing them would change which
+    # settings are live rather than just where they are written.
+    # Credentials are deliberately env-only: they are the two KACHE_S3_*
+    # variables a 0.15.0 daemon spawn does not strip, and they never enter a
+    # committed file.
+    env:
+      KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+      KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+      KACHE_S3_REGION: nbg1
+      KACHE_S3_BUCKET: ttq
+      KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k27
+      # Local store on the PVC so pods start warm and sync only moves
+      # deltas; cap it well below the 100Gi shared PVC.
+      KACHE_CACHE_DIR: /ci-cache/kache
+      KACHE_MAX_SIZE: 20GiB
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
@@ -283,19 +392,12 @@ jobs:
       - id: identity
         run: echo "signed=${{ secrets.APPLE_P12_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
 
+      # The KACHE_S3_* / KACHE_CACHE_DIR block this step used to carry now sits
+      # at job level, so the bootstrap can assert the prefix against the config
+      # file. Only the signing credentials stay step-scoped.
       - name: Build + package binaries
         run: moon run repo:build-dist
         env:
-          KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
-          KACHE_S3_REGION: nbg1
-          KACHE_S3_BUCKET: ttq
-          KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-          KACHE_S3_PREFIX: kache/pond
-          # Local store on the PVC so pods start warm and sync only moves
-          # deltas; cap it well below the 100Gi shared PVC.
-          KACHE_CACHE_DIR: /ci-cache/kache
-          KACHE_MAX_SIZE: 20GiB
           APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
           APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
 

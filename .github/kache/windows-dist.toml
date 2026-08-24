@@ -1,0 +1,23 @@
+# kache's remote for the windows-dist leg. Same shape and same reasoning as
+# .github/kache/windows-verify.toml - see that file's header, or
+# docs/plans/2608-24-ci-caching-architecture.md, for why the remote lives in a
+# file and the credentials do not.
+#
+# A separate file rather than a shared one because each build shape carries
+# its own prefix: nothing is shared across these two anyway (windows-dist
+# inherits the dist profile's thin LTO and cgu=1, so the rustc flags differ per
+# unit and the keys never collide).
+#
+# Selected by the KACHE_CONFIG that .github/actions/windows-bootstrap exports
+# before the kache-action step; `prefix` MUST equal the s3-prefix it hands the
+# action, and the bootstrap asserts it.
+[cache.remote]
+type = "s3"
+bucket = "ttq"
+endpoint = "https://nbg1.your-objectstorage.com"
+region = "nbg1"
+# Per-job and schema-tagged, same reasoning as windows-verify.toml. This
+# prefix starts empty: the first release build after the rotation is the cold
+# one (~76 min), which is why it gets a forced prewarm dispatch before the
+# next release PR merges.
+prefix = "kache/pond/windows-dist/k27"

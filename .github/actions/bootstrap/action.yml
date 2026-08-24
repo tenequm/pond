@@ -15,7 +15,11 @@ runs:
         set -euo pipefail
         MOON_VERSION=2.5.1
         PROTOC_VERSION=35.1
-        KACHE_VERSION=0.9.0
+        # Bumped in lockstep with the kache-action `version:` in
+        # windows-bootstrap and the k-tag in the .github/kache/*.toml prefixes,
+        # never alone: a bump changes CACHE_KEY_VERSION (21 at 0.9.0, 25 at
+        # 0.14.2, 27 at 0.15.0) and costs one cold run per leg.
+        KACHE_VERSION=0.15.0
         UV_VERSION=0.11.33
 
         mkdir -p /ci-cache/bin /ci-cache/tmp
@@ -25,6 +29,17 @@ runs:
         # proto from .moon/toolchains.yml on first use. These only put proto's
         # tool tree and the two package caches on the PVC, so the pods that
         # follow reuse them instead of re-downloading a toolchain per job.
+        #
+        # KACHE_CONFIG points at the committed remote settings rather than at
+        # the ~/.config/kache stub the build-dist task used to write. A daemon
+        # cannot watch an environment, and 0.15.0 strips
+        # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
+        # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) while keeping
+        # KACHE_CONFIG. Discovery is KACHE_CONFIG > nearest .kache.toml > XDG
+        # (src/config.rs, resolve_config_path), so one mechanism covers both
+        # legs. Exported for every caller of this bootstrap; it is inert in the
+        # jobs that never set RUSTC_WRAPPER.
+        KACHE_CONFIG="$GITHUB_WORKSPACE/.github/kache/linux-dist.toml"
         {
           echo "CARGO_HOME=/ci-cache/cargo"
           echo "RUSTUP_HOME=/ci-cache/rustup"
@@ -32,7 +47,22 @@ runs:
           echo "PROTO_HOME=/ci-cache/proto"
           echo "npm_config_cache=/ci-cache/npm"
           echo "UV_CACHE_DIR=/ci-cache/uv"
+          echo "KACHE_CONFIG=$KACHE_CONFIG"
         } >> "$GITHUB_ENV"
+
+        # dist-build is the only caller that declares a remote, and the CLI
+        # reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so
+        # the CLI (env) and a future daemon (file) can never split across two
+        # prefixes - a split makes prefetch fetch from one place while the
+        # manifest is written to another, and nothing says so.
+        if [ -n "${KACHE_S3_PREFIX:-}" ]; then
+          test -f "$KACHE_CONFIG"
+          file_prefix=$(awk -F'"' '/^[[:space:]]*prefix[[:space:]]*=/ { print $2; exit }' "$KACHE_CONFIG")
+          if [ "$file_prefix" != "$KACHE_S3_PREFIX" ]; then
+            echo "kache prefix mismatch: $KACHE_CONFIG has '$file_prefix', job env has '$KACHE_S3_PREFIX'" >&2
+            exit 1
+          fi
+        fi
         export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
         export PROTO_HOME=/ci-cache/proto
         export PATH="/ci-cache/bin:/ci-cache/cargo/bin:$PATH"

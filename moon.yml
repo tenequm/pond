@@ -20,6 +20,11 @@ fileGroups:
     - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
+    # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
+    # omits them lets a rustflags change be served from a cache entry built with
+    # the old ones. kache's own keys already include the flags, so adding this
+    # costs one moon run and no cold cache.
+    - '.cargo/config.toml'
   tests:
     - 'packages/pond/tests/**/*'
     - 'packages/pond/benches/**/*'
@@ -63,13 +68,22 @@ tasks:
                         aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 
       # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
-      # cold-start net for a fresh /ci-cache. No KACHE_REMOTE_TYPE env exists -
-      # the two-line config file is required to activate s3. Push on EXIT, not
-      # after success: crates compiled before a failure still warm the retry.
+      # cold-start net for a fresh /ci-cache. The remote is no longer written
+      # here - it lives in .github/kache/linux-dist.toml, which the bootstrap
+      # selects through KACHE_CONFIG, so the wrapper and any daemon kache spawns
+      # for itself both resolve it from a file they can re-read. The old stub
+      # named no bucket and leaned on the job's KACHE_S3_* env, which 0.15.0
+      # strips from a daemon spawn. Push on EXIT, not after success: crates
+      # compiled before a failure still warm the retry.
+      # --all: one paginated LIST of the per-job prefix instead of one LIST
+      # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
+      # worse from a runner). Safe only because the prefix holds exactly this
+      # job's artifacts. --allow-partial: 0.15.0 exits non-zero on any failed
+      # transfer, and under `set -euo pipefail` that would redden a job that
+      # would compile through fine - a partial pull is a slower build, never a
+      # broken one.
       export RUSTC_WRAPPER=kache
-      mkdir -p ~/.config/kache
-      printf '[cache.remote]\ntype = "s3"\n' > ~/.config/kache/config.toml
-      kache sync --pull
+      kache sync --pull --all --allow-partial
       trap 'kache sync --push || true' EXIT
 
       # Cargo unifies features across all targets in one invocation, leaking
