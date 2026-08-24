@@ -163,6 +163,10 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
+          # verify only, never windows-dist: a restored harness has unresolved
+          # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
+          # of link time here; not worth it on the leg whose output ships.
+          cache-executables: 'true'
 
       # Diagnostic only, transfers nothing: --dry-run prints how many artifacts
       # a real pull would move, and how long the enumeration itself takes. Both

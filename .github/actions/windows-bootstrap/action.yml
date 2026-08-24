@@ -17,6 +17,12 @@ inputs:
   kache-secret-access-key:
     description: S3 secret key for the kache remote.
     required: true
+  cache-executables:
+    description: >
+      Cache the linked executables too. Off by default because a restored
+      binary carries unresolved .pdb paths, i.e. weaker backtraces on a failing
+      test - a fair trade on the verify leg, not on the leg whose output ships.
+    default: 'false'
   manifest-key:
     description: >
       Scopes kache's warm-prefetch manifest. MUST differ per build variant:
@@ -192,6 +198,10 @@ runs:
         # The hosted runner's disk is far smaller than kache's 50GiB default,
         # and an evicted local entry costs a remote fetch, not a rebuild.
         max-size: 20GiB
+        # ~3 min of link time on unchanged sources; the trade is unresolved
+        # .pdb paths on a restored harness. Revert this line alone if job time
+        # regresses - it is independent of everything else in the round.
+        cache-executables: ${{ inputs.cache-executables }}
         # Would require `pull-requests: write`, which this workflow deliberately
         # does not grant. The job summary carries the same report.
         pr-comment: false
