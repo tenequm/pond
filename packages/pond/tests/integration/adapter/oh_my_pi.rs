@@ -1,21 +1,22 @@
-//! oh-my-pi adapter integration suite: ingest -> Store -> searchable scope over
-//! the committed omp fixture corpus, plus additive re-sync freshness through the
-//! store's rowmap oracle. Single-module mapping behavior (title-slot folding,
+//! oh-my-pi adapter integration suite: the shared conformance checks over the
+//! committed omp fixture corpus, plus the two omp-specific cross-module
+//! hazards - brand borrowing from the pi codec it shares, and freshness keyed
+//! through the title slot. Single-module mapping behavior (title-slot folding,
 //! carrier taxonomy, watermark math, the ingest-only restore refusal) stays in
-//! the `src/adapter/oh_my_pi.rs` unit tests; this suite covers the cross-module
-//! paths - the ones a slot-fronted file could break without any unit test
-//! noticing.
+//! the `src/adapter/oh_my_pi.rs` unit tests.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
 
 use pond::{
-    adapter::{NoopOracle, OhMyPiAdapter, SkipOracle},
+    adapter::{NoopOracle, OhMyPiAdapter, OhMyPiFactory},
     handlers::ingest_adapter,
     sessions::{RowmapOracle, Store},
     substrate::{Predicate, ScalarValue},
 };
 use tempfile::TempDir;
+
+use super::{Conformance, RoundTrip};
 
 const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -27,40 +28,43 @@ const FIXTURE_ROOT: &str = concat!(
 const FIXTURE_SESSIONS: usize = 5;
 const SLOT_FRONTED_SESSION: &str = "0a1b2c3d4e5f6071";
 
-async fn ingest(root: &Path) -> anyhow::Result<(Store, TempDir)> {
-    let store_dir = TempDir::new()?;
-    let store = Store::open_local(store_dir.path()).await?;
-    ingest_adapter(&store, &OhMyPiAdapter::new(root), &NoopOracle, |_| {}).await?;
-    Ok((store, store_dir))
+fn conformance() -> Conformance<'static> {
+    Conformance {
+        factory: &OhMyPiFactory,
+        fixture_root: Path::new(FIXTURE_ROOT),
+        expected_sessions: FIXTURE_SESSIONS,
+        round_trip: RoundTrip::IngestOnly,
+    }
 }
 
-/// Full-corpus ingest through the Store: every session lands under the omp
-/// brand and its conversational text reaches the searchable scope - the proof
-/// the whole pipeline ran, index fold included, on files whose first line is
-/// container framing rather than a record.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
+    conformance().assert_ingest_counts_and_searchable().await
+}
 
-    let ids = store.session_ids().await?;
-    assert_eq!(
-        ids.len(),
-        FIXTURE_SESSIONS,
-        "every omp session is ingested, slot-fronted and legacy alike",
-    );
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
+    conformance().assert_resync_is_noop().await
+}
 
-    let searchable = store
-        .searchable_in_scope(&Predicate::Eq(
-            "source_agent",
-            ScalarValue::String("oh-my-pi".to_owned()),
-        ))
-        .await?;
-    assert!(
-        searchable > 0,
-        "omp sessions must be searchable after ingest",
-    );
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
+    conformance().assert_round_trip().await
+}
 
-    // The brand is omp's own, never borrowed from the pi codec it shares.
+/// The brand is omp's own, never borrowed from the pi codec it shares.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_omp_row_brands_itself_as_pi() -> anyhow::Result<()> {
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    ingest_adapter(
+        &store,
+        &OhMyPiAdapter::new(FIXTURE_ROOT),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+
     let as_pi = store
         .searchable_in_scope(&Predicate::Eq(
             "source_agent",
@@ -71,36 +75,27 @@ async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-sync is additive and skips what is already stored. This only works if the
-/// freshness peek reads the session id from behind the title slot: a regression
-/// there is silent - it looks like a working sync that re-reads the whole corpus
-/// on every run.
+/// The freshness peek must read the session id from behind the title slot: a
+/// regression there is silent - the rowmap key would be the slot line, every
+/// re-sync would re-read the file, and `assert_resync_is_noop` alone could not
+/// say WHY.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
-    let store_dir = TempDir::new()?;
-    let store = Store::open_local(store_dir.path()).await?;
-    let adapter = OhMyPiAdapter::new(FIXTURE_ROOT);
+async fn the_rowmap_keys_the_slot_fronted_session_by_its_header_id() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let store = Store::open_local(temp.path().join("store")).await?;
+    ingest_adapter(
+        &store,
+        &OhMyPiAdapter::new(FIXTURE_ROOT),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
 
-    let first = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
-    assert!(first.sessions_inserted > 0, "first sync ingests the corpus");
-
-    store.ensure_rowmap(&store_dir.path().join("cache")).await?;
+    store.ensure_rowmap(&temp.path().join("cache")).await?;
     let oracle = RowmapOracle(store.rowmap_snapshot());
     assert!(
-        oracle.session_max_ts(SLOT_FRONTED_SESSION).is_some(),
+        pond::adapter::SkipOracle::session_max_ts(&oracle, SLOT_FRONTED_SESSION).is_some(),
         "the slot-fronted session is keyed by its header id, not skipped as unreadable",
-    );
-
-    let second = ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
-    assert_eq!(
-        second.sessions_inserted, 0,
-        "an unchanged omp corpus re-syncs no session",
-    );
-    assert_eq!(second.inserted, 0, "and writes nothing");
-    assert_eq!(
-        store.session_ids().await?.len(),
-        FIXTURE_SESSIONS,
-        "and stores no duplicates",
     );
     Ok(())
 }

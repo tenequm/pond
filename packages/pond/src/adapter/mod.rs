@@ -958,6 +958,54 @@ mod tests {
         );
     }
 
+    /// Adapters are structurally isolated from the store and query layer: no
+    /// file in `src/adapter/` references the substrate, the store, the ingest
+    /// handlers, or the rowmap outside its `#[cfg(test)]` module. (The
+    /// canonical model types - `IngestEvent`, `SessionWithMessages` - are the
+    /// seam's vocabulary and stay allowed.) This isolation is why an adapter
+    /// PR needs `cargo test` green and nothing else: code that cannot name the
+    /// store cannot regress store performance, so adapter changes skip the
+    /// release bench gate by construction.
+    #[test]
+    fn adapters_never_touch_the_store_or_query_layer() {
+        let adapter_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("adapter");
+        let forbidden = ["substrate", "sessions::Store", "handlers::", "rowmap"];
+        let mut violations = Vec::new();
+        for entry in std::fs::read_dir(&adapter_dir).expect("src/adapter is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let text = std::fs::read_to_string(&path).expect("adapter source is readable");
+            for (index, line) in text.lines().enumerate() {
+                let line = line.trim_start();
+                // Test modules sit at the bottom of the file (repo convention)
+                // and legitimately drive the store end to end - stop there.
+                if line.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                if line.starts_with("//") {
+                    continue;
+                }
+                for token in forbidden {
+                    if line.contains(token) {
+                        violations.push(format!("{name}:{}: {line}", index + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "adapter code reached into the store/query layer - qualified paths \
+             included, this breaks the isolation that lets adapter PRs skip \
+             benchmarks:\n{}",
+            violations.join("\n"),
+        );
+    }
+
     /// The unwind is scoped to this batch: a directory it did not create keeps
     /// standing, and everything already inside it stays.
     #[test]

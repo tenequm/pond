@@ -1,3 +1,7 @@
+//! opencode adapter integration suite: the shared conformance checks over the
+//! committed fixture data dir (`opencode.db` + the legacy `storage/` tree),
+//! plus the opt-in real-corpus restore oracle below.
+//!
 //! Real-corpus restore oracle (spec.md#adapter-native-restore-lossless): ingest
 //! a REAL opencode data dir into a scratch store, native-serialize every
 //! DB-backed session, and assert each emitted `opencode import` envelope is
@@ -21,6 +25,44 @@ use pond::{
 };
 use serde_json::Value;
 use tempfile::TempDir;
+
+use super::{Conformance, RoundTrip};
+
+const FIXTURE_ROOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/opencode"
+);
+
+fn conformance() -> Conformance<'static> {
+    Conformance {
+        factory: &OpencodeFactory,
+        fixture_root: Path::new(FIXTURE_ROOT),
+        // 10 DB-resident sessions plus 4 legacy split-file-tree sessions; the
+        // two source eras carry disjoint ids, so nothing is superseded.
+        expected_sessions: 14,
+        // Native restore emits `opencode import` envelopes for an external
+        // tool, not files this adapter re-reads.
+        round_trip: RoundTrip::ExternalImport {
+            verified_by: "native_restore_is_value_equal_to_real_db_corpus (opt-in, below) and \
+                          the serialize unit tests in src/adapter/opencode.rs",
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
+    conformance().assert_ingest_counts_and_searchable().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
+    conformance().assert_resync_is_noop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_restore_serves_full_fidelity_import_envelopes() -> anyhow::Result<()> {
+    conformance().assert_round_trip().await
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real-corpus oracle: set POND_OPENCODE_DATA_DIR and run with --ignored"]
