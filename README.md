@@ -223,6 +223,23 @@ enabled = false                    # kept in config, skipped on `pond sync`
 path = "~/.codex/sessions"
 ```
 
+### Supported harnesses
+
+One adapter per harness, in `pond adapters` discovery order. `Last verified` is when the adapter's mapping was last checked against a real capture of the source format; adapters are maintained best-effort, and format drift is safe by design (unknown record shapes still ingest losslessly, malformed input surfaces as a typed error naming the file). Adding a harness is routine work - see [Contributing](#contributing).
+
+| Adapter | Reads | Last verified |
+|---------|-------|---------------|
+| `claude-code` | Claude Code CLI, `~/.claude/projects` | 2026-08-14 |
+| `claude-desktop-app` | Claude Desktop / Cowork local agent sessions | 2026-05-13 |
+| `claude-ai-export` | claude.ai data-export archive (manual `--path`) | 2026-07-23 |
+| `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-05-13 |
+| `opencode` | opencode, `~/.local/share/opencode` (SQLite DB + legacy tree) | 2026-07-14 |
+| `openclaw` | openclaw, `~/.openclaw` | 2026-07-23 |
+| `nanoclaw` | nanoclaw, `~/nanoclaw/data/v2-sessions` | 2026-07-23 |
+| `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |
+| `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
+| `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |
+
 Search is BM25 full-text by default. Semantic search is opt-in and off unless you ask for it: with it off no pond process downloads or loads an embedding model, new messages get no vectors, and `--mode vector` is refused. Turn it on in config or with `POND_EMBEDDINGS_ENABLED=true`, then run `pond optimize --only embed` once to fill the backlog:
 
 ```toml
@@ -263,17 +280,18 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 4 | Tool-call columns and read-only SQL over the corpus | ✅ [v0.13](https://github.com/tenequm/pond/releases/tag/v0.13.0) |
 | 5 | Crash-safe local stores that self-heal on open | ✅ [v0.14.0](https://github.com/tenequm/pond/releases/tag/v0.14.0) |
 | 6 | Eleven harnesses, `pond resume` into any client, MCP registry, Windows | ✅ [v0.14.11](https://github.com/tenequm/pond/releases/tag/v0.14.11) |
-| 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ⏭ Next |
-| 8 | Lance 10: count pushdown, date-filter zonemaps, faster index commits. [#145](https://github.com/tenequm/pond/issues/145) | ⏭ Next |
-| 9 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
-| 10 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
-| 11 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | ⏳ Later |
-| 12 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
+| 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ✅ [v0.15.0](https://github.com/tenequm/pond/releases/tag/v0.15.0) |
+| 8 | New adapters become routine: `add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) | ⏭ Next |
+| 9 | Lance 10: count pushdown, date-filter zonemaps, faster index commits. [#145](https://github.com/tenequm/pond/issues/145) | ⏭ Next |
+| 10 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
+| 11 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
+| 12 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | ⏳ Later |
+| 13 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
 | | A capture daemon. pond reads what your harness already writes. | ❌ Not planned |
 | | A hosted service that owns your bucket. Your storage stays yours. | ❌ Not planned |
 | | Summaries or pruning of stored sessions. pond keeps the sessions. | ❌ Not planned |
 
-Step 7 is based on data. Over 63 days, agents ran 1,126 searches against this archive. BM25 found the answer 61% of the time. Vector found it 37% of the time. Read [the measurement](docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md).
+Step 7 was based on data. Over 63 days, agents ran 1,126 searches against this archive. BM25 found the answer 61% of the time. Vector found it 37% of the time. Read [the measurement](docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md).
 
 This is a direction, not a contract. The order changes when the data changes.
 
@@ -294,6 +312,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 
 Issues and pull requests are welcome. The most useful contributions right now:
 
+- An adapter for a harness pond does not read yet. The playbook is the [`add-adapter` skill](.agents/skills/add-adapter/SKILL.md); the PR expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - Spec feedback on [`docs/spec.md`](docs/spec.md).
 - Pointers to additional reference schemas or session samples worth documenting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).

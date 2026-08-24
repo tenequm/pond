@@ -126,6 +126,7 @@ The only code that doesn't break is the code that doesn't exist. Keep pond the s
 - The adapter seam enforces correctness via types - synthesized values (sentinel strings, fallback defaults like `"unknown"`, `"function"`, `""`) MUST NOT compile, and the seam is transport-agnostic via `Source`/`Extracted<T>` so file, HTTP, and stream adapters share one set of primitives.
 - Keep `packages/pond/src/adapter/mod.rs` as seam and registry only. Never put source-specific adapter details there: default install paths, fixture paths, source layout rules, source option schemas beyond generic seam contracts, restore path conventions, freshness heuristics, or adapter-specific probe tests. Put those in the concrete adapter module (`packages/pond/src/adapter/<adapter>.rs`) next to the factory/reader they describe.
 - Unit tests live in `#[cfg(test)] mod tests` at the bottom of the source file they test; `tests/` is reserved for genuine cross-module integration suites only.
+- Adding an adapter: follow the playbook in `.agents/skills/add-adapter/SKILL.md` (the `/add-adapter` skill) - spec doc + sandboxed self-captured fixture + adapter + conformance suite via the shared harness in `packages/pond/tests/integration/adapter/mod.rs`, all in one PR.
 
 ## Seam boundaries
 
