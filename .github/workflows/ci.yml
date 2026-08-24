@@ -765,7 +765,20 @@ jobs:
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
-      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+      # winget-releaser hard-fails until the package exists upstream; self-clears once microsoft/winget-pkgs#419055 merges.
+      - id: winget
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh api repos/microsoft/winget-pkgs/contents/manifests/t/tenequm/pond >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::winget package tenequm.pond is not yet in microsoft/winget-pkgs (microsoft/winget-pkgs#419055 still open); skipping winget-releaser"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.winget.outputs.present == 'true'
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:
           identifier: tenequm.pond
           version: ${{ needs.dist-build.outputs.v }}
