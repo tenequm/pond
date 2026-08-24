@@ -48,7 +48,7 @@ Every row below is a required section of the spec doc. Every answer cites eviden
 | # | Decision | What to resolve | Contract |
 |---|----------|-----------------|----------|
 | 1 | `source_agent` brand | The immutable brand string (e.g. `oh-my-pi`). If the harness has satellite session kinds, define the kind-subpath taxonomy (openclaw precedent: `openclaw/{subagent,cron,hook,probe}`). | brand = `AdapterFactory::name()` |
-| 2 | Session identity | How the session id is built; any path/name encoding is decoded once at ingest. | `adapter-integrity-opaque-ids` |
+| 2 | Session identity | How the session id is built; any path/name encoding is decoded once at ingest. A root session's id must not contain `/`: the search layer reads that character as the claude-code subagent marker (`handlers::retain_non_subagents`) and drops the hit before ranking, so the session ingests and reads back yet never surfaces in a default `pond search`. Join components with `:` (hermes and every message id do). The conformance harness asserts this. | `adapter-integrity-opaque-ids` |
 | 3 | Project resolution | Which real source datum becomes `Session.project` (cwd, workspace key, account id, ...), and the fallback chain. | `model-project-non-empty`, `model-no-synthesis` |
 | 4 | Ordering key | The source-intrinsic `(timestamp, tiebreaker)` that fixes event order per session. | `adapter-integrity-event-ordering` |
 | 5 | Tool-call correlation | Where `call_id` comes from; what an unfinished call looks like; whether results can arrive without a matching call. | `model-no-synthesis` (no guessed links) |
@@ -121,3 +121,5 @@ Two layers, split by seam (single-module mapping behavior in unit tests; cross-m
 ### 7. Validate
 
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` - all green locally (`--all-targets` matters: Linux CI lints only the library, the Windows leg lints the tests too). CI additionally runs the identical test suite natively on Windows (`windows-verify`) for same-repo branches, which is what makes decision-table row 11 checked instead of aspirational; a fork PR gets that leg when a maintainer pushes the branch or on merge. That is the whole bar; no benchmark run is part of an adapter PR.
+
+Before opening the PR, also run the built binary once the way a user will: `cargo build --release --bin pond`, then against a scratch store (`--config-file <empty file> --storage-path <scratch dir>`) `pond sync <name> --path <fixture root>`, `pond sync` again (must skip everything fresh), and a default-mode `pond search "<word from the fixture>"` with no `--source-agent`-style scoping that must return a hit. The test suite proves ingest, freshness and round-trip through the seam; it does not walk the CLI, the registry entry, or the search handler's default filters - the letta-code session-id defect (row 2) was invisible to a green CI and took thirty seconds to see this way.

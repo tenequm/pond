@@ -10,9 +10,10 @@
 //! `source_message_id`. Format archaeology and the decision record live in
 //! `docs/adapters/letta-code.md`.
 //!
-//! Identity is the path: the session id is `<agent-dir>/<conversation-dir>`
+//! Identity is the path: the session id is `<agent-dir>:<conversation-dir>`
 //! (letta sanitizes both to `[A-Za-z0-9._-]`, so the directory names ARE the
-//! ids), the project is the agent id (the transcript carries no cwd; the agent
+//! ids; joined with `:` because a `/` would read as a subagent id to search),
+//! the project is the agent id (the transcript carries no cwd; the agent
 //! is letta's shared-state scope), and message ids are position-derived
 //! (`<session>:<line:06>`) because letta's `letta-msg-<n>` line ids are
 //! process-scoped counters that repeat inside one conversation.
@@ -228,8 +229,10 @@ fn placement(root: &Path, path: &Path) -> Option<(String, String)> {
     Some((name(agent_dir)?, name(conversation_dir)?))
 }
 
+/// `:` and never `/`: the search layer reads `/` in a session id as the
+/// claude-code subagent marker and drops the hit from every default search.
 fn session_id(agent: &str, conversation: &str) -> String {
-    format!("{agent}/{conversation}")
+    format!("{agent}:{conversation}")
 }
 
 fn captured_at(row: &Value) -> Option<DateTime<Utc>> {
@@ -664,6 +667,9 @@ mod tests {
     );
     const AGENT_A: &str = "agent-local-0ce90846-9803-4ab1-8d67-31baacdd5148";
     const AGENT_B: &str = "agent-local-61c7e9e2-999a-453d-99d5-cac7c76a0543";
+    /// The agent captured on Windows 11, the leg that proves the writer's
+    /// bytes are the same there: LF endings, no BOM, no native path anywhere.
+    const AGENT_WIN: &str = "agent-local-7ea0712d-8c11-40a1-a599-6ece6ab2303b";
     const LEGACY: &str = "conversation-00000000-0000-4000-8000-000000000001";
 
     fn fixture_path(agent: &str, conversation: &str) -> PathBuf {
@@ -703,14 +709,14 @@ mod tests {
         let path = fixture_path(AGENT_A, "default");
         assert_eq!(
             adapter.peek_session_id(&path, ""),
-            Some(format!("{AGENT_A}/default")),
+            Some(format!("{AGENT_A}:default")),
         );
         let rows = vec![BoundedRow {
             line: 1,
             value: json!({"kind": "user", "text": "hi", "captured_at": "2026-08-24T16:42:32.405Z"}),
         }];
         let session = adapter.session(&path, &rows).expect("session decodes");
-        assert_eq!(session.id, format!("{AGENT_A}/default"));
+        assert_eq!(session.id, format!("{AGENT_A}:default"));
         assert_eq!(&*session.project, AGENT_A);
         assert_eq!(
             session
@@ -771,7 +777,7 @@ mod tests {
 
     fn a_session() -> Session {
         Session {
-            id: format!("{AGENT_A}/default"),
+            id: format!("{AGENT_A}:default"),
             parent_session_id: None,
             parent_message_id: None,
             source_agent: NAME.to_owned(),
@@ -901,7 +907,7 @@ mod tests {
         }
         assert_eq!(
             restored_paths.len(),
-            4,
+            5,
             "every non-empty transcript restores"
         );
         Ok(())
@@ -915,7 +921,7 @@ mod tests {
         let temp = TempDir::new()?;
         let store = ingest_fixtures(&temp).await?;
         let session = store
-            .get_session(&format!("{AGENT_A}/default"))
+            .get_session(&format!("{AGENT_A}:default"))
             .await?
             .expect("default conversation");
         let files = LettaCodeFactory.serialize(&session, RestoreFidelity::Foreign)?;
@@ -956,7 +962,7 @@ mod tests {
         .await?;
         assert_eq!(summary.dropped_events, 0);
         let reingested = verify
-            .get_session(&format!("{AGENT_A}/default{RECONSTRUCTED_SUFFIX}"))
+            .get_session(&format!("{AGENT_A}:default{RECONSTRUCTED_SUFFIX}"))
             .await?
             .expect("reconstructed transcript re-ingests");
         // 4 user + 4 assistant + 1 reasoning + 3 calls + 3 results.
@@ -992,7 +998,7 @@ mod tests {
         assert_eq!(sanitize_segment(""), "unknown");
     }
 
-    /// The census the fixture README promises: two agents, four sessions
+    /// The census the fixture README promises: three agents, five sessions
     /// (the empty conversation ingests none), the synthetic legacy rows in.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_fixture_corpus_ingests_as_documented() -> anyhow::Result<()> {
@@ -1003,14 +1009,15 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                format!("{AGENT_A}/{LEGACY}"),
-                format!("{AGENT_A}/default"),
-                format!("{AGENT_A}/local-conv-2"),
-                format!("{AGENT_B}/local-conv-1"),
+                format!("{AGENT_A}:{LEGACY}"),
+                format!("{AGENT_A}:default"),
+                format!("{AGENT_A}:local-conv-2"),
+                format!("{AGENT_B}:local-conv-1"),
+                format!("{AGENT_WIN}:local-conv-1"),
             ],
         );
         let legacy = store
-            .get_session(&format!("{AGENT_A}/{LEGACY}"))
+            .get_session(&format!("{AGENT_A}:{LEGACY}"))
             .await?
             .expect("legacy rows ingest");
         // user, reasoning, assistant, unfinished call, error carrier, call +
@@ -1031,13 +1038,20 @@ mod tests {
             .count();
         assert_eq!(carriers, 1, "the error row is the only carrier");
         for session in [
-            &format!("{AGENT_A}/default"),
-            &format!("{AGENT_B}/local-conv-1"),
+            &format!("{AGENT_A}:default"),
+            &format!("{AGENT_B}:local-conv-1"),
+            &format!("{AGENT_WIN}:local-conv-1"),
         ] {
             let session = store.get_session(session).await?.expect("session");
             assert_eq!(session.session.parent_session_id, None);
             assert_eq!(session.session.source_agent, NAME);
         }
+        let windows = store
+            .get_session(&format!("{AGENT_WIN}:local-conv-1"))
+            .await?
+            .expect("the Windows capture ingests");
+        assert_eq!(windows.messages.len(), 4, "two text-only turns");
+        assert_eq!(&*windows.session.project, AGENT_WIN);
         Ok(())
     }
 }

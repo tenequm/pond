@@ -19,10 +19,10 @@ const FIXTURE_ROOT: &str = concat!(
     "/tests/fixtures/adapter/letta-code/transcripts"
 );
 
-// Two agents: three conversations under the first (one of them the synthetic
-// legacy shape), one under the second; the zero-byte `local-conv-3` ingests
-// nothing.
-const FIXTURE_SESSIONS: usize = 4;
+// Three agents: three conversations under the first (one of them the synthetic
+// legacy shape), one under the second, one under the Windows-captured third;
+// the zero-byte `local-conv-3` ingests nothing.
+const FIXTURE_SESSIONS: usize = 5;
 const AGENT_A: &str = "agent-local-0ce90846-9803-4ab1-8d67-31baacdd5148";
 
 fn conformance() -> Conformance<'static> {
@@ -59,7 +59,7 @@ async fn native_restore_round_trips_through_reingest() -> anyhow::Result<()> {
 async fn tool_rows_and_reasoning_read_back_from_the_store() -> anyhow::Result<()> {
     let (store, _store_dir) = ingest_into_temp_store(&LettaCodeAdapter::new(FIXTURE_ROOT)).await?;
     let session = store
-        .get_session(&format!("{AGENT_A}/default"))
+        .get_session(&format!("{AGENT_A}:default"))
         .await?
         .expect("the default conversation ingests");
     assert_eq!(&*session.session.project, AGENT_A);

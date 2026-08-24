@@ -13,10 +13,15 @@ use pond::{
         Adapter, AdapterFactory, ClaudeCodeAdapter, ClaudeCodeFactory, CodexCliAdapter,
         CodexCliFactory, NoopOracle, RestoreFidelity, SkipOracle,
     },
-    handlers::{SyncEvent, SyncStatus, ingest_adapter},
+    config::SearchConfig,
+    embed::LazyEmbedder,
+    handlers::{SyncEvent, SyncStatus, ingest_adapter, pond_search},
     sessions::{IngestSummary, RowmapOracle, SessionWithMessages, Store},
-    substrate::Predicate,
-    wire::Message,
+    substrate::{MaintenancePolicy, Predicate},
+    wire::{
+        Message, PartKind, Provenance, Role, SearchEnvelope, SearchFilters, SearchModeWire,
+        SearchRequest, SortBy,
+    },
 };
 use tempfile::TempDir;
 
@@ -102,6 +107,27 @@ pub(crate) async fn ingest_into_temp_store(
     Ok((store, store_dir))
 }
 
+/// The first alphabetic word of at least five letters in a user or assistant
+/// Text part of the session - a token BM25 indexes and a default search can
+/// be asked for.
+fn conversational_word(session: &SessionWithMessages) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.message.role(), Role::User | Role::Assistant))
+        .flat_map(|message| message.parts.iter())
+        .filter(|part| part.provenance == Provenance::Conversational)
+        .filter_map(|part| match &part.kind {
+            PartKind::Text {
+                text: Some(text), ..
+            } => Some(text.as_ref().as_str()),
+            _ => None,
+        })
+        .flat_map(|text| text.split(|c: char| !c.is_ascii_alphabetic()))
+        .find(|word| word.len() >= 5)
+        .map(str::to_ascii_lowercase)
+}
+
 /// A fixture ingest is clean or the suite is not measuring the adapter: a
 /// dropped event, a rejected session, or a storage error still leaves the
 /// session count and the searchable scope intact.
@@ -145,6 +171,7 @@ impl Conformance<'_> {
             ids.len(),
         );
         let kind_prefix = format!("{brand}/");
+        let mut probe_word = None;
         for id in &ids {
             let session = store
                 .get_session(id)
@@ -159,6 +186,20 @@ impl Conformance<'_> {
                 agent == brand || agent.starts_with(&kind_prefix),
                 "{brand}: session {id} carries foreign brand {agent}",
             );
+            if session.session.parent_session_id.is_none() {
+                // The search layer reads `/` in a session id as the claude-code
+                // subagent marker (`handlers::retain_non_subagents`) and drops
+                // the hit before ranking, so a root session named that way
+                // ingests and reads back yet never surfaces in a default
+                // search. Caught live on letta-code's `<agent>/<conversation>`.
+                anyhow::ensure!(
+                    !id.contains('/'),
+                    "{brand}: root session id {id} contains '/', which default search treats as a subagent",
+                );
+                if probe_word.is_none() {
+                    probe_word = conversational_word(&session);
+                }
+            }
         }
 
         // Exact-or-subpath, the same scope shape the handlers use, so an
@@ -177,6 +218,45 @@ impl Conformance<'_> {
             searchable == all,
             "{brand}: {} searchable rows carry a foreign brand",
             all - searchable,
+        );
+
+        // The handler path, not just the store: one default-mode search (no
+        // source_agent scope - scoping disables the subagent exclusion and would
+        // hide exactly the failure above) for a word taken from a root session's
+        // own conversation must hit. This is what `pond search` runs.
+        let probe_word = probe_word.ok_or_else(|| {
+            anyhow::anyhow!("{brand}: no root session carries a conversational word to search for")
+        })?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
+        let request = SearchRequest {
+            protocol_version: pond::PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            query: probe_word.clone(),
+            mode: SearchModeWire::Fts,
+            sort_by: SortBy::Relevance,
+            filters: SearchFilters::default(),
+            limit: 5,
+        };
+        let response = match pond_search(
+            &store,
+            &LazyEmbedder::candle(),
+            request,
+            &SearchConfig::default(),
+        )
+        .await
+        {
+            SearchEnvelope::Success(response) => response,
+            SearchEnvelope::Error(error) => {
+                anyhow::bail!("{brand}: default search for {probe_word:?} failed: {error:?}")
+            }
+        };
+        anyhow::ensure!(
+            response.matched_total > 0,
+            "{brand}: default search for {probe_word:?} found nothing across {} searchable rows",
+            response.searchable_in_scope,
         );
         Ok(())
     }
