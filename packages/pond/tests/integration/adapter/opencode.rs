@@ -26,7 +26,7 @@ use pond::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-use super::{Conformance, RoundTrip};
+use super::{Conformance, RoundTrip, path_config};
 
 const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -46,6 +46,7 @@ fn conformance() -> Conformance<'static> {
             verified_by: "native_restore_is_value_equal_to_real_db_corpus (opt-in, below) and \
                           the serialize unit tests in src/adapter/opencode.rs",
         },
+        config: path_config,
     }
 }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use pond::adapter::ClaudeAiExportFactory;
 
-use super::{Conformance, RoundTrip};
+use super::{Conformance, RoundTrip, path_config};
 
 const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,6 +23,7 @@ fn conformance() -> Conformance<'static> {
         // Per-session restore is a one-conversation export the adapter itself
         // re-reads, so the round trip closes entirely inside pond.
         round_trip: RoundTrip::Reingest,
+        config: path_config,
     }
 }
 

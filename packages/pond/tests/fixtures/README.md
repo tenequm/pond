@@ -1,7 +1,7 @@
 # Session samples
 
 Curated, anonymized (or, where a real capture is infeasible, fully synthetic)
-session samples from 9 agentic-client platforms. These files
+session samples from 11 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
@@ -61,7 +61,13 @@ sample tree.
 
 ## Per-platform notes
 
-### claude_app (Claude Desktop, Cowork)
+### claude_ai_export (claude.ai data export)
+
+- Source: the official claude.ai data-export `.zip` (emailed download link), whose `conversations.json` entry is one JSON array of conversation objects - many sessions per file, no per-session files. Not auto-discoverable; the adapter is pointed at the `.zip`, an extracted directory, or the bare `conversations.json`.
+- Layout: `conversations.json` only. Each conversation carries `uuid`, `name`, `summary`, `created_at`, `updated_at`, `account.uuid`, and `chat_messages[]`; each message carries `uuid`, `sender` (`human` / `assistant`), `created_at`, and `content[]` blocks of `text`, `thinking`, `tool_use`, and `tool_result` (the export's `tool_result` has a tool `name` but no `tool_use_id`).
+- Samples: SYNTHETIC, hand-written to the export's shape rather than captured - 5 conversations under one account uuid: plain text, a `thinking` block, a `tool_use` + `tool_result` pair (the human turn of pure `tool_result` becomes a Tool message), an empty-`name` conversation, and a 0-message conversation (skipped as Empty; 4 sessions ingest). Schema-critical field names are the export's own; ids are the obvious `1111...`/`ffff...` placeholders.
+
+### claude_desktop_app (Claude Desktop, Cowork)
 
 - Source path: `~/Library/Application Support/Claude/local-agent-mode-sessions/<account-uuid>/<workspace-uuid>/`
 - Layout: pair per session. `local_<session-uuid>.json` is the metadata file
@@ -87,7 +93,7 @@ sample tree.
   for all because only one workspace existed on the source machine.
 - The web chat history at
   `~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/`
-  is described in `claude_app/schema-notes.md` but not captured (binary
+  is described in `claude_desktop_app/schema-notes.md` but not captured (binary
   LevelDB, separate extraction work).
 
 ### claude_code (Claude Code CLI)
@@ -457,7 +463,7 @@ be applied to refreshed samples.
 - Long product-internal system prompts beyond standard runtime boilerplate
   -> `<redacted: ~Nk-char product system prompt>` (Cowork system prompts
   are preserved verbatim because they are identical across all Claude
-  Desktop users; see `claude_app/schema-notes.md`)
+  Desktop users; see `claude_desktop_app/schema-notes.md`)
 
 ### Preserved verbatim
 

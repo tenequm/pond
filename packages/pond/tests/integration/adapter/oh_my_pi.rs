@@ -14,7 +14,7 @@ use pond::{
     substrate::{Predicate, ScalarValue},
 };
 
-use super::{Conformance, RoundTrip, ingest_into_temp_store};
+use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
 const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -32,6 +32,7 @@ fn conformance() -> Conformance<'static> {
         fixture_root: Path::new(FIXTURE_ROOT),
         expected_sessions: FIXTURE_SESSIONS,
         round_trip: RoundTrip::IngestOnly,
+        config: path_config,
     }
 }
 

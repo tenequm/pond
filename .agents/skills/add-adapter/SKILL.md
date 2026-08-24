@@ -102,7 +102,7 @@ Either implement `serialize` (native fidelity replays `raw_record`; foreign rebu
 Two layers, split by seam (single-module mapping behavior in unit tests; cross-module paths in the integration suite):
 
 - Unit tests inside the adapter file: mapping decisions from the spec doc's table (each row that involved a choice gets a test), `probe_default` via `test_support::assert_probe_default`, and - when the native layout is exactly the source file set - round-trip via `test_support::assert_native_restore`.
-- Integration suite `tests/integration/adapter/<name>.rs` using the shared conformance harness (`Conformance` in `tests/integration/adapter/mod.rs`): full-fixture ingest counts + searchable scope, re-sync-is-noop, and the round-trip mode the adapter declares (`Reingest`, `ExternalImport`, or `IngestOnly`). Keep adapter-specific assertions (lineage, taxonomy, project fallbacks) as extra tests in the same file.
+- Integration suite `tests/integration/adapter/<name>.rs` using the shared conformance harness (`Conformance` in `tests/integration/adapter/mod.rs`): full-fixture ingest counts + searchable scope, re-sync-is-noop, and the round-trip mode the adapter declares (`Reingest`, `ExternalImport`, or `IngestOnly`). The adapter also declares its config face (`path_config` for the usual `{ "path": ... }` blob; a custom `fn(&Path) -> Value` for anything else) - the harness never grows adapter-specific branches. Keep adapter-specific assertions (lineage, taxonomy, project fallbacks) as extra tests in the same file.
 
 ### 6. Docs
 

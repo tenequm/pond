@@ -57,6 +57,15 @@ pub(crate) struct Conformance<'a> {
     /// sessions, not source files - empty sources don't count.
     pub(crate) expected_sessions: usize,
     pub(crate) round_trip: RoundTrip,
+    /// The adapter's config face: a source root in, the blob
+    /// `AdapterFactory::open` takes out. A function rather than a value
+    /// because `Reingest` re-opens the adapter at a fresh restore root.
+    pub(crate) config: fn(&Path) -> serde_json::Value,
+}
+
+/// The config face every path-backed adapter shares.
+pub(crate) fn path_config(root: &Path) -> serde_json::Value {
+    serde_json::json!({ "path": root })
 }
 
 /// A fresh local store holding one full ingest of `adapter` (no freshness
@@ -74,7 +83,7 @@ pub(crate) async fn ingest_into_temp_store(
 impl Conformance<'_> {
     fn open_at(&self, root: &Path) -> anyhow::Result<Box<dyn Adapter>> {
         self.factory
-            .open(serde_json::json!({ "path": root }))
+            .open((self.config)(root))
             .map_err(|error| anyhow::anyhow!("factory refused its own config face: {error}"))
     }
 

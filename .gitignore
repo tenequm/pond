@@ -29,6 +29,7 @@ tmp/
 !.agents/skills/
 .agents/skills/*
 !.agents/skills/add-adapter/
+*/**/.agents/
 /.claude/*
 !/.claude/skills/
 /.claude/skills/*
