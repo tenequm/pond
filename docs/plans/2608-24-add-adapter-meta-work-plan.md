@@ -1,6 +1,6 @@
 # Adapter-addition meta-work: add-adapter skill, conformance harness, contributor flow
 
-Date: 2026-08-24. Owner: tenequm. Tracking: [#172](https://github.com/tenequm/pond/issues/172). Status: PR1 open as [#173](https://github.com/tenequm/pond/pull/173) (2026-08-24), awaiting review. Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
+Date: 2026-08-24. Owner: tenequm. Tracking: [#172](https://github.com/tenequm/pond/issues/172). Status: PR1 merged as `295c6cc` ([#173](https://github.com/tenequm/pond/pull/173), 2026-08-24); PR2 (letta-code, [#170](https://github.com/tenequm/pond/issues/170)) open as [#177](https://github.com/tenequm/pond/pull/177) on `feat/letta-code-adapter`, awaiting CI/merge. Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
 
 ## Goal
 

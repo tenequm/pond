@@ -34,6 +34,7 @@ mod discovery;
 pub mod extract;
 mod hermes;
 mod jsonl;
+mod letta_code;
 mod nanoclaw;
 mod oh_my_pi;
 mod openclaw;
@@ -54,6 +55,7 @@ pub use extract::{
     extract_str, extract_value,
 };
 pub use hermes::{HermesAdapter, HermesFactory};
+pub use letta_code::{LettaCodeAdapter, LettaCodeFactory};
 pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
 pub use oh_my_pi::{OhMyPiAdapter, OhMyPiFactory};
 pub use openclaw::{
@@ -535,6 +537,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &HermesFactory,
         &PiCodingAgentFactory,
         &OhMyPiFactory,
+        &LettaCodeFactory,
     ]
 }
 
@@ -649,7 +652,7 @@ pub(crate) fn part_ordinal(ordinal: usize) -> i32 {
 /// adapter's restore-write path on the same allowlist; the writer
 /// ([`write_restored_files`]) re-applies it as a defense-in-depth check on
 /// every segment regardless of which adapter built the `RestoredFile`.
-pub(crate) fn validate_path_id(
+pub fn validate_path_id(
     adapter: &'static str,
     kind: &str,
     id: &str,

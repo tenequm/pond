@@ -1,0 +1,7 @@
+{"kind":"user","text":"List the files here, then explain add() in one sentence.","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"reasoning","text":"Two steps: run ls, then read calc.py before summarizing.","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"assistant","text":"Listing the directory first.","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"tool_call","name":"Bash","argsText":"{\"command\":\"ls\"}","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"error","text":"Stream error: provider returned 502 Bad Gateway; retrying","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"tool_call","name":"Read","argsText":"{\"file_path\":\"/private/tmp/letta-fixture/project/calc.py\"}","resultText":"1\tdef add(a, b):\n2\t    return a + b\n3\t","captured_at":"2026-03-20T09:15:02.118Z"}
+{"kind":"assistant","text":"add(a, b) returns a + b, so it works for any operands Python can add.","captured_at":"2026-03-20T09:15:02.118Z"}
