@@ -34,6 +34,7 @@ mod discovery;
 pub mod extract;
 mod hermes;
 mod jsonl;
+mod letta_code;
 mod nanoclaw;
 mod oh_my_pi;
 mod openclaw;
@@ -54,6 +55,7 @@ pub use extract::{
     extract_str, extract_value,
 };
 pub use hermes::{HermesAdapter, HermesFactory};
+pub use letta_code::{LettaCodeAdapter, LettaCodeFactory};
 pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
 pub use oh_my_pi::{OhMyPiAdapter, OhMyPiFactory};
 pub use openclaw::{
@@ -535,6 +537,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &HermesFactory,
         &PiCodingAgentFactory,
         &OhMyPiFactory,
+        &LettaCodeFactory,
     ]
 }
 

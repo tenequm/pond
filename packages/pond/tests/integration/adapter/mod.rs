@@ -23,6 +23,7 @@ use tempfile::TempDir;
 mod claude_ai_export;
 mod claude_code;
 mod hermes;
+mod letta_code;
 mod nanoclaw;
 mod oh_my_pi;
 mod openclaw;

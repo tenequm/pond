@@ -1,7 +1,7 @@
 # Session samples
 
 Curated, anonymized (or, where a real capture is infeasible, fully synthetic)
-session samples from 11 agentic-client platforms. These files
+session samples from 12 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
@@ -9,7 +9,8 @@ serve as the test fixtures for the v1 adapter implementations (see
 Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
 claude_code nested workflow-subagent sample added 2026-06-04; opencode
 `opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
-synthetic hermes `state.db` fixtures generated 2026-07-23).
+synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
+transcripts captured 2026-08-24 from letta-code 0.30.30).
 
 ## Why
 
@@ -48,6 +49,7 @@ adapter/
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
+  letta-code/                letta-code (`letta` CLI) client-side transcripts
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   oh-my-pi/                  oh-my-pi (`omp`), a pi fork with its own sessions root
   openclaw/                  openclaw runtime
@@ -207,6 +209,56 @@ sample tree.
   (`hermes` / `hermes/subagent` / `hermes/cron`), the three lineage relations,
   project derivation, multimodal + tool part survival, searchability, and
   additive re-sync freshness via the rowmap oracle.
+
+### letta-code (`letta` CLI)
+
+- Source path: `~/.letta/transcripts/<agentId>/<conversationId>/transcript.jsonl`
+  (`$LETTA_TRANSCRIPT_ROOT` overrides the root). The transcript is letta-code's
+  client-side reflection log, appended on every `end_turn`; the conversation's
+  full message history lives in the backend (Letta Cloud, or the local backend's
+  `lc-local-backend/`), which the adapter does not read.
+- Layout: one `transcript.jsonl` per conversation directory, one JSON row per
+  line in two shapes: `{kind: user|assistant|reasoning|error, text}` and
+  `{kind: tool_call, name?, argsText?, resultText?, resultOk?}`, each with a
+  per-turn `captured_at` stamp (one value shared by every row of a turn) and
+  optional `source_line_id` (the provider tool-call id on `tool_call` rows) /
+  `source_message_id`. Sidecars in the same directory: `state.json` (reflection
+  cursor; rewritten in place) and `payload-auto-<nonce>.json` (a `/reflect`
+  payload). A per-agent `multi-reflection-payloads/` directory holds cross-conversation
+  payloads only. The adapter reads `transcript.jsonl` alone.
+- Samples: captured 2026-08-24 by sandbox self-capture - letta-code 0.30.30
+  under a throwaway `HOME` (`/private/tmp/letta-fixture/home`, a neutral base
+  path so no username appears in any row), `letta --backend local` so no
+  Letta account or credential file was involved, model
+  `openrouter/anthropic/claude-haiku-4.5` via `OPENROUTER_API_KEY` from the
+  environment only, `--yolo` to auto-approve tools. The first agent was
+  driven through the interactive TUI under tmux (the only producer that
+  writes tool rows; the `-p` one-shot path never writes the transcript), the
+  second through the headless bidirectional stream. Two agents:
+  - `agent-local-0ce90846-.../default` - a text-only turn, a two-tool turn
+    (`Read` then `Bash`, both `resultOk: true`), a failed `Bash`
+    (`resultOk: false`, exit code in `resultText`), and a reasoning turn
+    (`/reasoning-tab on`, effort `low`: a `reasoning` row before its
+    `assistant` sibling), plus the `state.json` and `payload-auto-yx1ua6.json`
+    a `/reflect` wrote afterwards.
+  - `agent-local-0ce90846-.../local-conv-2` - a `/new` conversation of the
+    same agent: one turn with a `reasoning` row, an `assistant` row, a `Read`
+    tool row and the final `assistant` row; its `letta-msg-<n>` ids start at
+    189, showing the counter is per process, not per conversation.
+  - `agent-local-0ce90846-.../local-conv-3` - a zero-byte `transcript.jsonl`
+    (a `/reflect` on an empty conversation), which ingests nothing.
+  - `agent-local-0ce90846-.../conversation-00000000-0000-4000-8000-000000000001` -
+    SYNTHETIC, hand-written to the pre-2026-04 row shape (no
+    `source_line_id` / `source_message_id`, legacy `v2_message_id` in
+    `state.json`) to cover an unfinished `tool_call` (no result fields), an
+    `error` row, and a result row without `resultOk`. Current letta-code cannot
+    produce these, and no real legacy home exists to capture from.
+  - `agent-local-61c7e9e2-.../local-conv-1` - a second agent, two text-only
+    turns from the headless bidirectional path (`user-<uuid>` line ids, no
+    tool rows), so conversation ids visibly repeat across agents and the
+    adapter's project (= agent id) has two values.
+- Census: 4 ingestible sessions; secret sweep trufflehog 0 / gitleaks 0; every
+  file parses; no host, username, `/Users/` path or provider key string.
 
 ### nanoclaw
 
