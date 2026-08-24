@@ -652,7 +652,7 @@ pub(crate) fn part_ordinal(ordinal: usize) -> i32 {
 /// adapter's restore-write path on the same allowlist; the writer
 /// ([`write_restored_files`]) re-applies it as a defense-in-depth check on
 /// every segment regardless of which adapter built the `RestoredFile`.
-pub(crate) fn validate_path_id(
+pub fn validate_path_id(
     adapter: &'static str,
     kind: &str,
     id: &str,

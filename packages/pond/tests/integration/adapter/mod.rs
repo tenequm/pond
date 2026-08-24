@@ -11,7 +11,7 @@ use std::path::Path;
 use pond::{
     adapter::{
         Adapter, AdapterFactory, ClaudeCodeAdapter, ClaudeCodeFactory, CodexCliAdapter,
-        CodexCliFactory, NoopOracle, RestoreFidelity, SkipOracle,
+        CodexCliFactory, NoopOracle, RestoreFidelity, SkipOracle, validate_path_id,
     },
     config::SearchConfig,
     embed::LazyEmbedder,
@@ -196,6 +196,15 @@ impl Conformance<'_> {
                     !id.contains('/'),
                     "{brand}: root session id {id} contains '/', which default search treats as a subagent",
                 );
+                // And the id must be embeddable in a restore filename: foreign
+                // restore targets (claude-code, codex-cli, ...) name their
+                // output file after the session id, so an id that fails the
+                // path rules (`:` is an NTFS alternate data stream, ...) makes
+                // `pond resume --to <them>` a runtime error. Caught live on
+                // letta-code's second try, `<agent>:<conversation>`.
+                if let Err(error) = validate_path_id("conformance", "session id", id, id.clone()) {
+                    anyhow::bail!("{brand}: root session id cannot name a restore file: {error}");
+                }
                 if probe_word.is_none() {
                     probe_word = conversational_word(&session);
                 }

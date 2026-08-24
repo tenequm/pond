@@ -59,7 +59,7 @@ async fn native_restore_round_trips_through_reingest() -> anyhow::Result<()> {
 async fn tool_rows_and_reasoning_read_back_from_the_store() -> anyhow::Result<()> {
     let (store, _store_dir) = ingest_into_temp_store(&LettaCodeAdapter::new(FIXTURE_ROOT)).await?;
     let session = store
-        .get_session(&format!("{AGENT_A}:default"))
+        .get_session(&format!("{AGENT_A}+default"))
         .await?
         .expect("the default conversation ingests");
     assert_eq!(&*session.session.project, AGENT_A);
