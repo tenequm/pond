@@ -192,13 +192,18 @@ jobs:
 
       # moon replays the hash main already stored when a diff touches none of a
       # task's declared inputs, which is every CI-only change - so a run whose
-      # kache numbers will be read has to defeat it deliberately. Written only
-      # when asked: MOON_FORCE is presence-checked, so exporting it as "0" would
-      # force every run instead.
+      # kache numbers will be read has to defeat it deliberately.
+      #
+      # The value must be the literal `true`. MOON_FORCE is not a presence
+      # check: it is the clap env binding for `--force` (`moon run --help`:
+      # `[env: MOON_FORCE=]`), so moon parses it as the flag's value and rejects
+      # anything outside true/false with `error: invalid value '1' for
+      # '--force'`. Written only when asked, so the variable is simply absent on
+      # an ordinary run.
       - name: Force a real compile
         if: inputs.force_build
         shell: pwsh
-        run: '"MOON_FORCE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
@@ -272,11 +277,11 @@ jobs:
 
       # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
       # prefix prewarms nothing if moon serves the stored hash, and the release
-      # then pays the cold build inline.
+      # then pays the cold build inline. Same `true`-not-`1` constraint too.
       - name: Force a real compile
         if: inputs.force_build
         shell: pwsh
-        run: '"MOON_FORCE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       # Build + smoke + package, as a moon task so the leg gets the same
       # task-level remote cache every other build has. `--profile dist`, not
