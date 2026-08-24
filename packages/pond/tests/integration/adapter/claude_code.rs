@@ -9,6 +9,40 @@ use pond::{
 };
 use tempfile::TempDir;
 
+use super::{Conformance, RoundTrip, path_config};
+
+const FIXTURE_ROOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/claude_code/projects"
+);
+
+fn conformance() -> Conformance<'static> {
+    Conformance {
+        factory: &ClaudeCodeFactory,
+        fixture_root: Path::new(FIXTURE_ROOT),
+        // 10 top-level sessions plus the `pond` session's 3 subagent sidecars
+        // (two direct, one workflow-nested), each a `claude-code/<type>` session.
+        expected_sessions: 13,
+        round_trip: RoundTrip::Reingest { downgraded: 0 },
+        config: path_config,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
+    conformance().assert_ingest_counts_and_searchable().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
+    conformance().assert_resync_is_noop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_restore_round_trips_parents_and_subagents_through_reingest() -> anyhow::Result<()> {
+    conformance().assert_round_trip().await
+}
+
 /// Real native-Windows capture; see the fixture-gate test below.
 const WINDOWS_FIXTURES: &str = "tests/fixtures/adapter/claude_code/windows-projects";
 

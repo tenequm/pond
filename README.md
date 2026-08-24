@@ -240,11 +240,11 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 |---------|-------|---------------|
 | `claude-code` | Claude Code CLI, `~/.claude/projects` | 2026-08-14 |
 | `claude-desktop-app` | Claude Desktop / Cowork local agent sessions | 2026-05-13 |
-| `claude-ai-export` | claude.ai data-export archive (manual `--path`) | 2026-07-23 |
+| `claude-ai-export` | claude.ai data-export archive (manual `--path`) | 2026-06-04 |
 | `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-05-13 |
 | `opencode` | opencode, `~/.local/share/opencode` (SQLite DB + legacy tree) | 2026-07-14 |
-| `openclaw` | openclaw, `~/.openclaw` | 2026-07-23 |
-| `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-07-23 |
+| `openclaw` | openclaw, `~/.openclaw` | 2026-05-13 |
+| `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-05-14 |
 | `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |
 | `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
 | `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |

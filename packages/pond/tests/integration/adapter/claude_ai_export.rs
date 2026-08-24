@@ -22,7 +22,7 @@ fn conformance() -> Conformance<'static> {
         expected_sessions: 4,
         // Per-session restore is a one-conversation export the adapter itself
         // re-reads, so the round trip closes entirely inside pond.
-        round_trip: RoundTrip::Reingest,
+        round_trip: RoundTrip::Reingest { downgraded: 0 },
         config: path_config,
     }
 }

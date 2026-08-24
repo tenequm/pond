@@ -27,14 +27,20 @@ mod nanoclaw;
 mod oh_my_pi;
 mod openclaw;
 mod opencode;
+mod pi_coding_agent;
 
 /// How an adapter's fixture proves the round-trip half of spec.md 6.8. The
 /// adapter declares its mode; the harness executes it uniformly - capability
 /// declarations, never per-adapter branching.
 pub(crate) enum RoundTrip {
     /// `serialize(Native)` output, re-opened through the factory's own config
-    /// face, re-ingests to canonically equal sessions.
-    Reingest,
+    /// face, re-ingests to canonically equal sessions. `downgraded` is how many
+    /// fixture sessions the adapter serves as `Foreign` on a `Native` request:
+    /// a native origin its client cannot load back is reconstructed, not
+    /// replayed (spec.md#adapter-native-restore-lossless). Those must still
+    /// re-ingest as a session, not equal; declaring the count makes a change
+    /// in the adapter's downgrade policy a visible test change.
+    Reingest { downgraded: usize },
     /// Native restore targets an external import tool, so its output cannot
     /// re-ingest here; deep value-equality against the source lives in the
     /// named adapter-specific test. The harness still asserts the restore face
@@ -219,7 +225,7 @@ impl Conformance<'_> {
                 }
                 Ok(())
             }
-            RoundTrip::Reingest => {
+            RoundTrip::Reingest { downgraded } => {
                 anyhow::ensure!(
                     self.factory.restore_unsupported().is_none(),
                     "{brand}: declared a restore face but restore_unsupported refuses",
@@ -227,6 +233,7 @@ impl Conformance<'_> {
                 let (store, _guard) = self.ingest_fixture().await?;
                 let reingest_store_dir = TempDir::new()?;
                 let reingest_store = Store::open_local(reingest_store_dir.path()).await?;
+                let mut downgrades = 0usize;
                 for id in store.session_ids().await? {
                     let session = store
                         .get_session(&id)
@@ -237,11 +244,11 @@ impl Conformance<'_> {
                         !files.is_empty(),
                         "{brand}: native restore of {id} emitted nothing",
                     );
-                    for file in &files {
-                        anyhow::ensure!(
-                            file.actual_fidelity == RestoreFidelity::Native,
-                            "{brand}: native restore of {id} downgraded to foreign",
-                        );
+                    let native = files
+                        .iter()
+                        .all(|file| file.actual_fidelity == RestoreFidelity::Native);
+                    if !native {
+                        downgrades += 1;
                     }
                     // Per-session restore root: adapters whose whole corpus is
                     // one file (an export archive) emit the same relative path
@@ -254,11 +261,16 @@ impl Conformance<'_> {
                         anyhow::anyhow!("{brand}: restored output of {id} did not re-ingest")
                     })?;
                     anyhow::ensure!(
-                        restored == session,
+                        !native || restored == session,
                         "{brand}: session {id} is not canonically equal after \
                          serialize(Native) -> re-ingest",
                     );
                 }
+                anyhow::ensure!(
+                    downgrades == downgraded,
+                    "{brand}: {downgrades} sessions downgraded to foreign on native restore, \
+                     {downgraded} declared",
+                );
                 Ok(())
             }
         }
