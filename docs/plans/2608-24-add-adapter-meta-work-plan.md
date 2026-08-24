@@ -1,6 +1,6 @@
 # Adapter-addition meta-work: add-adapter skill, conformance harness, contributor flow
 
-Date: 2026-08-24. Owner: tenequm. Tracking: [#172](https://github.com/tenequm/pond/issues/172). Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
+Date: 2026-08-24. Owner: tenequm. Tracking: [#172](https://github.com/tenequm/pond/issues/172). Status: PR1 open as [#173](https://github.com/tenequm/pond/pull/173) (2026-08-24), awaiting review. Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
 
 ## Goal
 
@@ -83,13 +83,13 @@ Shared helpers in `tests/integration/adapter/mod.rs` (the designated cross-adapt
 - `assert_resync_is_noop`: ingest fixture, ingest again, assert zero rows written the second time (additive-sync + freshness working together).
 - `assert_ingest_counts_and_searchable`: full-corpus ingest, expected session count, `source_agent`-scoped searchable > 0 (the pipeline-ran proof).
 
-Retrofit `oh_my_pi.rs`, `opencode.rs`, and (new suite) `claude_ai_export` onto the helpers; keep any adapter-specific assertions those suites carry. Design constraint: helpers take the adapter + fixture root + expectations struct, no per-adapter branching inside the harness (seam rules apply to test seams too).
+Retrofit `oh_my_pi.rs`, `opencode.rs`, and (new suite) `claude_ai_export` onto the helpers; keep any adapter-specific assertions those suites carry. Design constraint: helpers take the adapter + fixture root + expectations struct, no per-adapter branching inside the harness (seam rules apply to test seams too). The adapter also declares its config face (`config: fn(&Path) -> Value`, `path_config` for the usual `{ "path": ... }` blob), so an adapter with a different config shape (pi-coding-agent's `sqlite_path`) never edits the harness - adapter additions must not touch the seam.
 
 Implementation order note: survey how the three target suites (and the adapter-file unit tests) do round-trip TODAY before fixing helper signatures - both `src/adapter/snapshots/` and `tests/integration/adapter/snapshots/` exist, so insta snapshots are in play and the helpers must compose with them, not fight them.
 
 ### 4. Structural guard test
 
-A unit test (in `src/adapter/mod.rs` tests) that walks `src/adapter/*.rs` and fails on any reference to `crate::sessions` / `crate::substrate` - qualified inline paths included, not just `use` statements - turning the perf-isolation argument into CI fact. Keep the error message explanatory: it names WHY (adapters must stay store-free so adapter PRs cannot regress store performance).
+A unit test (in `src/adapter/mod.rs` tests) that walks `src/adapter/` recursively and fails on any production line naming the store or query layer, turning the perf-isolation argument into CI fact. As implemented: an identifier-token denylist (`Store`, `substrate`, `rowmap`, `handlers`, `lance`, `arrow`, `datafusion`, `object_store`) plus the path substrings `crate::sql`, `crate::transport`, `crate::embed` (bare `sql` is a legitimate identifier in the SQLite adapters); the scan stops at the `#[cfg(test)]` that opens a `mod`, not at item-level attributes (`opencode.rs` `open_db`, `extract.rs` `from_test_value`); `//` lines are skipped. The canonical model types (`IngestEvent`, `SessionWithMessages`) stay allowed. One named exemption with its reason: openclaw's `reconcile_deletions(&self, store: &Store)` is a read-only detection pass. A substring match on `sessions::Store` was tried first and was green while false (brace-grouped imports never spell it), so the test was rewritten and verified to flag `openclaw.rs:61` and `:1782` with the exemption removed. The error message names WHY (adapters must stay store-free so adapter PRs cannot regress store performance).
 
 ### 5. Docs
 
