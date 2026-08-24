@@ -1,6 +1,6 @@
 # Adapter-addition meta-work: add-adapter skill, conformance harness, contributor flow
 
-Date: 2026-08-24. Owner: tenequm. Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
+Date: 2026-08-24. Owner: tenequm. Tracking: [#172](https://github.com/tenequm/pond/issues/172). Targets: [#170](https://github.com/tenequm/pond/issues/170) (letta-code), [#171](https://github.com/tenequm/pond/issues/171) (grok-build), and every adapter after them.
 
 ## Goal
 
@@ -115,7 +115,7 @@ Follow the skill literally; patch skill/harness at every friction point in the s
 
 ## PR3 outline (grok-build, #171)
 
-Validation run - zero skill edits is the success bar. Phase A must resolve, in the spec doc: the rewind truncate-and-regrow behavior of `updates.jsonl` vs the tail-peek oracle and `adapter-integrity-additive-sync` (deja-vu keeps a prefix hash; decide pond's answer before implementation). Adds the byte-counting `Source` wrapper + declared-freshness-read-budget assertion to the harness, back-applied to letta. External references for archaeology (read-only, never authority): franken_agent_detection `src/connectors/grok.rs` (envelope variants, `.cwd` >255-byte override, `chat_history.jsonl` fallback), deja-vu `internal/sources/grok.go` + `docs/registry/grok.md` (rewind, chunk-join keys, spawn tree), ctx `crates/ctx-history-native-jsonl-parsers/src/grok_build.rs` (`rawOutput` typed unions, `/_meta/x.ai~1tool/kind` pointer escape, terminal-status pin).
+Validation run - zero skill edits is the success bar. Phase A must resolve, in the spec doc: the rewind truncate-and-regrow behavior of `updates.jsonl` vs the tail-peek oracle and `adapter-integrity-additive-sync` (deja-vu keeps a prefix hash; decide pond's answer before implementation). Adds the byte-counting `Source` wrapper + declared-freshness-read-budget assertion to the harness, back-applied to letta. External references for archaeology (read-only, never authority): franken_agent_detection `src/connectors/grok.rs` (envelope variants, `.cwd` >255-byte override, `chat_history.jsonl` fallback), deja-vu `internal/sources/grok.go` + `docs/registry/grok.md` (rewind, chunk-join keys, spawn tree), ctx `crates/ctx-history-native-jsonl-parsers/src/grok_build.rs` (`rawOutput` typed unions, `/_meta/x.ai~1tool/kind` pointer escape, terminal-status pin). Discovery caveat: `@vibe-kit/grok-cli` (npm) is a different product that also writes to `~/.grok` - grok-build discovery must distinguish them.
 
 ## Deferred / explicitly not in PR1
 
