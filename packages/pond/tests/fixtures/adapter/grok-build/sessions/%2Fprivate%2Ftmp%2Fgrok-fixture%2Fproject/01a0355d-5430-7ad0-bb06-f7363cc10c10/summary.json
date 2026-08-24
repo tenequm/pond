@@ -1,0 +1,21 @@
+{
+  "info": {
+    "id": "01a0355d-5430-7ad0-bb06-f7363cc10c10",
+    "cwd": "/private/tmp/grok-fixture/project"
+  },
+  "session_summary": "",
+  "created_at": "2026-08-24T20:01:44.113579Z",
+  "updated_at": "2026-08-24T20:01:45.018497Z",
+  "num_messages": 0,
+  "num_chat_messages": 2,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 0,
+  "chat_format_version": 1,
+  "git_root_dir": "/private/tmp/grok-fixture/project/",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}

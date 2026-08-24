@@ -10,7 +10,8 @@ Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
 claude_code nested workflow-subagent sample added 2026-06-04; opencode
 `opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
 synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
-transcripts captured 2026-08-24 from letta-code 0.30.30).
+transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
+captured 2026-08-24 from grok-build 1.0.5).
 
 ## Why
 
@@ -48,6 +49,7 @@ adapter/
   claude_desktop_app/        Claude Desktop (macOS), Cowork / local-agent-mode
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
+  grok-build/                grok-build (xAI `grok` CLI) session directories
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   letta-code/                letta-code (`letta` CLI) client-side transcripts
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
@@ -173,6 +175,57 @@ sample tree.
   like `surf__surf_amazon_search`.
 - Samples: 2 sessions across 2 dates from the interactive `codex_cli_rs`
   originator, models `gpt-5` and `gpt-5-codex`.
+
+### grok-build (xAI `grok` CLI)
+
+- Source path: `$GROK_HOME/sessions/<encoded-cwd>/<session-uuid>/` (default
+  `~/.grok/sessions/`). The cwd bucket is the percent-encoded working
+  directory, or `<slug>-<blake3-hex16>` plus a `.cwd` sidecar when the encoded
+  form exceeds 255 bytes. The adapter ingests `updates.jsonl` (the envelope
+  stream grok itself calls authoritative) plus `summary.json` for identity /
+  project / lineage; every other sibling is documented non-capture
+  (`docs/adapters/grok-build.md` row 8).
+- Samples: captured 2026-08-24 by sandbox self-capture - grok-build 1.0.5
+  (binary `5115b46bc909`) under throwaway homes at neutral base paths
+  (`/tmp/grok-fixture` on macOS, `C:\gf` on Windows 11 Pro x64), model
+  `grok-4.6` via the operator's X-account OAuth session: the host
+  `~/.grok/auth.json` was copied into each sandbox purely to authenticate and
+  deleted before anything was copied out. Project cwd was a two-file git repo
+  with one commit and no remote, so `summary.json` git metadata is populated
+  but carries no identity. Headless `-p` runs drove most sessions; the
+  rewind/compact session ran in the TUI under tmux.
+- Census: 15 sessions across three buckets (12 macOS project - 11 plus the
+  subagent child - 1 hash-form long-cwd, 2 Windows) plus the root
+  `session_search.sqlite` sibling. Per
+  session (`updates.jsonl` kind counts): text `...099c` and Windows twin
+  `...d15b` (2 user / 2 thought / 2 agent / 2 turn_completed each); image
+  `...24ab` (image content block, `image_dropped`, 3 tool_call / 6
+  tool_call_update); tools `...4cdd` (6 tool_call / 12 tool_call_update:
+  completed, exit-1 completed, and a `failed` read of a missing file;
+  `terminal/` spill logs) and Windows tools `...f4ae` (3 tool_call / 6
+  tool_call_update); fork `...8db1` (parent-prefixed eventIds in the inherited
+  prefix, `parent_session_id` + `forked_at` in summary); subagent parent
+  `...9c5a` (`subagent_spawned` + `subagent_finished`, `subagents/<id>/`
+  meta.json + output.json) with child `...aead` (`session_kind: "subagent"`,
+  no parent field of its own); plan `...cbdb` (1 `plan`); hook `...f1a8`
+  (1 `hook_execution`); interrupted `...0c00` (a `tool_call` with no terminal
+  update and no `turn_completed`); retry-failed `...4ad7` (`retry_state`
+  `type: failed` and no assistant output); no-updates `...5430` (a session dir
+  with no `updates.jsonl` at all); long-cwd `...5bc4` (hash bucket + `.cwd`);
+  TUI `...85a0` (4 turns, 1 `rewind_marker`, reused `promptIndex`, 1
+  `compaction_checkpoint` + `auto_compact_completed`, compaction sidecars).
+- Anonymization: one edit. grok's Claude-compat skill discovery resolves the
+  real Windows profile through the known-folder API (ignoring the sandbox
+  `USERPROFILE`), so a skill path in the two Windows `chat_history.jsonl`
+  sidecars carried the real username; it was replaced with `user`. Both files
+  are non-capture; no ingested file needed any edit. Sweeps: trufflehog 0,
+  gitleaks 0, every JSON/JSONL file parses (the zero-byte `events.jsonl` in
+  `...5430` is the one intentionally empty file), no `/Users/<name>`,
+  `C:\Users\<name>`, hostname, email, or key material outside xAI's own
+  documentation strings (`/Users/me/photo.jpg` examples inside prompt text).
+- Windows capture bytes: LF only (zero `\r`), no BOM, ASCII-clean - grok
+  writes the same JSONL shape on both platforms; the bucket name pins the
+  drive-colon/backslash encoding (`C:\gf\project` -> `C%3A%5Cgf%5Cproject`).
 
 ### hermes (Hermes Agent)
 

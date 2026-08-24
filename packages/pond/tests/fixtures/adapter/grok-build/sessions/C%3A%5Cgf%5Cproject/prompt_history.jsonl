@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-24T20:01:10.735040300Z","session_id":"01a0355c-d15b-7c03-87f5-fd313e64278e","prompt":"Reply with exactly three words describing a quiet forest.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:17.330487400Z","session_id":"01a0355c-d15b-7c03-87f5-fd313e64278e","prompt":"Now do the same for a windy coast.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:19.756575900Z","session_id":"01a0355c-f4ae-7682-b589-1bc923f41121","prompt":"Do these three things in order using tools, then reply with one short sentence: 1) run the shell command: echo fixture-tool-ok 2) read the file README.md 3) run the shell command: type C:\\nonexistent\\file.txt","is_bash":false}

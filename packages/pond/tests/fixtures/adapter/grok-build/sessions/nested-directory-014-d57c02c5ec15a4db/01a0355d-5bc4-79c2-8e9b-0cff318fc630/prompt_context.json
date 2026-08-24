@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "prompt_mode": "extend",
+  "audience": "primary",
+  "include_browser_verification": true,
+  "agents_md_files": [],
+  "persona_summaries": [],
+  "build_timestamp_utc": "2026-08-24T20:01:46.877364+00:00",
+  "memory_enabled": false,
+  "os_name": "macos",
+  "shell_path": "/bin/zsh",
+  "working_directory": "/private/tmp/grok-fixture/project/nested-directory-001/nested-directory-002/nested-directory-003/nested-directory-004/nested-directory-005/nested-directory-006/nested-directory-007/nested-directory-008/nested-directory-009/nested-directory-010/nested-directory-011/nested-directory-012/nested-directory-013/nested-directory-014",
+  "current_date": "2026-08-24",
+  "is_non_interactive": true,
+  "system_prompt_label": "Grok 4.6"
+}

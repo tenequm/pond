@@ -1,0 +1,21 @@
+{
+  "info": {
+    "id": "01a0355c-f4ae-7682-b589-1bc923f41121",
+    "cwd": "C:\\gf\\project"
+  },
+  "session_summary": "Echo README then type nonexistent file",
+  "created_at": "2026-08-24T20:01:19.538873900Z",
+  "updated_at": "2026-08-24T20:01:29.788670500Z",
+  "num_messages": 17,
+  "num_chat_messages": 16,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "request_id": "d00e30e6-37b5-460c-a11f-60d18f1482a4",
+  "grok_home": "C:\\gf\\home\\.grok",
+  "last_active_at": "2026-08-24T20:01:29.788670500Z",
+  "generated_title": "Echo README then type nonexistent file",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}

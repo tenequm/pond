@@ -1,0 +1,26 @@
+{
+  "info": {
+    "id": "01a0355d-85a0-73a0-ac3c-f33aaf3747a0",
+    "cwd": "/private/tmp/grok-fixture/project"
+  },
+  "session_summary": "One-word replies: alpha then beta",
+  "created_at": "2026-08-24T20:01:56.785990Z",
+  "updated_at": "2026-08-24T20:03:22.756424Z",
+  "num_messages": 19,
+  "num_chat_messages": 8,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 4,
+  "chat_format_version": 1,
+  "git_root_dir": "/private/tmp/grok-fixture/project/",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "request_id": "d17dabb5-7efd-4fc5-a0a2-794ba60a5cb2",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "last_active_at": "2026-08-24T20:03:21.603772Z",
+  "generated_title": "One-word replies: alpha then beta",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high",
+  "last_turn_summary": "gamma",
+  "last_turn_summary_prompt_id": "d17dabb5-7efd-4fc5-a0a2-794ba60a5cb2"
+}

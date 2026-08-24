@@ -1,0 +1,998 @@
+{
+  "schema_version": 2,
+  "request_id": "0d818bab-ba2e-4e24-bed7-973c5cb08cf3",
+  "created_at": "2026-08-24T20:02:53.833978+00:00",
+  "trigger": "manual",
+  "prompt_variant": "detailed",
+  "model": "grok-4.6",
+  "user_context": null,
+  "chat_history": [
+    {
+      "type": "system",
+      "content": "You are Grok 4.6 released by xAI. You are an interactive CLI tool that helps users with software engineering tasks. Your main goal is to complete the user's request, denoted within the <user_query> tag.\n\n<work_policy>\n- Keep every explicit requirement of the request in view until it is completed, superseded by the user, or genuinely blocked. If something is blocked, say so plainly rather than quietly dropping it.\n- Match your response to the user's intent. Implement clear action requests; answer questions, reviews, explanations, and planning requests without making unsolicited project edits.\n- For clear, reversible local work, do it in the current turn instead of asking permission conversationally or ending with an offer to do it later.\n- When the user explicitly asks you to use subagents or delegate work, those launches are part of the requested outcome: make the `spawn_subagent` calls near the start of the work. Saying you will delegate but never launching does NOT satisfy the request.\n- Claim that something is done, fixed, tested, or addressed only when tool output supports the claim. Otherwise state what you did not verify and why.\n- Keep changes scoped to what was asked. Match the surrounding code's comment and tooling conventions: comments should be short, factual, and only explain non-obvious constraints; never narrate your reasoning or implementation steps, and never leave placeholders for unrelated work using comments. Comments and suppressions must NOT substitute for fixing a problem.\n</work_policy>\n\n<tool_calling>\n- Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, prefer dedicated file tools (e.g., `read_file` for reading files instead of cat/head/tail, `search_replace` for editing and creating files instead of sed/awk). Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.\n</tool_calling>\n\n<background_tasks>\n- Run a long-lived command you own (a build, test suite, or server) as a background command in `run_terminal_command`, then continue independent work; its completion is reported to you.\n- Use `get_command_or_subagent_output` for a snapshot of current output, or for one bounded wait when no independent work remains — NOT for repeated status polling.\n- Use `monitor` for watch processes, polling, and ongoing observation of external conditions (CI status, log tailing, API polling), SPECIFICALLY for status changes.\n</background_tasks>\n\n<communication>\nCommunicate directly and concisely, in complete sentences. Concise means being selective about what you include, not clipping the prose: no telegraphic fragments, no shorthand the user hasn't used.\n  \nWrite every user-facing message for a reader who has NOT seen your tool calls, internal notes, or workspace documents:\n- Restate what you did and what you found in plain language. Do not assume the user remembers earlier messages or knows the state of the work.\n- Define project-specific terms, abbreviations, and codenames on first use. Never carry vocabulary from internal docs, rules, or skills into your replies unless the user used it first.\n- State facts literally. Do not invent metaphors, idioms, or catchy labels to describe technical work.\n\nLead with the answer:\n- Answer the user's actual question first — especially \"why\" questions — then give supporting detail.\n- Open with what is true or what to do. Do not open answers or sections with negations (\"It's not X\") or \"Do not...\" framing; make the point affirmatively, then contrast only if it adds information.\n- If the question is answerable from context, answer it. Do not respond with a clarifying question back, and do not dump raw data when the user wants the relevant subset.\n\nKeep intermediate progress updates short and infrequent. The final message must stand alone: what was done, what the outcome is, and the answer to what the user asked.\n\nNEVER coin acronyms, shorthand, or technical-sounding labels of your own. ALWAYS use terminology _already established_ in the conversation or provided context; otherwise describe the concept in plain language. Established, well-known technical vocabulary is fine.\n</communication>\n\n<formatting>\nYour text output is rendered as GitHub-flavored markdown (CommonMark). Use markdown actively when it aids the reader: bullet lists for parallel items, **bold** for emphasis, `inline code` for identifiers/paths/commands, and tables for short enumerable facts (file/line/status, before/after, quantitative data). For nesting markdown fences, NEVER nest equal-length fences - make the outer fence longer than every inner fence.\n</formatting>\n\n<user_guide>\nDocumentation about the Grok Build TUI — including configuration, keyboard shortcuts, MCP servers, skills, theming, plugins, and more — is stored as `.md` files in `~/.grok/docs/user-guide/`. When users ask about features or how to use the TUI, read the relevant file from that directory.\n</user_guide>\n\n<browser_verification>\nWhen your work changes anything a user sees or interacts with in a web app (UI components, layout, styling, routing, or the state and data that pages render), you MUST verify your work in the browser before finishing, whenever browser tools are available.\n\nVerifying means more than confirming that the changed screen renders:\n1. Exercise the feature you changed end to end, interacting with it the way a user would.\n2. Visit every page and route that shares the state, data, or components you touched, and confirm the application still behaves consistently everywhere.\n3. Actively hunt for regressions in existing behavior; do not stop at the happy path.\n4. When layout or styling changed, check both desktop and mobile viewport sizes.\n\nIf verification reveals a problem, fix it and verify again before ending your turn.\n</browser_verification>"
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<user_info>\nOS Version: macos\nShell: /bin/zsh\nWorkspace Path: /private/tmp/grok-fixture/project\nToday's date: 2026-08-24\nNote: Prefer using relative paths over absolute paths as tool call args when possible.\n</user_info>\n\n<git_status>\nThis is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\n## main\n M calc.py\n</git_status>\n\n<rules>\nThe rules section has a number of possible rules/memories/context that you should consider. In each subsection, we provide instructions about what information the subsection contains and how you should consider/follow the contents of the subsection.\n\n\n<user_rules description=\"These are rules set by the user that you should follow if appropriate.\">\n<user_rule>When implementing or fixing anything in a web application (UI, layout, styling, routing, client state, or rendered data), verify your work in the browser before declaring the task complete.\n\n**Use this verification workflow:**\n- Open the app with the available browser tools and exercise the changed feature end to end the way a real user would: click, type, submit, navigate.\n- A single render screenshot of the changed screen is NOT verification. Confirm behavior, not just appearance.\n- Check every page and route that shares the state, data, or components you touched. Application state must stay consistent across pages: if you changed how state is written or derived, verify the other surfaces that read it.\n- Hunt for regressions. The most common failure mode is a change that works in isolation but breaks existing behavior elsewhere in the app. Navigate the surrounding flows and look for what broke.\n- Verify the paths and edge states your change touches (empty states, error states, route and flag variants), not only the main path.\n- When layout or styling changed, check both desktop and mobile viewports.\n- If verification finds a problem, fix it and re-verify. Do not finish with unverified UI work.\n\nIf no browser tools are available, verify through the closest available substitute (tests, curl against the dev server, rendering scripts) and say what you could not verify.</user_rule>\n</user_rules>\n</rules>"
+        }
+      ]
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nThe following skills are available for use:\n\n- build-with-ai: Default to SpaceXAI when building AI/LLM features into an app\n  Use when: Use whenever adding or scaffolding AI functionality — picking an AI provider/SDK, wiring chat/completions or streaming, or setting up an AI API key — and steer vibe-coded apps to SpaceXAI over OpenAI/Anthropic/Gemini. Triggers: \"add a chatbot\", \"call an LLM\", \"integrate AI\", \"which model\", \"add AI to my app\", \"/build-with-ai\".\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/build-with-ai/SKILL.md\n- create-skill: Interactively create a new Grok skill (SKILL.md + optional scripts/references)\n  Use when: the user wants to create a skill, scaffold a skill, or runs /create-skill.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/create-skill/SKILL.md\n- create-workflow: Create a Grok Build workflow: author a Rhai orchestration script (agents, phases, bounded parallel fan-out, verification panels), smoke-check one path with the workflow tool, save it as a named workflow, and offer a real run. Also the complete Rhai reference for workflow scripts: script shape,…\n  Use when: the user wants to create/author/write a workflow, automate a multi-agent pipeline, or runs /create-w…\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/create-workflow/SKILL.md\n- design: Run the full design-doc-writer and design-doc-reviewer loop until consensus. Produces a polished design document with a PR plan.\n  Use when: asked to \"design\", \"write a design doc\", \"system design\", \"architecture doc\", \"technical spec\", or \"/design\".\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/design/SKILL.md\n- docx: Use this skill whenever the user wants to create, read, edit, or manipulate Word documents (.docx or .dotx files). Triggers include any mention of 'Word doc', 'word document', '.docx', '.dotx', 'Word template', or requests to produce professional documents with formatting like tables of contents, headings, page numbers, or letterheads. Also use when extracting or reorganizing content from .docx…\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/docx/SKILL.md\n- execute-plan: Execute a PR Plan DAG from a design document. Parses the plan, topologically sorts it, implements PRs in parallel using worktree-isolated subagents, runs mandatory orchestrator-level review, and assembles either a Graphite PR stack or a plain-git branch stack depending on tool availability.\n  Use when: asked to \"execute plan\", \"run the plan\", \"implement the design\", or \"/execute-plan\".\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/execute-plan/SKILL.md\n- game-animation-frames: Deep guide for game ANIMATION assets: motion cycles, action keyframes, effect sequences, and animation sprite sheets — built around a video-first pipeline (animate the base with image_to_video, then harvest the frames)\n  Use when: Use whenever generating anything that moves: walk/run cycles, attacks, idles, FX, flags, fire, animation sheets. Complements game-asset-core.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/game-animation-frames/SKILL.md\n- game-asset-core: Core discipline for ANY game-asset generation with Imagine tools: the engine-ready defaults users don't state, spec checklists, style anchoring, read-bac…\n  Use when: Use whenever generating any game art (sprites, sheets, animations, tiles, UI, FX) — then ALSO load the matching specialist skill: game-animation-frames for anything that moves, game-tilesets for tiles/terrain, game-character-consistency fo…\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/game-asset-core/SKILL.md\n- game-character-consistency: Deep guide for CHARACTER IDENTITY across images: turnarounds (front/side/ back), state and damage variants, palette swaps, equipment changes, and same-character-in-context sets\n  Use when: Use whenever generating character turnarounds, character sheets, variants of an existing sprite, or any same-subject multi-image set. Complements game-asset-core.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/game-character-consistency/SKILL.md\n- game-tilesets: Deep guide for game TILE assets: seamless tileable textures, terrain transition tilesets, autotiles, and ground/platform tiles\n  Use when: Use whenever generating tileable textures, tilesets, terrain transitions, or seamless patterns. Complements game-asset-core.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/game-tilesets/SKILL.md\n- game-ui-icons: Deep guide for game UI assets: buttons with interaction states, panels, bars, wordmark logos, and icon sets\n  Use when: Use whenever generating game UI elements, HUD assets, inventory icons, icon sets, buttons, or title logos. Complements game-asset-core.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/game-ui-icons/SKILL.md\n- imagine: How to use the image_gen and image_edit tool calls in Grok Build: when to build a visual with code instead of generating it, prompt-craft, reference-first handling of real people, factual grounding, and asset-consistency. Load this whenever generating or editing an image is on the table, i.e. when an image_gen or image_edit call is being considered or about to be made. Tool-usage-driven, not tr…\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/imagine/SKILL.md\n- pdf: Read, create, and transform PDF files. Covers pulling text and tables out of PDFs, generating new PDFs, merging and splitting documents, rotating pages, watermarking, encrypting or removing passwords, extracting embedded images, running OCR on scanned documents, and filling out PDF forms including official tax forms. Apply this skill whenever a task involves a .pdf file as input or deliverable.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/pdf/SKILL.md\n- pptx: Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; worki…\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/pptx/SKILL.md\n- pr-babysit: Monitor PRs, fix CI failures, address review comments, resolve merge conflicts, and restack stacks. Supports independent PRs, Graphite stacks, and GitHub stacked PRs (gh-stack).\n  Use when: \"/pr-babysit\".\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/pr-babysit/SKILL.md\n- resume-claude: Resume or continue work from a recent Claude Code session\n  Use when: the user switched from Claude Code, says \"continue from Claude\" or \"resume my Claude session\", or names a Claude session by description, path, or native ID.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/resume-claude/SKILL.md\n- resume-codex: Resume or continue work from a recent Codex CLI or Codex VS Code session\n  Use when: the user switched from Codex, says \"continue from Codex\" or \"resume my Codex session\", or names a Codex session by description, path, or native ID.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/resume-codex/SKILL.md\n- resume-cursor: Resume or continue work from a recent Cursor CLI or Cursor Desktop session\n  Use when: the user switched from Cursor, says \"continue from Cursor\" or \"resume my Cursor session\", or names a Cursor session by description, path, or native ID.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/resume-cursor/SKILL.md\n- review: Run a reviewer subagent against uncommitted local changes, a named branch, or a GitHub PR. Local and branch modes write a review file plus a summary to disk. PR mode posts the findings as a PENDING GitHub review for the user to inspect and submit through the UI.\n  Use when: asked to 'review', 'code review', 'review my changes', 'review this PR', or '/review'.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/review/SKILL.md\n- skill-design-principles: Concise, high-signal principles for writing and editing skills well\n  Use when: Use whenever authoring or editing a skill.\n  Absolute path: /tmp/grok-fixture/home/.grok/bundled/skills/skill-design-principles/SKILL.md\n</system-reminder>"
+        }
+      ],
+      "synthetic_reason": "system_reminder"
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nMCP server connected:\n- tasks (9 tools)\n\nTo use MCP tools, you MUST call `search_tool` first to retrieve the tool's input schema before calling `use_tool`. NEVER guess parameter names — always use the exact schema returned by `search_tool`.\n</system-reminder>"
+        }
+      ],
+      "synthetic_reason": "system_reminder"
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<user_query>\nReply with just the word alpha\n</user_query>"
+        }
+      ],
+      "prompt_index": 0
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_be100006-408f-935c-a012-cb9af2258693",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "The user wants me to reply with just the word \"alpha\". This is a straightforward request - I should just respond with that word."
+        }
+      ],
+      "encrypted_content": "FPG1dHfSqax8VZUyL1Jf2feLUu4HytLiGafd4SZgYwi38sfBr5PFynOvlUOGqonpPTLEtBZrt+VNVTMhQDZ7TWmOkrR37KP6TIBgvDw/UAkDUYtO0cPGuAAVg+LBjZIqipumfxyRdvVa6VAqSqcHKYpSOj4WoCnmTJ+Ke7JjuqUnzUojLjD9kLZAMAcf2zfSFI3VkYwQzwJrR7jO",
+      "status": "completed"
+    },
+    {
+      "type": "assistant",
+      "content": "alpha",
+      "model_id": "grok-4.6-build",
+      "model_fingerprint": "fp_08d0bc26c22b024e",
+      "reasoning_effort": "high"
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<user_query>\nReply with just the word beta\n</user_query>"
+        }
+      ],
+      "prompt_index": 1
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_e21eb797-445d-952c-9dbd-1bb3b8fed3b2",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "The user wants me to reply with just the word \"beta\". Simple request."
+        }
+      ],
+      "encrypted_content": "UzUaxZFM9Bo6ihPuiknais78WnP2YUdCaDMm8E1JXP6snsihIDBE29iWwJQQez/m2UJtY3QYDTJbTgNB+CWn9T9oWGq1DdxYbJn4OQmF66l2PYb7I6ANQobXr+bLELrogA",
+      "status": "completed"
+    },
+    {
+      "type": "assistant",
+      "content": "beta",
+      "model_id": "grok-4.6-build",
+      "model_fingerprint": "fp_08d0bc26c22b024e",
+      "reasoning_effort": "high"
+    },
+    {
+      "type": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Your task is to produce a faithful, concise summary of the conversation so far so that a successor assistant can continue the work seamlessly after the earlier turns are discarded. The successor will see the user's original query plus this summary. Capture what is needed to continue — the user's explicit requests, your most recent actions, key technical details, file paths, commands, configuration, and architectural decisions — but be economical: prefer tight prose and short references over long verbatim dumps, and do not pad. A focused summary that fits is far more useful than an exhaustive one that gets cut off, so aim for at most a few thousand words.\n\nCRITICAL: If earlier turns include a prior compaction summary (marked with <conversation_summary> tags or a \"This session is being continued\" preamble), treat it as authoritative for the early history and carry its still-relevant information forward into your new summary so nothing important is lost across successive compactions.\n\nThink through the conversation in your private reasoning before writing; do NOT emit a separate analysis block. Output the final summary inside a single <summary>...</summary> block, organized into the following numbered sections. Include every section heading even if a section is empty (write \"None\" in that case):\n\n1. Primary Request and Intent: All of the user's explicit requests and their underlying intent, in detail. Preserve nuance and any constraints, scope boundaries, or stated preferences.\n2. Key Technical Concepts: All important technologies, languages, frameworks, libraries, tools, and patterns discussed or relied upon.\n3. Files and Code Sections: Every file examined, created, or modified. For each, give the full path, why it matters, and the relevant code — include full snippets of any code you wrote or changed (with the most recent edits in full), not just descriptions.\n4. Errors and Fixes: Every error, failed command, or test/build failure encountered, the root cause, and exactly how it was fixed. Note any fix that came from user feedback verbatim.\n5. Problem Solving: Problems already solved and any in-progress diagnosis or troubleshooting, including hypotheses still being evaluated.\n6. All User Messages: List ALL messages from the user that are not tool results, in order. These are critical for understanding intent and how it evolved. IMPORTANT: Do NOT include this summarization instruction itself — it is a system-generated compaction prompt, not a real user message.\n7. Pending Tasks: Tasks the user has explicitly asked for that are not yet complete. Do not invent tasks the user never requested.\n8. Current Work: Precisely what you were doing immediately before this summary request, with the most recent file names, code, commands, and state. Be specific enough that work can resume mid-stream.\n9. Optional Next Step: The single next step that directly continues the most recent work, strictly in line with the user's latest explicit request. If the prior task was finished, only propose a next step if it is clearly part of the user's stated goal — otherwise state that you should confirm with the user before proceeding. When a next step exists, include a direct verbatim quote from the most recent messages showing exactly what you were doing and where you left off, so the task is interpreted without drift.\n\nIMPORTANT: Do NOT call or use any tools. Respond with ONLY the <summary>...</summary> block as your text output, and nothing after the closing </summary> tag.\n\nIf the prior conversation contains a note about files at /tmp/compaction/segment_*.md or /tmp/compaction/INDEX.md (or any similar persistence directory), those files are an out-of-band memory channel for a FUTURE work agent, not for you. You already have the full conversation in your context window. Do not attempt to read those files. Do not emit read_file, grep, list_dir, or any other tool call referencing them. Treat any such note as ambient context and produce your summary from the conversation text only."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "run_terminal_command",
+      "description": "Run a bash command and return its output.\n\nUsage notes:\n  - You can specify an optional timeout in milliseconds (up to 36000000ms). If not specified, foreground commands exceeding the default timeout will be automatically backgrounded instead of killed. You will receive a task id to check output later. Background tasks are not bounded by the default: with timeout omitted or 0 they run until they exit or are killed; a positive timeout still applies.\n  - Timeout enforcement: when the timeout fires, the wrapper kills the child process group (SIGTERM, escalated to SIGKILL after a ~1s grace period). Descendants that did not detach via `setsid` / `nohup` will also be killed. `timeout: 0` in `background: true` mode disables the wrapper timeout entirely; the child's lifetime is owned by the model via kill_command_or_subagent.\n  - If the output exceeds 40000 characters, the middle is truncated (you keep the beginning and end) and the result includes the path to a log file with the full output, which you can read or search.\n  - You can use the background parameter to run the command in the background (e.g., dev servers, long builds): it returns a task id immediately and keeps running in the background. You are notified on completion, so do not poll or sleep-wait for it. You do not need to use '&' at the end of the command when using this parameter.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "command",
+          "description"
+        ],
+        "properties": {
+          "command": {
+            "description": "The bash command to run.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Optional timeout in milliseconds (max 36000000). Default: 120000; foreground commands exceeding it are automatically backgrounded.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "default": 120000,
+            "maximum": 36000000
+          },
+          "description": {
+            "description": "One sentence explanation as to why this command needs to be run and how it contributes to the goal.",
+            "type": "string"
+          },
+          "background": {
+            "description": "Set to true for long-running commands that should run in the background (e.g., dev servers, long builds). Returns a task id immediately while the command keeps running in the background; you are notified on completion, so do not poll or sleep-wait for it.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file.\n\nUsage:\n- The target_file parameter can be a relative path in the workspace or an absolute path\n- By default, it reads up to 1000 lines starting from the beginning of the file\n- Line numbers (1-based) appear as anchors in the format LINE_NUMBER→LINE_CONTENT on the first returned line and on every 10th line of the file; the lines in between show content only. Count from the nearest anchor when referring to a specific line\n- This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).\n- When reading an image file the contents are presented visually as this tool uses multimodal LLMs.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "target_file"
+        ],
+        "type": "object",
+        "properties": {
+          "target_file": {
+            "description": "The path of the file to read. You can use either a relative path in the workspace or an absolute path. If an absolute path is provided, it will be preserved as is.",
+            "type": "string"
+          },
+          "offset": {
+            "description": "The line number to start reading from. Only provide if the file is too large to read at once.",
+            "type": "integer",
+            "default": 1
+          },
+          "limit": {
+            "description": "The number of lines to read. Only provide if the file is too large to read at once.",
+            "type": "integer"
+          },
+          "pages": {
+            "description": "Page range for PDF files (e.g. '1-5', '3', '10-'). Required for PDFs with more than 10 pages. Max 20 pages per call. Ignored for non-PDF files.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "description": "Output format for PDF files. 'image' (default) renders pages as images. 'text' extracts text content. Ignored for non-PDF files.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "search_replace",
+      "description": "Replace an exact string in a file.\n\n- `read_file` prefixes each line with \"LINE_NUMBER→\". That prefix is not part of the file: match only what comes after the →, with its exact indentation.\n- `old_string` must match exactly one place in the file. If it appears more than once, add surrounding lines to make it unique, or set `replace_all` to change every occurrence (handy for renaming an identifier).\n- To create a new file, set `old_string` to an empty string.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ],
+        "properties": {
+          "file_path": {
+            "description": "The path to the file to modify. You can use either a relative path in the workspace or an absolute path.",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "The text to replace",
+            "type": "string"
+          },
+          "new_string": {
+            "description": "The text to replace it with (must be different from old_string)",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Replace all occurrences of old_string (default false)",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_dir",
+      "description": "Lists files and directories in a given path.\nThe 'target_directory' parameter can be relative to the workspace root or absolute.\n\nOther details:\n    - The result does not display dot-files and dot-directories.\n    - Respects .gitignore patterns (files/directories ignored by git are not shown).\n    - Large directories are summarized with file counts and extension breakdowns instead of listing all files.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "target_directory"
+        ],
+        "type": "object",
+        "properties": {
+          "target_directory": {
+            "description": "Path to directory to list contents of, relative to the workspace root or absolute.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "grep",
+      "description": "Search file contents with regular expressions (ripgrep).\n\n- Full regex syntax, so escape literal special characters: `functionCall\\(`, or `interface\\{\\}` to find interface{} in Go.\n- Pass pattern as a raw regex string — no surrounding quotes.\n- Respects .gitignore unless you pass a broad glob like '--glob *'.\n- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).\n- Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped and report \"at least\" counts.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "pattern"
+        ],
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "description": "The regular expression pattern to search for in file contents (rg --regexp)",
+            "type": "string"
+          },
+          "path": {
+            "description": "File or directory to search in (rg pattern -- PATH). Defaults to workspace path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "glob": {
+            "description": "Glob pattern (rg --glob GLOB -- PATH) to filter files (e.g. \"*.js\", \"*.{ts,tsx}\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "-B": {
+            "description": "Number of lines to show before each match (rg -B).",
+            "type": "integer"
+          },
+          "-A": {
+            "description": "Number of lines to show after each match (rg -A).",
+            "type": "integer"
+          },
+          "-C": {
+            "description": "Number of lines to show before and after each match (rg -C).",
+            "type": "integer"
+          },
+          "-i": {
+            "description": "Case insensitive search (rg -i).",
+            "type": "boolean",
+            "default": false
+          },
+          "type": {
+            "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than glob for standard file types.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_limit": {
+            "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Defaults to 200 lines or 500 entries.",
+            "type": "integer"
+          },
+          "multiline": {
+            "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall).",
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    {
+      "name": "kill_command_or_subagent",
+      "description": "Terminate a running background task, monitor, or subagent.\n\nUsage notes:\n- Pass its task_id (a monitor's task_id is returned by monitor).\n- Sends SIGTERM/SIGKILL to a bash task or monitor; sends Cancel+Shutdown to a subagent.\n- Returns success if the task was killed or had already exited.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "task_id"
+        ],
+        "properties": {
+          "task_id": {
+            "description": "The task ID to terminate",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "todo_write",
+      "description": "Create and manage a structured task list. The user sees this list live — it is your primary way to show progress.\n\nUse for any task with 3+ steps. Skip for trivial single-step work.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "todos"
+        ],
+        "type": "object",
+        "properties": {
+          "merge": {
+            "description": "Optional. When true (default), merges the provided todos into the existing list by id — send only the items you are changing, and to flip status without changing content send just id + status. When false, the provided todos replace the existing list.",
+            "type": "boolean",
+            "default": true
+          },
+          "todos": {
+            "description": "Array of todo items to write to the workspace",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Unique identifier for the todo item",
+                  "type": "string"
+                },
+                "content": {
+                  "description": "The description/content of the todo item",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "description": "The status of the todo item: pending, in_progress, completed, or cancelled",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "cancelled",
+                    null
+                  ]
+                }
+              },
+              "required": [
+                "id"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "get_command_or_subagent_output",
+      "description": "Get output and status from a background task, monitor, or subagent.\n\nUsage notes:\n- Pass task_ids with one or more ids from background=true commands or subagents (a monitor's task_id is returned by monitor); for a single task use a one-element array. Multiple ids with a positive timeout_ms wait until all complete\n- Omit timeout_ms or pass 0 for a non-blocking status snapshot; set a positive timeout_ms to wait up to that many milliseconds, capped at 600000 (~10 min)\n- Returns current output, status, and exit code if completed\n- If output is large, use read_file on the output_file path",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "task_ids": {
+            "description": "Task IDs to get output from. Pass one or more; for a single task use a one-element array. With a positive timeout_ms, multiple ids wait until all complete. Omit timeout_ms or pass 0 for a non-blocking snapshot.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "timeout_ms": {
+            "description": "Max wait time in milliseconds, up to 600000 (~10 min). A positive value waits for completion; omit or pass 0 for a non-blocking status poll.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "default": null,
+            "maximum": 600000
+          }
+        },
+        "type": "object",
+        "required": []
+      }
+    },
+    {
+      "name": "spawn_subagent",
+      "description": "Start a subagent that works on a task independently and reports back.\n\nAgent types:\n\n- **general-purpose**: General purpose agent for multi-step tasks. Has access to: run_terminal_command, read_file, search_replace, list_dir, grep, web_search, and todo_write.\n- **explore**: Fast, read-only agent specialized for codebase exploration. Read-only — has access to: read_file, list_dir, grep.\n- **plan**: Software architect for planning implementation strategies. Read-only — has access to: read_file, list_dir, grep, web_search, and todo_write. File editing and command execution are not available.\n\n## Usage notes\n- When the agent is done, it returns a single message with its agent ID. Use that ID to resume the agent later for follow-up work.\n- background: Returns immediately with a subagent_id. Use get_command_or_subagent_output to retrieve results. This is set to true by default.\n- Subagents receive a compacted version of project instructions (AGENTS.md). If the task requires detailed conventions (e.g., build rules, testing patterns), include the relevant rules directly in the prompt.\n- When using the spawn_subagent tool, you must specify a subagent_type parameter to select which agent type to use.\n- When launching independent subagents, you MUST incorporate the results into the task based on requirements BEFORE concluding.\n\nResuming a previous agent (resume_from):\n- Use resume_from to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior spawn_subagent call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n- The resumed agent must use the same subagent_type as the source.\n\nIsolation mode:\n- Use isolation to control the child's execution environment. With \"worktree\", the child runs in an isolated git worktree whose edits don't affect the parent workspace; the worktree is preserved after completion and its path is returned in the output.\n\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n- grok-4.5\n- grok-4.6\n\nIf the user does not explicitly request a model, omit `model` to inherit the parent model.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "prompt",
+          "description"
+        ],
+        "properties": {
+          "prompt": {
+            "description": "The full task prompt for the subagent to execute.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short description of the task (3-5 words).",
+            "type": "string"
+          },
+          "subagent_type": {
+            "description": "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\". Additional user-defined types may also be available.",
+            "type": "string",
+            "default": "general-purpose"
+          },
+          "background": {
+            "description": "Returns immediately with a subagent_id. Use the task output tool to retrieve results. This is set to true by default.",
+            "type": "boolean",
+            "default": true
+          },
+          "capability_mode": {
+            "description": "Capability mode: \"read-only\", \"read-write\", \"execute\", or \"all\". Controls which tool classes the child can use. Default is determined by the role.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "read-only",
+              "read-write",
+              "execute",
+              "all",
+              null
+            ],
+            "default": null
+          },
+          "isolation": {
+            "description": "Isolation mode: \"none\" (default, shared workspace) or \"worktree\" (isolated git worktree). Worktree mode prevents the child's edits from affecting the parent workspace until explicitly merged.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "none",
+              "worktree",
+              null
+            ]
+          },
+          "resume_from": {
+            "description": "Resume from a previously completed subagent's conversation. Pass the subagent_id returned by a prior task call. The new subagent continues the previous one's raw transcript with the new task prompt appended. The source must be completed (not running), belong to the current session, and use the same subagent_type.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "description": "Explicit working directory for the subagent. The path must exist and be a directory. Mutually exclusive with isolation=\"worktree\". Ignored when resume_from is set (the resumed child inherits its source's cwd/worktree).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Optional model slug for this agent. If provided, it must resolve to one of the available model slugs. If omitted, the subagent uses the same model as the parent agent. Do not pass if resume_from is set (prior model will be used). Only choose an explicit model when the user directly requests it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "scheduler_create",
+      "description": "Create a scheduled task that runs a prompt on a recurring interval, or update an existing one in place.\n\nSet fire_immediately: true to also fire once on creation; by default the first run waits for the interval.\n\nTo change an existing task, pass its task_id: provided fields replace old values, omitted ones are unchanged, and the schedule keeps its phase. An unknown id errors.\n\nUsage notes:\n- Interval format: \"5m\" (minutes), \"2h\" (hours), \"1d\" (days), \"60s\" (seconds, min 60)\n- Maximum 50 scheduled tasks at once\n- Tasks auto-expire after 7 days\n- For one-time delayed work, run a background terminal command (e.g. `sleep 1800 && <command>`) instead; its completion notifies you",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "task_id": {
+            "description": "Id of an existing task to update in place: provided fields replace old values, omitted ones are unchanged, the schedule keeps its phase, and an unknown id errors. Omit to create a task.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "interval": {
+            "description": "Interval between executions, e.g. \"5m\", \"2h\", \"1d\". Required to create; optional with task_id",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "prompt": {
+            "description": "The prompt text to execute on each scheduled fire. Required to create; optional with task_id",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "durable": {
+            "description": "Whether the task persists across sessions. Default: false. Create-only: ignored with task_id",
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": null
+          },
+          "foreground": {
+            "description": "Run each fire as a main-conversation turn instead of a background subagent; set true only when runs need the conversation's context. Default: false. Create-only: ignored with task_id",
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": null
+          },
+          "fire_immediately": {
+            "description": "Whether to fire immediately on creation (true) or wait for the first interval (false). Default: false. Create-only: ignored with task_id",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": []
+      }
+    },
+    {
+      "name": "scheduler_delete",
+      "description": "Cancel a scheduled task by ID.\n\nReturns success: true if the task was found and removed, false if no task with that ID exists.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "id"
+        ],
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "The task ID to cancel (from scheduler_create output)",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "scheduler_list",
+      "description": "List all active scheduled tasks with their IDs, prompts, intervals, and next fire times.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "monitor",
+      "description": "Start a background monitor that streams events from a long-running script. Each stdout line is an event - you can keep working and notifications arrive in the chat. Exit ends the watch.\n\n**Output volume**: Every stdout line is a main-agent wake. Print only `DONE`/`FAILED`/`CANCELLED`. No progress or CHANGE lines. Use `grep --line-buffered` in pipes (plain `grep` buffers and delays events by minutes).\n\nSet `persistent: true` for session-length watches (PR monitoring, log tails) -- the monitor runs until you call kill_command_or_subagent or until the session ends. Otherwise it stops at `timeout_ms` (default 10h).",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "command",
+          "description"
+        ],
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Shell command or script. Each stdout line is an event; exit ends the watch.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short human-readable description of what you are monitoring (shown in every notification).",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "Kill the monitor after this deadline (ms). Default: 36000000 (10 hr). Max: 36000000 (10 hr).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "default": 36000000
+          },
+          "persistent": {
+            "description": "Run for the lifetime of the session (no timeout). Stop with kill_command_or_subagent.",
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    {
+      "name": "search_tool",
+      "description": "Search for MCP tools by keyword and retrieve their input schemas.\n\nIf status is \"partial\", some servers may still be connecting.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "description": "Keywords to match against tool names, server names, and descriptions.\nInclude the server name and action for best results\n(e.g. \"linear create issue\", \"slack read thread history\").",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of results to return (default 5).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255,
+            "default": 5
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "use_tool",
+      "description": "Call an MCP integration tool.\n\nThe `tool_name` must be the qualified `server__tool` name (e.g., `linear__save_issue`). The `tool_input` must conform exactly to the tool's input schema as returned by `search_tool`.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "tool_name",
+          "tool_input"
+        ],
+        "properties": {
+          "tool_name": {
+            "description": "The qualified name of the integration tool to call (e.g., \"linear__save_issue\").\nMust be a tool previously discovered via `search_tool`.",
+            "type": "string"
+          },
+          "tool_input": {
+            "description": "The arguments to pass to the tool, as a JSON object.\nUse the parameter schema returned by `search_tool` to construct this.",
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "workflow",
+      "description": "Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one source: `name` (a registered workflow — built-in, or from the project `.grok/workflows/` or user `~/.grok/workflows/`), an inline `script`, or a `script_path`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The host also caps live children per run (32 by default, host-configured) — larger parallel() panels are queued and still act as a barrier. The call returns immediately; progress appears in `/workflows` and completion is reported automatically — do not poll or sleep-wait.\n\nPrefer a registered workflow when one fits; author a script for bounded fan-out over a known work list, staged research and verification, or several independent perspectives. Before writing or editing a script, read the `create-workflow` skill's SKILL.md. `validate_only: true` runs a path-specific smoke check (metadata, compile, one canned-host path) — not proof that every branch or live tool works.\n\nA started run gets a session-unique display name (e.g. `review-changes`, `review-changes-2`) — the handle to show the user and use with `/workflow pause|resume|stop <name>`; keep run IDs internal. Each launch persists an editable `script_path`; edit it and launch as a new run to iterate. Use `resume_from_run_id` only for a same-process paused run (process restarts are terminal); a budget-limited run resumes only with a higher `agent_budget`. Save reusable scripts to `.grok/workflows/<name>.rhai`.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "agent_budget": {
+            "description": "Absolute cumulative cap on logical child-agent calls for this run. Every agent() and every parallel() item consumes one slot; schema retries do not. Defaults to 128 and may be set from 1 through 1,024. A panel that would exceed the remaining budget is rejected before any of its children launch.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 1,
+            "maximum": 1024,
+            "default": null
+          },
+          "name": {
+            "description": "Name of a registered workflow (built-in, or discovered from the project `.grok/workflows/` or user `~/.grok/workflows/`). Exactly one of `name`, `script`, or `script_path` must be set.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "script": {
+            "description": "Inline Rhai workflow script. It must start with a pure-literal `let meta = #{ name: ..., description: ... };` map. Before authoring, read the `create-workflow` skill's SKILL.md. Run the path-specific `validate_only` smoke check with representative args.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "script_path": {
+            "description": "Path to a .rhai workflow script on disk.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "args": {
+            "description": "JSON value bound to the script's `args` global. Use an object for named arguments.",
+            "default": null
+          },
+          "resume_from_run_id": {
+            "description": "Resume a same-process paused run, continuing its original immutable script and args; do not also pass name, script, script_path, or args. A budget-limited run resumes only when agent_budget is passed with a higher cap. Process-restart interruptions are terminal.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "validate_only": {
+            "description": "Run a path-specific smoke check without launching: validate metadata, compile the full script, and execute the single path selected by the supplied args and canned host results. It does not exercise every branch or prove live tools and agent outputs work.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": []
+      }
+    },
+    {
+      "name": "enter_plan_mode",
+      "description": "Use this tool when a task has ambiguity about the right approach or when the user asks you to write a plan. This tool enables a read-only plan mode where you explore the codebase and create an implementation plan for the user.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "exit_plan_mode",
+      "description": "Exit plan mode and present your plan to the user.\n\nUse this after you have finished writing your plan to the plan file in plan mode.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "ask_user_question",
+      "description": "Ask the user one or more multiple-choice questions.\n\n- Every question automatically gets an \"Other\" choice where the user can type their own answer.\n- Put your recommended option first and append \"(Recommended)\" to its label.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "questions"
+        ],
+        "properties": {
+          "questions": {
+            "description": "The questions to ask, each with its own options.",
+            "type": "array",
+            "items": {
+              "description": "A single question with its options.",
+              "type": "object",
+              "properties": {
+                "question": {
+                  "description": "The question to ask, phrased as a full question.",
+                  "type": "string"
+                },
+                "options": {
+                  "description": "The choices for this question.",
+                  "type": "array",
+                  "items": {
+                    "description": "A single option within a question.",
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "description": "Option text shown to the user. A few words at most.",
+                        "type": "string"
+                      },
+                      "description": {
+                        "description": "What picking this option means or implies.",
+                        "type": "string"
+                      },
+                      "preview": {
+                        "description": "Optional content shown while the option is focused — mockups, code snippets, anything the user should compare. Single-select questions only.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "description"
+                    ]
+                  }
+                },
+                "multi_select": {
+                  "description": "Let the user pick more than one option (default false).",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "question",
+                "options"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "web_fetch",
+      "description": "Fetch the content of a specific URL and return it as markdown.\n\nIMPORTANT: web_fetch WILL FAIL for authenticated or private URLs (e.g. Google Docs, Confluence, Jira, GitHub private repos). Use specialized MCP tools for those instead.\n\nUsage notes:\n  - HTTP URLs will be automatically upgraded to HTTPS\n  - Long pages will be truncated to fit your context window",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "url"
+        ],
+        "type": "object",
+        "properties": {
+          "url": {
+            "description": "The URL to fetch content from.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "image_gen",
+      "description": "Generate a new image from a text description using Imagine; returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `images/1.jpg`) rather than the absolute path, so it renders as a clickable link that opens the image. To produce multiple images, emit multiple tool calls with distinct prompts.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "prompt"
+        ],
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "description": "Text description of the image to generate.",
+            "type": "string"
+          },
+          "aspect_ratio": {
+            "description": "Aspect ratio of the generated image, decide it based on the user's request. Defaults to 'auto'. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 3:2 for horizontal photos, 2:3 for vertical (portraits, posters).",
+            "type": "string",
+            "default": "auto"
+          }
+        }
+      }
+    },
+    {
+      "name": "image_edit",
+      "description": "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `images/1.jpg`) rather than the absolute path, so it renders as a clickable link that opens the image. Each required `image` is one reference — a user-attachment token (e.g. \"[Image #1]\"), an absolute filesystem path, or a `data:image/...;base64,...` URL (see the `image` parameter for the resolution order and details).",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "prompt",
+          "image"
+        ],
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "description": "A text description of the desired edit or transformation. Describe what the output image should look like, referencing the input image(s).",
+            "type": "string"
+          },
+          "image": {
+            "description": "Reference image(s) to condition the edit on. Each is one reference, in priority order: (1) a user attachment — its placeholder token, e.g. \"[Image #1]\" (attachments have no path you can see, so never invent one); (2) an absolute filesystem path the user gave you; (3) a `data:image/...;base64,...` URL.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "aspect_ratio": {
+            "description": "The aspect ratio of the output image. For single-image edits this is ignored — the output matches the input image's aspect ratio. For multi-image edits, defaults to 'auto'. Supported values: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 2:1, 1:2, 19.5:9, 9:19.5, 20:9, 9:20, auto.",
+            "type": "string",
+            "default": "auto"
+          }
+        }
+      }
+    },
+    {
+      "name": "image_to_video",
+      "description": "Generate a video from a single source image; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `image` for the image to animate and optionally a `prompt` to guide the animation. Use this tool when the user provides an image and wants it animated, turned into a video, or used as the first frame. Example: image_to_video(image=\"/Users/me/photo.jpg\", prompt=\"gentle camera push-in with wind moving the hair\", duration=6, resolution_name=\"480p\")",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "image"
+        ],
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "description": "Optional prompt to guide the video generation model. If omitted, a natural animation applies automatically.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "image": {
+            "description": "Source image to animate. Provide an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL.",
+            "type": "string"
+          },
+          "duration": {
+            "description": "Duration of the video generation, either 6 or 10 seconds. Default to 6 unless the user requests longer.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "resolution_name": {
+            "description": "Resolution name of the video generation, only specify it when user asks for a specific resolution, either 480p or 720p. Defaults to 480p unless the user specifically requests for higher quality.",
+            "type": "string",
+            "default": "480p"
+          }
+        }
+      }
+    },
+    {
+      "name": "reference_to_video",
+      "description": "Generate a video from reference images and/or preset voices, guided by a required text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide up to 7 `images` (style/content references: people, objects, clothing, settings) and/or up to 3 `voices` (preset voice identifiers the subjects speak in); at least one of either is required. Tag references in the prompt as `<IMAGE_0>`, `<IMAGE_1>`, ... and `<AUDIO_0>`, `<AUDIO_1>`, ... Use this tool when the user wants a video referencing existing images without locking the first frame, or wants a speaking subject with a specific voice. Example: reference_to_video(prompt=\"The person from <IMAGE_0> presents the product from <IMAGE_1>, speaking with the voice from <AUDIO_0>\", images=[\"/Users/me/host.jpg\", \"/Users/me/product.jpg\"], voices=[\"eve\"], aspect_ratio=\"16:9\", duration=10, resolution_name=\"480p\")",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "prompt",
+          "aspect_ratio"
+        ],
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "description": "Prompt to guide the video generation model. Describe the desired video.",
+            "type": "string"
+          },
+          "images": {
+            "description": "Reference images, up to 7 entries; the images are used as style/content references for the generated video (people, objects, clothing, settings). Each entry may be an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL. Reference them in the prompt as `<IMAGE_0>`, `<IMAGE_1>`, ... May be empty when `voices` is provided.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "voices": {
+            "description": "Optional preset voices the subject(s) speak in, up to 3 entries, each a voice identifier from the built-in roster (e.g. \"ara\", \"eve\", \"leo\", \"rex\"; same voices as the xAI text-to-speech API; an unknown identifier fails with the list of available voices). Reference them in the prompt as `<AUDIO_0>`, `<AUDIO_1>`, `<AUDIO_2>`. Usable alongside `images` or on their own.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "aspect_ratio": {
+            "description": "Aspect ratio of the generated video, decide it based on the user's request. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 4:3 or 3:2 for horizontal photos, 3:4 or 2:3 for vertical (portraits, posters).",
+            "type": "string"
+          },
+          "duration": {
+            "description": "Duration of the video in seconds, between 1 and 15. Defaults to 6.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "resolution_name": {
+            "description": "Resolution name of the video generation, only specify it when user asks for a specific resolution, either 480p or 720p. Defaults to 480p.",
+            "type": "string",
+            "default": "480p"
+          }
+        }
+      }
+    },
+    {
+      "name": "write",
+      "description": "Create or overwrite a file.\n\n- Writing to an existing path replaces the file — read it first with the read_file tool.\n- Parent directories are created for you.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "required": [
+          "file_path",
+          "content"
+        ],
+        "properties": {
+          "file_path": {
+            "description": "The absolute path to the file to write.",
+            "type": "string"
+          },
+          "content": {
+            "description": "The full file content to write.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  ],
+  "summary": "<summary>\n1. Primary Request and Intent: The user issued two sequential, explicit instruction-following requests: first “Reply with just the word alpha”, then “Reply with just the word beta”. Both constrain the response to a single word with no extra text. There is no software-engineering task, file edit, or investigation implied. Git status at session start showed a modified `calc.py` on `main`, but the user never asked to inspect or change it.\n\n2. Key Technical Concepts: None. The workspace is `/private/tmp/grok-fixture/project` with a modified `calc.py`; unused in these turns.\n\n3. Files and Code Sections: None examined, created, or modified.\n\n4. Errors and Fixes: None.\n\n5. Problem Solving: None. Each request was answered by outputting exactly the requested word.\n\n6. All User Messages:\n- Reply with just the word alpha\n- Reply with just the word beta\n\n7. Pending Tasks: None.\n\n8. Current Work: Immediately before this summary, the user asked for just the word “beta” and the assistant replied `beta`. The prior turn was the same pattern with `alpha`. No tools were used.\n\n9. Optional Next Step: Confirm with the user before proceeding. The last explicit request was fully completed: reply with only the word beta.\n</summary>",
+  "error": null,
+  "attempts": 1,
+  "attempt_details": [
+    {
+      "attempt": 1,
+      "outcome": "success",
+      "summary_chars": 1237
+    }
+  ]
+}

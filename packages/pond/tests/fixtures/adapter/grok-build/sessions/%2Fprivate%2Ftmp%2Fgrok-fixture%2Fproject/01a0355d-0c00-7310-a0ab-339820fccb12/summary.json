@@ -1,0 +1,24 @@
+{
+  "info": {
+    "id": "01a0355d-0c00-7310-a0ab-339820fccb12",
+    "cwd": "/private/tmp/grok-fixture/project"
+  },
+  "session_summary": "Run sleep 45 shell command",
+  "created_at": "2026-08-24T20:01:25.635446Z",
+  "updated_at": "2026-08-24T20:01:29.787341Z",
+  "num_messages": 4,
+  "num_chat_messages": 6,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "git_root_dir": "/private/tmp/grok-fixture/project/",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "request_id": "b30a5cc7-df36-4729-9d50-1a789d47cd84",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "last_active_at": "2026-08-24T20:01:28.736818Z",
+  "generated_title": "Run sleep 45 shell command",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}

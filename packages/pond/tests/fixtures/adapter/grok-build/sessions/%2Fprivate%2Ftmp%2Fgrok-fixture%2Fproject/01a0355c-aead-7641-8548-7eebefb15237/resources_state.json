@@ -1,0 +1,35 @@
+{
+  "state": {
+    "grok_build.ReportedTaskCompletions": {
+      "reported": []
+    }
+  },
+  "params": {
+    "grok_build.AskUserQuestion": {
+      "timeout_enabled": true,
+      "timeout_secs": 1800,
+      "non_interactive": true
+    },
+    "grok_build.WebFetch": {
+      "cache_ttl_secs": null,
+      "max_cache_entries": null,
+      "timeout_secs": null,
+      "max_content_length": null,
+      "max_markdown_length": null,
+      "context_window_tokens": 500000,
+      "allowed_domains": null,
+      "proxy_endpoint": null,
+      "allow_local": null
+    },
+    "grok_build.ListDir": {
+      "max_output_chars": null
+    },
+    "grok_build.Grep": {
+      "max_output_bytes": null,
+      "max_chars_per_line": null
+    },
+    "grok_build.ReadFile": {
+      "cursor_rules_on_read": false
+    }
+  }
+}

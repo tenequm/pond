@@ -32,6 +32,7 @@ mod claude_desktop_app;
 mod codex_cli;
 mod discovery;
 pub mod extract;
+mod grok_build;
 mod hermes;
 mod jsonl;
 mod letta_code;
@@ -54,6 +55,7 @@ pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
 };
+pub use grok_build::{GrokBuildAdapter, GrokBuildFactory};
 pub use hermes::{HermesAdapter, HermesFactory};
 pub use letta_code::{LettaCodeAdapter, LettaCodeFactory};
 pub use nanoclaw::{NanoclawAdapter, NanoclawFactory};
@@ -538,6 +540,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &PiCodingAgentFactory,
         &OhMyPiFactory,
         &LettaCodeFactory,
+        &GrokBuildFactory,
     ]
 }
 

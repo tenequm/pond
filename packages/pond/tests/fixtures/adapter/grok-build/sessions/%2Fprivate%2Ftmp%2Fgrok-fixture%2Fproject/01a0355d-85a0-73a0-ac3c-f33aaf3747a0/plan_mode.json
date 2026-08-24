@@ -1,0 +1,7 @@
+{
+  "state": "Inactive",
+  "was_previously_active": false,
+  "reminder_count": 0,
+  "pending_exit_reminder": false,
+  "awaiting_plan_approval": false
+}

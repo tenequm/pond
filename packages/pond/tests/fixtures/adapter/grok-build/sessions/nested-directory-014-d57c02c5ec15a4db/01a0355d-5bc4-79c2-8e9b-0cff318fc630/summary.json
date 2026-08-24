@@ -1,0 +1,23 @@
+{
+  "info": {
+    "id": "01a0355d-5bc4-79c2-8e9b-0cff318fc630",
+    "cwd": "/private/tmp/grok-fixture/project/nested-directory-001/nested-directory-002/nested-directory-003/nested-directory-004/nested-directory-005/nested-directory-006/nested-directory-007/nested-directory-008/nested-directory-009/nested-directory-010/nested-directory-011/nested-directory-012/nested-directory-013/nested-directory-014"
+  },
+  "session_summary": "",
+  "created_at": "2026-08-24T20:01:46.057723Z",
+  "updated_at": "2026-08-24T20:01:48.255580Z",
+  "num_messages": 4,
+  "num_chat_messages": 6,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "git_root_dir": "/private/tmp/grok-fixture/project/",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "request_id": "7ac40cc5-b7ec-44a7-917b-249ab490d7c4",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "last_active_at": "2026-08-24T20:01:48.255580Z",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}
