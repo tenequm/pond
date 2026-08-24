@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
 use std::path::Path;
 
 use pond::{
@@ -9,8 +7,46 @@ use pond::{
 };
 use tempfile::TempDir;
 
+use super::{Conformance, RoundTrip, path_config};
+
+const FIXTURE_ROOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/claude_code/projects"
+);
+
+fn conformance() -> Conformance<'static> {
+    Conformance {
+        factory: &ClaudeCodeFactory,
+        fixture_root: Path::new(FIXTURE_ROOT),
+        // 10 top-level sessions plus the `pond` session's 3 subagent sidecars
+        // (two direct, one workflow-nested), each a `claude-code/<type>` session.
+        expected_sessions: 13,
+        resync_rereads: &[],
+        round_trip: RoundTrip::Reingest { downgraded: &[] },
+        config: path_config,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
+    conformance().assert_ingest_counts_and_searchable().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
+    conformance().assert_resync_is_noop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_restore_round_trips_parents_and_subagents_through_reingest() -> anyhow::Result<()> {
+    conformance().assert_round_trip().await
+}
+
 /// Real native-Windows capture; see the fixture-gate test below.
-const WINDOWS_FIXTURES: &str = "tests/fixtures/adapter/claude_code/windows-projects";
+const WINDOWS_FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/claude_code/windows-projects"
+);
 
 /// The directory name Claude Code chose for the capture's `cwd`.
 const WINDOWS_SLUG: &str = "C--dev-pond-fixture-demo-v2";
@@ -30,7 +66,7 @@ const WINDOWS_CHILD_SUFFIX: &str = "agent-a44fd74de879ec6e2";
 async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
+    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
 
     let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     assert_eq!(summary.dropped_events, 0);
@@ -56,7 +92,7 @@ async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
 async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
+    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
 
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     let first_counts = store.row_counts().await?;
@@ -77,7 +113,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
+    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
 
     let mut events: Vec<SyncEvent> = Vec::new();
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
@@ -118,7 +154,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 async fn adapter_names_filters_subagents_by_default() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new("tests/fixtures/adapter/claude_code/projects");
+    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
     // `include_subagents=false` (the CLI default): sub-branded sessions

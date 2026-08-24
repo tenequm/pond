@@ -615,11 +615,11 @@ Adapters are listed in one registry; adding an adapter is a new file plus one li
 
 ### 6.8 Conformance
 
-Each adapter has a round-trip codec test: parse a committed fixture to canonical, serialize it back native, and assert the result is value-equal to the fixture - this is what enforces `adapter-native-restore-lossless` and exercises `model-lossless-projection`. Foreign serialization is tested for validity in the target format and reviewed against a golden file.
+Each adapter has a round-trip codec test: parse a committed fixture to canonical, serialize it back native, and assert the result is value-equal to the fixture - this is what enforces `adapter-native-restore-lossless` and exercises `model-lossless-projection`. The shared conformance harness (`packages/pond/tests/integration/adapter/mod.rs`) additionally proves the canonical fixed point - native output re-ingested through the adapter's own config face is canonically equal - or, where the native output targets an external import tool, names the test that owns value-equality. Foreign serialization is tested for validity in the target format and reviewed against a golden file.
 
 ### 6.9 Adapter set
 
-The adapter set is intentionally not listed here. The registry in `packages/pond/src/adapter/mod.rs` is the source of truth for which formats a build supports, and Section 6 is the contract every registered adapter must satisfy. Per-adapter extraction detail - how an adapter resolves `project`, what its `source_agent` brand is, its on-disk layout, and which source records it deliberately does not ingest - lives in that adapter's own code, which is its documentation.
+The adapter set is intentionally not listed here. The registry in `packages/pond/src/adapter/mod.rs` is the source of truth for which formats a build supports, and Section 6 is the contract every registered adapter must satisfy. Per-adapter extraction detail - how an adapter resolves `project`, what its `source_agent` brand is, its on-disk layout, and which source records it deliberately does not ingest - lives in that adapter's own code, which is its documentation. An adapter's format archaeology and decision record - facts about the upstream format and the choices made against it, which do not rot when pond's code changes - live in `docs/adapters/<source_agent>.md` (written with each adapter added under the playbook; none exist yet for the pre-playbook adapters); the code stays authoritative for extraction behavior.
 
 ---
 

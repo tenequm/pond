@@ -716,8 +716,10 @@ mod tests {
         Ok(())
     }
 
+    /// Serialize-shape only: the full serialize -> re-ingest -> canonical
+    /// equality round trip is the integration suite's `RoundTrip::Reingest`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_restore_round_trips_one_conversation() -> anyhow::Result<()> {
+    async fn native_restore_emits_a_one_conversation_export() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path().join("store")).await?;
         ingest_adapter(
@@ -749,27 +751,7 @@ mod tests {
             array[0].get("uuid").and_then(Value::as_str),
             Some(TOOL_CONV),
         );
-
-        let restore_dir = temp.path().join("restore");
-        std::fs::create_dir_all(&restore_dir)?;
-        std::fs::write(restore_dir.join(CONVERSATIONS_ENTRY), &files[0].bytes)?;
-        let restore_store = Store::open_local(temp.path().join("restore-store")).await?;
-        ingest_adapter(
-            &restore_store,
-            &ClaudeAiExportAdapter::new(&restore_dir),
-            &crate::adapter::NoopOracle,
-            |_| {},
-        )
-        .await?;
-        let restored = restore_store
-            .get_session(TOOL_CONV)
-            .await?
-            .expect("restored");
-        assert_eq!(
-            restored.messages.len(),
-            session.messages.len(),
-            "native restore replays every message",
-        );
+        assert_eq!(files[0].actual_fidelity, RestoreFidelity::Native);
         Ok(())
     }
 }

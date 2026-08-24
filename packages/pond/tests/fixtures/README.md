@@ -1,7 +1,7 @@
 # Session samples
 
 Curated, anonymized (or, where a real capture is infeasible, fully synthetic)
-session samples from 9 agentic-client platforms. These files
+session samples from 11 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
@@ -42,8 +42,9 @@ Constraints baked in:
 ```
 adapter/
   README.md                  this file
-  claude_app/                Claude Desktop (macOS), Cowork / local-agent-mode
+  claude_ai_export/          claude.ai data export (synthetic conversations.json)
   claude_code/               Claude Code CLI
+  claude_desktop_app/        Claude Desktop (macOS), Cowork / local-agent-mode
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
@@ -60,7 +61,13 @@ sample tree.
 
 ## Per-platform notes
 
-### claude_app (Claude Desktop, Cowork)
+### claude_ai_export (claude.ai data export)
+
+- Source: the official claude.ai data-export `.zip` (emailed download link), whose `conversations.json` entry is one JSON array of conversation objects - many sessions per file, no per-session files. Not auto-discoverable; the adapter is pointed at the `.zip`, an extracted directory, or the bare `conversations.json`.
+- Layout: `conversations.json` only. Each conversation carries `uuid`, `name`, `summary`, `created_at`, `updated_at`, `account.uuid`, and `chat_messages[]`; each message carries `uuid`, `sender` (`human` / `assistant`), `created_at`, and `content[]` blocks of `text`, `thinking`, `tool_use`, and `tool_result` (the export's `tool_result` has a tool `name` but no `tool_use_id`).
+- Samples: SYNTHETIC, hand-written to the export's shape rather than captured - 5 conversations under one account uuid: plain text, a `thinking` block, a `tool_use` + `tool_result` pair (the human turn of pure `tool_result` becomes a Tool message), an empty-`name` conversation, and a 0-message conversation (skipped as Empty; 4 sessions ingest). Schema-critical field names are the export's own; ids are the obvious `1111...`/`ffff...` placeholders.
+
+### claude_desktop_app (Claude Desktop, Cowork)
 
 - Source path: `~/Library/Application Support/Claude/local-agent-mode-sessions/<account-uuid>/<workspace-uuid>/`
 - Layout: pair per session. `local_<session-uuid>.json` is the metadata file
@@ -86,7 +93,7 @@ sample tree.
   for all because only one workspace existed on the source machine.
 - The web chat history at
   `~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/`
-  is described in `claude_app/schema-notes.md` but not captured (binary
+  is described in `claude_desktop_app/schema-notes.md` but not captured (binary
   LevelDB, separate extraction work).
 
 ### claude_code (Claude Code CLI)
@@ -122,6 +129,15 @@ sample tree.
   CLI versions and includes `queue-operation` entries (the message-queue
   feature - these carry no uuid / parentUuid and must be skipped in the
   parentUuid chain).
+- `windows-projects/` is a separate root holding a real native-Windows capture
+  (added 2026-08-14): two sessions under `C--dev-pond-fixture-demo-v2`, the slug
+  Claude Code chose for a `cwd` of `C:\dev\pond fixture_demo.v2`, one of them
+  with two subagent sidecars. It pins the project-slug encoding for drive
+  colons, backslashes, spaces, underscores and dots. Its consumers are the
+  Windows gate tests in `tests/integration/adapter/claude_code.rs` and the
+  `native_restore_is_value_equal_to_the_windows_capture` unit test in
+  `src/adapter/claude_code.rs`; the `projects/` conformance census stays 13
+  sessions.
 
 ### claude_managed_agents (Anthropic API Managed Agents)
 
@@ -412,14 +428,14 @@ Where formats fundamentally disagree (informs canonical type design in
 
 | Concern | Variants observed |
 |---|---|
-| Top-level file shape | JSONL stream (claude_code, codex_cli, pi, nanoclaw, openclaw, claude_app audit) vs JSON array (claude_managed_agents) vs fan-out tree (opencode) vs metadata + audit pair (claude_app) |
-| Message-to-event granularity | Coalesced messages (claude_code, opencode, openclaw, claude_app audit) vs per-event stream where one assistant turn produces many events (claude_managed_agents, codex_cli with separate `response_item`s) |
-| Tool call / result linking | Same-line content blocks (claude_code, claude_app, claude_managed_agents) vs separate top-level events (pi, codex_cli) vs side-table parts (opencode) vs inline content with separate `role:"toolResult"` (openclaw) |
-| Inter-message linking | parentUuid chain (claude_code) vs parentId tree (pi, openclaw) vs flat sequence with span IDs (claude_managed_agents) vs file order only (codex_cli, opencode, claude_app audit) |
-| Sidecar files | `tool-results/`, `subagents/` (nanoclaw) vs per-message part dirs (opencode) vs `uploads/` + `outputs/` (claude_app) vs none (most others) |
+| Top-level file shape | JSONL stream (claude_code, codex_cli, pi, nanoclaw, openclaw, claude_desktop_app audit) vs JSON array (claude_managed_agents) vs fan-out tree (opencode) vs metadata + audit pair (claude_desktop_app) |
+| Message-to-event granularity | Coalesced messages (claude_code, opencode, openclaw, claude_desktop_app audit) vs per-event stream where one assistant turn produces many events (claude_managed_agents, codex_cli with separate `response_item`s) |
+| Tool call / result linking | Same-line content blocks (claude_code, claude_desktop_app, claude_managed_agents) vs separate top-level events (pi, codex_cli) vs side-table parts (opencode) vs inline content with separate `role:"toolResult"` (openclaw) |
+| Inter-message linking | parentUuid chain (claude_code) vs parentId tree (pi, openclaw) vs flat sequence with span IDs (claude_managed_agents) vs file order only (codex_cli, opencode, claude_desktop_app audit) |
+| Sidecar files | `tool-results/`, `subagents/` (nanoclaw) vs per-message part dirs (opencode) vs `uploads/` + `outputs/` (claude_desktop_app) vs none (most others) |
 | Provider / model recording | Per-assistant-message (most) vs per-span via `span.model_request_*` events (claude_managed_agents) vs per-line `turn_context` (codex_cli) |
 | Encrypted opaque payloads | Codex `encrypted_content` Fernet blobs vs none |
-| HMAC over content | claude_app `_audit_hmac` vs none |
+| HMAC over content | claude_desktop_app `_audit_hmac` vs none |
 | Streaming on disk | None of the captured samples persists streaming deltas; all are coalesced to final-state |
 
 ## Anonymization rules applied
@@ -456,7 +472,7 @@ be applied to refreshed samples.
 - Long product-internal system prompts beyond standard runtime boilerplate
   -> `<redacted: ~Nk-char product system prompt>` (Cowork system prompts
   are preserved verbatim because they are identical across all Claude
-  Desktop users; see `claude_app/schema-notes.md`)
+  Desktop users; see `claude_desktop_app/schema-notes.md`)
 
 ### Preserved verbatim
 
@@ -479,7 +495,7 @@ be applied to refreshed samples.
 - Anthropic and OpenAI API field names
 - Codex `encrypted_content` Fernet payloads (opaque; pond cannot decrypt;
   preserved for schema fidelity)
-- claude_app `_audit_hmac` field values (cryptographically invalid against
+- claude_desktop_app `_audit_hmac` field values (cryptographically invalid against
   modified content but the field is kept so adapters see it)
 - Cowork system prompts (identical across all Claude Desktop users;
   preserved for schema fidelity)
@@ -525,12 +541,18 @@ Closed gaps (kept here briefly for history):
 - **nanoclaw single top-level session** - closed by adding
   `agentgroup-synthetic-001/` (2 synthetic structural-replay sessions; see
   the nanoclaw per-platform note).
-- **claude_app populated `uploads/` sidecar** - closed by adding the
+- **claude_desktop_app populated `uploads/` sidecar** - closed by adding the
   `local_5c09adfc` staged session. Also established definitively that
   `outputs/` is not a deliverable sink (the agent writes to the user's
   workspace folder); it stays empty by design, so it is not a gap.
 
 ## How to refresh
+
+New conformance fixtures follow the sandbox self-capture in
+`.agents/skills/add-adapter/SKILL.md` (run the agent under a throwaway home,
+so the capture is born clean and this file's rules become a verification
+step). The host-capture procedure below is the legacy path the pre-playbook
+samples came from; use it only to refresh one of those in place.
 
 To replace a sample with a fresh capture:
 

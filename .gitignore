@@ -23,9 +23,17 @@ Thumbs.db
 .secrets*
 tmp/
 .mcp.json
-/.claude/*local.json
-/.claude
-.agents/
+# Local agent state stays ignored; only the repo-native add-adapter skill is
+# committed (git never descends into ignored dirs, hence the unignore cascade).
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/add-adapter/
+*/**/.agents/
+/.claude/*
+!/.claude/skills/
+/.claude/skills/*
+!/.claude/skills/add-adapter
 skills-lock.json
 /packages/pond/benches/corpus/
 
