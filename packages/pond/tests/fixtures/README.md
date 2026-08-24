@@ -234,7 +234,8 @@ sample tree.
   environment only, `--yolo` to auto-approve tools. The first agent was
   driven through the interactive TUI under tmux (the only producer that
   writes tool rows; the `-p` one-shot path never writes the transcript), the
-  second through the headless bidirectional stream. Two agents:
+  second and third through the headless bidirectional stream (the third on
+  Windows 11, the rest on macOS). Three agents:
   - `agent-local-0ce90846-.../default` - a text-only turn, a two-tool turn
     (`Read` then `Bash`, both `resultOk: true`), a failed `Bash`
     (`resultOk: false`, exit code in `resultText`), and a reasoning turn
@@ -257,8 +258,23 @@ sample tree.
     turns from the headless bidirectional path (`user-<uuid>` line ids, no
     tool rows), so conversation ids visibly repeat across agents and the
     adapter's project (= agent id) has two values.
-- Census: 4 ingestible sessions; secret sweep trufflehog 0 / gitleaks 0; every
-  file parses; no host, username, `/Users/` path or provider key string.
+  - `agent-local-7ea0712d-.../local-conv-1` - the native Windows capture: a
+    third agent, same headless bidirectional path, written by letta-code
+    itself on Windows 11 Pro x64 (10.0.26200) on 2026-08-24 with letta-code
+    0.30.30 on Node v24.19.0 / npm 11.17.0, sandbox `USERPROFILE` / `HOME` /
+    `APPDATA` / `LOCALAPPDATA` under `C:\lf\home` and cwd `C:\lf\project`, so
+    the transcript root resolved to `C:\lf\home\.letta\transcripts`. Two
+    text-only turns (2 `user` + 2 `assistant` rows). Observed bytes: no UTF-8
+    BOM (file starts `7b 22 6b 69 6e 64` = `{"kind`), LF only (zero `\r` bytes),
+    final byte `0a`, every byte ASCII - identical to what the macOS captures
+    produce. No `C:\` path, username or hostname appears in any row; letta
+    records no cwd in the transcript (the stream-json `init` event does carry
+    `"cwd":"C:\\lf\\project"`, but that event is not part of the transcript).
+    This is what the adapter spec's Windows row rests on, and CI's Windows leg
+    ingests it with the rest of the fixture.
+- Census: 5 ingestible sessions; secret sweep trufflehog 0 / gitleaks 0; every
+  file parses; no host, username, `/Users/` path, `C:\` path or provider key
+  string.
 
 ### nanoclaw
 
