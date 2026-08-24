@@ -283,7 +283,7 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 5 | Crash-safe local stores that self-heal on open | ✅ [v0.14.0](https://github.com/tenequm/pond/releases/tag/v0.14.0) |
 | 6 | Eleven harnesses, `pond resume` into any client, MCP registry, Windows | ✅ [v0.14.11](https://github.com/tenequm/pond/releases/tag/v0.14.11) |
 | 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ✅ [v0.15.0](https://github.com/tenequm/pond/releases/tag/v0.15.0) |
-| 8 | New adapters become routine: `add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) | ⏭ Next |
+| 8 | New adapters become routine: `add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) - twelve harnesses | ✅ [v0.15.1](https://github.com/tenequm/pond/releases/tag/v0.15.1) |
 | 9 | Lance 10: count pushdown, date-filter zonemaps, faster index commits. [#145](https://github.com/tenequm/pond/issues/145) | ⏭ Next |
 | 10 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
 | 11 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
