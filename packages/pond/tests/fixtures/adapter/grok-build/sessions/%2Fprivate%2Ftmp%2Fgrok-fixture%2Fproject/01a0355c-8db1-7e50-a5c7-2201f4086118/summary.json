@@ -1,0 +1,26 @@
+{
+  "info": {
+    "id": "01a0355c-8db1-7e50-a5c7-2201f4086118",
+    "cwd": "/private/tmp/grok-fixture/project"
+  },
+  "session_summary": "Edit calc.py add to subtract, run tools",
+  "created_at": "2026-08-24T20:00:53.170698Z",
+  "updated_at": "2026-08-24T20:00:55.847842Z",
+  "num_messages": 34,
+  "num_chat_messages": 27,
+  "current_model_id": "grok-4.6",
+  "parent_session_id": "01a0355c-4cdd-7c62-9d7b-f0bd11ba9d2d",
+  "forked_at": "2026-08-24T20:00:53.170698Z",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "session_kind": "fork",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "request_id": "6c94b336-0f27-4370-9a74-da11b5d625a5",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "last_active_at": "2026-08-24T20:00:55.847842Z",
+  "generated_title": "Edit calc.py add to subtract, run tools",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}

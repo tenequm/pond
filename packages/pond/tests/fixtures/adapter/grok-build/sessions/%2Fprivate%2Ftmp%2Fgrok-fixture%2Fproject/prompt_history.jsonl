@@ -1,0 +1,14 @@
+{"timestamp":"2026-08-24T20:00:20.261450Z","session_id":"01a0355c-099c-71d0-ac0c-a9efb1907c77","prompt":"Reply with exactly three words describing a calm lake.","is_bash":false}
+{"timestamp":"2026-08-24T20:00:24.017719Z","session_id":"01a0355c-099c-71d0-ac0c-a9efb1907c77","prompt":"Now do the same for a busy harbor.","is_bash":false}
+{"timestamp":"2026-08-24T20:00:27.205855Z","session_id":"01a0355c-24ab-7031-bb96-f3697c6ad221","prompt":"What single color is this image? One word.","is_bash":false}
+{"timestamp":"2026-08-24T20:00:37.620029Z","session_id":"01a0355c-4cdd-7c62-9d7b-f0bd11ba9d2d","prompt":"Do these five things in order using tools, then reply with one short sentence: 1) run the shell command: echo fixture-tool-ok 2) read the file README.md 3) edit calc.py so that add returns a - b instead of a + b 4) run the shell command: cat /nonexistent/file 5) read the file /nonexistent/missing.txt","is_bash":false}
+{"timestamp":"2026-08-24T20:00:54.344988Z","session_id":"01a0355c-8db1-7e50-a5c7-2201f4086118","prompt":"What did the echo command print? One short sentence.","is_bash":false}
+{"timestamp":"2026-08-24T20:00:57.960839Z","session_id":"01a0355c-9c5a-71e3-8b8a-253db47e0a24","prompt":"Use the spawn_subagent tool with subagent_type explore to count the lines in README.md, then report the number in one short sentence.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:10.128386Z","session_id":"01a0355c-cbdb-7aa3-acb2-cadccaef1e88","prompt":"Make a short two-step plan for adding a CHANGELOG.md to this project and record it with your todo tool. Do not edit any files.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:19.816168Z","session_id":"01a0355c-f1a8-7440-8533-cfbb51894a1b","prompt":"Run the shell command: echo hook-check. Then reply with one word.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:26.446368Z","session_id":"01a0355d-0c00-7310-a0ab-339820fccb12","prompt":"Run the shell command: sleep 45. Then reply done.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:42.653722Z","session_id":"01a0355d-4ad7-7751-a53e-1cc1ba5a6ca4","prompt":"Reply with one word.","is_bash":false}
+{"timestamp":"2026-08-24T20:01:57.652209Z","session_id":"01a0355d-85a0-73a0-ac3c-f33aaf3747a0","prompt":"Reply with just the word alpha","is_bash":false}
+{"timestamp":"2026-08-24T20:02:12.686140Z","session_id":"01a0355d-85a0-73a0-ac3c-f33aaf3747a0","prompt":"Reply with just the word beta","is_bash":false}
+{"timestamp":"2026-08-24T20:02:38.800478Z","session_id":"01a0355d-85a0-73a0-ac3c-f33aaf3747a0","prompt":"Reply with just the word beta","is_bash":false}
+{"timestamp":"2026-08-24T20:03:19.868090Z","session_id":"01a0355d-85a0-73a0-ac3c-f33aaf3747a0","prompt":"Reply with just the word gamma","is_bash":false}

@@ -662,7 +662,11 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store};
+    use crate::{
+        adapter::jsonl::{PEEK_TAIL_CAP, peek_metering},
+        handlers::ingest_adapter,
+        sessions::Store,
+    };
     use tempfile::TempDir;
 
     const FIXTURES: &str = concat!(
@@ -753,6 +757,36 @@ mod tests {
                 .unsupported_path(&fixture_path(AGENT_A, "default"))
                 .is_none(),
         );
+    }
+
+    /// The freshness peek reads a bounded tail, never the file twice: the
+    /// budget is one window, and for a transcript under the cap that pins the
+    /// peek to a single pass over it. This is the declared freshness-read
+    /// budget the sync gate is held to.
+    #[test]
+    fn the_freshness_peek_stays_within_one_tail_window_per_file() -> anyhow::Result<()> {
+        let adapter = LettaCodeAdapter::new(FIXTURES);
+        for (agent, conversation) in [
+            (AGENT_A, "default"),
+            (AGENT_A, "local-conv-2"),
+            (AGENT_A, LEGACY),
+            (AGENT_B, "local-conv-1"),
+            (AGENT_WIN, "local-conv-1"),
+        ] {
+            let path = fixture_path(agent, conversation);
+            let (watermark, bytes) = peek_metering::measure(|| adapter.peek_watermark(&path));
+            assert!(
+                matches!(watermark, SourceWatermark::At(_)),
+                "{agent}/{conversation}: every captured transcript has a stamped tail",
+            );
+            let budget = std::fs::metadata(&path)?.len().min(PEEK_TAIL_CAP);
+            assert!(
+                bytes <= budget,
+                "{agent}/{conversation}: peek read {bytes} bytes, over the \
+                 {budget}-byte budget",
+            );
+        }
+        Ok(())
     }
 
     /// The watermark is the last row's stamp; an unparseable tail re-reads.

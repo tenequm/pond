@@ -1,0 +1,24 @@
+{
+  "info": {
+    "id": "01a0355c-099c-71d0-ac0c-a9efb1907c77",
+    "cwd": "/private/tmp/grok-fixture/project"
+  },
+  "session_summary": "Reply with exactly three words describing a calm lake.",
+  "created_at": "2026-08-24T20:00:19.490663Z",
+  "updated_at": "2026-08-24T20:00:25.214267Z",
+  "num_messages": 8,
+  "num_chat_messages": 8,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 2,
+  "chat_format_version": 1,
+  "git_root_dir": "/private/tmp/grok-fixture/project/",
+  "head_commit": "6cd080cf1e9140a169bca5d829592bfbdd5f72f2",
+  "head_branch": "main",
+  "request_id": "993e00b0-26e8-46d5-b639-6d8268e738c9",
+  "grok_home": "/tmp/grok-fixture/home/.grok",
+  "last_active_at": "2026-08-24T20:00:25.214267Z",
+  "generated_title": "Reply with exactly three words describing a calm lake.",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}

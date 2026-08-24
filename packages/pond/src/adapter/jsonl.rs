@@ -432,6 +432,8 @@ pub(crate) fn peek_nth_line(path: &Path, n: usize) -> Option<String> {
         if read == 0 {
             return None;
         }
+        #[cfg(test)]
+        peek_metering::record(read as u64);
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -458,6 +460,8 @@ pub(crate) fn read_tail(path: &Path, cap: u64) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(len - window)).ok()?;
     let mut buf = Vec::with_capacity(window as usize);
     (&mut file).take(window).read_to_end(&mut buf).ok()?;
+    #[cfg(test)]
+    peek_metering::record(buf.len() as u64);
     Some(buf)
 }
 
@@ -1040,5 +1044,36 @@ mod tests {
             "expected exactly one unsupported skip, got {} yields",
             yields.len(),
         );
+    }
+}
+
+/// Test-only meter for the freshness peek's read cost: an adapter declares a
+/// per-file read budget (a bounded tail, never the file) and its unit test
+/// holds the peek to it. Thread-local, so parallel tests never cross-count;
+/// disarmed (`None`) outside [`peek_metering::measure`], so unmetered peeks
+/// cost one branch.
+#[cfg(test)]
+pub(crate) mod peek_metering {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn record(n: u64) {
+        BYTES.with(|bytes| {
+            if let Some(current) = bytes.get() {
+                bytes.set(Some(current + n));
+            }
+        });
+    }
+
+    /// Run `f` with the meter armed on this thread; returns its result and the
+    /// bytes the peek helpers read on its behalf.
+    pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        BYTES.with(|bytes| bytes.set(Some(0)));
+        let out = f();
+        let read = BYTES.with(|bytes| bytes.replace(None)).unwrap_or(0);
+        (out, read)
     }
 }

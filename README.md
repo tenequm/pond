@@ -249,6 +249,7 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 | `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
 | `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |
 | `letta-code` | letta-code, `~/.letta/transcripts` (a root relocated via `LETTA_TRANSCRIPT_ROOT` is configured as an explicit `path`) | 2026-08-24 |
+| `grok-build` | grok-build (xAI `grok` CLI), `~/.grok/sessions` (a relocated `GROK_HOME` is configured as an explicit `path`) | 2026-08-24 |
 
 ### Verbosity
 
@@ -307,7 +308,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 | [kilo-org/kilocode](https://github.com/kilo-org/kilocode) | OpenCode fork. Adds `editorContext`, plan-followup, kilocode-specific events. |
 | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi-coding-agent leaf-cursor branching and cross-provider conformance test matrix. |
 | [open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions) | GenAI semantic conventions. Inspiration for shape overlap; pond does not derive from OTel. |
-| `packages/pond/tests/fixtures/adapter/` | Session samples for twelve source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, hermes, letta-code, nanoclaw, oh-my-pi, openclaw, opencode, pi-coding-agent; real captures except the synthetic hermes `state.db` and the generated oh-my-pi corpus). Drives adapter design and serves as adapter test fixtures. |
+| `packages/pond/tests/fixtures/adapter/` | Session samples for thirteen source harnesses (claude_ai_export, claude_code, claude_desktop_app, claude_managed_agents, codex_cli, grok-build, hermes, letta-code, nanoclaw, oh-my-pi, openclaw, opencode, pi-coding-agent; real captures except the synthetic hermes `state.db` and the generated oh-my-pi corpus). Drives adapter design and serves as adapter test fixtures. |
 
 ## Contributing
 

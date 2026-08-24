@@ -1,0 +1,4 @@
+{"ts":"2026-08-24T20:01:42.655Z","type":"turn_started","session_id":"01a0355d-4ad7-7751-a53e-1cc1ba5a6ca4","turn_number":0,"model_id":"x-ai/grok-code-fast-1","yolo_mode":false,"conversation_message_count":3,"session_relationship":"primary","schema_version":"1.0"}
+{"ts":"2026-08-24T20:01:42.656Z","type":"loop_started","loop_index":0}
+{"ts":"2026-08-24T20:01:42.656Z","type":"phase_changed","phase":"waiting_for_model"}
+{"ts":"2026-08-24T20:01:42.944Z","type":"turn_ended","outcome":"error"}
