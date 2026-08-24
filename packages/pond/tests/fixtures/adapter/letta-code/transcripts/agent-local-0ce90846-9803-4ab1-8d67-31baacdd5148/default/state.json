@@ -1,0 +1,9 @@
+{
+  "schema_version": "v3_assistant_steps",
+  "reflected_through_message_id": "letta-msg-187",
+  "total_completed_steps": 4,
+  "reflected_completed_steps": 4,
+  "steps_since_last_successful_reflection": 0,
+  "last_reflection_started_at": "2026-08-24T16:45:27.385Z",
+  "last_reflection_succeeded_at": "2026-08-24T16:46:07.459Z"
+}

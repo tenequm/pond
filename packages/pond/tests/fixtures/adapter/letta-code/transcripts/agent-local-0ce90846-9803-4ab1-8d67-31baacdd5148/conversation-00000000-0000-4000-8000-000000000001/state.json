@@ -1,0 +1,6 @@
+{
+  "schema_version": "v2_message_id",
+  "total_completed_turns": 1,
+  "reflected_completed_turns": 0,
+  "turns_since_last_successful_reflection": 1
+}

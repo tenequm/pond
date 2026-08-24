@@ -120,6 +120,21 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
         None
     }
 
+    /// The same verdict answered from the path alone - a transcript at a depth
+    /// or under a name the adapter cannot place. The driver honors it before
+    /// the freshness peek and before the file is opened, so a misconfigured
+    /// root rejects every file without parsing it on each sync. Default: none.
+    fn unsupported_path(&self, _path: &Path) -> Option<String> {
+        None
+    }
+
+    /// Whether [`JsonlTree::peek_session_id`] needs the file's first line. An
+    /// adapter whose identity is the path alone returns `false`, and the
+    /// freshness peek then never opens the file for it. Default: `true`.
+    fn peeks_first_line(&self) -> bool {
+        true
+    }
+
     /// A path the adapter knows carries no session data. Receives both files
     /// (a runner control file whose content duplicates real transcripts) and
     /// directories (a subtree another reader owns, e.g. nanoclaw's
@@ -347,6 +362,15 @@ fn collect_heads<D: JsonlTree>(
 }
 
 fn peek_head<D: JsonlTree>(driver: &D, path: &Path) -> FileHead {
+    // A path the driver cannot place has no stored side to compare against;
+    // the read loop skips it as `Unsupported` without opening it.
+    if driver.unsupported_path(path).is_some() {
+        return FileHead {
+            path: path.to_owned(),
+            session_id: None,
+            watermark: SourceWatermark::Opaque,
+        };
+    }
     // A zero-byte file provably holds nothing to ingest, in any format - the
     // one `Empty` verdict the seam owns. Drivers only judge non-empty files.
     if std::fs::metadata(path).is_ok_and(|meta| meta.len() == 0) {
@@ -356,7 +380,11 @@ fn peek_head<D: JsonlTree>(driver: &D, path: &Path) -> FileHead {
             watermark: SourceWatermark::Empty,
         };
     }
-    let first_line = peek_first_line(path).unwrap_or_default();
+    let first_line = if driver.peeks_first_line() {
+        peek_first_line(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let session_id = driver.peek_session_id(path, &first_line);
     let watermark = if session_id.is_some() {
         driver.peek_watermark(path)
@@ -534,6 +562,14 @@ fn read_one_file<D: JsonlTree>(
 
     let name = driver.name();
     let display = path.display().to_string();
+    if let Some(reason) = driver.unsupported_path(path) {
+        emit!(Ok(AdapterYield::Skipped {
+            session_id: None,
+            project: None,
+            reason: SkipReason::Unsupported(reason),
+        }));
+        return true;
+    }
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(source) => {
@@ -932,6 +968,12 @@ mod tests {
         fn peek_watermark(&self, _path: &Path) -> SourceWatermark {
             SourceWatermark::At(1)
         }
+        fn unsupported_path(&self, path: &Path) -> Option<String> {
+            path.file_name()?
+                .to_str()?
+                .starts_with("wrong-")
+                .then(|| "wrong place".to_owned())
+        }
         fn session(&self, _path: &Path, _rows: &[BoundedRow]) -> Result<Session, AdapterError> {
             unreachable!("collect_heads never builds sessions")
         }
@@ -965,6 +1007,38 @@ mod tests {
                 .iter()
                 .all(|head| head.session_id.is_some() && head.watermark == SourceWatermark::At(1)),
             "the peeked fields must survive the parallel fan-out",
+        );
+    }
+
+    /// A path verdict is honored before any byte is read: the peek yields no
+    /// id, and the read yields the skip alone - never a parse error from the
+    /// unparseable content behind it.
+    #[test]
+    fn a_path_verdict_skips_the_file_before_it_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_peek_file(&dir, "wrong-depth.jsonl", "not json at all\n");
+        let tree = PeekTree {
+            root: dir.path().to_owned(),
+        };
+        let heads = collect_heads(&tree, false).unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].session_id, None);
+        assert_eq!(heads[0].watermark, SourceWatermark::Opaque);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(read_one_file(&tree, &path, &tx));
+        drop(tx);
+        let yields: Vec<_> = std::iter::from_fn(|| rx.blocking_recv()).collect();
+        assert!(
+            matches!(
+                yields.as_slice(),
+                [Ok(AdapterYield::Skipped {
+                    reason: SkipReason::Unsupported(_),
+                    ..
+                })]
+            ),
+            "expected exactly one unsupported skip, got {} yields",
+            yields.len(),
         );
     }
 }
