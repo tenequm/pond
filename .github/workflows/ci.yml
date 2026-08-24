@@ -163,32 +163,19 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
+          s3-prefix: kache/pond/windows-verify/k27
           # verify only, never windows-dist: a restored harness has unresolved
           # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
           # of link time here; not worth it on the leg whose output ships.
           cache-executables: 'true'
 
-      # Diagnostic only, transfers nothing: --dry-run prints how many artifacts
-      # a real pull would move, and how long the enumeration itself takes. Both
-      # numbers size the bulk warm-up in slice 2 of
-      # docs/plans/2608-24-ci-caching-architecture.md - the lock-filtered path
-      # this measures is one sequential LIST per Cargo.lock crate, which is the
-      # cost that decides between it and `--pull --all` on a per-job prefix.
-      # Runs from the workspace root because the filter is parsed out of the
-      # Cargo.lock in the cwd. Output is capped: the dry run prints one line per
-      # key and the shared prefix holds tens of thousands. Bounded and
-      # non-blocking - a diagnostic must never be what fails the Windows gate.
-      - name: kache pull dry run
-        shell: pwsh
-        continue-on-error: true
-        timeout-minutes: 10
-        run: |
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          $out = kache sync --pull --dry-run
-          $sw.Stop()
-          "kache sync --pull --dry-run took $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
-          $out | Select-String -Pattern '^Plan:'
-          $out | Select-Object -First 30
+      # The round-one `kache pull dry run` step is gone, deliberately: it
+      # measured the lock-filtered enumeration (one sequential LIST per lock
+      # crate, 126.8 s measured against the shared prefix), and that number did
+      # its job - it sized round two in favor of `--pull --all` on a per-job
+      # prefix. The bootstrap's warm-up step now reports the same Plan: count
+      # and elapsed time from the pull that actually runs, so re-adding a
+      # lock-filtered dry run would buy nothing and cost ~2 min per run.
 
       # moon replays the hash main already stored when a diff touches none of a
       # task's declared inputs, which is every CI-only change - so a run whose
@@ -274,6 +261,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
+          s3-prefix: kache/pond/windows-dist/k27
 
       # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
       # prefix prewarms nothing if moon serves the stored hash, and the release
@@ -377,8 +365,8 @@ jobs:
     # Job-level, not step-level, so the bootstrap can see KACHE_S3_PREFIX and
     # assert it against the prefix in .github/kache/linux-dist.toml before
     # anything compiles. Bucket/endpoint/region stay here as well because the
-    # 0.9.0 CLI reads them ahead of the file, so removing them would change
-    # which settings are live rather than just where they are written.
+    # CLI reads them ahead of the file, so removing them would change which
+    # settings are live rather than just where they are written.
     # Credentials are deliberately env-only: they are the two KACHE_S3_*
     # variables a 0.15.0 daemon spawn does not strip, and they never enter a
     # committed file.
@@ -388,7 +376,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k27
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache

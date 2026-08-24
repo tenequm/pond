@@ -10,14 +10,15 @@
 # bucket and leaned on the job's KACHE_S3_* env - the env a 0.15.0 daemon
 # spawn no longer inherits.
 #
-# The 0.9.0 CLI still reads KACHE_S3_PREFIX ahead of this file, so the
-# bootstrap asserts the two agree before anything runs; a split would put the
-# daemon on one prefix and the CLI on another.
+# The CLI still reads KACHE_S3_PREFIX ahead of this file, so the bootstrap
+# asserts the two agree before anything runs; a split would put the daemon on
+# one prefix and the CLI on another.
 [cache.remote]
 type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Unchanged from the shared prefix for now; slice 2 moves it to
-# kache/pond/linux-dist/k21 (0.9.0's cache-key schema).
-prefix = "kache/pond"
+# Per-job and schema-tagged, same reasoning as windows-verify.toml. k27 is
+# kache 0.15.0's CACHE_KEY_VERSION - both legs bumped together, never one.
+# The old shared kache/pond prefix is left in place as the revert window.
+prefix = "kache/pond/linux-dist/k27"

@@ -35,11 +35,12 @@ inputs:
     required: true
   s3-prefix:
     description: >
-      Remote key prefix handed to kache-action. Declared once here rather than
-      per caller because both Windows legs share it today; the step below
-      asserts it equals the `prefix` in the selected .github/kache/*.toml and
-      fails the job if they differ.
-    default: kache/pond
+      Remote key prefix handed to kache-action. Required and per caller - each
+      build shape has its own schema-tagged prefix, and a shared default is
+      exactly how two shapes would silently land in one prefix again. The step
+      below asserts it equals the `prefix` in the selected .github/kache/*.toml
+      and fails the job if they differ.
+    required: true
 runs:
   using: composite
   steps:
@@ -193,7 +194,12 @@ runs:
         # Pinned like Linux pins KACHE_VERSION: the default resolves latest at
         # run time, so an upstream cache-key bump invalidates the store with no
         # commit here. 0.14.0's bump cost a 138 min run against 9.5 min warm.
-        version: v0.14.2
+        # Bumped in lockstep with the Linux KACHE_VERSION and the k-tag in the
+        # prefixes, never alone. 0.15.0 strips the remote env from daemons it
+        # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
+        # what the bump buys is key schema 27, whose schema 25 predecessor
+        # could under-key (module-body swaps, include_dir renames).
+        version: v0.15.0
         manifest-key: ${{ inputs.manifest-key }}
         # The hosted runner's disk is far smaller than kache's 50GiB default,
         # and an evicted local entry costs a remote fetch, not a rebuild.
@@ -233,3 +239,27 @@ runs:
         if ($remote -notmatch "^s3://.+/$([regex]::Escape($env:KACHE_PREFIX_EXPECTED))$") {
           throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
         }
+
+    # Bulk warm-up before cargo starts: one paginated LIST of the per-job
+    # prefix plus concurrent downloads with no per-object demand ceiling,
+    # instead of ~1450 on-demand fetches at ~250 ms each - this is what removes
+    # the aggregate demand latency and the >3 s recompiles (lance's 57 MB blob
+    # can never beat the wrapper's hard 3 s demand window). Only safe because
+    # the prefix holds exactly this job's artifacts: --all pulls the whole
+    # prefix, which is also the rotation trigger - rotate when the Plan: line
+    # exceeds about twice the working set (~1450 units / 1.2 GB).
+    #
+    # --allow-partial because 0.15.0 exits non-zero on any failed transfer.
+    # The trailing `exit 0` is the composite-action stand-in for
+    # continue-on-error: a warm-up failure must degrade to demand fetches
+    # during the build, never redden a job that would compile through fine.
+    - name: Warm the kache store
+      shell: pwsh
+      run: |
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $out = kache sync --pull --all --allow-partial 2>&1
+        $sw.Stop()
+        "kache sync --pull --all took $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
+        $out | Select-String -Pattern '^Plan:|^Sync|failed'
+        $out | Select-Object -First 20
+        exit 0

@@ -3,8 +3,8 @@
 # docs/plans/2608-24-ci-caching-architecture.md, for why the remote lives in a
 # file and the credentials do not.
 #
-# A separate file rather than a shared one because slice 2 gives each build
-# shape its own prefix: nothing is shared across these two anyway (windows-dist
+# A separate file rather than a shared one because each build shape carries
+# its own prefix: nothing is shared across these two anyway (windows-dist
 # inherits the dist profile's thin LTO and cgu=1, so the rustc flags differ per
 # unit and the keys never collide).
 #
@@ -16,6 +16,8 @@ type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Unchanged from the shared prefix for now; slice 2 moves it to
-# kache/pond/windows-dist/k25.
-prefix = "kache/pond"
+# Per-job and schema-tagged, same reasoning as windows-verify.toml. This
+# prefix starts empty: the first release build after the rotation is the cold
+# one (~76 min), which is why it gets a forced prewarm dispatch before the
+# next release PR merges.
+prefix = "kache/pond/windows-dist/k27"

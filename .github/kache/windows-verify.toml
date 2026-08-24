@@ -21,14 +21,16 @@
 # silence exactly those. Credentials stay in env too - KACHE_S3_ACCESS_KEY and
 # KACHE_S3_SECRET_KEY come from repository secrets and never enter a file.
 #
-# Every key below exists unchanged in 0.9.0 and 0.14.2 (RemoteFileConfig).
-# Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
+# Every key below exists unchanged in 0.9.0, 0.14.2 and 0.15.0
+# (RemoteFileConfig). Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
 [cache.remote]
 type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Still the prefix every leg already shares, so nothing goes cold on this
-# change. Slice 2 moves it to kache/pond/windows-verify/k25 together with the
-# s3-prefix input in the bootstrap.
-prefix = "kache/pond"
+# Per-job and schema-tagged: nothing is shared across build shapes anyway (the
+# rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
+# whole prefix so the prefix must hold only this job's artifacts, and the k27
+# tag (kache 0.15.0's CACHE_KEY_VERSION) keeps the next schema rotation a
+# sibling directory instead of a subtree - rotation IS the remote GC.
+prefix = "kache/pond/windows-verify/k27"

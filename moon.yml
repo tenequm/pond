@@ -75,8 +75,15 @@ tasks:
       # named no bucket and leaned on the job's KACHE_S3_* env, which 0.15.0
       # strips from a daemon spawn. Push on EXIT, not after success: crates
       # compiled before a failure still warm the retry.
+      # --all: one paginated LIST of the per-job prefix instead of one LIST
+      # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
+      # worse from a runner). Safe only because the prefix holds exactly this
+      # job's artifacts. --allow-partial: 0.15.0 exits non-zero on any failed
+      # transfer, and under `set -euo pipefail` that would redden a job that
+      # would compile through fine - a partial pull is a slower build, never a
+      # broken one.
       export RUSTC_WRAPPER=kache
-      kache sync --pull
+      kache sync --pull --all --allow-partial
       trap 'kache sync --push || true' EXIT
 
       # Cargo unifies features across all targets in one invocation, leaking
