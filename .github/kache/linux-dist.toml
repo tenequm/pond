@@ -1,0 +1,23 @@
+# kache's remote for the Linux dist-build leg. Same shape and same reasoning as
+# .github/kache/windows-verify.toml - see that file's header, or
+# docs/plans/2608-24-ci-caching-architecture.md, for why the remote lives in a
+# file and the credentials do not.
+#
+# Selected by the KACHE_CONFIG that .github/actions/bootstrap exports; the
+# consumer is the `build-dist` task in the root moon.yml, which runs from the
+# repo root with RUSTC_WRAPPER=kache. This file replaces the two-line
+# ~/.config/kache/config.toml stub that task used to write, which named no
+# bucket and leaned on the job's KACHE_S3_* env - the env a 0.15.0 daemon
+# spawn no longer inherits.
+#
+# The 0.9.0 CLI still reads KACHE_S3_PREFIX ahead of this file, so the
+# bootstrap asserts the two agree before anything runs; a split would put the
+# daemon on one prefix and the CLI on another.
+[cache.remote]
+type = "s3"
+bucket = "ttq"
+endpoint = "https://nbg1.your-objectstorage.com"
+region = "nbg1"
+# Unchanged from the shared prefix for now; slice 2 moves it to
+# kache/pond/linux-dist/k21 (0.9.0's cache-key schema).
+prefix = "kache/pond"

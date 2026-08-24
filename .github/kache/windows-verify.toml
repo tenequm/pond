@@ -1,0 +1,34 @@
+# kache's remote for the windows-verify leg, in a committed file rather than in
+# the job's environment because a daemon cannot watch an environment: 0.15.0
+# strips KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
+# spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) and keeps KACHE_CONFIG,
+# which is why "file for the remote, env for the secrets" is the shape that
+# survives the next bump.
+#
+# Selected by the KACHE_CONFIG that .github/actions/windows-bootstrap exports
+# before the kache-action step; discovery is KACHE_CONFIG > nearest .kache.toml
+# > XDG at both 0.9.0 and 0.14.2 (src/config.rs, resolve_config_path). NOT a
+# repo-root .kache.toml: that is found by every contributor running kache as
+# RUSTC_WRAPPER anywhere inside a checkout and silently points them at a bucket
+# they have no credentials for.
+#
+# `prefix` MUST equal the s3-prefix the bootstrap hands kache-action; the
+# bootstrap asserts it and fails the job otherwise.
+#
+# [cache.remote] and nothing else. The store size, the prefetch caps,
+# KACHE_NAMESPACE and KACHE_MANIFEST_KEY stay in env (the last two have no file
+# form at all), and `[cache] ignore_env` is never set here because it would
+# silence exactly those. Credentials stay in env too - KACHE_S3_ACCESS_KEY and
+# KACHE_S3_SECRET_KEY come from repository secrets and never enter a file.
+#
+# Every key below exists unchanged in 0.9.0 and 0.14.2 (RemoteFileConfig).
+# Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
+[cache.remote]
+type = "s3"
+bucket = "ttq"
+endpoint = "https://nbg1.your-objectstorage.com"
+region = "nbg1"
+# Still the prefix every leg already shares, so nothing goes cold on this
+# change. Slice 2 moves it to kache/pond/windows-verify/k25 together with the
+# s3-prefix input in the bootstrap.
+prefix = "kache/pond"

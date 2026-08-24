@@ -22,7 +22,18 @@ inputs:
       Scopes kache's warm-prefetch manifest. MUST differ per build variant:
       every build sharing the bucket otherwise writes the same triple-keyed
       default and they clobber each other, silently dropping prefetch to zero.
+
+      Doubles as the config selector: this bootstrap loads
+      .github/kache/<manifest-key>.toml, so a new build variant gets its own
+      remote settings by adding a file with the matching name.
     required: true
+  s3-prefix:
+    description: >
+      Remote key prefix handed to kache-action. Declared once here rather than
+      per caller because both Windows legs share it today; the step below
+      asserts it equals the `prefix` in the selected .github/kache/*.toml and
+      fails the job if they differ.
+    default: kache/pond
 runs:
   using: composite
   steps:
@@ -72,11 +83,35 @@ runs:
         # network-attached disk on this image; D: is ~147 GB of fast local
         # storage and already holds target/ (actions/runner-images#12416).
         "KACHE_CACHE_DIR=D:\kache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        # Prefetch stops at 2GiB of blobs or 300s of scheduling by default and
-        # this graph is far past both - lance alone is 287 MB of ~790 crates -
-        # so the crates the caps drop are the expensive ones.
+        # Prefetch stops at 2GiB of blobs, 2000 entries, or 300s of scheduling
+        # by default and this graph is past two of the three - 1454 cached
+        # units, lance alone 287 MB of ~790 crates - so what a cap drops is an
+        # expensive crate. 0 means unlimited for each (src/config.rs;
+        # prefetch_key_budget_overflow returns 0 when max_keys is 0). The key
+        # cap is precautionary: 2000 is already above today's 1454.
         "KACHE_PREFETCH_MAX_BYTES=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "KACHE_PREFETCH_MAX_KEYS=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         "KACHE_PREFETCH_DEADLINE_SECS=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    # Same disk argument as KACHE_CACHE_DIR above: the cargo registry index and
+    # the unpacked .crate sources are thousands of small files, and on C: every
+    # one is a round trip to a network-attached disk. Set before rustup runs so
+    # the toolchain's first cargo invocation already writes to D:.
+    #
+    # CARGO_HOME moves, RUSTUP_HOME does not: rustup's proxies resolve
+    # toolchains out of RUSTUP_HOME and never read CARGO_HOME, and the proxies
+    # already on PATH are self-contained copies of rustup.exe, so cargo and
+    # rustc keep working with an empty D:\cargo\bin.
+    #
+    # This makes `--no-self-update` on the next step LOAD-BEARING: rustup's
+    # self-update looks for rustup.exe inside $CARGO_HOME/bin and hard-fails
+    # with "rustup is not installed at 'D:\cargo'" when it is absent
+    # (rust-lang/rustup#2946). Any rustup update added to this job needs the
+    # flag too.
+    - name: Put the cargo registry on the D drive
+      shell: pwsh
+      run: |
+        "CARGO_HOME=D:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     # rustup honors rust-toolchain.toml; the host triple IS the build target,
     # so no extra rust-std is downloaded.
@@ -87,6 +122,39 @@ runs:
         rustup toolchain install --no-self-update
         rustup show active-toolchain
         cargo --version
+
+    # The remote settings live in a committed file, not in this job's env,
+    # because a daemon cannot watch an environment: 0.15.0 strips
+    # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
+    # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) and keeps
+    # KACHE_CONFIG. Exported BEFORE kache-action so the daemon it starts, every
+    # rustc wrapper invocation, and the post step all load the same file.
+    # Discovery is KACHE_CONFIG > nearest .kache.toml > XDG, identically at
+    # 0.9.0 and 0.14.2 (src/config.rs, resolve_config_path).
+    #
+    # The assertion is not cosmetic. At 0.14.2 env beats file for the CLI and
+    # kache-action always exports KACHE_S3_PREFIX; at 0.15 the daemon loses the
+    # env prefix but keeps the file. A mismatch therefore means the daemon
+    # prefetches from and uploads to one prefix while save-manifest writes
+    # another - prefetch silently never lands, which is the exact failure this
+    # whole arrangement exists to remove.
+    - name: Select the kache config
+      shell: pwsh
+      env:
+        KACHE_CONFIG_NAME: ${{ inputs.manifest-key }}
+        KACHE_PREFIX_EXPECTED: ${{ inputs.s3-prefix }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $config = Join-Path $env:GITHUB_WORKSPACE ".github\kache\$($env:KACHE_CONFIG_NAME).toml"
+        if (-not (Test-Path $config)) { throw "no kache config at $config" }
+        $match = Select-String -Path $config -Pattern '^\s*prefix\s*=\s*"([^"]+)"' | Select-Object -First 1
+        if (-not $match) { throw "no [cache.remote] prefix in $config" }
+        $filePrefix = $match.Matches[0].Groups[1].Value
+        if ($filePrefix -ne $env:KACHE_PREFIX_EXPECTED) {
+          throw "kache prefix mismatch: $config has '$filePrefix', kache-action is given '$($env:KACHE_PREFIX_EXPECTED)'"
+        }
+        "KACHE_CONFIG=$config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "kache config $config, prefix $filePrefix"
 
     # kache on S3, deliberately NOT GitHub's cache: GitHub caps a repository at
     # 10 GB (raisable only as a paid metered SKU) and scopes entries per branch
@@ -111,7 +179,8 @@ runs:
         s3-region: nbg1
         # Same prefix as the dist build's raw-kache usage. Content-addressed and
         # triple-keyed, so sharing can only add hits, never cross-contaminate.
-        s3-prefix: kache/pond
+        # Asserted equal to the config file's `prefix` by the step above.
+        s3-prefix: ${{ inputs.s3-prefix }}
         s3-access-key-id: ${{ inputs.kache-access-key-id }}
         s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
         github-cache: false
@@ -126,3 +195,31 @@ runs:
         # Would require `pull-requests: write`, which this workflow deliberately
         # does not grant. The job summary carries the same report.
         pr-comment: false
+
+    # The one kache step deliberately allowed to redden the job, and the reason
+    # a bad config file makes CI red rather than slow: the wrapper calls
+    # Config::load() on every rustc invocation, so a TOML typo or a rejected
+    # prefix would otherwise kill 1454 compiles one at a time instead of once
+    # here. A config gate, not a connectivity gate - the `Remote:` line is
+    # resolved from the config without the bucket having to answer. Expect an
+    # auto-start line: `kache stats` starts a daemon if none is reachable, which
+    # is harmless here.
+    #
+    # The exit code is NOT the gate. Measured against 0.9.0: a config whose TOML
+    # does not parse makes `kache stats` print `Remote: not configured` and exit
+    # 0, which is precisely the silent local-only run this arrangement exists to
+    # prevent. So the assertion is on the line itself.
+    - name: Verify the kache config loads
+      shell: pwsh
+      env:
+        KACHE_PREFIX_EXPECTED: ${{ inputs.s3-prefix }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $stats = kache stats 2>&1
+        $stats
+        $line = $stats | Select-String -Pattern '^Remote:\s+(\S+)' | Select-Object -First 1
+        if (-not $line) { throw "kache stats printed no Remote: line" }
+        $remote = $line.Matches[0].Groups[1].Value
+        if ($remote -notmatch "^s3://.+/$([regex]::Escape($env:KACHE_PREFIX_EXPECTED))$") {
+          throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
+        }

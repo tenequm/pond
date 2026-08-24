@@ -25,6 +25,17 @@ runs:
         # proto from .moon/toolchains.yml on first use. These only put proto's
         # tool tree and the two package caches on the PVC, so the pods that
         # follow reuse them instead of re-downloading a toolchain per job.
+        #
+        # KACHE_CONFIG points at the committed remote settings rather than at
+        # the ~/.config/kache stub the build-dist task used to write. A daemon
+        # cannot watch an environment, and 0.15.0 strips
+        # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
+        # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) while keeping
+        # KACHE_CONFIG. Discovery is KACHE_CONFIG > nearest .kache.toml > XDG,
+        # identically at 0.9.0 and 0.14.2 (src/config.rs, resolve_config_path),
+        # so one mechanism covers both legs. Exported for every caller of this
+        # bootstrap; it is inert in the jobs that never set RUSTC_WRAPPER.
+        KACHE_CONFIG="$GITHUB_WORKSPACE/.github/kache/linux-dist.toml"
         {
           echo "CARGO_HOME=/ci-cache/cargo"
           echo "RUSTUP_HOME=/ci-cache/rustup"
@@ -32,7 +43,22 @@ runs:
           echo "PROTO_HOME=/ci-cache/proto"
           echo "npm_config_cache=/ci-cache/npm"
           echo "UV_CACHE_DIR=/ci-cache/uv"
+          echo "KACHE_CONFIG=$KACHE_CONFIG"
         } >> "$GITHUB_ENV"
+
+        # dist-build is the only caller that declares a remote, and the 0.9.0
+        # CLI reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so
+        # the CLI (env) and a future daemon (file) can never split across two
+        # prefixes - a split makes prefetch fetch from one place while the
+        # manifest is written to another, and nothing says so.
+        if [ -n "${KACHE_S3_PREFIX:-}" ]; then
+          test -f "$KACHE_CONFIG"
+          file_prefix=$(awk -F'"' '/^[[:space:]]*prefix[[:space:]]*=/ { print $2; exit }' "$KACHE_CONFIG")
+          if [ "$file_prefix" != "$KACHE_S3_PREFIX" ]; then
+            echo "kache prefix mismatch: $KACHE_CONFIG has '$file_prefix', job env has '$KACHE_S3_PREFIX'" >&2
+            exit 1
+          fi
+        fi
         export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
         export PROTO_HOME=/ci-cache/proto
         export PATH="/ci-cache/bin:/ci-cache/cargo/bin:$PATH"
