@@ -17,7 +17,7 @@ Adapters are structurally isolated from everything the release bench gate measur
 ## Decisions (resolved 2026-08-24)
 
 1. **Sequencing**: meta-work first, letta-code second (easiest adapter = cheapest shakedown; failures attribute to the meta-work, not the format), grok-build third (genuinely different shape: multi-file, ACP stream, forks, rewind - a real generality test).
-2. **Skill location**: committed at `.agents/skills/add-adapter/` with a committed symlink `.claude/skills/add-adapter` - the exact layout `npx skills` already materializes for managed skills, so the repo-native skill is indistinguishable from the tooling's own convention. Requires a gitignore unignore cascade (git never descends into ignored dirs). Not listed in `skills-lock.json` (repo-native, not CLI-managed).
+2. **Skill location**: committed at `.agents/skills/add-adapter/` with a committed symlink `.claude/skills/add-adapter` - the exact layout `npx skills` already materializes for managed skills, so the repo-native skill is indistinguishable from the tooling's own convention. Requires a gitignore unignore cascade (git never descends into ignored dirs). Not listed in `skills-lock.json` (repo-native, not CLI-managed). Accepted caveat: a Windows clone without symlink support checks the symlink out as a text file containing the path - harmless (the skill's real home is `.agents/skills/`, and Windows CI never loads skills); noted here so it is not re-litigated.
 3. **Harness scope**: shared conformance helpers + retrofit onto exactly three shape-diverse adapters - oh-my-pi (single JSONL), opencode (multi-file fan-out join), claude-ai-export (archive, not a live source). The remaining adapters are not retrofitted in PR1 (churn that teaches the harness nothing new); they migrate opportunistically when next touched.
 4. **Byte-counting freshness assertion: deferred to PR3.** Every existing adapter is tail-peek-shaped - one case. Grok's `updates.jsonl` can truncate and regrow on rewind (deja-vu finding), so a correct grok oracle reads a prefix, not a tail. The right harness API ("adapter declares its freshness read budget; harness asserts actuals stay within it") can only be designed once that second case exists. It back-applies to letta in PR3 for a few lines.
 5. **Fixture policy**: sandbox self-capture is the one approved way for the conformance fixture. Run the target agent under a sandboxed `HOME`/`XDG_*` (the technique already documented in CLAUDE.md for wizard testing), script one session that exercises every shape the fixture spec requires, so the capture is born clean - sanitization collapses into verification against `packages/pond/tests/fixtures/README.md`. Generator-script synthetics are allowed only as supplementary edge-case rows, never the round-trip ground truth. No vendoring of third-party fixtures (ctx et al.); external repos are read-only format references.
@@ -60,17 +60,18 @@ The playbook, written for an agent to execute and a human to read. Structure:
   - Conformance suite via the shared harness (item 3) in `tests/integration/adapter/<name>.rs` + unit tests in the adapter file.
   - Spec doc committed under `docs/adapters/`; README adapter table row.
 
-- **The decision table** (10 rows, each a required section of the spec doc):
-  1. Session identity (id construction, one-time decode - `adapter-integrity-opaque-ids`)
-  2. Project resolution (real source data satisfying `model-project-non-empty`)
-  3. Ordering key (source-intrinsic `(timestamp, tiebreaker)`)
-  4. Tool-call correlation (call_id source, unfinished-call handling)
-  5. Provenance classification (conversational vs injected per record kind; fused-span splits)
-  6. Lineage (forks/spawns/subagents -> `parent_session_id`)
-  7. Deliberate non-capture (ignored siblings/records, with reasons)
-  8. Restore face (native restore, or `restore_unsupported` with a reason naming the alternative - the omp precedent)
-  9. Freshness/skip oracle (how "changed?" is answered cheaply; note if the source can rewrite in place)
-  10. Windows (where the agent writes on Windows, env overrides, encoding quirks; `windows-verify` CI runs all tests natively per PR)
+- **The decision table** (11 rows, each a required section of the spec doc):
+  1. `source_agent` brand (the immutable brand string, e.g. `oh-my-pi`, `grok-build`; plus a kind-subpath taxonomy where the harness has satellite session kinds - the openclaw precedent: `openclaw/{subagent,cron,hook,probe}`)
+  2. Session identity (id construction, one-time decode - `adapter-integrity-opaque-ids`)
+  3. Project resolution (real source data satisfying `model-project-non-empty`)
+  4. Ordering key (source-intrinsic `(timestamp, tiebreaker)`)
+  5. Tool-call correlation (call_id source, unfinished-call handling)
+  6. Provenance classification (conversational vs injected per record kind; fused-span splits)
+  7. Lineage (forks/spawns/subagents -> `parent_session_id`)
+  8. Deliberate non-capture (ignored siblings/records, with reasons)
+  9. Restore face (native restore, or `restore_unsupported` with a reason naming the alternative - the omp precedent)
+  10. Freshness/skip oracle (how "changed?" is answered cheaply; note if the source can rewrite in place)
+  11. Windows (where the agent writes on Windows, env overrides, encoding quirks; `windows-verify` CI runs all tests natively per PR)
 
 - Adapter-specific concerns beyond the table land as extra prose in the spec doc, not as new universal rows.
 
@@ -84,9 +85,11 @@ Shared helpers in `tests/integration/adapter/mod.rs` (the designated cross-adapt
 
 Retrofit `oh_my_pi.rs`, `opencode.rs`, and (new suite) `claude_ai_export` onto the helpers; keep any adapter-specific assertions those suites carry. Design constraint: helpers take the adapter + fixture root + expectations struct, no per-adapter branching inside the harness (seam rules apply to test seams too).
 
+Implementation order note: survey how the three target suites (and the adapter-file unit tests) do round-trip TODAY before fixing helper signatures - both `src/adapter/snapshots/` and `tests/integration/adapter/snapshots/` exist, so insta snapshots are in play and the helpers must compose with them, not fight them.
+
 ### 4. Structural guard test
 
-A unit test (in `src/adapter/mod.rs` tests) that walks `src/adapter/*.rs` and fails on `use crate::sessions` / `use crate::substrate` - turning the perf-isolation argument into CI fact. Keep the error message explanatory: it names WHY (adapters must stay store-free so adapter PRs cannot regress store performance).
+A unit test (in `src/adapter/mod.rs` tests) that walks `src/adapter/*.rs` and fails on any reference to `crate::sessions` / `crate::substrate` - qualified inline paths included, not just `use` statements - turning the perf-isolation argument into CI fact. Keep the error message explanatory: it names WHY (adapters must stay store-free so adapter PRs cannot regress store performance).
 
 ### 5. Docs
 
@@ -94,12 +97,17 @@ A unit test (in `src/adapter/mod.rs` tests) that walks `src/adapter/*.rs` and fa
 - `docs/spec.md` 6.9 amendment: spec docs own format archaeology + decision record; code owns extraction behavior.
 - `README.md`: adapter table gains `Last verified` column (initial values from the fixture snapshot dates in `tests/fixtures/README.md`; `-` where unknown).
 - `CONTRIBUTING.md` (~20 lines): adding an adapter -> the playbook is `.agents/skills/add-adapter` (usable as a Claude Code skill, readable as a doc); one self-contained PR (spec doc + fixture + adapter + tests); draft-PR review of the decision table recommended; sandbox self-capture required for the conformance fixture; `cargo test` green is the whole bar - no benchmarks needed for adapter PRs.
+- `AGENTS.md` (repo CLAUDE.md): one pointer line in the "Adapter seam" section - "adding an adapter -> follow `.agents/skills/add-adapter`". Agents read CLAUDE.md unconditionally; skill discovery is the second line of defense, not the first.
 
 ### 6. Validation
 
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` green locally (including the three retrofitted suites and the guard test).
 - `git status` clean of formerly-ignored noise after the gitignore cascade.
 - Skill loads: `/add-adapter` visible in a fresh Claude Code session in the repo.
+
+## PR2/PR3 precondition
+
+The sandbox self-capture rule means the target agent must be installed and signed in BEFORE its PR starts: letta-code for PR2, grok-build for PR3 (xAI account access). Set both up ahead of time so capture is not discovered as a blocker the day implementation begins.
 
 ## PR2 outline (letta-code, #170)
 
