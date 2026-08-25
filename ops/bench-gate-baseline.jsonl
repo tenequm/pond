@@ -1,1 +1,0 @@
-{"date":"2026-08-12T16:00:00Z","commit":"a7abc72","get_session_sid_s":56.7,"get_session_mid_s":60.9,"get_message_s":40.8,"search_s":25.7,"sql_count_s":9.1,"equivalence":"OK","fts_iops":59,"vector_iops":100,"get_message_iops":4078,"search_iops":359,"open_store_ms":3580,"row_counts_ms":3703,"oracle_warm_ms":46700}

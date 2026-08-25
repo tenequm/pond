@@ -36,9 +36,9 @@ tasks:
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
 
   # Pre-release validation against the live remote store: gate benches + CLI
-  # probes + map-vs-scan equivalence, appending to ops/bench-gate-baseline.jsonl
-  # and printing the delta vs the previous run. ~30 min of S3 wall-clock; never
-  # cached, always live.
+  # probes + map-vs-scan equivalence, appending to
+  # docs/benchmarks/bench-gate-baseline.jsonl and printing the delta vs the
+  # previous run. ~30 min of S3 wall-clock; never cached, always live.
   bench-gate:
     command: 'bash ops/scripts/bench-gate.sh'
     toolchains: 'system'

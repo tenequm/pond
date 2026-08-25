@@ -202,3 +202,43 @@ sys	2m42.220s
 ```
 
 39m22s against 113m56s: first import is 2.89x faster with embeddings off (the new default). The gap is the inline embedding cost the old binary always paid; a new-enabled leg would land near the old number.
+
+## bench-gate: Lance 8 -> 10 upgrade (#145)
+
+Three-point bracket for the lance 8.0.0 -> 10.0.0 upgrade, all on s3-nbg1 (store digest `5fcd5e32b8dd` in `bench-gate-baseline.jsonl`) driven from mac-m1max, same day, so only the code under test differs. The 2026-08-12 jsonl row is NOT comparable to these rows: it predates the #168 search/bench rework, and until 2026-08-25 the gate ran ops_bench without `--url`, so that row's ops fields measured whatever store the operator config named at the time. Cross-row ops comparisons are valid from 2026-08-25 onward only.
+
+### 2026-08-25 - s3-nbg1, lance 8 (dd2562a) vs lance 10 + zonemap intent (33bf790)
+
+Gate delta, verbatim (`bash ops/scripts/bench-gate.sh`, read-only, so the store has no timestamp zonemap yet in either row):
+
+```
+metric                      prev         now     delta   (2026-08-25T13:30:59Z dd2562a -> 2026-08-25T14:42:16Z 33bf790)
+get_session_sid_s           23.8        52.8     +122%
+get_session_mid_s           51.8        50.7       -2%
+get_message_s               51.2        47.4       -7%
+search_s                   145.3       126.0      -13%
+search_dated_s             135.8       150.6      +11%
+sql_count_s                  2.1         1.3      -38%
+fts_iops                      17          16       -6%
+vector_iops                   92          93       +1%
+get_message_iops              18          29      +61%
+search_iops                  159         218      +37%
+open_store_ms               1330        5342     +302%
+row_counts_ms               1132         802      -29%
+oracle_warm_ms             50106       24640      -51%
+```
+
+Reconciliations (a second lance-10 `ops_bench --url` run, same store, minutes later):
+
+- `oracle_warm_ms` -51% is real and reproduces: rerun 23,724 ms vs lance 8's 50,106 ms.
+- `open_store_ms` +302% is transient S3 weather, not a regression: rerun 1,165 ms vs lance 8's 1,330 ms - parity.
+- `row_counts_ms` improvement reproduces: rerun 681 ms.
+- `sql_count_s` 2.1 -> 1.3 is the COUNT(*) pushdown on stable-row-id datasets landing.
+- The CLI search/get probes are one-shot cold-start dominated (~50 s gets, ~2 min search; see the #168 release A/B above) - parity within their noise. Lance 8's `get_session_sid_s` 23.8 was the outlier against its sibling probes (~51 s); lance 10's 52.8 is in line with them.
+
+### 2026-08-25 - s3-nbg1, timestamp zonemap materialized (lance 10)
+
+`pond optimize --only index` built `messages_timestamp_zonemap` on the store in 49 s. Date-filtered vector search (`--from-date` 7 days back), after vs before:
+
+- One-shot CLI: the date-filter penalty over unfiltered search is gone. Pre-zonemap dated ran +24.6 s over unfiltered (150.6 vs 126.0); post-zonemap dated ran 113.1/125.0 s - at or below unfiltered, i.e. parity within noise. The remaining ~2 min is the arm-independent one-shot cold start (#168 measured fts at ~112-117 s too), not the filter.
+- Served path (warm `pond serve`, `POST /v1/search`): unfiltered 0.16-0.18 s; dated 5.3/6.2 s with correct results (10 sessions, 11,643 messages in the 7-day scope). Issue #145's documented served dated figure on lance 8 was ~2 minutes: ~20x.
