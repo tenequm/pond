@@ -76,6 +76,12 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 - A bare inequality (`Ne`) on a nullable column in `Dataset::count_rows` hits a pathological slow path: `count_rows(Ne("embedding_model", v))` over ~2M rows (~87% null, 1 distinct non-null value) on the real S3 store ran **>25 min (effectively hung)**. Guard it - `And(IsNotNull("col"), Ne("col", val))` dropped the same count to **7.35 s**; a bare `IsNotNull` is also fast. It is the unguarded `Ne`, not the column, that is the trap.
 - Lance keeps no per-column null_count metadata, so every `count_rows(filter)` is a data-page read - count a **narrow co-set column, not a wide one** (`embedding_model IS NOT NULL`, never `vector IS NOT NULL`; they are co-set per spec.md#session-embed-from-canonical).
 
+## Benchmarking storage-path changes: both sides, before the new binary writes
+
+- A change that materially alters the read or write path (lance/DataFusion upgrades, index roster changes, storage-layer rewrites) must be benchmarked on BOTH sides before landing: reads via `moon run bench-gate`, writes via a matched-state A/B - old binary vs new against two identical s5cmd scratch copies of the store (sync replay and/or `optimize --rebuild`).
+- Run the old-side rows BEFORE the new binary ever writes to the real store: writes mutate store state, so the old-side baseline is unrecoverable afterwards except via scratch copies (the lance 8->10 upgrade lost its write baseline exactly this way).
+- Both rows go to `docs/benchmarks/bench-gate-baseline.jsonl`; write metrics use `write_sync_s` / `write_rebuild_s` keys, and the gate's delta printer flags rows that lack them.
+
 ## Errors
 
 - `anyhow::Result` internally. Typed `pond::Error` (thiserror, `packages/pond/src/lib.rs`) at the wire boundary - the `Conflict` variant is load-bearing for OCC retry matching. `AdapterError` (`packages/pond/src/adapter/mod.rs`) is a struct (not enum) so adapter ingestion failures carry adapter + location for attribution.
