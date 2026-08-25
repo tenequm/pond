@@ -768,8 +768,8 @@ impl Store {
 
         // `Sessions` never reaches the merge bucket in the product path (its
         // row is immutable, so a present session routes to neither append nor
-        // merge); the guard keeps a caller-built plan from forcing a scan with
-        // the messages/parts key on the sessions schema.
+        // merge); the guard turns a caller-built plan that violates this into
+        // a no-op instead of a wasted scan.
         let mut grown = 0usize;
         if !matches!(table, Table::Sessions) {
             for chunk in table_plan.merge.chunks(COPY_SESSION_IN_CHUNK) {
@@ -777,7 +777,7 @@ impl Store {
                     .iter()
                     .map(|id| ScalarValue::String(id.clone()))
                     .collect();
-                let predicate = Predicate::In("session_id", values.clone());
+                let predicate = in_predicate(key_column, chunk);
                 let stream = Self::source_scan(source, table, Some(&predicate)).await?;
                 grown += match table {
                     Table::Messages => {
@@ -790,7 +790,7 @@ impl Store {
                         self.append_filtered(table, stream, Self::part_keep(present))
                             .await?
                     }
-                    Table::Sessions => 0,
+                    Table::Sessions => unreachable!("guarded above"),
                 };
             }
         }

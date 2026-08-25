@@ -19,10 +19,29 @@ cd "$(git rev-parse --show-toplevel)"
 
 OPERATOR_CONFIG="${POND_CONFIG_FILE:-$HOME/.config/pond/config.toml}"
 STORE_URL="${STORE_URL:-$(awk -F'"' '/^\[storage\]/{s=1;next} /^\[/{s=0} s&&/^path/{print $2;exit}' "$OPERATOR_CONFIG")}"
+# A trailing slash would nest the benchw scratch prefix inside the store itself.
+STORE_URL="${STORE_URL%/}"
 PROBE_SID="${PROBE_SID:-8b7b9e47-66d2-464b-8ec6-0ad70855ff57}"
 PROBE_MID="${PROBE_MID:-419caaa5-13d7-448a-807c-5fb5105112a7}"
 BASELINE="docs/benchmarks/bench-gate-baseline.jsonl"
 TMP="$(mktemp -d)"
+# Fixed synthetic write corpus so write rows stay comparable across time; the
+# jsonl write_corpus tag derives from these.
+WRITE_SESSIONS=500 WRITE_MESSAGES=5 WRITE_SWEEP_BATCH=512
+SCRATCH_ENDPOINT="" SCRATCH_GLOB="" S5_KEY="" S5_SECRET="" S5_REGION=""
+scratch_clean() {
+  [ -n "$SCRATCH_GLOB" ] || return 0
+  local out
+  if out=$(AWS_ACCESS_KEY_ID="$S5_KEY" AWS_SECRET_ACCESS_KEY="$S5_SECRET" AWS_REGION="$S5_REGION" s5cmd --endpoint-url "$SCRATCH_ENDPOINT" rm "$SCRATCH_GLOB" 2>&1); then
+    echo "scratch cleaned: $SCRATCH_GLOB"
+  elif grep -q 'no object found' <<< "$out"; then
+    echo "scratch already clean: $SCRATCH_GLOB"
+  else
+    echo "WARNING: scratch cleanup failed for $SCRATCH_GLOB - clean manually"
+    printf '%s\n' "$out"
+  fi
+}
+trap 'scratch_clean; rm -rf "$TMP"' EXIT
 
 # Force embeddings on through the env mirror: Config::load layers
 # POND_EMBEDDINGS_ENABLED over the operator's file in every consumer (the CLI
@@ -43,7 +62,8 @@ else
   cargo build --release
   POND=target/release/pond
 fi
-BIN_VERSION="$($POND --version)"
+# Stripped of JSON-breaking chars - the row embeds it as a string.
+BIN_VERSION="$($POND --version | head -1 | tr -d '"\\')"
 echo "binary: $BIN_VERSION"
 
 now() { python3 -c 'import time; print(time.time())'; }
@@ -79,7 +99,7 @@ python3 -c "print(f'{$t1 - $t0:.1f}')" > "$TMP/sql_count.s"
 printf '%-28s       %ss\n' sql_count "$(cat "$TMP/sql_count.s")"
 
 echo "--- map-vs-scan equivalence (empty cache forces the scan path) ---"
-EMPTY="$(mktemp -d)"
+EMPTY="$TMP/empty-cache"; mkdir "$EMPTY"
 XDG_CACHE_HOME=$EMPTY $POND get-session "$PROBE_SID" > "$TMP/scan-sid.txt" 2>/dev/null
 XDG_CACHE_HOME=$EMPTY $POND get-session "$PROBE_MID" > "$TMP/scan-mid.txt" 2>/dev/null
 XDG_CACHE_HOME=$EMPTY $POND get-message "$PROBE_MID" > "$TMP/scan-msg.txt" 2>/dev/null
@@ -103,30 +123,21 @@ if [ -z "${POND_BIN:-}" ]; then
   cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
 
   echo "--- write benches (scratch stores, the real store is never written) ---"
-  # Fixed synthetic corpus so write rows are comparable across time; bump the
-  # corpus tag whenever the shape changes.
-  WRITE_SESSIONS=500 WRITE_MESSAGES=5
-  WRITE_CORPUS='"synthetic-500x5"'
-  if [[ "$STORE_URL" == s3* ]]; then
-    # Sibling prefix beside the gate store (same bucket/creds); each bench run
-    # creates its own scratch stores under it and cleanup removes them all.
+  WRITE_ARGS=(--sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES")
+  WRITE_CORPUS="\"synthetic-${WRITE_SESSIONS}x${WRITE_MESSAGES}\""
+  if [[ "$STORE_URL" == s3+http* ]]; then
+    # Sibling prefix beside the gate store (same bucket/creds); the bench's
+    # scratch stores are fixed-named benchw-* children, so stale ones from an
+    # aborted run are swept up front - they would fail the copy verification.
+    # Plain s3:// is excluded: its URL carries no endpoint host for s5cmd.
     WRITE_BASE="${STORE_URL%/*}/benchw"
-    DEST_ARGS=(--dest-url "$WRITE_BASE")
+    WRITE_ARGS+=(--dest-url "$WRITE_BASE")
     WRITE_BACKEND='"s3"'
-  else
-    DEST_ARGS=()
-    WRITE_BACKEND='"local"'
-  fi
-  cargo bench --bench write_bench -- --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" "${DEST_ARGS[@]}" | tee "$TMP/write-copy.txt"
-  if grep -q ': false' "$TMP/write-copy.txt"; then echo "WRITE VERIFICATION FAILED"; exit 1; fi
-  cargo bench --bench write_bench -- --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" --append-sweep 512 --sweep-commits-cap 10 "${DEST_ARGS[@]}" | tee "$TMP/write-sweep.txt"
-  # --grown 2: round 0 folds under the eager policy, round 1 under the deferred
-  # policy production sync uses - round 1 is the scraped fold figure.
-  cargo bench --bench write_bench -- --profile-optimize "$TMP/wprof" --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" --grown 2 "${DEST_ARGS[@]}" | tee "$TMP/write-prof.txt"
-  if [ -n "${WRITE_BASE:-}" ]; then
-    if command -v s5cmd > /dev/null; then
-      python3 - "$OPERATOR_CONFIG" "$WRITE_BASE" <<'PYEOF' > "$TMP/scratch-env.sh"
-import pathlib, subprocess, sys, tomllib
+    if [[ "${STORE_URL##*/}" == benchw* ]]; then
+      echo "WARNING: store prefix '${STORE_URL##*/}' would match the scratch glob - clean s3 scratch under $WRITE_BASE-* manually"
+    elif command -v s5cmd > /dev/null; then
+      if SCRATCH_ENV="$(python3 - "$OPERATOR_CONFIG" "$WRITE_BASE" <<'PYEOF'
+import pathlib, shlex, subprocess, sys, tomllib
 c = tomllib.load(open(sys.argv[1], "rb"))
 cr = c.get("creds", {}).get("default", {})
 def val(base):
@@ -141,20 +152,32 @@ def val(base):
     raise SystemExit(f"missing creds field: {base}")
 rest = sys.argv[2].split("://", 1)[1]
 host, key = rest.split("/", 1)
-print(f"export AWS_ACCESS_KEY_ID='{val('access_key_id')}'")
-print(f"export AWS_SECRET_ACCESS_KEY='{val('secret_access_key')}'")
-print(f"export AWS_REGION='{c['storage'].get('region', 'us-east-1')}'")
-print(f"export SCRATCH_ENDPOINT='https://{host}'")
-print(f"export SCRATCH_GLOB='s3://{key}*'")
+if "/" not in key:
+    raise SystemExit(f"no prefix segment in {sys.argv[2]} - refusing a bucket-root scratch glob")
+print(f"S5_KEY={shlex.quote(val('access_key_id'))}")
+print(f"S5_SECRET={shlex.quote(val('secret_access_key'))}")
+print(f"S5_REGION={shlex.quote(cr.get('region', 'us-east-1'))}")
+print(f"SCRATCH_ENDPOINT={shlex.quote('https://' + host)}")
+print(f"SCRATCH_GLOB={shlex.quote('s3://' + key + '-*')}")
 PYEOF
-      # shellcheck disable=SC1091
-      . "$TMP/scratch-env.sh"
-      s5cmd --endpoint-url "$SCRATCH_ENDPOINT" rm "$SCRATCH_GLOB" > /dev/null 2>&1 || true
-      echo "scratch cleaned: $SCRATCH_GLOB"
+)"; then
+        eval "$SCRATCH_ENV"
+        scratch_clean
+      else
+        echo "WARNING: creds for scratch cleanup unavailable - clean s3 scratch under $WRITE_BASE-* manually"
+      fi
     else
-      echo "WARNING: s5cmd not found - clean up scratch prefixes under $WRITE_BASE-* manually"
+      echo "WARNING: s5cmd not found - clean s3 scratch under $WRITE_BASE-* manually"
     fi
+  else
+    WRITE_BACKEND='"local"'
   fi
+  cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" | tee "$TMP/write-copy.txt"
+  if grep -q ': false' "$TMP/write-copy.txt"; then echo "WRITE VERIFICATION FAILED"; exit 1; fi
+  cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" --append-sweep "$WRITE_SWEEP_BATCH" --sweep-commits-cap 10 | tee "$TMP/write-sweep.txt"
+  # --grown 2: round 0 folds under the eager policy, round 1 under the deferred
+  # policy production sync uses - round 1 is the scraped fold figure.
+  cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" --profile-optimize "$TMP/wprof" --grown 2 | tee "$TMP/write-prof.txt"
 fi
 
 # `null` when the bench skipped that phase (serve_mem_bench skips its vector
@@ -166,7 +189,7 @@ ms() { local v; v=$(grep -F "$1" "$TMP/ops.txt" | awk '{print int($(NF-1))}' || 
 # streaming :   N ms", the sweep table row, "build total: N ms", and the
 # round-1 (production deferred policy) fold total.
 wcopy() { local v; v=$(grep -F "[$1]" "$TMP/write-copy.txt" | awk -F: '{print $2}' | awk '{print $1; exit}' || true); echo "${v:-null}"; }
-wsweep() { local v; v=$(awk -v f="$1" '$1 == "512" {gsub(/\(/, "", $f); print $f; exit}' "$TMP/write-sweep.txt"); echo "${v:-null}"; }
+wsweep() { local v; v=$(awk -v f="$1" -v b="$WRITE_SWEEP_BATCH" '$1 == b {gsub(/\(/, "", $f); print $f; exit}' "$TMP/write-sweep.txt"); echo "${v:-null}"; }
 wbuild() { local v; v=$(grep -F 'build total:' "$TMP/write-prof.txt" | awk '{print $3; exit}' || true); echo "${v:-null}"; }
 wfold() { local v; v=$(grep -E 'round +1 \[after' "$TMP/write-prof.txt" | awk -F'total: ' '{print $2}' | awk '{print $1; exit}' || true); echo "${v:-null}"; }
 # A dirty tree means the measured binary may not match the named commit; the
@@ -199,13 +222,16 @@ if len(rows) < 2:
 prev = rows[-2]
 if prev.get("store") != cur.get("store"):
     print(f"WARNING: different stores ({prev.get('store')} -> {cur.get('store')}) - deltas below are cross-store, not a regression signal")
-print(f"{'metric':<20}{'prev':>12}{'now':>12}{'delta':>10}   ({prev['date']} {prev['commit']} -> {cur['date']} {cur['commit']})")
+def label(r):
+    return f"{r['date']} {r['commit']}" + (f" [{r['bin']}]" if r.get("bin") else "")
+print(f"{'metric':<20}{'prev':>12}{'now':>12}{'delta':>10}   ({label(prev)} -> {label(cur)})")
+TAGS = ("date", "commit", "bin", "store", "equivalence", "search_mode", "write_backend", "write_corpus")
 for k, v in cur.items():
-    if k in ("date", "commit", "bin", "store", "equivalence", "search_mode", "write_backend", "write_corpus"):
+    if k in TAGS:
         continue
     p = prev.get(k)
     d = f"{(v - p) / p * 100:+.0f}%" if p and isinstance(v, (int, float)) else "n/a"
     print(f"{k:<20}{p if p is not None else '-':>12}{v if v is not None else '-':>12}{d:>10}")
-if not any(k.startswith("write_") and cur[k] is not None for k in cur):
+if not any(k.startswith("write_") and k not in TAGS and cur[k] is not None for k in cur):
     print("NOTE: no write_* metrics in this row - storage-path changes need a write-side A/B (AGENTS.md#benchmarking-storage-path-changes)")
 EOF
