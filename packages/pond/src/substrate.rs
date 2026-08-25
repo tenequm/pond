@@ -24,7 +24,9 @@ use lance::index::DatasetIndexExt;
 use lance::index::DatasetIndexInternalExt;
 use lance::index::vector::VectorIndexParams;
 use lance::session::Session;
+use lance::table::format::IndexMetadata;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::ivf::IvfBuildParams;
@@ -38,6 +40,7 @@ use lance_namespace::LanceNamespace;
 use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
+use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -1222,6 +1225,17 @@ impl IndexTrigger {
 }
 
 impl IndexParamsKind {
+    /// True for families whose search results are row *addresses*
+    /// (`fragment_id << 32 | offset`) emitted straight from the persisted
+    /// payload - named after Lance's `ScalarIndex::results_are_row_addresses`.
+    /// Lance 10 has two such families, ZoneMap and BloomFilter; pond ships
+    /// only the ZoneMap. Fragment ids die at compaction, so these indexes go
+    /// stale when covered fragments are rewritten; row-id-domain families
+    /// survive rewrites via stable row ids.
+    fn results_are_row_addresses(&self) -> bool {
+        matches!(self, Self::Scalar(BuiltinIndexType::ZoneMap))
+    }
+
     fn index_type(&self) -> IndexType {
         match self {
             Self::Scalar(BuiltinIndexType::Bitmap) => IndexType::Bitmap,
@@ -2421,8 +2435,10 @@ impl Handle {
     }
 
     /// Run the table-local maintenance cycle for the supplied index intents.
-    /// Every index family folds incrementally via `optimize_indices`; none is
-    /// rebuilt from scratch (spec.md#lance-index-maintenance).
+    /// Index families fold incrementally via `optimize_indices`
+    /// (spec.md#lance-index-maintenance); the two from-scratch exceptions are
+    /// the FTS consolidation rebuild at `DELTA_MERGE_THRESHOLD` and the
+    /// recreate of a stale address-domain index (`address_index_is_stale`).
     ///
     /// spec.md#substrate 3.7 (`lance-index-maintenance`): indices and compaction
     /// commit independently and use independent retry budgets, so a hot writer
@@ -3266,6 +3282,43 @@ async fn optimize_table_indices(
             continue;
         }
 
+        // Self-heal for address-domain indexes: compaction of covered
+        // fragments orphans the persisted payload (see
+        // `address_index_is_stale`), after which every date-filtered search
+        // hard-errors and the incremental fold below cannot repair it - the
+        // rewritten `fragment_bitmap` reports no unindexed fragments, so the
+        // append is a no-op over the dead zones. Recreate from scratch; this
+        // phase runs right after the compaction phase, so damage from this
+        // run's own compaction heals in the same `pond sync`/`pond optimize`.
+        if intent.params.results_are_row_addresses()
+            && address_index_is_stale(dataset, intent, &existing).await?
+        {
+            tracing::warn!(
+                index = intent.name,
+                "address-domain index references rewritten fragments; recreating it",
+            );
+            emit(
+                progress,
+                OptimizeEvent::PhaseStart {
+                    table,
+                    phase: OptimizePhase::IndexRebuild,
+                    detail: Some(intent.name.to_owned()),
+                },
+            );
+            let started = Instant::now();
+            rebuild_index(dataset, intent, progress, table).await?;
+            emit(
+                progress,
+                OptimizeEvent::PhaseDone {
+                    table,
+                    phase: OptimizePhase::IndexRebuild,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+            did_work = true;
+            continue;
+        }
+
         // A trailing tail (rows written since the last fold) stays fully
         // searchable while deferred: the retrievers drop `fast_search` whenever
         // an index has an unindexed tail, so Lance index-probes the folded rows
@@ -3431,6 +3484,55 @@ async fn optimize_table_indices(
     }
 
     Ok(did_work)
+}
+
+/// Staleness probe for an address-domain index: compares the fragment ids the
+/// persisted payload actually references (`calculate_included_frags` - one
+/// zone-stats row per zone, no data scan) against the live fragment set and
+/// the manifest `fragment_bitmap`, across all delta segments sharing the
+/// intent name.
+///
+/// Compaction on stable-row-id datasets never remaps such payloads: Lance
+/// skips the remapper entirely (lance-10 `optimize.rs` `needs_remapping`) and
+/// only rewrites each covered index's `fragment_bitmap` to the new fragment
+/// ids (`transaction.rs` `recalculate_fragment_bitmap`). A rewrite of covered
+/// fragments therefore leaves zones pointing at dead ids - `dead_in_payload`,
+/// the exact condition behind the query-time "fragment N referenced by an
+/// address-domain index result was not found" internal error - while the
+/// refreshed bitmap claims new fragments the payload holds no zones for
+/// (`claimed_not_held`: silent under-reporting, and `unindexed_fragments`
+/// sees nothing to fold). Both tests are load-bearing: a later fold merge
+/// drops the dead zones (`merge_segments` filters through
+/// `effective_fragment_bitmap`), clearing `dead_in_payload` while the
+/// coverage holes remain - observed on the production store as date-filtered
+/// searches returning empty with no error. The bitmap alone looks healthy in
+/// both directions; only the payload comparison detects either state, and it
+/// never fires on healthy appends, creates, or folds (there payload and
+/// bitmap coverage always agree).
+async fn address_index_is_stale(
+    dataset: &Dataset,
+    intent: &IndexIntent,
+    metas: &[IndexMetadata],
+) -> Result<bool> {
+    let live: RoaringBitmap = dataset
+        .iter_fragments()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut payload = RoaringBitmap::new();
+    let mut claimed_live = RoaringBitmap::new();
+    for meta in metas.iter().filter(|meta| meta.name == intent.name) {
+        let segment = dataset
+            .open_generic_index(intent.column, &meta.uuid, &NoOpMetricsCollector)
+            .await
+            .with_context(|| format!("staleness probe failed to open index {}", intent.name))?;
+        payload |= segment.calculate_included_frags().await?;
+        if let Some(effective) = meta.effective_fragment_bitmap(&live) {
+            claimed_live |= effective;
+        }
+    }
+    let dead_in_payload = !(&payload - &live).is_empty();
+    let claimed_not_held = !(&claimed_live - &payload).is_empty();
+    Ok(dead_in_payload || claimed_not_held)
 }
 
 /// Fragment-scoped scanner over the non-null rows of `column` - the shared

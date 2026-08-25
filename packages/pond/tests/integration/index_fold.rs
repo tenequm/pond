@@ -6,16 +6,24 @@
 //! before building the bitmap). The load-bearing guarantee these tests prove is
 //! that the fold path is byte-identical to a from-scratch rebuild on every
 //! field - so the switch cannot change behavior - plus correct BTree
-//! (`session_id`) and Bitmap (`source_agent`) pushdown. The last test exercises
-//! the compaction interaction: the index must survive a fragment rewrite via
-//! stable row ids (and the post-compaction index phase re-folds regardless).
+//! (`session_id`) and Bitmap (`source_agent`) pushdown. The last two tests
+//! exercise the compaction interaction: row-id-domain indexes must survive a
+//! fragment rewrite via stable row ids (and the post-compaction index phase
+//! re-folds regardless), while the address-domain zonemap does NOT survive -
+//! compaction orphans its payload, and the same-run staleness probe must
+//! detect that and recreate it.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, TimeZone, Utc};
 use pond::{
     handlers::ingest_events,
     sessions::{IngestEvent, Store},
-    substrate::{MaintenancePolicy, PhaseOutcome, Predicate, ScalarValue},
+    substrate::{
+        MaintenancePolicy, OptimizeEvent, OptimizePhase, OptimizeProgressFn, PhaseOutcome,
+        Predicate, ScalarValue,
+    },
     wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 use url::Url;
@@ -178,6 +186,90 @@ async fn fold_survives_compaction() -> anyhow::Result<()> {
         );
     }
     assert_correct(&corpus_snapshot(&store).await?, "after compaction");
+    Ok(())
+}
+
+/// Compaction of zonemap-covered fragments orphans the zonemap's
+/// address-domain payload: Lance skips index remapping on stable-row-id
+/// datasets and only rewrites the manifest `fragment_bitmap`, so the persisted
+/// zones keep pointing at the rewritten (dead) fragment ids and every
+/// date-filtered query hard-errors ("fragment N referenced by an
+/// address-domain index result was not found"). The indices phase runs after
+/// the compaction phase, so the staleness probe must detect the orphaned
+/// payload and recreate the index within the same optimize run - date-scoped
+/// counts stay exact across it.
+#[tokio::test(flavor = "multi_thread")]
+async fn zonemap_self_heals_after_compaction() -> anyhow::Result<()> {
+    let url = Url::parse("shared-memory://pond-test-zonemap-heal/")?;
+    let store = Store::open(&url).await?;
+
+    let jan = make_session("01HXYZMHEALJAN01", "claude-code");
+    // Many small ingest+fold waves: each fold extends zonemap coverage over a
+    // small fragment, giving the later compaction covered fragments to rewrite.
+    for batch in 0..6 {
+        ingest_events(
+            &store,
+            wave_events(&jan, batch * 5, 5, day(2026, 1, 1 + batch as u32)),
+        )
+        .await?;
+        store.build_indices_only(None).await?;
+    }
+
+    let jan_window = Predicate::And(vec![
+        Predicate::Gte(
+            "timestamp",
+            ScalarValue::Raw("timestamp '2026-01-01 00:00:00'".to_owned()),
+        ),
+        Predicate::Lte(
+            "timestamp",
+            ScalarValue::Raw("timestamp '2026-01-31 23:59:59'".to_owned()),
+        ),
+    ]);
+    assert_eq!(
+        store.searchable_in_scope(&jan_window).await?,
+        30,
+        "date-scoped count before compaction",
+    );
+
+    // Collect progress events so the heal is asserted directly, not inferred
+    // from the count staying right.
+    let rebuilds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&rebuilds);
+    let progress: OptimizeProgressFn = Arc::new(move |event| {
+        if let OptimizeEvent::PhaseStart {
+            phase: OptimizePhase::IndexRebuild,
+            detail: Some(detail),
+            ..
+        } = event
+        {
+            sink.lock().expect("rebuild sink").push(detail);
+        }
+    });
+    let outcome = store
+        .optimize_indices(Some(progress), &MaintenancePolicy::always_compact())
+        .await?;
+    for table in &outcome.tables {
+        assert!(
+            !matches!(table.indices, PhaseOutcome::Failed(_)),
+            "indices on {} must not Fail across compaction, got {:?}",
+            table.table.as_str(),
+            table.indices,
+        );
+    }
+    assert!(
+        rebuilds
+            .lock()
+            .expect("rebuild sink")
+            .iter()
+            .any(|detail| detail == "messages_timestamp_zonemap"),
+        "the staleness probe must recreate the zonemap in the same optimize run",
+    );
+
+    assert_eq!(
+        store.searchable_in_scope(&jan_window).await?,
+        30,
+        "date-scoped count after compaction (stale zonemap must self-heal, not error or undercount)",
+    );
     Ok(())
 }
 

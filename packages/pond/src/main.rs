@@ -5784,6 +5784,16 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
                 entry.table.as_str(),
             ))?;
         }
+        // Consequential since the stale-zonemap self-heal lives in this phase:
+        // a deferred indices phase can leave date-filtered search erroring
+        // until a later run wins the commit.
+        if matches!(entry.indices, PhaseOutcome::SkippedConflict) {
+            output(&format!(
+                "{}  index maintenance on {} deferred: concurrent writer; rerun once it finishes",
+                paint("hint", dim()),
+                entry.table.as_str(),
+            ))?;
+        }
     }
     for entry in &outcome.tables {
         if let PhaseOutcome::Failed(error) = &entry.indices {
