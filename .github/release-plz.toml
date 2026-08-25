@@ -14,6 +14,9 @@ release_always = true
 # semver-checks guards library consumers we don't have, so skip it - it otherwise
 # adds a multi-minute cold rustdoc build of the heavy dep tree to every release.
 semver_check = false
+# Label the release PR so it is findable deterministically
+# (`gh pr list --label release`), not by title pattern-matching.
+pr_labels = ["release"]
 
 # The crate now lives at packages/pond, so this is a cargo workspace. Without
 # these overrides release-plz would switch to workspace-style `pond-db-v{{
@@ -43,11 +46,37 @@ changelog_path = "CHANGELOG.md"
 header = """# Changelog
 
 """
+# The entry is generated from squash-commit messages alone, so it survives every
+# release-PR refresh (release-plz force-pushes/reopens the release PR on each main
+# push - hand edits there are lost by design). Two message conventions feed it:
+# a commit body renders as indented prose under that commit's bullet, and a body
+# section after a lone `[release-note]` line is hoisted to the top of the entry
+# (release lead paragraph / Upgrading block). See AGENTS.md "Changelog authoring".
+# Prose comes from `raw_message`, not `body`: the conventional parser eats a
+# trailer-shaped FINAL paragraph ("Fixture: three replays converge.") into
+# `footers`, silently dropping it from `body` - raw_message keeps every line, and
+# the line filter below strips the real trailers (Co-authored-by etc.) instead.
 body = """
 ## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- for commit in commits %}{% if commit.raw_message is containing("[release-note]") %}
+{% set note = commit.raw_message | split(pat="[release-note]") | last | trim %}
+{%- for line in note | split(pat="\n") %}
+{%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
+{{ line }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}{% endfor %}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/tenequm/pond/commit/{{ commit.id }}))
+{%- set prose = commit.raw_message | split(pat="\n") | slice(start=1) | join(sep="\n") | split(pat="[release-note]") | first | trim %}
+{%- if prose %}
+{%- for line in prose | split(pat="\n") %}
+{%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
+{% if line %}  {{ line }}{% endif %}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
 {% endfor %}{% endfor %}{% if release_link %}
 **Full Changelog**: {{ release_link }}
 {% endif %}"""
@@ -57,6 +86,8 @@ commit_preprocessors = [
   { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tenequm/pond/pull/${1}))" },
 ]
 commit_parsers = [
+  # Commit-level opt-out: a `changelog: ignore` footer excludes the commit.
+  { footer = "^changelog: ?ignore", skip = true },
   { message = "^chore: release", skip = true },
   { message = "^chore\\(release\\)", skip = true },
   { message = "^chore\\(deps\\)", skip = true },
