@@ -1,6 +1,13 @@
 # Changelog
 
-## [0.15.2](https://github.com/tenequm/pond/compare/v0.15.1...v0.15.2) - 2026-08-25
+## [0.16.0](https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0) - 2026-08-25
+
+Date-scoped search stops full-scanning. The storage engine moves to Lance 10.0.0, and `messages` gains a `timestamp` zonemap that prunes date-bounded queries at the index instead of the table: on a 2.9M-row remote store a served `--from-date` search went from ~2 minutes to 5-6 s (~20x), and the date filter now costs nothing over an unfiltered search instead of +25 s. COUNT pushdown fires under stable row ids too (`pond sql` count 2.1 s -> 1.3 s). Writes are unchanged: a matched-store A/B measured sync at parity on both cold and warm runs.
+
+**Upgrading:** nothing manual, but this one is a fleet decision. The zonemap is created on the first `pond sync` or `pond optimize` a 0.16.0 binary runs, and pond 0.15.1 and earlier consume that index in the wrong id domain - so an older binary reading the same store returns **zero results for date-filtered searches**, with no error and no warning (`--from-date` / `--to-date` on the CLI, `from_date` / `to_date` over MCP). Unfiltered search, `pond get-session`, `pond get-message`, and `pond sql` are unaffected, and nothing about the store is damaged: an old reader that upgrades is immediately correct again. If several machines share one store, upgrade every machine that reads it, not just the ones that write it.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] stores synced by 0.16.0 carry a timestamp zonemap that pond <= 0.15.1 reads as an empty date filter ([361abed](https://github.com/tenequm/pond/commit/361abed03ef174c1a742d92000bebbf741babccc))
 
 ### <!-- 1 -->🎉 New Features
 - upgrade Lance to 10.0.0 and prune date-scoped search with a timestamp zonemap ([#182](https://github.com/tenequm/pond/pull/182)) ([232993b](https://github.com/tenequm/pond/commit/232993b11ffde67851add245a2fba441c4f19169))
@@ -11,7 +18,7 @@
 ### <!-- 6 -->🧹 Chores
 - **embed:** drive idle eviction on tokio's virtual clock ([ce7138c](https://github.com/tenequm/pond/commit/ce7138c9e7800f0f9ad519cfbca0aaa362097407))
 
-**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.1...v0.15.2
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0
 
 ## [0.15.1](https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1) - 2026-08-24
 
