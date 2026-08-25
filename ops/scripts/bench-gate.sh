@@ -92,9 +92,10 @@ cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
 # invalid JSON like `"vector_iops":,`.
 iops() { local v; v=$(awk -v c="$1" '$1 == c {print $2; exit}' "$TMP/serve.txt"); echo "${v:-null}"; }
 ms() { local v; v=$(grep -F "$1" "$TMP/ops.txt" | awk '{print int($(NF-1))}'); echo "${v:-null}"; }
-# A dirty tree means the measured binary may not match the named commit.
+# A dirty tree means the measured binary may not match the named commit; the
+# baseline the gate itself appends to never affects the binary, so exclude it.
 COMMIT="$(git rev-parse --short HEAD)"
-if [ -n "$(git status --porcelain)" ]; then COMMIT="$COMMIT-dirty"; fi
+if [ -n "$(git status --porcelain -- ':!docs/benchmarks/bench-gate-baseline.jsonl')" ]; then COMMIT="$COMMIT-dirty"; fi
 # Rows from different stores must not be diffed as a regression, but the repo
 # is public, so the row carries a digest (or operator-set STORE_LABEL), never
 # the store URL itself.
@@ -116,6 +117,8 @@ if len(rows) < 2:
     print("first baseline row recorded; nothing to diff")
     sys.exit()
 prev = rows[-2]
+if prev.get("store") != cur.get("store"):
+    print(f"WARNING: different stores ({prev.get('store')} -> {cur.get('store')}) - deltas below are cross-store, not a regression signal")
 print(f"{'metric':<20}{'prev':>12}{'now':>12}{'delta':>10}   ({prev['date']} {prev['commit']} -> {cur['date']} {cur['commit']})")
 for k, v in cur.items():
     if k in ("date", "commit", "store", "equivalence", "search_mode"):
@@ -123,4 +126,6 @@ for k, v in cur.items():
     p = prev.get(k)
     d = f"{(v - p) / p * 100:+.0f}%" if p and isinstance(v, (int, float)) else "n/a"
     print(f"{k:<20}{p if p is not None else '-':>12}{v if v is not None else '-':>12}{d:>10}")
+if not any(k.startswith("write_") for k in cur):
+    print("NOTE: no write_* metrics in this row - storage-path changes need a write-side A/B (AGENTS.md#benchmarking-storage-path-changes)")
 EOF

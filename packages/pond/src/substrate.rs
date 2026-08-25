@@ -3061,16 +3061,10 @@ impl Handle {
 /// rewrote a 665 MiB tail fragment every 5-min sync). Only whole planned
 /// tasks are filtered, so OCC and conflict semantics are untouched.
 ///
-/// spec.md#lance-index-maintenance mandates FRI on by default, but at
-/// v7.0.0-beta.16 `defer_index_remap=true` together with `stable-row-ids`
-/// panics in `optimize.rs::commit_compaction` with "defer_index_remap
-/// requires row_addrs but none were provided": `rewrite_files` skips
-/// row_addrs when stable row ids are on, then the FRI builder demands
-/// them. With stable_row_ids the remap step is already a no-op
-/// (`optimize.rs:1490`: `needs_remapping = !uses_stable_row_ids() &&
-/// !defer_index_remap`), so running without FRI is correct - we only
-/// lose the documented concurrency-with-index-build benefit. Flip to
-/// `true` once upstream fixes the conflict.
+/// spec.md#lance-index-maintenance mandates FRI on by default, but lance
+/// rejects `defer_index_remap=true` on stable-row-id datasets
+/// (`optimize.rs:697`): they never remap, so there is nothing to defer - we
+/// only lose the documented concurrency-with-index-build benefit.
 async fn optimize_table_compact(
     dataset: &mut Dataset,
     table: Table,

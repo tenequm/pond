@@ -4685,13 +4685,11 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
 /// `vector IS NOT NULL`. `id` lookups are rare and full-scan. The `timestamp`
 /// ZoneMap prunes date-scoped prefilters that otherwise full-scan the table on
-/// remote stores. Under lance 8 it pruned every zone for the tz-aware column,
-/// so date filters returned empty (#75); lance 10's rewritten zonemap
-/// evaluation compares the tz-naive date literal correctly (the upstream
-/// `safe_coerce_scalar` tz drop itself is unchanged 8 -> 10, so the fix is in
-/// zone evaluation). The #75 date-bounds regression test in
-/// tests/integration/search.rs guards this - re-verify it on any lance bump
-/// before trusting this index.
+/// remote stores. It depends on lance translating scalar-index results from
+/// the address domain into row ids (upstream #7434); without that translation
+/// stable-row-id datasets get silently empty date filters (#75) - lance-8
+/// readers of a store carrying this index still do. Re-verify via the #75
+/// regression test in tests/integration/search.rs on any lance bump.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
@@ -4818,8 +4816,8 @@ pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 const IVF_SQ_NUM_BITS: u16 = 8;
 const IVF_SQ_MAX_ITERS: usize = 15;
 
-/// Pond's production IndexIntents: the per-table intent set
-/// `Store::open_with_options` registers with the substrate.
+/// Pond's production IndexIntents: the per-table intent set the maintenance
+/// paths (sync/optimize/copy) reconcile against the store.
 pub fn pond_index_intents() -> IndexIntents {
     pond_index_intents_with_vector_threshold(
         VECTOR_INDEX_ACTIVATION_ROWS,
