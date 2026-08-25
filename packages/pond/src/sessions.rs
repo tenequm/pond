@@ -766,29 +766,33 @@ impl Store {
             )
             .await?;
 
-        // `Sessions` never reaches here: its row is immutable, so a present
-        // session is identical and routes to neither append nor merge.
+        // `Sessions` never reaches the merge bucket in the product path (its
+        // row is immutable, so a present session routes to neither append nor
+        // merge); the guard turns a caller-built plan that violates this into
+        // a no-op instead of a wasted scan.
         let mut grown = 0usize;
-        for chunk in table_plan.merge.chunks(COPY_SESSION_IN_CHUNK) {
-            let values: Vec<ScalarValue> = chunk
-                .iter()
-                .map(|id| ScalarValue::String(id.clone()))
-                .collect();
-            let predicate = Predicate::In("session_id", values.clone());
-            let stream = Self::source_scan(source, table, Some(&predicate)).await?;
-            grown += match table {
-                Table::Messages => {
-                    let present = Arc::new(self.present_message_pks(&values).await?);
-                    self.append_filtered(table, stream, Self::message_keep(present))
-                        .await?
-                }
-                Table::Parts => {
-                    let present = Arc::new(self.present_part_pks(&values).await?);
-                    self.append_filtered(table, stream, Self::part_keep(present))
-                        .await?
-                }
-                Table::Sessions => 0,
-            };
+        if !matches!(table, Table::Sessions) {
+            for chunk in table_plan.merge.chunks(COPY_SESSION_IN_CHUNK) {
+                let values: Vec<ScalarValue> = chunk
+                    .iter()
+                    .map(|id| ScalarValue::String(id.clone()))
+                    .collect();
+                let predicate = in_predicate(key_column, chunk);
+                let stream = Self::source_scan(source, table, Some(&predicate)).await?;
+                grown += match table {
+                    Table::Messages => {
+                        let present = Arc::new(self.present_message_pks(&values).await?);
+                        self.append_filtered(table, stream, Self::message_keep(present))
+                            .await?
+                    }
+                    Table::Parts => {
+                        let present = Arc::new(self.present_part_pks(&values).await?);
+                        self.append_filtered(table, stream, Self::part_keep(present))
+                            .await?
+                    }
+                    Table::Sessions => unreachable!("guarded above"),
+                };
+            }
         }
         Ok((appended + grown, appended + grown))
     }
