@@ -3519,7 +3519,13 @@ impl Store {
                     .map(|(_, address, _)| *address)
                     .collect::<Vec<_>>();
                 let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
-                for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                for ((row, address, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                    // Lance 10 returns one entry per requested address, `None`
+                    // for a null cell - impossible here, since every `file` row
+                    // is written with its payload.
+                    let blob = blob.with_context(|| {
+                        format!("file part blob is null at row address {address}")
+                    })?;
                     // Legacy blob (lance-encoding:blob): payload is bytes; the
                     // url variant stored its URL as UTF-8 bytes, recovered via
                     // `file_data_from_blob`'s `data_kind = "url"` branch.

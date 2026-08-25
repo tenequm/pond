@@ -693,10 +693,6 @@ impl FtsMisuse {
 }
 
 impl ScalarUDFImpl for FtsMisuse {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "fts"
     }
@@ -785,10 +781,6 @@ struct ScoredFtsProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for ScoredFtsProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -904,10 +896,6 @@ struct LenientJsonGet {
 }
 
 impl ScalarUDFImpl for LenientJsonGet {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
