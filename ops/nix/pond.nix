@@ -2,12 +2,12 @@
 let
   inherit (stdenv) hostPlatform;
   inherit (hostPlatform) system;
-  version = "0.16.0";
+  version = "0.16.1";
   base = "https://github.com/tenequm/pond/releases/download/v${version}";
   shaMap = {
-    x86_64-linux = "df9e7060347933ef776072ebb118b29d6767174cc458b10c83a0ed88461a1702";
-    aarch64-linux = "602f0778f1ca38d2d037276c86994c6f36d4b948c480ff5befb8f846381ed6c0";
-    aarch64-darwin = "efa684877a9612fafe4d33a8a9f931190b338c9116f5e80b7ec8306da6a8814b";
+    x86_64-linux = "963730db8c1bd8a7e6c04e5b5905620d9f58e30c6f784d93e5811c7357526980";
+    aarch64-linux = "9d542545fcf30a4793cc888a7e3f5502ffef52dbeb5ad8ccbca3e30d0e054e12";
+    aarch64-darwin = "5690e121c28c9caef57fb8eb79867faabb9e02f60b9968e0206e42829222ef52";
   };
   urlMap = {
     x86_64-linux = "${base}/pond-x86_64-unknown-linux-gnu.tar.xz";
