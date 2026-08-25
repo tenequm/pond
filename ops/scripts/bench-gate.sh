@@ -55,6 +55,10 @@ probe get_session_sid "$TMP/map-sid.txt" $POND get-session "$PROBE_SID"
 probe get_session_mid "$TMP/map-mid.txt" $POND get-session "$PROBE_MID"
 probe get_message     "$TMP/map-msg.txt" $POND get-message "$PROBE_MID"
 probe search          "$TMP/search.txt"  $POND search --mode vector "read performance optimization lance" --limit 10
+# Date-scoped search is the worst-measured real query shape (28-31% success vs
+# 47-48% unfiltered in the 63-day trace); the timestamp zonemap exists for it.
+DATED_FROM="$(python3 -c 'import datetime; print((datetime.date.today() - datetime.timedelta(days=7)).isoformat())')"
+probe search_dated    "$TMP/search-dated.txt" $POND search --mode vector "read performance optimization lance" --limit 10 --from-date "$DATED_FROM"
 t0=$(now); $POND sql "SELECT count(*) FROM messages" > "$TMP/sql.txt"; t1=$(now)
 python3 -c "print(f'{$t1 - $t0:.1f}')" > "$TMP/sql_count.s"
 printf '%-28s       %ss\n' sql_count "$(cat "$TMP/sql_count.s")"
@@ -73,17 +77,20 @@ echo "--- serve_mem_bench (io-trace) ---"
 cargo bench --bench serve_mem_bench --features io-trace -- --storage-path "$STORE_URL" --io-trace | tee "$TMP/serve.txt"
 
 echo "--- ops_bench ---"
-cargo bench --bench ops_bench | tee "$TMP/ops.txt"
+# --url is load-bearing: ops_bench resolves the operator XDG config directly
+# (it ignores POND_CONFIG_FILE), so without it the ops phases silently measure
+# whatever store the operator's config names instead of the gate store.
+cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
 
 # `null` when the bench skipped that phase (serve_mem_bench skips its vector
 # phases on an embeddings-disabled instance), so a missing row can never emit
 # invalid JSON like `"vector_iops":,`.
 iops() { local v; v=$(awk -v c="$1" '$1 == c {print $2; exit}' "$TMP/serve.txt"); echo "${v:-null}"; }
 ms() { local v; v=$(grep -F "$1" "$TMP/ops.txt" | awk '{print int($(NF-1))}'); echo "${v:-null}"; }
-printf '{"date":"%s","commit":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"oracle_warm_ms":%s}\n' \
+printf '{"date":"%s","commit":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_dated_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"oracle_warm_ms":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --short HEAD)" \
   "$(cat "$TMP/get_session_sid.s")" "$(cat "$TMP/get_session_mid.s")" "$(cat "$TMP/get_message.s")" \
-  "$(cat "$TMP/search.s")" "$(cat "$TMP/sql_count.s")" \
+  "$(cat "$TMP/search.s")" "$(cat "$TMP/search_dated.s")" "$(cat "$TMP/sql_count.s")" \
   "$(iops fts_search)" "$(iops vector_search)" "$(iops pond_get_message)" "$(iops pond_search)" \
   "$(ms 'open store (manifests)')" "$(ms row_counts)" "$(ms 'session_last_message_ids WARM')" \
   >> "$BASELINE"

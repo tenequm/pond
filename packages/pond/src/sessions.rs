@@ -4683,10 +4683,13 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// `embedding_model`: pond's invariant is one active model at a time (a model
 /// swap goes through `pond optimize --force-embed` which drops the IVF_SQ,
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
-/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. Do NOT add a
-/// ZoneMap on `timestamp`: it prunes every zone for the tz-aware column, so
-/// date filters return empty (#75) - an upstream `safe_coerce_scalar` tz drop
-/// that no literal form escapes. Date bounds run as a refine over the arm pool.
+/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. The `timestamp`
+/// ZoneMap prunes date-scoped prefilters that otherwise full-scan the table on
+/// remote stores. It is safe only because DataFusion 54's
+/// `ScalarValue::partial_cmp` ignores timezones for same-unit timestamps, which
+/// masks lance's `safe_coerce_scalar` tz drop that made date filters return
+/// empty under DF 53 (#75) - re-verify the date-bounds regression test on any
+/// DataFusion bump before trusting this index.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
@@ -4697,6 +4700,11 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         "source_agent",
         BuiltinIndexType::Bitmap,
         "messages_source_agent_bitmap",
+    ),
+    (
+        "timestamp",
+        BuiltinIndexType::ZoneMap,
+        "messages_timestamp_zonemap",
     ),
 ];
 
