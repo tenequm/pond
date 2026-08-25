@@ -328,7 +328,7 @@ text in language B. fts",
     /// pattern, drilling pattern, and worked examples for `pond_sql`.
     /// Loaded on demand so the tool description stays tight.
     ///
-    /// TODO(#47): when the lance v8 FM-Index on parts.variant_data lands,
+    /// TODO(#47): when the lance FM-Index on parts.variant_data lands,
     /// tool-body substring search becomes `contains(variant_data, 'needle')`;
     /// update the routing guidance below (drop the "Never LIKE over parts ...
     /// no substring index (yet)" framing) and the timeout message in

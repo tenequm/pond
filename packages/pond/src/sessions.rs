@@ -4685,11 +4685,13 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
 /// `vector IS NOT NULL`. `id` lookups are rare and full-scan. The `timestamp`
 /// ZoneMap prunes date-scoped prefilters that otherwise full-scan the table on
-/// remote stores. It is safe only because DataFusion 54's
-/// `ScalarValue::partial_cmp` ignores timezones for same-unit timestamps, which
-/// masks lance's `safe_coerce_scalar` tz drop that made date filters return
-/// empty under DF 53 (#75) - re-verify the date-bounds regression test on any
-/// DataFusion bump before trusting this index.
+/// remote stores. Under lance 8 it pruned every zone for the tz-aware column,
+/// so date filters returned empty (#75); lance 10's rewritten zonemap
+/// evaluation compares the tz-naive date literal correctly (the upstream
+/// `safe_coerce_scalar` tz drop itself is unchanged 8 -> 10, so the fix is in
+/// zone evaluation). The #75 date-bounds regression test in
+/// tests/integration/search.rs guards this - re-verify it on any lance bump
+/// before trusting this index.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",

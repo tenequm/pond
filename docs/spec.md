@@ -215,6 +215,7 @@ Writes commit data without folding indexes; index maintenance is operator-trigge
 |---|---|---|
 | BTree (scalar) | `optimize_indices(append)` | Merges existing sorted index pages with only the new fragments' data; never re-scans already-indexed source. |
 | Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
+| ZoneMap (scalar) | `optimize_indices(append)` | Incremental fold is safe (zonemap implements per-fragment `update`). |
 | Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
 | IVF_SQ (vector) | `optimize_indices(append)` | Stable-row-id IVF supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and per-dimension SQ ranges carry forward. |
 
@@ -457,7 +458,7 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | Column | Notes |
 |---|---|
 | `session_id`, `id` | composite primary key; clustered on `(session_id, timestamp)` |
-| `timestamp` | canonical ordering key |
+| `timestamp` | canonical ordering key; zonemap-indexed for date-scoped filter pushdown |
 | `role` | message role |
 | `source_agent` | denormalized; scalar-indexed filter-pushdown surface |
 | `project` | denormalized filter column |

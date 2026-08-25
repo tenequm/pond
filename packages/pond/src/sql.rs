@@ -195,7 +195,7 @@ pub async fn run(
             "a leading-wildcard LIKE over the whole JSONB document - \
              json_extract(variant_data, '$') LIKE '%...%' - stringifies and scans every row, \
              so over parts it will not finish within the time limit. There is no substring \
-             index on tool bodies yet (TODO #47: lance v8 FM-Index). Instead match a single \
+             index on tool bodies yet (TODO #47: lance FM-Index). Instead match a single \
              field with json_extract(variant_data, '$.field') LIKE '...', scope to one session \
              with session_id = '<id>' and read it with pond_get_session, or search \
              conversational text with contains_tokens(search_text, '...')."
@@ -225,7 +225,7 @@ pub async fn run(
     let started = Instant::now();
     // TODO(#47): substring hunts inside parts.variant_data (json_extract +
     // LIKE full scans) are the dominant real-world cause of this timeout. The
-    // planned fix is lance v8's FM-Index on variant_data (raw-byte substring
+    // planned fix is lance's FM-Index on variant_data (raw-byte substring
     // search via `contains(variant_data, 'needle')`); until it lands, the
     // message steers agents to predicates the current indexes can serve.
     let timeout = effective_timeout(timeout_secs);
@@ -479,7 +479,7 @@ fn jsonb_cast_misuse(sql: &str) -> bool {
 /// in milliseconds instead of a timeout. Token-scan heuristic in the spirit of
 /// `jsonb_cast_misuse`; the timeout message remains the backstop for anything
 /// that slips through.
-/// TODO(#47): lance v8's FM-Index gives raw-byte substring search
+/// TODO(#47): lance's FM-Index gives raw-byte substring search
 /// (`contains(variant_data, 'needle')`); retire this gate once it lands.
 fn jsonb_fulldoc_like_scan(sql: &str) -> bool {
     const JSONB_COLUMNS: [&str; 2] = ["variant_data", "options"];
@@ -713,8 +713,8 @@ impl ScalarUDFImpl for FtsMisuse {
     }
 }
 
-/// Vendored replacement for lance's `FtsQueryUDTF` (lance-7.0.0
-/// src/dataset/udtf.rs). The upstream provider omits `_score` from its
+/// Vendored replacement for lance's `FtsQueryUDTF` (src/dataset/udtf.rs,
+/// still unfixed at lance-10.0.0). The upstream provider omits `_score` from its
 /// declared schema while leaving the scanner's scoring autoprojection on, so
 /// `_score` is physically appended but logically unknown: naming it in SQL
 /// fails ("No field named _score") and any aggregate over fts() dies on
