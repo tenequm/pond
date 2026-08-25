@@ -72,35 +72,38 @@ jobs:
           curl -fsSL https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.160/release-plz-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin release-plz
           release-plz --version
       - name: Render the changelog entry this PR would produce
+        # Scratch files live in RUNNER_TEMP, never the checkout: release-plz
+        # refuses to run against a dirty working tree, and an untracked msg.txt
+        # in the repo is enough to count as dirty.
         run: |
           git fetch origin "pull/$(printenv PR_NUMBER)/head:prhead"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if ! git merge --squash prhead >/dev/null 2>&1; then
-            echo "conflicts with main - no preview until the branch is updated" > preview.md
+            echo "conflicts with main - no preview until the branch is updated" > "$RUNNER_TEMP/preview.md"
             exit 0
           fi
-          printenv PR_TITLE > msg.txt
-          echo >> msg.txt
+          printenv PR_TITLE > "$RUNNER_TEMP/msg.txt"
+          echo >> "$RUNNER_TEMP/msg.txt"
           # The squash body CI previews is exactly what the merge command uses:
           # the PR body's `## Release note` section, HTML comments stripped.
-          printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | perl -0777 -pe 's/<!--.*?-->//gs' >> msg.txt
-          git commit -q --allow-empty -F msg.txt
-          release-plz update --config .github/release-plz.toml 2> release-plz.log || { cat release-plz.log >&2; echo "release-plz update failed - no preview" > preview.md; exit 0; }
+          printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | perl -0777 -pe 's/<!--.*?-->//gs' >> "$RUNNER_TEMP/msg.txt"
+          git commit -q --allow-empty -F "$RUNNER_TEMP/msg.txt"
+          release-plz update --config .github/release-plz.toml 2> "$RUNNER_TEMP/release-plz.log" || { cat "$RUNNER_TEMP/release-plz.log" >&2; echo "release-plz update failed - no preview (see job log)" > "$RUNNER_TEMP/preview.md"; exit 0; }
           if git diff --quiet CHANGELOG.md; then
-            echo "no changelog entry (release-plz found no releasable change)" > preview.md
+            echo "no changelog entry (release-plz found no releasable change)" > "$RUNNER_TEMP/preview.md"
           else
-            awk '/^## \[/{n++} n==1{print} n==2{exit}' CHANGELOG.md > preview.md
+            awk '/^## \[/{n++} n==1{print} n==2{exit}' CHANGELOG.md > "$RUNNER_TEMP/preview.md"
           fi
       - name: Comment the preview
         run: |
-          { echo '<!-- release-note-preview -->'; echo '### Changelog preview'; echo; echo 'The entry below is what this PR contributes to the next release, rendered by `release-plz` from the PR title + `## Release note` section. Edit the PR description to change it.'; echo; cat preview.md; } > comment.md
-          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          { echo '<!-- release-note-preview -->'; echo '### Changelog preview'; echo; echo 'The entry below is what this PR contributes to the next release, rendered by `release-plz` from the PR title + `## Release note` section. Edit the PR description to change it.'; echo; cat "$RUNNER_TEMP/preview.md"; } > "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
           existing=$(gh api "repos/${{ github.repository }}/issues/$(printenv PR_NUMBER)/comments" --paginate -q '.[] | select(.body | startswith("<!-- release-note-preview -->")) | .id' | head -1)
           if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" -F body=@comment.md >/dev/null
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null
           else
-            gh api -X POST "repos/${{ github.repository }}/issues/$(printenv PR_NUMBER)/comments" -F body=@comment.md >/dev/null
+            gh api -X POST "repos/${{ github.repository }}/issues/$(printenv PR_NUMBER)/comments" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null
           fi
         # Fork PRs get a read-only token: the sticky comment fails, the step
         # summary above still carries the preview.
