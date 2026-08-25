@@ -242,3 +242,19 @@ Reconciliations (a second lance-10 `ops_bench --url` run, same store, minutes la
 
 - One-shot CLI: the date-filter penalty over unfiltered search is gone. Pre-zonemap dated ran +24.6 s over unfiltered (150.6 vs 126.0); post-zonemap dated ran 113.1/125.0 s - at or below unfiltered, i.e. parity within noise. The remaining ~2 min is the arm-independent one-shot cold start (#168 measured fts at ~112-117 s too), not the filter.
 - Served path (warm `pond serve`, `POST /v1/search`): unfiltered 0.16-0.18 s; dated 5.3/6.2 s with correct results (10 sessions, 11,643 messages in the 7-day scope). Issue #145's documented served dated figure on lance 8 was ~2 minutes: ~20x.
+
+### 2026-08-25 - s3-nbg1, write A/B: lance 8 vs lance 10 sync replay (matched scratch copies)
+
+Method: the production store was s5cmd-copied to identical scratch prefixes (parity-verified: 417 objects / 12.2 GB / 2,931,634 message rows each), and the same frozen 4-session / +741-row / +46-searchable delta (a snapshot of the local source dir) was synced into each copy once per binary. `warm` = local index/rowmap cache primed by an immediately preceding `--dry-run` against the same copy, which is the recurring-cron shape (cache persists across runs on one store path); `cold` = first-ever run against that store path. Embeddings disabled, matching the read-gate rows. Every run converged to the identical end state (2,932,375 rows).
+
+| state | lance 8 (pond 0.15.1) | lance 10 (feat/lance-10-upgrade) | verdict |
+|---|---|---|---|
+| cold sync | 133.3 s | 134.3 s | parity |
+| warm sync | 12.2 s | 10.4 s | parity (~15% ahead, single-run noise) |
+
+Writes neither regressed nor meaningfully improved 8 -> 10: sync cost is pond-logic and S3-round-trip bound, and cold runs are dominated by the same arm-independent cold start the read probes documented. Caveats: n=1 per cell; the fold in this delta hit the deferred-small-tail path (0-2 s), so a large-tail fold was not A/B'd (the one-sided lance-10 datapoint for that is the 48 s incremental fold in the production sync above).
+
+Side findings from the setup, both pre-existing and lance-independent:
+
+- Hetzner list-after-write lag: a store opened seconds after being s5cmd-copied can list as absent, which routes pond into the store-create path. A visibility poll + settle delay before first open avoids it.
+- The store-create path itself, when it fired spuriously, attempted a PUT with the bucket segment missing from the URL (`NoSuchBucket`). Store creation on a genuinely fresh prefix works (verified by write_bench scratch stores), so the malformed URL appears specific to the create-after-failed-detection flow; worth its own issue.

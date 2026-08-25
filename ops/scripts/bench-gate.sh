@@ -33,8 +33,18 @@ TMP="$(mktemp -d)"
 export POND_EMBEDDINGS_ENABLED=true
 
 echo "=== bench gate: $STORE_URL ==="
-cargo build --release
-POND=target/release/pond
+# POND_BIN: measure a prebuilt binary (e.g. the released pond) instead of HEAD.
+# Only the CLI probes run through it - the cargo benches compile HEAD source,
+# so they are skipped and their fields (iops/ops/write_*) land as null. A
+# POND_BIN row is a probe-level snapshot of the named binary, not a full row.
+if [ -n "${POND_BIN:-}" ]; then
+  POND="$POND_BIN"
+else
+  cargo build --release
+  POND=target/release/pond
+fi
+BIN_VERSION="$($POND --version)"
+echo "binary: $BIN_VERSION"
 
 now() { python3 -c 'import time; print(time.time())'; }
 probe() { # probe <name> <outfile> <cmd...> -> records best-of-runs seconds in $TMP/<name>.s
@@ -78,20 +88,87 @@ for f in sid mid msg; do
 done
 echo "EQUIVALENCE OK: map-served output identical to scan-served"
 
-echo "--- serve_mem_bench (io-trace) ---"
-cargo bench --bench serve_mem_bench --features io-trace -- --storage-path "$STORE_URL" --io-trace | tee "$TMP/serve.txt"
+: > "$TMP/serve.txt"; : > "$TMP/ops.txt"
+: > "$TMP/write-copy.txt"; : > "$TMP/write-sweep.txt"; : > "$TMP/write-prof.txt"
+WRITE_BACKEND=null
+WRITE_CORPUS=null
+if [ -z "${POND_BIN:-}" ]; then
+  echo "--- serve_mem_bench (io-trace) ---"
+  cargo bench --bench serve_mem_bench --features io-trace -- --storage-path "$STORE_URL" --io-trace | tee "$TMP/serve.txt"
 
-echo "--- ops_bench ---"
-# --url is load-bearing: ops_bench resolves the operator XDG config directly
-# (it ignores POND_CONFIG_FILE), so without it the ops phases silently measure
-# whatever store the operator's config names instead of the gate store.
-cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
+  echo "--- ops_bench ---"
+  # --url is load-bearing: ops_bench resolves the operator XDG config directly
+  # (it ignores POND_CONFIG_FILE), so without it the ops phases silently measure
+  # whatever store the operator's config names instead of the gate store.
+  cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
+
+  echo "--- write benches (scratch stores, the real store is never written) ---"
+  # Fixed synthetic corpus so write rows are comparable across time; bump the
+  # corpus tag whenever the shape changes.
+  WRITE_SESSIONS=500 WRITE_MESSAGES=5
+  WRITE_CORPUS='"synthetic-500x5"'
+  if [[ "$STORE_URL" == s3* ]]; then
+    # Sibling prefix beside the gate store (same bucket/creds); each bench run
+    # creates its own scratch stores under it and cleanup removes them all.
+    WRITE_BASE="${STORE_URL%/*}/benchw"
+    DEST_ARGS=(--dest-url "$WRITE_BASE")
+    WRITE_BACKEND='"s3"'
+  else
+    DEST_ARGS=()
+    WRITE_BACKEND='"local"'
+  fi
+  cargo bench --bench write_bench -- --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" "${DEST_ARGS[@]}" | tee "$TMP/write-copy.txt"
+  if grep -q ': false' "$TMP/write-copy.txt"; then echo "WRITE VERIFICATION FAILED"; exit 1; fi
+  cargo bench --bench write_bench -- --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" --append-sweep 512 --sweep-commits-cap 10 "${DEST_ARGS[@]}" | tee "$TMP/write-sweep.txt"
+  # --grown 2: round 0 folds under the eager policy, round 1 under the deferred
+  # policy production sync uses - round 1 is the scraped fold figure.
+  cargo bench --bench write_bench -- --profile-optimize "$TMP/wprof" --sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES" --grown 2 "${DEST_ARGS[@]}" | tee "$TMP/write-prof.txt"
+  if [ -n "${WRITE_BASE:-}" ]; then
+    if command -v s5cmd > /dev/null; then
+      python3 - "$OPERATOR_CONFIG" "$WRITE_BASE" <<'PYEOF' > "$TMP/scratch-env.sh"
+import pathlib, subprocess, sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+cr = c.get("creds", {}).get("default", {})
+def val(base):
+    if cr.get(base):
+        return cr[base]
+    f = cr.get(base + "_file")
+    if f:
+        return pathlib.Path(f).expanduser().read_text().strip()
+    cmd = cr.get(base + "_command")
+    if cmd:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True).stdout.strip()
+    raise SystemExit(f"missing creds field: {base}")
+rest = sys.argv[2].split("://", 1)[1]
+host, key = rest.split("/", 1)
+print(f"export AWS_ACCESS_KEY_ID='{val('access_key_id')}'")
+print(f"export AWS_SECRET_ACCESS_KEY='{val('secret_access_key')}'")
+print(f"export AWS_REGION='{c['storage'].get('region', 'us-east-1')}'")
+print(f"export SCRATCH_ENDPOINT='https://{host}'")
+print(f"export SCRATCH_GLOB='s3://{key}*'")
+PYEOF
+      # shellcheck disable=SC1091
+      . "$TMP/scratch-env.sh"
+      s5cmd --endpoint-url "$SCRATCH_ENDPOINT" rm "$SCRATCH_GLOB" > /dev/null 2>&1 || true
+      echo "scratch cleaned: $SCRATCH_GLOB"
+    else
+      echo "WARNING: s5cmd not found - clean up scratch prefixes under $WRITE_BASE-* manually"
+    fi
+  fi
+fi
 
 # `null` when the bench skipped that phase (serve_mem_bench skips its vector
-# phases on an embeddings-disabled instance), so a missing row can never emit
-# invalid JSON like `"vector_iops":,`.
+# phases on an embeddings-disabled instance; every bench is skipped under
+# POND_BIN), so a missing row can never emit invalid JSON like `"vector_iops":,`.
 iops() { local v; v=$(awk -v c="$1" '$1 == c {print $2; exit}' "$TMP/serve.txt"); echo "${v:-null}"; }
-ms() { local v; v=$(grep -F "$1" "$TMP/ops.txt" | awk '{print int($(NF-1))}'); echo "${v:-null}"; }
+ms() { local v; v=$(grep -F "$1" "$TMP/ops.txt" | awk '{print int($(NF-1))}' || true); echo "${v:-null}"; }
+# write_bench scrapers, keyed to its human-readable lines: "[1] full copy
+# streaming :   N ms", the sweep table row, "build total: N ms", and the
+# round-1 (production deferred policy) fold total.
+wcopy() { local v; v=$(grep -F "[$1]" "$TMP/write-copy.txt" | awk -F: '{print $2}' | awk '{print $1; exit}' || true); echo "${v:-null}"; }
+wsweep() { local v; v=$(awk -v f="$1" '$1 == "512" {gsub(/\(/, "", $f); print $f; exit}' "$TMP/write-sweep.txt"); echo "${v:-null}"; }
+wbuild() { local v; v=$(grep -F 'build total:' "$TMP/write-prof.txt" | awk '{print $3; exit}' || true); echo "${v:-null}"; }
+wfold() { local v; v=$(grep -E 'round +1 \[after' "$TMP/write-prof.txt" | awk -F'total: ' '{print $2}' | awk '{print $1; exit}' || true); echo "${v:-null}"; }
 # A dirty tree means the measured binary may not match the named commit; the
 # baseline the gate itself appends to never affects the binary, so exclude it.
 COMMIT="$(git rev-parse --short HEAD)"
@@ -100,12 +177,15 @@ if [ -n "$(git status --porcelain -- ':!docs/benchmarks/bench-gate-baseline.json
 # is public, so the row carries a digest (or operator-set STORE_LABEL), never
 # the store URL itself.
 STORE_LABEL="${STORE_LABEL:-$(printf %s "$STORE_URL" | shasum -a 256 | cut -c1-12)}"
-printf '{"date":"%s","commit":"%s","store":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_dated_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"oracle_warm_ms":%s}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$STORE_LABEL" \
+printf '{"date":"%s","commit":"%s","bin":"%s","store":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_dated_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"oracle_warm_ms":%s,"write_backend":%s,"write_corpus":%s,"write_copy_ms":%s,"write_copy_merge_ms":%s,"write_copy_noop_ms":%s,"write_copy_delta_ms":%s,"write_ms_per_commit":%s,"write_rows_per_s":%s,"write_index_build_ms":%s,"write_fold_ms":%s}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$BIN_VERSION" "$STORE_LABEL" \
   "$(cat "$TMP/get_session_sid.s")" "$(cat "$TMP/get_session_mid.s")" "$(cat "$TMP/get_message.s")" \
   "$(cat "$TMP/search.s")" "$(cat "$TMP/search_dated.s")" "$(cat "$TMP/sql_count.s")" \
   "$(iops fts_search)" "$(iops vector_search)" "$(iops pond_get_message)" "$(iops pond_search)" \
   "$(ms 'open store (manifests)')" "$(ms row_counts)" "$(ms 'session_last_message_ids WARM')" \
+  "$WRITE_BACKEND" "$WRITE_CORPUS" \
+  "$(wcopy 1)" "$(wcopy 1b)" "$(wcopy 3)" "$(wcopy 4)" \
+  "$(wsweep 5)" "$(wsweep 6)" "$(wbuild)" "$(wfold)" \
   >> "$BASELINE"
 
 echo "--- delta vs previous run ---"
@@ -121,11 +201,11 @@ if prev.get("store") != cur.get("store"):
     print(f"WARNING: different stores ({prev.get('store')} -> {cur.get('store')}) - deltas below are cross-store, not a regression signal")
 print(f"{'metric':<20}{'prev':>12}{'now':>12}{'delta':>10}   ({prev['date']} {prev['commit']} -> {cur['date']} {cur['commit']})")
 for k, v in cur.items():
-    if k in ("date", "commit", "store", "equivalence", "search_mode"):
+    if k in ("date", "commit", "bin", "store", "equivalence", "search_mode", "write_backend", "write_corpus"):
         continue
     p = prev.get(k)
     d = f"{(v - p) / p * 100:+.0f}%" if p and isinstance(v, (int, float)) else "n/a"
     print(f"{k:<20}{p if p is not None else '-':>12}{v if v is not None else '-':>12}{d:>10}")
-if not any(k.startswith("write_") for k in cur):
+if not any(k.startswith("write_") and cur[k] is not None for k in cur):
     print("NOTE: no write_* metrics in this row - storage-path changes need a write-side A/B (AGENTS.md#benchmarking-storage-path-changes)")
 EOF
