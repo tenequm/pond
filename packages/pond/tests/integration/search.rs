@@ -319,6 +319,14 @@ async fn filters_narrow_results_over_the_fixture_corpus() -> anyhow::Result<()> 
     request.filters.from_date = Some("2099-01-01".to_owned());
     assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
 
+    // ... and a far-past upper bound excludes it from the other direction.
+    // These empty-window asserts only guard bounds-not-applied; an over-pruning
+    // zonemap (#75) passes them trivially - the #75 guard is the wide-window
+    // case below.
+    let mut request = search_request(&phrase);
+    request.filters.to_date = Some("2000-01-01".to_owned());
+    assert!(hits_of(pond_search(&store, &embedder, request, &search_config()).await).is_empty());
+
     // #75: a wide far-past..far-future window must keep every hit, not prune the corpus.
     let unfiltered =
         hits_of(pond_search(&store, &embedder, search_request(&phrase), &search_config()).await)

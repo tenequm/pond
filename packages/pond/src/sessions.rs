@@ -3519,7 +3519,13 @@ impl Store {
                     .map(|(_, address, _)| *address)
                     .collect::<Vec<_>>();
                 let blobs = dataset.take_blobs_by_addresses(&addresses, "data").await?;
-                for ((row, _, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                for ((row, address, variant_data), blob) in file_rows.into_iter().zip(blobs) {
+                    // Lance 10 returns one entry per requested address, `None`
+                    // for a null cell - impossible here, since every `file` row
+                    // is written with its payload.
+                    let blob = blob.with_context(|| {
+                        format!("file part blob is null at row address {address}")
+                    })?;
                     // Legacy blob (lance-encoding:blob): payload is bytes; the
                     // url variant stored its URL as UTF-8 bytes, recovered via
                     // `file_data_from_blob`'s `data_kind = "url"` branch.
@@ -4677,10 +4683,13 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// `embedding_model`: pond's invariant is one active model at a time (a model
 /// swap goes through `pond optimize --force-embed` which drops the IVF_SQ,
 /// clears stale rows, and re-bootstraps), so the only embedding-state filter is
-/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. Do NOT add a
-/// ZoneMap on `timestamp`: it prunes every zone for the tz-aware column, so
-/// date filters return empty (#75) - an upstream `safe_coerce_scalar` tz drop
-/// that no literal form escapes. Date bounds run as a refine over the arm pool.
+/// `vector IS NOT NULL`. `id` lookups are rare and full-scan. The `timestamp`
+/// ZoneMap prunes date-scoped prefilters that otherwise full-scan the table on
+/// remote stores. It depends on lance translating scalar-index results from
+/// the address domain into row ids (upstream #7434); without that translation
+/// stable-row-id datasets get silently empty date filters (#75) - lance-8
+/// readers of a store carrying this index still do. Re-verify via the #75
+/// regression test in tests/integration/search.rs on any lance bump.
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",
@@ -4691,6 +4700,11 @@ const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
         "source_agent",
         BuiltinIndexType::Bitmap,
         "messages_source_agent_bitmap",
+    ),
+    (
+        "timestamp",
+        BuiltinIndexType::ZoneMap,
+        "messages_timestamp_zonemap",
     ),
 ];
 
@@ -4802,8 +4816,8 @@ pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 const IVF_SQ_NUM_BITS: u16 = 8;
 const IVF_SQ_MAX_ITERS: usize = 15;
 
-/// Pond's production IndexIntents: the per-table intent set
-/// `Store::open_with_options` registers with the substrate.
+/// Pond's production IndexIntents: the per-table intent set the maintenance
+/// paths (sync/optimize/copy) reconcile against the store.
 pub fn pond_index_intents() -> IndexIntents {
     pond_index_intents_with_vector_threshold(
         VECTOR_INDEX_ACTIVATION_ROWS,
