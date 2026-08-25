@@ -847,10 +847,31 @@ fn validation_details(
 }
 
 pub fn storage_error(error_value: anyhow::Error) -> ErrorEnvelope {
+    // Lance's "fragment N referenced by an address-domain index result was not
+    // found" internal error means a compaction orphaned the timestamp
+    // zonemap's fragment references - any writer without the same-run
+    // self-heal does this, including this binary's own compaction in the
+    // window before its indices phase heals it. The store's data is intact
+    // and the index is recreatable; name the recovery instead of surfacing a
+    // bare storage failure.
+    let stale_address_index = error_value.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("referenced by an address-domain index result")
+    });
+    if stale_address_index {
+        return error(
+            ErrorCode::StorageUnavailable,
+            "date-filter index is stale: it references fragments that compaction rewrote; \
+             run `pond optimize --rebuild`, or the next `pond sync`/`pond optimize` from \
+             this pond version repairs it automatically",
+            serde_json::json!({ "underlying": format!("{error_value:#}") }),
+        );
+    }
     error(
         ErrorCode::StorageUnavailable,
         "storage operation failed",
-        serde_json::json!({ "underlying": error_value.to_string() }),
+        serde_json::json!({ "underlying": format!("{error_value:#}") }),
     )
 }
 
@@ -866,5 +887,24 @@ mod tests {
         let envelope: ErrorEnvelope = crate::Error::Conflict { attempts: 3 }.into();
         assert_eq!(envelope.error.code, ErrorCode::Conflict);
         assert_eq!(envelope.error.details, json!({ "attempts": 3 }));
+    }
+
+    #[test]
+    fn storage_error_names_the_stale_zonemap_recovery() {
+        let lance_internal = anyhow::anyhow!(
+            "Internal error: fragment 5225 referenced by an address-domain index result \
+             was not found in the dataset"
+        )
+        .context("scan failed");
+        let envelope = storage_error(lance_internal);
+        assert_eq!(envelope.error.code, ErrorCode::StorageUnavailable);
+        assert!(envelope.error.message.contains("pond optimize --rebuild"));
+        let underlying = envelope.error.details["underlying"]
+            .as_str()
+            .expect("underlying detail");
+        assert!(underlying.contains("fragment 5225"));
+
+        let generic = storage_error(anyhow::anyhow!("connection refused"));
+        assert_eq!(generic.error.message, "storage operation failed");
     }
 }

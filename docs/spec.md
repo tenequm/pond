@@ -215,7 +215,7 @@ Writes commit data without folding indexes; index maintenance is operator-trigge
 |---|---|---|
 | BTree (scalar) | `optimize_indices(append)` | Merges existing sorted index pages with only the new fragments' data; never re-scans already-indexed source. |
 | Bitmap (scalar) | `optimize_indices(append)` | Incremental fold is safe. |
-| ZoneMap (scalar) | `optimize_indices(append)` | Incremental fold is safe (zonemap implements per-fragment `update`). Non-remappable; safe only because stable-row-id datasets never remap. |
+| ZoneMap (scalar) | `optimize_indices(append)`; full recreate when the payload is stale | Incremental fold is safe (zonemap implements per-fragment `update`) - but the payload is address-domain and non-remappable, and compaction of covered fragments orphans it even under stable row ids: Lance skips the remapper and rewrites only the manifest `fragment_bitmap`, leaving zones pointing at dead fragment ids (hard error on every date-filtered query) while the bitmap claims fragments the payload has no zones for. The indices phase therefore probes payload-vs-live fragment ids (`calculate_included_frags`) for address-domain indexes and recreates the index when stale; the probe runs after the compaction phase, so same-run damage heals in the same optimize. |
 | Inverted (FTS) | `optimize_indices(append)` | Incremental fold is safe. |
 | IVF_SQ (vector) | `optimize_indices(append)` | Stable-row-id IVF supports incremental fold via `IvfIndexBuilder::new_incremental`; centroids and per-dimension SQ ranges carry forward. |
 

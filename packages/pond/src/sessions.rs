@@ -4689,7 +4689,10 @@ fn role_from_str(value: &str) -> Result<Role> {
 /// the address domain into row ids (upstream #7434); without that translation
 /// stable-row-id datasets get silently empty date filters (#75) - lance-8
 /// readers of a store carrying this index still do. Re-verify via the #75
-/// regression test in tests/integration/search.rs on any lance bump.
+/// regression test in tests/integration/search.rs on any lance bump. Because
+/// the payload is address-domain, compaction of covered fragments orphans it
+/// (lance never remaps it under stable row ids); the indices phase detects
+/// that and recreates the index (`address_index_is_stale` in substrate.rs).
 const MESSAGE_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     (
         "session_id",

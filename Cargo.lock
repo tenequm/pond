@@ -6734,6 +6734,7 @@ dependencies = [
  "parquet",
  "rlimit",
  "rmcp",
+ "roaring",
  "rusqlite",
  "s3s",
  "s3s-fs",
