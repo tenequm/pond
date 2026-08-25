@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.15.2](https://github.com/tenequm/pond/compare/v0.15.1...v0.15.2) - 2026-08-25
+
+### <!-- 1 -->🎉 New Features
+- upgrade Lance to 10.0.0 and prune date-scoped search with a timestamp zonemap ([#182](https://github.com/tenequm/pond/pull/182)) ([232993b](https://github.com/tenequm/pond/commit/232993b11ffde67851add245a2fba441c4f19169))
+
+### <!-- 5 -->📚 Documentation
+- **readme:** mark roadmap step 8 shipped in v0.15.1 ([c80b15c](https://github.com/tenequm/pond/commit/c80b15cce12deb666f08ed1df12536a3fdae5a4d))
+
+### <!-- 6 -->🧹 Chores
+- **embed:** drive idle eviction on tokio's virtual clock ([ce7138c](https://github.com/tenequm/pond/commit/ce7138c9e7800f0f9ad519cfbca0aaa362097407))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.1...v0.15.2
+
 ## [0.15.1](https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1) - 2026-08-24
 
 Two new harnesses, and the machinery that made them cheap to add. pond now ingests **letta-code** and **grok-build** (xAI's `grok` CLI) sessions, bringing the registry to twelve harnesses, eleven of them auto-discovered. Both adapters were requested by [Kyle Little](https://github.com/klittle32) (#170, #171), who runs letta as the orchestrator over codex, pi, claude-code, omp and grok workers, and were the first picked by the roadmap's reaction ordering. Both were built end to end from a new `add-adapter` playbook and a shared conformance harness - the second one needed zero edits to either, which was the bar the playbook had to meet. Every adapter now carries a `docs/adapters/<name>.md` spec with an 11-row decision table and a `Last verified` date against a named upstream version, so "does pond still read this format?" has a written answer instead of a guess.
