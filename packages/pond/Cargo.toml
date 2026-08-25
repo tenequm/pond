@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.95"

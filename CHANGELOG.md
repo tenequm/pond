@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.16.0](https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0) - 2026-08-25
+
+Date-scoped search stops full-scanning. The storage engine moves to Lance 10.0.0, and `messages` gains a `timestamp` zonemap that prunes date-bounded queries at the index instead of the table: on a 2.9M-row remote store a served `--from-date` search went from ~2 minutes to 5-6 s (~20x), and the date filter now costs nothing over an unfiltered search instead of +25 s. COUNT pushdown fires under stable row ids too (`pond sql` count 2.1 s -> 1.3 s). Writes are unchanged: a matched-store A/B measured sync at parity on both cold and warm runs.
+
+**Upgrading:** nothing manual, but this one is a fleet decision. The zonemap is created on the first `pond sync` or `pond optimize` a 0.16.0 binary runs, and pond 0.15.1 and earlier consume that index in the wrong id domain - so an older binary reading the same store returns **zero results for date-filtered searches**, with no error and no warning (`--from-date` / `--to-date` on the CLI, `from_date` / `to_date` over MCP). Unfiltered search, `pond get-session`, `pond get-message`, and `pond sql` are unaffected, and nothing about the store is damaged: an old reader that upgrades is immediately correct again. If several machines share one store, upgrade every machine that reads it, not just the ones that write it.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] stores synced by 0.16.0 carry a timestamp zonemap that pond <= 0.15.1 reads as an empty date filter ([361abed](https://github.com/tenequm/pond/commit/361abed03ef174c1a742d92000bebbf741babccc))
+
+### <!-- 1 -->🎉 New Features
+- upgrade Lance to 10.0.0 and prune date-scoped search with a timestamp zonemap ([#182](https://github.com/tenequm/pond/pull/182)) ([232993b](https://github.com/tenequm/pond/commit/232993b11ffde67851add245a2fba441c4f19169))
+
+### <!-- 5 -->📚 Documentation
+- **readme:** mark roadmap step 8 shipped in v0.15.1 ([c80b15c](https://github.com/tenequm/pond/commit/c80b15cce12deb666f08ed1df12536a3fdae5a4d))
+
+### <!-- 6 -->🧹 Chores
+- **embed:** drive idle eviction on tokio's virtual clock ([ce7138c](https://github.com/tenequm/pond/commit/ce7138c9e7800f0f9ad519cfbca0aaa362097407))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0
+
 ## [0.15.1](https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1) - 2026-08-24
 
 Two new harnesses, and the machinery that made them cheap to add. pond now ingests **letta-code** and **grok-build** (xAI's `grok` CLI) sessions, bringing the registry to twelve harnesses, eleven of them auto-discovered. Both adapters were requested by [Kyle Little](https://github.com/klittle32) (#170, #171), who runs letta as the orchestrator over codex, pi, claude-code, omp and grok workers, and were the first picked by the roadmap's reaction ordering. Both were built end to end from a new `add-adapter` playbook and a shared conformance harness - the second one needed zero edits to either, which was the bar the playbook had to meet. Every adapter now carries a `docs/adapters/<name>.md` spec with an 11-row decision table and a `Last verified` date against a named upstream version, so "does pond still read this format?" has a written answer instead of a guess.
