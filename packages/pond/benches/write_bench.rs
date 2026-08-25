@@ -409,7 +409,9 @@ async fn temp_staging_copy(from: &Store, to: &Store) -> Result<u128> {
 async fn merge_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let mut plan = to.plan_incremental_from(from).await?;
-    for table in [&mut plan.sessions, &mut plan.messages, &mut plan.parts] {
+    // Sessions stay on append: their rows are immutable, so the merge bucket
+    // is undefined for them (copy_table ignores it by invariant).
+    for table in [&mut plan.messages, &mut plan.parts] {
         let appended = std::mem::take(&mut table.append);
         table.merge.extend(appended);
     }
