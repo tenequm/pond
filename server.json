@@ -7,13 +7,13 @@
     "url": "https://github.com/tenequm/pond",
     "source": "github"
   },
-  "version": "0.14.11",
+  "version": "0.16.0",
   "websiteUrl": "https://pond.locker/",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "pond-db",
-      "version": "0.14.11",
+      "version": "0.16.0",
       "transport": {
         "type": "stdio"
       }
