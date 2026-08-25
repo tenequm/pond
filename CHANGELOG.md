@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.1](https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1) - 2026-08-25
+
+### <!-- 1 -->🎉 New Features
+- bench-gate measures writes and stamps the binary, one row per run ([#183](https://github.com/tenequm/pond/pull/183)) ([ec6dad3](https://github.com/tenequm/pond/commit/ec6dad321c062198ffcebd0bd605305319546bd5))
+
+### <!-- 2 -->🐛 Bug Fixes
+- self-heal the timestamp zonemap after compaction orphans its fragment references ([#185](https://github.com/tenequm/pond/pull/185)) ([eeb2676](https://github.com/tenequm/pond/commit/eeb267667529e31548782889a2338411243a1c5e))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1
+
 ## [0.16.0](https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0) - 2026-08-25
 
 Date-scoped search stops full-scanning. The storage engine moves to Lance 10.0.0, and `messages` gains a `timestamp` zonemap that prunes date-bounded queries at the index instead of the table: on a 2.9M-row remote store a served `--from-date` search went from ~2 minutes to 5-6 s (~20x), and the date filter now costs nothing over an unfiltered search instead of +25 s. COUNT pushdown fires under stable row ids too (`pond sql` count 2.1 s -> 1.3 s). Writes are unchanged: a matched-store A/B measured sync at parity on both cold and warm runs.
