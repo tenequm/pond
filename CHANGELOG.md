@@ -2,6 +2,12 @@
 
 ## [0.16.1](https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1) - 2026-08-25
 
+Date-filtered search stays correct across compaction. 0.16.0's timestamp zonemap indexes rows by *address* (fragment id plus offset), and Lance never remaps those addresses when compaction rewrites a fragment - it refreshes the index's fragment list while the index body keeps pointing at fragments that no longer exist. Every pond version's compaction does this, 0.16.0's own included. The result was a date-filtered search that either failed outright (`storage_unavailable`, naming a missing fragment) or, once a later index fold cleaned up the dangling references, silently dropped the rewritten rows from its results. Ordinary search, `pond get-session`, `pond get-message`, and `pond sql` were never affected, and no data was ever at risk - the index went stale, the store did not.
+
+pond now checks the index against the store's live fragments at the end of every maintenance run and rebuilds it when they disagree. Because the check runs immediately after compaction, a machine repairs its own damage within the same `pond sync` or `pond optimize`, and picks up another machine's on the next one. The rebuild only fires when compaction actually rewrote indexed fragments.
+
+**Upgrading:** just upgrade - a store that is already broken is repaired by the first `pond sync` or `pond optimize` a 0.16.1 binary runs, with no manual step (`pond optimize --rebuild` still works if you want it now). This is the version that ends the cycle: until every machine writing to a shared store is on 0.16.1, any older binary's compaction can break date filters again, so upgrade the writers, not just the readers.
+
 ### <!-- 1 -->🎉 New Features
 - bench-gate measures writes and stamps the binary, one row per run ([#183](https://github.com/tenequm/pond/pull/183)) ([ec6dad3](https://github.com/tenequm/pond/commit/ec6dad321c062198ffcebd0bd605305319546bd5))
 
