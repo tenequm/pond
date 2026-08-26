@@ -78,9 +78,10 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Benchmarking storage-path changes: both sides, before the new binary writes
 
-- A change that materially alters the read or write path (lance/DataFusion upgrades, index roster changes, storage-layer rewrites) must be benchmarked on BOTH sides before landing: reads via `moon run bench-gate`, writes via a matched-state A/B - old binary vs new against two identical s5cmd scratch copies of the store (sync replay and/or `optimize --rebuild`).
-- Run the old-side rows BEFORE the new binary ever writes to the real store: writes mutate store state, so the old-side baseline is unrecoverable afterwards except via scratch copies (the lance 8->10 upgrade lost its write baseline exactly this way).
-- Both rows go to `docs/benchmarks/bench-gate-baseline.jsonl`; write metrics use `write_sync_s` / `write_rebuild_s` keys, and the gate's delta printer flags rows that lack them.
+- A change that materially alters the read or write path (lance/DataFusion upgrades, index roster changes, storage-layer rewrites) must be benchmarked on BOTH sides before landing. `moon run bench-gate` covers both in one run - read probes/benches against the configured store, write benches (copy suite, commit sweep, index build/fold) against ephemeral scratch stores beside it - and appends one row per run to `docs/benchmarks/bench-gate-baseline.jsonl`.
+- Run the old-side row (the gate at the pre-change commit) BEFORE the new binary ever writes to the real store: writes mutate store state, so the old-side read baseline is unrecoverable afterwards except via s5cmd scratch copies (the lance 8->10 upgrade lost its sync-write baseline exactly this way). The gate's write metrics have no such hazard - they run on fixed synthetic scratch stores either way.
+- `POND_BIN=/path/to/pond moon run bench-gate` snapshots a prebuilt binary (e.g. the released one) through the CLI probes; the cargo-bench fields land null since those compile HEAD. A full old-side row needs the gate run from the old commit's checkout.
+- Rows are comparable only within the same `store` digest and `write_corpus` tag; the delta printer warns on store changes and flags rows with no write metrics.
 
 ## Errors
 

@@ -399,17 +399,18 @@ async fn temp_staging_copy(from: &Store, to: &Store) -> Result<u128> {
     Ok(started.elapsed().as_millis())
 }
 
-/// C8 treatment: force every absent session through merge-insert instead of the
+/// C8 treatment: force messages and parts through merge-insert instead of the
 /// append fast-path - the counterfactual cost of routing copy through a
 /// merge-insert seam (`WhenMatched::DoNothing`) rather than the filtered append
-/// it now uses. Same inputs as `streaming_copy`; the only difference is append
-/// ids are moved into the merge bucket, so the destination pays a per-row target
-/// probe/join. The delta vs `streaming_copy` is the cost of dropping the append
-/// fast-path.
+/// it now uses. Same inputs as `streaming_copy`; message/part append ids are
+/// moved into the merge bucket (sessions stay on append: immutable rows make
+/// their merge bucket undefined), so the destination pays a per-row target
+/// probe/join. The delta vs `streaming_copy` is the cost of dropping the
+/// append fast-path.
 async fn merge_copy(from: &Store, to: &Store) -> Result<(DeltaPlan, u128, u64)> {
     let before = to.dataset(Table::Messages).await?.version_id();
     let mut plan = to.plan_incremental_from(from).await?;
-    for table in [&mut plan.sessions, &mut plan.messages, &mut plan.parts] {
+    for table in [&mut plan.messages, &mut plan.parts] {
         let appended = std::mem::take(&mut table.append);
         table.merge.extend(appended);
     }

@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.16.2](https://github.com/tenequm/pond/compare/v0.16.1...v0.16.2) - 2026-08-26
+
+A Windows schedule that can never fire is now diagnosed instead of silently reported healthy. Both failure modes in this release were found live on a real Windows machine after a winget-to-Scoop migration: the scheduled task's action still pointed at the uninstalled binaries (every 5-minute tick died with 0x80070002 FILE_NOT_FOUND while `pond schedule status` said `active`), and the task itself had been registered from an elevated shell, so `pond schedule start`/`stop` from a normal shell failed with a bare `Access is denied`. Alongside the fix, Scoop becomes the working Windows install channel: the bucket now genuinely self-updates from each release (its checkver had been broken since creation), each release pings it so new versions land within minutes, and winget leaves the docs until [winget-pkgs#419055](https://github.com/microsoft/winget-pkgs/pull/419055) merges.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **schedule:** detect broken Task Scheduler registrations and name the elevated-ownership fix ([8945816](https://github.com/tenequm/pond/commit/89458160a6d7b6fbb73adbb520d08183dc3985e1))
+  - A registration whose launcher no longer exists (uninstall, package-manager switch) renders as `schedule  broken (task-scheduler, every 5m) - the registered launcher no longer exists (...); run pond schedule start to re-register`, in `pond status` text and as `schedule.problem` in `--format json`. The next-run estimate, the `(pond schedule logs)` pointer, and the "scheduled sync hasn't completed yet" hint are suppressed for it - that launcher never runs, so the log it points at stays empty. Gated once at derivation so text and JSON agree; exit codes unchanged (broken still exits 0, documented).
+  - A task registered from an elevated shell is owned by Administrators and untouchable from normal shells. `schtasks /Create`/`/Delete` failures over an existing task now explain the trap and name the recovery - `pond schedule stop` from an elevated shell - checked on task existence, not stderr text, because schtasks messages are localized. `pond schedule start` warns before registering from an elevated shell, after the already-scheduled no-op return, so only a run that actually registers sets off the note.
+  - `pondw_bin` documents why the `current_exe` fallback is the designed Scoop path - the shim spawns the real exe as a child and `GetModuleFileNameW` preserves the stable `current` junction (measured on a real box 2026-08-26) - and must never canonicalize, which would pin the task to a versioned dir `scoop cleanup` deletes.
+  - Validated twice on Windows: the full suite in CI, and the schedule tests plus clippy on a physical Windows 11 machine where the originating incident was reproduced and repaired end to end (elevated delete, unelevated re-register, manual and unattended ticks both `Ready / 0`).
+
+### <!-- 5 -->📚 Documentation
+- remove winget from install docs until the winget-pkgs review merges ([dc393e3](https://github.com/tenequm/pond/commit/dc393e3bea2f17e114fdb2dba2fc1aeea953b805))
+  - `winget install tenequm.pond` led the Windows install docs while resolving to "No package found" - the manifest is still in review upstream. Scoop is now the documented channel; the `winget install Google.Protobuf` / `NASM.NASM` build prerequisites stay, since those packages resolve fine. winget returns to the docs when the review merges (the CI publish job self-activates the moment the package exists upstream).
+  - Off-repo but part of the same story: the scoop-bucket's `checkver` pointed at the homepage instead of the GitHub repo, so its 4-hourly autoupdate had 404ed on every run since creation, pinning the bucket at 0.14.10 - the pre-NTFS-durability Windows build. Fixed and bumped to 0.16.1 in [tenequm/scoop-bucket](https://github.com/tenequm/scoop-bucket), and each pond release now dispatches the bucket's updater directly ([e623cc8](https://github.com/tenequm/pond/commit/e623cc8)), cutting Scoop lag from up to 4h to minutes.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.1...v0.16.2
+
+## [0.16.1](https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1) - 2026-08-25
+
+Date-filtered search stays correct across compaction. 0.16.0's timestamp zonemap indexes rows by *address* (fragment id plus offset), and Lance never remaps those addresses when compaction rewrites a fragment - it refreshes the index's fragment list while the index body keeps pointing at fragments that no longer exist. Every pond version's compaction does this, 0.16.0's own included. The result was a date-filtered search that either failed outright (`storage_unavailable`, naming a missing fragment) or, once a later index fold cleaned up the dangling references, silently dropped the rewritten rows from its results. Ordinary search, `pond get-session`, `pond get-message`, and `pond sql` were never affected, and no data was ever at risk - the index went stale, the store did not.
+
+pond now checks the index against the store's live fragments at the end of every maintenance run and rebuilds it when they disagree. Because the check runs immediately after compaction, a machine repairs its own damage within the same `pond sync` or `pond optimize`, and picks up another machine's on the next one. The rebuild only fires when compaction actually rewrote indexed fragments.
+
+**Upgrading:** just upgrade - a store that is already broken is repaired by the first `pond sync` or `pond optimize` a 0.16.1 binary runs, with no manual step (`pond optimize --rebuild` still works if you want it now). This is the version that ends the cycle: until every machine writing to a shared store is on 0.16.1, any older binary's compaction can break date filters again, so upgrade the writers, not just the readers.
+
+### <!-- 1 -->🎉 New Features
+- bench-gate measures writes and stamps the binary, one row per run ([#183](https://github.com/tenequm/pond/pull/183)) ([ec6dad3](https://github.com/tenequm/pond/commit/ec6dad321c062198ffcebd0bd605305319546bd5))
+
+### <!-- 2 -->🐛 Bug Fixes
+- self-heal the timestamp zonemap after compaction orphans its fragment references ([#185](https://github.com/tenequm/pond/pull/185)) ([eeb2676](https://github.com/tenequm/pond/commit/eeb267667529e31548782889a2338411243a1c5e))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1
+
+## [0.16.0](https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0) - 2026-08-25
+
+Date-scoped search stops full-scanning. The storage engine moves to Lance 10.0.0, and `messages` gains a `timestamp` zonemap that prunes date-bounded queries at the index instead of the table: on a 2.9M-row remote store a served `--from-date` search went from ~2 minutes to 5-6 s (~20x), and the date filter now costs nothing over an unfiltered search instead of +25 s. COUNT pushdown fires under stable row ids too (`pond sql` count 2.1 s -> 1.3 s). Writes are unchanged: a matched-store A/B measured sync at parity on both cold and warm runs.
+
+**Upgrading:** nothing manual, but this one is a fleet decision. The zonemap is created on the first `pond sync` or `pond optimize` a 0.16.0 binary runs, and pond 0.15.1 and earlier consume that index in the wrong id domain - so an older binary reading the same store returns **zero results for date-filtered searches**, with no error and no warning (`--from-date` / `--to-date` on the CLI, `from_date` / `to_date` over MCP). Unfiltered search, `pond get-session`, `pond get-message`, and `pond sql` are unaffected, and the store's data is never damaged: an old reader that upgrades is immediately correct again. **Writers** are the dangerous case (correction post-release): compaction orphans the zonemap whenever it rewrites fragments the index covers - every version's compaction does this, 0.16.0's own included - after which date-filtered searches on 0.16.0 fail with a `storage_unavailable` error until `pond optimize --rebuild` recreates the index. 0.16.1 adds the repair: every `pond sync`/`pond optimize` detects the stale index right after compaction and recreates it in the same run. If several machines share one store, upgrade every machine that reads it, not just the ones that write it, and stop the schedule on machines you cannot upgrade yet.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] stores synced by 0.16.0 carry a timestamp zonemap that pond <= 0.15.1 reads as an empty date filter ([361abed](https://github.com/tenequm/pond/commit/361abed03ef174c1a742d92000bebbf741babccc))
+
+### <!-- 1 -->🎉 New Features
+- upgrade Lance to 10.0.0 and prune date-scoped search with a timestamp zonemap ([#182](https://github.com/tenequm/pond/pull/182)) ([232993b](https://github.com/tenequm/pond/commit/232993b11ffde67851add245a2fba441c4f19169))
+
+### <!-- 5 -->📚 Documentation
+- **readme:** mark roadmap step 8 shipped in v0.15.1 ([c80b15c](https://github.com/tenequm/pond/commit/c80b15cce12deb666f08ed1df12536a3fdae5a4d))
+
+### <!-- 6 -->🧹 Chores
+- **embed:** drive idle eviction on tokio's virtual clock ([ce7138c](https://github.com/tenequm/pond/commit/ce7138c9e7800f0f9ad519cfbca0aaa362097407))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.15.1...v0.16.0
+
 ## [0.15.1](https://github.com/tenequm/pond/compare/v0.15.0...v0.15.1) - 2026-08-24
 
 Two new harnesses, and the machinery that made them cheap to add. pond now ingests **letta-code** and **grok-build** (xAI's `grok` CLI) sessions, bringing the registry to twelve harnesses, eleven of them auto-discovered. Both adapters were requested by [Kyle Little](https://github.com/klittle32) (#170, #171), who runs letta as the orchestrator over codex, pi, claude-code, omp and grok workers, and were the first picked by the roadmap's reaction ordering. Both were built end to end from a new `add-adapter` playbook and a shared conformance harness - the second one needed zero edits to either, which was the bar the playbook had to meet. Every adapter now carries a `docs/adapters/<name>.md` spec with an 11-row decision table and a `Last verified` date against a named upstream version, so "does pond still read this format?" has a written answer instead of a guess.

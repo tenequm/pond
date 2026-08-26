@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.15.1"
+version = "0.16.2"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.95"
@@ -151,6 +151,10 @@ object_store = { version = "0.13", default-features = false }
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+# Already in the tree via lance-table (`IndexMetadata::fragment_bitmap`); named
+# directly so the address-domain staleness probe can compare fragment bitmaps
+# with set ops instead of decomposing them into hash sets.
+roaring = "0.11"
 # opencode's storage moved from a JSON file tree to a Drizzle-managed SQLite DB
 # (`opencode*.db`, WAL) in v1.2.0; the opencode adapter opens it read-only. First
 # SQLite dependency in the tree; `bundled` statically links libsqlite3 so the

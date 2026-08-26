@@ -5784,6 +5784,16 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
                 entry.table.as_str(),
             ))?;
         }
+        // Consequential since the stale-zonemap self-heal lives in this phase:
+        // a deferred indices phase can leave date-filtered search erroring
+        // until a later run wins the commit.
+        if matches!(entry.indices, PhaseOutcome::SkippedConflict) {
+            output(&format!(
+                "{}  index maintenance on {} deferred: concurrent writer; rerun once it finishes",
+                paint("hint", dim()),
+                entry.table.as_str(),
+            ))?;
+        }
     }
     for entry in &outcome.tables {
         if let PhaseOutcome::Failed(error) = &entry.indices {
@@ -5951,6 +5961,7 @@ fn status_json(
             "active": local.schedule.active,
             "backend": local.schedule.backend,
             "every": local.schedule.every.map(|every| every.label()),
+            "problem": local.schedule.problem,
         },
         "initialized": true,
     });
@@ -6170,7 +6181,13 @@ async fn local_status(
     store_key: &str,
     schedule: crate::schedule::ScheduleSnapshot,
 ) -> LocalStatus {
-    let active_every = schedule.every;
+    // A broken registration will not fire, so it gets no next-run estimate -
+    // gated here at derivation so the text and JSON surfaces agree.
+    let active_every = schedule
+        .problem
+        .is_none()
+        .then_some(schedule.every)
+        .flatten();
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
     // last sync - exactly the baseline "pending since then" wants, and a
@@ -6311,8 +6328,10 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
     let last_sync_line = match &local.last_sync {
         // An active schedule with no record means the scheduled sync has not
         // completed here yet (or is skipping on the lock) - without saying
-        // so, "never" reads as contradicting the schedule line below it.
-        None if local.schedule.active => paint(
+        // so, "never" reads as contradicting the schedule line below it. A
+        // broken registration is excluded: its launcher never runs, so the
+        // log this points at stays empty.
+        None if local.schedule.active && local.schedule.problem.is_none() => paint(
             "never recorded on this host - the scheduled sync hasn't completed yet (`pond schedule logs`), or run `pond sync` now",
             dim(),
         ),

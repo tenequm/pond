@@ -242,3 +242,62 @@ Reconciliations (a second lance-10 `ops_bench --url` run, same store, minutes la
 
 - One-shot CLI: the date-filter penalty over unfiltered search is gone. Pre-zonemap dated ran +24.6 s over unfiltered (150.6 vs 126.0); post-zonemap dated ran 113.1/125.0 s - at or below unfiltered, i.e. parity within noise. The remaining ~2 min is the arm-independent one-shot cold start (#168 measured fts at ~112-117 s too), not the filter.
 - Served path (warm `pond serve`, `POST /v1/search`): unfiltered 0.16-0.18 s; dated 5.3/6.2 s with correct results (10 sessions, 11,643 messages in the 7-day scope). Issue #145's documented served dated figure on lance 8 was ~2 minutes: ~20x.
+
+### 2026-08-25 - s3-nbg1, write A/B: lance 8 vs lance 10 sync replay (matched scratch copies)
+
+Method: the production store was s5cmd-copied to identical scratch prefixes (parity-verified: 417 objects / 12.2 GB / 2,931,634 message rows each), and the same frozen 4-session / +741-row / +46-searchable delta (a snapshot of the local source dir) was synced into each copy once per binary. `warm` = local index/rowmap cache primed by an immediately preceding `--dry-run` against the same copy, which is the recurring-cron shape (cache persists across runs on one store path); `cold` = first-ever run against that store path. Embeddings disabled, matching the read-gate rows. Every run converged to the identical end state (2,932,375 rows).
+
+| state | lance 8 (pond 0.15.1) | lance 10 (feat/lance-10-upgrade) | verdict |
+|---|---|---|---|
+| cold sync | 133.3 s | 134.3 s | parity |
+| warm sync | 12.2 s | 10.4 s | parity (~15% ahead, single-run noise) |
+
+Writes neither regressed nor meaningfully improved 8 -> 10: sync cost is pond-logic and S3-round-trip bound, and cold runs are dominated by the same arm-independent cold start the read probes documented. Caveats: n=1 per cell; the fold in this delta hit the deferred-small-tail path (0-2 s), so a large-tail fold was not A/B'd (the one-sided lance-10 datapoint for that is the 48 s incremental fold in the production sync above).
+
+Side findings from the setup, both pre-existing and lance-independent:
+
+- Hetzner list-after-write lag: a store opened seconds after being s5cmd-copied can list as absent, which routes pond into the store-create path. A visibility poll + settle delay before first open avoids it.
+- The store-create path itself, when it fired spuriously, attempted a PUT with the bucket segment missing from the URL (`NoSuchBucket`). Store creation on a genuinely fresh prefix works (verified by write_bench scratch stores), so the malformed URL appears specific to the create-after-failed-detection flow; worth its own issue.
+
+### 2026-08-25 - s3-nbg1, full-gate rows (read + write): lance 8 baseline (dd2562a-dirty) and lance 10 (be14674)
+
+Two complete jsonl rows produced with the current gate (CLI probes + ops_bench + write_bench), same store digest `5fcd5e32b8dd`, same machine, same day.
+
+Rig for the v8 row: a worktree at dd2562a with only the current `ops/scripts/bench-gate.sh` overlaid plus a 1-line `write_bench` merge-loop fix (bench harness, not product code), so the measured binary is pure lance 8; the row is stamped `dd2562a-dirty` to make the overlay visible.
+
+**`search_dated_s 2.7` in the v8 row is not a performance number - it is the old-reader hazard measured.** Lance 8 consumes the store's `messages_timestamp_zonemap` in the wrong id domain (see the 0.16.0 changelog), so the dated probe returned zero results and did almost no work: 2.7 s against the same row's unfiltered `search_s 178.1`. On top of that, the store's zonemap was corrupt at probe time (see below). Treat the field as invalid for any comparison; the lance-10 row's dated figure is the real one.
+
+Incident, discovered when the first lance-10 gate run failed at the dated probe: the machine's scheduled pond 0.15.1 sync had kept compacting the store for ~3.5 h after the zonemap was built, orphaning the index's address-domain fragment references - lance 10 then hard-errors date-filtered search in both modes (`fragment 5225 referenced by an address-domain index result was not found`). Contained by `pond schedule stop` + `pond optimize --rebuild` (10m13s, store healed, dated search correct again); the compaction-staleness self-heal ships in 0.16.1. The write path is identical in lance 8 and 10 - any pre-0.16.1 writer's compaction of covered fragments does this - so the gate row here was produced with no concurrent sync.
+
+Gate delta, verbatim (v8 full row -> lance 10 rerun after the store rebuild; `be14674-dirty` = this worktree carried the uncommitted jsonl/results.md docs edits, product code is be14674 exactly):
+
+```
+metric                      prev         now     delta   (2026-08-25T18:42:30Z dd2562a-dirty [pond 0.15.1 (aarch64-macos)] -> 2026-08-25T19:52:42Z be14674-dirty [pond 0.15.1 (aarch64-macos)])
+get_session_sid_s           23.2        21.7       -6%
+get_session_mid_s           53.5        53.6       +0%
+get_message_s               47.4        52.1      +10%
+search_s                   178.1       105.9      -41%
+search_dated_s               2.7       102.0    +3678%
+sql_count_s                  1.4         1.3       -7%
+fts_iops                      16          12      -25%
+vector_iops                   91           0     -100%
+get_message_iops              18          18       +0%
+search_iops                  159          40      -75%
+open_store_ms               1053        1821      +73%
+row_counts_ms               1066        1438      +35%
+oracle_warm_ms             28592       28099       -2%
+write_copy_ms               4034        3671       -9%
+write_copy_merge_ms          607         447      -26%
+write_copy_noop_ms           401         515      +28%
+write_copy_delta_ms          547         658      +20%
+write_ms_per_commit        446.2       359.6      -19%
+write_rows_per_s            1121        1390      +24%
+write_index_build_ms       14747       16291      +10%
+write_fold_ms               2195        1528      -30%
+```
+
+Reconciliations:
+
+- `search_dated_s` +3678% is the v8 field being invalid (above), not a regression: 102.0 vs unfiltered 105.9 is the zonemap's date-filter parity, matching the earlier 113.1/125.0 post-zonemap observations.
+- The warm-query S3-IO drops (`search_iops` 159 -> 40, `vector_iops` 91 -> 0, `fts_iops` 16 -> 12; iops = S3 requests per warm query, lower is better) are real but not a lance-10 code effect: the `optimize --rebuild` an hour earlier consolidated every index into a single fresh segment, so warm queries page far less. Prior rows measured organically-grown multi-segment indexes; treat cross-row iops comparisons against this row accordingly.
+- Write-side fields are parity within single-run noise (copy 4034 -> 3671, per-commit 446 -> 360, fold 2195 -> 1528, index build 14747 -> 16291), consistent with the matched-copy sync A/B above: lance 8 -> 10 does not move writes.
