@@ -11,6 +11,14 @@ The most wanted contribution. The full playbook is [`.agents/skills/add-adapter/
 - Recommended: open the PR as a draft after the spec doc, so the decision table gets reviewed before you implement.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` green is the whole bar. No benchmarks: adapters are import-isolated from the store and query layer, and a guard test enforces it.
 
+## Release notes
+
+pond's changelog is generated from squash-commit messages, so what you write on the PR is what ships - there is no separate release-notes pass later.
+
+- **PR title** must be a conventional commit (`type(scope): description`, e.g. `fix(sync): stop dropping resumed folds`). It becomes the squash-commit subject and the changelog bullet. CI lints it.
+- **`## Release note` section** in the PR description (the template prompts for it) becomes the prose under that bullet. Write it for pond users rather than reviewers: markdown `- ` sub-bullets, any measured numbers, ASCII only. Required for `feat`/`fix`/`perf` PRs; leave it empty when users see nothing.
+- CI posts a **rendered preview** of your entry as a PR comment - edit the description and it updates.
+
 ## Everything else
 
 Run the same three commands before pushing. CI re-runs them on Linux, and natively on Windows for same-repo branches (a fork PR gets the Windows leg when a maintainer pushes the branch, or on merge).

@@ -201,9 +201,14 @@ runs:
         # could under-key (module-body swaps, include_dir renames).
         version: v0.15.0
         manifest-key: ${{ inputs.manifest-key }}
-        # The hosted runner's disk is far smaller than kache's 50GiB default,
-        # and an evicted local entry costs a remote fetch, not a rebuild.
-        max-size: 20GiB
+        # Below kache's 50GiB default because the runner disk is shared with
+        # target/ and CARGO_HOME, but the cap MUST stay above the remote prefix
+        # size: `sync --pull --all` materializes the whole prefix locally, and a
+        # cap under it makes the store evict mid-run - measured 2026-08-26 at a
+        # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
+        # and demand re-fetches during the build. D: holds ~147 GB total; the
+        # warm-pull timer forces a prefix rotation long before 40GiB binds.
+        max-size: 40GiB
         # ~3 min of link time on unchanged sources; the trade is unresolved
         # .pdb paths on a restored harness. Revert this line alone if job time
         # regresses - it is independent of everything else in the round.
@@ -240,6 +245,43 @@ runs:
           throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
         }
 
+    # The warm pull below moves the whole remote prefix (27.5 GiB / ~156 s
+    # measured 2026-08-26), yet moon serves the msvc tasks straight from its
+    # remote cache whenever none of their declared inputs changed - every doc-,
+    # CI- and plugin-only diff, and every merge push whose PR already compiled
+    # (12 of the 21 runs preceding this change). On those runs the pull is pure
+    # waste: cargo never starts, kache serves nothing. Skip it when the commit
+    # range touches nothing the msvc tasks take as input.
+    #
+    # Fail-soft by construction, in both directions: any doubt (dispatch event,
+    # zero/unreachable base after a force-push, diff failure) keeps the pull,
+    # and a wrong skip (a moon miss despite untouched inputs - remote eviction,
+    # a moon version bump) only degrades that one run to kache demand fetches
+    # during the compile - slower, never red, never a wrong artifact. The path
+    # pattern deliberately over-matches (all of packages/pond/, every moon
+    # config) so an error can only be an unnecessary pull.
+    - name: Decide whether the warm pull is needed
+      id: affected
+      shell: pwsh
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        $warm = 'true'
+        if (($env:EVENT_NAME -eq 'pull_request' -or $env:EVENT_NAME -eq 'push') -and $env:BASE_SHA -and $env:BASE_SHA -notmatch '^0+$') {
+          git cat-file -e $env:BASE_SHA 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $changed = git diff --name-only "$($env:BASE_SHA)...HEAD" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $hits = @($changed | Where-Object { $_ -match '^(Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.cargo/|moon\.yml$|\.moon/|packages/pond/)' })
+              "changed: $(@($changed).Count) files, task-input hits: $($hits.Count)"
+              if ($hits.Count -eq 0) { $warm = 'false' }
+            }
+          }
+        }
+        "warm pull needed: $warm"
+        "warm=$warm" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
     # Bulk warm-up before cargo starts: one paginated LIST of the per-job
     # prefix plus concurrent downloads with no per-object demand ceiling,
     # instead of ~1450 on-demand fetches at ~250 ms each - this is what removes
@@ -247,13 +289,16 @@ runs:
     # can never beat the wrapper's hard 3 s demand window). Only safe because
     # the prefix holds exactly this job's artifacts: --all pulls the whole
     # prefix, which is also the rotation trigger - rotate when the Plan: line
-    # exceeds about twice the working set (~1450 units / 1.2 GB).
+    # exceeds about twice the working set, in artifacts or in bytes/pull-time
+    # (the creep that actually hurts: 1538 artifacts / 45 s on 2026-08-24 grew
+    # to 1925 / 156 s by 2026-08-26 - entry count alone lags the byte growth).
     #
     # --allow-partial because 0.15.0 exits non-zero on any failed transfer.
     # The trailing `exit 0` is the composite-action stand-in for
     # continue-on-error: a warm-up failure must degrade to demand fetches
     # during the build, never redden a job that would compile through fine.
     - name: Warm the kache store
+      if: steps.affected.outputs.warm == 'true'
       shell: pwsh
       run: |
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
