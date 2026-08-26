@@ -16,7 +16,7 @@ The most wanted contribution. The full playbook is [`.agents/skills/add-adapter/
 pond's changelog is generated from squash-commit messages, so what you write on the PR is what ships - there is no separate release-notes pass later.
 
 - **PR title** must be a conventional commit (`type(scope): description`, e.g. `fix(sync): stop dropping resumed folds`). It becomes the squash-commit subject and the changelog bullet. CI lints it.
-- **`## Release note` section** in the PR description (the template prompts for it) becomes the prose under that bullet. Write it for pond users rather than reviewers: markdown `- ` sub-bullets, any measured numbers, ASCII only. Required for `feat`/`fix`/`perf` PRs; leave it empty when users see nothing.
+- **`## Release note` section** in the PR description (the template prompts for it) becomes the prose under that bullet. Write it for pond users rather than reviewers: markdown `- ` sub-bullets, any measured numbers, ASCII only. Required for `feat`/`fix`/`perf` PRs; leave it empty when users see nothing. Keep it short - a few bullets, not a report; reviewer detail belongs in the sections above it. It must be the **last** section of the PR body (CI enforces both the position and a size cap), so the changelog entry ends where your description does.
 - CI posts a **rendered preview** of your entry as a PR comment - edit the description and it updates.
 
 ## Everything else

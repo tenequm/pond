@@ -59,6 +59,29 @@ jobs:
             echo "::error::the '## Release note' section contains an HTML comment - the changelog template cannot strip it, so it would ship verbatim. Move it above the header or delete it." >&2
             exit 1
           fi
+      # Position and size. Last section: the note is the user-facing tail of
+      # the squash body, and a section buried mid-description invites reviewer
+      # prose to leak into it. Size cap: the section IS the changelog entry, so
+      # it stays a few bullets - detail belongs in the sections above. The cap
+      # applies to the per-PR part only; a release-wide lead after a lone
+      # `[release-note]` line (the hoist mechanism) is exempt, since 0.15.0-style
+      # lead paragraphs plus an Upgrading block are legitimately longer.
+      - name: Release note is the last section and stays changelog-sized
+        run: |
+          if ! printenv PR_BODY | grep -q '^## Release note'; then
+            exit 0
+          fi
+          after=$(printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{print; exit}')
+          if [ -n "$after" ]; then
+            echo "::error::the '## Release note' section must be the LAST section of the PR body (\"$after\" follows it) - move it to the bottom." >&2
+            exit 1
+          fi
+          entry=$(printenv PR_BODY | awk '/^## Release note/{f=1; next} f{print}' | awk '/^\[release-note\]$/{exit} {print}')
+          chars=$(printf '%s' "$entry" | wc -c)
+          if [ "$chars" -gt 1200 ]; then
+            echo "::error::the '## Release note' section is $chars characters (cap: 1200) - it ships verbatim as the changelog entry, so keep it to a few bullets and move detail into the sections above (a release-wide lead after a lone '[release-note]' line is exempt from the cap)." >&2
+            exit 1
+          fi
 
   preview:
     if: ${{ !startsWith(github.head_ref, 'release-plz-') }}

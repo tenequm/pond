@@ -41,12 +41,12 @@ Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking ch
 Install, run guided setup, and ingest your local sessions:
 
 ```sh
-brew install tenequm/tap/pond
+brew install tenequm/tap/pond   # macOS / Linux; Windows: Scoop or a release zip - see Install below
 pond init   # guided setup: storage, adapters, MCP + agent skill, optional schedule
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code (by hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: save `pond skill` output to `~/.claude/skills/pond/SKILL.md`). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (PowerShell shape differs - see [Connect your agents](https://pond.locker/get-started/connect-your-agents); a bare `>` in Windows PowerShell 5.1 writes UTF-16 and corrupts it). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -93,12 +93,30 @@ The v1 surface includes: full CLI, HTTP+JSON and MCP transports, search over thr
 
 Linux, macOS, and Windows are supported.
 
-**Package Managers (macOS and Linux):**
+**macOS and Linux:**
 
 ```sh
 brew install tenequm/tap/pond              # Homebrew
 nix profile add github:tenequm/pond#pond   # Nix
-cargo install pond-db                      # crates.io (installs the `pond` command)
+```
+
+**Windows:**
+
+```powershell
+# No Scoop yet? First: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; irm get.scoop.sh | iex
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
+scoop install pond
+```
+
+See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+
+**No package manager (any platform):** every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries (`pond-x86_64-pc-windows-msvc.zip` on Windows) - unpack one and put it on `PATH`, nothing else to install.
+
+**Via cargo (any platform, needs the Rust toolchain):**
+
+```sh
+cargo binstall pond-db   # downloads the prebuilt binary (needs cargo-binstall)
+cargo install pond-db    # builds from crates.io (installs the `pond` command)
 ```
 
 **Build from source:**
@@ -115,18 +133,7 @@ For CUDA acceleration on Linux:
 cargo install --path packages/pond --features cuda
 ```
 
-On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features.
-
-On Windows, the Homebrew/Nix packages do not apply:
-
-```powershell
-scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
-scoop install pond
-
-cargo binstall pond-db
-```
-
-See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
+On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features. Building from source on Windows additionally needs `protoc` (`winget install Google.Protobuf`) and NASM (`winget install NASM.NASM`) on `PATH`.
 
 ## Usage
 
@@ -197,7 +204,7 @@ pond schedule logs
 
 ### Remote storage
 
-By default pond stores data locally under `$XDG_DATA_HOME/pond`. To use an object store, add credentials and switch the destination:
+By default pond stores data locally under `~/.local/share/pond` (`%LOCALAPPDATA%\pond\data` on Windows). To use an object store, add credentials and switch the destination:
 
 ```sh
 pond creds add                                                    # interactive: name, access key, hidden secret
@@ -209,7 +216,7 @@ pond storage check                                                # verify: pars
 
 ### Configuration
 
-`pond init` walks through everything below interactively and enables the adapters it finds. `pond sync` only ingests already-enabled adapters - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync. Config lives under `$XDG_CONFIG_HOME/pond/`. Every `[adapters.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped.
+`pond init` walks through everything below interactively and enables the adapters it finds. `pond sync` only ingests already-enabled adapters - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync. Config lives at `~/.config/pond/config.toml` on macOS and Linux, `%APPDATA%\pond\config.toml` on Windows (`pond config path` prints it). Every `[adapters.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped. `~` in paths expands on every platform (`%USERPROFILE%` on Windows).
 
 ```toml
 [adapters.claude-code]
@@ -232,7 +239,7 @@ Full detail, including what it costs and how mixed fleets behave, is in the [con
 
 ### Supported harnesses
 
-One adapter per harness, in `pond adapters` discovery order; `Reads` is the path `pond init` discovers and writes to `[adapters.<name>].path`. `Last verified` is the most recent capture or refresh date of the adapter's committed fixture (`packages/pond/tests/fixtures/adapter/`), the corpus its mapping is tested against. Adapters are maintained best-effort, and format drift is safe by design: unknown record shapes still ingest losslessly, malformed input surfaces as a typed error naming the file. Adding a harness is routine work - see [Contributing](#contributing).
+One adapter per harness, in `pond adapters` discovery order; `Reads` is the path `pond init` discovers and writes to `[adapters.<name>].path` - shown POSIX-style, with the same home-relative layout on Windows (`~/.claude/projects` is `%USERPROFILE%\.claude\projects`). `Last verified` is the most recent capture or refresh date of the adapter's committed fixture (`packages/pond/tests/fixtures/adapter/`), the corpus its mapping is tested against. Adapters are maintained best-effort, and format drift is safe by design: unknown record shapes still ingest losslessly, malformed input surfaces as a typed error naming the file. Adding a harness is routine work - see [Contributing](#contributing).
 
 | Adapter | Reads | Last verified |
 |---------|-------|---------------|

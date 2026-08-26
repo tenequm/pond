@@ -1,0 +1,48 @@
+---
+description: Diagnose common pond problems - a missing binary after install, a sync that finds nothing, a schedule that stopped firing, missing MCP tools, empty search results after an upgrade, and where pond keeps its files and logs.
+---
+
+# Troubleshooting
+
+First stop for anything: `pond status`. It reports store health, per-adapter pending counts, index readiness, the last sync's outcome (including a failure from a scheduled run), and whether the schedule is active or broken. Most error messages name their own fix - read them before reaching for this page.
+
+## `pond` is not found right after installing
+
+The install added pond's directory to `PATH`, but only processes started afterwards see it. Open a new terminal; if an agent client is running, restart it too. Over SSH on Windows, Scoop's shim fails even then ("Could not create process") - remote logons cannot traverse its directory junction; call the versioned path directly (`~\scoop\apps\pond\<version>\pond.exe`) or use the [release zip](https://github.com/tenequm/pond/releases).
+
+## Sync finds no sessions
+
+`pond adapters list` shows what is enabled; `pond adapters discover` re-probes the default locations; `pond sync --dry-run` previews what the next sync would read without writing. Discovery looks under your home directory on every OS (`~/.claude/projects` is `%USERPROFILE%\.claude\projects` on Windows). A session dir somewhere else goes in config as `[adapters.<name>].path` - a single dir or an array.
+
+## The pond tools don't appear in my agent
+
+Clients load MCP servers at startup: after `pond init` or `claude mcp add`, restart the client. `claude mcp list` shows whether the registration exists at all. On Windows, an entry registered with a Git Bash-style `/c/Users/...` path registers cleanly but never spawns - re-add with bare `pond` or a native `C:\...` path (see [Connect your agents](/get-started/connect-your-agents)).
+
+## The schedule stopped syncing
+
+`pond schedule status` reports not configured, active, or broken - the last being a registration whose launcher no longer exists (typically after switching install channels), with the dangling path and the fix named on the line. `pond schedule logs` prints recent scheduled-run output; `pond status` surfaces the last scheduled sync's outcome either way. On Windows, if `pond schedule start`/`stop` fails with Access denied, the task was registered from an elevated shell and is owned by Administrators - the error names the recovery; re-register from a normal shell.
+
+## Search results went missing after an upgrade
+
+When several machines share one store, a schema-migrating release makes older binaries stop syncing at open (loud), but a version-skewed *writer* compacting the store can silently stale the date index for everyone (fixed in 0.16.1, which self-heals on the next sync). Rule: upgrade every machine that writes to a shared store together, and check with `pond --version`. An incomplete index reports itself in `pond status` and is rebuilt with `pond optimize --only index`.
+
+## A sync is stuck or reports "busy"
+
+Sync is single-flight per store: a second `pond sync` waits and names the holder; scheduled runs pass `--no-wait` and skip cleanly. A crash mid-sync leaves nothing to clean up - the store commits atomically, and the local store self-heals on the next open.
+
+## Slow sync or search on Windows
+
+A pond store is many small files and Defender's real-time scanning charges per file. Exclude pond's data directory (`%LOCALAPPDATA%\pond`) - see the [Windows install notes](/get-started/install#windows).
+
+## Where everything lives
+
+| | macOS / Linux | Windows |
+|---|---|---|
+| config | `~/.config/pond/config.toml` | `%APPDATA%\pond\config.toml` |
+| store (data) | `~/.local/share/pond` | `%LOCALAPPDATA%\pond\data` |
+| cache | `~/.cache/pond` | `%LOCALAPPDATA%\pond\cache` |
+| state + sync log | `~/.local/state/pond` | `%LOCALAPPDATA%\pond\state` |
+
+`pond config path` prints the resolved config location; `pond config show` every setting with its source; `pond schedule logs` the scheduled-sync log. `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` / `$XDG_STATE_HOME` override the defaults on every platform.
+
+Still stuck? `pond status --format json` captures the full picture for a bug report - [open an issue](https://github.com/tenequm/pond/issues).

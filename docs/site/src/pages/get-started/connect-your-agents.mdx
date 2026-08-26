@@ -4,14 +4,25 @@ description: Register pond as an MCP server for Claude Code, Codex, OpenCode, an
 
 # Connect your agents
 
-pond is an MCP server. `pond init` registers it for detected clients and installs the bundled pond skill into Claude Code's user skills dir. To add the server by hand:
+pond is an MCP server. `pond init` registers it for detected clients and installs the bundled pond skill into Claude Code's user skills dir - it may already have done this for you, so check with `claude mcp list` before adding by hand. To add the server manually:
 
 ```sh
 claude mcp add -s user pond -- pond mcp   # Claude Code
 codex mcp add pond -- pond mcp            # Codex
 ```
 
-Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the server command. The skill installs by hand too: save `pond skill` output to `~/.claude/skills/pond/SKILL.md`.
+Clients load MCP servers at startup, so restart the client after registering - the pond tools appear on the next session.
+
+Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the server command. The skill installs by hand too: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md`. PowerShell needs a different shape - a bare `>` in Windows PowerShell 5.1 writes UTF-16 and `Out-File -Encoding utf8` prepends a BOM, either of which can corrupt the file:
+
+```powershell
+New-Item -ItemType Directory -Force ~\.claude\skills\pond | Out-Null
+[IO.File]::WriteAllText("$HOME\.claude\skills\pond\SKILL.md", (pond skill | Out-String))
+```
+
+:::info[Windows]
+The client spawns the server through `CreateProcess`, which searches `PATH` and appends `.exe` - the bare `pond` above works once the install's shim dir is on the client's `PATH` (restart the client after a fresh install so it picks the new `PATH` up). If it still doesn't resolve, register the native Windows path instead (`C:\Users\<you>\scoop\shims\pond.exe`, quoted if it contains spaces) - never a Git Bash `/c/...` path, which registers cleanly and then never spawns.
+:::
 
 ## Tools the agent gets
 
@@ -25,7 +36,20 @@ Other clients: use `pond mcp` (alias for `pond serve --transport stdio`) as the 
 Paste into your agent:
 
 ```text
-Set up pond as my session memory. Install it (brew install tenequm/tap/pond),
-run `pond init -y`, then `pond sync`. Register pond as an MCP server for this
-client, then use pond_search / pond_get_session / pond_get_message to answer questions about my past work.
+Set up pond as my session memory.
+Install it - macOS/Linux: `brew install tenequm/tap/pond`. Windows (PowerShell):
+`scoop bucket add tenequm https://github.com/tenequm/scoop-bucket; scoop install pond`
+(no Scoop? first `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`,
+then `irm get.scoop.sh | iex`). Other options and build
+prerequisites: https://pond.locker/get-started/install - do not build from
+source unless that page's prerequisites are already installed.
+On Windows, open a new terminal after installing so the shim dir is on PATH.
+Run `pond init -y` - it registers pond as an MCP server for this client and
+installs the pond skill - then `pond sync`, then `pond status` to confirm.
+Verify the registration with `claude mcp list`; only if pond is missing, add it:
+`claude mcp add -s user pond -- pond mcp` (on Windows use a native path like
+C:\Users\<you>\scoop\shims\pond.exe if bare `pond` does not resolve - never a
+Git Bash /c/... path). Finally tell me to restart this client so the
+pond_search / pond_get_session / pond_get_message tools load, and use them to
+answer questions about my past work from then on.
 ```

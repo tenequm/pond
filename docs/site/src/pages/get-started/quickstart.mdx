@@ -4,7 +4,7 @@ description: Get started with pond - pond init sets up storage, adapters, and MC
 
 # Quickstart
 
-Set up, ingest, ask.
+Set up, ingest, ask. (`pond` not installed yet? [Install](/get-started/install) first.)
 
 ::::steps
 
@@ -25,7 +25,13 @@ pond sync  # import and index - every enabled adapter
 
 `sync` only ingests already-enabled adapters; it never enables on its own. Manage the set with `pond adapters list|discover|enable|disable`.
 
-Discovery is per-platform: adapters are found under `~/` on macOS and Linux, and under `%APPDATA%` / `%LOCALAPPDATA%` on Windows. Nothing to configure either way - `pond init` and `pond adapters discover` look in the right place for the OS they run on.
+Discovery looks under your home directory on every OS - `~/.claude/projects`, `~/.codex/sessions`, and the rest live in the same place on Windows (`%USERPROFILE%\.claude\projects`, ...); only the Claude Desktop app's sessions sit elsewhere (`%APPDATA%\Claude` on Windows). Nothing to configure either way - `pond init` and `pond adapters discover` look in the right places for the OS they run on.
+
+Then confirm it worked:
+
+```sh
+pond status  # stored sessions/messages, per-adapter pending counts, index readiness
+```
 
 ## Ask your agent
 

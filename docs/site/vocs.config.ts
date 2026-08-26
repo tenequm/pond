@@ -92,6 +92,7 @@ export default defineConfig({
         { text: 'Several machines, one bucket', link: '/guides/several-machines' },
         { text: 'Backup & restore', link: '/guides/backup-and-restore' },
         { text: 'Import a Claude.ai export', link: '/guides/import-claude-ai' },
+        { text: 'Troubleshooting', link: '/guides/troubleshooting' },
       ],
     },
     {
