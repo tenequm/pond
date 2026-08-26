@@ -1,0 +1,123 @@
+# Release-note plumbing on feature PRs: lint the title (it becomes the squash
+# subject and the changelog headline), require a `## Release note` section for
+# user-visible types, and comment the exact changelog entry the PR would produce.
+# The changelog itself is generated from squash-commit messages at release time
+# (see .github/release-plz.toml), so this is the only moment feedback can still
+# change the message cheaply.
+name: release-note
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: release-note-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # The release PR is generated, not authored - nothing to lint or preview.
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Title/body go through env, never inline interpolation (script injection).
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - name: Lint PR title as conventional commit
+        run: |
+          if ! printenv PR_TITLE | grep -qE '^(feat|fix|perf|refactor|docs|chore|ci|build|test)(\([a-zA-Z0-9._/-]+\))?!?: .+'; then
+            echo "::error::PR title must be a conventional commit: type(scope): description" >&2
+            echo "Title: $(printenv PR_TITLE)" >&2
+            exit 1
+          fi
+      - name: Require release note for user-visible types
+        run: |
+          if printenv PR_TITLE | grep -qE '^(feat|fix|perf)'; then
+            # perl -0777, not sed: an HTML comment can span lines, and a
+            # line-based strip would leave it behind and read as a filled note.
+            note=$(printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | perl -0777 -pe 's/<!--.*?-->//gs' | tr -d '[:space:]')
+            if [ -z "$note" ]; then
+              echo "::error::feat/fix/perf PRs need a non-empty '## Release note' section in the PR body - it becomes the changelog entry at squash-merge." >&2
+              exit 1
+            fi
+          fi
+      # The changelog template extracts this section from the squash body but
+      # cannot strip HTML comments (Tera has no multi-line regex), so a comment
+      # inside the section would ship verbatim in the changelog. The PR template
+      # keeps its guidance comment above the header; this rejects author-added
+      # ones, on every PR type - chore/docs bodies land in the changelog too.
+      - name: Reject HTML comments inside the release-note section
+        run: |
+          if printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | grep -q '<!--'; then
+            echo "::error::the '## Release note' section contains an HTML comment - the changelog template cannot strip it, so it would ship verbatim. Move it above the header or delete it." >&2
+            exit 1
+          fi
+
+  preview:
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+      # Bypass pond's rust-toolchain.toml pin: release-plz only needs any cargo
+      # for `cargo metadata`, and the runner's preinstalled stable avoids a
+      # toolchain download.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0 # release-plz walks history since the last release tag
+      - name: Install release-plz
+        run: |
+          curl -fsSL https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.160/release-plz-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin release-plz
+          release-plz --version
+      - name: Render the changelog entry this PR would produce
+        # Scratch files live in RUNNER_TEMP, never the checkout: release-plz
+        # refuses to run against a dirty working tree, and an untracked msg.txt
+        # in the repo is enough to count as dirty.
+        run: |
+          git fetch origin "pull/$(printenv PR_NUMBER)/head:prhead"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git merge --squash prhead >/dev/null 2>&1; then
+            echo "conflicts with main - no preview until the branch is updated" > "$RUNNER_TEMP/preview.md"
+            exit 0
+          fi
+          printenv PR_TITLE > "$RUNNER_TEMP/msg.txt"
+          echo >> "$RUNNER_TEMP/msg.txt"
+          # The squash body is the FULL PR description - exactly what the repo's
+          # squash defaults (PR_TITLE / PR_BODY) land at merge. The changelog
+          # template extracts the `## Release note` section itself, so preview
+          # and release share one extraction path and cannot drift.
+          printenv PR_BODY >> "$RUNNER_TEMP/msg.txt"
+          git commit -q --allow-empty -F "$RUNNER_TEMP/msg.txt"
+          release-plz update --config .github/release-plz.toml 2> "$RUNNER_TEMP/release-plz.log" || { cat "$RUNNER_TEMP/release-plz.log" >&2; echo "release-plz update failed - no preview (see job log)" > "$RUNNER_TEMP/preview.md"; exit 0; }
+          if git diff --quiet CHANGELOG.md; then
+            echo "no changelog entry (release-plz found no releasable change)" > "$RUNNER_TEMP/preview.md"
+          else
+            awk '/^## \[/{n++} n==1{print} n==2{exit}' CHANGELOG.md > "$RUNNER_TEMP/preview.md"
+          fi
+      - name: Comment the preview
+        run: |
+          { echo '<!-- release-note-preview -->'; echo '### Changelog preview'; echo; echo 'The entry below is what this PR contributes to the next release, rendered by `release-plz` from the PR title + `## Release note` section. Edit the PR description to change it.'; echo; cat "$RUNNER_TEMP/preview.md"; } > "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          existing=$(gh api "repos/${{ github.repository }}/issues/$(printenv PR_NUMBER)/comments" --paginate -q '.[] | select(.body | startswith("<!-- release-note-preview -->")) | .id' | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/$(printenv PR_NUMBER)/comments" -F body=@"$RUNNER_TEMP/comment.md" >/dev/null
+          fi
+        # Fork PRs get a read-only token: the sticky comment fails, the step
+        # summary above still carries the preview.
+        continue-on-error: true

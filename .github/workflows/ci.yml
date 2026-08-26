@@ -222,6 +222,7 @@ jobs:
         timeout-minutes: 2
         run: |
           kache stats
+          Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
 
@@ -303,6 +304,7 @@ jobs:
         timeout-minutes: 2
         run: |
           kache stats
+          Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
 
