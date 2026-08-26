@@ -6,9 +6,13 @@ description: Diagnose common pond problems - a missing binary after install, a s
 
 First stop for anything: `pond status`. It reports store health, per-adapter pending counts, index readiness, the last sync's outcome (including a failure from a scheduled run), and whether the schedule is active or broken. Most error messages name their own fix - read them before reaching for this page.
 
+## Installing on Windows fails before pond is involved
+
+`scoop bucket add` failing with "Git is required for buckets": buckets are git clones and Scoop's own installer does not bring git - run `scoop install git` and retry. `irm get.scoop.sh | iex` failing with "running scripts is disabled on this system": set the execution policy first (`Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force`); if that succeeds but the error persists, a machine-scope group policy is overriding it - ask your admin. Scoop's installer also refuses an **elevated** shell by design: run both steps from a normal PowerShell.
+
 ## `pond` is not found right after installing
 
-The install added pond's directory to `PATH`, but only processes started afterwards see it. Open a new terminal; if an agent client is running, restart it too. Over SSH on Windows, Scoop's shim fails even then ("Could not create process") - remote logons cannot traverse its directory junction; call the versioned path directly (`~\scoop\apps\pond\<version>\pond.exe`) or use the [release zip](https://github.com/tenequm/pond/releases).
+The install added pond's directory to `PATH`, but only processes started afterwards see it. Open a new terminal; if an agent client is running, restart it too. Over SSH on Windows, if the Scoop shim fails with "Could not create process" while local shells work, reinstall from the bucket to regenerate the shim, or call the exe directly (`~\scoop\apps\pond\current\pond.exe`) - see [Over SSH](/get-started/install#over-ssh).
 
 ## Sync finds no sessions
 
@@ -43,6 +47,6 @@ A pond store is many small files and Defender's real-time scanning charges per f
 | cache | `~/.cache/pond` | `%LOCALAPPDATA%\pond\cache` |
 | state + sync log | `~/.local/state/pond` | `%LOCALAPPDATA%\pond\state` |
 
-`pond config path` prints the resolved config location; `pond config show` every setting with its source; `pond schedule logs` the scheduled-sync log. `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` / `$XDG_STATE_HOME` override the defaults on every platform.
+`pond config path` prints the resolved config location; `pond config show` every setting with its source (on Windows it renders paths tilde-style - `~\AppData\Roaming\pond\config.toml` is `%APPDATA%\pond\config.toml`); `pond schedule logs` the scheduled-sync log. `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` / `$XDG_STATE_HOME` override the defaults on every platform.
 
 Still stuck? `pond status --format json` captures the full picture for a bug report - [open an issue](https://github.com/tenequm/pond/issues).
