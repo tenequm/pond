@@ -41,10 +41,12 @@ if [ "$bad" -ne 0 ]; then
   exit 1
 fi
 
-# Backstop for the release-note flow: a user-visible entry with no prose under it
-# means a squash commit landed with an empty body (see AGENTS.md "Changelog
-# authoring"). Nothing can fix the commit now, but the release PR can still be
-# hand-patched before it ships - this is the last moment anyone looks.
+# Backstop for the release-note flow: a user-visible entry with no prose under
+# it means the note is missing at the source - the PR description had no
+# `## Release note` section either, since a squash that merely lost its body is
+# repaired at generation time from the PR (see AGENTS.md "Changelog authoring").
+# Fix it by adding the section to that PR's description, which the next release
+# PR refresh picks up; the release PR can also be hand-patched before it ships.
 #
 # Only checked when this change actually writes the top entry - i.e. the release
 # PR. An entry already on `main` is shipped history the flow cannot fix, and
