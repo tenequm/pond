@@ -758,6 +758,12 @@ jobs:
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
+      # The bucket's scheduled Excavator picks releases up within 4h on its own;
+      # this dispatch just cuts the lag to minutes, so a failure only warns.
+      - name: Trigger Scoop bucket excavator
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+        run: gh workflow run excavator.yml -R tenequm/scoop-bucket || echo "::warning::excavator dispatch failed; the scoop-bucket schedule will pick up the release within 4h"
       # winget-releaser hard-fails until the package exists upstream; self-clears once microsoft/winget-pkgs#419055 merges.
       - id: winget
         env:
