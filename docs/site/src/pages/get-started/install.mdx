@@ -17,7 +17,7 @@ nix profile add github:tenequm/pond#pond
 ```
 
 ```powershell [Scoop (Windows)]
-# No Scoop yet? Install it first: irm get.scoop.sh | iex
+# No Scoop yet? First: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; irm get.scoop.sh | iex
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install pond
 ```
@@ -45,11 +45,11 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 irm get.scoop.sh | iex
 ```
 
-Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. It fetches `pond-x86_64-pc-windows-msvc.zip` (~77 MB download, ~233 MB unpacked), which is attached to every [release](https://github.com/tenequm/pond/releases) - no Scoop, no problem: unpack it anywhere and put that directory on `PATH`; nothing else to install.
+Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. What it fetches is `pond-x86_64-pc-windows-msvc.zip` (~77 MB download, ~223 MB unpacked), attached to every [release](https://github.com/tenequm/pond/releases). No Scoop at all? Unpack that zip anywhere, put the directory on `PATH`, and you are done - nothing else to install.
 
 Installed with an agent session already running? The new `PATH` entry reaches only processes started after the install - open a fresh terminal (and restart the agent client) if `pond` reports not found.
 
-The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE`; with Scoop the file is at `~\scoop\apps\pond\current\completions\_pond.ps1`. On a fresh machine `$PROFILE` may not exist yet - create it first (`New-Item -Force $PROFILE`).
+The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE`; with Scoop the file is at `~\scoop\apps\pond\current\completions\_pond.ps1`. On a fresh machine `$PROFILE` may not exist yet - create it first with `if (!(Test-Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force }` (a bare `New-Item -Force` would truncate an existing profile).
 
 Building from source instead needs two tools the prebuilt binary spares you: `protoc`, because `protobuf-src` cannot vendor it on Windows, and NASM, for `aws-lc-sys`. Embeddings, if you enable them, run on the CPU backend.
 
@@ -75,6 +75,6 @@ Running the Linux binary under WSL works when both the agent session files and t
 
 ## Updating
 
-`brew upgrade pond` / `scoop update pond` / `cargo binstall pond-db` (re-run) / a fresh zip - and `pond --version` to check what you're on. Keep every machine that writes to a shared store on the same version: a store-schema release migrates the store in place, after which older binaries stop syncing until they upgrade (see [Several machines, one bucket](/guides/several-machines#mixed-versions)).
+`brew upgrade pond` / `nix profile upgrade pond` / `scoop update pond` / `cargo binstall pond-db` (re-run) / a fresh zip - and `pond --version` to check what you're on. Keep every machine that writes to a shared store on the same version: a store-schema release migrates the store in place, after which older binaries stop syncing until they upgrade (see [Several machines, one bucket](/guides/several-machines#mixed-versions)).
 
 Next: [Quickstart](/get-started/quickstart).

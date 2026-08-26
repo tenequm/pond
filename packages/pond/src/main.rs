@@ -368,6 +368,15 @@ const CONFIG_FILE_HELP: &str = r"Config file to read (default: `%APPDATA%\pond\c
 #[cfg(not(windows))]
 const CONFIG_FILE_HELP: &str = "Config file to read (default: `~/.config/pond/config.toml`)";
 
+#[cfg(windows)]
+const STORAGE_PATH_LONG_HELP: &str = r"Storage destination: a local path or remote URL.
+
+Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`%LOCALAPPDATA%\pond\data`).";
+#[cfg(not(windows))]
+const STORAGE_PATH_LONG_HELP: &str = "Storage destination: a local path or remote URL.
+
+Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).";
+
 // The redirection example is platform-specific twice over: the path differs,
 // and Windows PowerShell 5.1's `>` writes UTF-16LE, so the example must name
 // the encoding-safe form there.
@@ -387,17 +396,12 @@ const CONFIG_EXAMPLES_HELP: &str = "Examples:
 #[command(next_help_heading = "Global options")]
 struct StoreArgs {
     /// Storage destination: a local path or remote URL.
-    ///
-    /// Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`,
-    /// `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword
-    /// `local` (the platform default local data dir). Default:
-    /// `[storage].path` from config, then the platform data dir
-    /// (`~/.local/share/pond`).
     #[arg(
         long,
         global = true,
         env = "POND_STORAGE_PATH",
         hide_env_values = true,
+        long_help = STORAGE_PATH_LONG_HELP,
         value_parser = parse_storage_path,
         value_name = "URL"
     )]

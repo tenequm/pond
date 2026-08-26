@@ -46,7 +46,7 @@ pond init   # guided setup: storage, adapters, MCP + agent skill, optional sched
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `pond skill > ~/.claude/skills/pond/SKILL.md` (PowerShell: `pond skill | Out-File -Encoding utf8 ~\.claude\skills\pond\SKILL.md` - a bare `>` there writes UTF-16 and corrupts it). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (PowerShell shape differs - see [Connect your agents](https://pond.locker/get-started/connect-your-agents); a bare `>` in Windows PowerShell 5.1 writes UTF-16 and corrupts it). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -103,12 +103,14 @@ nix profile add github:tenequm/pond#pond   # Nix
 **Windows:**
 
 ```powershell
-# No Scoop yet? Install it first: irm get.scoop.sh | iex
+# No Scoop yet? First: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; irm get.scoop.sh | iex
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install pond
 ```
 
-No package manager at all: every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries for all platforms (`pond-x86_64-pc-windows-msvc.zip` on Windows) - unpack one and put it on `PATH`, nothing else to install. See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+
+**No package manager (any platform):** every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries (`pond-x86_64-pc-windows-msvc.zip` on Windows) - unpack one and put it on `PATH`, nothing else to install.
 
 **Via cargo (any platform, needs the Rust toolchain):**
 

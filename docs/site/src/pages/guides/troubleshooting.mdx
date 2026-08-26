@@ -20,7 +20,7 @@ Clients load MCP servers at startup: after `pond init` or `claude mcp add`, rest
 
 ## The schedule stopped syncing
 
-`pond schedule status` distinguishes three states: not configured, active, and broken - a registration whose launcher no longer exists (typically after switching install channels), which reports the dangling path and the fix. `pond schedule logs` prints recent scheduled-run output; `pond status` surfaces the last scheduled sync's outcome either way. On Windows, if `pond schedule start`/`stop` fails with Access denied, the task was registered from an elevated shell and is owned by Administrators - the error names the recovery; re-register from a normal shell.
+`pond schedule status` reports not configured, active, or broken - the last being a registration whose launcher no longer exists (typically after switching install channels), with the dangling path and the fix named on the line. `pond schedule logs` prints recent scheduled-run output; `pond status` surfaces the last scheduled sync's outcome either way. On Windows, if `pond schedule start`/`stop` fails with Access denied, the task was registered from an elevated shell and is owned by Administrators - the error names the recovery; re-register from a normal shell.
 
 ## Search results went missing after an upgrade
 
@@ -43,6 +43,6 @@ A pond store is many small files and Defender's real-time scanning charges per f
 | cache | `~/.cache/pond` | `%LOCALAPPDATA%\pond\cache` |
 | state + sync log | `~/.local/state/pond` | `%LOCALAPPDATA%\pond\state` |
 
-`pond config path` prints the resolved config location; `pond config show` every setting with its source; `pond schedule logs` the scheduled-sync log. `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_STATE_HOME` override the defaults on every platform.
+`pond config path` prints the resolved config location; `pond config show` every setting with its source; `pond schedule logs` the scheduled-sync log. `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_CACHE_HOME` / `$XDG_STATE_HOME` override the defaults on every platform.
 
 Still stuck? `pond status --format json` captures the full picture for a bug report - [open an issue](https://github.com/tenequm/pond/issues).

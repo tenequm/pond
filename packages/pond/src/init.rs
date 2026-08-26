@@ -355,11 +355,17 @@ pub(crate) async fn run(
     }
     // Materialize a local store dir the plan just announced: a user (or
     // agent) verifying setup looks for it, and an init that promises a path
-    // it never creates reads as a failed install. Idempotent; remote stores
-    // have nothing local to create.
-    if let Some(local_store) = config::local_path(chosen.canonical()) {
-        std::fs::create_dir_all(&local_store)
-            .with_context(|| format!("failed to create {}", local_store.display()))?;
+    // it never creates reads as a failed install. The store also creates it
+    // at first open, so failure here only warns - aborting would leave the
+    // config written but MCP, skill, and schedule unregistered.
+    if let Some(local_store) = config::local_path(chosen.canonical())
+        && let Err(error) = std::fs::create_dir_all(&local_store)
+    {
+        cliclack::log::warning(format!(
+            "could not create the data dir {} ({error}); fix [storage].path or the \
+             directory's permissions - the first sync will retry",
+            local_store.display()
+        ))?;
     }
 
     // External side effects (MCP registration, the first sync, OS-scheduler
@@ -471,17 +477,17 @@ fn display_path(path: &Path) -> String {
     config::contract_home(path).display().to_string()
 }
 
-/// cliclack's note box wraps long unbroken lines (a Windows path is one word)
-/// at a width it cannot know without a TTY, mangling the wizard's headline
-/// output for agents and ssh sessions - plain lines carry the same content
-/// there without the box.
+/// cliclack renders on stderr and wraps its note box at that terminal's
+/// width; without a stderr TTY (agents, ssh, CI) the guessed width mangles
+/// long unbroken lines like Windows paths - plain stderr lines carry the
+/// same content there without the box.
 fn note(title: &str, body: &str) -> Result<()> {
-    if std::io::stdin().is_terminal() {
+    if std::io::stderr().is_terminal() {
         cliclack::note(title, body)?;
     } else {
-        pond::output::line(title)?;
+        pond::output::line_err(title)?;
         for line in body.lines() {
-            pond::output::line(&format!("  {line}"))?;
+            pond::output::line_err(&format!("  {line}"))?;
         }
     }
     Ok(())
@@ -952,6 +958,7 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
         // One consent covers registration and the skill; a fresh install
         // that says yes here is not asked again for the skill write.
         let mut skill_consented = false;
+        let mut fresh_registration = false;
         if registered {
             cliclack::log::success("mcp: pond is already registered in Claude Code")?;
         } else {
@@ -973,11 +980,7 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
                 .context("failed to run `claude mcp add`")?;
                 if output.status.success() {
                     cliclack::log::success("mcp: registered in Claude Code (user scope)")?;
-                    // Clients load MCP servers at startup; a registration
-                    // added mid-session is invisible until the next one.
-                    cliclack::log::info(
-                        "restart Claude Code so the pond tools load (they appear on the next session)",
-                    )?;
+                    fresh_registration = true;
                 } else {
                     cliclack::log::warning(format!(
                         "mcp: `claude mcp add` exited {}: {} - run `claude mcp add -s user pond -- pond mcp` manually",
@@ -992,14 +995,24 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
                 )?;
             }
         }
-        if registered || skill_consented {
-            skill_section(prompts, auto, skill_consented)?;
+        let skill_changed = if registered || skill_consented {
+            skill_section(prompts, auto, skill_consented)?
+        } else {
+            false
+        };
+        // Claude Code loads MCP servers and user skills at startup, so a
+        // change made mid-session is invisible until the next one - one hint
+        // covers both the fresh registration and a skill install/update.
+        if fresh_registration || skill_changed {
+            cliclack::log::info(
+                "restart Claude Code to pick this up (MCP servers and skills load at startup)",
+            )?;
         }
     }
     if codex.is_some() {
         note(
             "codex detected",
-            "register pond manually:\n  codex mcp add pond -- pond mcp",
+            "register pond manually:\n  codex mcp add pond -- pond mcp\nthen restart Codex so the pond tools load",
         )?;
     }
     Ok(())
@@ -1017,12 +1030,12 @@ const SKILL_DISPLAY_PATH: &str = r"~\.claude\skills\pond\SKILL.md";
 const SKILL_DISPLAY_PATH: &str = "~/.claude/skills/pond/SKILL.md";
 
 /// Sync the bundled skill into Claude Code's user skills dir.
-fn skill_section(prompts: bool, auto: bool, consented: bool) -> Result<()> {
+fn skill_section(prompts: bool, auto: bool, consented: bool) -> Result<bool> {
     let Some(home) = config::home_dir() else {
         cliclack::log::info(format!(
             "skill: no home dir (HOME/USERPROFILE unset) - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
         ))?;
-        return Ok(());
+        return Ok(false);
     };
     let path = home
         .join(".claude")
@@ -1035,12 +1048,12 @@ fn skill_section(prompts: bool, auto: bool, consented: bool) -> Result<()> {
 /// Three states: current (no-op), absent (install), differs (an older pond's
 /// copy or a user edit - overwriting is asked about explicitly in prompt
 /// mode, even when the combined registration consent already said yes).
-fn skill_sync(path: &Path, prompts: bool, auto: bool, consented: bool) -> Result<()> {
+fn skill_sync(path: &Path, prompts: bool, auto: bool, consented: bool) -> Result<bool> {
     let existing = std::fs::read_to_string(path).ok();
     let (question, done) = match existing.as_deref() {
         Some(current) if current == SKILL_MD => {
             cliclack::log::success(format!("skill: up to date ({SKILL_DISPLAY_PATH})"))?;
-            return Ok(());
+            return Ok(false);
         }
         Some(_) => (
             format!("Update the pond skill? ({SKILL_DISPLAY_PATH} differs from this pond version)"),
@@ -1062,7 +1075,7 @@ fn skill_sync(path: &Path, prompts: bool, auto: bool, consented: bool) -> Result
         cliclack::log::info(format!(
             "skill: skipped - install later by saving `pond skill` output to {SKILL_DISPLAY_PATH}",
         ))?;
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1071,7 +1084,7 @@ fn skill_sync(path: &Path, prompts: bool, auto: bool, consented: bool) -> Result
     std::fs::write(path, SKILL_MD)
         .with_context(|| format!("failed to write {}", path.display()))?;
     cliclack::log::success(format!("{done} ({SKILL_DISPLAY_PATH})"))?;
-    Ok(())
+    Ok(true)
 }
 
 struct LegacyStorage {
