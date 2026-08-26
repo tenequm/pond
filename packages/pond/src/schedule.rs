@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
-use pond::output::{dim, line, line_err, paint};
+use pond::output::{dim, line, line_err, paint, red};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -83,7 +83,8 @@ pub(crate) enum ScheduleCmd {
     Stop,
     /// Show whether a schedule is active.
     ///
-    /// Exit 0 when active, 1 when not configured.
+    /// Exit 0 when active, 1 when not configured. A broken-but-registered
+    /// schedule still exits 0; the status line carries the problem.
     Status,
     /// Show recent scheduled-sync output.
     Logs {
@@ -100,6 +101,9 @@ pub(crate) struct ScheduleSnapshot {
     pub active: bool,
     pub backend: Option<&'static str>,
     pub every: Option<ScheduleEvery>,
+    /// A registered schedule that cannot run (e.g. the task's launcher path
+    /// no longer exists after a reinstall); the text names the fix.
+    pub problem: Option<String>,
 }
 
 // ===========================================================================
@@ -111,20 +115,44 @@ enum State {
     Active {
         backend: &'static str,
         every: Option<ScheduleEvery>,
+        /// Registered but unable to run.
+        problem: Option<String>,
     },
     Inactive,
 }
 use State::{Active, Inactive};
 
+impl State {
+    /// A healthy registration; only `windows::probe` ever reports a problem,
+    /// so every other constructor goes through here.
+    fn active(backend: &'static str, every: Option<ScheduleEvery>) -> Self {
+        Active {
+            backend,
+            every,
+            problem: None,
+        }
+    }
+}
+
 fn render_state(state: &State) -> String {
     match state {
-        Active { backend, every } => format!(
-            "{}  active ({backend}{})",
-            paint("schedule", dim()),
-            every
+        Active {
+            backend,
+            every,
+            problem,
+        } => {
+            let cadence = every
                 .map(|every| format!(", every {}", every.label()))
-                .unwrap_or_default(),
-        ),
+                .unwrap_or_default();
+            match problem {
+                Some(problem) => format!(
+                    "{}  {} ({backend}{cadence}) - {problem}",
+                    paint("schedule", dim()),
+                    paint("broken", red()),
+                ),
+                None => format!("{}  active ({backend}{cadence})", paint("schedule", dim())),
+            }
+        }
         Inactive => format!(
             "{}  not configured - run `pond schedule start` to sync automatically",
             paint("schedule", dim()),
@@ -145,15 +173,20 @@ pub(crate) fn status_line() -> String {
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
     match platform_probe() {
         Ok(state) => {
-            let (active, backend, every) = match &state {
-                Active { backend, every } => (true, Some(*backend), *every),
-                Inactive => (false, None, None),
+            let (active, backend, every, problem) = match &state {
+                Active {
+                    backend,
+                    every,
+                    problem,
+                } => (true, Some(*backend), *every, problem.clone()),
+                Inactive => (false, None, None, None),
             };
             ScheduleSnapshot {
                 line: render_state(&state),
                 active,
                 backend,
                 every,
+                problem,
             }
         }
         Err(_) => ScheduleSnapshot {
@@ -164,6 +197,7 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
             active: false,
             backend: None,
             every: None,
+            problem: None,
         },
     }
 }
@@ -175,15 +209,20 @@ pub(crate) fn run(command: ScheduleCmd, config: Option<PathBuf>) -> Result<()> {
         ScheduleCmd::Status => {
             let state = platform_probe()?;
             line(&render_state(&state))?;
-            if let Active { .. } = state {
-                line(&format!(
-                    "{}      {}  (pond schedule logs)",
-                    paint("logs", dim()),
-                    crate::config::display(&crate::config::url_for_path(log_path())?),
-                ))?;
-                Ok(())
-            } else {
-                std::process::exit(1);
+            match &state {
+                // A broken registration gets no logs pointer: its launcher
+                // never runs, so the log it points at stays empty.
+                Active { problem, .. } => {
+                    if problem.is_none() {
+                        line(&format!(
+                            "{}      {}  (pond schedule logs)",
+                            paint("logs", dim()),
+                            crate::config::display(&crate::config::url_for_path(log_path())?),
+                        ))?;
+                    }
+                    Ok(())
+                }
+                Inactive => std::process::exit(1),
             }
         }
         ScheduleCmd::Logs { lines } => logs(lines),
@@ -339,7 +378,7 @@ mod unix {
     use anyhow::{Context, Result, bail};
 
     use super::{ScheduleEvery, State};
-    use State::{Active, Inactive};
+    use State::Inactive;
 
     const LAUNCHD_LABEL: &str = "sh.pond.sync";
     const CRON_FENCE_BEGIN: &str = "# BEGIN POND SYNC (maintained by pond; do not edit)";
@@ -350,16 +389,10 @@ mod unix {
             "macos" => probe_launchd(),
             "linux" => {
                 if systemd_timer_enabled() {
-                    return Ok(Active {
-                        backend: "systemd",
-                        every: read_systemd_interval(),
-                    });
+                    return Ok(State::active("systemd", read_systemd_interval()));
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
-                    return Ok(Active {
-                        backend: "cron",
-                        every: cron_entry_interval(&entry),
-                    });
+                    return Ok(State::active("cron", cron_entry_interval(&entry)));
                 }
                 Ok(Inactive)
             }
@@ -555,10 +588,10 @@ mod unix {
                 plist.display(),
             );
         }
-        pond::output::line(&super::render_state(&super::State::Active {
-            backend: "launchd",
-            every: Some(every),
-        }))?;
+        pond::output::line(&super::render_state(&super::State::active(
+            "launchd",
+            Some(every),
+        )))?;
         pond::output::line(&format!(
             "{}      {}  (pond schedule logs)",
             pond::output::paint("logs", pond::output::dim()),
@@ -596,10 +629,7 @@ mod unix {
         let every = std::fs::read_to_string(plist_path()?)
             .ok()
             .and_then(|body| plist_interval(&body));
-        Ok(Active {
-            backend: "launchd",
-            every,
-        })
+        Ok(State::active("launchd", every))
     }
 
     /// Pull `<integer>N</integer>` following the StartInterval key out of a
@@ -721,10 +751,10 @@ mod unix {
                 );
             }
         }
-        pond::output::line(&super::render_state(&super::State::Active {
-            backend: "systemd",
-            every: Some(every),
-        }))?;
+        pond::output::line(&super::render_state(&super::State::active(
+            "systemd",
+            Some(every),
+        )))?;
         pond::output::line(&format!(
             "{}      journalctl --user -u pond-sync.service  (pond schedule logs)",
             pond::output::paint("logs", pond::output::dim()),
@@ -931,10 +961,10 @@ mod unix {
         }
         body.push_str(&fence_block(&entry));
         write_crontab(&body)?;
-        pond::output::line(&super::render_state(&super::State::Active {
-            backend: "cron",
-            every: Some(every),
-        }))?;
+        pond::output::line(&super::render_state(&super::State::active(
+            "cron",
+            Some(every),
+        )))?;
         pond::output::line(&format!(
             "{}      {}  (pond schedule logs)",
             pond::output::paint("logs", pond::output::dim()),
@@ -1038,6 +1068,11 @@ mod windows {
     use State::{Active, Inactive};
 
     const TASK_NAME: &str = "pond-sync";
+    /// Shared recovery hint for the admin-owned-task trap; the literal task
+    /// name rides along because a const cannot interpolate `TASK_NAME`.
+    const ELEVATED_OWNERSHIP_HINT: &str = "likely registered from an elevated shell and owned by Administrators; remove it \
+         by running `pond schedule stop` from an elevated shell (or \
+         `schtasks /Delete /TN pond-sync /F`)";
 
     /// The registered task's XML, or `None` when no such task exists.
     fn query_xml() -> Result<Option<String>> {
@@ -1059,7 +1094,26 @@ mod windows {
         Ok(Active {
             backend: "task-scheduler",
             every: parse_interval_from_xml(&xml),
+            problem: launcher_problem(&xml),
         })
+    }
+
+    /// The registered action outlives the install that wrote it (an uninstall
+    /// or package-manager switch removes both exes), and Task Scheduler keeps
+    /// reporting the task while every tick dies with FILE_NOT_FOUND before
+    /// pondw can run or log anything. A missing `<Command>` is that whole
+    /// failure class; anything past launch reaches sync.log through pondw's
+    /// exit-code propagation instead.
+    fn launcher_problem(xml: &str) -> Option<String> {
+        between(xml, "<Command>", "</Command>")
+            .map(xml_unescape)
+            .filter(|launcher| !std::path::Path::new(launcher).is_file())
+            .map(|launcher| {
+                format!(
+                    "the registered launcher no longer exists ({launcher}); \
+                     run `pond schedule start` to re-register from the current install"
+                )
+            })
     }
 
     /// Register (or replace, via `/F`) the Task Scheduler job. Shared by
@@ -1140,6 +1194,19 @@ mod windows {
             return Ok(());
         }
 
+        // A task registered elevated is owned by Administrators, which makes
+        // every later `pond schedule start`/`stop` from a normal shell fail
+        // with Access denied. Warn at creation - after the no-op return above,
+        // so only a run that actually registers sets off the note (see the
+        // /Create failure path below for the caught-in-the-trap version).
+        if shell_is_elevated() {
+            pond::output::line(
+                "note: this shell is elevated - the task will be owned by Administrators, \
+                 and `pond schedule start`/`stop` from a normal shell will fail with \
+                 Access denied; re-run from a non-elevated shell unless that is intended",
+            )?;
+        }
+
         // Write the XML task definition to a temp file; schtasks /Create /XML
         // requires a file path. Pass the PathBuf directly to avoid to_str()
         // panics on non-UTF-8 paths. The bytes MUST be UTF-16LE with a BOM:
@@ -1163,10 +1230,23 @@ mod windows {
 
         let output = create_result?;
         if !output.status.success() {
-            bail!(
-                "schtasks /Create failed: {}",
-                decode_console(&output.stderr).trim()
-            );
+            let stderr = decode_console(&output.stderr);
+            let stderr = stderr.trim();
+            // /F replaces an existing task, so a create that fails while the
+            // task still exists is almost always an ownership problem: a task
+            // registered from an elevated shell is admin-owned and a normal
+            // shell can neither replace nor delete it. Checked on existence,
+            // not stderr text - schtasks messages are localized. The probe is
+            // advisory only, so its own failure must not mask the /Create
+            // stderr - hence no `?`.
+            if matches!(query_xml(), Ok(Some(_))) {
+                bail!(
+                    "schtasks /Create failed: {stderr}\n\
+                     the existing '{TASK_NAME}' task could not be replaced - it was \
+                     {ELEVATED_OWNERSHIP_HINT}, then re-run `pond schedule start` unelevated"
+                );
+            }
+            bail!("schtasks /Create failed: {stderr}");
         }
 
         // The pre-pondw action chain, when this is an upgrade. Removed only
@@ -1176,10 +1256,10 @@ mod windows {
             let _ = std::fs::remove_file(pond_state.join(stale));
         }
 
-        pond::output::line(&super::render_state(&super::State::Active {
-            backend: "task-scheduler",
-            every: Some(every),
-        }))?;
+        pond::output::line(&super::render_state(&super::State::active(
+            "task-scheduler",
+            Some(every),
+        )))?;
         pond::output::line(&format!(
             "{}      {}  (pond schedule logs)",
             pond::output::paint("logs", pond::output::dim()),
@@ -1206,7 +1286,8 @@ mod windows {
             Inactive => pond::output::line("nothing was scheduled")?,
             Active { .. } => {
                 bail!(
-                    "schtasks /Delete failed: {}",
+                    "schtasks /Delete failed: {}\n\
+                     the task is {ELEVATED_OWNERSHIP_HINT}",
                     decode_console(&output.stderr).trim()
                 );
             }
@@ -1372,9 +1453,28 @@ mod windows {
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pond")))
     }
 
+    /// True when this process runs elevated. `whoami /groups` lists the
+    /// token's groups with their SIDs, and an elevated token carries the
+    /// High Mandatory Level label S-1-16-12288 - a locale-independent probe,
+    /// unlike parsing schtasks/net output text. Registration-time only, so
+    /// the process spawn is not on any hot path.
+    fn shell_is_elevated() -> bool {
+        Command::new("whoami")
+            .args(["/groups"])
+            .output()
+            .map(|output| decode_console(&output.stdout).contains("S-1-16-12288"))
+            .unwrap_or(false)
+    }
+
     /// The launcher shipped beside `pond.exe`. `bin` comes from PATH, which
     /// under winget is a symlink in its Links dir with no pondw.exe next to it,
-    /// so the running binary's own directory is the fallback.
+    /// so the running binary's own directory is the fallback. Scoop lands on
+    /// the same fallback by design (its manifest shims `pond.exe` only), and
+    /// the path it yields is the stable `apps\pond\current\` junction: the
+    /// shim spawns the real exe as a child and GetModuleFileNameW preserves
+    /// the junction (measured 2026-08-26). Do NOT canonicalize here -
+    /// resolving the junction would pin the task to a versioned dir that
+    /// `scoop cleanup` deletes on the next update.
     fn pondw_bin(bin: &std::path::Path) -> Result<PathBuf> {
         [
             Some(bin.with_file_name("pondw.exe")),
@@ -1455,6 +1555,21 @@ mod windows {
                 let parsed = parse_interval_from_xml(&xml);
                 assert_eq!(parsed, Some(every), "cadence {every:?} did not round-trip");
             }
+        }
+
+        #[test]
+        fn launcher_problem_flags_only_a_missing_command() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let real = dir.path().join("pondw.exe");
+            std::fs::write(&real, b"x").expect("write");
+            let present = format!("<Command>{}</Command>", real.display());
+            assert_eq!(launcher_problem(&present), None);
+
+            let gone = dir.path().join("uninstalled").join("pondw.exe");
+            let problem = launcher_problem(&format!("<Command>{}</Command>", gone.display()))
+                .expect("problem");
+            assert!(problem.contains("pond schedule start"), "{problem}");
+            assert!(problem.contains("uninstalled"), "{problem}");
         }
 
         #[test]
