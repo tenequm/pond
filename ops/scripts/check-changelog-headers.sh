@@ -40,3 +40,30 @@ if [ "$bad" -ne 0 ]; then
   printf '  ### %s\n' "${allowed[@]}" >&2
   exit 1
 fi
+
+# Backstop for the release-note flow: a user-visible entry with no prose under it
+# means a squash commit landed with an empty body (see AGENTS.md "Changelog
+# authoring"). Nothing can fix the commit now, but the release PR can still be
+# hand-patched before it ships - this is the last moment anyone looks.
+#
+# Only checked when this change actually writes the top entry - i.e. the release
+# PR. An entry already on `main` is shipped history the flow cannot fix, and
+# enforcing prose there would block every later commit on someone else's miss.
+base_section=$(git show origin/main:"$file" 2>/dev/null | awk '/^## \[/{n++} n==1{print} n==2{exit}')
+if [ -n "$base_section" ] && [ "$section" = "$base_section" ]; then
+  exit 0
+fi
+
+bare=$(awk '
+  /^### / { visible = ($0 ~ /(New Features|Bug Fixes|Performance|Breaking Changes)/); next }
+  /^- / { if (visible) { entry = $0; if ((getline nxt) <= 0 || nxt !~ /^  /) print entry } }
+' <<< "$section")
+
+if [ -n "$bare" ]; then
+  echo "check-changelog: user-visible entries with no release-note prose:" >&2
+  printf '  %s\n' "$bare" >&2
+  echo >&2
+  echo "Write the prose in the squash-commit body at merge time (PR's '## Release note')." >&2
+  echo "For an already-merged commit, hand-patch this entry on the release PR." >&2
+  exit 1
+fi
