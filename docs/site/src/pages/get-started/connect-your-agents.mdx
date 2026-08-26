@@ -37,33 +37,21 @@ Paste into your agent:
 
 ```text
 Set up pond as my session memory.
-Install it - macOS/Linux: `brew install tenequm/tap/pond`. Windows: these are
-PowerShell commands - if your shell is something else, wrap each in
-`powershell -NoProfile -Command "..."`:
-`scoop bucket add tenequm https://github.com/tenequm/scoop-bucket; scoop install tenequm/pond`
-(if that fails with "Git is required for buckets": `scoop install git`, retry;
-if Scoop itself is missing, ask me before bootstrapping it, since it changes
-the execution policy: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned
--Scope CurrentUser -Force; irm get.scoop.sh | iex`, from a non-admin shell).
-Other options and build prerequisites:
-https://pond.locker/get-started/install - do not build from source unless that
-page's prerequisites are already installed.
-Your shell inherits this client's PATH, so a freshly installed `pond` may not
-resolve until I restart the client - on Windows call it as
-"$env:USERPROFILE\scoop\shims\pond.exe" for the rest of this setup.
-Run `pond init -y` - it registers pond as an MCP server for Claude Code and
-installs the pond skill; for other clients it prints the registration command
-to run, so run it. Then `pond sync` (the first sync reads full history and can
-run several minutes - Ctrl-C is safe, the next sync resumes), then
-`pond status` to confirm, and `pond schedule start` (from a normal,
-non-elevated shell) to keep it syncing.
-Verify with `claude mcp list`: pond must show as Connected - listed but
-failing counts as broken, so re-add it (`claude mcp remove pond`, then
-`claude mcp add -s user pond -- pond mcp`); add it the same way if missing.
-On Windows, if bare `pond` does not resolve there, use the quoted native path
-from `where.exe pond` (never a Git Bash /c/... path - it registers cleanly and
-never spawns).
-Finally tell me to restart this client so the pond_search / pond_get_session /
-pond_get_message tools load, and use them to answer questions about my past
-work from then on.
+
+1. Install it for my OS - https://pond.locker/get-started/install
+   (macOS/Linux: brew install tenequm/tap/pond). Never build from
+   source. Ask me before bootstrapping Scoop: it changes my
+   execution policy.
+2. Run pond init -y, then pond sync, then pond status. The first
+   sync reads my whole history and can take minutes - Ctrl-C is
+   safe, it resumes. Not on your PATH yet? Call pond by full path
+   rather than waiting for a restart.
+3. Run pond schedule start to keep it current - unless this shell
+   is elevated, in which case ask me to run it.
+4. Confirm the MCP registration in this client (Claude Code:
+   claude mcp list; Codex: codex mcp list). Listed but failing is
+   usually just my stale PATH - do not re-register it, tell me.
+5. Tell me to restart this client, then use pond_search,
+   pond_get_session and pond_get_message to answer questions
+   about my past work.
 ```

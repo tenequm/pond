@@ -46,9 +46,11 @@ something that sounds prior, search pond.
 
 ## Setup
 
-`brew install tenequm/tap/pond` (or `cargo binstall pond-db`, or `nix profile
-add github:tenequm/pond#pond`), then `pond init` - it registers the MCP server
-and installs this skill. Keep current with `pond sync`; `pond --help` for the
+`brew install tenequm/tap/pond` on macOS/Linux, `scoop bucket add tenequm
+https://github.com/tenequm/scoop-bucket; scoop install tenequm/pond` on Windows
+(or `nix profile add github:tenequm/pond#pond`, or `cargo binstall pond-db`
+where a Rust toolchain exists), then `pond init` - it registers the MCP server
+for Claude Code and installs this skill. Keep current with `pond sync`; `pond --help` for the
 rest. Claude.ai chats are not synced automatically - request a data export
 (claude.ai Settings -> Privacy -> Export data, arrives as an emailed `.zip`),
 then `pond sync claude-ai-export --path <export.zip>`.

@@ -17,9 +17,9 @@ Your agent history is already on your disk: thousands of sessions full of decisi
 
 ```sh
 brew install tenequm/tap/pond   # macOS / Linux
-```
-```powershell
-scoop bucket add tenequm https://github.com/tenequm/scoop-bucket; scoop install tenequm/pond   # Windows
+
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket   # Windows
+scoop install tenequm/pond
 ```
 
 Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)"* - the full, failure-proofed version of that prompt is in [Connect your agents](https://pond.locker/get-started/connect-your-agents#agent-setup-prompt).
@@ -49,7 +49,7 @@ pond init   # guided setup: storage, adapters, MCP + agent skill, optional sched
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -103,12 +103,14 @@ brew install tenequm/tap/pond              # Homebrew
 nix profile add github:tenequm/pond#pond   # Nix
 ```
 
-**Windows** (Scoop, the supported channel - it also ships `pondw.exe`, the windowless launcher scheduled sync runs through):
+**Windows** (Scoop, the primary channel - it also ships `pondw.exe`, the windowless launcher that scheduled sync runs through):
 
 ```powershell
-scoop bucket add tenequm https://github.com/tenequm/scoop-bucket   # buckets are git clones: `scoop install git` first if git is missing
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install tenequm/pond
 ```
+
+Buckets are git clones, so the first line needs git on `PATH` - if it fails with "Git is required for buckets", run `scoop install git` and retry.
 
 No Scoop yet? Bootstrap it first, from a **normal (non-admin) PowerShell** (its installer refuses an elevated shell):
 
@@ -124,17 +126,21 @@ Then open a new terminal - `PATH` changes reach only processes started after the
 **Via cargo (any platform, needs the Rust toolchain):**
 
 ```sh
-cargo binstall pond-db   # downloads the prebuilt binary (needs cargo-binstall); on Windows it installs pond.exe only - scheduled sync needs pondw.exe, which ships with Scoop and the zip
-cargo install pond-db    # builds from crates.io (installs the `pond` command) - on Windows this needs the protoc + NASM prerequisites from Build from source below
+cargo binstall pond-db   # downloads the prebuilt binary (needs cargo-binstall)
+cargo install pond-db    # builds from crates.io (installs the `pond` command)
 ```
+
+Both install `pond.exe` only, so scheduled sync on Windows - which runs through `pondw.exe` - wants the Scoop or zip install instead (or `--features windows-launcher` on a source build). `cargo install` also needs the protoc and NASM prerequisites below.
 
 **Build from source:**
 
 ```sh
-git clone https://github.com/tenequm/pond.git   # Windows: first `git config --global core.longpaths true` - test-fixture paths exceed 260 chars
+git clone https://github.com/tenequm/pond.git
 cd pond
-cargo install --path packages/pond              # Windows: add `--target x86_64-pc-windows-msvc` (required - without it build scripts get +crt-static and fail to load)
+cargo install --path packages/pond
 ```
+
+On Windows that clone needs `git config --global core.longpaths true` first (test-fixture paths exceed 260 characters), and the build needs an explicit `--target x86_64-pc-windows-msvc` - without it cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
 
 For CUDA acceleration on Linux:
 

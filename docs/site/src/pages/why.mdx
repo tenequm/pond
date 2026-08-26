@@ -14,8 +14,8 @@ Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool
 Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
 ```sh
-brew install tenequm/tap/pond
-pond init   # guided setup: storage, adapters, MCP registration, optional schedule
+brew install tenequm/tap/pond   # macOS / Linux; Windows: Scoop, see Install
+pond init   # guided setup: storage, adapters, MCP + agent skill, optional schedule
 pond sync   # ingest and update indexes
 ```
 

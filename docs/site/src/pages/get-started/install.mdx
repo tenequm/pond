@@ -4,7 +4,7 @@ description: Install pond on macOS, Linux, or Windows via Homebrew, Nix, Scoop, 
 
 # Install
 
-macOS, Linux, and Windows. Homebrew on macOS and Linux; Scoop on Windows; cargo-binstall or a plain [release zip](https://github.com/tenequm/pond/releases) anywhere.
+macOS, Linux, and Windows. Homebrew on macOS and Linux; Scoop on Windows; a plain [release zip](https://github.com/tenequm/pond/releases) anywhere, or cargo-binstall where a Rust toolchain already exists.
 
 ::::code-group
 
@@ -18,7 +18,7 @@ nix profile add github:tenequm/pond#pond
 
 ```powershell [Scoop (Windows)]
 # No Scoop yet? Bootstrap it first - see the Windows section below.
-# Buckets are git clones: `scoop install git` first if git is not on PATH.
+# Buckets are git clones: run scoop install git first if git is not on PATH.
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install tenequm/pond
 ```
@@ -33,7 +33,8 @@ cargo binstall pond-db
 ```sh [Cargo (build from source)]
 # On Windows this needs protoc (winget install Google.Protobuf) and NASM on
 # PATH (winget install NASM.NASM does not update PATH - add C:\Program
-# Files\NASM yourself). macOS and Linux vendor protoc themselves.
+# Files\NASM yourself), and like binstall it builds pond.exe only - add
+# --features windows-launcher for pondw.exe. macOS and Linux vendor protoc.
 cargo install pond-db
 ```
 
@@ -55,7 +56,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 irm get.scoop.sh | iex
 ```
 
-Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. What it fetches is `pond-x86_64-pc-windows-msvc.zip` (~77 MB download, ~223 MB unpacked), attached to every [release](https://github.com/tenequm/pond/releases). No Scoop at all? Unpack that zip anywhere, put the directory on `PATH`, and you are done - nothing else to install. The build is x86_64; on Windows-on-ARM it runs under the built-in x64 emulation. winget is not available yet - the manifest is [in review](https://github.com/microsoft/winget-pkgs/pull/419055); `winget install tenequm.pond` starts working once it merges.
+Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. What it fetches is `pond-x86_64-pc-windows-msvc.zip` (~77 MB download, ~223 MB unpacked), attached to every [release](https://github.com/tenequm/pond/releases). No Scoop at all? Unpack that zip anywhere, put the directory on `PATH`, and you are done - nothing else to install. The build is x86_64; on Windows 11 on ARM it installs and runs under the built-in x64 emulation (Windows 10 on ARM has no x64 emulation, and Scoop resolves it to a 32-bit entry this manifest does not carry). winget is not available yet - the manifest is [in review](https://github.com/microsoft/winget-pkgs/pull/419055); `winget install tenequm.pond` starts working once it merges.
 
 Already have a Rust toolchain? `cargo binstall pond-db` fetches the same prebuilt zip with no git, protoc, or NASM involved - but it installs `pond.exe` only, so [scheduled sync](#scheduled-sync) (which runs through `pondw.exe`) needs the Scoop or zip install.
 
@@ -71,7 +72,7 @@ Building from source instead needs two tools the prebuilt binary spares you: `pr
 
 ### Over SSH
 
-A bucket install's shim works over SSH - `pond` resolves and spawns from remote PowerShell, cmd, and bash sessions alike (verified against 0.16.3). If yours fails with "Could not create process" while local shells work fine, the shim itself is stale - seen once with a shim created by a hand-pinned manifest install - and reinstalling from the bucket (`scoop uninstall pond; scoop install tenequm/pond`) regenerates it. As a stopgap, call the exe directly: `~\scoop\apps\pond\current\pond.exe`.
+A bucket install's shim works over SSH - `pond` resolves and spawns from remote PowerShell, cmd, and Git Bash sessions alike (inside WSL, call it as `pond.exe`: interop appends the Windows `PATH` but does not infer the extension). If yours fails with "Could not create process" while local shells work fine, the shim itself is stale - seen once with a shim created by a hand-pinned manifest install - and reinstalling from the bucket (`scoop uninstall pond; scoop install tenequm/pond`) regenerates it. As a stopgap, call the exe directly: `~\scoop\apps\pond\current\pond.exe`.
 
 ### Defender and where the store lives
 
