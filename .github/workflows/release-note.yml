@@ -40,13 +40,24 @@ jobs:
       - name: Require release note for user-visible types
         run: |
           if printenv PR_TITLE | grep -qE '^(feat|fix|perf)'; then
-            # perl -0777, not sed: the template's guidance comment spans lines, and
-            # a line-based strip would leave it behind and read as a filled note.
+            # perl -0777, not sed: an HTML comment can span lines, and a
+            # line-based strip would leave it behind and read as a filled note.
             note=$(printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | perl -0777 -pe 's/<!--.*?-->//gs' | tr -d '[:space:]')
             if [ -z "$note" ]; then
               echo "::error::feat/fix/perf PRs need a non-empty '## Release note' section in the PR body - it becomes the changelog entry at squash-merge." >&2
               exit 1
             fi
+          fi
+      # The changelog template extracts this section from the squash body but
+      # cannot strip HTML comments (Tera has no multi-line regex), so a comment
+      # inside the section would ship verbatim in the changelog. The PR template
+      # keeps its guidance comment above the header; this rejects author-added
+      # ones, on every PR type - chore/docs bodies land in the changelog too.
+      - name: Reject HTML comments inside the release-note section
+        run: |
+          if printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | grep -q '<!--'; then
+            echo "::error::the '## Release note' section contains an HTML comment - the changelog template cannot strip it, so it would ship verbatim. Move it above the header or delete it." >&2
+            exit 1
           fi
 
   preview:
@@ -85,9 +96,11 @@ jobs:
           fi
           printenv PR_TITLE > "$RUNNER_TEMP/msg.txt"
           echo >> "$RUNNER_TEMP/msg.txt"
-          # The squash body CI previews is exactly what the merge command uses:
-          # the PR body's `## Release note` section, HTML comments stripped.
-          printenv PR_BODY | awk '/^## Release note/{f=1; next} f && /^## /{exit} f{print}' | perl -0777 -pe 's/<!--.*?-->//gs' >> "$RUNNER_TEMP/msg.txt"
+          # The squash body is the FULL PR description - exactly what the repo's
+          # squash defaults (PR_TITLE / PR_BODY) land at merge. The changelog
+          # template extracts the `## Release note` section itself, so preview
+          # and release share one extraction path and cannot drift.
+          printenv PR_BODY >> "$RUNNER_TEMP/msg.txt"
           git commit -q --allow-empty -F "$RUNNER_TEMP/msg.txt"
           release-plz update --config .github/release-plz.toml 2> "$RUNNER_TEMP/release-plz.log" || { cat "$RUNNER_TEMP/release-plz.log" >&2; echo "release-plz update failed - no preview (see job log)" > "$RUNNER_TEMP/preview.md"; exit 0; }
           if git diff --quiet CHANGELOG.md; then

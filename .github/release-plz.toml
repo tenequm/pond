@@ -48,18 +48,30 @@ header = """# Changelog
 """
 # The entry is generated from squash-commit messages alone, so it survives every
 # release-PR refresh (release-plz force-pushes/reopens the release PR on each main
-# push - hand edits there are lost by design). Two message conventions feed it:
-# a commit body renders as indented prose under that commit's bullet, and a body
+# push - hand edits there are lost by design). The squash body is the full PR
+# description, landed automatically by the repo's squash defaults
+# (squash_merge_commit_title = PR_TITLE, squash_merge_commit_message = PR_BODY -
+# repo settings, load-bearing: see AGENTS.md "Changelog authoring"), so the
+# template extracts what it needs itself. Per commit, in order:
+# a `## Release note` section renders as indented prose under that commit's
+# bullet (the rest of the description never reaches the changelog); a body with
+# other `## ` sections but no release-note section contributes nothing (a
+# structured PR body whose author declared nothing user-visible); a body with no
+# markdown sections at all renders whole, as before (plain/direct commits). A
 # section after a lone `[release-note]` line is hoisted to the top of the entry
-# (release lead paragraph / Upgrading block). See AGENTS.md "Changelog authoring".
+# (release lead paragraph / Upgrading block).
 # Prose comes from `raw_message`, not `body`: the conventional parser eats a
 # trailer-shaped FINAL paragraph ("Fixture: three replays converge.") into
 # `footers`, silently dropping it from `body` - raw_message keeps every line, and
 # the line filter below strips the real trailers (Co-authored-by etc.) instead.
+# The section split pattern is "\n## Release note" (line-anchored by the leading
+# newline) so prose that merely mentions the section name cannot trigger it.
 body = """
 ## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
-{%- for commit in commits %}{% if commit.raw_message is containing("[release-note]") %}
-{% set note = commit.raw_message | split(pat="[release-note]") | last | trim %}
+{%- for commit in commits %}
+{%- if commit.raw_message is containing("\n## Release note") %}{% set hoist_src = commit.raw_message | split(pat="\n## Release note") | last | split(pat="\n## ") | first %}{% else %}{% set hoist_src = commit.raw_message %}{% endif %}
+{%- if hoist_src is containing("[release-note]") %}
+{% set note = hoist_src | split(pat="[release-note]") | last | trim %}
 {%- for line in note | split(pat="\n") %}
 {%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
 {{ line }}
@@ -69,7 +81,14 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}{% if commit.scope %}- **{{ commit.scope }}:** {% else %}- {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/tenequm/pond/commit/{{ commit.id }}))
-{%- set prose = commit.raw_message | split(pat="\n") | slice(start=1) | join(sep="\n") | split(pat="[release-note]") | first | trim %}
+{%- if commit.raw_message is containing("\n## Release note") %}
+{%- set prose_src = commit.raw_message | split(pat="\n## Release note") | last | split(pat="\n## ") | first %}
+{%- elif commit.raw_message is containing("\n## ") %}
+{%- set prose_src = "" %}
+{%- else %}
+{%- set prose_src = commit.raw_message | split(pat="\n") | slice(start=1) | join(sep="\n") %}
+{%- endif %}
+{%- set prose = prose_src | split(pat="[release-note]") | first | trim %}
 {%- if prose %}
 {%- for line in prose | split(pat="\n") %}
 {%- if line is starting_with("Co-authored-by") or line is starting_with("Signed-off-by") or line is starting_with("Reviewed-by") or line is starting_with("changelog:") or line is starting_with("BREAKING") %}{% else %}
