@@ -362,32 +362,43 @@ struct Cli {
 
 // The config default differs per platform (config.rs `default_config_path`);
 // a single hardcoded string in the help text told Windows users the wrong
-// place to look for their config.
-#[cfg(windows)]
-const CONFIG_FILE_HELP: &str = r"Config file to read (default: `%APPDATA%\pond\config.toml`)";
-#[cfg(not(windows))]
-const CONFIG_FILE_HELP: &str = "Config file to read (default: `~/.config/pond/config.toml`)";
+// place to look for their config. Both variants stay compiled on every
+// platform so `help_snapshots` can pin the unix wording everywhere.
+const CONFIG_FILE_HELP_UNIX: &str = "Config file to read (default: `~/.config/pond/config.toml`)";
+const CONFIG_FILE_HELP_WINDOWS: &str =
+    r"Config file to read (default: `%APPDATA%\pond\config.toml`)";
+const CONFIG_FILE_HELP: &str = if cfg!(windows) {
+    CONFIG_FILE_HELP_WINDOWS
+} else {
+    CONFIG_FILE_HELP_UNIX
+};
 
-#[cfg(windows)]
-const STORAGE_PATH_LONG_HELP: &str = r"Storage destination: a local path or remote URL.
-
-Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`%LOCALAPPDATA%\pond\data`).";
-#[cfg(not(windows))]
-const STORAGE_PATH_LONG_HELP: &str = "Storage destination: a local path or remote URL.
+const STORAGE_PATH_LONG_HELP_UNIX: &str = "Storage destination: a local path or remote URL.
 
 Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).";
+const STORAGE_PATH_LONG_HELP_WINDOWS: &str = r"Storage destination: a local path or remote URL.
+
+Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`%LOCALAPPDATA%\pond\data`).";
+const STORAGE_PATH_LONG_HELP: &str = if cfg!(windows) {
+    STORAGE_PATH_LONG_HELP_WINDOWS
+} else {
+    STORAGE_PATH_LONG_HELP_UNIX
+};
 
 // The redirection example is platform-specific twice over: the path differs,
 // and Windows PowerShell 5.1's `>` writes UTF-16LE, so the example must name
 // the encoding-safe form there.
-#[cfg(windows)]
-const CONFIG_EXAMPLES_HELP: &str = r"Examples:
-  pond config show                 every setting, its value, and where it came from
-  pond config schema | Out-File -Encoding utf8 $env:APPDATA\pond\config.toml   start from the annotated template";
-#[cfg(not(windows))]
-const CONFIG_EXAMPLES_HELP: &str = "Examples:
+const CONFIG_EXAMPLES_HELP_UNIX: &str = "Examples:
   pond config show                 every setting, its value, and where it came from
   pond config schema > ~/.config/pond/config.toml   start from the annotated template";
+const CONFIG_EXAMPLES_HELP_WINDOWS: &str = r"Examples:
+  pond config show                 every setting, its value, and where it came from
+  pond config schema | Out-File -Encoding utf8 $env:APPDATA\pond\config.toml   start from the annotated template";
+const CONFIG_EXAMPLES_HELP: &str = if cfg!(windows) {
+    CONFIG_EXAMPLES_HELP_WINDOWS
+} else {
+    CONFIG_EXAMPLES_HELP_UNIX
+};
 
 /// Storage and config selectors. Flattened once into the root `Cli` with
 /// `global = true` args, so every subcommand inherits them and they parse
@@ -7316,7 +7327,18 @@ mod tests {
     // churn these.
     #[test]
     fn help_snapshots() {
-        let mut root = Cli::command();
+        // Pin the platform-cfg'd help strings to their unix wording so one
+        // snapshot set reviews the text on every platform - the per-OS split
+        // is a compile-time constant swap, not logic worth forking snapshots
+        // over.
+        let mut root = Cli::command()
+            .mut_arg("storage_path", |arg| {
+                arg.long_help(STORAGE_PATH_LONG_HELP_UNIX)
+            })
+            .mut_arg("config", |arg| arg.help(CONFIG_FILE_HELP_UNIX))
+            .mut_subcommand("config", |sub| {
+                sub.after_long_help(CONFIG_EXAMPLES_HELP_UNIX)
+            });
         root.build();
         // Normalize the version so a release bump doesn't churn the snapshot.
         let root_help = root
