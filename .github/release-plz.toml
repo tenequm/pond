@@ -102,6 +102,12 @@ body = """
 trim = true
 protect_breaking_commits = true
 commit_preprocessors = [
+  # FIRST, before the PR-link rewrite below: it needs the bare `(#N)` in the
+  # subject to find the PR. Recovers a `## Release note` from the pull request
+  # when the squash commit landed without one (see the script for why that
+  # happens and why it cannot be fixed after the fact). Both the changelog and
+  # the GitHub release body render from this, so both stay correct.
+  { pattern = '(?s)^.*$', replace_command = "ops/scripts/release-note-from-pr.sh" },
   { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tenequm/pond/pull/${1}))" },
 ]
 commit_parsers = [

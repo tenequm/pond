@@ -17,7 +17,8 @@ pond's changelog is generated from squash-commit messages, so what you write on 
 
 - **PR title** must be a conventional commit (`type(scope): description`, e.g. `fix(sync): stop dropping resumed folds`). It becomes the squash-commit subject and the changelog bullet. CI lints it.
 - **`## Release note` section** in the PR description (the template prompts for it) becomes the prose under that bullet. Write it for pond users rather than reviewers: **one paragraph, at most 300 characters, no bullets and no blank lines** - CI enforces all three, plus that it is the **last** section of the PR body. One to three plain sentences: what changed for the user, and what they must do about it. Short sentences, active voice, present tense, the same word for the same thing. Say the effect, not the work you did or how you validated it - that belongs in the sections above, which never reach the changelog. Required for `feat`/`fix`/`perf` PRs; leave it empty when users see nothing. A release-wide story or an `**Upgrading:**` block goes after a lone `[release-note]` line, which is exempt from the cap.
-- CI posts a **rendered preview** of your entry as a PR comment - edit the description and it updates.
+- CI comments only when something is wrong, listing every problem at once, and clears the comment once the description passes.
+- If a note turns out wrong after merge, edit the PR description - the changelog is regenerated from it on the next release-PR refresh.
 
 ## Everything else
 
