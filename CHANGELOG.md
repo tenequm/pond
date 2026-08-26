@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.2](https://github.com/tenequm/pond/compare/v0.16.1...v0.16.2) - 2026-08-26
+
+### <!-- 2 -->🐛 Bug Fixes
+- **schedule:** detect broken Task Scheduler registrations and name the elevated-ownership fix ([8945816](https://github.com/tenequm/pond/commit/89458160a6d7b6fbb73adbb520d08183dc3985e1))
+
+### <!-- 5 -->📚 Documentation
+- remove winget from install docs until the winget-pkgs review merges ([dc393e3](https://github.com/tenequm/pond/commit/dc393e3bea2f17e114fdb2dba2fc1aeea953b805))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.1...v0.16.2
+
 ## [0.16.1](https://github.com/tenequm/pond/compare/v0.16.0...v0.16.1) - 2026-08-25
 
 Date-filtered search stays correct across compaction. 0.16.0's timestamp zonemap indexes rows by *address* (fragment id plus offset), and Lance never remaps those addresses when compaction rewrites a fragment - it refreshes the index's fragment list while the index body keeps pointing at fragments that no longer exist. Every pond version's compaction does this, 0.16.0's own included. The result was a date-filtered search that either failed outright (`storage_unavailable`, naming a missing fragment) or, once a later index fold cleaned up the dangling references, silently dropped the rewritten rows from its results. Ordinary search, `pond get-session`, `pond get-message`, and `pond sql` were never affected, and no data was ever at risk - the index went stale, the store did not.
