@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.16.3](https://github.com/tenequm/pond/compare/v0.16.2...v0.16.3) - 2026-08-26
+
+### <!-- 2 -->🐛 Bug Fixes
+- **init:** Windows onboarding - help defaults, non-TTY output, store dir, restart hint, docs overhaul ([#189](https://github.com/tenequm/pond/pull/189)) ([162a925](https://github.com/tenequm/pond/commit/162a925f47627923a6b3dae67906a6c56995c92b))
+  - `pond --help` and `pond init` now show Windows users real Windows
+  paths (`%APPDATA%\pond\config.toml`, `%LOCALAPPDATA%\pond\data`), init
+  renders cleanly for agents and ssh sessions, creates the store dir it
+  announces, and reminds you to restart your client after MCP/skill
+  changes.
+  - Docs: the release zip is a first-class install path, Scoop setup is
+  fully documented, the agent setup prompt works on Windows, and a new
+  [Troubleshooting](https://pond.locker/guides/troubleshooting) guide
+  covers the common traps.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.2...v0.16.3
+
 ## [0.16.2](https://github.com/tenequm/pond/compare/v0.16.1...v0.16.2) - 2026-08-26
 
 A Windows schedule that can never fire is now diagnosed instead of silently reported healthy. Both failure modes in this release were found live on a real Windows machine after a winget-to-Scoop migration: the scheduled task's action still pointed at the uninstalled binaries (every 5-minute tick died with 0x80070002 FILE_NOT_FOUND while `pond schedule status` said `active`), and the task itself had been registered from an elevated shell, so `pond schedule start`/`stop` from a normal shell failed with a bare `Access is denied`. Alongside the fix, Scoop becomes the working Windows install channel: the bucket now genuinely self-updates from each release (its checkver had been broken since creation), each release pings it so new versions land within minutes, and winget leaves the docs until [winget-pkgs#419055](https://github.com/microsoft/winget-pkgs/pull/419055) merges.
