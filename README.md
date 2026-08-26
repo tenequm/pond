@@ -120,15 +120,13 @@ On macOS the Metal backend is selected automatically; on other systems the CPU f
 On Windows, the Homebrew/Nix packages do not apply:
 
 ```powershell
-winget install tenequm.pond
-
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install pond
 
 cargo binstall pond-db
 ```
 
-The winget manifest is in review at [winget-pkgs](https://github.com/microsoft/winget-pkgs), so `winget install` does not resolve yet - use Scoop until it merges. See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
+See the [Windows notes](https://pond.locker/get-started/install#windows) for building from source, Defender, long paths, and WSL.
 
 ## Usage
 
