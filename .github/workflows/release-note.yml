@@ -59,14 +59,18 @@ jobs:
             echo "::error::the '## Release note' section contains an HTML comment - the changelog template cannot strip it, so it would ship verbatim. Move it above the header or delete it." >&2
             exit 1
           fi
-      # Position and size. Last section: the note is the user-facing tail of
+      # Position and shape. Last section: the note is the user-facing tail of
       # the squash body, and a section buried mid-description invites reviewer
-      # prose to leak into it. Size cap: the section IS the changelog entry, so
-      # it stays a few bullets - detail belongs in the sections above. The cap
-      # applies to the per-PR part only; a release-wide lead after a lone
-      # `[release-note]` line (the hoist mechanism) is exempt, since 0.15.0-style
+      # prose to leak into it. One paragraph under 300 chars: the section IS the
+      # changelog entry, and a list is how a paragraph becomes a report - so
+      # bullets and blank lines are rejected outright. 300 is calibrated against
+      # Kubernetes' `release-note` block (24 sampled merged PRs: median 132
+      # chars, longest 295), whose changes are not smaller than pond's - the
+      # budget is what forces "what changed for you" over "what I did". All
+      # three checks apply to the per-PR part only; a release-wide lead after a
+      # lone `[release-note]` line (the hoist mechanism) is exempt, since
       # lead paragraphs plus an Upgrading block are legitimately longer.
-      - name: Release note is the last section and stays changelog-sized
+      - name: Release note is the last section and stays one short paragraph
         run: |
           if ! printenv PR_BODY | grep -q '^## Release note'; then
             exit 0
@@ -77,9 +81,18 @@ jobs:
             exit 1
           fi
           entry=$(printenv PR_BODY | awk '/^## Release note/{f=1; next} f{print}' | awk '/^\[release-note\]$/{exit} {print}')
-          chars=$(printf '%s' "$entry" | wc -c)
-          if [ "$chars" -gt 1200 ]; then
-            echo "::error::the '## Release note' section is $chars characters (cap: 1200) - it ships verbatim as the changelog entry, so keep it to a few bullets and move detail into the sections above (a release-wide lead after a lone '[release-note]' line is exempt from the cap)." >&2
+          if printf '%s\n' "$entry" | grep -qE '^\s*([-*+]|[0-9]+\.)\s'; then
+            echo "::error::the '## Release note' section must be one paragraph, not a list - it ships verbatim as the changelog entry. State what changed for the user in prose; reviewer detail belongs in the sections above." >&2
+            exit 1
+          fi
+          # sed strips leading/trailing blank lines so only interior ones fail.
+          if printf '%s\n' "$entry" | sed -e '/./,$!d' -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' | grep -qE '^[[:space:]]*$'; then
+            echo "::error::the '## Release note' section must be a single paragraph - remove the blank line inside it (a release-wide lead after a lone '[release-note]' line is exempt)." >&2
+            exit 1
+          fi
+          chars=$(printf '%s' "$entry" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' | wc -c | tr -d ' ')
+          if [ "$chars" -gt 300 ]; then
+            echo "::error::the '## Release note' section is $chars characters (cap: 300) - one to three sentences saying what changed for the user. Move detail into the sections above, or, for a release-wide story, after a lone '[release-note]' line (exempt from the cap)." >&2
             exit 1
           fi
 
