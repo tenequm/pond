@@ -4,7 +4,7 @@ description: Configure pond via config.toml with POND_* environment overrides - 
 
 # Configuration & environment
 
-Config lives in `config.toml`; every field has a `POND_*` env override. Precedence: flag > env > config > ambient cloud SDK chain > default. `pond config show` prints resolved values with secrets redacted and per-field source.
+Config lives in `config.toml` - `~/.config/pond/config.toml` on macOS and Linux, `%APPDATA%\pond\config.toml` on Windows (`$XDG_CONFIG_HOME` overrides both; `pond config path` prints the resolved location). Data, cache, and state live separately: `~/.local/share/pond`, `~/.cache/pond`, `~/.local/state/pond` on macOS and Linux, all three under `%LOCALAPPDATA%\pond` on Windows. Every field has a `POND_*` env override. Precedence: flag > env > config > ambient cloud SDK chain > default. `pond config show` prints resolved values with secrets redacted and per-field source.
 
 ## config.toml
 
@@ -72,4 +72,4 @@ The stored vectors themselves stay as data columns, so re-enabling later picks u
 
 ## Secrets
 
-Keep secrets out of the URL and CLI flags. Instead of inline values: `secret_access_key_file = "/run/secrets/pond-s3"` or `secret_access_key_command = "op read op://vault/pond/secret"`. pond writes `config.toml` with `0600` permissions.
+Keep secrets out of the URL and CLI flags. Instead of inline values: `secret_access_key_file = "/run/secrets/pond-s3"` or `secret_access_key_command = "op read op://vault/pond/secret"`. pond writes `config.toml` with `0600` permissions on macOS and Linux; on Windows the file inherits the profile directory's ACLs.

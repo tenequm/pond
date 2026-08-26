@@ -4,7 +4,7 @@ description: Install pond on macOS, Linux, or Windows via Homebrew, Nix, Scoop, 
 
 # Install
 
-macOS, Linux, and Windows.
+macOS, Linux, and Windows. Homebrew on macOS and Linux; Scoop on Windows; cargo-binstall or a plain [release zip](https://github.com/tenequm/pond/releases) anywhere.
 
 ::::code-group
 
@@ -17,6 +17,7 @@ nix profile add github:tenequm/pond#pond
 ```
 
 ```powershell [Scoop (Windows)]
+# No Scoop yet? Install it first: irm get.scoop.sh | iex
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
 scoop install pond
 ```
@@ -37,11 +38,28 @@ cargo install pond-db
 
 ## Windows
 
-Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. It fetches `pond-x86_64-pc-windows-msvc.zip`, which is attached to every [release](https://github.com/tenequm/pond/releases) and can also be unpacked by hand.
+Scoop is the Windows channel. If you don't have Scoop yet, install it first - it needs an execution policy of `RemoteSigned` or looser and lives entirely in your user profile:
 
-The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE` (`. <path>\_pond.ps1`), which needs an execution policy of `RemoteSigned` or looser.
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+irm get.scoop.sh | iex
+```
+
+Scoop installs pond as a portable zip: the shim puts `pond` on `PATH`, the bucket updates itself from each GitHub release, and `scoop update pond` upgrades in place. It fetches `pond-x86_64-pc-windows-msvc.zip` (~77 MB download, ~233 MB unpacked), which is attached to every [release](https://github.com/tenequm/pond/releases) - no Scoop, no problem: unpack it anywhere and put that directory on `PATH`; nothing else to install.
+
+Installed with an agent session already running? The new `PATH` entry reaches only processes started after the install - open a fresh terminal (and restart the agent client) if `pond` reports not found.
+
+The zip carries completion scripts for PowerShell, bash, zsh, and fish. Register the PowerShell one by dot-sourcing it from your `$PROFILE`; with Scoop the file is at `~\scoop\apps\pond\current\completions\_pond.ps1`. On a fresh machine `$PROFILE` may not exist yet - create it first (`New-Item -Force $PROFILE`).
 
 Building from source instead needs two tools the prebuilt binary spares you: `protoc`, because `protobuf-src` cannot vendor it on Windows, and NASM, for `aws-lc-sys`. Embeddings, if you enable them, run on the CPU backend.
+
+### Scheduled sync
+
+`pond schedule start` registers a Task Scheduler job. Run it from a **normal** shell, not an elevated one: a task registered elevated is owned by Administrators, and every later `pond schedule start`/`stop` from a normal shell fails with Access denied (pond warns before registering elevated, and the error names the recovery if you're already caught). After moving pond between install channels - a manual zip to Scoop, say - run `pond schedule start` once so the task points at the new binaries; `pond status` flags a registration whose launcher no longer exists.
+
+### Over SSH
+
+Scoop's `current` shim path is a directory junction, and Windows disables remote-to-local symlink evaluation by default - so over SSH (or any network logon) the shim fails with "Could not create process" while local shells work fine. Provisioning remotely? Call the versioned path directly (`~\scoop\apps\pond\<version>\pond.exe`) or use the unpacked release zip instead.
 
 ### Defender and where the store lives
 
@@ -54,5 +72,9 @@ The Windows binary ships a manifest declaring long-path awareness, which only ta
 ### WSL
 
 Running the Linux binary under WSL works when both the agent session files and the pond store live on the ext4 side. Do not point either across `/mnt/c`: throughput collapses and Windows-side writes are missed.
+
+## Updating
+
+`brew upgrade pond` / `scoop update pond` / `cargo binstall pond-db` (re-run) / a fresh zip - and `pond --version` to check what you're on. Keep every machine that writes to a shared store on the same version: a store-schema release migrates the store in place, after which older binaries stop syncing until they upgrade (see [Several machines, one bucket](/guides/several-machines#mixed-versions)).
 
 Next: [Quickstart](/get-started/quickstart).

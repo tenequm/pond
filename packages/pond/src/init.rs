@@ -333,7 +333,7 @@ pub(crate) async fn run(
         )?;
     }
     plan.push_str(&format!("\nconfig     {}", display_path(&config_file)));
-    cliclack::note("Plan", plan)?;
+    note("Plan", &plan)?;
     if prompts {
         let write = wiz(cliclack::confirm("Write config?")
             .initial_value(true)
@@ -352,6 +352,14 @@ pub(crate) async fn run(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         crate::config::write_config_file(&config_file, &new_text)?;
+    }
+    // Materialize a local store dir the plan just announced: a user (or
+    // agent) verifying setup looks for it, and an init that promises a path
+    // it never creates reads as a failed install. Idempotent; remote stores
+    // have nothing local to create.
+    if let Some(local_store) = config::local_path(chosen.canonical()) {
+        std::fs::create_dir_all(&local_store)
+            .with_context(|| format!("failed to create {}", local_store.display()))?;
     }
 
     // External side effects (MCP registration, the first sync, OS-scheduler
@@ -386,7 +394,7 @@ pub(crate) async fn run(
     } else {
         "pond sync      import your sessions\npond status    check health\npond --help    explore the rest"
     };
-    cliclack::note("Next steps", next_steps)?;
+    note("Next steps", next_steps)?;
     // The outro is the wizard UI's closing element, but the first sync still
     // runs after it - say so, or "Config written" reads as "done" and the
     // sync output looks like a second program starting.
@@ -461,6 +469,22 @@ pub(crate) async fn run(
 
 fn display_path(path: &Path) -> String {
     config::contract_home(path).display().to_string()
+}
+
+/// cliclack's note box wraps long unbroken lines (a Windows path is one word)
+/// at a width it cannot know without a TTY, mangling the wizard's headline
+/// output for agents and ssh sessions - plain lines carry the same content
+/// there without the box.
+fn note(title: &str, body: &str) -> Result<()> {
+    if std::io::stdin().is_terminal() {
+        cliclack::note(title, body)?;
+    } else {
+        pond::output::line(title)?;
+        for line in body.lines() {
+            pond::output::line(&format!("  {line}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// The platform-local default destination, contracted for display and for
@@ -949,6 +973,11 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
                 .context("failed to run `claude mcp add`")?;
                 if output.status.success() {
                     cliclack::log::success("mcp: registered in Claude Code (user scope)")?;
+                    // Clients load MCP servers at startup; a registration
+                    // added mid-session is invisible until the next one.
+                    cliclack::log::info(
+                        "restart Claude Code so the pond tools load (they appear on the next session)",
+                    )?;
                 } else {
                     cliclack::log::warning(format!(
                         "mcp: `claude mcp add` exited {}: {} - run `claude mcp add -s user pond -- pond mcp` manually",
@@ -968,7 +997,7 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
         }
     }
     if codex.is_some() {
-        cliclack::note(
+        note(
             "codex detected",
             "register pond manually:\n  codex mcp add pond -- pond mcp",
         )?;
@@ -980,6 +1009,11 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
 /// always matches the running binary (the same bytes `pond skill` prints).
 const SKILL_MD: &str = include_str!("../SKILL.md");
 
+// Native separators: mixed `~/...` and `~\...` in one wizard's output reads
+// as two different locations to a Windows user.
+#[cfg(windows)]
+const SKILL_DISPLAY_PATH: &str = r"~\.claude\skills\pond\SKILL.md";
+#[cfg(not(windows))]
 const SKILL_DISPLAY_PATH: &str = "~/.claude/skills/pond/SKILL.md";
 
 /// Sync the bundled skill into Claude Code's user skills dir.

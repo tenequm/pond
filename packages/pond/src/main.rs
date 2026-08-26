@@ -360,6 +360,26 @@ struct Cli {
     verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::WarnLevel>,
 }
 
+// The config default differs per platform (config.rs `default_config_path`);
+// a single hardcoded string in the help text told Windows users the wrong
+// place to look for their config.
+#[cfg(windows)]
+const CONFIG_FILE_HELP: &str = r"Config file to read (default: `%APPDATA%\pond\config.toml`)";
+#[cfg(not(windows))]
+const CONFIG_FILE_HELP: &str = "Config file to read (default: `~/.config/pond/config.toml`)";
+
+// The redirection example is platform-specific twice over: the path differs,
+// and Windows PowerShell 5.1's `>` writes UTF-16LE, so the example must name
+// the encoding-safe form there.
+#[cfg(windows)]
+const CONFIG_EXAMPLES_HELP: &str = r"Examples:
+  pond config show                 every setting, its value, and where it came from
+  pond config schema | Out-File -Encoding utf8 $env:APPDATA\pond\config.toml   start from the annotated template";
+#[cfg(not(windows))]
+const CONFIG_EXAMPLES_HELP: &str = "Examples:
+  pond config show                 every setting, its value, and where it came from
+  pond config schema > ~/.config/pond/config.toml   start from the annotated template";
+
 /// Storage and config selectors. Flattened once into the root `Cli` with
 /// `global = true` args, so every subcommand inherits them and they parse
 /// before or after the subcommand name.
@@ -382,13 +402,14 @@ struct StoreArgs {
         value_name = "URL"
     )]
     storage_path: Option<StorageUrl>,
-    /// Config file to read (default: `~/.config/pond/config.toml`).
+    /// Config file to read.
     #[arg(
         long = "config-file",
         global = true,
         env = "POND_CONFIG_FILE",
         hide_env_values = true,
-        value_name = "PATH"
+        value_name = "PATH",
+        help = CONFIG_FILE_HELP
     )]
     config: Option<PathBuf>,
     /// Directory holding pond's per-host state: the sync lock, the last-sync
@@ -835,9 +856,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// Resolved values with provenance (show), the config file location
     /// (path), and the fully-annotated template (schema).
     #[command(flatten_help = true)]
-    #[command(after_long_help = "Examples:
-  pond config show                 every setting, its value, and where it came from
-  pond config schema > ~/.config/pond/config.toml   start from the annotated template")]
+    #[command(after_long_help = CONFIG_EXAMPLES_HELP)]
     #[command(display_order = 6)]
     Config {
         #[command(subcommand)]
