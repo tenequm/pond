@@ -16,10 +16,13 @@ Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool
 Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP - so "how did we fix this before?" is a query, not an archaeology dig. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
 ```sh
-brew install tenequm/tap/pond
+brew install tenequm/tap/pond   # macOS / Linux
+
+scoop bucket add tenequm https://github.com/tenequm/scoop-bucket   # Windows
+scoop install tenequm/pond
 ```
 
-Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)."*
+Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)"* - the full, failure-proofed version of that prompt is in [Connect your agents](https://pond.locker/get-started/connect-your-agents#agent-setup-prompt).
 
 <p align="center">
   <img src="docs/site/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
@@ -46,7 +49,7 @@ pond init   # guided setup: storage, adapters, MCP + agent skill, optional sched
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for detected clients and installs the bundled pond skill for Claude Code - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (PowerShell shape differs - see [Connect your agents](https://pond.locker/get-started/connect-your-agents); a bare `>` in Windows PowerShell 5.1 writes UTF-16 and corrupts it). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -100,17 +103,25 @@ brew install tenequm/tap/pond              # Homebrew
 nix profile add github:tenequm/pond#pond   # Nix
 ```
 
-**Windows:**
+**Windows** (Scoop, the primary channel - it also ships `pondw.exe`, the windowless launcher that scheduled sync runs through):
 
 ```powershell
-# No Scoop yet? First: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; irm get.scoop.sh | iex
 scoop bucket add tenequm https://github.com/tenequm/scoop-bucket
-scoop install pond
+scoop install tenequm/pond
 ```
 
-See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+Buckets are git clones, so the first line needs git on `PATH` - if it fails with "Git is required for buckets", run `scoop install git` and retry.
 
-**No package manager (any platform):** every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries (`pond-x86_64-pc-windows-msvc.zip` on Windows) - unpack one and put it on `PATH`, nothing else to install.
+No Scoop yet? Bootstrap it first, from a **normal (non-admin) PowerShell** (its installer refuses an elevated shell):
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+irm get.scoop.sh | iex
+```
+
+Then open a new terminal - `PATH` changes reach only processes started after the install. See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+
+**No package manager (any platform):** every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries (`pond-x86_64-pc-windows-msvc.zip` on Windows, ~223 MB unpacked) - unpack one and add its directory to `PATH` (on Windows: Settings > System > About > Advanced system settings > Environment Variables, under your user variables), nothing else to install.
 
 **Via cargo (any platform, needs the Rust toolchain):**
 
@@ -118,6 +129,8 @@ See the [Windows notes](https://pond.locker/get-started/install#windows) for Def
 cargo binstall pond-db   # downloads the prebuilt binary (needs cargo-binstall)
 cargo install pond-db    # builds from crates.io (installs the `pond` command)
 ```
+
+Both install `pond.exe` only, so scheduled sync on Windows - which runs through `pondw.exe` - wants the Scoop or zip install instead (or `--features windows-launcher` on a source build). `cargo install` also needs the protoc and NASM prerequisites below.
 
 **Build from source:**
 
@@ -127,13 +140,17 @@ cd pond
 cargo install --path packages/pond
 ```
 
+On Windows that clone needs `git config --global core.longpaths true` first (test-fixture paths exceed 260 characters), and the build needs an explicit `--target x86_64-pc-windows-msvc` - without it cargo applies the repo's `+crt-static` flag to build scripts and proc-macros too, which then fail to load.
+
 For CUDA acceleration on Linux:
 
 ```sh
 cargo install --path packages/pond --features cuda
 ```
 
-On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features. Building from source on Windows additionally needs `protoc` (`winget install Google.Protobuf`) and NASM (`winget install NASM.NASM`) on `PATH`.
+On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features. Building from source on Windows additionally needs `protoc` (`winget install Google.Protobuf`) and NASM (`winget install NASM.NASM`, then add `C:\Program Files\NASM` to `PATH` yourself - its installer doesn't) on `PATH`.
+
+If any install path fails, the [Troubleshooting guide](https://pond.locker/guides/troubleshooting) covers the common stalls.
 
 ## Usage
 
@@ -190,7 +207,7 @@ pond optimize --only index
 
 ### Scheduled sync
 
-Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux, Task Scheduler on Windows):
+Keep pond current automatically (launchd on macOS, systemd user timers or cron on Linux, Task Scheduler on Windows - there, run it from a normal shell, not an elevated one, or the task ends up owned by Administrators):
 
 ```sh
 pond schedule start                # every 5m by default (--every 15m|1h|6h|1d)
