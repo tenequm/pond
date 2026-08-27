@@ -23,9 +23,11 @@ JSON column:
 | `options.anthropic.usage.cache_creation.ephemeral_5m_input_tokens` | cache write, 5-minute TTL |
 | `options.anthropic.usage.cache_creation.ephemeral_1h_input_tokens` | cache write, 1-hour TTL |
 
-Only Anthropic calls carry this. Rows from `codex-cli`, `pi-coding-agent`,
-`opencode` and `oh-my-pi` have no usage at all, so they drop out on their own.
-`nanoclaw` and other SDK entrypoints do carry it.
+`nanoclaw` and `claude-desktop-app` use this same shape, so everything below
+applies to them unchanged. Other harnesses - `codex-cli`, `pi-coding-agent`,
+`opencode`, `oh-my-pi` - record usage too, but under different paths with
+different semantics, so they fall out of an `options.anthropic` query silently.
+See "Other harnesses" at the end.
 
 ## The dedup rule
 
@@ -180,3 +182,123 @@ that also ingests other machines should come out **higher**. A run on
 
 If your pond figure comes out **lower** than ccusage over the same window, the
 dedup is over-collapsing - that is the signal to check first.
+
+## Other harnesses
+
+pond ingests more than Claude Code, and each adapter records usage in its own
+place with its own semantics. Row counts below are from one store on
+2026-08-27, for scale only.
+
+| Harness | Assistant rows | Usage path |
+|---|---|---|
+| `claude-code` (+ subagents) | 1,241,784 | `options.anthropic.usage` |
+| `codex-cli` | 30,387 | `options.source.raw_record.payload.info.total_token_usage` |
+| `nanoclaw` | 7,161 | `options.anthropic.usage` |
+| `pi-coding-agent` | 1,475 | `options.pi.usage` (plus `options.pi.usage.cost`) |
+| `opencode` | 935 | `options.source.raw_record.tokens` + `.cost` |
+| `claude-desktop-app` | 368 | `options.anthropic.usage` |
+| `claude-ai-export` | 40 | none recorded |
+| `oh-my-pi` | 6 | `options.pi.usage` |
+
+Three accounting models sit behind that table:
+
+1. **Anthropic-shaped** (`claude-code`, `nanoclaw`, `claude-desktop-app`) -
+   per-call usage snapshots, dedup by message id, price from a table. Everything
+   above applies as written.
+2. **Cumulative counters** (`codex-cli`) - session-running totals, no dedup key,
+   and inverted cache semantics.
+3. **Self-priced** (`pi-coding-agent`, `opencode`, `oh-my-pi`) - the harness
+   already computed the dollar cost and stored it per row.
+
+### Codex: two traps
+
+**The counters are cumulative per session.** Codex writes `token_count` events
+carrying both `payload.info.last_token_usage` (that one call) and
+`payload.info.total_token_usage` (the session so far). Summing
+`total_token_usage` across events inflates enormously. Take the final
+`total_token_usage` per session, or sum `last_token_usage`.
+
+**Cached tokens are a subset of input, not a separate bucket.** A real row reads
+`input_tokens: 8976, cached_input_tokens: 8832`. This is the OpenAI convention
+and it inverts Anthropic's, where `input_tokens` excludes everything cached.
+Applying the Anthropic formula - which adds cache reads on top of input -
+double-counts almost the whole input leg. Price cached and uncached separately
+out of the single `input_tokens` figure:
+`uncached = input_tokens - cached_input_tokens`.
+
+Note also `reasoning_output_tokens`, which is already included in
+`output_tokens`; adding it again double-counts.
+
+### pi and opencode: read the recorded cost
+
+Both harnesses store the price they were charged.
+
+- pi: `options.pi.usage.{input, output, cacheRead, cacheWrite}` for tokens
+  (camelCase, unlike Anthropic's snake_case) and
+  `options.pi.usage.cost.{input, output, cacheRead, cacheWrite, total}` for
+  dollars. `options.pi.provider` and `options.pi.model` identify the route.
+- opencode: `options.source.raw_record.cost` as a single float, with tokens under
+  `options.source.raw_record.tokens.{input, output}` and
+  `.tokens.cache.{read, write}`. `providerID` and `modelID` identify the route.
+
+Prefer these fields over recomputing. They are the only record of what a
+third-party route actually charged, and no bundled price table covers models
+like `zai-org-glm-5-2` or `moonshotai/kimi-k3`.
+
+One caveat for opencode: the cost field is authoritative for metered providers
+but is written as `0` for Anthropic-through-opencode rows, which carry real
+tokens. Summing opencode `cost` blindly understates there.
+
+### Deriving your own rate table
+
+When you do need per-token rates - to price a harness that records tokens but no
+cost, or to compare routes - derive them from rows that carry both. pi's cost
+breakdown makes this a division:
+
+```sql
+SELECT json_get_string(options,'pi','provider') AS provider,
+       json_get_string(options,'pi','model') AS model,
+       ROUND(SUM(json_get_float(options,'pi','usage','cost','input'))
+           / NULLIF(SUM(json_get_int(options,'pi','usage','input')),0) * 1000000, 3) AS input_per_mtok,
+       ROUND(SUM(json_get_float(options,'pi','usage','cost','output'))
+           / NULLIF(SUM(json_get_int(options,'pi','usage','output')),0) * 1000000, 3) AS output_per_mtok,
+       ROUND(SUM(json_get_float(options,'pi','usage','cost','cacheRead'))
+           / NULLIF(SUM(json_get_int(options,'pi','usage','cacheRead')),0) * 1000000, 3) AS cacheread_per_mtok
+FROM messages
+WHERE json_extract(options,'$.pi.usage') IS NOT NULL
+  AND json_get_float(options,'pi','usage','cost','total') > 0
+GROUP BY provider, model;
+```
+
+The rates come back as published list prices - `moonshotai/kimi-k3` resolves to
+exactly 3.00 / 15.00 / 0.30 per Mtok, with cache read at 0.1x input, the same
+convention Anthropic uses.
+
+Cross-validate before trusting a derived rate. Provider and model pairs that
+appear under more than one harness let you price one harness's tokens with the
+other's derived rates and compare against its own recorded cost. Applying
+pi-derived rates to opencode's tokens on 2026-08-27:
+
+| Model | Predicted | opencode's own | Error |
+|---|---|---|---|
+| venice `glm-4.7-flash-heretic` | $0.14220 | $0.1422 | exact |
+| openrouter `z-ai/glm-5.2:exacto` | $0.01575 | $0.0158 | 0.3% |
+| venice `qwen-3-6-plus` | $2.2463 | $2.264 | 0.8% |
+
+Two limits. A derived rate is a blended average over whatever window the rows
+span, so it absorbs any price change inside it - round numbers suggest a stable
+price, awkward ones (0.924) suggest drift, and neither is safe for pricing a
+single old session. And a model never run on a metered provider has no
+derivable rate at all; look it up from the provider's own API instead.
+
+### Self-hosted models have no token price
+
+Rows from `runpod-*`, `ollama`, `litellm` and `mlx-local` correctly record cost
+`0`. That is not missing data - those routes are not billed per token. Do not
+assign them a synthetic rate; keep them in their own bucket so token volume
+stays visible without implying dollars.
+
+If you want their real economics, the unit is GPU-hours, and an effective
+$/Mtok is the pod's hourly rate times its uptime, divided by the tokens produced
+in that window. That is the number that says whether renting beat a metered API,
+but it has to come from the rental records, not from pond.
