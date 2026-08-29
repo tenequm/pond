@@ -79,7 +79,83 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
         embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
         search: pond::config::SearchConfig::default(),
     };
-    Ok((temp, store, http::router(state)))
+    Ok((temp, store, http::router(state, &[])))
+}
+
+/// The `/mcp` route validates `Host` against an allowlist (the MCP spec's
+/// DNS-rebinding defence, carried by rmcp) and that list is loopback-only
+/// unless `serve` is told otherwise - so a server reached by its own public
+/// name answers `/mcp` with 403 until that name is passed in. `/v1/*` carries
+/// no such check, which is why a hosted pond can look healthy on the JSON API
+/// while every MCP client is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
+    pond::embed::init_enabled(true);
+    let temp = TempDir::new()?;
+    let store = Arc::new(Store::open_local(temp.path()).await?);
+    let state = AppState {
+        store,
+        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
+            FakeBackend,
+        ))),
+        search: pond::config::SearchConfig::default(),
+    };
+    let app = http::router(state, &["pond.example.com".to_owned()]);
+
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pond-test", "version": "0"},
+        },
+    });
+
+    // Loopback keeps working: the defaults are extended, not replaced.
+    assert_eq!(
+        mcp_status(&app, "localhost", &initialize).await,
+        StatusCode::OK
+    );
+    // The name the deployment actually answers to.
+    assert_eq!(
+        mcp_status(&app, "pond.example.com", &initialize).await,
+        StatusCode::OK
+    );
+    // Anything else is still refused.
+    assert_eq!(
+        mcp_status(&app, "attacker.example.com", &initialize).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Same rejected `Host`, unrelated route: the JSON API is not gated.
+    let search = json!({"protocol_version": PROTOCOL_VERSION, "query": "anything"});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/search")
+        .header("host", "attacker.example.com")
+        .header("content-type", "application/json")
+        .body(Body::from(search.to_string()))
+        .unwrap();
+    let status = app.clone().oneshot(request).await.unwrap().status();
+    assert_ne!(status, StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+/// `POST /mcp` under one `Host`, reporting only the status - the allowlist is
+/// checked before the request is parsed, so the body never matters here.
+async fn mcp_status(app: &Router, host: &str, body: &Value) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", host)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
 }
 
 async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap, Value) {

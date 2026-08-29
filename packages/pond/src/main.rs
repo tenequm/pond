@@ -733,7 +733,8 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     #[command(after_long_help = "Examples:
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
-  pond serve --transport stdio     same as `pond mcp`")]
+  pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name")]
     #[command(display_order = 16)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
@@ -755,6 +756,22 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
             default_value_t = 9797
         )]
         port: u16,
+        /// Public Host value the MCP route also accepts, on top of localhost.
+        ///
+        /// MCP over streamable HTTP validates the Host header against an
+        /// allowlist (the spec's DNS-rebinding defence), and the default list
+        /// is loopback only - so a server reached by any other name answers
+        /// /mcp with 403 until that name is listed here. Repeat the flag, or
+        /// set the env to a comma-separated list. The /v1/* routes are not
+        /// gated this way.
+        #[arg(
+            long = "allowed-host",
+            env = "POND_ALLOWED_HOSTS",
+            hide_env_values = true,
+            value_delimiter = ',',
+            value_name = "HOST"
+        )]
+        allowed_host: Vec<String>,
         /// Also run periodic sync in-process, reusing this server's store and
         /// embedding model (no separate `pond sync` child cold-loading a second
         /// ~500 MB model). Sync output goes to stderr/tracing; stdout stays
@@ -1536,6 +1553,7 @@ async fn run() -> anyhow::Result<()> {
             transport,
             host,
             port,
+            allowed_host,
             with_sync,
             sync_every,
             bootstrap,
@@ -1587,7 +1605,7 @@ async fn run() -> anyhow::Result<()> {
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
-                    transport::http::serve(state, host, port).await?;
+                    transport::http::serve(state, host, port, allowed_host).await?;
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");

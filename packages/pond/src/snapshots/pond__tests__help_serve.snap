@@ -27,6 +27,13 @@ Options:
           [env: POND_PORT]
           [default: 9797]
 
+      --allowed-host <HOST>
+          Public Host value the MCP route also accepts, on top of localhost.
+          
+          MCP over streamable HTTP validates the Host header against an allowlist (the spec's DNS-rebinding defence), and the default list is loopback only - so a server reached by any other name answers /mcp with 403 until that name is listed here. Repeat the flag, or set the env to a comma-separated list. The /v1/* routes are not gated this way.
+          
+          [env: POND_ALLOWED_HOSTS]
+
       --with-sync
           Also run periodic sync in-process, reusing this server's store and embedding model (no separate `pond sync` child cold-loading a second ~500 MB model). Sync output goes to stderr/tracing; stdout stays reserved for the transport
 
@@ -64,3 +71,4 @@ Examples:
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name

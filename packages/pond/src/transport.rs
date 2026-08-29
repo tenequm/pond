@@ -57,15 +57,31 @@ pub mod http {
     /// instead of pond's typed `validation_failed`.
     pub const HTTP_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
+    /// The `Host` authorities the `/mcp` route answers to: rmcp's loopback
+    /// defaults plus `extra`. The MCP spec (2025-06-18) makes a streamable-HTTP
+    /// server validate `Host` against an allowlist so a browser cannot reach a
+    /// local server by rebinding DNS, and rmcp's default list is loopback only.
+    /// A server reached by any other name therefore answers `/mcp` with 403
+    /// until that name is listed - `/v1/*` carries no such check.
+    fn mcp_allowed_hosts(extra: &[String]) -> Vec<String> {
+        let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
+        hosts.extend(extra.iter().cloned());
+        hosts
+    }
+
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
-    /// without binding a socket.
-    pub fn router(state: AppState) -> Router {
+    /// without binding a socket. `allowed_hosts` extends the `/mcp` route's
+    /// loopback `Host` allowlist (see [`mcp_allowed_hosts`]).
+    pub fn router(state: AppState, allowed_hosts: &[String]) -> Router {
         let mcp_state = state.clone();
         let mcp = StreamableHttpService::new(
             move || Ok(super::mcp::PondMcp::new(mcp_state.clone())),
             LocalSessionManager::default().into(),
-            StreamableHttpServerConfig::default(),
+            // `with_allowed_hosts` replaces the list, so the helper hands it
+            // the defaults plus the extras rather than the extras alone.
+            StreamableHttpServerConfig::default()
+                .with_allowed_hosts(mcp_allowed_hosts(allowed_hosts)),
         );
         Router::new()
             .route("/v1/search", post(search))
@@ -80,7 +96,14 @@ pub mod http {
     /// Bind and serve until ctrl-c. `--port 0` selects an OS-assigned free port;
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
-    pub async fn serve(state: AppState, host: String, port: u16) -> anyhow::Result<()> {
+    /// `allowed_hosts` names the public authorities the `/mcp` route accepts
+    /// (see [`mcp_allowed_hosts`]).
+    pub async fn serve(
+        state: AppState,
+        host: String,
+        port: u16,
+        allowed_hosts: Vec<String>,
+    ) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
             .with_context(|| format!("invalid --host {host:?}"))?;
@@ -98,7 +121,7 @@ pub mod http {
             .local_addr()
             .context("failed to read bound address")?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
-        axum::serve(listener, router(state))
+        axum::serve(listener, router(state, &allowed_hosts))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("axum server error")
@@ -181,6 +204,37 @@ pub mod http {
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+        use super::*;
+
+        /// The loopback defaults are never dropped - a hosted `serve` still has
+        /// to answer the local clients that reach it over a tunnel - and the
+        /// deployment's own names are appended in the order given.
+        #[test]
+        fn allowed_hosts_extend_the_loopback_defaults() {
+            let defaults = StreamableHttpServerConfig::default().allowed_hosts;
+            assert!(defaults.contains(&"localhost".to_owned()));
+
+            assert_eq!(mcp_allowed_hosts(&[]), defaults);
+
+            let hosted = mcp_allowed_hosts(&[
+                "pond.example.com".to_owned(),
+                "pond.internal:9797".to_owned(),
+            ]);
+            assert_eq!(&hosted[..defaults.len()], &defaults[..]);
+            assert_eq!(
+                &hosted[defaults.len()..],
+                &[
+                    "pond.example.com".to_owned(),
+                    "pond.internal:9797".to_owned()
+                ]
+            );
         }
     }
 }
