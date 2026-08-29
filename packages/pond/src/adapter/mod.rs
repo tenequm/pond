@@ -34,6 +34,7 @@ mod codex_cli;
 mod devin;
 mod discovery;
 pub mod extract;
+mod goose;
 mod grok_build;
 mod hermes;
 mod jsonl;
@@ -59,6 +60,7 @@ pub use extract::{
     Extracted, Source, extract_bool, extract_compact_repr, extract_raw_record, extract_self_str,
     extract_str, extract_value,
 };
+pub use goose::{GooseAdapter, GooseFactory};
 pub use grok_build::{GrokBuildAdapter, GrokBuildFactory};
 pub use hermes::{HermesAdapter, HermesFactory};
 pub use letta_code::{LettaCodeAdapter, LettaCodeFactory};
@@ -548,6 +550,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &OpenClawFactory,
         &NanoclawFactory,
         &HermesFactory,
+        &GooseFactory,
         &PiCodingAgentFactory,
         &OhMyPiFactory,
         &LettaCodeFactory,
