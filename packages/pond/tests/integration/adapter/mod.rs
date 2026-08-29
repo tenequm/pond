@@ -28,6 +28,7 @@ use tempfile::TempDir;
 mod claude_ai_export;
 mod claude_code;
 mod grok_build;
+mod goose;
 mod hermes;
 mod letta_code;
 mod nanoclaw;

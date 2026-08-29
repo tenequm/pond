@@ -11,7 +11,8 @@ claude_code nested workflow-subagent sample added 2026-06-04; opencode
 `opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
 synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
 transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
-captured 2026-08-24 from grok-build 1.0.5).
+captured 2026-08-24 from grok-build 1.0.5; synthetic goose `sessions.db` +
+legacy JSONL fixtures generated 2026-08-25).
 
 ## Why
 
@@ -50,6 +51,7 @@ adapter/
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
   grok-build/                grok-build (xAI `grok` CLI) session directories
+  goose/                     Goose (Block) CLI (SQLite sessions.db + legacy JSONL)
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   letta-code/                letta-code (`letta` CLI) client-side transcripts
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
@@ -328,6 +330,35 @@ sample tree.
 - Census: 5 ingestible sessions; secret sweep trufflehog 0 / gitleaks 0; every
   file parses; no host, username, `/Users/` path, `C:\` path or provider key
   string.
+
+### goose
+
+Goose (Block) has two on-disk formats; this fixture carries both. Current
+goose writes a SQLite DB; pre-1.10 wrote JSONL files. The adapter reads
+both for session-movement-complete.
+
+- Source-of-truth layout: `<data-dir>/sessions/` under
+  `~/.local/share/goose/data/` (Linux), `~/Library/Application Support/Block/goose/data/`
+  (macOS), `%APPDATA%\Block\goose\data` (Windows).
+  - `sessions.db` - WAL, `sessions`/`messages` tables.
+    Schema: github.com/aaif-goose/goose/blob/main/crates/goose/src/session/session_manager.rs ~L991-1090.
+    Checkpointed to rollback-journal `.db` here so the fixture is a single file.
+  - `*.jsonl` - legacy pre-1.10 format, one per session. Filename stem = session id.
+    Line 1 metadata; lines 2+ messages `{role, created, content}`.
+
+- DB sample: GENERATED via the sqlite3 CLI at fixture-capture time, not
+  captured from a real user (goose requires LLM provider credentials to
+  generate sessions). Schema verbatim from upstream; rows exercise multi-turn
+  text, tool request+response, sub_agent lineage, thinking blocks, and
+  scheduled session type.
+
+- JSONL samples: SYNTHETIC SUPPLEMENTARY rows, hand-built to match
+  goose_legacy.rs semantics. The writer no longer produces these; they exist
+  only to exercise the legacy reader path. Marked synthetic in the
+  fixture itself.
+
+- `trufflehog` and `gitleaks` report zero findings; no personal names,
+  real project names, credentials, or IP addresses.
 
 ### nanoclaw
 
