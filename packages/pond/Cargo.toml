@@ -173,6 +173,10 @@ thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 tokio = { version = "1.52", features = ["fs", "io-util", "io-std", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.18"
+# `CancellationToken` for shutdown: cancelling the token rmcp's streamable-HTTP
+# service was built with tears down live MCP sessions, which is what lets axum's
+# graceful shutdown finish. Already in the tree as an rmcp dependency.
+tokio-util = "0.7.18"
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1.44"

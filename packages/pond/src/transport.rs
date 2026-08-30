@@ -27,7 +27,11 @@ pub mod http {
     //! `POST /v1/get-message`, and the `/mcp` route carrying rmcp's
     //! streamable-HTTP MCP transport.
 
-    use std::net::{IpAddr, SocketAddr};
+    use std::{
+        future::Future,
+        net::{IpAddr, SocketAddr},
+        time::Duration,
+    };
 
     use anyhow::Context;
     use axum::{
@@ -41,6 +45,7 @@ pub mod http {
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
 
     use super::AppState;
     use crate::{
@@ -69,11 +74,23 @@ pub mod http {
         hosts
     }
 
+    /// How long shutdown waits after the MCP sessions have been cancelled before
+    /// the process exits regardless. Cancelling the token closes the live
+    /// streams, so the drain normally finishes far inside this; the deadline is
+    /// only a backstop, so that a client which ignores the close cannot hold the
+    /// process open the way an uncancelled stream used to.
+    const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
     /// without binding a socket. `allowed_hosts` extends the `/mcp` route's
-    /// loopback `Host` allowlist (see [`mcp_allowed_hosts`]).
-    pub fn router(state: AppState, allowed_hosts: &[String]) -> Router {
+    /// loopback `Host` allowlist (see [`mcp_allowed_hosts`]); cancelling
+    /// `mcp_shutdown` tears down live MCP sessions (see [`serve_with_shutdown`]).
+    pub fn router(
+        state: AppState,
+        allowed_hosts: &[String],
+        mcp_shutdown: CancellationToken,
+    ) -> Router {
         let mcp_state = state.clone();
         let mcp = StreamableHttpService::new(
             move || Ok(super::mcp::PondMcp::new(mcp_state.clone())),
@@ -81,7 +98,8 @@ pub mod http {
             // `with_allowed_hosts` replaces the list, so the helper hands it
             // the defaults plus the extras rather than the extras alone.
             StreamableHttpServerConfig::default()
-                .with_allowed_hosts(mcp_allowed_hosts(allowed_hosts)),
+                .with_allowed_hosts(mcp_allowed_hosts(allowed_hosts))
+                .with_cancellation_token(mcp_shutdown),
         );
         Router::new()
             .route("/v1/search", post(search))
@@ -121,14 +139,82 @@ pub mod http {
             .local_addr()
             .context("failed to read bound address")?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
-        axum::serve(listener, router(state, &allowed_hosts))
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("axum server error")
+        serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
     }
 
+    /// The serving half of [`serve`], with the stop trigger injected. Public so
+    /// the integration test can drive a real socket and a real MCP stream
+    /// without raising a process signal.
+    ///
+    /// Stopping is two-stage, because axum's graceful shutdown waits for every
+    /// in-flight connection and an MCP client holds its `GET /mcp` stream open
+    /// for the life of the session: cancelling the token the streamable-HTTP
+    /// service was built with ends those sessions so the drain can finish, and
+    /// [`SHUTDOWN_DRAIN`] then bounds the wait for anything that ignored it.
+    pub async fn serve_with_shutdown(
+        listener: TcpListener,
+        state: AppState,
+        allowed_hosts: &[String],
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let mcp_shutdown = CancellationToken::new();
+        // Fires when `stop` does, so the drain deadline is measured from the
+        // stop request rather than from startup. An un-cancelled token's
+        // `cancelled()` never resolves, which is exactly what keeps the
+        // deadline arm below inert while the server is running normally.
+        let stopping = CancellationToken::new();
+        let server = axum::serve(listener, router(state, allowed_hosts, mcp_shutdown.clone()))
+            .with_graceful_shutdown({
+                let stopping = stopping.clone();
+                async move {
+                    stop.await;
+                    tracing::info!("shutdown: closing MCP sessions, then draining");
+                    mcp_shutdown.cancel();
+                    stopping.cancel();
+                }
+            });
+        tokio::select! {
+            result = server => result.context("axum server error"),
+            () = async move {
+                stopping.cancelled().await;
+                tokio::time::sleep(SHUTDOWN_DRAIN).await;
+            } => {
+                tracing::warn!(
+                    seconds = SHUTDOWN_DRAIN.as_secs(),
+                    "shutdown: connections still open after the drain window; exiting anyway"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve on the first stop request: ctrl-c everywhere, and SIGTERM too on
+    /// unix. SIGTERM is what a container runtime or a service manager sends,
+    /// and a server running as PID 1 gets no default disposition for a signal
+    /// it has not handled - so without this arm `serve` ignored the stop
+    /// outright and was killed when the supervisor's grace period ran out.
     async fn shutdown_signal() {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            match signal(SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = terminate.recv() => {}
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "no SIGTERM handler; stopping on ctrl-c only");
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 
     async fn search(
