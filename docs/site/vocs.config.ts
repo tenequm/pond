@@ -90,6 +90,7 @@ export default defineConfig({
       items: [
         { text: 'Remote storage', link: '/guides/remote-storage' },
         { text: 'Several machines, one bucket', link: '/guides/several-machines' },
+        { text: 'Run a remote serve', link: '/guides/remote-serve' },
         { text: 'Backup & restore', link: '/guides/backup-and-restore' },
         { text: 'Import a Claude.ai export', link: '/guides/import-claude-ai' },
         { text: 'Troubleshooting', link: '/guides/troubleshooting' },

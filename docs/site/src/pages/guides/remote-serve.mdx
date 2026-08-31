@@ -1,0 +1,73 @@
+---
+description: Run pond serve as a long-lived read side on a host you control - point it at the bucket without a config file, name the host for /mcp, put auth in front, give it a writable cache, and stop it cleanly under a supervisor.
+---
+
+# Run a remote serve
+
+pond splits into two sides. Sync runs on the machines where the agents run, because that is where the session files are, and it writes into the bucket. `pond serve` is the read side: search and MCP over HTTP against the same bucket, from one long-running process with a warm cache. This guide runs that process on a host you control - a VPS, a container, a PaaS - and points your agents at it. Nothing here is specific to one platform.
+
+`serve` reads the store and answers queries. It does not authenticate callers, and it does not sync unless told to (`--with-sync` needs the session files on the same machine, so it belongs on an agent host, not on a hosted read side).
+
+::::steps
+
+## Point it at the bucket
+
+Env is a complete configuration - no `config.toml`, no `pond init`:
+
+```sh
+POND_STORAGE_PATH=s3+https://nbg1.your-objectstorage.com/my-pond
+POND_CREDS_DEFAULT_ACCESS_KEY_ID=...
+POND_CREDS_DEFAULT_SECRET_ACCESS_KEY=...
+```
+
+Same URL forms and credential rules as [Remote storage](/guides/remote-storage). Add `POND_EMBEDDINGS_ENABLED=true` only if the store carries embeddings and you want vector search from this host; it loads a ~500 MB model on the first vector query.
+
+## Bind and name the host
+
+```sh
+POND_HOST=0.0.0.0
+POND_PORT=9797
+POND_ALLOWED_HOSTS=pond.example.com
+```
+
+The default bind is loopback, so a supervised process must ask for `0.0.0.0` (or `::`); `serve` logs a notice when it does. `POND_ALLOWED_HOSTS` matters more than it looks: the `/mcp` route validates the `Host` header against an allowlist (the MCP spec's DNS-rebinding defence) and that list is loopback only, so a server reached by any other name answers every MCP request with `403 Forbidden: Host header is not allowed` while `/v1/*` keeps working. Name every hostname clients will use, comma-separated; loopback stays allowed. A name without a port matches any port.
+
+## Put auth in front
+
+`serve` has no authentication of its own, and the store behind it is your whole session history. Never expose it bare. Put something that checks a credential in front: a reverse proxy with a bearer-token check, a Tailscale or WireGuard network, or your platform's private-app token gate. Terminate TLS there too; `serve` speaks plain HTTP.
+
+## Give it a writable cache
+
+`serve` keeps a search row map on disk and refreshes it while running. It lands under `$XDG_CACHE_HOME/pond`, else `$HOME/.cache/pond`, else `./.pond-cache`. A process with no writable home should set the variable explicitly:
+
+```sh
+XDG_CACHE_HOME=/var/cache
+```
+
+If the cache cannot be written, `serve` still starts and logs a warning, but every query pays the cold load instead of the warm one. With embeddings enabled, the model cache follows `HF_HOME` (default `~/.cache/huggingface`) the same way.
+
+## Stop it cleanly
+
+`serve` stops on SIGTERM as well as ctrl-c. It closes live MCP sessions first (agents hold their `/mcp` stream open for the life of the session) and bounds the drain to five seconds, so a supervisor's stop finishes in milliseconds instead of timing out into SIGKILL. Give it any grace period of five seconds or more.
+
+::::
+
+## Connect a client
+
+```sh
+claude mcp add -s user --transport http pond https://pond.example.com/mcp --header "Authorization: Bearer <token>"
+codex mcp add pond --url https://pond.example.com/mcp
+```
+
+Drop the header if your gate is a private network rather than a token. The skill still installs locally - `pond skill > ~/.claude/skills/pond/SKILL.md` - so the agent knows how to use the tools it now reaches remotely.
+
+## Check it
+
+From anywhere the gate lets through:
+
+```sh
+curl -sS -X POST https://pond.example.com/v1/search -H 'content-type: application/json' -d '{"protocol_version":1,"query":"anything"}'
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://pond.example.com/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}'
+```
+
+The first returns a search envelope; the second prints `200`. A `403` on the second with a `200` on the first means the hostname is missing from `POND_ALLOWED_HOSTS`.
