@@ -6,6 +6,14 @@
 
 <!-- What and why, for the reviewer. -->
 
+<!-- Adding an adapter? Add a `## Adapter evidence` section here (above the
+     release note) with: the fixture's provenance - agent version, captured
+     under a sandbox home, or why a capture was impossible - and the output of
+     the playbook's run-it-as-a-user step: `pond sync <name> --path <fixture>`,
+     the re-sync skipping every session fresh, a default-mode `pond search`
+     hit, and `pond adapters list` showing the harness `detected` on a real
+     install. Reviewers read it before the code. -->
+
 <!-- The section below is extracted from the squash-commit body (the whole PR
      description lands there at merge, via the repo's squash defaults) and
      becomes the changelog entry under your title - written once, never lost.
