@@ -311,6 +311,7 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 11 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
 | 12 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | ⏳ Later |
 | 13 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
+| | Community adapters: ten harnesses wanted, playbook-driven - Gemini CLI, Qwen Code, Crush, Cline, OpenHands, Copilot CLI, Cursor CLI, Droid, Kiro CLI, Roo/Zoo Code. [`adapter` issues](https://github.com/tenequm/pond/issues?q=is%3Aissue%20state%3Aopen%20label%3Aadapter) | 🙋 Wanted |
 | | A capture daemon. pond reads what your harness already writes. | ❌ Not planned |
 | | A hosted service that owns your bucket. Your storage stays yours. | ❌ Not planned |
 | | Summaries or pruning of stored sessions. pond keeps the sessions. | ❌ Not planned |
