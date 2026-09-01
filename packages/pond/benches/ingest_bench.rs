@@ -1,7 +1,8 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
 //! Ingest-path microbenchmark. Drives [`ingest_adapter`] against one or more
-//! claude-code corpora and emits a structured per-stage breakdown. The probe
+//! source corpora (`--adapter` picks the decoder; claude-code by default) and
+//! emits a structured per-stage breakdown. The probe
 //! captures `pond::perf` tracing events (emitted by [`ingest_adapter`] and
 //! [`Handle::merge_insert`]) into an in-memory aggregator so each run prints:
 //!
@@ -20,6 +21,7 @@
 //! Run:
 //!   cargo bench --bench ingest_bench -- --source-dir ~/.claude/projects/-Users-tenequm-Projects-blackbox
 //!   cargo bench --bench ingest_bench -- --source-dir <a> --source-dir <b>
+//!   cargo bench --bench ingest_bench -- --adapter codex-cli --source-dir ~/.codex/sessions/2026/09
 //!   cargo bench --bench ingest_bench               # defaults to the fixture corpus
 
 use std::{
@@ -32,7 +34,7 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use pond::{
-    adapter::ClaudeCodeAdapter,
+    adapter::{Adapter, ClaudeCodeAdapter, CodexCliAdapter},
     config::Config,
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::Store,
@@ -56,6 +58,10 @@ struct Args {
     /// fixture corpus when none are given.
     #[arg(long, value_name = "PATH")]
     source_dir: Vec<PathBuf>,
+    /// Which adapter decodes `--source-dir`. The decode stage is the number
+    /// an adapter change moves, so bench the adapter you changed.
+    #[arg(long, value_enum, default_value_t = AdapterKind::ClaudeCode)]
+    adapter: AdapterKind,
     /// Ingest into this REMOTE store (resolved through the config creds, like
     /// the CLI) instead of a throwaway local TempDir. This is how you feel the
     /// S3 cost of the write path - the per-table merge_insert breakdown over
@@ -92,6 +98,12 @@ struct Args {
 enum OracleKind {
     Noop,
     Rowmap,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AdapterKind {
+    ClaudeCode,
+    CodexCli,
 }
 
 #[tokio::main]
@@ -132,7 +144,10 @@ async fn main() -> Result<()> {
         // `_temp` keeps the local scratch dir alive for the whole corpus when
         // not targeting a remote store.
         let (store, _temp) = open_store(args.url.as_deref(), config.as_ref()).await?;
-        let adapter = ClaudeCodeAdapter::new(&corpus);
+        let adapter: Box<dyn Adapter> = match args.adapter {
+            AdapterKind::ClaudeCode => Box::new(ClaudeCodeAdapter::new(&corpus)),
+            AdapterKind::CodexCli => Box::new(CodexCliAdapter::new(&corpus)),
+        };
         let rowmap_cache = TempDir::new()?;
 
         for pass in 1..=passes {
@@ -159,7 +174,7 @@ async fn main() -> Result<()> {
             let mut sync_partial = 0u64;
             let mut sync_partial_drops = 0u64;
             let mut sync_superseded = 0u64;
-            let summary = ingest_adapter(&store, &adapter, oracle, |event| {
+            let summary = ingest_adapter(&store, adapter.as_ref(), oracle, |event| {
                 if let SyncEvent::SessionDone(outcome) = event {
                     match &outcome.status {
                         SyncStatus::Skipped { reason } => {

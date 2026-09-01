@@ -2,10 +2,32 @@
 //!
 //! Source path: `~/.codex/sessions/<year>/<month>/<day>/rollout-<ts>-<uuid>.jsonl`.
 //! Each line is an envelope `{timestamp, type, payload}`. Top-level types:
-//! `session_meta` (consumed up front for Session), `event_msg` /
-//! `turn_context` (transport noise, skipped), `response_item` (the per-turn
-//! model interaction: subtypes `message`, `reasoning`, `function_call`,
-//! `function_call_output`, `custom_tool_call`).
+//! `session_meta` (consumed up front for Session), `response_item` (the
+//! per-turn model interaction: subtypes `message`, `reasoning`,
+//! `function_call`, `function_call_output`, `custom_tool_call`,
+//! `custom_tool_call_output`), and lifecycle rows (`event_msg`,
+//! `turn_context`, `world_state`, ...) that carry no conversation and are
+//! kept as System-role raw carriers with no Part, so native restore can
+//! replay them.
+//!
+//! Codex 0.147+ routes every tool through a JavaScript runtime: each call is
+//! `custom_tool_call{name:"exec", input:<js snippet>}`, whose snippet calls
+//! `tools.<real tool>(...)`, and its outcome lives in the `event_msg
+//! item_completed` rows (`item.type == "CommandExecution"`: argv, cwd, exit
+//! code) that sit between the call and its `custom_tool_call_output`. The
+//! adapter names the call after the one tool the snippet wraps (a snippet
+//! that wraps none or several stays `exec`), exposes the executed commands on
+//! `params`, and marks the result failed when the script itself failed
+//! (`Script failed` header) OR any command it ran exited non-zero - wider
+//! than one exit code on purpose, since one script can run several commands.
+//! That is a deliberate fork from the rule other adapters follow (grok-build:
+//! a non-zero exit stays `completed`, `failed` means the tool itself failed):
+//! the JS runtime reports `Script completed` for a red build, so its own
+//! verdict alone would never flag a failed command. Only JS-runtime calls get
+//! this rule; `function_call` rows and non-`exec` custom tools keep
+//! `is_failure: false` as before. Argument parsing stops at the tool name:
+//! arguments are JavaScript, not JSON (`apply_patch` takes a template
+//! literal), so the raw snippet is kept as `params.script`.
 //!
 //! Pre-Oct-2025 legacy rollouts (spec.md#adapters) predate the envelope: the
 //! first row is a bare metadata object and each data row is an un-enveloped
@@ -14,6 +36,7 @@
 
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -31,7 +54,7 @@ use super::{
     empty_options,
     extract::{
         Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
-        json_or_string,
+        extract_str_range, json_or_string,
     },
     extracted_text,
     jsonl::{
@@ -42,6 +65,8 @@ use super::{
 };
 
 const NAME: &str = "codex-cli";
+/// The `custom_tool_call` name Codex 0.147+ gives every JS-runtime wrapper.
+const JS_RUNTIME_TOOL: &str = "exec";
 
 /// Stateless factory: opens [`CodexCliAdapter`] instances and probes for the
 /// canonical install location under `~/.codex/sessions`.
@@ -112,6 +137,27 @@ fn serialize_session(
 }
 
 fn codex_relative_path(session: &crate::sessions::SessionWithMessages) -> PathBuf {
+    // The placement recorded at ingest (local-time stamped, see
+    // session_from_rows) is the only faithful source; the UTC derivation
+    // below is the foreign fallback and matches native only for a
+    // UTC-offset-zero capture.
+    let source = session.session.options.get("source");
+    if let Some(name) = source
+        .and_then(|source| source.get("file_name"))
+        .and_then(Value::as_str)
+        && let Some(Value::Array(day_dir)) = source.and_then(|source| source.get("day_dir"))
+        && let Some([year, month, day]) = day_dir
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .as_deref()
+    {
+        return PathBuf::from("sessions")
+            .join(year)
+            .join(month)
+            .join(day)
+            .join(name);
+    }
     let ts = session.session.created_at;
     let filename_ts = ts.format("%Y-%m-%dT%H-%M-%S");
     PathBuf::from("sessions")
@@ -257,7 +303,7 @@ impl Adapter for CodexCliAdapter {
 }
 
 impl JsonlTree for CodexCliAdapter {
-    type State = HashMap<String, Extracted<String>>;
+    type State = FileState;
 
     fn name(&self) -> &'static str {
         NAME
@@ -320,13 +366,16 @@ impl JsonlTree for CodexCliAdapter {
         session_from_rows(path, rows)
     }
 
+    fn file_state(&self, rows: &[BoundedRow]) -> FileState {
+        FileState::index(rows)
+    }
+
     fn events_from_row(
         &self,
         session: &Session,
         row: &BoundedRow,
         state: &mut Self::State,
     ) -> Result<Vec<IngestEvent>, String> {
-        capture_tool_call_name(&row.value, state);
         events_from_row(&session.id, row.line, &row.value, session.created_at, state)
     }
 }
@@ -436,6 +485,19 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
             "base_instructions": payload.get("base_instructions"),
             "instructions": payload.get("instructions"),
             "source": payload.get("source"),
+            // Codex names the rollout and its `<y>/<m>/<d>` directories in
+            // LOCAL time, which nothing inside the file records; native
+            // restore needs both to land the file where codex would have.
+            "file_name": path.file_name().and_then(|name| name.to_str()),
+            "day_dir": path
+                .ancestors()
+                .skip(1)
+                .take(3)
+                .filter_map(|dir| dir.file_name().and_then(|name| name.to_str()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
             "raw_record": extract_raw_record(row),
         }),
     );
@@ -453,18 +515,19 @@ fn session_from_rows(path: &Path, rows: &[BoundedRow]) -> Result<Session, Adapte
 
 /// Map one codex-cli JSONL record into zero-or-more `IngestEvent`s. Records pond
 /// keeps: `response_item` with `payload.type = "message"` (User/Assistant/
-/// System message + text Parts), `function_call` (Assistant + ToolCall),
-/// `function_call_output` (Tool + ToolResult), `reasoning` (Assistant +
-/// Reasoning Part). `session_meta` is consumed up front; `event_msg` and
-/// `turn_context` are transport noise. Legacy rows (spec.md#adapters) carry
-/// the same payload shapes un-enveloped; `{record_type:"state"}` markers and
-/// the bare first row are eventless.
+/// System message + text Parts), `function_call` / `custom_tool_call`
+/// (Assistant + ToolCall), `function_call_output` / `custom_tool_call_output`
+/// (Tool + ToolResult), `reasoning` (Assistant + Reasoning Part); every other
+/// row (`event_msg`, `turn_context`, `world_state`, ...) is a System-role raw
+/// carrier with no Part. `session_meta` is consumed up front. Legacy rows
+/// (spec.md#adapters) carry the same payload shapes un-enveloped;
+/// `{record_type:"state"}` markers and the bare first row are eventless.
 fn events_from_row(
     session_id: &str,
     line: usize,
     row: &Value,
     default_timestamp: DateTime<Utc>,
-    tool_call_names: &HashMap<String, Extracted<String>>,
+    state: &FileState,
 ) -> Result<Vec<IngestEvent>, String> {
     let kind = row.get("type").and_then(Value::as_str);
     // Eventless rows: `session_meta` (current) and the legacy bare first row
@@ -476,19 +539,17 @@ fn events_from_row(
     {
         return Ok(Vec::new());
     }
-    // Normalize to the per-turn payload. A current row wraps it in a
-    // `response_item` envelope carrying its own timestamp; a legacy data row
-    // IS the payload (spec.md#adapters) and inherits the session timestamp.
-    let (payload, timestamp) = if kind == Some("response_item") {
-        let timestamp = row
-            .get("timestamp")
+    // A `response_item` envelope carries its own timestamp; a legacy data row
+    // inherits the session's.
+    let payload = normalized_payload(row);
+    let timestamp = if kind == Some("response_item") {
+        row.get("timestamp")
             .and_then(Value::as_str)
             .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
             .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(default_timestamp);
-        (row.get("payload").unwrap_or(&Value::Null), timestamp)
+            .unwrap_or(default_timestamp)
     } else {
-        (row, default_timestamp)
+        default_timestamp
     };
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let message_id = format!("{session_id}:{line:06}");
@@ -508,7 +569,7 @@ fn events_from_row(
             timestamp,
             payload,
             row,
-            tool_call_names,
+            state,
         )),
         "reasoning" => Ok(reasoning_events(
             session_id,
@@ -523,6 +584,7 @@ fn events_from_row(
             timestamp,
             payload,
             row,
+            state,
         )),
         "custom_tool_call_output" => Ok(custom_tool_result_events(
             session_id,
@@ -530,6 +592,7 @@ fn events_from_row(
             timestamp,
             payload,
             row,
+            state,
         )),
         _ => Ok(vec![raw_carrier_event(session_id, line, row, timestamp)]),
     }
@@ -567,30 +630,189 @@ fn raw_carrier_event(
     })
 }
 
-/// Stash one row's `function_call` (call_id -> name) into the per-file
-/// map so the matching `function_call_output` row downstream can resolve
-/// the tool name rather than fall back to a sentinel.
-fn capture_tool_call_name(row: &Value, map: &mut HashMap<String, Extracted<String>>) {
-    // Mirror events_from_row's payload normalization: a current row wraps the
-    // payload under `response_item`, a legacy row IS the payload.
-    let payload = match row.get("type").and_then(Value::as_str) {
-        Some("response_item") => row.get("payload"),
-        Some(_) => Some(row),
-        None => None,
-    };
-    let Some(payload) = payload else {
-        return;
-    };
-    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
-        return;
+/// The per-turn payload of a row: a current row wraps it under
+/// `response_item`, a legacy row IS the payload (spec.md#adapters).
+fn normalized_payload(row: &Value) -> &Value {
+    if row.get("type").and_then(Value::as_str) == Some("response_item") {
+        row.get("payload").unwrap_or(&Value::Null)
+    } else {
+        row
     }
-    let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
-        return;
+}
+
+/// Per-file index the row walk reads (`JsonlTree::file_state`): what a tool
+/// call's result row needs from rows that come BEFORE it (the call's name)
+/// and what a JS-runtime call row needs from rows that come AFTER it (the
+/// commands it ran). Built in one pass over the file's rows, dropped with
+/// the file.
+#[derive(Default)]
+pub(crate) struct FileState {
+    /// `call_id -> tool name`, so an output row (which carries no name) can
+    /// name its tool. For a JS-runtime `exec` call this is the wrapped tool.
+    tool_call_names: HashMap<String, Extracted<String>>,
+    /// Every JS-runtime `exec` call by `call_id`, with the
+    /// `{command, cwd, exit_code}` of each `CommandExecution` row between it
+    /// and its output row - only those three fields, never the item's
+    /// stdout/stderr. Association is positional: the rows carry no call id,
+    /// and the writer emits them strictly inside the call's window. Presence
+    /// of the key is what marks a call as JS-runtime; other calls never get
+    /// an entry, so the exit-code rule cannot reach them.
+    executions: HashMap<String, Vec<Value>>,
+}
+
+impl FileState {
+    fn index(rows: &[BoundedRow]) -> Self {
+        let mut state = Self::default();
+        let mut open_call: Option<String> = None;
+        for row in rows {
+            let row = &row.value;
+            let kind = row.get("type").and_then(Value::as_str);
+            if kind == Some("event_msg") {
+                if let Some(call_id) = &open_call
+                    && let Some(item) = row.get("payload").and_then(|p| p.get("item"))
+                    && item.get("type").and_then(Value::as_str) == Some("CommandExecution")
+                {
+                    let mut run = serde_json::Map::new();
+                    for key in ["command", "cwd", "exit_code"] {
+                        run.insert(
+                            key.to_owned(),
+                            item.get(key).cloned().unwrap_or(Value::Null),
+                        );
+                    }
+                    state
+                        .executions
+                        .entry(call_id.clone())
+                        .or_default()
+                        .push(Value::Object(run));
+                }
+                continue;
+            }
+            let payload = normalized_payload(row);
+            let call_id = payload.get("call_id").and_then(Value::as_str);
+            match (payload.get("type").and_then(Value::as_str), call_id) {
+                (Some("function_call" | "custom_tool_call"), Some(call_id)) => {
+                    if let Some(name) = tool_call_name(payload) {
+                        state.tool_call_names.insert(call_id.to_owned(), name);
+                    }
+                    open_call = None;
+                    if payload.get("name").and_then(Value::as_str) == Some(JS_RUNTIME_TOOL) {
+                        state.executions.entry(call_id.to_owned()).or_default();
+                        open_call = Some(call_id.to_owned());
+                    }
+                }
+                (Some("function_call_output" | "custom_tool_call_output"), _) => {
+                    open_call = None;
+                }
+                _ => {}
+            }
+        }
+        state
+    }
+
+    fn tool_name(&self, call_id: Option<&Extracted<String>>) -> Option<Extracted<String>> {
+        call_id
+            .and_then(|id| self.tool_call_names.get(id.as_str()))
+            .cloned()
+    }
+
+    /// `None` for a call that is not a JS-runtime `exec` wrapper.
+    fn executions(&self, call_id: Option<&Extracted<String>>) -> Option<&[Value]> {
+        call_id
+            .and_then(|id| self.executions.get(id.as_str()))
+            .map(Vec::as_slice)
+    }
+}
+
+/// The tool a call row names: for a JS-runtime `exec` wrapper the one tool
+/// its snippet calls, else the row's own `name`.
+fn tool_call_name(payload: &Value) -> Option<Extracted<String>> {
+    let name = extract_str(payload, "name")?;
+    if name.as_str() != JS_RUNTIME_TOOL {
+        return Some(name);
+    }
+    payload
+        .get("input")
+        .and_then(Value::as_str)
+        .and_then(wrapped_tool_name)
+        .and_then(|range| extract_str_range(payload, "input", range))
+        .or(Some(name))
+}
+
+/// Where in a JS-runtime snippet the wrapped tool's name sits: the single
+/// distinct `tools.<name>(` it references. `None` when it references none (a
+/// script that only inspects `ALL_TOOLS`, say) or several - those stay
+/// `exec`.
+fn wrapped_tool_name(script: &str) -> Option<Range<usize>> {
+    const MARKER: &str = "tools.";
+    let bytes = script.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut found: Option<Range<usize>> = None;
+    let mut cursor = 0;
+    while let Some(offset) = script[cursor..].find(MARKER) {
+        let marker_at = cursor + offset;
+        let start = marker_at + MARKER.len();
+        cursor = start;
+        // `ALL_TOOLS.filter(` and `mytools.x(` are not the runtime namespace.
+        if marker_at > 0 && is_ident(bytes[marker_at - 1]) {
+            continue;
+        }
+        let end = start + bytes[start..].iter().take_while(|b| is_ident(**b)).count();
+        if end == start || bytes.get(end) != Some(&b'(') {
+            continue;
+        }
+        match &found {
+            Some(prev) if script[prev.clone()] != script[start..end] => return None,
+            _ => found = Some(start..end),
+        }
+    }
+    found
+}
+
+/// `params` for a JS-runtime call: the raw snippet plus what the
+/// `CommandExecution` rows in its window recorded - argv (`command`), `cwd`
+/// and `exit_code` flattened when exactly one command ran (the common case),
+/// or one `executions[]` entry per command when a script ran several.
+/// `command` is codex's argv (`["/bin/zsh", "-lc", "<cmd>"]`), not a string
+/// like claude-code's Bash `command`.
+fn exec_params(script: Value, executions: &[Value]) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("script".to_owned(), script);
+    match executions {
+        [] => {}
+        [only] => {
+            if let Value::Object(fields) = only {
+                params.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+        }
+        several => {
+            params.insert("executions".to_owned(), Value::Array(several.to_vec()));
+        }
+    }
+    Value::Object(params)
+}
+
+fn any_command_failed(executions: &[Value]) -> bool {
+    executions.iter().any(|item| {
+        item.get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+    })
+}
+
+/// The JS runtime's own verdict on the script, the first line of its output
+/// (`Script completed` / `Script failed`). Script-level only: `text(r.output)`
+/// runs whatever the command's exit code was, so a failed build still reads
+/// `Script completed` here - the command verdict is `any_command_failed`.
+fn script_failed(output: &Value) -> bool {
+    let head = match output {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(blocks) => blocks
+            .first()
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str),
+        _ => None,
     };
-    let Some(name) = extract_str(payload, "name") else {
-        return;
-    };
-    map.insert(call_id.to_owned(), name);
+    head.is_some_and(|text| text.starts_with("Script failed"))
 }
 
 fn message_events(
@@ -774,7 +996,14 @@ fn custom_tool_call_events(
     timestamp: DateTime<Utc>,
     payload: &Value,
     row: &Value,
+    state: &FileState,
 ) -> Vec<IngestEvent> {
+    let call_id = extract_str(payload, "call_id");
+    let input = payload.get("input").cloned().unwrap_or(Value::Null);
+    let params = match state.executions(call_id.as_ref()) {
+        Some(executions) => exec_params(input, executions),
+        None => input,
+    };
     let part = Part {
         session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
@@ -784,9 +1013,11 @@ fn custom_tool_call_events(
         provenance: Provenance::Conversational,
         options: empty_options(),
         kind: PartKind::ToolCall {
-            call_id: extract_str(payload, "call_id"),
-            name: extract_str(payload, "name"),
-            params: payload.get("input").cloned().unwrap_or(Value::Null),
+            name: state
+                .tool_name(call_id.as_ref())
+                .or_else(|| extract_str(payload, "name")),
+            call_id,
+            params,
             provider_executed: true,
         },
     };
@@ -807,7 +1038,10 @@ fn custom_tool_result_events(
     timestamp: DateTime<Utc>,
     payload: &Value,
     row: &Value,
+    state: &FileState,
 ) -> Vec<IngestEvent> {
+    let call_id = extract_str(payload, "call_id");
+    let result = payload.get("output").cloned().unwrap_or(Value::Null);
     let part = Part {
         session_id: session_id.to_owned(),
         id: part_id(message_id, 0),
@@ -817,10 +1051,14 @@ fn custom_tool_result_events(
         provenance: Provenance::Injected,
         options: empty_options(),
         kind: PartKind::ToolResult {
-            call_id: extract_str(payload, "call_id"),
-            name: extract_str(payload, "name"),
-            is_failure: false,
-            result: payload.get("output").cloned().unwrap_or(Value::Null),
+            name: state
+                .tool_name(call_id.as_ref())
+                .or_else(|| extract_str(payload, "name")),
+            is_failure: state
+                .executions(call_id.as_ref())
+                .is_some_and(|executions| script_failed(&result) || any_command_failed(executions)),
+            call_id,
+            result,
         },
     };
     vec![
@@ -840,16 +1078,13 @@ fn tool_result_events(
     timestamp: DateTime<Utc>,
     payload: &Value,
     row: &Value,
-    tool_call_names: &HashMap<String, Extracted<String>>,
+    state: &FileState,
 ) -> Vec<IngestEvent> {
     let call_id = extract_str(payload, "call_id");
     // Resolve tool name from the earlier `function_call` row via the
     // per-file `call_id -> name` map. Misses (e.g. compaction pruned the
     // originating call) yield `None`, a faithful "unresolved" value.
-    let name = call_id
-        .as_ref()
-        .and_then(|id| tool_call_names.get(id.as_str()))
-        .cloned();
+    let name = state.tool_name(call_id.as_ref());
     let result = payload.get("output").cloned().unwrap_or(Value::Null);
     let part = Part {
         session_id: session_id.to_owned(),
@@ -942,6 +1177,161 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/adapter/codex_cli/sessions"
     );
+
+    fn wrapped(script: &str) -> Option<&str> {
+        wrapped_tool_name(script).map(|range| &script[range])
+    }
+
+    #[test]
+    fn wrapped_tool_name_is_the_single_tool_the_snippet_calls() {
+        assert_eq!(
+            wrapped("const r = await tools.exec_command({\"cmd\":\"ls\"});\ntext(r.output);"),
+            Some("exec_command")
+        );
+        assert_eq!(
+            wrapped(
+                "for (const c of cmds) { const r = await tools.exec_command({cmd: c}); text(r); }"
+            ),
+            Some("exec_command")
+        );
+        assert_eq!(
+            wrapped(
+                "const patch = `*** Begin Patch\n*** End Patch`;\ntext(await tools.apply_patch(patch));"
+            ),
+            Some("apply_patch")
+        );
+    }
+
+    #[test]
+    fn wrapped_tool_name_stays_unresolved_for_none_or_several() {
+        assert_eq!(
+            wrapped("text(ALL_TOOLS.filter(x => x.name.includes(\"plan\")));"),
+            None
+        );
+        assert_eq!(wrapped("tools.foo; tools.bar"), None);
+        assert_eq!(
+            wrapped("await tools.exec_command({cmd: \"ls\"}); await tools.apply_patch(p);"),
+            None
+        );
+        assert_eq!(wrapped("mytools.exec_command()"), None);
+    }
+
+    #[test]
+    fn script_failed_reads_the_runtime_header_only() {
+        assert!(script_failed(
+            &json!([{"type":"input_text","text":"Script failed\nError: x"}])
+        ));
+        assert!(script_failed(&json!("Script failed\nError: x")));
+        assert!(!script_failed(
+            &json!([{"type":"input_text","text":"Script completed\nWall time 0.4 seconds\nOutput:\nexit 1"}])
+        ));
+        assert!(!script_failed(
+            &json!([{"type":"input_text","text":"Wall time 0.4 seconds"}])
+        ));
+        assert!(!script_failed(&Value::Null));
+    }
+
+    fn row(line: usize, value: Value) -> BoundedRow {
+        BoundedRow { line, value }
+    }
+
+    fn response_item(line: usize, payload: Value) -> BoundedRow {
+        row(
+            line,
+            json!({"timestamp": "2026-09-01T18:50:56.000Z", "type": "response_item", "payload": payload}),
+        )
+    }
+
+    fn command_execution(line: usize, cmd: &str, exit_code: i64) -> BoundedRow {
+        row(
+            line,
+            json!({"timestamp": "2026-09-01T18:50:56.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "command": ["/bin/zsh", "-lc", cmd], "cwd": "file:///tmp/codex-fixture/repo", "exit_code": exit_code, "status": if exit_code == 0 { "completed" } else { "failed" }}}}),
+        )
+    }
+
+    /// The per-file index: a JS-runtime call's window (call .. output)
+    /// collects the `CommandExecution` rows it ran, a row outside any window
+    /// is dropped, and a `function_call` resolves by its own name but gets no
+    /// window - the exit-code rule never reaches legacy rows.
+    #[test]
+    fn file_state_windows_command_executions_under_js_runtime_calls() {
+        let rows = vec![
+            command_execution(1, "stray", 1),
+            response_item(
+                2,
+                json!({"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": "await tools.exec_command({cmd:\"echo a\"}); await tools.exec_command({cmd:\"false\"});"}),
+            ),
+            command_execution(3, "echo a", 0),
+            command_execution(4, "false", 1),
+            response_item(
+                5,
+                json!({"type": "custom_tool_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "Script completed"}]}),
+            ),
+            response_item(
+                6,
+                json!({"type": "custom_tool_call", "call_id": "c2", "name": "exec", "input": "text(ALL_TOOLS.length);"}),
+            ),
+            response_item(
+                7,
+                json!({"type": "custom_tool_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": "Script failed\nError"}]}),
+            ),
+            response_item(
+                8,
+                json!({"type": "function_call", "call_id": "c3", "name": "shell", "arguments": "{}"}),
+            ),
+            command_execution(9, "ls", 1),
+            response_item(
+                10,
+                json!({"type": "function_call_output", "call_id": "c3", "output": "ok"}),
+            ),
+        ];
+        let state = FileState::index(&rows);
+        let id = |s: &str| Some(Extracted::from_test_value(s.to_owned()));
+
+        assert_eq!(
+            state.tool_name(id("c1").as_ref()).as_deref(),
+            Some(&"exec_command".to_owned())
+        );
+        assert_eq!(
+            state.tool_name(id("c2").as_ref()).as_deref(),
+            Some(&"exec".to_owned())
+        );
+        assert_eq!(
+            state.tool_name(id("c3").as_ref()).as_deref(),
+            Some(&"shell".to_owned())
+        );
+        let c1 = state
+            .executions(id("c1").as_ref())
+            .expect("js-runtime call");
+        assert_eq!(c1.len(), 2);
+        assert!(any_command_failed(c1));
+        assert_eq!(
+            state.executions(id("c2").as_ref()).map(<[Value]>::len),
+            Some(0)
+        );
+        assert!(
+            state.executions(id("c3").as_ref()).is_none(),
+            "a function_call gets no window",
+        );
+        assert!(state.executions(None).is_none());
+    }
+
+    #[test]
+    fn exec_params_flattens_only_a_single_command() {
+        let run = |cmd: &str, code: i64| json!({"command": ["/bin/zsh", "-lc", cmd], "cwd": "file:///tmp/codex-fixture/repo", "exit_code": code});
+        let single = exec_params(json!("s"), &[run("ls", 0)]);
+        assert_eq!(single["command"], json!(["/bin/zsh", "-lc", "ls"]));
+        assert_eq!(single["cwd"], json!("file:///tmp/codex-fixture/repo"));
+        assert_eq!(single["exit_code"], json!(0));
+        assert!(single.get("executions").is_none());
+        let several = exec_params(json!("s"), &[run("echo a", 0), run("false", 1)]);
+        assert!(
+            several.get("command").is_none(),
+            "two commands: nothing to flatten"
+        );
+        assert_eq!(several["executions"][1]["exit_code"], json!(1));
+        assert_eq!(exec_params(json!("s"), &[]), json!({"script": "s"}));
+    }
 
     #[test]
     fn probe_default_finds_codex_sessions_under_home() -> anyhow::Result<()> {
@@ -1100,7 +1490,7 @@ mod tests {
     #[test]
     fn legacy_rows_normalize_to_payloads() {
         let ts = Utc::now();
-        let map: HashMap<String, Extracted<String>> = HashMap::new();
+        let map = FileState::default();
 
         // The bare first row and `{record_type:"state"}` markers are eventless.
         let first = json!({"id": "s1", "timestamp": "2025-09-13T04:30:17.447Z"});
@@ -1137,7 +1527,7 @@ mod tests {
     #[test]
     fn unknown_message_role_becomes_lossless_carrier() {
         let ts = Utc::now();
-        let map: HashMap<String, Extracted<String>> = HashMap::new();
+        let map = FileState::default();
         let row = json!({
             "type": "response_item",
             "timestamp": "2026-06-01T00:00:00Z",

@@ -174,7 +174,33 @@ sample tree.
   them; preserved for schema fidelity). MCP tools appear as flattened names
   like `surf__surf_amazon_search`.
 - Samples: 2 sessions across 2 dates from the interactive `codex_cli_rs`
-  originator, models `gpt-5` and `gpt-5-codex`.
+  originator, models `gpt-5` and `gpt-5-codex`, plus one pre-Oct-2025 legacy
+  rollout (bare header, un-enveloped payloads), plus one JS-runtime rollout
+  (below).
+- JS-runtime sample (`2026/09/01/rollout-...-01a05e4f-6011-7b73-b3cf-742c36deb501.jsonl`):
+  captured 2026-09-01 by sandbox self-capture - `codex exec` 0.152.0
+  (originator `codex_exec`, model `gpt-5.6-sol`, `-s workspace-write`,
+  `approval_policy=never`) under a throwaway `HOME`/`CODEX_HOME` at the
+  neutral base path `/tmp/codex-fixture`, project cwd a two-file git repo with
+  one commit and no remote. The operator's `auth.json` was copied into the
+  sandbox purely to authenticate and deleted before anything was copied out.
+  `HOME` had to be sandboxed as well as `CODEX_HOME`: codex discovers skills
+  under `$HOME/.agents/skills`, and a rehearsal with only `CODEX_HOME` set
+  wrote the real username and skill catalogue into the first user turn.
+  Codex 0.147+ routes every tool through a JavaScript runtime, so the rollout
+  carries `custom_tool_call{name:"exec", input:<js>}` /
+  `custom_tool_call_output` pairs with `event_msg item_completed`
+  (`CommandExecution`, `FileChange`) rows between them; it also carries the
+  newer `world_state` top-level rows. Census (57 rows): 8 `message`, 7
+  `custom_tool_call`, 7 `custom_tool_call_output`, 5 `reasoning`, 8
+  `token_count`, 7 `item_completed.CommandExecution` (exit codes 0,1,0,0,1,0,2),
+  1 `item_completed.FileChange`, 5 `item_completed.Reasoning`, 2
+  `item_completed.AgentMessage`, 1 `item_completed.UserMessage`, 1
+  `task_started`, 1 `task_complete`, 2 `world_state`, 1 `turn_context`, 1
+  `session_meta`. The seven calls: a script that only filters `ALL_TOOLS`
+  (no `tools.` reference - stays `exec`), `ls`, `cat missing.txt` (exit 1),
+  `sed -n '1,120p' notes.md`, an `apply_patch`, one script running `echo a`
+  / `false` / `echo b` as three `exec_command` calls, and `sh -c "exit 2"`.
 
 ### grok-build (xAI `grok` CLI)
 
@@ -693,6 +719,8 @@ Pre-commit checks run against this directory:
   unverified secrets.
 - `gitleaks detect --no-git --source <dir>` - any findings reviewed; current
   findings are Apify MCP tool registry hex suffixes (content-addressed tool
-  IDs), false positives.
+  IDs), false positives. trufflehog's one unverified hit on the codex-cli
+  JS-runtime rollout is the same class: an `app-<hex>@openai-curated-remote`
+  entry from codex's built-in app catalogue in the system prompt.
 - Targeted regex sweeps for project-specific personal identifiers.
 - JSON / JSONL parse validation on every file.

@@ -254,6 +254,22 @@ pub fn extract_str(source: &dyn Source, key: &str) -> Option<Extracted<String>> 
     })
 }
 
+/// Extract a byte span of a `String` field - for an identifier a scan located
+/// inside a larger source string. Still source data (only text the source
+/// carried can come out), and total: `None` when the field is absent or the
+/// range is not on char boundaries.
+pub fn extract_str_range(
+    source: &dyn Source,
+    key: &str,
+    range: std::ops::Range<usize>,
+) -> Option<Extracted<String>> {
+    source.str_field(key)?.get(range).map(|s| {
+        let mut owned = s.to_owned();
+        bound_str(&mut owned);
+        wrap(owned)
+    })
+}
+
 /// Extract a `bool` field. `None` when the source did not carry it.
 pub fn extract_bool(source: &dyn Source, key: &str) -> Option<Extracted<bool>> {
     source.bool_field(key).map(wrap)
