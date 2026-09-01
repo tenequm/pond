@@ -74,12 +74,22 @@ pub mod http {
         hosts
     }
 
-    /// How long shutdown waits after the MCP sessions have been cancelled before
-    /// the process exits regardless. Cancelling the token closes the live
-    /// streams, so the drain normally finishes far inside this; the deadline is
-    /// only a backstop, so that a client which ignores the close cannot hold the
-    /// process open the way an uncancelled stream used to.
-    const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+    /// How long [`serve_with_shutdown`] waits, after the MCP sessions have been
+    /// cancelled, before returning regardless. Cancelling the token closes the
+    /// live streams, so the drain normally finishes far inside this; the
+    /// deadline is only a backstop, so that a client which ignores the close
+    /// cannot hold the process open the way an uncancelled stream used to. It
+    /// bounds this function's return, not the process: `main` still drops the
+    /// runtime afterwards, which waits on `spawn_blocking` work already started.
+    ///
+    /// Returning on the deadline can truncate an in-flight `POST /v1/ingest`
+    /// between commits, since messages and parts commit before the session row:
+    /// a stop landing in that gap leaves message rows whose session row is not
+    /// written yet. Every Lance commit is atomic and the next ingest of that
+    /// session rewrites the missing row, so the store converges. The bound stays
+    /// anyway - exempting ingest would leave the drain unbounded in exactly the
+    /// case that can hold the process open.
+    pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
@@ -158,25 +168,22 @@ pub mod http {
         stop: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
         let mcp_shutdown = CancellationToken::new();
-        // Fires when `stop` does, so the drain deadline is measured from the
-        // stop request rather than from startup. An un-cancelled token's
-        // `cancelled()` never resolves, which is exactly what keeps the
-        // deadline arm below inert while the server is running normally.
-        let stopping = CancellationToken::new();
         let server = axum::serve(listener, router(state, allowed_hosts, mcp_shutdown.clone()))
             .with_graceful_shutdown({
-                let stopping = stopping.clone();
+                let mcp_shutdown = mcp_shutdown.clone();
                 async move {
                     stop.await;
                     tracing::info!("shutdown: closing MCP sessions, then draining");
                     mcp_shutdown.cancel();
-                    stopping.cancel();
                 }
             });
         tokio::select! {
             result = server => result.context("axum server error"),
+            // rmcp only ever derives `child_token()` from this token and never
+            // cancels it, so it resolves exactly when the arm above cancels it:
+            // the deadline runs from the stop request, not from startup.
             () = async move {
-                stopping.cancelled().await;
+                mcp_shutdown.cancelled().await;
                 tokio::time::sleep(SHUTDOWN_DRAIN).await;
             } => {
                 tracing::warn!(

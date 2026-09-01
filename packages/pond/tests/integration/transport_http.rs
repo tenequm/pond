@@ -3,9 +3,16 @@
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
 //! `POST /v1/search`, `POST /v1/get-session`, and `POST /v1/get-message`
 //! are thin adapters over the shared wire handlers. The router is driven via
-//! `tower::ServiceExt::oneshot` - no socket bind, no HTTP client dependency.
+//! `tower::ServiceExt::oneshot` - no HTTP client dependency. The exception is
+//! `shutdown_completes_while_an_mcp_stream_is_open`, which does bind a socket:
+//! the hang it covers is in the connection drain, and `oneshot` never opens a
+//! connection to drain.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -90,6 +97,20 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
     ))
 }
 
+/// An `AppState` over an empty store, for the tests that never read a row: the
+/// fixture corpus [`router`] ingests would only add cost to them.
+async fn empty_state(temp: &TempDir) -> anyhow::Result<AppState> {
+    // The vector arm is refused unless this instance opted in.
+    pond::embed::init_enabled(true);
+    Ok(AppState {
+        store: Arc::new(Store::open_local(temp.path()).await?),
+        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
+            FakeBackend,
+        ))),
+        search: pond::config::SearchConfig::default(),
+    })
+}
+
 /// Shutdown has to finish while an MCP client is attached. axum's graceful
 /// shutdown waits for every in-flight connection, and a streamable-HTTP client
 /// holds its `GET /mcp` stream open for the whole session, so before the
@@ -98,16 +119,8 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
 /// `oneshot` against the `Router` never binds one.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_completes_while_an_mcp_stream_is_open() -> anyhow::Result<()> {
-    pond::embed::init_enabled(true);
     let temp = TempDir::new()?;
-    let store = Arc::new(Store::open_local(temp.path()).await?);
-    let state = AppState {
-        store,
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
-            FakeBackend,
-        ))),
-        search: pond::config::SearchConfig::default(),
-    };
+    let state = empty_state(&temp).await?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -134,20 +147,34 @@ async fn shutdown_completes_while_an_mcp_stream_is_open() -> anyhow::Result<()> 
     .await?;
     // Guard against this test quietly going vacuous: if the stream were ever
     // refused, the connection would close and shutdown would finish for the
-    // wrong reason. With the session cancel removed, this test takes the full
-    // SHUTDOWN_DRAIN instead of milliseconds, which is what proves the open
-    // stream is really what blocks the drain.
+    // wrong reason, still green.
     assert!(
-        head.starts_with("HTTP/1.1 200"),
+        head.starts_with("HTTP/1.1 200")
+            && head
+                .to_ascii_lowercase()
+                .contains("content-type: text/event-stream"),
         "the /mcp stream has to be established for this test to mean anything:\n{head}"
     );
 
+    let started = Instant::now();
     stop.send(()).expect("serve task should still be running");
 
     let served = tokio::time::timeout(Duration::from_secs(30), server)
         .await
         .expect("serve must stop while a client holds its /mcp stream open")?;
     served?;
+
+    // This is what pins the session teardown rather than the backstop. Drop
+    // `.with_cancellation_token(..)` in transport.rs and the deadline arm still
+    // returns `Ok(())`, just after SHUTDOWN_DRAIN, so every assertion above
+    // stays green; bounding the elapsed time is what fails.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < http::SHUTDOWN_DRAIN,
+        "shutdown took {elapsed:?}, so the drain deadline returned rather than \
+         the MCP session teardown letting it finish inside SHUTDOWN_DRAIN ({:?})",
+        http::SHUTDOWN_DRAIN
+    );
     drop(stream);
     Ok(())
 }
@@ -190,17 +217,27 @@ async fn mcp_session(addr: SocketAddr) -> anyhow::Result<String> {
 /// rather than through a client crate: the point is to own the socket and
 /// decide when it closes, which is what this test is about.
 async fn request(stream: &mut TcpStream, raw: &str) -> anyhow::Result<String> {
-    stream.write_all(raw.as_bytes()).await?;
-    let mut head = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if stream.read(&mut byte).await? == 0 {
-            anyhow::bail!("connection closed before the response head was complete");
+    // Deadlined: the read below has no natural end, so a regression that stalls
+    // before emitting headers would hang this test until the CI runner's limit
+    // instead of failing it.
+    tokio::time::timeout(RESPONSE_HEAD_TIMEOUT, async {
+        stream.write_all(raw.as_bytes()).await?;
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await? == 0 {
+                anyhow::bail!("connection closed before the response head was complete");
+            }
+            head.push(byte[0]);
         }
-        head.push(byte[0]);
-    }
-    Ok(String::from_utf8_lossy(&head).into_owned())
+        Ok(String::from_utf8_lossy(&head).into_owned())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for a response head"))?
 }
+
+/// Deadline on one request/response head (see [`request`]).
+const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `/mcp` route validates `Host` against an allowlist (the MCP spec's
 /// DNS-rebinding defence, carried by rmcp) and that list is loopback-only
@@ -210,16 +247,8 @@ async fn request(stream: &mut TcpStream, raw: &str) -> anyhow::Result<String> {
 /// while every MCP client is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
-    pond::embed::init_enabled(true);
     let temp = TempDir::new()?;
-    let store = Arc::new(Store::open_local(temp.path()).await?);
-    let state = AppState {
-        store,
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
-            FakeBackend,
-        ))),
-        search: pond::config::SearchConfig::default(),
-    };
+    let state = empty_state(&temp).await?;
     let app = http::router(
         state,
         &["pond.example.com".to_owned()],
