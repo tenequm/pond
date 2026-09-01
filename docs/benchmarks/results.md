@@ -301,3 +301,61 @@ Reconciliations:
 - `search_dated_s` +3678% is the v8 field being invalid (above), not a regression: 102.0 vs unfiltered 105.9 is the zonemap's date-filter parity, matching the earlier 113.1/125.0 post-zonemap observations.
 - The warm-query S3-IO drops (`search_iops` 159 -> 40, `vector_iops` 91 -> 0, `fts_iops` 16 -> 12; iops = S3 requests per warm query, lower is better) are real but not a lance-10 code effect: the `optimize --rebuild` an hour earlier consolidated every index into a single fresh segment, so warm queries page far less. Prior rows measured organically-grown multi-segment indexes; treat cross-row iops comparisons against this row accordingly.
 - Write-side fields are parity within single-run noise (copy 4034 -> 3671, per-commit 446 -> 360, fold 2195 -> 1528, index build 14747 -> 16291), consistent with the matched-copy sync A/B above: lance 8 -> 10 does not move writes.
+
+## bench-gate: Lance 10 -> 11 upgrade (feat/upgrade-to-lance-v11)
+
+Two-point same-day A/B for the lance 10.0.0 -> 11.0.0 upgrade on s3-nbg1 (store digest `5fcd5e32b8dd`), driven from mac-m1max, so only the code under test differs; the 08-25 lance-10 row is kept as the week-over-week reference. The upgrade is a dependency pin plus a `recursion_limit` attribute - no pond code path changed - so the interesting content here is the two things lance 11 did change underneath: the stemmer (behavioral, documented below) and, possibly, the zonemap-filtered search path (one unreconciled field).
+
+### 2026-09-01 - s3-nbg1, full-gate rows: lance 11 (61c1498-dirty, 14:25Z) and same-day lance-10 control (61c1498-dirty, 15:33Z)
+
+Two complete jsonl rows on store digest `5fcd5e32b8dd`, same machine (mac-m1max), same day, back to back, with the machine's two launchd pond jobs (`io.kolesnik.pond-mirror` hourly S3 mirror, `sh.pond.sync` 5-min local sync) paused for each window. Other hosts still push to the store hourly, so it is not fully quiet. **Both rows carry the stamp `61c1498-dirty`; tell them apart by date**: `2026-09-01T14:25:59Z` is the lance-11 binary (the 6376bad tree measured before it was committed), `2026-09-01T15:33:32Z` is the lance-10 control (a detached worktree at 61c1498 with only the fixed `bench-gate.sh` overlaid - the same rig shape as the v8 row on 08-25). A second v11 row on the committed tree was planned and skipped: the control already gives a same-day A/B.
+
+Store state at gate time: `messages.lance` version 7464, 3,122,185 message rows / 15,728 sessions (2,931,634 rows on 08-25), all indexes `ready` including `messages_timestamp_zonemap`, with a week of organically appended index segments on top of the 08-25 `optimize --rebuild`. That is why the warm-query iops are back at the pre-rebuild levels of the `dd2562a` / `33bf790` rows (search_iops 155-156, vector_iops 91) rather than the `be14674` row's single-segment lows (40 / 0) - a store-state effect, identical in both of today's rows.
+
+Gate-script fix carried by this branch (`ops/scripts/bench-gate.sh`): the CLI probes (`get-session`, `get-message`, `search`, `sql`, the equivalence gets) now pass `--storage-path "$STORE_URL"`. They previously read the operator config, so with the config pointing at the local store (the case since the mirror setup) a `STORE_URL` run measured local CLI probes next to S3 bench fields - the first lance-11 attempt returned 0.1-0.8 s "S3" gets and was discarded. Both rows here were produced by the fixed script.
+
+Same-day A/B, verbatim (lance-10 control -> lance-11; both `pond 0.16.3 (aarch64-macos)`):
+
+```
+metric                      prev         now     delta   (2026-09-01T15:33:32Z 61c1498-dirty [lance 10] -> 2026-09-01T14:25:59Z 61c1498-dirty [lance 11])
+get_session_sid_s           23.9        21.6      -10%
+get_session_mid_s           53.9        51.3       -5%
+get_message_s               46.8        48.7       +4%
+search_s                   122.9       123.7       +1%
+search_dated_s             119.0       147.8      +24%
+sql_count_s                  1.7         2.2      +29%
+fts_iops                      18          18       +0%
+vector_iops                   91          91       +0%
+get_message_iops              16          15       -6%
+search_iops                  156         155       -1%
+open_store_ms               1790        1927       +8%
+row_counts_ms               1291        1261       -2%
+oracle_warm_ms             26283       25313       -4%
+write_copy_ms               5329        4194      -21%
+write_copy_merge_ms          906         637      -30%
+write_copy_noop_ms           931         525      -44%
+write_copy_delta_ms          593         660      +11%
+write_ms_per_commit        637.6       566.4      -11%
+write_rows_per_s             784         883      +13%
+write_index_build_ms       24979       16088      -36%
+write_fold_ms               2075        2439      +18%
+```
+
+Raw probe runs (best of 2 is what the row keeps): lance 11 sid 26.9/21.6, mid 52.0/51.3, msg 48.7/86.0, search 127.3/123.7, dated 174.2/147.8; lance 10 sid 29.0/23.9, mid 53.9/59.0, msg 46.8/51.6, search 137.0/122.9, dated 119.0/124.1.
+
+Against the 08-25 lance-10 row for the week-over-week view (the gate's own delta, `be14674-dirty` -> lance 11): sid 21.7 -> 21.6, mid 53.6 -> 51.3, msg 52.1 -> 48.7, search 105.9 -> 123.7 (+17%), dated 102.0 -> 147.8 (+45%), sql_count 1.3 -> 2.2, open_store 1821 -> 1927, row_counts 1438 -> 1261, oracle_warm 28099 -> 25313, write_copy 3671 -> 4194 (+14%), merge 447 -> 637, noop 515 -> 525, delta 658 -> 660, ms_per_commit 359.6 -> 566.4 (+58%), rows_per_s 1390 -> 883 (-36%), index_build 16291 -> 16088, fold 1528 -> 2439 (+60%). The control's deltas against the same 08-25 row are: search +16%, dated +17%, write_copy +45%, merge +103%, noop +81%, ms_per_commit +77%, rows_per_s -44%, index_build +53%, fold +36% - i.e. the week-over-week movement is the store and the day, not lance 11 (next paragraph).
+
+Reconciliations:
+
+- Reads are parity. Every get/search probe is within one run's spread of the control (sid -10%, mid -5%, msg +4%, search +1%), and every warm-query iops field is identical (18 / 91 / 15-16 / 155-156) - lance 11 issues the same S3 requests per query as lance 10 on this store. `sql_count_s` 1.7 -> 2.2 is a single cold-start run each; the 08-25 rows sat at 1.3-1.4 with a smaller store.
+- Writes are parity-or-better, and the apparent week-over-week write regression is not lance 11. Against the same-day control, lance 11 is faster on every write field but `write_copy_delta_ms` (+11%) and `write_fold_ms` (+18%), including copy -21%, noop -44%, index build -36%. Against the 08-25 row both of today's rows look 15-100% slower on writes, with the lance-10 control the slower of the two - S3 write latency on 09-01 was simply worse than on 08-25 (the 08-25 rows themselves already showed a 4034 -> 3671 same-day spread on `write_copy_ms`). n=1 per cell; do not read the -21%/-36% as a lance-11 win either.
+- **`search_dated_s` +24% (119.0 -> 147.8) is the one field that moved against lance 11 and did not reconcile.** Unfiltered search is at parity (122.9 vs 123.7), so it is specific to the zonemap-filtered path. Both control runs sit at or below the control's unfiltered time (119.0 / 124.1 vs 122.9 best), both lance-11 runs sit above its unfiltered time (174.2 / 147.8 vs 123.7) - the direction is consistent across all four runs, but the lance-11 pair has a 26 s spread and each cell is 2 runs, so this is a signal to re-measure, not a confirmed regression. Candidate area: lance 11's changes around address-domain (zonemap) index results (the v11 delta adds `results_are_row_addrs()` branching in index maintenance and a row-address prefilter, lance-format/lance#7288); nothing in pond's dated-search code changed. Follow-up: a dated-only probe loop (n>=5 per arm) on the same store before attributing it, and a check of whether the zonemap needs a lance-11 rebuild to regain the parity the 08-25 row showed (102.0 dated vs 105.9 unfiltered).
+- `open_store_ms` +8% (1790 -> 1927) and the 08-25 -> 09-01 `row_counts_ms` / `oracle_warm_ms` drops (-10..-12% / -6..-10%, on both arms) are within the spread the 08-25 pair already showed (1053 -> 1821 open_store on the same day); nothing to attribute.
+
+Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replaced `rust-stemmers 1.2.0` with `frostem` (lance-format/lance#8183, to fix a Greek-stemmer panic). The PR describes the swap as output-identical; measured side by side (both crates linked into one binary, English), it is not:
+
+- `/usr/share/dict/words`: 484 / 235,976 words stem differently, 398 of them `-ogist` (`anthropologist`: old `anthropologist`, new `anthropolog`).
+- pond's real corpus, a 30,000-row `search_text` sample from the local store (3,064,041 tokens, 29,966 distinct words): 40 words (0.13%) but 7,052 token occurrences (0.23%). Top offenders are ordinary transcript vocabulary: `added`/`adding` (`ad` -> `add`, 4,315 occurrences), `internal`/`internally`/`internals` (`intern` -> `internal`, 1,695), `paste`/`pasted` (`past` -> `paste`, 400), then `evening`, `universal`, `interval`, `organization`, `emergency`.
+- Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
+
+Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
