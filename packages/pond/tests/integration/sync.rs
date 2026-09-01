@@ -9,7 +9,7 @@
 use pond::{
     adapter::{ClaudeCodeAdapter, NoopOracle, SkipOracle},
     handlers::ingest_adapter,
-    sessions::{RowmapOracle, Store},
+    sessions::{RowmapOracle, SessionWithMessages, Store},
 };
 use tempfile::TempDir;
 
@@ -94,6 +94,78 @@ async fn ensure_rowmap_rebuilds_an_unreadable_map() -> anyhow::Result<()> {
     assert!(
         !oracle.is_empty(),
         "map must be rebuilt after purging the unreadable one"
+    );
+    Ok(())
+}
+
+/// The state a cut flush leaves once `upsert_session_batch` commits `messages`
+/// last: the session row and its parts are durable, the messages are not. The
+/// freshness key is the messages max timestamp, so the gate has nothing to
+/// call fresh and the next sync re-ingests, filling in the messages without
+/// duplicating the parts (spec.md#session-movement-complete). This pins the
+/// read side of the invariant; the write order itself is pinned by
+/// `sessions::tests::messages_commit_last`.
+#[tokio::test(flavor = "multi_thread")]
+async fn half_flushed_session_is_re_ingested_not_skipped() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let adapter = ClaudeCodeAdapter::new(FIXTURES);
+
+    // Borrow one fully ingested session's rows from a reference store.
+    let reference = Store::open_local(temp.path().join("reference")).await?;
+    ingest_adapter(&reference, &adapter, &NoopOracle, |_| {}).await?;
+    // `session_ids` is an unordered scan and the corpus also holds subagent and
+    // fork sessions (`parent/child` ids), so sort and take the first main one.
+    let mut ids = reference.session_ids().await?;
+    ids.sort();
+    let session_id = ids
+        .into_iter()
+        .find(|id| !id.contains('/'))
+        .expect("fixtures yield a top-level session");
+    let SessionWithMessages { session, messages } = reference
+        .get_session(&session_id)
+        .await?
+        .expect("reference holds the session");
+    let parts: Vec<_> = messages
+        .iter()
+        .flat_map(|with_parts| with_parts.parts.iter().cloned())
+        .collect();
+    assert!(!parts.is_empty(), "the borrowed session must carry parts");
+
+    // Fabricate the cut: row and parts durable, no messages.
+    let store = Store::open_local(temp.path().join("store")).await?;
+    store
+        .upsert_sessions(std::slice::from_ref(&session))
+        .await?;
+    store.upsert_parts(&parts).await?;
+    let cut = store
+        .get_session(&session_id)
+        .await?
+        .expect("the row is visible before its messages");
+    assert!(cut.messages.is_empty(), "fabricated state: no messages yet");
+
+    let cache = temp.path().join("cache");
+    store.ensure_rowmap(&cache).await?;
+    let oracle = RowmapOracle(store.rowmap_snapshot());
+    assert_eq!(
+        oracle.session_max_ts(&session_id),
+        None,
+        "no messages, no freshness key"
+    );
+
+    ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
+    let healed = store
+        .get_session(&session_id)
+        .await?
+        .expect("the session survives the re-ingest");
+    assert_eq!(
+        healed.messages.len(),
+        messages.len(),
+        "the next sync fills in the missing messages"
+    );
+    assert_eq!(
+        healed.messages.iter().map(|m| m.parts.len()).sum::<usize>(),
+        parts.len(),
+        "the parts that already landed are not duplicated"
     );
     Ok(())
 }

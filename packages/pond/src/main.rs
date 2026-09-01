@@ -484,12 +484,9 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         path: Option<PathBuf>,
         /// Reconcile pass: bypass the freshness skip and re-read every source
-        /// body, re-ingesting through the idempotent merge. The skip compares
-        /// source mtime to pond's per-session ingest watermark; a session that
-        /// was partially flushed before the commit-row-last fix kept a frozen
-        /// watermark that mtime can never re-read past. This is the body-reading
-        /// tier that heals that historical damage (and audits completeness). It
-        /// is slower - every file is decoded - so it is opt-in, not the default.
+        /// body, re-ingesting through the idempotent merge - the full re-read
+        /// backstop for anything the gate cannot see, and a completeness audit.
+        /// It is slower - every file is decoded - so it is opt-in, not the default.
         #[arg(long)]
         verify: bool,
         /// Preview the next sync: per-adapter source counts and how many the
@@ -4788,9 +4785,8 @@ async fn run_import_stage(
     }
     // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
     // watermark, so every source body is re-decoded and re-ingested through the
-    // idempotent merge. This is the only path that heals historical M1 damage -
-    // a session partially flushed before the commit-row-last fix keeps a frozen
-    // watermark that mtime can never re-read past (spec.md#session-movement-complete).
+    // idempotent merge - the full re-read backstop for anything the gate
+    // cannot see (spec.md#session-movement-complete).
     let noop = pond::adapter::NoopOracle;
     let rowmap_oracle;
     let oracle: &dyn pond::adapter::SkipOracle = if verify {

@@ -368,3 +368,52 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 - Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
+
+## sync_oracle_bench: the durable-session intersection, measured and rejected (#212)
+
+### 2026-09-01 - s3-nbg1, cost of a per-sync `collect_ids(Sessions)` scan
+
+Context: the first fix for #212 (a half-flushed session latched fresh by the messages-keyed oracle) added the sessions id-set to `RowmapOracle`, one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions), mac-m1max, one process each (cold = first call after open, warm = second call in the same process). The `sessions_idset` arm (a direct `collect_ids(Sessions)` one-column scan) existed only on the rejected branch and was not kept; the `sessions_ids_only` arm (the same scan via the SQL path) remains in the bench:
+
+```
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset
+  open store (manifests)                       1757.3 ms
+  sessions_idset COLD                          4199.1 ms
+  sessions_idset WARM                          2116.9 ms
+
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only
+  open store (manifests)                       2170.9 ms
+  sessions_ids_only COLD                       6412.6 ms
+  sessions_ids_only WARM                       2138.6 ms
+```
+
+End to end, `pond sync --dry-run --format json --storage-path <store>`, old 0.16.3 binary vs the scan branch, warm local rowmap cache in both: identical verdicts (claude-code 11610 sessions / 11582 fresh / 28 pending, codex-cli 253 / 245 / 8, all other adapters 0 pending) and wall-clock 1.79 s -> 5.92 s and 6.02 s. Every sync tick is a fresh process, so the cold figure is the one paid: about +4 s per tick on S3, on no-op ticks too. Against the local store the whole dry-run is 0.47 s.
+
+Decision: rejected. The gate does not need a second table read; it needs the table it keys on to commit last. `upsert_session_batch` now commits the session row and parts concurrently, then messages (spec.md#session-movement-complete names the invariant). Cost of that order: no change in commit count; a flush that adds no new session goes from one stage (messages and parts concurrently) to two (parts, then messages), one commit round-trip (`write_ms_per_commit` 566 ms on lance 11, 638 ms on lance 10 per the gate rows above) on S3 writing ticks only. Recoverable later by overlapping the messages fragment upload with the parts commit through the write chokepoint (Lance two-phase write: write fragments, then commit), and by moving the messages embed and batch encode into the same concurrent stage - only the commit has to be last, but the embed call is synchronous today and would need `spawn_blocking`; neither is done here.
+
+### 2026-09-01 - s3-nbg1, bench-gate row for the commit-order change (#213, lance 11)
+
+One jsonl row on store digest `5fcd5e32b8dd`, mac-m1max, commit `69f5c9a` (the reorder rebased onto the lance-11 upgrade), taken at `2026-09-01T20:03:23Z` with `moon run repo:bench-gate` and `STORE_URL` set to the S3 store. Compared against the lance-11 row of the same day (`2026-09-01T14:25:59Z`, `61c1498-dirty`), not the lance-10 control the delta printer picked as "previous". Unlike the two earlier rows the launchd pond jobs were not paused for this window, so the hourly mirror could overlap it.
+
+```
+metric                     v11 row      #213    delta
+get_session_sid_s             21.6      21.8      +1%
+get_session_mid_s             51.3      49.1      -4%
+get_message_s                 48.7      52.9      +9%
+search_s                     123.7     114.7      -7%
+search_dated_s               147.8     138.5      -6%
+oracle_warm_ms               25313     31182     +23%
+write_copy_ms                 4194      5625     +34%
+write_copy_noop_ms             525       714     +36%
+write_copy_delta_ms            660       893     +35%
+write_ms_per_commit          566.4     547.6      -3%
+write_index_build_ms         16088     19911     +24%
+write_fold_ms                 2439      7390    +203%
+```
+
+- Reads at parity (every CLI probe within the same-day spread the two 09-01 rows already showed; `fts_iops` 18 -> 12 is fewer requests, not more).
+- `write_ms_per_commit` is the messages append sweep, a path the reorder does not touch: -3% is noise, and it is the one write field that tracks this PR's actual cost model (one extra ~550 ms stage on S3 flushes that add no new session; no change in commit count).
+- The copy fields (+34/+36/+35%) run through `copy_delta_from`, which this PR does not change; they are the hour's S3 write latency. `oracle_warm_ms` is `session_last_message_ids WARM`, also untouched.
+- `write_fold_ms` +203% is not the reorder either, and it is not slower code. The fold total times `optimize_indices` only (the grown-corpus ingest is outside the timer). The earlier rows' round 1 landed on messages manifest version 15 (`round 1 [after ] v=15` in both 09-01 logs); this tree lands on 16, because #214's final form stamps the FTS stemmer fingerprint with a separate `update_config` commit after the index build (`substrate.rs` `record_fts_stemmer`, absent from the `6376bad` tree the lance-11 row was measured on). Version 16 is where the `cleanup_interval = 16` gate fires `cleanup_old_versions`: 4651 ms of the 7390 here (a same-binary rerun ten minutes later: 1989 ms cleanup, 5513 total). The reorder itself changes no per-table commit count - the seed and the grown flushes issue the same commits in a different order - so it moves no version number. The stamp is one commit per FTS build or rebuild, never per sync.
+
+n=1 per cell as always; nothing in the row points at the reorder.

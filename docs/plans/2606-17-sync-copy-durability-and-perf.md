@@ -10,6 +10,10 @@ Do not re-run the investigations. Every number below was measured on the real co
 
 All changes from this plan MUST land as ONE chunk and ONE commit. Do not split into multiple commits. The single commit also subsumes the already-present uncommitted working-tree artifacts from the investigation (see "Current working-tree state" at the end): the `AGENTS.md` notes and the `benches/sync_oracle_bench.rs` + `benches/write_bench.rs` extensions. Mark the commit breaking if it changes the oracle/skip wire or copy semantics (`<type>!:`), per the repo's release-plz convention.
 
+## Decision update (2026-09-01): commit the freshness key last (supersedes A1; #212, #213)
+
+A1's "commit the session row last" was correct for the row-keyed watermark it was written against. The shipped oracle is the resident row-meta map, keyed on `messages` max timestamp, and the write order was never flipped with it - so a flush cut between the messages commit and the session-row commit produced a session the gate reported fresh forever (issue #212; `Store::session_last_message_ids` carried the compensating intersection but had no production caller). The invariant is "the key's table commits last", not "the row commits last": `upsert_session_batch` now commits the session row and parts concurrently, then messages. Zero read-side cost; the alternative (a per-sync `sessions.id` scan) measured ~4 s per S3 tick and is recorded as rejected in `docs/benchmarks/results.md`.
+
 ## Decision update (2026-06-17): mtime oracle retained; `versions()` made cheap (supersedes B6/B7)
 
 The original Phase-2 plan replaced the watermark with a messages-based last-id key (B6) and the source skip with a tail-peek of the JSONL last-record id (B7). We deliberately did NOT do that. The shipped design keeps the original mtime comparison - source file mtime on the left, the per-session Lance ingest-commit timestamp on the right - and instead made the right side cheap.
