@@ -122,7 +122,7 @@ pub mod http {
     }
 
     /// Bind and serve until a stop request - ctrl-c, or SIGTERM on unix (see
-    /// [`shutdown_signal`]). `--port 0` selects an OS-assigned free port;
+    /// `shutdown_signal`). `--port 0` selects an OS-assigned free port;
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     /// `allowed_hosts` names the public authorities the `/mcp` route accepts

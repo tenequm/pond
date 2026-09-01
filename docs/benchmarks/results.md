@@ -373,15 +373,15 @@ Consequence: a store's writers must all move to the lance-11 pond before its FTS
 
 ### 2026-09-01 - s3-nbg1, cost of a per-sync `collect_ids(Sessions)` scan
 
-Context: the first fix for #212 (a half-flushed session latched fresh by the messages-keyed oracle) added the sessions id-set to `RowmapOracle`, one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions), mac-m1max, one process each (cold = first call after open, warm = second call in the same process):
+Context: the first fix for #212 (a half-flushed session latched fresh by the messages-keyed oracle) added the sessions id-set to `RowmapOracle`, one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions), mac-m1max, one process each (cold = first call after open, warm = second call in the same process). The `sessions_idset` arm (a direct `collect_ids(Sessions)` one-column scan) existed only on the rejected branch and was not kept; the `sessions_ids_only` arm (the same scan via the SQL path) remains in the bench:
 
 ```
-cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset   (collect_ids(Sessions), one-column scan; bench mode not kept)
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset
   open store (manifests)                       1757.3 ms
   sessions_idset COLD                          4199.1 ms
   sessions_idset WARM                          2116.9 ms
 
-cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only   (same scan via the SQL path)
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only
   open store (manifests)                       2170.9 ms
   sessions_ids_only COLD                       6412.6 ms
   sessions_ids_only WARM                       2138.6 ms
@@ -389,4 +389,4 @@ cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only 
 
 End to end, `pond sync --dry-run --format json --storage-path <store>`, old 0.16.3 binary vs the scan branch, warm local rowmap cache in both: identical verdicts (claude-code 11610 sessions / 11582 fresh / 28 pending, codex-cli 253 / 245 / 8, all other adapters 0 pending) and wall-clock 1.79 s -> 5.92 s and 6.02 s. Every sync tick is a fresh process, so the cold figure is the one paid: about +4 s per tick on S3, on no-op ticks too. Against the local store the whole dry-run is 0.47 s.
 
-Decision: rejected. The gate does not need a second table read; it needs the table it keys on to commit last. `upsert_session_batch` now commits the session row and parts concurrently, then messages (spec.md#session-movement-complete names the invariant). Cost of that order: no change in commit count; a flush that adds no new session goes from one stage (messages and parts concurrently) to two (parts, then messages), one commit round-trip (`write_ms_per_commit` 566 ms on lance 11, 638 ms on lance 10 per the gate rows above) on S3 writing ticks only. Recoverable later by overlapping the messages fragment upload with the parts commit through the write chokepoint (Lance two-phase write: write fragments, then commit); not done here.
+Decision: rejected. The gate does not need a second table read; it needs the table it keys on to commit last. `upsert_session_batch` now commits the session row and parts concurrently, then messages (spec.md#session-movement-complete names the invariant). Cost of that order: no change in commit count; a flush that adds no new session goes from one stage (messages and parts concurrently) to two (parts, then messages), one commit round-trip (`write_ms_per_commit` 566 ms on lance 11, 638 ms on lance 10 per the gate rows above) on S3 writing ticks only. Recoverable later by overlapping the messages fragment upload with the parts commit through the write chokepoint (Lance two-phase write: write fragments, then commit), and by moving the messages embed and batch encode into the same concurrent stage - only the commit has to be last, but the embed call is synchronous today and would need `spawn_blocking`; neither is done here.

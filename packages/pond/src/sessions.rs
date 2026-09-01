@@ -699,8 +699,9 @@ impl Store {
         plan: &DeltaPlan,
     ) -> Result<LanceArchiveImport> {
         // The three tables are independent Lance datasets with separate write
-        // locks, so copy them concurrently - mirrors the ingest path's
-        // three-table `try_join!` (see `upsert_session_batch`).
+        // locks, so copy them concurrently. Unlike the ingest flush, copy is not
+        // bound to commit `messages` last: the closing composite-PK verify and
+        // the re-plan on re-run are its backstop (spec.md#session-movement-complete).
         let ((sessions, sessions_inserted), (messages, messages_inserted), (parts, parts_inserted)) =
             tokio::try_join!(
                 self.copy_table(
@@ -1306,33 +1307,26 @@ impl Store {
         // last. A cut before it leaves the key absent or behind and the next sync
         // re-ingests through the idempotent filters above; the session row and
         // parts landing first leave a transiently incomplete session, never one
-        // the gate mistakes for done (spec.md#session-movement-complete). The two
-        // tables the key does not depend on commit concurrently.
-        let session_batches = if sessions_owned.is_empty() {
-            None
-        } else {
-            Some(sessions_batches(&sessions_owned)?)
-        };
-        let ((), _parts_appended) = tokio::try_join!(
-            async {
-                if let Some(batches) = session_batches {
-                    merge_insert_chunks(&self.handle, Table::Sessions, batches).await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            },
+        // the gate mistakes for done (spec.md#session-movement-complete). An
+        // empty `sessions_owned` yields no batches, so no merge commit is issued.
+        tokio::try_join!(
+            merge_insert_chunks(
+                &self.handle,
+                Table::Sessions,
+                sessions_batches(&sessions_owned)?,
+            ),
             self.append_filtered(
                 Table::Parts,
                 part_stream,
                 Self::part_keep(existing_part_pks.clone()),
             ),
         )?;
-        let _messages_appended = self
-            .append_filtered(
-                Table::Messages,
-                message_stream,
-                Self::message_keep(existing_message_pks.clone()),
-            )
-            .await?;
+        self.append_filtered(
+            Table::Messages,
+            message_stream,
+            Self::message_keep(existing_message_pks.clone()),
+        )
+        .await?;
 
         for substream in &writeable {
             outcomes.extend(success_outcomes_for_substream(
@@ -1433,16 +1427,18 @@ impl Store {
         Ok(sessions)
     }
 
-    /// `session_id -> last durable message id` for the sync freshness gate.
+    /// `session_id -> last durable message id`: the bench and test baseline for
+    /// the sync freshness oracle (the shipped gate is [`RowmapOracle`]).
     /// Scans stored message data only, never Lance version history:
     /// `Dataset::versions()` is remote-manifest-bound on object stores, and a
     /// write timestamp can exist even when a non-atomic ingest did not commit
     /// the messages (spec.md#session-movement-complete).
     ///
-    /// Only emits a key when the session row is ALSO durable. `upsert_session_batch`
-    /// commits `messages` last, so a cut flush cannot leave messages without their
-    /// row; the intersection stays as the guard for stores written before that
-    /// order held (spec.md#session-movement-complete).
+    /// Only emits a key when the session row is ALSO durable. The ingest flush
+    /// commits `messages` last and cannot leave messages without their row; the
+    /// intersection guards the states other writers can still leave - an
+    /// interrupted `pond copy`, or a store written before that order held
+    /// (spec.md#session-movement-complete).
     pub async fn session_last_message_ids(&self) -> Result<HashMap<String, String>> {
         let (session_ids, latest) = tokio::try_join!(self.collect_ids(Table::Sessions), async {
             let scanner = self
@@ -8162,9 +8158,10 @@ mod tests {
         let empty_session = synthetic_session("session-row-only");
         store.upsert_sessions(&[empty_session]).await?;
 
-        // Orphan: messages committed but the session row never was (the crash
-        // window `upsert_session_batch`'s write order can leave). The gate must
-        // NOT key on it, so the source re-ingests and heals the missing row.
+        // Orphan: messages committed but the session row never was. The ingest
+        // flush no longer leaves this (messages commit last); an interrupted copy
+        // or a store written before that order still can. The gate must NOT key
+        // on it, so the source re-ingests and heals the missing row.
         let orphan = synthetic_session("messages-no-row");
         let orphan_message = Message::User {
             id: "orphan-a".to_owned(),
@@ -8608,9 +8605,9 @@ mod tests {
     /// (spec.md#session-movement-complete). Making the messages table
     /// unwritable cuts the flush at exactly that boundary: the row and parts
     /// must already be durable, and no message row may exist. Under the old
-    /// order (messages and parts concurrently, then the row) the same fault aborted the batch
-    /// before the row was written. Unix only: a read-only directory bit does not
-    /// stop file creation on Windows.
+    /// order (messages and parts concurrently, then the row) the same fault
+    /// aborted the batch before the row was written. Unix only: a read-only
+    /// directory bit does not stop file creation on Windows.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn messages_commit_last() -> anyhow::Result<()> {
@@ -8633,7 +8630,8 @@ mod tests {
             "the messages table lives at <store>/messages.lance"
         );
 
-        let events = conversational_events("01HXYORDER0000000000000000", 3);
+        let session_id = "01HXYORDER0000000000000000";
+        let events = conversational_events(session_id, 3);
         chmod_recursive(&messages_dir, 0o555)?;
         let cut = ingest_events(&store, events.clone()).await;
         chmod_recursive(&messages_dir, 0o755)?;
@@ -8649,7 +8647,7 @@ mod tests {
             "the row and parts commit before the messages, so the cut leaves them durable and the key absent"
         );
         let visible = store
-            .get_session("01HXYORDER0000000000000000")
+            .get_session(session_id)
             .await?
             .expect("the session row is visible before its messages");
         assert!(visible.messages.is_empty());
