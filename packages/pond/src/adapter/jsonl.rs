@@ -102,6 +102,15 @@ pub(crate) trait JsonlTree: Clone + Send + Sync + 'static {
 
     fn session(&self, path: &Path, rows: &[BoundedRow]) -> Result<Session, AdapterError>;
 
+    /// Per-file state the row walk starts from, built from the whole file:
+    /// the hook for a format whose rows reference rows that come LATER (a
+    /// tool call whose outcome sits between it and its result). The rows are
+    /// already in memory, so an index built here costs one extra in-memory
+    /// pass and nothing else.
+    fn file_state(&self, _rows: &[BoundedRow]) -> Self::State {
+        Self::State::default()
+    }
+
     fn events_from_row(
         &self,
         session: &Session,
@@ -639,7 +648,7 @@ fn read_one_file<D: JsonlTree>(
         session.clone()
     ))));
 
-    let mut state = D::State::default();
+    let mut state = driver.file_state(&rows);
     for row in &rows {
         match driver.events_from_row(&session, row, &mut state) {
             Ok(events) => {

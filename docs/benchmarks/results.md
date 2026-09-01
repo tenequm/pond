@@ -368,3 +368,25 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 - Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
+
+## ingest_bench decode: codex-cli JS-runtime decode (#216)
+
+### 2026-09-01 - mac-m1max, local `~/.codex/sessions/2026/09`, old 0ab11c7 vs new (fix/codex-exec-wrapper, uncommitted)
+
+The #216 fix adds a per-file index pass to the codex-cli adapter (`JsonlTree::file_state`: `call_id -> wrapped tool name` and `call_id -> {command, cwd, exit_code}` of the `CommandExecution` rows in each call's window) plus a byte scan of every `exec` snippet for `tools.<name>(`. This is the decode-stage before/after that gates it. `ingest_bench` gained `--adapter codex-cli` for the purpose (the harness file is identical on both sides; only the three adapter/seam sources differ).
+
+Setup: dev profile (both sides, so the delta is relative; absolute decode is ~3x slower than release), one worktree, old side built by swapping `codex_cli.rs` / `extract.rs` / `jsonl.rs` to their `origin/main` content and snapshotting the binary, then restoring. Corpus: the 0.151+/0.152 rollouts under `~/.codex/sessions/2026/09` - 42-47 files / 19.3k-20.2k rows (live, grew during the run; every JS-runtime row type present, 1,289 `CommandExecution` rows in the 18:39Z snapshot). Store: TempDir, NoopOracle, pass 1. Runs interleaved old/new. The host was NOT quiet: load average 20-30 throughout (other sessions compiling), which is what the spread below is.
+
+```
+pair   old decode   new decode   old wall   new wall   note
+1      0.32 s       0.35 s       2.54 s     2.60 s     new = whole-item clone in the index
+2      0.33 s       0.34 s       2.54 s     2.56 s     new = whole-item clone in the index
+3      0.34 s       0.38 s       3.78 s     3.28 s     slim index (three fields) from here on
+4      0.45 s       0.66 s       3.13 s     3.44 s     loaded
+5      0.36 s       0.36 s       2.73 s     2.71 s
+6      0.41 s       0.42 s       3.72 s     5.58 s     loaded
+7      1.22 s       0.59 s       6.12 s     4.83 s     loaded (old side hit)
+8      0.39 s       0.38 s       3.01 s     2.84 s
+```
+
+Reconciliation: min decode old 0.32 s vs new 0.34 s; the quiet pairs (1, 2, 5, 8) differ by 0.00-0.03 s on ~20k rows, below the run-to-run spread of either side under this load (old alone ranged 0.32-1.22 s). Validator (the merge_insert fan-out) is 85-90% of wall on both sides and unchanged. Pair 3 onward carries the slim index (the first cut cloned each `CommandExecution` item whole, stdout/stderr included; the index now keeps only `command` / `cwd` / `exit_code`) - pairs 5 and 8 are the cleanest read of the shipped code: parity. Nothing here is a release-profile number; rerun with `cargo bench --bench ingest_bench -- --adapter codex-cli --source-dir <codex 0.151+ corpus>` on a quiet host if a release-profile row is ever needed.
