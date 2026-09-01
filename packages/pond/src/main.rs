@@ -4471,10 +4471,10 @@ async fn run_sync_dry_run(
     let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
         &noop
     } else {
-        // The same freshness map a real sync would use, so the preview
+        // The same freshness oracle a real sync would use, so the preview
         // matches what sync would actually skip.
         ensure_rowmap_with_spinner(&store, false).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        rowmap_oracle = store.sync_oracle().await?;
         &rowmap_oracle
     };
     struct DryRunRow {
@@ -4788,9 +4788,8 @@ async fn run_import_stage(
     }
     // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
     // watermark, so every source body is re-decoded and re-ingested through the
-    // idempotent merge. This is the only path that heals historical M1 damage -
-    // a session partially flushed before the commit-row-last fix keeps a frozen
-    // watermark that mtime can never re-read past (spec.md#session-movement-complete).
+    // idempotent merge - the full re-read backstop for anything the gate
+    // cannot see (spec.md#session-movement-complete).
     let noop = pond::adapter::NoopOracle;
     let rowmap_oracle;
     let oracle: &dyn pond::adapter::SkipOracle = if verify {
@@ -4804,8 +4803,11 @@ async fn run_import_stage(
         // sequential scan, a warm sync delta-extends it - never the per-manifest
         // version-resolution storm that throttled remote syncs to a stall. A
         // missing/stale map yields no key, so the session simply re-reads (safe).
+        // The durable-session scan inside `sync_oracle` is not optional: a store
+        // that cannot serve one column is not one to write to, so it fails the
+        // sync rather than degrading.
         ensure_rowmap_with_spinner(store, quiet).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        rowmap_oracle = store.sync_oracle().await?;
         &rowmap_oracle
     };
     // Set expectations up front on the one run that is genuinely long: a first
@@ -6248,7 +6250,7 @@ async fn local_status(
     // version-matched load would cost a remote manifest read instead.
     let rowmap = store.open_cached_rowmap(&default_cache_dir());
     let pending_known = rowmap.is_some();
-    let oracle = pond::sessions::RowmapOracle(rowmap);
+    let oracle = pond::sessions::RowmapOracle::estimate(rowmap);
     let mut adapters = Vec::new();
     let (resolved, adapters_error) = match loaded.resolve_adapters(None) {
         Ok(resolved) => (resolved, None),

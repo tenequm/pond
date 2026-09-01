@@ -2216,6 +2216,15 @@ impl Store {
         self.rowmap.load_full()
     }
 
+    /// The `pond sync` freshness oracle: the installed map plus the set of
+    /// durable session ids (see [`RowmapOracle`]).
+    pub async fn sync_oracle(&self) -> Result<RowmapOracle> {
+        Ok(RowmapOracle {
+            map: self.rowmap_snapshot(),
+            durable_sessions: Some(self.collect_ids(Table::Sessions).await?),
+        })
+    }
+
     /// Resolve index-only `(row_id, score)` hits to keys via the map; row ids the
     /// map lacks (appended since build) fall back to one `take_rows` batch. The
     /// caller re-sorts, so the misses appended at the end carry no order meaning.
@@ -5750,15 +5759,43 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
 /// check stays deterministic with no local cursor). A `None` map (never
 /// prewarmed, or the build failed) yields no watermark, so every source
 /// re-reads - safe, just slower.
-pub struct RowmapOracle(pub Option<Arc<RowMetaSet>>);
+///
+/// The watermark counts only for sessions whose row is durable. The map is
+/// built from the messages table alone, and `upsert_session_batch` commits
+/// messages and parts before the session row, so a flush cut between those
+/// commits leaves a session whose messages the map knows and whose row does
+/// not exist; keyed on the map alone it reads fresh forever and the row is
+/// never written (spec.md#session-movement-complete). [`Store::sync_oracle`]
+/// builds the intersection.
+pub struct RowmapOracle {
+    map: Option<Arc<RowMetaSet>>,
+    durable_sessions: Option<HashSet<String>>,
+}
+
+impl RowmapOracle {
+    /// Estimate only, for `pond status`: the cached map with no sessions scan,
+    /// so it costs no store read. Never for a write path - it has the
+    /// half-flushed blind spot [`Store::sync_oracle`] exists to close.
+    pub fn estimate(map: Option<Arc<RowMetaSet>>) -> Self {
+        Self {
+            map,
+            durable_sessions: None,
+        }
+    }
+}
 
 impl crate::adapter::SkipOracle for RowmapOracle {
     fn session_max_ts(&self, session_id: &str) -> Option<i64> {
-        self.0.as_ref()?.lookup_max_ts(session_id)
+        if let Some(durable) = &self.durable_sessions
+            && !durable.contains(session_id)
+        {
+            return None;
+        }
+        self.map.as_ref()?.lookup_max_ts(session_id)
     }
 
     fn is_empty(&self) -> bool {
-        self.0.as_ref().is_none_or(|set| set.is_empty())
+        self.map.as_ref().is_none_or(|set| set.is_empty())
     }
 }
 

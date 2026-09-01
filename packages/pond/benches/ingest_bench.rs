@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
             let oracle: &dyn pond::adapter::SkipOracle =
                 if args.oracle == OracleKind::Rowmap && pass > 1 {
                     store.ensure_rowmap(rowmap_cache.path()).await?;
-                    rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+                    rowmap_oracle = store.sync_oracle().await?;
                     &rowmap_oracle
                 } else {
                     &pond::adapter::NoopOracle

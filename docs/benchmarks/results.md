@@ -368,3 +368,22 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 - Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
+## sync_oracle_bench: the durable-session intersection (#212)
+
+### 2026-09-01 - s3-nbg1, cost of `Store::sync_oracle`'s `collect_ids(Sessions)` scan
+
+Context: `RowmapOracle` now returns no watermark for a session whose row is not in the sessions table, closing the half-flushed latch (#212). The price is one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions) from `.claude/worktrees/sync-oracle`, mac-m1max, one process each (cold = first call after open, warm = second call in the same process):
+
+```
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset
+  open store (manifests)                       1757.3 ms
+  sessions_idset COLD                          4199.1 ms
+  sessions_idset WARM                          2116.9 ms
+
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only   (same scan via the SQL path, for reference)
+  open store (manifests)                       2170.9 ms
+  sessions_ids_only COLD                       6412.6 ms
+  sessions_ids_only WARM                       2138.6 ms
+```
+
+Reading: the shipped path (`[M] sessions_idset`, a direct one-column Lance scan) and the SQL path converge warm at ~2.1 s, so the cost is the sessions table's fragment round-trips, not planning. Do not compare it against the gate's `oracle_warm_ms` - that field times `session_last_message_ids`, which no production path calls. The stage `pond sync` actually runs is `ensure_rowmap` plus this scan, and on an unchanged store warm `ensure_rowmap` is a manifest version check plus a local mmap open, so on a no-op cron tick this scan is the oracle stage's main remote read; `commands_bench` now times it as its own `oracle (session ids)` phase. The cold number is paid once per process. Accepted as a correctness cost. If it grows, the levers are sessions-table compaction (fewer fragments) or caching the id set beside the rowmap chain keyed on the sessions table's `version_id()`, which would skip the scan on every tick where that table did not advance.

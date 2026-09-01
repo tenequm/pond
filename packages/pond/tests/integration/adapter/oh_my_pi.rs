@@ -9,7 +9,6 @@ use std::path::Path;
 
 use pond::{
     adapter::{OhMyPiAdapter, OhMyPiFactory, SkipOracle},
-    sessions::RowmapOracle,
     substrate::{Predicate, ScalarValue},
 };
 
@@ -75,7 +74,7 @@ async fn the_rowmap_keys_the_slot_fronted_session_by_its_header_id() -> anyhow::
     let (store, store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(FIXTURE_ROOT)).await?;
 
     store.ensure_rowmap(&store_dir.path().join("cache")).await?;
-    let oracle = RowmapOracle(store.rowmap_snapshot());
+    let oracle = store.sync_oracle().await?;
     assert!(
         oracle.session_max_ts(SLOT_FRONTED_SESSION).is_some(),
         "the slot-fronted session is keyed by its header id, not skipped as unreadable",

@@ -491,10 +491,8 @@ async fn export_then_ingest_round_trips_canonical_events() -> anyhow::Result<()>
 async fn verify_bypasses_the_freshness_skip_and_re_reads_every_session() -> anyhow::Result<()> {
     // `pond sync --verify` drives ingest with a `NoopOracle` instead of the
     // per-session watermark map, so the freshness gate never fires and every
-    // source body is re-decoded. This is the only path that heals historical
-    // M1 damage: a session partially flushed before the commit-row-last fix
-    // keeps a frozen watermark mtime can never re-read past
-    // (spec.md#session-movement-complete).
+    // source body is re-decoded - the full re-read backstop for anything the
+    // gate cannot see (spec.md#session-movement-complete).
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
     let first = ingest_adapter(

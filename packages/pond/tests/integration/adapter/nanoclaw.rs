@@ -14,7 +14,7 @@ use std::path::Path;
 use pond::{
     adapter::{NanoclawAdapter, NoopOracle, SkipOracle},
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
-    sessions::{RowmapOracle, Store},
+    sessions::Store,
     substrate::{Predicate, ScalarValue},
 };
 use rusqlite::Connection;
@@ -291,7 +291,7 @@ async fn re_sync_skips_fresh_and_is_additive() -> anyhow::Result<()> {
 
     let cache = temp.path().join("cache");
     store.ensure_rowmap(&cache).await?;
-    let oracle = RowmapOracle(store.rowmap_snapshot());
+    let oracle = store.sync_oracle().await?;
     assert!(
         !oracle.is_empty(),
         "resident map populated after first sync"
