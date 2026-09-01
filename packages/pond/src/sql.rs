@@ -714,7 +714,7 @@ impl ScalarUDFImpl for FtsMisuse {
 }
 
 /// Vendored replacement for lance's `FtsQueryUDTF` (src/dataset/udtf.rs,
-/// still unfixed at lance-10.0.0). The upstream provider omits `_score` from its
+/// still unfixed at lance-11.0.0). The upstream provider omits `_score` from its
 /// declared schema while leaving the scanner's scoring autoprojection on, so
 /// `_score` is physically appended but logically unknown: naming it in SQL
 /// fails ("No field named _score") and any aggregate over fts() dies on

@@ -3079,7 +3079,7 @@ impl Handle {
 ///
 /// spec.md#lance-index-maintenance mandates FRI on by default, but lance
 /// rejects `defer_index_remap=true` on stable-row-id datasets
-/// (`optimize.rs:697`): they never remap, so there is nothing to defer - we
+/// (`optimize.rs:738`): they never remap, so there is nothing to defer - we
 /// only lose the documented concurrency-with-index-build benefit.
 async fn optimize_table_compact(
     dataset: &mut Dataset,
@@ -3493,9 +3493,10 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-10 `optimize.rs` `needs_remapping`) and
+/// skips the remapper entirely (lance-11 `optimize.rs` `needs_remapping`) and
 /// only rewrites each covered index's `fragment_bitmap` to the new fragment
-/// ids (`transaction.rs` `recalculate_fragment_bitmap`). A rewrite of covered
+/// ids (lance-table `transaction/index_maintenance.rs`
+/// `recalculate_fragment_bitmap`). A rewrite of covered
 /// fragments therefore leaves zones pointing at dead ids - `dead_in_payload`,
 /// the exact condition behind the query-time "fragment N referenced by an
 /// address-domain index result was not found" internal error - while the
