@@ -6777,6 +6777,7 @@ dependencies = [
  "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
+ "lance-tokenizer",
  "libc",
  "memmap2",
  "object_store",

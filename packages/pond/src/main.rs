@@ -5872,8 +5872,6 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Title + storage-destination line, shared by the populated header and the
-/// empty-store render so `pond status` opens the same way in either state.
 /// Per-index status word for `pond status --format json`, mirroring the
 /// existence/backlog split the text `index detail` block surfaces.
 /// Mirrors `classify_index_health`'s threshold logic: a tail below the sync
@@ -5884,6 +5882,8 @@ fn render_optimize_hints(outcome: &OptimizeOutcome) -> anyhow::Result<()> {
 fn index_status_label(status: &IndexStatus, fold_threshold: u64) -> &'static str {
     if !status.exists {
         "not_built"
+    } else if !status.stemmer_current {
+        "stemmer_outdated"
     } else if (status.unindexed_rows as u64) < fold_threshold.max(1) {
         "ready"
     } else {
@@ -6468,6 +6468,8 @@ enum IndexHealthState {
     NotBuilt,
     Ready,
     Pending(u64),
+    /// FTS only: built under another stemmer; the next indices phase recreates it.
+    StemmerOutdated,
 }
 
 #[derive(Debug, Clone)]
@@ -6499,6 +6501,9 @@ fn classify_index_health(
     fn classify_one(status: &IndexStatus, fold_threshold: u64) -> IndexHealthState {
         if !status.exists {
             return NotBuilt;
+        }
+        if !status.stemmer_current {
+            return StemmerOutdated;
         }
         if (status.unindexed_rows as u64) < fold_threshold.max(1) {
             Ready
@@ -6549,17 +6554,16 @@ fn render_indexes_line(health: &IndexHealth) -> String {
     use IndexHealthState::*;
     use pond::output::{dim, paint, yellow};
 
+    let text_part = match &health.text {
+        Ready => "text ready".to_owned(),
+        Pending(n) => format!("text {} pending", format_thousands(*n)),
+        NotBuilt => "text not built".to_owned(),
+        StemmerOutdated => "text stemmer outdated (rebuilds on next sync/optimize)".to_owned(),
+    };
     let body = match (&health.text, health.semantic.as_ref()) {
-        (Ready, None) => "text ready".to_owned(),
-        (Pending(n), None) => format!("text {} pending", format_thousands(*n)),
-        (NotBuilt, None) => "text not built".to_owned(),
+        (_, None) => text_part,
         (Ready, Some(Ready)) => "text + semantic ready".to_owned(),
         (_, Some(semantic)) => {
-            let text_part = match &health.text {
-                Ready => "text ready".to_owned(),
-                Pending(n) => format!("text {} pending", format_thousands(*n)),
-                NotBuilt => "text not built".to_owned(),
-            };
             let semantic_part = match semantic {
                 Ready => "semantic ready".to_owned(),
                 Pending(n) => format!("semantic {} pending", format_thousands(*n)),
@@ -6567,14 +6571,18 @@ fn render_indexes_line(health: &IndexHealth) -> String {
                 // vector search already works below it via a brute-force scan -
                 // so say "ready", not the alarming "below activation threshold"
                 // that reads as broken (three fresh users misread it that way).
-                NotBuilt => "semantic ready (brute-force; index builds at scale)".to_owned(),
+                // Only the FTS index carries a stemmer, so `StemmerOutdated`
+                // never reaches this arm.
+                NotBuilt | StemmerOutdated => {
+                    "semantic ready (brute-force; index builds at scale)".to_owned()
+                }
             };
             format!("{text_part} . {semantic_part}")
         }
     };
-    let any_pending =
-        matches!(health.text, Pending(_)) || matches!(health.semantic, Some(Pending(_)));
-    let label = if any_pending {
+    let needs_attention = matches!(health.text, Pending(_) | StemmerOutdated)
+        || matches!(health.semantic, Some(Pending(_)));
+    let label = if needs_attention {
         paint("indexes", yellow())
     } else {
         paint("indexes", dim())
@@ -6732,6 +6740,7 @@ mod tests {
             unindexed_fragments: usize::from(unindexed_rows > 0),
             unindexed_rows,
             exists,
+            stemmer_current: true,
         }
     }
 
@@ -6762,6 +6771,20 @@ mod tests {
         let missing = [index_status(MESSAGES_FTS_INDEX, false, 0)];
         let health = classify_index_health(&missing, None, 0, false);
         assert!(render_indexes_line(&health).ends_with("text not built"));
+    }
+
+    /// An FTS index built under another stemmer outranks a pending tail (the
+    /// rebuild subsumes the fold) in both the text line and the JSON label.
+    #[test]
+    fn stemmer_outdated_text_index_reports_the_rebuild_in_both_renders() {
+        let mut outdated = index_status(MESSAGES_FTS_INDEX, true, 1234);
+        outdated.stemmer_current = false;
+        assert_eq!(index_status_label(&outdated, 0), "stemmer_outdated");
+        let health = classify_index_health(&[outdated], None, 0, false);
+        assert!(
+            render_indexes_line(&health)
+                .ends_with("text stemmer outdated (rebuilds on next sync/optimize)")
+        );
     }
 
     /// The embedding backlog override must not resurrect the semantic half

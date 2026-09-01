@@ -138,6 +138,9 @@ lance-io = "11.0.0"
 lance-linalg = "11.0.0"
 lance-namespace = "11.0.0"
 lance-namespace-impls = "11.0.0"
+# Already in the tree via lance-index; named so the FTS stemmer fingerprint
+# can iterate the tokenizer's token stream (`TokenStream::process`).
+lance-tokenizer = "11.0.0"
 # Memory-mapped, process-shareable row_id -> key map (`src/rowmap.rs`): the file
 # is mmap'd so the OS page cache holds one physical copy across pond instances.
 # Already in the tree via candle/safetensors.
