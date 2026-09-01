@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.17.0](https://github.com/tenequm/pond/compare/v0.16.3...v0.17.0) - 2026-09-01
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] upgrade Lance 10.0.0 -> 11.0.0 with FTS stemmer self-heal ([#214](https://github.com/tenequm/pond/pull/214)) ([0ab11c7](https://github.com/tenequm/pond/commit/0ab11c72ec22e93cda7fab7b467eecfa7a698051))
+  Lance 10 -> 11. Its English stemmer changed, so a text index built by an
+  older pond misses some word forms; pond now rebuilds it once on the next
+  sync or `pond optimize` (~10 min on a remote store) and `pond status`
+  shows `stemmer outdated` until then. Upgrade every host sharing a store
+  first.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **codex-cli:** decode Codex 0.151+ JS-runtime tool calls ([#218](https://github.com/tenequm/pond/pull/218)) ([94ab1e3](https://github.com/tenequm/pond/commit/94ab1e3c5a28db31c2d7533bb82112afe5f28a7a))
+  codex-cli now decodes Codex JS-runtime tool calls (seen from 0.147 on):
+  tool_name is the wrapped tool instead of exec, is_failure is set when
+  the script or any command it ran failed, and params carry the executed
+  command and cwd. Native restore uses codex's local-time filename.
+- **serve:** stop cleanly when a supervisor asks ([#198](https://github.com/tenequm/pond/pull/198)) ([98df4a1](https://github.com/tenequm/pond/commit/98df4a1388ea537cd6d3092415496b693f8071ef))
+  `pond serve` now stops when a supervisor asks it to. It handles SIGTERM
+  as well
+  as ctrl-c, and shutdown no longer hangs when an agent is connected: live
+  MCP
+  sessions are closed and the drain is bounded, so restarts finish instead
+  of
+  waiting for the process to be killed.
+- **serve:** let /mcp answer on the deployment's own hostname ([#196](https://github.com/tenequm/pond/pull/196)) ([1355a3e](https://github.com/tenequm/pond/commit/1355a3e54371cccfd5c9f93a03bcb1585660f01f))
+  `pond serve` reached by a hostname other than localhost now answers MCP
+  once
+  you name that host with `--allowed-host` (or `POND_ALLOWED_HOSTS`);
+  without it
+  the `/mcp` route refuses every request with 403 while `/v1/*` keeps
+  working.
+  Local use is unchanged.
+
+### <!-- 5 -->📚 Documentation
+- **readme:** add the community-adapters row to the roadmap ([#211](https://github.com/tenequm/pond/pull/211)) ([e99d352](https://github.com/tenequm/pond/commit/e99d3520be8ec0489ceab5b3c05ec788de259f04))
+- harden the Windows install path from live fresh-eyes verification ([#191](https://github.com/tenequm/pond/pull/191)) ([a7d1b5c](https://github.com/tenequm/pond/commit/a7d1b5c86ed6727484e2e85d822d27a84848ac92))
+  Windows install docs now name the git prerequisite for `scoop bucket add` and the `core.longpaths` and `--target` steps a source build needs. Installed via `cargo binstall`? You have `pond.exe` only - use Scoop or the zip for scheduled sync.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.16.3...v0.17.0
+
 ## [0.16.3](https://github.com/tenequm/pond/compare/v0.16.2...v0.16.3) - 2026-08-26
 
 ### <!-- 2 -->🐛 Bug Fixes
