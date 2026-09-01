@@ -12,7 +12,7 @@ use std::path::Path;
 use pond::{
     adapter::{HermesAdapter, NoopOracle, SkipOracle},
     handlers::ingest_adapter,
-    sessions::Store,
+    sessions::{RowmapOracle, Store},
     substrate::{Predicate, ScalarValue},
     wire::PartKind,
 };
@@ -188,7 +188,7 @@ async fn re_sync_skips_fresh_and_is_additive() -> anyhow::Result<()> {
 
     let cache = temp.path().join("cache");
     store.ensure_rowmap(&cache).await?;
-    let oracle = store.sync_oracle().await?;
+    let oracle = RowmapOracle(store.rowmap_snapshot());
     assert!(
         !oracle.is_empty(),
         "resident map populated after first sync"

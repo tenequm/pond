@@ -368,22 +368,25 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 - Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
-## sync_oracle_bench: the durable-session intersection (#212)
 
-### 2026-09-01 - s3-nbg1, cost of `Store::sync_oracle`'s `collect_ids(Sessions)` scan
+## sync_oracle_bench: the durable-session intersection, measured and rejected (#212)
 
-Context: `RowmapOracle` now returns no watermark for a session whose row is not in the sessions table, closing the half-flushed latch (#212). The price is one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions) from `.claude/worktrees/sync-oracle`, mac-m1max, one process each (cold = first call after open, warm = second call in the same process):
+### 2026-09-01 - s3-nbg1, cost of a per-sync `collect_ids(Sessions)` scan
+
+Context: the first fix for #212 (a half-flushed session latched fresh by the messages-keyed oracle) added the sessions id-set to `RowmapOracle`, one narrow `sessions.id` scan per sync. Measured read-only against the real corpus (`s3+https://nbg1.your-objectstorage.com/pondarium/pond`, 11k sessions), mac-m1max, one process each (cold = first call after open, warm = second call in the same process):
 
 ```
-cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_idset   (collect_ids(Sessions), one-column scan; bench mode not kept)
   open store (manifests)                       1757.3 ms
   sessions_idset COLD                          4199.1 ms
   sessions_idset WARM                          2116.9 ms
 
-cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only   (same scan via the SQL path, for reference)
+cargo bench --bench sync_oracle_bench -- --url <store> --only sessions_ids_only   (same scan via the SQL path)
   open store (manifests)                       2170.9 ms
   sessions_ids_only COLD                       6412.6 ms
   sessions_ids_only WARM                       2138.6 ms
 ```
 
-Reading: the shipped path (`[M] sessions_idset`, a direct one-column Lance scan) and the SQL path converge warm at ~2.1 s, so the cost is the sessions table's fragment round-trips, not planning. Do not compare it against the gate's `oracle_warm_ms` - that field times `session_last_message_ids`, which no production path calls. The stage `pond sync` actually runs is `ensure_rowmap` plus this scan, and on an unchanged store warm `ensure_rowmap` is a manifest version check plus a local mmap open, so on a no-op cron tick this scan is the oracle stage's main remote read; `commands_bench` now times it as its own `oracle (session ids)` phase. Every `pond sync` tick is a fresh process, so the cold figure is the one a scheduled sync pays. Confirmed end to end with `pond sync --dry-run --format json --storage-path <store>` on the same corpus, old 0.16.3 binary vs this branch, warm local rowmap cache in both: identical verdicts (claude-code 11610 sessions / 11582 fresh / 28 pending, codex-cli 253 / 245 / 8, all other adapters 0 pending), wall-clock 1.79 s -> 5.92 s and 6.02 s on two runs, so about +4 s per tick on S3 and no spurious re-reads. Against the local store the whole dry-run is 0.47 s. Accepted as a correctness cost. If it grows, the levers are sessions-table compaction (fewer fragments) or caching the id set beside the rowmap chain keyed on the sessions table's `version_id()`, which would skip the scan on every tick where that table did not advance.
+End to end, `pond sync --dry-run --format json --storage-path <store>`, old 0.16.3 binary vs the scan branch, warm local rowmap cache in both: identical verdicts (claude-code 11610 sessions / 11582 fresh / 28 pending, codex-cli 253 / 245 / 8, all other adapters 0 pending) and wall-clock 1.79 s -> 5.92 s and 6.02 s. Every sync tick is a fresh process, so the cold figure is the one paid: about +4 s per tick on S3, on no-op ticks too. Against the local store the whole dry-run is 0.47 s.
+
+Decision: rejected. The gate does not need a second table read; it needs the table it keys on to commit last. `upsert_session_batch` now commits the session row and parts concurrently, then messages (spec.md#session-movement-complete names the invariant). Cost of that order: no change in commit count; a flush that adds no new session goes from one stage (messages and parts concurrently) to two (parts, then messages), one commit round-trip (`write_ms_per_commit` 566 ms on lance 11, 638 ms on lance 10 per the gate rows above) on S3 writing ticks only. Recoverable later by overlapping the messages fragment upload with the parts commit through the write chokepoint (Lance two-phase write: write fragments, then commit); not done here.

@@ -9,7 +9,7 @@
 use pond::{
     adapter::{ClaudeCodeAdapter, NoopOracle, SkipOracle},
     handlers::ingest_adapter,
-    sessions::{MessageWrite, SessionWithMessages, Store, search_text},
+    sessions::{RowmapOracle, SessionWithMessages, Store},
 };
 use tempfile::TempDir;
 
@@ -29,7 +29,7 @@ async fn rowmap_oracle_skips_unchanged_then_verify_re_reads() -> anyhow::Result<
     // path `pond sync` takes (no per-manifest version-resolution storm).
     let cache = temp.path().join("cache");
     store.ensure_rowmap(&cache).await?;
-    let oracle = store.sync_oracle().await?;
+    let oracle = RowmapOracle(store.rowmap_snapshot());
     assert!(!oracle.is_empty(), "resident map is populated after ingest");
 
     // Re-sync unchanged sources: each session's source timestamp matches the
@@ -90,7 +90,7 @@ async fn ensure_rowmap_rebuilds_an_unreadable_map() -> anyhow::Result<()> {
     // purge it, and rebuild - returning Ok, not erroring.
     let reopened = Store::open_local(&store_dir).await?;
     reopened.ensure_rowmap(&cache).await?;
-    let oracle = reopened.sync_oracle().await?;
+    let oracle = RowmapOracle(reopened.rowmap_snapshot());
     assert!(
         !oracle.is_empty(),
         "map must be rebuilt after purging the unreadable one"
@@ -98,12 +98,13 @@ async fn ensure_rowmap_rebuilds_an_unreadable_map() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A session whose messages and parts committed but whose row did not - the
-/// window `upsert_session_batch`'s write order leaves, which a crash, a SIGTERM
-/// to a running sync, or the runtime drop under `serve --with-sync` can land
-/// in - must be re-ingested by the next sync, not latched fresh
-/// (spec.md#session-movement-complete). The messages-only map calls it fresh:
-/// its max_ts already equals the source's last message.
+/// The state a cut flush leaves once `upsert_session_batch` commits `messages`
+/// last: the session row and its parts are durable, the messages are not. The
+/// freshness key is the messages max timestamp, so the gate has nothing to
+/// call fresh and the next sync re-ingests, filling in the messages without
+/// duplicating the parts (spec.md#session-movement-complete). This pins the
+/// read side of the invariant; the write order itself is pinned by
+/// `sessions::tests::messages_commit_last`.
 #[tokio::test(flavor = "multi_thread")]
 async fn half_flushed_session_is_re_ingested_not_skipped() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -124,66 +125,47 @@ async fn half_flushed_session_is_re_ingested_not_skipped() -> anyhow::Result<()>
         .get_session(&session_id)
         .await?
         .expect("reference holds the session");
-
-    // Fabricate the half flush: messages and parts durable, no session row.
-    let store = Store::open_local(temp.path().join("store")).await?;
-    let texts: Vec<Option<String>> = messages
-        .iter()
-        .map(|with_parts| search_text(&with_parts.message, &with_parts.parts))
-        .collect();
-    let writes: Vec<MessageWrite<'_>> = messages
-        .iter()
-        .zip(&texts)
-        .map(|(with_parts, text)| MessageWrite {
-            message: &with_parts.message,
-            parts: &with_parts.parts,
-            search_text: text.as_deref(),
-        })
-        .collect();
-    store.upsert_messages(&session, &writes).await?;
     let parts: Vec<_> = messages
         .iter()
         .flat_map(|with_parts| with_parts.parts.iter().cloned())
         .collect();
+    assert!(!parts.is_empty(), "the borrowed session must carry parts");
+
+    // Fabricate the cut: row and parts durable, no messages.
+    let store = Store::open_local(temp.path().join("store")).await?;
+    store
+        .upsert_sessions(std::slice::from_ref(&session))
+        .await?;
     store.upsert_parts(&parts).await?;
-    assert!(
-        store.get_session(&session_id).await?.is_none(),
-        "fabricated state: the session row is absent"
-    );
+    let cut = store
+        .get_session(&session_id)
+        .await?
+        .expect("the row is visible before its messages");
+    assert!(cut.messages.is_empty(), "fabricated state: no messages yet");
 
     let cache = temp.path().join("cache");
     store.ensure_rowmap(&cache).await?;
-    // Control: the map alone would call it fresh - this is what the sessions
-    // intersection has to override.
-    assert!(
-        store
-            .rowmap_snapshot()
-            .expect("map built")
-            .lookup_max_ts(&session_id)
-            .is_some(),
-        "the resident map knows the half-flushed session's messages"
-    );
-    let oracle = store.sync_oracle().await?;
+    let oracle = RowmapOracle(store.rowmap_snapshot());
     assert_eq!(
         oracle.session_max_ts(&session_id),
         None,
-        "no durable session row, no watermark"
+        "no messages, no freshness key"
     );
 
     ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
     let healed = store
         .get_session(&session_id)
         .await?
-        .expect("the next sync writes the missing session row");
+        .expect("the session survives the re-ingest");
     assert_eq!(
         healed.messages.len(),
         messages.len(),
-        "the re-ingest heals the row without duplicating the messages"
+        "the next sync fills in the missing messages"
     );
     assert_eq!(
         healed.messages.iter().map(|m| m.parts.len()).sum::<usize>(),
         parts.len(),
-        "the re-ingest heals the row without duplicating the parts"
+        "the parts that already landed are not duplicated"
     );
     Ok(())
 }

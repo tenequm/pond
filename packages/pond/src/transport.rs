@@ -83,10 +83,10 @@ pub mod http {
     /// runtime afterwards, which waits on `spawn_blocking` work already started.
     ///
     /// Returning on the deadline can truncate an in-flight `POST /v1/ingest`
-    /// between commits, since messages and parts commit before the session row:
-    /// a stop landing in that gap leaves message rows whose session row is not
-    /// written yet. Every Lance commit is atomic and the next ingest of that
-    /// session rewrites the missing row, so the store converges. The bound stays
+    /// between commits. The session row and parts commit before the messages,
+    /// so a stop in that gap leaves a session that is transiently incomplete,
+    /// never one the freshness gate mistakes for done: every Lance commit is
+    /// atomic and the next ingest of that session converges it. The bound stays
     /// anyway - exempting ingest would leave the drain unbounded in exactly the
     /// case that can hold the process open.
     pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);

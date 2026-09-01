@@ -285,21 +285,15 @@ async fn run_sync(args: &Args, url: &str, config: &Config) -> Result<RunReport> 
     let total_start = Instant::now();
     let store = timed("open_store", &mut phases, async { open(url, config).await }).await?;
     let cache_dir = std::env::temp_dir().join("pond-commands-bench-rowmap");
-    timed("oracle (rowmap)", &mut phases, async {
+    let oracle = timed("oracle (rowmap)", &mut phases, async {
         store
             .ensure_rowmap(&cache_dir)
             .await
-            .context("ensure_rowmap")
+            .context("ensure_rowmap")?;
+        Ok::<_, anyhow::Error>(pond::sessions::RowmapOracle(store.rowmap_snapshot()))
     })
     .await?;
-    let oracle = timed("oracle (session ids)", &mut phases, async {
-        store.sync_oracle().await.context("sync_oracle")
-    })
-    .await?;
-    detail(
-        &mut phases,
-        format!("map_present={}", store.rowmap_snapshot().is_some()),
-    );
+    detail(&mut phases, format!("map_present={}", oracle.0.is_some()));
 
     let resolved = config
         .resolve_adapters(args.adapter.as_deref())

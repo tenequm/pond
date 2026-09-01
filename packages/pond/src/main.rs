@@ -4468,10 +4468,10 @@ async fn run_sync_dry_run(
     let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
         &noop
     } else {
-        // The same freshness oracle a real sync would use, so the preview
+        // The same freshness map a real sync would use, so the preview
         // matches what sync would actually skip.
         ensure_rowmap_with_spinner(&store, false).await;
-        rowmap_oracle = store.sync_oracle().await?;
+        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
     struct DryRunRow {
@@ -4800,11 +4800,8 @@ async fn run_import_stage(
         // sequential scan, a warm sync delta-extends it - never the per-manifest
         // version-resolution storm that throttled remote syncs to a stall. A
         // missing/stale map yields no key, so the session simply re-reads (safe).
-        // The durable-session scan inside `sync_oracle` is not optional: a store
-        // that cannot serve one column is not one to write to, so it fails the
-        // sync rather than degrading.
         ensure_rowmap_with_spinner(store, quiet).await;
-        rowmap_oracle = store.sync_oracle().await?;
+        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
     // Set expectations up front on the one run that is genuinely long: a first
@@ -6247,7 +6244,7 @@ async fn local_status(
     // version-matched load would cost a remote manifest read instead.
     let rowmap = store.open_cached_rowmap(&default_cache_dir());
     let pending_known = rowmap.is_some();
-    let oracle = pond::sessions::RowmapOracle::estimate(rowmap);
+    let oracle = pond::sessions::RowmapOracle(rowmap);
     let mut adapters = Vec::new();
     let (resolved, adapters_error) = match loaded.resolve_adapters(None) {
         Ok(resolved) => (resolved, None),

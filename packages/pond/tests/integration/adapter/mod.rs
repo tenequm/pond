@@ -16,7 +16,7 @@ use pond::{
     config::SearchConfig,
     embed::LazyEmbedder,
     handlers::{SyncEvent, SyncStatus, ingest_adapter, pond_search},
-    sessions::{IngestSummary, SessionWithMessages, Store},
+    sessions::{IngestSummary, RowmapOracle, SessionWithMessages, Store},
     substrate::{MaintenancePolicy, Predicate},
     wire::{
         Message, PartKind, Provenance, Role, SearchEnvelope, SearchFilters, SearchModeWire,
@@ -290,7 +290,7 @@ impl Conformance<'_> {
         );
 
         store.ensure_rowmap(&temp.path().join("cache")).await?;
-        let oracle = store.sync_oracle().await?;
+        let oracle = RowmapOracle(store.rowmap_snapshot());
         anyhow::ensure!(
             !oracle.is_empty(),
             "{brand}: resident rowmap empty after first sync",

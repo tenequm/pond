@@ -28,9 +28,6 @@
 //!                                 id column.
 //!   F. `sessions_full_scan`   -> `SELECT id, source_agent, created_at FROM
 //!                                 sessions`. What sync USED to depend on.
-//!   M. `sessions_idset`       -> `Store::collect_ids(Sessions)`. The durable
-//!                                 session id-set `Store::sync_oracle` scans
-//!                                 per sync (#212), as shipped rather than via SQL.
 //!
 //! Usage (always against the small benchmark corpus):
 //!
@@ -286,18 +283,6 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    if run("sessions_idset") {
-        println!(
-            "\n[M] sessions_idset - collect_ids(sessions) -> HashSet<id> (the durable-row intersection `Store::sync_oracle` adds per sync, #212)"
-        );
-        let s = store.clone();
-        timed_pair("sessions_idset", args.cold_only, move || {
-            let s = s.clone();
-            async move { s.collect_ids(Table::Sessions).await.map(|m| m.len()) }
-        })
-        .await;
-    }
-
     if run("messages_group_count_and_maxts") {
         println!(
             "\n[G] messages_group_count_and_maxts - SELECT session_id, COUNT(*), MAX(timestamp) FROM messages GROUP BY session_id"
@@ -428,7 +413,6 @@ async fn main() -> Result<()> {
         "messages_group_count_and_maxts",
         "messages_total_count",
         "sessions_ids_only",
-        "sessions_idset",
         "sessions_full_scan",
         "parts_group_count",
         "verify_collect_ids_all",
