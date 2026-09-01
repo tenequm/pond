@@ -10,7 +10,7 @@
 //! kept as System-role raw carriers with no Part, so native restore can
 //! replay them.
 //!
-//! Codex 0.151+ routes every tool through a JavaScript runtime: each call is
+//! Codex 0.147+ routes every tool through a JavaScript runtime: each call is
 //! `custom_tool_call{name:"exec", input:<js snippet>}`, whose snippet calls
 //! `tools.<real tool>(...)`, and its outcome lives in the `event_msg
 //! item_completed` rows (`item.type == "CommandExecution"`: argv, cwd, exit
@@ -65,7 +65,7 @@ use super::{
 };
 
 const NAME: &str = "codex-cli";
-/// The `custom_tool_call` name Codex 0.151+ gives every JS-runtime wrapper.
+/// The `custom_tool_call` name Codex 0.147+ gives every JS-runtime wrapper.
 const JS_RUNTIME_TOOL: &str = "exec";
 
 /// Stateless factory: opens [`CodexCliAdapter`] instances and probes for the

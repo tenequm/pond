@@ -187,7 +187,7 @@ sample tree.
   `HOME` had to be sandboxed as well as `CODEX_HOME`: codex discovers skills
   under `$HOME/.agents/skills`, and a rehearsal with only `CODEX_HOME` set
   wrote the real username and skill catalogue into the first user turn.
-  Codex 0.151+ routes every tool through a JavaScript runtime, so the rollout
+  Codex 0.147+ routes every tool through a JavaScript runtime, so the rollout
   carries `custom_tool_call{name:"exec", input:<js>}` /
   `custom_tool_call_output` pairs with `event_msg item_completed`
   (`CommandExecution`, `FileChange`) rows between them; it also carries the

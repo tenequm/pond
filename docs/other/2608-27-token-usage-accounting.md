@@ -229,8 +229,8 @@ out of the single `input_tokens` figure:
 Note also `reasoning_output_tokens`, which is already included in
 `output_tokens`; adding it again double-counts.
 
-**Tool-level analytics need Codex 0.151+ rows decoded, not stored verbatim.**
-Codex 0.151+ wraps every tool in a JavaScript runtime (`custom_tool_call`
+**Tool-level analytics need Codex 0.147+ rows decoded, not stored verbatim.**
+Codex 0.147+ wraps every tool in a JavaScript runtime (`custom_tool_call`
 named `exec`); pond names the part after the tool the snippet wraps
 (`exec_command`, `apply_patch`, ...), puts the executed argv on
 `params.command` (`params.executions[*]` when one script ran several), and
