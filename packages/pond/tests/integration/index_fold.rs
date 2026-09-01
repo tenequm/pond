@@ -189,6 +189,24 @@ async fn fold_survives_compaction() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Progress callback that records the name of every index an optimize run
+/// recreates from scratch (`IndexRebuild` phase starts).
+fn rebuild_sink() -> (Arc<Mutex<Vec<String>>>, OptimizeProgressFn) {
+    let rebuilds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&rebuilds);
+    let progress: OptimizeProgressFn = Arc::new(move |event| {
+        if let OptimizeEvent::PhaseStart {
+            phase: OptimizePhase::IndexRebuild,
+            detail: Some(detail),
+            ..
+        } = event
+        {
+            sink.lock().expect("rebuild sink").push(detail);
+        }
+    });
+    (rebuilds, progress)
+}
+
 /// Compaction of zonemap-covered fragments orphans the zonemap's
 /// address-domain payload: Lance skips index remapping on stable-row-id
 /// datasets and only rewrites the manifest `fragment_bitmap`, so the persisted
@@ -233,18 +251,7 @@ async fn zonemap_self_heals_after_compaction() -> anyhow::Result<()> {
 
     // Collect progress events so the heal is asserted directly, not inferred
     // from the count staying right.
-    let rebuilds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&rebuilds);
-    let progress: OptimizeProgressFn = Arc::new(move |event| {
-        if let OptimizeEvent::PhaseStart {
-            phase: OptimizePhase::IndexRebuild,
-            detail: Some(detail),
-            ..
-        } = event
-        {
-            sink.lock().expect("rebuild sink").push(detail);
-        }
-    });
+    let (rebuilds, progress) = rebuild_sink();
     let outcome = store
         .optimize_indices(Some(progress), &MaintenancePolicy::always_compact())
         .await?;
@@ -270,6 +277,99 @@ async fn zonemap_self_heals_after_compaction() -> anyhow::Result<()> {
         30,
         "date-scoped count after compaction (stale zonemap must self-heal, not error or undercount)",
     );
+    Ok(())
+}
+
+/// An FTS index built under another stemmer holds different stems for the
+/// same words than the running binary produces at query time, so whole-word
+/// search silently misses (lance 11 swapped rust-stemmers for frostem:
+/// `added`, `internal`, `paste`, ... drift). Pond stamps the manifest config
+/// with the building binary's stemmer fingerprint; an index whose stamp is
+/// missing - every index built before the stamp existed - or different must
+/// be recreated by the next indices phase and re-stamped, and a current stamp
+/// must not trigger a rebuild.
+#[tokio::test(flavor = "multi_thread")]
+async fn fts_index_self_heals_after_a_stemmer_change() -> anyhow::Result<()> {
+    use pond::sessions::MESSAGES_FTS_INDEX;
+    use pond::substrate::{FTS_STEMMER_KEY, Table, fts_stemmer_fingerprint};
+
+    async fn stamp(store: &Store) -> anyhow::Result<Option<String>> {
+        Ok(store
+            .dataset(Table::Messages)
+            .await?
+            .config()
+            .get(FTS_STEMMER_KEY)
+            .cloned())
+    }
+    fn fts_outdated(statuses: &[pond::substrate::IndexStatus]) -> bool {
+        statuses
+            .iter()
+            .any(|status| status.intent_name == MESSAGES_FTS_INDEX && !status.stemmer_current)
+    }
+
+    let url = Url::parse("shared-memory://pond-test-fts-stemmer-heal/")?;
+    let store = Store::open(&url).await?;
+    let session = make_session("01HXYZSTEMHEAL01", "claude-code");
+    ingest_events(&store, wave_events(&session, 0, 5, day(2026, 1, 1))).await?;
+    store.build_indices_only(None).await?.into_result()?;
+
+    let fingerprint = fts_stemmer_fingerprint()?;
+    assert!(
+        fingerprint.contains("add") && fingerprint.contains("internal"),
+        "the fingerprint must carry the canary stems, got {fingerprint:?}",
+    );
+    assert_eq!(
+        stamp(&store).await?.as_deref(),
+        Some(fingerprint),
+        "a fresh build must stamp the manifest config",
+    );
+
+    let (rebuilds, progress) = rebuild_sink();
+    store
+        .build_indices_only(Some(progress.clone()))
+        .await?
+        .into_result()?;
+    assert!(
+        rebuilds.lock().expect("rebuild sink").is_empty(),
+        "a current stamp must not trigger a rebuild",
+    );
+    assert!(!fts_outdated(&store.index_status().await?));
+
+    // A missing stamp (an index built before the stamp existed) and a foreign
+    // one (built by a binary linking another stemmer) must both heal. Each
+    // pass reopens the store: the old handle would serve its cached manifest
+    // inside the freshness window, exactly as a lance-10 index is first seen
+    // by an upgraded binary opening the store afresh.
+    for foreign in [
+        None,
+        Some("ad ad intern past even univers interv organ emerg anthropolog"),
+    ] {
+        let mut dataset = (*store.dataset(Table::Messages).await?).clone();
+        dataset.checkout_latest().await?;
+        dataset.update_config([(FTS_STEMMER_KEY, foreign)]).await?;
+        let store = Store::open(&url).await?;
+        assert!(
+            fts_outdated(&store.index_status().await?),
+            "stamp {foreign:?} must read as outdated",
+        );
+
+        rebuilds.lock().expect("rebuild sink").clear();
+        store
+            .build_indices_only(Some(progress.clone()))
+            .await?
+            .into_result()?;
+        assert_eq!(
+            rebuilds.lock().expect("rebuild sink").as_slice(),
+            [MESSAGES_FTS_INDEX],
+            "stamp {foreign:?} must recreate exactly the FTS index",
+        );
+        assert_eq!(
+            stamp(&store).await?.as_deref(),
+            Some(fingerprint),
+            "the rebuild must re-stamp the manifest config",
+        );
+        assert!(!fts_outdated(&store.index_status().await?));
+    }
     Ok(())
 }
 

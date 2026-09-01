@@ -40,6 +40,7 @@ use lance_namespace::LanceNamespace;
 use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::DescribeTableRequest;
 use lance_namespace_impls::ConnectBuilder;
+use lance_tokenizer::TokenStream;
 use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1210,6 +1211,78 @@ pub enum IndexParamsKind {
     IvfSqCosine { num_bits: u16, max_iters: usize },
 }
 
+/// Shared by the index build and the stemmer fingerprint so the two can
+/// never disagree (spec.md#search-language-neutral-index).
+fn fts_index_params() -> InvertedIndexParams {
+    InvertedIndexParams::default()
+        .base_tokenizer("simple".to_owned())
+        .stem(true)
+        .remove_stop_words(false)
+}
+
+/// Manifest config key on `messages`: the stemmer fingerprint the FTS index
+/// was last built under.
+pub const FTS_STEMMER_KEY: &str = "pond.fts.stems";
+
+/// Words whose English stems differ between the stemmers Lance has shipped
+/// (rust-stemmers through lance 10, frostem from lance 11: `added` -> `ad` vs
+/// `add`, `internal` -> `intern` vs `internal`, ...), so any swap that touches
+/// ordinary vocabulary changes the fingerprint. `The` and `Don't` pin the
+/// stop-word, casing and splitting settings of `fts_index_params` too.
+const FTS_STEMMER_CANARY: &str = "The added adding internal paste evening universal interval \
+                                  organization emergency anthropologist Don't";
+
+/// Stems of [`FTS_STEMMER_CANARY`] under this binary's FTS tokenizer. Lance
+/// stems query terms with whatever stemmer the binary links while the index
+/// holds the stems of the build that produced it; where the two differ,
+/// whole-word FTS silently misses in both directions until the index is
+/// rebuilt. Comparing this against [`FTS_STEMMER_KEY`] is how the indices
+/// phase catches that. Process-constant, so computed once.
+pub fn fts_stemmer_fingerprint() -> Result<&'static str> {
+    static FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(fingerprint) = FINGERPRINT.get() {
+        return Ok(fingerprint);
+    }
+    let mut tokenizer = fts_index_params()
+        .build()
+        .context("FTS tokenizer build failed")?;
+    let mut stems = Vec::new();
+    tokenizer
+        .token_stream_for_doc(FTS_STEMMER_CANARY)
+        .process(&mut |token| stems.push(token.text.clone()));
+    Ok(FINGERPRINT.get_or_init(|| stems.join(" ")))
+}
+
+/// Whether `dataset`'s FTS index was built under another stemmer than this
+/// binary's. A missing key (an index built before the stamp existed) is stale.
+fn fts_stemmer_stale(dataset: &Dataset) -> Result<bool> {
+    Ok(dataset.config().get(FTS_STEMMER_KEY).map(String::as_str)
+        != Some(fts_stemmer_fingerprint()?))
+}
+
+/// Stamp the FTS index with this binary's stemmer fingerprint right after a
+/// build or rebuild; a no-op for every other intent. A separate manifest
+/// commit, so a crash or a failed commit in between leaves the index looking
+/// stale - one redundant rebuild on a later run, never a wrong stamp. Failure
+/// is logged, not returned: the indices phase runs under `retry_lance`, and
+/// aborting it here would re-run the rebuild just paid for.
+async fn record_fts_stemmer(dataset: &mut Dataset, intent: &IndexIntent) -> Result<()> {
+    if !matches!(intent.params, IndexParamsKind::InvertedFtsWord) {
+        return Ok(());
+    }
+    let fingerprint = fts_stemmer_fingerprint()?;
+    if let Err(error) = dataset
+        .update_config([(FTS_STEMMER_KEY, fingerprint)])
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            "recording the FTS stemmer fingerprint failed; the next optimize rebuilds the index once more",
+        );
+    }
+    Ok(())
+}
+
 impl IndexTrigger {
     async fn should_create(&self, dataset: &Dataset) -> Result<bool> {
         match self {
@@ -1249,12 +1322,7 @@ impl IndexParamsKind {
     async fn build(&self, dataset: &Dataset) -> Result<Box<dyn lance::index::IndexParams>> {
         match self {
             Self::Scalar(kind) => Ok(Box::new(ScalarIndexParams::for_builtin(kind.clone()))),
-            Self::InvertedFtsWord => Ok(Box::new(
-                InvertedIndexParams::default()
-                    .base_tokenizer("simple".to_owned())
-                    .stem(true)
-                    .remove_stop_words(false),
-            )),
+            Self::InvertedFtsWord => Ok(Box::new(fts_index_params())),
             Self::IvfSqCosine {
                 num_bits,
                 max_iters,
@@ -1287,6 +1355,10 @@ pub struct IndexStatus {
     pub unindexed_fragments: usize,
     pub unindexed_rows: usize,
     pub exists: bool,
+    /// `false` only for an FTS index built under another stemmer
+    /// (`fts_stem_fingerprint`): searchable, but missing some word forms
+    /// until the next indices phase recreates it.
+    pub stemmer_current: bool,
 }
 
 /// Anyhow-chain sentinel pond attaches when `retry_lance` exhausts attempts
@@ -2687,6 +2759,19 @@ impl Handle {
         Ok(indices.iter().any(|index| index.name == name))
     }
 
+    /// Whether the `messages` FTS index was built under this binary's stemmer
+    /// (`fts_stem_fingerprint`); `true` when the index does not exist yet.
+    /// Manifest-only: the config map rides on the already-loaded manifest.
+    pub(crate) async fn messages_fts_stemmer_current(&self) -> Result<bool> {
+        if !self
+            .messages_has_index(sessions::MESSAGES_FTS_INDEX)
+            .await?
+        {
+            return Ok(true);
+        }
+        Ok(!fts_stemmer_stale(&self.dataset(Table::Messages).await?)?)
+    }
+
     /// Whether `messages` index `name` covers every row - it exists and has no
     /// unindexed tail - so `fast_search` (index-only) is complete. When a
     /// deferred fold has left a tail, the retrievers must omit `fast_search` so
@@ -3079,7 +3164,7 @@ impl Handle {
 ///
 /// spec.md#lance-index-maintenance mandates FRI on by default, but lance
 /// rejects `defer_index_remap=true` on stable-row-id datasets
-/// (`optimize.rs:697`): they never remap, so there is nothing to defer - we
+/// (`optimize.rs:738`): they never remap, so there is nothing to defer - we
 /// only lose the documented concurrency-with-index-build benefit.
 async fn optimize_table_compact(
     dataset: &mut Dataset,
@@ -3270,6 +3355,7 @@ async fn optimize_table_indices(
                 .progress(lance_progress(progress, table, intent.name))
                 .await
                 .with_context(|| format!("failed to create index {}", intent.name))?;
+            record_fts_stemmer(dataset, intent).await?;
             emit(
                 progress,
                 OptimizeEvent::PhaseDone {
@@ -3282,21 +3368,34 @@ async fn optimize_table_indices(
             continue;
         }
 
-        // Self-heal for address-domain indexes: compaction of covered
-        // fragments orphans the persisted payload (see
-        // `address_index_is_stale`), after which every date-filtered search
-        // hard-errors and the incremental fold below cannot repair it - the
-        // rewritten `fragment_bitmap` reports no unindexed fragments, so the
-        // append is a no-op over the dead zones. Recreate from scratch; this
-        // phase runs right after the compaction phase, so damage from this
-        // run's own compaction heals in the same `pond sync`/`pond optimize`.
-        if intent.params.results_are_row_addresses()
+        // Two self-heals that recreate an existing index from scratch. Address
+        // domain: compaction of covered fragments orphans the persisted payload
+        // (see `address_index_is_stale`), after which every date-filtered
+        // search hard-errors and the incremental fold below cannot repair it -
+        // the rewritten `fragment_bitmap` reports no unindexed fragments, so the
+        // append is a no-op over the dead zones; this phase runs right after
+        // the compaction phase, so damage from this run's own compaction heals
+        // in the same `pond sync`/`pond optimize`. Stemmer: an FTS index stamped
+        // with another fingerprint, or none - built before the stamp existed -
+        // (see `fts_stemmer_fingerprint`) is recreated before any fold could
+        // append this binary's stems to it.
+        let stale_reason = if intent.params.results_are_row_addresses()
             && address_index_is_stale(dataset, intent, &existing).await?
         {
-            tracing::warn!(
-                index = intent.name,
-                "address-domain index references rewritten fragments; recreating it",
-            );
+            Some("address-domain index references rewritten fragments; recreating it")
+        } else if matches!(intent.params, IndexParamsKind::InvertedFtsWord)
+            && fts_stemmer_stale(dataset)?
+        {
+            Some(
+                "FTS index was built by an older stemmer; rebuilding it once (seconds locally, \
+                 minutes on a remote store) - full-text search may miss some word forms until \
+                 this finishes",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = stale_reason {
+            tracing::warn!(index = intent.name, "{reason}");
             emit(
                 progress,
                 OptimizeEvent::PhaseStart {
@@ -3493,9 +3592,10 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-10 `optimize.rs` `needs_remapping`) and
+/// skips the remapper entirely (lance-11 `optimize.rs` `needs_remapping`) and
 /// only rewrites each covered index's `fragment_bitmap` to the new fragment
-/// ids (`transaction.rs` `recalculate_fragment_bitmap`). A rewrite of covered
+/// ids (lance-table `transaction/index_maintenance.rs`
+/// `recalculate_fragment_bitmap`). A rewrite of covered
 /// fragments therefore leaves zones pointing at dead ids - `dead_in_payload`,
 /// the exact condition behind the query-time "fragment N referenced by an
 /// address-domain index result was not found" internal error - while the
@@ -3602,6 +3702,7 @@ async fn rebuild_index(
         .progress(lance_progress(progress, table, intent.name))
         .await
         .with_context(|| format!("failed to rebuild index {}", intent.name))?;
+    record_fts_stemmer(dataset, intent).await?;
     Ok(())
 }
 
@@ -3627,6 +3728,7 @@ async fn index_status(
                 unindexed_fragments: total_fragments,
                 unindexed_rows: total_rows,
                 exists,
+                stemmer_current: true,
             });
             continue;
         }
@@ -3663,6 +3765,8 @@ async fn index_status(
             unindexed_fragments,
             unindexed_rows,
             exists,
+            stemmer_current: !matches!(intent.params, IndexParamsKind::InvertedFtsWord)
+                || !fts_stemmer_stale(dataset)?,
         });
     }
     Ok(statuses)

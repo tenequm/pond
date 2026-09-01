@@ -65,6 +65,9 @@ fi
 # Stripped of JSON-breaking chars - the row embeds it as a string.
 BIN_VERSION="$($POND --version | head -1 | tr -d '"\\')"
 echo "binary: $BIN_VERSION"
+# Every CLI probe names the gate store explicitly: `$POND` alone would read
+# the operator config, which need not point at the store under test.
+pond() { "$POND" --storage-path "$STORE_URL" "$@"; }
 
 now() { python3 -c 'import time; print(time.time())'; }
 probe() { # probe <name> <outfile> <cmd...> -> records best-of-runs seconds in $TMP/<name>.s
@@ -83,26 +86,26 @@ probe() { # probe <name> <outfile> <cmd...> -> records best-of-runs seconds in $
 
 echo "--- CLI probes (2 runs each, best kept) ---"
 SEARCH_ARGS=(search --mode vector "read performance optimization lance" --limit 10)
-probe get_session_sid "$TMP/map-sid.txt" $POND get-session "$PROBE_SID"
-probe get_session_mid "$TMP/map-mid.txt" $POND get-session "$PROBE_MID"
-probe get_message     "$TMP/map-msg.txt" $POND get-message "$PROBE_MID"
-probe search          "$TMP/search.txt"  $POND "${SEARCH_ARGS[@]}"
+probe get_session_sid "$TMP/map-sid.txt" pond get-session "$PROBE_SID"
+probe get_session_mid "$TMP/map-mid.txt" pond get-session "$PROBE_MID"
+probe get_message     "$TMP/map-msg.txt" pond get-message "$PROBE_MID"
+probe search          "$TMP/search.txt"  pond "${SEARCH_ARGS[@]}"
 # Date-scoped search is the worst-measured real query shape (28-31% success vs
 # 47-48% unfiltered in the 63-day trace behind
 # docs/researches/2608-21-semantic-vs-fts-usage-eval); the timestamp zonemap
 # exists for it. Same query as `search` so the pair isolates the date filter.
 DATED_DAYS="${DATED_DAYS:-7}"
 DATED_FROM="$(python3 -c "import datetime; print((datetime.date.today() - datetime.timedelta(days=$DATED_DAYS)).isoformat())")"
-probe search_dated    "$TMP/search-dated.txt" $POND "${SEARCH_ARGS[@]}" --from-date "$DATED_FROM"
-t0=$(now); $POND sql "SELECT count(*) FROM messages" > "$TMP/sql.txt"; t1=$(now)
+probe search_dated    "$TMP/search-dated.txt" pond "${SEARCH_ARGS[@]}" --from-date "$DATED_FROM"
+t0=$(now); pond sql "SELECT count(*) FROM messages" > "$TMP/sql.txt"; t1=$(now)
 python3 -c "print(f'{$t1 - $t0:.1f}')" > "$TMP/sql_count.s"
 printf '%-28s       %ss\n' sql_count "$(cat "$TMP/sql_count.s")"
 
 echo "--- map-vs-scan equivalence (empty cache forces the scan path) ---"
 EMPTY="$TMP/empty-cache"; mkdir "$EMPTY"
-XDG_CACHE_HOME=$EMPTY $POND get-session "$PROBE_SID" > "$TMP/scan-sid.txt" 2>/dev/null
-XDG_CACHE_HOME=$EMPTY $POND get-session "$PROBE_MID" > "$TMP/scan-mid.txt" 2>/dev/null
-XDG_CACHE_HOME=$EMPTY $POND get-message "$PROBE_MID" > "$TMP/scan-msg.txt" 2>/dev/null
+XDG_CACHE_HOME=$EMPTY pond get-session "$PROBE_SID" > "$TMP/scan-sid.txt" 2>/dev/null
+XDG_CACHE_HOME=$EMPTY pond get-session "$PROBE_MID" > "$TMP/scan-mid.txt" 2>/dev/null
+XDG_CACHE_HOME=$EMPTY pond get-message "$PROBE_MID" > "$TMP/scan-msg.txt" 2>/dev/null
 for f in sid mid msg; do
   diff "$TMP/map-$f.txt" "$TMP/scan-$f.txt" > /dev/null || { echo "EQUIVALENCE FAILED: $f"; diff "$TMP/map-$f.txt" "$TMP/scan-$f.txt" | head -20; exit 1; }
 done

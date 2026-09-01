@@ -2499,6 +2499,24 @@ impl Store {
         filter: &Predicate,
     ) -> Result<lance::dataset::scanner::Scanner> {
         let mut scanner = self.handle.scanner(Table::Messages, Some(filter)).await?;
+        // Checked once per process, and never fatal: a diagnostic must not fail
+        // a query, and a long-lived `serve` would otherwise re-read the manifest
+        // on every query until the next sync heals the index.
+        static STEMMER_CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if STEMMER_CHECKED.get().is_none() {
+            if !self
+                .handle
+                .messages_fts_stemmer_current()
+                .await
+                .unwrap_or(true)
+            {
+                tracing::warn!(
+                    "FTS index was built by an older stemmer; full-text search may miss some \
+                     word forms until `pond optimize` (or the next sync) rebuilds it",
+                );
+            }
+            let _ = STEMMER_CHECKED.set(());
+        }
         scanner.full_text_search(
             FullTextSearchQuery::new(query.to_owned()).with_column("search_text".to_owned())?,
         )?;
