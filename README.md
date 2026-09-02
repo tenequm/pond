@@ -263,7 +263,7 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 | `claude-code` | Claude Code CLI, `~/.claude/projects` | 2026-08-14 |
 | `claude-desktop-app` | Claude Desktop / Cowork local agent sessions | 2026-05-13 |
 | `claude-ai-export` | claude.ai data-export archive (manual `--path`) | 2026-06-04 |
-| `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-05-13 |
+| `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-09-01 |
 | `opencode` | opencode, `~/.local/share/opencode` (SQLite DB + legacy tree) | 2026-07-14 |
 | `openclaw` | openclaw, `~/.openclaw` | 2026-05-13 |
 | `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-05-14 |
@@ -306,12 +306,13 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 6 | Eleven harnesses, `pond resume` into any client, MCP registry, Windows | ✅ [v0.14.11](https://github.com/tenequm/pond/releases/tag/v0.14.11) |
 | 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ✅ [v0.15.0](https://github.com/tenequm/pond/releases/tag/v0.15.0) |
 | 8 | New adapters become routine: `add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) - twelve harnesses | ✅ [v0.15.1](https://github.com/tenequm/pond/releases/tag/v0.15.1) |
-| 9 | Lance 10: count pushdown, date-filter zonemaps, faster index commits. [#145](https://github.com/tenequm/pond/issues/145) | ⏭ Next |
+| 9 | Lance 10, then 11: count pushdown, date-filter zonemaps, stemmer self-heal. [#145](https://github.com/tenequm/pond/issues/145) | ✅ [v0.16.0](https://github.com/tenequm/pond/releases/tag/v0.16.0)-[v0.17.0](https://github.com/tenequm/pond/releases/tag/v0.17.0) |
 | 10 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
 | 11 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
-| 12 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | ⏳ Later |
+| 12 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | 🔧 In progress ([design](docs/plans/2609-01-scoped-access-tenants-design.md)) |
 | 13 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
-| | Community adapters: ten harnesses wanted, playbook-driven - Gemini CLI, Qwen Code, Crush, Cline, OpenHands, Copilot CLI, Cursor CLI, Droid, Kiro CLI, Roo/Zoo Code. [`adapter` issues](https://github.com/tenequm/pond/issues?q=is%3Aissue%20state%3Aopen%20label%3Aadapter) | 🙋 Wanted |
+| 14 | herdr plugin: every session in one list, live or not, on any machine. Resume, fork, hand off. [#219](https://github.com/tenequm/pond/issues/219) | ⏳ Later |
+| | Community adapters: ten harnesses wanted, playbook-driven - Antigravity CLI, Qwen Code, Crush, Cline, OpenHands, Copilot CLI, Cursor CLI, Droid, Kiro CLI, Roo/Zoo Code. [`adapter` issues](https://github.com/tenequm/pond/issues?q=is%3Aissue%20state%3Aopen%20label%3Aadapter) | 🙋 Wanted |
 | | A capture daemon. pond reads what your harness already writes. | ❌ Not planned |
 | | A hosted service that owns your bucket. Your storage stays yours. | ❌ Not planned |
 | | Summaries or pruning of stored sessions. pond keeps the sessions. | ❌ Not planned |
