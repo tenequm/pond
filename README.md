@@ -312,6 +312,7 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 12 | Namespaces: keep work and personal sessions apart. [#166](https://github.com/tenequm/pond/issues/166) | 🔧 In progress ([design](docs/plans/2609-01-scoped-access-tenants-design.md)) |
 | 13 | Redaction on copy, export, and resume. Never at ingest. [#167](https://github.com/tenequm/pond/issues/167) | ⏳ Later |
 | 14 | herdr plugin: every session in one list, live or not, on any machine. Resume, fork, hand off. [#219](https://github.com/tenequm/pond/issues/219) | ⏳ Later |
+| | The canonical model as a published contract: ATIF export and import, a `/format` page, a stability promise. Vote-gated, outside the numbered order. [#180](https://github.com/tenequm/pond/issues/180) | 🔧 In progress |
 | | Community adapters: ten harnesses wanted, playbook-driven - Antigravity CLI, Qwen Code, Crush, Cline, OpenHands, Copilot CLI, Cursor CLI, Droid, Kiro CLI, Roo/Zoo Code. [`adapter` issues](https://github.com/tenequm/pond/issues?q=is%3Aissue%20state%3Aopen%20label%3Aadapter) | 🙋 Wanted |
 | | A capture daemon. pond reads what your harness already writes. | ❌ Not planned |
 | | A hosted service that owns your bucket. Your storage stays yours. | ❌ Not planned |
