@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/tenequm/pond/compare/v0.17.0...v0.17.1) - 2026-09-02
+
+### <!-- 5 -->📚 Documentation
+- **readme:** add the vote-gated format-contract row to the roadmap ([e3073cb](https://github.com/tenequm/pond/commit/e3073cb40186848568ffd239fa2b27df07526d4a))
+- **readme:** roadmap after v0.17.0 - step 9 shipped, namespaces in progress, herdr plugin #219, Antigravity CLI replaces Gemini CLI ([ac08614](https://github.com/tenequm/pond/commit/ac0861454424937ce0b78ae1796a44e802d749d1))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.17.0...v0.17.1
+
 ## [0.17.0](https://github.com/tenequm/pond/compare/v0.16.3...v0.17.0) - 2026-09-01
 
 ### <!-- 0 -->🛠 Breaking Changes
