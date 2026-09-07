@@ -627,17 +627,36 @@ jobs:
       # The tag was cut from this checkout's HEAD, so this lands one commit
       # after it: tag-pinned flake refs carry the previous release's hashes,
       # main is always current. [skip ci] keeps the push from triggering CI.
+      # The commit is created through GraphQL createCommitOnBranch instead of
+      # git push: GitHub signs API commits itself, so main satisfies the
+      # ruleset's required-signatures rule with no key material on the runner.
       - name: Point the repo flake at the new binaries
         if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
+        env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
         run: |
           set -euo pipefail
-          cp "$RUNNER_TEMP/pond.nix" ops/nix/pond.nix
-          git add ops/nix/pond.nix
-          git -c user.name=ci -c user.email=ci@pond commit -m "chore(release): point flake at v$V binaries [skip ci]"
-          git fetch "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond" main
-          git rebase FETCH_HEAD
-          git push "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond" HEAD:main
+          # Re-read the head OID on every try: the checkout is minutes old, and
+          # expectedHeadOid must be main's tip at commit time. Retries only lose
+          # to a push landing inside that seconds-wide window.
+          for i in 1 2 3; do
+            if gh api graphql \
+              -f query='mutation($head: GitObjectID!, $contents: Base64String!, $message: String!) {
+                createCommitOnBranch(input: {
+                  branch: { repositoryNameWithOwner: "tenequm/pond", branchName: "main" }
+                  expectedHeadOid: $head
+                  message: { headline: $message }
+                  fileChanges: { additions: [{ path: "ops/nix/pond.nix", contents: $contents }] }
+                }) { commit { oid } }
+              }' \
+              -f head="$(gh api repos/tenequm/pond/branches/main --jq .commit.sha)" \
+              -f contents="$(base64 < "$RUNNER_TEMP/pond.nix" | tr -d '\n')" \
+              -f message="chore(release): point flake at v$V binaries [skip ci]"; then
+              exit 0
+            fi
+            sleep "$i"
+          done
+          echo "createCommitOnBranch kept losing the head-OID race" >&2
+          exit 1
 
       - name: Publish Homebrew formula
         if: ${{ steps.release-plz.outputs.releases_created }}
