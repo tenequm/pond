@@ -171,7 +171,7 @@ fn tool_text(result: &CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|content| content.raw.as_text())
+        .and_then(|content| content.as_text())
         .map(|text| text.text.as_str())
         .expect("a tool result should carry a text block")
 }
@@ -193,7 +193,7 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     let server_info = client
         .peer_info()
         .expect("server sent its initialize result");
-    assert_eq!(server_info.server_info.name, "pond");
+    assert_eq!(server_info.server_info.as_ref().unwrap().name, "pond");
 
     let tools = client.list_all_tools().await?;
     let meta_chars = |name: &str| -> Option<i64> {

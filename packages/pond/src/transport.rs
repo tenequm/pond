@@ -348,10 +348,10 @@ pub mod mcp {
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
-            AnnotateAble, CallToolResult, Content, ErrorCode as JsonRpcErrorCode, Implementation,
-            ListResourcesResult, ListToolsResult, Meta, PaginatedRequestParams, RawResource,
-            ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-            ServerInfo,
+            CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode, Implementation,
+            ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+            ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+            ResourceContents, ServerCapabilities, ServerInfo,
         },
         schemars,
         service::RequestContext,
@@ -946,13 +946,13 @@ Examples (4 patterns the agent should recognize):
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
             let Some(mode) = parse_search_mode(params.mode.as_deref()) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "unknown mode {:?}; use \"vector\" or \"fts\"",
                     params.mode.unwrap_or_default()
                 ))]));
             };
             let Some(sort_by) = parse_sort_by(params.sort_by.as_deref()) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "unknown sort_by {:?}; use \"relevance\" or \"recency\"",
                     params.sort_by.unwrap_or_default()
                 ))]));
@@ -992,7 +992,7 @@ Examples (4 patterns the agent should recognize):
                 // one: a JSON-RPC error makes plugin hosts tear down and respawn
                 // the pond child on every call.
                 SearchEnvelope::Error(envelope) if is_semantic_disabled(&envelope) => Ok(
-                    CallToolResult::error(vec![Content::text(envelope.error.message.clone())]),
+                    CallToolResult::error(vec![ContentBlock::text(envelope.error.message.clone())]),
                 ),
                 SearchEnvelope::Error(envelope) => Err(to_error_data(&envelope)),
             }
@@ -1110,7 +1110,7 @@ Examples (4 patterns the agent should recognize):
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
                 Some("ndjson") => sql::Mode::Export(sql::Format::Ndjson),
                 Some(other) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "unknown format {other:?}; use \"text\", \"parquet\", or \"ndjson\""
                     ))]));
                 }
@@ -1189,7 +1189,7 @@ Examples (4 patterns the agent should recognize):
                     }
                 }
                 Err(sql::SqlError::Query(message)) => {
-                    Ok(CallToolResult::error(vec![Content::text(message)]))
+                    Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
                 }
                 Err(sql::SqlError::Infra(error)) => Err(ErrorData::internal_error(
                     format!("sql execution failed: {error}"),
@@ -1268,31 +1268,29 @@ Examples (4 patterns the agent should recognize):
             _request: Option<PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
         ) -> Result<ListResourcesResult, ErrorData> {
-            Ok(ListResourcesResult {
-                resources: vec![
-                    RawResource::new("schema://pond", "pond search schema").no_annotation(),
-                    RawResource::new("schema://pond-sql", "pond SQL table schema").no_annotation(),
-                    RawResource::new("stats://pond", "pond corpus stats").no_annotation(),
-                ],
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListResourcesResult::with_all_items(vec![
+                Resource::new("schema://pond", "pond search schema"),
+                Resource::new("schema://pond-sql", "pond SQL table schema"),
+                Resource::new("stats://pond", "pond corpus stats"),
+            ]))
         }
 
         async fn read_resource(
             &self,
             request: ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<ReadResourceResult, ErrorData> {
+        ) -> Result<ReadResourceResponse, ErrorData> {
             match request.uri.as_str() {
                 "schema://pond" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     schema_doc_for(crate::embed::embeddings_enabled()),
                     request.uri,
-                )])),
+                )])
+                .into()),
                 "schema://pond-sql" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     SQL_SCHEMA_DOC,
                     request.uri,
-                )])),
+                )])
+                .into()),
                 // `pond_sql` export artifacts: read the file pond wrote
                 // (parquet -> base64 blob, ndjson -> text). The filename is
                 // validated to a minted `<uuid>.<ext>` so the URI can't traverse.
@@ -1317,7 +1315,7 @@ Examples (4 patterns the agent should recognize):
                         ResourceContents::blob(STANDARD.encode(&bytes), request.uri)
                             .with_mime_type("application/vnd.apache.parquet")
                     };
-                    Ok(ReadResourceResult::new(vec![contents]))
+                    Ok(ReadResourceResult::new(vec![contents]).into())
                 }
                 "stats://pond" => {
                     let store = &self.state.store;
@@ -1393,7 +1391,8 @@ Examples (4 patterns the agent should recognize):
                     Ok(ReadResourceResult::new(vec![ResourceContents::text(
                         stats.to_string(),
                         request.uri,
-                    )]))
+                    )])
+                    .into())
                 }
                 other => Err(ErrorData::resource_not_found(
                     format!("unknown resource: {other}"),
@@ -1408,11 +1407,7 @@ Examples (4 patterns the agent should recognize):
             context: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, ErrorData> {
             let _ = (request, context);
-            let mut result = ListToolsResult {
-                tools: self.tool_router.list_all(),
-                next_cursor: None,
-                meta: None,
-            };
+            let mut result = ListToolsResult::with_all_items(self.tool_router.list_all());
             annotate_tool_limits(&mut result);
             annotate_search_mode_with(&mut result, crate::embed::embeddings_enabled());
             Ok(result)
@@ -1489,7 +1484,7 @@ Examples (4 patterns the agent should recognize):
                 "anthropic/maxResultSizeChars".to_owned(),
                 serde_json::json!(chars),
             );
-            tool.meta = Some(Meta(meta));
+            tool.meta = Some(MetaObject(meta));
         }
     }
 
@@ -1511,7 +1506,7 @@ Examples (4 patterns the agent should recognize):
     /// is the whole point on the MCP surface. Programmatic clients that want the
     /// structured wire shape use the HTTP `/v1/*` JSON API instead.
     fn tool_result(transcript: String) -> CallToolResult {
-        CallToolResult::success(vec![Content::text(transcript)])
+        CallToolResult::success(vec![ContentBlock::text(transcript)])
     }
 
     /// Build the `pond_sql` export result: a text summary plus a
@@ -1546,11 +1541,14 @@ Examples (4 patterns the agent should recognize):
                 path.display()
             ));
         }
-        let link = RawResource::new(uri, name.to_owned())
+        let link = Resource::new(uri, name.to_owned())
             .with_description(format!("pond SQL export ({}, {rows} rows)", format.ext()))
             .with_mime_type(format.mime().to_owned())
-            .with_size(u32::try_from(bytes).unwrap_or(u32::MAX));
-        CallToolResult::success(vec![Content::text(summary), Content::resource_link(link)])
+            .with_size(u64::try_from(bytes).unwrap_or(u64::MAX));
+        CallToolResult::success(vec![
+            ContentBlock::text(summary),
+            ContentBlock::resource_link(link),
+        ])
     }
 
     /// Accept only the export filenames pond mints (`<uuid>.parquet|ndjson`),
@@ -1602,6 +1600,51 @@ Examples (4 patterns the agent should recognize):
 
         use super::*;
         use crate::wire::{ErrorBody, ErrorCode};
+
+        #[tokio::test]
+        async fn discovery_startup_exposes_pond_tools() -> anyhow::Result<()> {
+            use rmcp::{ClientLifecycleMode, ClientServiceExt, model::ProtocolVersion};
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let temp = tempfile::TempDir::new()?;
+                let server = PondMcp::new(AppState {
+                    store: Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
+                    embedder: Arc::new(crate::embed::LazyEmbedder::candle()),
+                    search: crate::config::SearchConfig::default(),
+                });
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let server_task = tokio::spawn(async move {
+                    server.serve(server_io).await?.waiting().await?;
+                    anyhow::Ok(())
+                });
+                let client = ()
+                    .serve_with_lifecycle(
+                        client_io,
+                        ClientLifecycleMode::Discover {
+                            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                        },
+                    )
+                    .await?;
+                let info = client.peer_info().unwrap();
+                assert_eq!(info.server_info.as_ref().unwrap().name, "pond");
+                let tools = client.list_all_tools().await?;
+                let mut names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+                names.sort_unstable();
+                assert_eq!(
+                    names,
+                    [
+                        "pond_get_message",
+                        "pond_get_session",
+                        "pond_search",
+                        "pond_sql"
+                    ]
+                );
+                client.cancel().await?;
+                server_task.await??;
+                anyhow::Ok(())
+            })
+            .await?
+        }
 
         #[test]
         fn error_data_carries_code_and_retryability() {
@@ -1675,15 +1718,11 @@ Examples (4 patterns the agent should recognize):
         #[test]
         fn annotate_tool_limits_sets_anthropic_meta() {
             let schema = Arc::new(serde_json::Map::new());
-            let mut result = ListToolsResult {
-                tools: vec![
-                    Tool::new("pond_search", "Search", Arc::clone(&schema)),
-                    Tool::new("pond_get_session", "Get session", Arc::clone(&schema)),
-                    Tool::new("pond_get_message", "Get message", Arc::clone(&schema)),
-                ],
-                next_cursor: None,
-                meta: None,
-            };
+            let mut result = ListToolsResult::with_all_items(vec![
+                Tool::new("pond_search", "Search", Arc::clone(&schema)),
+                Tool::new("pond_get_session", "Get session", Arc::clone(&schema)),
+                Tool::new("pond_get_message", "Get message", Arc::clone(&schema)),
+            ]);
             annotate_tool_limits(&mut result);
             let value = |name: &str| {
                 result
@@ -1735,11 +1774,7 @@ Examples (4 patterns the agent should recognize):
         }
 
         fn listed_tools() -> ListToolsResult {
-            ListToolsResult {
-                tools: PondMcp::tool_router().list_all(),
-                next_cursor: None,
-                meta: None,
-            }
+            ListToolsResult::with_all_items(PondMcp::tool_router().list_all())
         }
 
         fn search_tool(result: &ListToolsResult) -> &Tool {
