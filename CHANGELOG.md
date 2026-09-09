@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.17.1](https://github.com/tenequm/pond/compare/v0.17.0...v0.17.1) - 2026-09-09
+
+### <!-- 2 -->🐛 Bug Fixes
+- **mcp:** support stdio discovery startup ([#223](https://github.com/tenequm/pond/pull/223)) ([d0294af](https://github.com/tenequm/pond/commit/d0294af714c37f3d1b099639719cfc3840aac4fb))
+  Pond's stdio MCP server now supports the modern discovery startup used
+  by dual-era clients such as Antigravity while remaining compatible with
+  legacy MCP clients. No HTTP daemon or port workaround is needed.
+
+### <!-- 5 -->📚 Documentation
+- **readme:** add the vote-gated format-contract row to the roadmap ([e3073cb](https://github.com/tenequm/pond/commit/e3073cb40186848568ffd239fa2b27df07526d4a))
+- **readme:** roadmap after v0.17.0 - step 9 shipped, namespaces in progress, herdr plugin #219, Antigravity CLI replaces Gemini CLI ([ac08614](https://github.com/tenequm/pond/commit/ac0861454424937ce0b78ae1796a44e802d749d1))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.17.0...v0.17.1
+
 ## [0.17.0](https://github.com/tenequm/pond/compare/v0.16.3...v0.17.0) - 2026-09-01
 
 ### <!-- 0 -->🛠 Breaking Changes
