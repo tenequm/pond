@@ -182,14 +182,14 @@ fn first_text(result: &CallToolResult) -> Option<&str> {
     result
         .content
         .iter()
-        .find_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
+        .find_map(|content| content.as_text().map(|text| text.text.as_str()))
 }
 
 fn resource_link_uri(result: &CallToolResult) -> Option<String> {
     result
         .content
         .iter()
-        .find_map(|content| content.raw.as_resource_link().map(|link| link.uri.clone()))
+        .find_map(|content| content.as_resource_link().map(|link| link.uri.clone()))
 }
 
 #[tokio::test(flavor = "multi_thread")]
