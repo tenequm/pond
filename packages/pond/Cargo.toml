@@ -241,7 +241,7 @@ lance-linalg = "11.0.0"
 # The `protoc` feature is activated via the non-Windows per-target gate below.
 lance = { version = "11.0.0" }
 lance-index = "11.0.0"
-# Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
+# Re-declared so the MCP tests can drive the server in-process via the `client` feature.
 rmcp = { version = "3.2.0", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
 rusqlite = { version = "0.40", features = ["bundled"] }

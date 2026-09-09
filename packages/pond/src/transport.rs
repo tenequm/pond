@@ -1491,6 +1491,14 @@ Examples (4 patterns the agent should recognize):
     /// Run the stdio MCP server until the client disconnects. All diagnostics
     /// go to stderr (the shared `tracing` subscriber); stdout carries only
     /// JSON-RPC frames, written by rmcp's stdio transport (spec.md#scope).
+    ///
+    /// TODO(rust-sdk#1248): a first request carrying incomplete 2026-07-28
+    /// `_meta` is answered `-32602` and then still ends the process, so a
+    /// client opening with a malformed probe never gets to fall back. Upstream
+    /// is making that recoverable (rust-sdk#1157 -> #1160 shipped the error
+    /// response, <https://github.com/modelcontextprotocol/rust-sdk/pull/1248>
+    /// keeps the connection open), so pond stays on the default
+    /// `.serve(stdio())` and inherits it on the next rmcp bump.
     pub async fn serve_stdio(state: AppState) -> anyhow::Result<()> {
         let service = PondMcp::new(state)
             .serve(stdio())
@@ -1601,6 +1609,10 @@ Examples (4 patterns the agent should recognize):
         use super::*;
         use crate::wire::{ErrorBody, ErrorCode};
 
+        /// A 2026-07-28 client opens with `server/discover` before
+        /// `initialize`, which rmcp 1.7 treated as fatal. `V_2026_07_28` is
+        /// deliberately not `ProtocolVersion::LATEST` (2025-11-25) - `LATEST`
+        /// negotiates the classic handshake and stops exercising discovery.
         #[tokio::test]
         async fn discovery_startup_exposes_pond_tools() -> anyhow::Result<()> {
             use rmcp::{ClientLifecycleMode, ClientServiceExt, model::ProtocolVersion};

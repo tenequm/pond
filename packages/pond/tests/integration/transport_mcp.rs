@@ -323,6 +323,6 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     assert_eq!(data.get("retryable"), Some(&json!(false)));
 
     client.cancel().await?;
-    let _ = server_handle.await;
+    server_handle.await??;
     Ok(())
 }
