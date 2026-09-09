@@ -268,6 +268,7 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 | `openclaw` | openclaw, `~/.openclaw` | 2026-05-13 |
 | `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-05-14 |
 | `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |
+| `goose` | Goose (Block), `~/.local/share/goose/data` (SQLite DB + legacy JSONL) | 2026-08-25 |
 | `pi-coding-agent` | pi, `~/.pi/agent/sessions` | 2026-08-06 |
 | `oh-my-pi` | oh-my-pi, `~/.omp/agent/sessions` (ingest-only) | 2026-08-14 |
 | `letta-code` | letta-code, `~/.letta/transcripts` (a root relocated via `LETTA_TRANSCRIPT_ROOT` is configured as an explicit `path`) | 2026-08-24 |
