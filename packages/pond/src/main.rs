@@ -6275,9 +6275,12 @@ async fn local_status(
         .flatten();
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
-    // last sync - exactly the baseline "pending since then" wants, and a
-    // version-matched load would cost a remote manifest read instead.
-    let rowmap = store.open_cached_rowmap(&default_cache_dir());
+    // last sync - exactly the baseline "pending since then" wants. It costs one
+    // manifest read (a row count) to reject a chain left by a PREVIOUS store at
+    // this path; without that, status reports a rebuilt store as fully synced.
+    // `None` leaves `pending_known` false, so status says "unknown" rather than
+    // a number it cannot stand behind.
+    let rowmap = store.open_cached_rowmap(&default_cache_dir()).await;
     let pending_known = rowmap.is_some();
     let oracle = pond::sessions::RowmapOracle(rowmap);
     let mut adapters = Vec::new();
