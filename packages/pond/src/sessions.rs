@@ -2020,6 +2020,18 @@ impl Store {
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
         {
+            // Guarded like the sync paths, and for a sharper reason: this map
+            // is what search hydration reads message ids out of, so a chain
+            // left by a previous store at this path would not merely gate
+            // freshness wrongly - it would answer with rows attributed to
+            // sessions they do not belong to.
+            if !self.rowmap_matches_store(&set).await? {
+                tracing::warn!(
+                    store = self.store_key(),
+                    "cached rowmap describes a different store at this path; ignoring it"
+                );
+                return Ok(());
+            }
             self.rowmap.store(Some(Arc::new(set)));
         }
         Ok(())

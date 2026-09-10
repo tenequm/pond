@@ -7,13 +7,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use pond::{
-    adapter::{ClaudeCodeAdapter, NoopOracle, SkipOracle},
+    adapter::{AgyAdapter, ClaudeCodeAdapter, NoopOracle, SkipOracle},
     handlers::ingest_adapter,
     sessions::{RowmapOracle, Store},
 };
 use tempfile::TempDir;
 
 const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
+const AGY_FIXTURES: &str = "tests/fixtures/adapter/agy";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rowmap_oracle_skips_unchanged_then_verify_re_reads() -> anyhow::Result<()> {
@@ -102,6 +103,57 @@ async fn a_store_rebuilt_at_the_same_path_does_not_inherit_the_old_rowmap() -> a
         "every session must land in the rebuilt store, not skip as fresh",
     );
     assert_eq!(after.skipped_fresh, 0, "nothing in an empty store is fresh");
+    Ok(())
+}
+
+/// The read commands take a different door to the same map: `pond search`,
+/// `get-message` and `get-session` call `load_rowmap_if_present`, which
+/// installs a discovered chain without building one. Left unguarded, a chain
+/// from a previous store at this path is what search hydrates message ids out
+/// of - answering with rows attributed to sessions they do not belong to,
+/// which is worse than the empty-sync symptom.
+///
+/// The rebuilt store is populated with a DIFFERENT corpus, for two reasons: an
+/// empty store never reaches the version the chain claims, so nothing would
+/// install and the test would pass vacuously; and when both stores hold the
+/// same rows a stale map is right by coincidence, so only disjoint data can
+/// show the hazard.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_path_ignores_a_rowmap_from_a_previous_store() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let cache = temp.path().join("cache");
+    let store_dir = temp.path().join("store");
+
+    let store = Store::open_local(&store_dir).await?;
+    ingest_adapter(
+        &store,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+    store.ensure_rowmap(&cache).await?;
+    assert!(!RowmapOracle(store.rowmap_snapshot()).is_empty());
+    drop(store);
+
+    std::fs::remove_dir_all(&store_dir)?;
+    let rebuilt = Store::open_local(&store_dir).await?;
+    ingest_adapter(
+        &rebuilt,
+        &AgyAdapter::new(AGY_FIXTURES),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+
+    // The read path installs a chain, it never builds one - so with the guard
+    // holding, this store has no resident map at all rather than another
+    // store's.
+    rebuilt.load_rowmap_if_present(&cache).await?;
+    assert!(
+        RowmapOracle(rebuilt.rowmap_snapshot()).is_empty(),
+        "a read command must not hydrate from the previous store's map",
+    );
     Ok(())
 }
 
