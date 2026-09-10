@@ -1,0 +1,7 @@
+{"display":"Reply with exactly: first interactive turn","timestamp":1789053430202,"workspace":"/tmp/agy-fixture/project"}
+{"display":"Reply with exactly: second interactive turn","timestamp":1789053434268,"workspace":"/tmp/agy-fixture/project","conversationId":"07439cf3-11de-46cd-ae53-730229b38bac"}
+{"display":"/rewind","timestamp":1789053438397,"workspace":"/tmp/agy-fixture/project","conversationId":"07439cf3-11de-46cd-ae53-730229b38bac","type":"slash_command"}
+{"display":"Reply with exactly: turn after the rewind","timestamp":1789053447525,"workspace":"/tmp/agy-fixture/project","conversationId":"07439cf3-11de-46cd-ae53-730229b38bac"}
+{"display":"/fork","timestamp":1789053451624,"workspace":"/tmp/agy-fixture/project","conversationId":"07439cf3-11de-46cd-ae53-730229b38bac","type":"slash_command"}
+{"display":"Reply with exactly: first turn inside the fork","timestamp":1789053458683,"workspace":"/tmp/agy-fixture/project","conversationId":"3abd71a7-c181-48a7-a473-16f564089f7a"}
+{"display":"/exit","timestamp":1789053462774,"workspace":"/tmp/agy-fixture/project","conversationId":"3abd71a7-c181-48a7-a473-16f564089f7a","type":"slash_command"}

@@ -1,0 +1,6 @@
+
+The command exited with code 1.
+Stdout:
+
+Stderr:
+
