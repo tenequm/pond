@@ -371,9 +371,39 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
 
+## bench-gate: quiet Linux re-run (openclaw DB era, #228)
+
+### 2026-09-10 - ws-pond-01, `92c32c4`, pond 0.17.1 (x86_64-linux) - the clean row
+
+The re-run the section below deferred, taken after [#232](https://github.com/tenequm/pond/pull/232) merged so the row carries `rowmap_cold_ms` / `rowmap_warm_ms` instead of the dead `oracle_warm_ms`. Machine quiet this time: `pond schedule stop` for the window, no cargo running (every binary the gate needs was pre-built, so its own `cargo build --release` finished in 0.63s), nothing else on the VM. `EQUIVALENCE OK`. Clean tree at the merge commit, so this is the first row all day whose `commit` field is not `-dirty`.
+
+**It refutes half of the contamination call in the section below, and the half it refutes is the half that named a cause.** Four rows on one machine, one store (`5fcd5e32b8dd`), one day:
+
+```
+metric                  19:24        20:29        21:06        22:09
+                      e3e6a26      5838108   5bc4f8b(*)      92c32c4
+write_copy_ms            2812         2954         7353         3777
+write_copy_noop_ms        393          266         1086          481
+write_index_build_ms     9063        12982        14480        14284
+search_dated_s            4.5         10.3         15.0         10.0
+search_s                  3.6          4.8          5.5          4.1
+get_session_sid_s        14.7         19.9         16.7         15.8
+                                            (*) the loaded run
+```
+
+- **Contention confirmed for the `write_copy` family.** `write_copy_ms` 7353 -> 3777 and `write_copy_noop_ms` 1086 -> 481 on a quiet machine. Those two spikes were the operator's builds, as claimed.
+- **Refuted for `write_index_build_ms`.** It did not recover: 14480 loaded, 14284 quiet, a 1% difference. It instead steps 9063 -> 12982 between the 19:24 and 20:29 rows and stays at 13-14.5s for the three rows after. Three of four rows agree; the 9063 row is the outlier, not the norm. The section below called this column "precisely the CPU-bound" evidence of contention, and that was wrong twice - it did not move with load, and it is not CPU-bound, because `write_bench` builds its index against an S3 scratch prefix and the time is dominated by round trips to nbg1.
+- **Partly refuted for `search_dated_s`.** 15.0 -> 10.0 quiet, so load was worth ~5s, but the floor is 10s and the 19:24 row's 4.5s does not come back. The 20:29 row independently read 10.3s.
+
+No PR in the bracket touches the write path or the scanner, so the honest reading of the step between 19:24 and 20:29 is store- or endpoint-side drift that one gate row cannot separate from a code effect. That is the same conclusion #226 reached from the other direction, and it is the durable finding here: **on this store a single gate row brackets a change to within roughly a factor of two, and no amount of quiet fixes that.** Deltas printed against the immediately preceding row should be read as "nothing moved by more than the noise floor" or not at all.
+
+First gate reading of the new columns: `rowmap_cold_ms` 141478, `rowmap_warm_ms` 1119. Cold is the ~2m21s a first sync on a fresh host pays before printing anything (#226 measured 183805 ms on the same path an hour earlier - a 23% spread on a number neither run had any reason to move, which is the noise floor stated again).
+
+`bash ops/scripts/bench-gate.sh`, `pond schedule start` afterwards.
+
 ## bench-gate: second Linux row (openclaw DB era, #228)
 
-### 2026-09-10 - ws-pond-01, `5bc4f8b-dirty`, pond 0.17.1 (x86_64-linux) - CONTAMINATED, DO NOT COMPARE
+### 2026-09-10 - ws-pond-01, `5bc4f8b-dirty`, pond 0.17.1 (x86_64-linux) - CONTAMINATED, but see the clean re-run above
 
 **Read nothing into this row's deltas. The machine was not quiet, and the operator is the one who made it noisy.** For the whole 30-minute window (20:36-21:06Z) the same VM was running `cargo bench ingest_bench` (a 9-minute compile plus two bench passes), `cargo test --locked`, `cargo clippy --all-targets`, and a `cargo build` - and the gate's own `write_bench` leg spent 2m24s compiling against that. The row is in `bench-gate-baseline.jsonl` because the gate appends it itself, and this entry exists so nobody later reads it as a regression.
 
@@ -406,11 +436,13 @@ write_fold_ms               2192        2588      +18%
 
 Why this is contention and not code: **neither PR in the bracket touches the read or write substrate.** #225 adds an adapter, #228 fixes a different adapter and the CLI surfaces that report counts. Nothing between the two rows changed a Lance call, a commit path, or an index policy. Yet the columns that blew out are precisely the CPU-bound ones - `write_copy_ms` +161%, `write_index_build_ms` +60%, `write_copy_noop_ms` +176% - while `vector_iops` (S3 requests per warm query, a count rather than a time) is identical at 92. A code regression does not move wall-clock and leave request counts untouched; a busy machine does exactly that.
 
+**The quiet re-run above kept the first and third of those and threw out the second.** `write_copy_ms` and `write_copy_noop_ms` came back down; `write_index_build_ms` did not, and calling it CPU-bound was an error - it is S3 round trips. The paragraph is left as written because being able to see which half of a call held is the point of an append-only notebook, but read it with that correction attached.
+
 `equivalence: OK` - the map-vs-scan hard gate passed, which is the one assertion in this row that a loaded machine cannot falsify.
 
 `get_message_iops` 620 -> 75 is the one delta worth a second look, since iops is a request count. It is not a win: warm-query iops track how many index segments a query pages through, and the store is written by other hosts on a schedule, so segment count moves between runs independently of anything measured here (the 08-25 entry records the same effect after an `optimize --rebuild`). Treat cross-row iops as a property of the store's shape that day.
 
-**A clean re-run is deferred to after [#232](https://github.com/tenequm/pond/pull/232) merges**, deliberately rather than for scheduling reasons. #232 replaces `oracle_warm_ms` - which times `Store::session_last_message_ids`, a function with no production callers - with `rowmap_cold_ms` / `rowmap_warm_ms` against `ensure_rowmap`, the path sync actually takes. Re-running before that lands would buy a quiet row with a dead column still in it. After it lands, one quiet run gets both the right columns and a usable Linux noise floor, which is what the first two Linux rows were supposed to establish and neither can.
+**A clean re-run is deferred to after [#232](https://github.com/tenequm/pond/pull/232) merges** (done - it is the section above), deliberately rather than for scheduling reasons. #232 replaces `oracle_warm_ms` - which times `Store::session_last_message_ids`, a function with no production callers - with `rowmap_cold_ms` / `rowmap_warm_ms` against `ensure_rowmap`, the path sync actually takes. Re-running before that lands would buy a quiet row with a dead column still in it. After it lands, one quiet run gets both the right columns and a usable Linux noise floor, which is what the first two Linux rows were supposed to establish and neither can.
 
 `bash ops/scripts/bench-gate.sh`, 30m 08s wall. Local pond sync schedule stopped for the window (`pond schedule stop`) per the 2026-08-25 incident below; other hosts still push to this store hourly.
 ## rowmap identity guard (#226)
