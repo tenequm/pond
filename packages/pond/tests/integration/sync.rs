@@ -7,13 +7,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use pond::{
-    adapter::{ClaudeCodeAdapter, NoopOracle, SkipOracle},
+    adapter::{AgyAdapter, ClaudeCodeAdapter, NoopOracle, SkipOracle},
     handlers::ingest_adapter,
     sessions::{RowmapOracle, Store},
 };
 use tempfile::TempDir;
 
 const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
+const AGY_FIXTURES: &str = "tests/fixtures/adapter/agy";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rowmap_oracle_skips_unchanged_then_verify_re_reads() -> anyhow::Result<()> {
@@ -52,6 +53,129 @@ async fn rowmap_oracle_skips_unchanged_then_verify_re_reads() -> anyhow::Result<
     assert_eq!(
         verify.inserted, 0,
         "re-reading complete data inserts nothing"
+    );
+    Ok(())
+}
+
+/// A store deleted and re-created at the same path must not inherit the old
+/// store's rowmap. The cache is keyed by a hash of the storage URL, and nothing
+/// in Lance survives a rebuild to tell the two apart - version numbers, row ids
+/// and fragment ids all restart - so the stale chain used to be installed as
+/// current and gate every session `Fresh` against rows that no longer existed:
+/// `pond sync` reported "up to date" into an empty store, exit 0, no warning.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_rebuilt_at_the_same_path_does_not_inherit_the_old_rowmap() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let cache = temp.path().join("cache");
+    let store_dir = temp.path().join("store");
+    let adapter = ClaudeCodeAdapter::new(FIXTURES);
+
+    // A store with history, and the rowmap that describes it.
+    let store = Store::open_local(&store_dir).await?;
+    let first = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
+    assert!(first.sessions_inserted > 0);
+    store.ensure_rowmap(&cache).await?;
+    assert!(!RowmapOracle(store.rowmap_snapshot()).is_empty());
+    // Drop the mapping before unlinking: Windows refuses to remove a mapped file.
+    drop(store);
+
+    // What a user does: wipe the store, keep the path, sync again. The cache
+    // directory is untouched, exactly as it survives in ~/.cache/pond.
+    std::fs::remove_dir_all(&store_dir)?;
+    assert!(
+        std::fs::read_dir(&cache)?
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "rmm")),
+        "the old store's segments must still be on disk for this to be a test"
+    );
+
+    let rebuilt = Store::open_local(&store_dir).await?;
+    rebuilt.ensure_rowmap(&cache).await?;
+    let oracle = RowmapOracle(rebuilt.rowmap_snapshot());
+    assert!(
+        oracle.is_empty(),
+        "an empty store's oracle must be empty; a stale map would gate every source fresh",
+    );
+
+    let after = ingest_adapter(&rebuilt, &adapter, &oracle, |_| {}).await?;
+    assert_eq!(
+        after.sessions_inserted, first.sessions_inserted,
+        "every session must land in the rebuilt store, not skip as fresh",
+    );
+    assert_eq!(after.skipped_fresh, 0, "nothing in an empty store is fresh");
+    Ok(())
+}
+
+/// The read commands take a different door to the same map: `pond search`,
+/// `get-message` and `get-session` call `load_rowmap_if_present`, which
+/// installs a discovered chain without building one. Left unguarded, a chain
+/// from a previous store at this path is what search hydrates message ids out
+/// of - answering with rows attributed to sessions they do not belong to,
+/// which is worse than the empty-sync symptom.
+///
+/// The rebuilt store is populated with a DIFFERENT corpus, for two reasons: an
+/// empty store never reaches the version the chain claims, so nothing would
+/// install and the test would pass vacuously; and when both stores hold the
+/// same rows a stale map is right by coincidence, so only disjoint data can
+/// show the hazard.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_path_ignores_a_rowmap_from_a_previous_store() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let cache = temp.path().join("cache");
+    let store_dir = temp.path().join("store");
+
+    let store = Store::open_local(&store_dir).await?;
+    ingest_adapter(
+        &store,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+    store.ensure_rowmap(&cache).await?;
+    assert!(!RowmapOracle(store.rowmap_snapshot()).is_empty());
+    let chain_version = store.messages_version().await?;
+    drop(store);
+
+    std::fs::remove_dir_all(&store_dir)?;
+    let rebuilt = Store::open_local(&store_dir).await?;
+    ingest_adapter(
+        &rebuilt,
+        &AgyAdapter::new(AGY_FIXTURES),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+
+    // The precondition this test rests on: `load_rowmap_if_present` installs a
+    // chain only at a matching version, so unless the two corpora land the
+    // messages dataset on the same version the guard is never reached and the
+    // assertion below passes for the wrong reason. Both fixture sets sit well
+    // under `ADAPTER_FLUSH_BATCH`, so both take one flush - but assert it
+    // rather than rely on it, or growing a fixture makes this test vacuous in
+    // silence.
+    assert_eq!(
+        rebuilt.messages_version().await?,
+        chain_version,
+        "the cached chain must sit at the rebuilt store's version, or the read \
+         path skips it for a reason unrelated to the guard",
+    );
+
+    // The read path installs a chain, it never builds one - so with the guard
+    // holding, this store has no resident map at all rather than another
+    // store's.
+    rebuilt.load_rowmap_if_present(&cache).await?;
+    assert!(
+        RowmapOracle(rebuilt.rowmap_snapshot()).is_empty(),
+        "a read command must not hydrate from the previous store's map",
+    );
+
+    // `pond status` reads the same cache through its own estimate seam, which
+    // is version-agnostic by design, so it needs the check just as much: a
+    // rebuilt store must not be reported as fully synced.
+    assert!(
+        rebuilt.open_cached_rowmap(&cache).await.is_none(),
+        "the status estimate must not use the previous store's map",
     );
     Ok(())
 }
