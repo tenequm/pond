@@ -375,7 +375,18 @@ Consequence: a store's writers must all move to the lance-11 pond before its FTS
 
 ### 2026-09-10 - ws-pond-01 -> s3-nbg1, `234f5e7` vs installed 0.17.1
 
-The guard that stops a rebuilt store inheriting the previous store's rowmap adds one probe read per `ensure_rowmap`. Measured on the path that actually changed, because **the bench gate does not reach it**: `ops_bench`'s `session_last_message_ids` (`sessions.rs:1431`) is a full scan of messages and never calls `ensure_rowmap`. A gate row is evidence that nothing else moved, not evidence about this change.
+The guard that stops a rebuilt store inheriting the previous store's rowmap adds one probe read per `ensure_rowmap`. Measured on the path that actually changed, because **the bench gate did not reach it** - and that gap is fixed in the same PR.
+
+`ops_bench`'s `[sync] change-detection oracle` timed `Store::session_last_message_ids`, a full scan of messages that **no production path has called since the resident rowmap replaced it**: the only callers left are two `mod tests` blocks and `sync_oracle_bench`, where comparing oracle strategies is the point. So the gate spent ~90 s per run measuring a path `pond sync` does not take, reported it as the sync oracle, and a change to the real oracle passed it untouched. It now times `ensure_rowmap` - what sync actually calls - as COLD (full build into an empty scratch cache) and WARM (a second `Store`, so the chain must be discovered, validated and mapped from disk rather than reused from memory). The jsonl row drops `oracle_warm_ms` and gains `rowmap_cold_ms` / `rowmap_warm_ms`; rows before 2026-09-10 carry the old column and are not comparable to the new ones.
+
+First readings of the live path, same store:
+
+```
+ensure_rowmap COLD                        183805.2 ms
+ensure_rowmap WARM                           743.0 ms
+```
+
+Three minutes to build the map from scratch is what a first sync on a fresh host pays before it prints anything, and it had never been measured. WARM at 743 ms includes the identity probe this PR adds.
 
 `pond sync --dry-run` builds the freshness map through `ensure_rowmap` (`main.rs:4476`) and writes nothing to the store, so it isolates the change. `XDG_CACHE_HOME` was redirected per arm, both arms seeded from one cold build of the operator's real chain (base `v8917`, 477 MB, plus delta `d8921`), so neither arm read or wrote `~/.cache/pond`.
 

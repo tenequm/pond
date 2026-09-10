@@ -203,12 +203,12 @@ if [ -n "$(git status --porcelain -- ':!docs/benchmarks/bench-gate-baseline.json
 # is public, so the row carries a digest (or operator-set STORE_LABEL), never
 # the store URL itself.
 STORE_LABEL="${STORE_LABEL:-$(printf %s "$STORE_URL" | shasum -a 256 | cut -c1-12)}"
-printf '{"date":"%s","commit":"%s","bin":"%s","store":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_dated_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"oracle_warm_ms":%s,"write_backend":%s,"write_corpus":%s,"write_copy_ms":%s,"write_copy_merge_ms":%s,"write_copy_noop_ms":%s,"write_copy_delta_ms":%s,"write_ms_per_commit":%s,"write_rows_per_s":%s,"write_index_build_ms":%s,"write_fold_ms":%s}\n' \
+printf '{"date":"%s","commit":"%s","bin":"%s","store":"%s","get_session_sid_s":%s,"get_session_mid_s":%s,"get_message_s":%s,"search_s":%s,"search_dated_s":%s,"search_mode":"vector","sql_count_s":%s,"equivalence":"OK","fts_iops":%s,"vector_iops":%s,"get_message_iops":%s,"search_iops":%s,"open_store_ms":%s,"row_counts_ms":%s,"rowmap_cold_ms":%s,"rowmap_warm_ms":%s,"write_backend":%s,"write_corpus":%s,"write_copy_ms":%s,"write_copy_merge_ms":%s,"write_copy_noop_ms":%s,"write_copy_delta_ms":%s,"write_ms_per_commit":%s,"write_rows_per_s":%s,"write_index_build_ms":%s,"write_fold_ms":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$BIN_VERSION" "$STORE_LABEL" \
   "$(cat "$TMP/get_session_sid.s")" "$(cat "$TMP/get_session_mid.s")" "$(cat "$TMP/get_message.s")" \
   "$(cat "$TMP/search.s")" "$(cat "$TMP/search_dated.s")" "$(cat "$TMP/sql_count.s")" \
   "$(iops fts_search)" "$(iops vector_search)" "$(iops pond_get_message)" "$(iops pond_search)" \
-  "$(ms 'open store (manifests)')" "$(ms row_counts)" "$(ms 'session_last_message_ids WARM')" \
+  "$(ms 'open store (manifests)')" "$(ms row_counts)" "$(ms 'ensure_rowmap COLD')" "$(ms 'ensure_rowmap WARM')" \
   "$WRITE_BACKEND" "$WRITE_CORPUS" \
   "$(wcopy 1)" "$(wcopy 1b)" "$(wcopy 3)" "$(wcopy 4)" \
   "$(wsweep 5)" "$(wsweep 6)" "$(wbuild)" "$(wfold)" \

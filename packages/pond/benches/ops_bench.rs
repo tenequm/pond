@@ -113,18 +113,35 @@ async fn main() -> Result<()> {
     timed("adapter_names(false)", store.adapter_names(false)).await?;
 
     // pond sync: the change-detection oracle built before any progress prints.
-    // The key derives from durable message rows, not Lance version history.
-    println!("\n[sync] change-detection oracle (read-only)");
+    //
+    // This times `ensure_rowmap`, which is what `pond sync` actually calls
+    // (`main.rs`, before the import and again to republish after it). It used to
+    // time `Store::session_last_message_ids` - a full scan of messages that no
+    // production path has called since the resident rowmap replaced it; only
+    // tests and `sync_oracle_bench` (where comparing oracle strategies is the
+    // point) still do. The gate was spending ~90 s per run measuring a path
+    // sync does not take, and reporting it as the sync oracle, so a change to
+    // the real oracle passed the gate untouched.
+    //
+    // COLD is a full build from the store into an empty cache; WARM opens the
+    // store again so the chain must be discovered, validated and mapped from
+    // disk rather than reused from the first Store's memory - the split a
+    // second sync on a warm host actually pays. The cache lives in a scratch
+    // dir: the operator's own is never read, written, or purged by a bench.
+    println!("\n[sync] change-detection oracle (read-only; rowmap cache in a scratch dir)");
+    let rowmap_cache = tempfile::tempdir().context("scratch rowmap cache")?;
     timed(
-        "session_last_message_ids COLD",
-        store.session_last_message_ids(),
+        "ensure_rowmap COLD",
+        store.ensure_rowmap(rowmap_cache.path()),
     )
     .await?;
+    let warm_store = open_configured(&url, &config).await?;
     timed(
-        "session_last_message_ids WARM",
-        store.session_last_message_ids(),
+        "ensure_rowmap WARM",
+        warm_store.ensure_rowmap(rowmap_cache.path()),
     )
     .await?;
+    drop(warm_store);
 
     // pond optimize: the read side that decides what work is owed. The embed +
     // index commits that follow are the work itself, timed by the command.
