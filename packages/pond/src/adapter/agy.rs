@@ -79,12 +79,32 @@ mod step_type {
     pub(super) const USER_INPUT: i64 = 14;
     pub(super) const PLANNER_RESPONSE: i64 = 15;
     pub(super) const ERROR_MESSAGE: i64 = 17;
+    pub(super) const RUN_COMMAND: i64 = 21;
+    pub(super) const FIND: i64 = 25;
     pub(super) const EPHEMERAL_MESSAGE: i64 = 90;
     pub(super) const CONVERSATION_HISTORY: i64 = 98;
     pub(super) const SYSTEM_MESSAGE: i64 = 101;
     pub(super) const AGENCY_TOOL_CALL: i64 = 103;
     pub(super) const GENERIC: i64 = 132;
 }
+
+/// Kind steps that execute a tool at the top level rather than inside a
+/// `GENERIC` result: the step's own payload field, then paths to the text the
+/// model was shown, best first. Both are written by the harness the ACP server
+/// spawns (`docs/adapters/agy.md` row 5).
+const KIND_TOOL_RESULTS: [(i64, u64, &[&[u64]]); 2] = [
+    // `CortexStepRunCommand`: `combined_output` (21) is a `RunCommandOutput`
+    // whose `full` (1) is the text, `truncated` (2) the shortened form agy
+    // shows instead; `stdout_output` (19) is the same message for one stream,
+    // and `stdout` (4) the older plain string.
+    (
+        step_type::RUN_COMMAND,
+        28,
+        &[&[21, 1], &[21, 2], &[19, 1], &[4]],
+    ),
+    // `CortexStepFind`: `raw_output` (11), else the error it recorded instead.
+    (step_type::FIND, 34, &[&[11], &[8]]),
+];
 
 /// `CortexStepStatus` values that mean the step is still being produced.
 /// Anything else (DONE, ERROR, CANCELED, INTERRUPTED, CLEARED, INVALID, and
@@ -1191,7 +1211,15 @@ fn tool_result_part(ids: &PartIds<'_>, step: &StepView<'_>) -> Option<Part> {
         Some(step_type::AGENCY_TOOL_CALL) => pb::message(step.payload, 116)
             .and_then(agency_tool_response)
             .map(json_or_string),
-        _ => None,
+        Some(kind) => KIND_TOOL_RESULTS
+            .iter()
+            .find(|(step_type, _, _)| *step_type == kind)
+            .and_then(|(_, payload_field, paths)| {
+                let body = pb::message(step.payload, *payload_field)?;
+                paths.iter().find_map(|path| field_path(body, path))
+            })
+            .map(|text| Value::String(text.to_owned())),
+        None => None,
     }
     .or_else(|| {
         failed
@@ -1217,6 +1245,17 @@ fn tool_result_part(ids: &PartIds<'_>, step: &StepView<'_>) -> Option<Part> {
             },
         ),
     )
+}
+
+/// A non-empty string at a path of field numbers: every number but the last
+/// steps into a submessage.
+fn field_path<'a>(body: &'a [u8], path: &[u64]) -> Option<&'a str> {
+    let (text, parents) = path.split_last()?;
+    let mut cursor = body;
+    for field in parents {
+        cursor = pb::message(cursor, *field)?;
+    }
+    pb::string(cursor, *text).filter(|text| !text.is_empty())
 }
 
 /// `CortexStepAgencyToolCall.response_messages[]` holds `google.protobuf.Any`
@@ -1891,6 +1930,100 @@ mod tests {
             }
         }
         temp
+    }
+
+    /// A `steps` row built by hand, for shapes the captured fixture does not
+    /// hold.
+    fn step_row(idx: i64, step_type: i64, status: i64, payload: Vec<u8>) -> Row {
+        let names: std::sync::Arc<[String]> = ["idx", "step_type", "status", "step_payload"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        Row {
+            names,
+            cells: vec![
+                Cell::Int(idx),
+                Cell::Int(step_type),
+                Cell::Int(status),
+                Cell::Blob(payload),
+            ],
+        }
+    }
+
+    /// The ACP lane's harness runs shell commands and file searches as
+    /// top-level kind steps, not wrapped in a `GENERIC` result. Their output
+    /// is the tool result; without this the call would pair with nothing.
+    #[test]
+    fn a_kind_step_carries_its_own_tool_result() {
+        use pb::encode;
+        let call = {
+            let mut out = Vec::new();
+            encode::bytes(1, b"call_2388674", &mut out);
+            encode::bytes(2, b"run_command", &mut out);
+            out
+        };
+        let meta = {
+            let mut out = Vec::new();
+            encode::bytes(4, &call, &mut out);
+            out
+        };
+        let run_command = {
+            // `combined_output` is a `RunCommandOutput`, not a string: the
+            // text sits one level in, which is what the path walk is for.
+            let mut output = Vec::new();
+            encode::bytes(1, b"total 4\n-rw-r--r-- 1 u u 0 calc.py\n", &mut output);
+            let mut out = Vec::new();
+            encode::uint(6, 0, &mut out);
+            encode::bytes(21, &output, &mut out);
+            encode::bytes(23, b"ls -la", &mut out);
+            out
+        };
+        let mut payload = Vec::new();
+        encode::uint(1, 21, &mut payload);
+        encode::uint(4, 3, &mut payload);
+        encode::bytes(5, &meta, &mut payload);
+        encode::bytes(28, &run_command, &mut payload);
+
+        let row = step_row(2, step_type::RUN_COMMAND, 3, payload);
+        let step = StepView::decode(&row).expect("a well-formed kind step");
+        let ids = PartIds {
+            session_id: "s",
+            message_id: "m",
+        };
+        let part = tool_result_part(&ids, &step).expect("the command's own output is the result");
+        let PartKind::ToolResult {
+            call_id,
+            name,
+            is_failure,
+            result,
+        } = part.kind
+        else {
+            panic!("a tool result");
+        };
+        assert_eq!(call_id.as_deref().map(String::as_str), Some("call_2388674"));
+        assert_eq!(name.as_deref().map(String::as_str), Some("run_command"));
+        assert!(!is_failure, "a completed command is not a failure");
+        assert!(result.as_str().unwrap().contains("calc.py"));
+
+        // The same shape for a search step, whose output field is its own.
+        let find = {
+            let mut out = Vec::new();
+            encode::bytes(1, b"*.py", &mut out);
+            encode::bytes(11, b"calc.py", &mut out);
+            out
+        };
+        let mut payload = Vec::new();
+        encode::uint(1, 25, &mut payload);
+        encode::uint(4, 3, &mut payload);
+        encode::bytes(5, &meta, &mut payload);
+        encode::bytes(34, &find, &mut payload);
+        let row = step_row(3, step_type::FIND, 3, payload);
+        let step = StepView::decode(&row).expect("a well-formed find step");
+        let part = tool_result_part(&ids, &step).expect("the search's raw output is the result");
+        let PartKind::ToolResult { result, .. } = part.kind else {
+            panic!("a tool result");
+        };
+        assert_eq!(result.as_str(), Some("calc.py"));
     }
 
     #[test]
