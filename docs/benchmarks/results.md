@@ -14,7 +14,9 @@ Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-
 - **win-5700x3d** - AMD Ryzen 7 5700X3D (8C/16T), 16 GB, Windows 11 Pro 10.0.26200, NTFS on NVMe SSD.
 - **s3-nbg1** - Hetzner object storage at `nbg1.your-objectstorage.com`, driven from mac-m1max.
 
-No Linux entry exists yet: on 2026-08-17 every recorded session mentioning a benchmark was searched for bench output carrying a Linux path or target triple, and none exists. CI does not run benches, so a Linux number would have to be produced deliberately.
+- **ws-pond-01** - Devboxes sandbox VM, NixOS (Linux 6.18.50), AMD EPYC 16 vCPU, 62 GB, ext4 on virtio SSD. Drives s3-nbg1 from Nuremberg-adjacent network rather than over a home link, which is why its S3 numbers are not comparable to mac-m1max's.
+
+The 2026-09-10 bench-gate row is the first Linux entry in this file. Before it, on 2026-08-17, every recorded session mentioning a benchmark was searched for output carrying a Linux path or target triple and none existed. CI still does not run benches.
 
 ## write_bench --append-sweep
 
@@ -368,6 +370,139 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 - Sandboxed fixture store (2,295 messages, index built by pond 0.16.3 / lance 10, queried via `fts('messages', ...)` counts): a lance-11 binary returned `internal` 4 -> 0 and `paste` 1 -> 0 against the lance-10 index. After `pond optimize --rebuild` with the lance-11 binary: `internal` 4, `added`/`adding` 19 -> 32 (`add`, `added`, `adding` now share a stem; the old `paste` hit was a collision with `past`). The lance-10 binary querying the rebuilt index returned `added` 0 and `internal` 0 - the hazard is symmetric.
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
+
+## bench-gate: first Linux row (agy adapter, #225)
+
+### 2026-09-10 - ws-pond-01, `e3e6a26-dirty`, pond 0.17.1 (x86_64-linux)
+
+The gate run that accompanied the `agy` adapter. **The delta this run printed is a change of environment, not a change of code**: the previous row is mac-m1max on 0.16.3, this one is a Linux VM on 0.17.1, so read it as "what this store looks like from another machine" and compare future Linux rows to this one instead. `equivalence: OK` (the hard gate). Store digest `5fcd5e32b8dd`, same store as the Lance 8/10/11 brackets above.
+
+`moon run repo:bench-gate`, 30m 37s wall.
+
+```
+--- CLI probes (2 runs each, best kept) ---
+get_session_sid              run1  14.7s
+get_session_sid              run2  16.1s
+get_session_mid              run1  16.7s
+get_session_mid              run2  14.0s
+get_message                  run1  16.3s
+get_message                  run2  26.7s
+search                       run1  135.2s
+search                       run2  3.6s
+search_dated                 run1  4.5s
+search_dated                 run2  14.9s
+sql_count                          0.8s
+```
+
+The `search` pair is the whole story of this column: 135.2 s cold against 3.6 s warm, and the gate keeps the best, so `search_s: 3.6` in the jsonl is a warm-cache number. `search_dated` ran the other way round (4.5 s then 14.9 s), which is how much this store's read latency moves with cache state alone - a reminder that the probe columns are not stable enough to bracket a code change on their own.
+
+```
+=== S3 IO per warm query (component isolated) ===
+component         iops_p50  iops_p95    bytes_p50    bytes_p95
+scope_count              0         1            0            0
+fts_search              42        64      1049135      7503233
+vector_search           92        99       504710      5548148
+pond_get_message       620       628     12669221     12753073
+pond_search            398       521      4750380      8030193
+  hydration            264       357    (derived: pond_search - scope - fts - vector)
+```
+
+`pond_get_message` at 620 iops / 12.7 MB per warm query is the outlier worth chasing: one message expansion pulls more objects and more bytes than a whole search. Previous rows recorded 15-16 iops for it on mac-m1max, so this is not a regression in kind but a different measurement - #168 reworked the probe, and the io-trace here counts the hydration reads that the older row did not attribute.
+
+```
+ops_bench: s3+https://nbg1.your-objectstorage.com/pondarium/pond
+
+  open store (manifests)                       455.1 ms
+
+[status] (read-only)
+  row_counts                                   778.0 ms
+  table_sizes                                 2030.1 ms
+  index_status                                  58.0 ms
+  embedding_progress                         37539.1 ms
+  adapter_names(false)                        6331.4 ms
+
+[sync] change-detection oracle (read-only)
+  session_last_message_ids COLD              64787.2 ms
+  session_last_message_ids WARM              27624.7 ms
+
+[optimize] backlog probes (read-only)
+  stale_embedding_count                      10989.1 ms
+  embedding_progress                         23318.0 ms
+
+[copy] delta detection, self-to-self (read-only)
+  plan_incremental_from                      32698.2 ms
+  (delta sessions: 0)
+```
+
+`open store` 455 ms and `row_counts` 778 ms are 3-4x better than the mac rows (1790 ms / 1291 ms); the oracle warm path is within 5% (27.6 s vs 26.3 s). Manifest reads move with the network, the oracle moves with the corpus - which is the shape you would expect if the oracle is doing real work and the manifest reads are latency-bound.
+
+```
+append write-path sweep (messages table, fresh dest per point, cap 10 commits):
+ batch      rows    commits    wall_ms    ms/commit
+   512      2500          5       1691      338.2    (1478 rows/s)
+```
+
+Against the mac row's 637.6 ms/commit and 784 rows/s. Same bucket, same batch size, different driving host.
+
+```
+--- delta vs previous run ---
+metric                      prev         now     delta   (2026-09-01T15:33:32Z 61c1498-dirty [pond 0.16.3 (aarch64-macos)] -> 2026-09-10T19:24:03Z e3e6a26-dirty [pond 0.17.1 (x86_64-linux)])
+get_session_sid_s           23.9        14.7      -38%
+get_session_mid_s           53.9        14.0      -74%
+get_message_s               46.8        16.3      -65%
+search_s                   122.9         3.6      -97%
+search_dated_s             119.0         4.5      -96%
+sql_count_s                  1.7         0.8      -53%
+fts_iops                      18          42     +133%
+vector_iops                   91          92       +1%
+get_message_iops              16         620    +3775%
+search_iops                  156         398     +155%
+open_store_ms               1790         455      -75%
+row_counts_ms               1291         778      -40%
+oracle_warm_ms             26283       27624       +5%
+write_copy_ms               5329        2812      -47%
+write_copy_merge_ms          906         743      -18%
+write_copy_noop_ms           931         393      -58%
+write_copy_delta_ms          593         415      -30%
+write_ms_per_commit        637.6       338.2      -47%
+write_rows_per_s             784        1478      +89%
+write_index_build_ms       24979        9063      -64%
+write_fold_ms               2075        2192       +6%
+```
+
+The `-dirty` on the commit is uncommitted `ingest_bench.rs` work in the same tree, not a modified read or write path.
+
+## ingest_bench: agy adapter (#225)
+
+### 2026-09-10 - ws-pond-01, local store, release profile
+
+First run of the registry-driven `--adapter` flag: before this the bench had a hand-written enum with two of the fourteen adapters in it, so most of the registry could not be benched at all.
+
+`cargo bench --bench ingest_bench -- --adapter agy --source-dir tests/fixtures/adapter/agy`
+
+```
+=== tests/fixtures/adapter/agy [agy] (62 source files) ===
+wall                 0.06 s
+peak rss              196 MB
+rows              inserted=154  matched=0
+stages            decode=0.02s (30%)  validator=0.04s (68%)  other=0.00s ( 0%)
+calls             decode_calls=156  validator_calls=155
+merge_insert sessions    calls=    1  total= 0.01s  mean=  6.0ms  min=  6ms  max=   6ms  rows=12
+merge_insert SUM  0.01s  (11% of total)
+```
+
+Validator at 68% against decode's 30% is the same split every adapter shows: protobuf decoding of 62 steps is cheaper than the fan-out that stores them.
+
+End-to-end through the CLI, `hyperfine`, one fresh store path per run (see the warning below):
+
+```
+fixture: 13 databases, 12 sessions, 77 messages   mean  226.2 ms   sd  9.2   n=10
+one conversation: 20,000 steps, 82 MB            mean 1629.9 ms   sd 55.9   n=5
+```
+
+~12,300 messages/s on the large conversation, which is what confirms the adapter's 512-row keyset paging is not paying a round-trip penalty against the single scan it replaced.
+
+**Measurement warning, cost three wrong numbers here before it was caught.** `pond` keeps a row-metadata cache at `~/.cache/pond/rowmetamap-<hash>` keyed by the *store path*, and it outlives the store directory. Deleting the store and syncing again into the same path reports "up to date", ingests nothing, and times a no-op: the same fixture measured 104 ms that way against 226 ms honestly, and the 20,000-step conversation measured 92 ms against 1630 ms. Give every timed run its own store path (`--parameter-scan` with `--runs 1`), and assert the row count afterwards. Tracked as [#226](https://github.com/tenequm/pond/issues/226).
 
 ## ingest_bench decode: codex-cli JS-runtime decode (#216)
 

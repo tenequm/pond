@@ -22,7 +22,11 @@
 //!   cargo bench --bench ingest_bench -- --source-dir ~/.claude/projects/-Users-tenequm-Projects-blackbox
 //!   cargo bench --bench ingest_bench -- --source-dir <a> --source-dir <b>
 //!   cargo bench --bench ingest_bench -- --adapter codex-cli --source-dir ~/.codex/sessions/2026/09
+//!   cargo bench --bench ingest_bench -- --adapter agy --source-dir tests/fixtures/adapter/agy
 //!   cargo bench --bench ingest_bench               # defaults to the fixture corpus
+//!
+//! `--adapter` takes any name in the registry (`pond adapters list`), so a new
+//! adapter is benchable the day it lands.
 
 use std::{
     collections::HashMap,
@@ -34,7 +38,6 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use pond::{
-    adapter::{Adapter, ClaudeCodeAdapter, CodexCliAdapter},
     config::Config,
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::Store,
@@ -58,10 +61,13 @@ struct Args {
     /// fixture corpus when none are given.
     #[arg(long, value_name = "PATH")]
     source_dir: Vec<PathBuf>,
-    /// Which adapter decodes `--source-dir`. The decode stage is the number
-    /// an adapter change moves, so bench the adapter you changed.
-    #[arg(long, value_enum, default_value_t = AdapterKind::ClaudeCode)]
-    adapter: AdapterKind,
+    /// Which adapter decodes `--source-dir`, by its registry name (`pond
+    /// adapters list`). The decode stage is the number an adapter change
+    /// moves, so bench the adapter you changed. Resolved through the same
+    /// registry `pond sync` uses, so every adapter is benchable the day it
+    /// lands - there is no per-adapter list here to fall behind.
+    #[arg(long, default_value = "claude-code")]
+    adapter: String,
     /// Ingest into this REMOTE store (resolved through the config creds, like
     /// the CLI) instead of a throwaway local TempDir. This is how you feel the
     /// S3 cost of the write path - the per-table merge_insert breakdown over
@@ -100,10 +106,66 @@ enum OracleKind {
     Rowmap,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum AdapterKind {
-    ClaudeCode,
-    CodexCli,
+/// The registry entry named on the command line. Resolved once, before any
+/// store is created, so a typo fails on the argument rather than after the
+/// first corpus has been set up.
+fn resolve_adapter(name: &str) -> Result<&'static dyn pond::adapter::AdapterFactory> {
+    pond::adapter::registry()
+        .iter()
+        .copied()
+        .find(|factory| factory.name() == name)
+        .ok_or_else(|| {
+            let known: Vec<&str> = pond::adapter::registry()
+                .iter()
+                .map(|factory| factory.name())
+                .collect();
+            anyhow::anyhow!(
+                "unknown adapter `{name}`; registry has: {}",
+                known.join(", ")
+            )
+        })
+}
+
+/// Peak resident set size of this process in MB, or `None` on a platform this
+/// does not cover.
+///
+/// The ingest path buffers a whole session and materializes a whole batch, so
+/// a decode change that looks free in wall time can still move this: it is the
+/// number that distinguishes "streams its source" from "holds it all". A
+/// process high-water mark, so with `--passes 2+` it carries the largest pass,
+/// not the last one.
+///
+/// `getrusage` rather than `/proc/self/status`, which does not exist on macOS -
+/// the environment most of `docs/benchmarks/results.md` was recorded in.
+/// Windows would need `GetProcessMemoryInfo` and a `windows-sys` dependency for
+/// one line of a hand-run bench, so it omits the line instead.
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<u64> {
+    // The crate denies `unsafe_code` rather than forbidding it precisely so a
+    // call like this can opt in with its reasoning stated (see `embed.rs`).
+    #[allow(unsafe_code)]
+    let usage = {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` either fills the caller-owned `rusage` it is
+        // handed and returns 0, or touches nothing and returns -1. The struct
+        // is only read on the success arm.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        unsafe { usage.assume_init() }
+    };
+    let max_rss = u64::try_from(usage.ru_maxrss).ok()?;
+    // Linux counts kilobytes here; macOS and the BSDs count bytes.
+    Some(if cfg!(target_os = "macos") {
+        max_rss / (1024 * 1024)
+    } else {
+        max_rss / 1024
+    })
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<u64> {
+    None
 }
 
 #[tokio::main]
@@ -136,18 +198,17 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // Resolved before any store is created, so a typo fails on the argument.
+    let factory = resolve_adapter(&args.adapter)?;
     let passes = args.passes.max(1);
     for corpus in corpora {
-        let file_count = count_jsonl(&corpus);
+        let file_count = count_sources(&corpus);
         // One store per corpus, reused across passes: pass 1 inserts, pass 2+
         // re-merge already-present rows (the sync-of-unchanged re-merge cost).
         // `_temp` keeps the local scratch dir alive for the whole corpus when
         // not targeting a remote store.
         let (store, _temp) = open_store(args.url.as_deref(), config.as_ref()).await?;
-        let adapter: Box<dyn Adapter> = match args.adapter {
-            AdapterKind::ClaudeCode => Box::new(ClaudeCodeAdapter::new(&corpus)),
-            AdapterKind::CodexCli => Box::new(CodexCliAdapter::new(&corpus)),
-        };
+        let adapter = factory.open(serde_json::json!({ "path": &corpus }))?;
         let rowmap_cache = TempDir::new()?;
 
         for pass in 1..=passes {
@@ -199,6 +260,7 @@ async fn main() -> Result<()> {
 
             report(Report {
                 corpus: &corpus,
+                adapter: &args.adapter,
                 pass,
                 passes,
                 files: file_count,
@@ -316,7 +378,24 @@ fn print_drop_reasons(label: &str, reasons: &std::collections::BTreeMap<&'static
     println!();
 }
 
-fn count_jsonl(root: &std::path::Path) -> u64 {
+/// A rough size-of-corpus figure for the report header, in files: a JSONL-tree
+/// adapter counts transcripts, a SQLite-backed one counts databases. Counting
+/// only a trailing `.jsonl` reported zero for every SQLite-backed adapter, and
+/// missed any source whose name continues past its type - a rotated
+/// `<id>.jsonl.reset.<ts>`, a compressed `<id>.jsonl.zst`. So a file counts
+/// when any dot-delimited segment of its name names a source type, which also
+/// keeps SQLite's `-wal` / `-shm` sidecars out (`x.db-wal` has no `db`
+/// segment).
+///
+/// A hint, not an accounting: an adapter whose sidecars share the extension of
+/// its transcripts (openclaw's `<id>.trajectory.jsonl`) counts them too.
+fn count_sources(root: &std::path::Path) -> u64 {
+    const SOURCE_TYPES: [&str; 4] = ["jsonl", "json", "db", "sqlite"];
+    fn is_source(name: &str) -> bool {
+        name.split('.')
+            .skip(1)
+            .any(|segment| SOURCE_TYPES.contains(&segment))
+    }
     fn walk(path: &std::path::Path, count: &mut u64) {
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
@@ -325,7 +404,11 @@ fn count_jsonl(root: &std::path::Path) -> u64 {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, count);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_source)
+            {
                 *count += 1;
             }
         }
@@ -468,6 +551,7 @@ impl Visit for FieldCollector {
 
 struct Report<'a> {
     corpus: &'a std::path::Path,
+    adapter: &'a str,
     pass: usize,
     passes: usize,
     files: u64,
@@ -492,13 +576,19 @@ fn report(r: Report<'_>) {
         String::new()
     };
     println!(
-        "=== {} ({} jsonl files){} ===",
+        "=== {} [{}] ({} source files){} ===",
         r.corpus.display(),
+        r.adapter,
         r.files,
         pass_tag
     );
     let wall_s = (r.wall_ms as f64) / 1000.0;
     println!("wall              {wall_s:>7.2} s");
+    if let Some(peak) = peak_rss_mb() {
+        // High-water mark for the process, so on pass 2+ it carries pass 1's
+        // peak: the number to read is the largest pass, not the delta.
+        println!("peak rss          {peak:>7} MB");
+    }
     println!(
         "rows              inserted={}  matched={}",
         r.inserted, r.matched
