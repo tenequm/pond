@@ -205,6 +205,28 @@ not chained). See section 8 for the adjudicated lineage rules.
 User calls: keep the 7.6 behaviour and fix only the false clause (no Section 9 item); fix the
 silent-skip in this PR; fix all ten extras in this PR.
 
+### Root-generation ambiguity: DECLINE, do not infer (user, 2026-09-10)
+
+`is_root_generation` finds the generation a key was created as by looking for the single row
+with no `previous_session_id`. When a key has SEVERAL such rows the layout cannot say which
+came first, and every generation of that key declines its lineage edge - including the one
+where the edge is real.
+
+This is not rare. In the db-era capture `previous_session_id` is NULL on 7 of 8 rows, and
+BOTH generations of `agent:main:cron:556dc024` are NULL; only the `dashboard:rollover` pair
+records it. So a forked key rotated by anything other than the idle/daily rollover path
+loses its fork edge entirely, where the unguarded code gave one right edge and one wrong one.
+
+Alternative considered and REJECTED: order the key's generations by `created_at` and give the
+edge to the earliest. It recovers the real edge, but it infers a root the source never
+states, and this adapter's whole failure mode in #224 was trusting a plausible-looking
+derivation. `model-no-synthesis` prefers an absent edge to a real-looking wrong one, and
+`resolve_window_key` already resolves its own ambiguity the same way. Consistency with the
+sibling rule decided it.
+
+Revisit only with evidence about which paths write `previous_session_id`, not on the strength
+of the edges it would recover.
+
 ### Spec changes - DONE
 - **7.6 (L680)** false repair clause replaced. It claimed a stale label is "repaired by
   `pond erase` and a re-sync"; 5.4's denylist makes that re-sync impossible and
